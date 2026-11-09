@@ -1,0 +1,28 @@
+[package]
+name = "wasmkeep-cluster"
+description = "Leases, heartbeats, node discovery and request forwarding."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = ["object-store"]
+# Production bucket adapter. Off in the madsim simulation, which builds only
+# the trait-based protocol code.
+object-store = ["dep:object_store", "dep:futures-util"]
+
+[dependencies]
+thiserror.workspace = true
+object_store = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+object_store = { workspace = true, features = ["aws"] }
+
+[lints]
+workspace = true

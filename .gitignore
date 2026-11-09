@@ -1,0 +1,20 @@
+/target
+**/target
+*.cwasm
+/data
+.DS_Store
+.idea/
+
+node_modules/
+THIRD_PARTY_LICENSES.md
+
+__pycache__/
+*.py[cod]
+
+# Local state and secrets the docs and examples create
+/.wasmkeep/
+/examples/*/.wasmkeep/
+agent.env
+hub.env
+secrets.key
+token.txt

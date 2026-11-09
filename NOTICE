@@ -1,0 +1,10 @@
+WasmKeep
+Copyright 2026 Julien Turbide
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on third-party software under their own licenses, all permissive
+(MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0, CDLA-Permissive-2.0 and
+similar); SQLite, bundled through rusqlite, is in the public domain.
+scripts/licenses.sh lists every dependency with its license; its output
+must accompany binary distributions. See docs/legal.md.

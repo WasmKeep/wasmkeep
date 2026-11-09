@@ -1,0 +1,33 @@
+[package]
+name = "wasmkeep-runtime"
+description = "Wasmtime engine, actor mailbox, hibernation and resource limits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+wasmtime.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+wasmtime = { workspace = true, features = ["wat"] }
+criterion.workspace = true
+tempfile.workspace = true
+wat.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+
+[[bench]]
+name = "instantiate"
+harness = false
+
+[lints]
+workspace = true

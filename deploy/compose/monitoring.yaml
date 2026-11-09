@@ -1,0 +1,89 @@
+# Monitoring for the three-node example: each node's metrics, Prometheus
+# scraping them, and Grafana with the WasmKeep dashboard
+# (deploy/grafana/wasmkeep.json). An overlay on compose.yaml:
+#
+#   docker compose -f compose.yaml -f monitoring.yaml up -d --build
+#   (or: podman compose -f compose.yaml -f monitoring.yaml up -d --build)
+#
+# Grafana: http://127.0.0.1:3000 (anonymous viewer access; admin/admin to
+# edit). Prometheus: http://127.0.0.1:9090. Both bound to 127.0.0.1 only.
+
+services:
+  a:
+    command:
+      - serve
+      - --app=demo/counter
+      - --bucket=s3://wasmkeep/demo
+      - --node-id=a
+      - --advertise=http://a:8080
+      - --listen=0.0.0.0:8080
+      - --cluster-listen=0.0.0.0:7443
+      - --cluster-advertise=https://a:7443
+      - --cluster-plaintext=refuse
+      - --data-dir=/var/lib/wasmkeep/data
+      - --cache-dir=/var/lib/wasmkeep/cache
+      # Metrics for Prometheus, on the compose network only.
+      - --metrics-listen=0.0.0.0:9100
+  b:
+    command:
+      - serve
+      - --app=demo/counter
+      - --bucket=s3://wasmkeep/demo
+      - --node-id=b
+      - --advertise=http://b:8080
+      - --listen=0.0.0.0:8080
+      - --cluster-listen=0.0.0.0:7443
+      - --cluster-advertise=https://b:7443
+      - --cluster-plaintext=refuse
+      - --data-dir=/var/lib/wasmkeep/data
+      - --cache-dir=/var/lib/wasmkeep/cache
+      # Metrics for Prometheus, on the compose network only.
+      - --metrics-listen=0.0.0.0:9100
+  c:
+    command:
+      - serve
+      - --app=demo/counter
+      - --bucket=s3://wasmkeep/demo
+      - --node-id=c
+      - --advertise=http://c:8080
+      - --listen=0.0.0.0:8080
+      - --cluster-listen=0.0.0.0:7443
+      - --cluster-advertise=https://c:7443
+      - --cluster-plaintext=refuse
+      - --data-dir=/var/lib/wasmkeep/data
+      - --cache-dir=/var/lib/wasmkeep/cache
+      # Metrics for Prometheus, on the compose network only.
+      - --metrics-listen=0.0.0.0:9100
+
+  prometheus:
+    image: docker.io/prom/prometheus:v3.16.0@sha256:89c1a644817e9ad70fa2af76c84898e327c1de7063735f962e8313b1e28672c3
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: docker.io/grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    environment:
+      # Demo settings: anyone who can reach port 3000 on this machine may
+      # view; editing needs the admin login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/wasmkeep.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./monitoring/grafana/datasources.yaml:/etc/grafana/provisioning/datasources/wasmkeep.yaml:ro
+      - ./monitoring/grafana/dashboards.yaml:/etc/grafana/provisioning/dashboards/wasmkeep.yaml:ro
+      - ../grafana/wasmkeep.json:/var/lib/grafana/dashboards/wasmkeep.json:ro
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped

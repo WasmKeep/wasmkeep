@@ -1,0 +1,12 @@
+{
+  "name": "wasmkeep-example-ts-workflows",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wasmkeep-ts build src/index.ts -o orders.wasm",
+    "build:starlingmonkey": "wasmkeep-ts build src/index.ts -o orders-starlingmonkey.wasm --engine starlingmonkey"
+  },
+  "dependencies": {
+    "@wasmkeep/sdk": "file:../../sdks/typescript"
+  }
+}

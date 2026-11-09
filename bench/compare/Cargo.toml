@@ -1,0 +1,21 @@
+[package]
+name = "wasmkeep-compare"
+description = "Compares actor runtimes on the same workload (bench/run.sh)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "compare"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Only to check the harness's descriptor floor against the server's budget.
+wasmkeep-server.workspace = true
+
+[lints]
+workspace = true

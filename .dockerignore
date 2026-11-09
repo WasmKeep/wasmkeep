@@ -1,0 +1,13 @@
+# Build context for deploy/Dockerfile (Docker reads .dockerignore, Podman
+# and Buildah read it too). Keep build outputs and history out of it.
+.git
+.claude
+.idea
+target
+**/target
+**/node_modules
+data
+.wasmkeep
+**/.wasmkeep
+bench/results
+docs

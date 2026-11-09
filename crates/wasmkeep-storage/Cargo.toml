@@ -1,0 +1,27 @@
+[package]
+name = "wasmkeep-storage"
+description = "Per-actor SQLite storage, WAL replication and restore."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+lz4_flex.workspace = true
+
+[features]
+# Test-only: `faults::fail_next` makes named operations fail once.
+fault-injection = []
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

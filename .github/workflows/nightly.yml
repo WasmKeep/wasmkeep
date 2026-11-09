@@ -1,0 +1,23 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    name: simulation (madsim, 20,000 seeds)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg madsim
+      WASMKEEP_SIM_SEEDS: "20000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: madsim-release
+      - run: cargo test -p wasmkeep-sim --locked --release --target-dir target/madsim

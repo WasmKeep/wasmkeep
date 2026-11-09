@@ -1,0 +1,12 @@
+# R2 operations on the soak's bucket during the soak run of
+# 2026-11-07-0f2986f-soak-r2.csv (02:55:38Z to 03:25:45Z), from Cloudflare's
+# GraphQL analytics (r2OperationsAdaptiveGroups, by actionType). Class A on
+# R2: PutObject, ListObjects, ListMultipartUploads; Class B: GetObject,
+# HeadBucket; DeleteObjects is free.
+action,requests
+PutObject,47083
+ListObjects,4432
+ListMultipartUploads,1
+GetObject,47762
+HeadBucket,2
+DeleteObjects,121

@@ -1,0 +1,104 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "sim", "bench/compare"]
+exclude = ["examples"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/wasmkeep/wasmkeep"
+authors = ["Julien Turbide"]
+publish = false
+
+[workspace.dependencies]
+wasmkeep-runtime = { path = "crates/wasmkeep-runtime" }
+wasmkeep-server = { path = "crates/wasmkeep-server" }
+wasmkeep-wit = { path = "crates/wasmkeep-wit" }
+wasmkeep-storage = { path = "crates/wasmkeep-storage" }
+wasmkeep-cluster = { path = "crates/wasmkeep-cluster" }
+wasmkeep-sdk = { path = "crates/wasmkeep-sdk" }
+# Exact versions are pinned here; wasmtime stays on one version per milestone
+# (see ROADMAP.md) and is never bumped in a feature change.
+wasmtime = { version = "=50.0.1", default-features = false, features = [
+  "std",
+  "runtime",
+  "cranelift",
+  "parallel-compilation",
+  "component-model",
+  "pooling-allocator",
+  "async",
+  "backtrace",
+  "call-hook",
+] }
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "=50.0.1", default-features = false, features = ["p2", "default-send-request"] }
+hyper = { version = "=1.12.0", features = ["server", "client", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio", "http1", "client-legacy"] }
+tower-service = "=0.3.3"
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
+http-body-util = "=0.1.5"
+bytes = "=1.12.1"
+# Outbound HTTP under an egress policy (crates/wasmkeep-server/src/egress.rs):
+# the same crates and features wasmtime-wasi-http's default sender uses.
+http = "=1.5.0"
+http-body = "=1.1.0"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "tls12", "logging", "std"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "=1.0.11"
+# Thread CPU clock for the per-event CPU budget; already in the tree via wasmtime.
+rustix = { version = "=1.1.6", default-features = false, features = ["std", "time", "fs", "process"] }
+tokio = { version = "=1.54.1", features = ["rt", "net", "sync", "time", "macros"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+clap = { version = "=4.6.7", features = ["derive"] }
+anyhow = "=1.0.104"
+thiserror = "=2.0.21"
+object_store = { version = "=0.14.2", default-features = false }
+# JSON in tests (the Watch example's API); already in the tree via wasmtime.
+serde_json = "=1.0.154"
+# HTTPS client for the opt-in usage ping; already in the tree via object_store (same features).
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "hooks", "limits"] }
+# Parses the WIT package to generate the API reference (tests only); already in the tree via wasmtime.
+wit-parser = { version = "=0.262.0", default-features = false, features = ["std"] }
+wit-bindgen = { version = "=0.63.0", default-features = false, features = ["macros", "realloc"] }
+wasip2 = "=2.0.1"
+sha2 = "=0.10.9"
+# AEAD, HKDF and RNG for secrets sealed in the bucket (ADR 0016); already in the tree via rustls and rcgen.
+ring = "=0.17.14"
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "=3.27.0"
+wat = "=1.263.0"
+
+[workspace.lints.rust]
+# `madsim` is set only when running the madsim simulation (sim/).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+large_futures = "warn"
+undocumented_unsafe_blocks = "deny"
+
+# Full debug info made target/ grow past 25 GB: every integration-test binary
+# links all of Wasmtime. Keep line tables only (backtraces still show
+# file:line); use `--config profile.dev.debug=true` when stepping in a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
+
+# Wasmtime's code generator, optimized even in dev builds: compiling a large
+# component (a 13 MB JavaScript actor) takes ~40 s with it unoptimized.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3

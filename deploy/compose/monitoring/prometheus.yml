@@ -1,0 +1,8 @@
+# Scrapes the three nodes of compose.yaml (with monitoring.yaml).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+scrape_configs:
+  - job_name: wasmkeep
+    static_configs:
+      - targets: ["a:9100", "b:9100", "c:9100"]

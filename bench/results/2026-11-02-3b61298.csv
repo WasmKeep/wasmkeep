@@ -1,0 +1,6 @@
+date,commit,host,cpu,cores,rustc,bench,median_ns,median_low_ns,median_high_ns,mean_ns
+"2026-11-02","3b61298","cloud container (KVM, 4 vCPU, 16 GB)","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","hello/instantiate",17852,16978,19558,18704
+"2026-11-02","3b61298","cloud container (KVM, 4 vCPU, 16 GB)","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","hello/request_raw-hyper",43795,43226,44987,43648
+"2026-11-02","3b61298","cloud container (KVM, 4 vCPU, 16 GB)","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","hello/request_wasmkeep",155524,149977,158809,156210
+"2026-11-02","3b61298","cloud container (KVM, 4 vCPU, 16 GB)","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","instantiate/store+instance+call",2268,2226,2382,2603
+"2026-11-02","3b61298","cloud container (KVM, 4 vCPU, 16 GB)","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","instantiate/store+instance",1892,1888,1897,1956

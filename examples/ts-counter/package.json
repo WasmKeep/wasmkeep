@@ -1,0 +1,12 @@
+{
+  "name": "wasmkeep-example-ts-counter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wasmkeep-ts build src/index.ts -o counter.wasm",
+    "build:starlingmonkey": "wasmkeep-ts build src/index.ts -o counter-starlingmonkey.wasm --engine starlingmonkey"
+  },
+  "dependencies": {
+    "@wasmkeep/sdk": "file:../../sdks/typescript"
+  }
+}

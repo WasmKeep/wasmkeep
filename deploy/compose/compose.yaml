@@ -1,0 +1,160 @@
+# Three WasmKeep nodes sharing a MinIO bucket, with mutual TLS between nodes.
+# A demo and a test bed, not a production layout: see README.md.
+#
+#   docker compose up -d --build        (or: podman compose up -d --build)
+#   curl -i -X POST http://127.0.0.1:8081/actor/counter/alice
+
+name: wasmkeep
+
+x-bucket-env: &bucket-env
+  # Demo credentials, known to everyone who reads this file: replace them
+  # (and MinIO's below) before the bucket holds anything you care about.
+  AWS_ACCESS_KEY_ID: wasmkeep-demo
+  AWS_SECRET_ACCESS_KEY: wasmkeep-demo-secret
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT: http://minio:9000
+  AWS_ALLOW_HTTP: "true"
+
+x-node: &node
+  image: localhost/wasmkeep:dev
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+  environment:
+    <<: *bucket-env
+    RUST_LOG: info
+  # A node started before the deploy exits ("nothing is deployed") and is
+  # restarted until it finds one. Waiting on the one-shot services with
+  # `condition: service_completed_successfully` would be tidier, but
+  # podman-compose turns every dependency into `--requires`, which needs
+  # the dependency still running: retrying works with both.
+  depends_on:
+    - minio
+  restart: unless-stopped
+  # A clean stop can take about 25 s (in-flight requests, queued events,
+  # handover); the default 10 s would turn it into a crash.
+  stop_grace_period: 30s
+  # Three open files per resident actor (docs/deploy/where-to-run.md).
+  ulimits:
+    nofile: 65536
+
+services:
+  minio:
+    # MinIO no longer publishes official images; Chainguard builds it from
+    # source. Chainguard's free tier only tags `latest`: the digest is the pin.
+    image: cgr.dev/chainguard/minio:latest@sha256:cee9a8e35885e93f14b3cb32960e5017aff74e2adfb52ba87c65003b0163886b
+    command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: wasmkeep-demo
+      MINIO_ROOT_PASSWORD: wasmkeep-demo-secret
+    volumes:
+      - minio:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+
+  # Creates the bucket (an existing one is fine), retrying until MinIO
+  # answers. MinIO's images have no shell, so curl signs the request.
+  bucket:
+    image: docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+    environment: *bucket-env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 60); do
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            --aws-sigv4 "aws:amz:$$AWS_REGION:s3" \
+            --user "$$AWS_ACCESS_KEY_ID:$$AWS_SECRET_ACCESS_KEY" \
+            "$$AWS_ENDPOINT/wasmkeep")
+          case "$$code" in
+            200|409) echo "bucket wasmkeep ready ($$code)"; exit 0 ;;
+          esac
+          sleep 1
+        done
+        echo "MinIO did not create the bucket (last status $$code)" >&2
+        exit 1
+    depends_on:
+      - minio
+    restart: on-failure
+
+  # Deploys the counter example as app demo/counter; the nodes serve
+  # whatever is deployed for it. Run it again to deploy a new version.
+  deploy:
+    image: localhost/wasmkeep-demo:dev
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      target: demo
+    environment: *bucket-env
+    command:
+      - deploy
+      - --app=demo/counter
+      - --bucket=s3://wasmkeep/demo
+      - --actor=counter=/components/counter.wasm
+    # Fails until the bucket exists, and is restarted until it succeeds.
+    depends_on:
+      - minio
+    restart: on-failure
+
+  a:
+    <<: *node
+    command:
+      - serve
+      - --app=demo/counter
+      - --bucket=s3://wasmkeep/demo
+      - --node-id=a
+      - --advertise=http://a:8080
+      - --listen=0.0.0.0:8080
+      - --cluster-listen=0.0.0.0:7443
+      - --cluster-advertise=https://a:7443
+      - --cluster-plaintext=refuse
+      - --data-dir=/var/lib/wasmkeep/data
+      - --cache-dir=/var/lib/wasmkeep/cache
+    volumes:
+      - a:/var/lib/wasmkeep
+    ports:
+      - "127.0.0.1:8081:8080"
+
+  b:
+    <<: *node
+    command:
+      - serve
+      - --app=demo/counter
+      - --bucket=s3://wasmkeep/demo
+      - --node-id=b
+      - --advertise=http://b:8080
+      - --listen=0.0.0.0:8080
+      - --cluster-listen=0.0.0.0:7443
+      - --cluster-advertise=https://b:7443
+      - --cluster-plaintext=refuse
+      - --data-dir=/var/lib/wasmkeep/data
+      - --cache-dir=/var/lib/wasmkeep/cache
+    volumes:
+      - b:/var/lib/wasmkeep
+    ports:
+      - "127.0.0.1:8082:8080"
+
+  c:
+    <<: *node
+    command:
+      - serve
+      - --app=demo/counter
+      - --bucket=s3://wasmkeep/demo
+      - --node-id=c
+      - --advertise=http://c:8080
+      - --listen=0.0.0.0:8080
+      - --cluster-listen=0.0.0.0:7443
+      - --cluster-advertise=https://c:7443
+      - --cluster-plaintext=refuse
+      - --data-dir=/var/lib/wasmkeep/data
+      - --cache-dir=/var/lib/wasmkeep/cache
+    volumes:
+      - c:/var/lib/wasmkeep
+    ports:
+      - "127.0.0.1:8083:8080"
+
+volumes:
+  minio:
+  a:
+  b:
+  c:

@@ -1,0 +1,3 @@
+gen/
+chat_room.wasm
+.zig-cache/

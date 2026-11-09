@@ -1,0 +1,11 @@
+# The docs site: `scripts/docs-site.sh` builds it into target/book.
+[book]
+title = "WasmKeep"
+description = "Self-hosted actors: Wasm components with a SQLite database each."
+language = "en"
+# The build stages docs/ as <stage>/docs, so page paths match the repository.
+src = "docs"
+
+[output.html]
+git-repository-url = "https://github.com/wasmkeep/wasmkeep"
+edit-url-template = "https://github.com/wasmkeep/wasmkeep/edit/main/{path}"

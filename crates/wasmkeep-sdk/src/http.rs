@@ -1,0 +1,191 @@
+//! The `wasi:http` request handler, plus small helpers for the common cases.
+
+pub use wasip2::exports::http::incoming_handler::Guest;
+pub use wasip2::http::types::{
+    Fields, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
+};
+
+use std::io::{Read as _, Write as _};
+
+/// Sends a complete response with one body. Errors writing the body are
+/// ignored: the client has gone away and there is nobody left to tell.
+pub fn respond(out: ResponseOutparam, status: u16, content_type: &str, body: &[u8]) {
+    let headers = Fields::new();
+    let _ = headers.set("content-type", &[content_type.as_bytes().to_vec()]);
+    let response = OutgoingResponse::new(headers);
+    let _ = response.set_status_code(status);
+    let Ok(outgoing) = response.body() else {
+        return;
+    };
+    ResponseOutparam::set(out, Ok(response));
+    if let Ok(mut stream) = outgoing.write() {
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+    }
+    let _ = OutgoingBody::finish(outgoing, None);
+}
+
+/// Reads the whole request body, up to `limit` bytes. `None` if the body
+/// was already consumed, could not be read, or is longer than `limit`.
+pub fn read_body(request: &IncomingRequest, limit: usize) -> Option<Vec<u8>> {
+    let body = request.consume().ok()?;
+    let mut stream = body.stream().ok()?;
+    let mut buf = Vec::new();
+    let read = (&mut stream)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    drop(stream);
+    (read <= limit).then_some(buf)
+}
+
+/// The request method as an uppercase string.
+pub fn method_name(method: &Method) -> String {
+    match method {
+        Method::Get => "GET".into(),
+        Method::Head => "HEAD".into(),
+        Method::Post => "POST".into(),
+        Method::Put => "PUT".into(),
+        Method::Delete => "DELETE".into(),
+        Method::Connect => "CONNECT".into(),
+        Method::Options => "OPTIONS".into(),
+        Method::Trace => "TRACE".into(),
+        Method::Patch => "PATCH".into(),
+        Method::Other(other) => other.clone(),
+    }
+}
+
+/// A response from [`fetch`].
+#[derive(Debug, Clone)]
+pub struct Fetched {
+    /// The HTTP status.
+    pub status: u16,
+    /// The body, up to the limit passed to [`fetch`].
+    pub body: Vec<u8>,
+}
+
+/// Sends an outbound HTTP request and waits for the response: `url` is
+/// `http://` or `https://`, `timeout` bounds connecting, the first byte of the
+/// response, and each gap between bytes. The body is read up to `limit`
+/// bytes (the rest is dropped). Errors are described as text (DNS, refused,
+/// timeout, ...), ready to log or record.
+///
+/// The actor's event waits meanwhile (other events to it queue); waiting
+/// does not count against its CPU budget, but does against the event's
+/// wall-clock limit (30 s by default).
+pub fn fetch(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    timeout: std::time::Duration,
+    limit: usize,
+) -> Result<Fetched, String> {
+    use wasip2::http::outgoing_handler;
+    use wasip2::http::types::{OutgoingRequest, RequestOptions, Scheme};
+
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("{url}: no scheme"))?;
+    let scheme = match scheme {
+        "http" => Scheme::Http,
+        "https" => Scheme::Https,
+        other => return Err(format!("{url}: unsupported scheme {other}")),
+    };
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    if authority.is_empty() {
+        return Err(format!("{url}: no host"));
+    }
+
+    let fields = Fields::new();
+    for (name, value) in headers {
+        fields
+            .append(name, value.as_bytes())
+            .map_err(|e| format!("header {name}: {e:?}"))?;
+    }
+    // A known length rather than a chunked body: some servers refuse
+    // requests without one.
+    if !body.is_empty()
+        && !headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+    {
+        fields
+            .append("content-length", body.len().to_string().as_bytes())
+            .map_err(|e| format!("header content-length: {e:?}"))?;
+    }
+    let request = OutgoingRequest::new(fields);
+    let method = match method.to_ascii_uppercase().as_str() {
+        "GET" => Method::Get,
+        "HEAD" => Method::Head,
+        "POST" => Method::Post,
+        "PUT" => Method::Put,
+        "DELETE" => Method::Delete,
+        "PATCH" => Method::Patch,
+        "OPTIONS" => Method::Options,
+        other => Method::Other(other.to_owned()),
+    };
+    request
+        .set_method(&method)
+        .and_then(|()| request.set_scheme(Some(&scheme)))
+        .and_then(|()| request.set_authority(Some(authority)))
+        .and_then(|()| request.set_path_with_query(Some(&path)))
+        .map_err(|()| format!("{url}: invalid request"))?;
+    let outgoing = request
+        .body()
+        .map_err(|()| "request body unavailable".to_owned())?;
+
+    let options = RequestOptions::new();
+    let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+    let _ = options.set_connect_timeout(Some(nanos));
+    let _ = options.set_first_byte_timeout(Some(nanos));
+    let _ = options.set_between_bytes_timeout(Some(nanos));
+
+    let future = outgoing_handler::handle(request, Some(options)).map_err(|e| format!("{e:?}"))?;
+    let wait = || loop {
+        if let Some(result) = future.get() {
+            break result;
+        }
+        future.subscribe().block();
+    };
+    if !body.is_empty() {
+        let mut stream = outgoing
+            .write()
+            .map_err(|()| "request body unavailable".to_owned())?;
+        let sent = stream
+            .write_all(body)
+            .map_err(|e| e.to_string())
+            .and_then(|()| stream.flush().map_err(|e| e.to_string()));
+        if let Err(e) = sent {
+            // The stream closes when the request fails (refused, no
+            // connection): the response says why, where it can.
+            drop(stream);
+            drop(outgoing);
+            return Err(match wait() {
+                Ok(Err(code)) => format!("{code:?}"),
+                _ => format!("sending the body: {e}"),
+            });
+        }
+    }
+    OutgoingBody::finish(outgoing, None).map_err(|e| format!("{e:?}"))?;
+
+    let response = wait()
+        .map_err(|()| "response already taken".to_owned())?
+        .map_err(|e| format!("{e:?}"))?;
+    let status = response.status();
+    let mut body = Vec::new();
+    if let Ok(incoming) = response.consume()
+        && let Ok(mut stream) = incoming.stream()
+    {
+        let _ = (&mut stream).take(limit as u64).read_to_end(&mut body);
+    }
+    Ok(Fetched { status, body })
+}

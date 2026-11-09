@@ -1,0 +1,29 @@
+# cargo-nextest settings for the local gate (scripts/check.sh) and anyone
+# running the suites by hand.
+
+[profile.default]
+# A test running past a minute is reported, and ended after two: a hung test
+# fails the run instead of holding it forever.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.default.junit]
+# target/nextest/default/junit.xml: which tests failed, how long each took,
+# to tell a flaky test from a slow one over several runs.
+path = "junit.xml"
+
+[test-groups]
+# The multi-node suites start several nodes per test with tight lease
+# timings; run too many at once on a loaded machine, they miss those timings
+# (the flaky multi-node tests seen so far all come from them).
+cluster = { max-threads = 8 }
+
+[[profile.default.overrides]]
+filter = 'binary(cluster) | binary(cluster_over_tls) | binary(revocation) | binary(cluster_tls) | binary(failover) | binary(cluster_status)'
+test-group = 'cluster'
+
+[[profile.default.overrides]]
+# The soak (bench/soak.sh) runs for its configured time, 30 minutes to 12
+# hours, and failover waits production lease timings: reported when slow,
+# never ended for it.
+filter = 'binary(soak) | binary(failover)'
+slow-timeout = { period = "300s" }

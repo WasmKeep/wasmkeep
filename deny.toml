@@ -1,0 +1,49 @@
+# cargo-deny: `cargo deny check` (advisories, licenses, bans, sources).
+# Keep the license list in step with scripts/licenses.py and docs/legal.md.
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained crates fail the check unless listed here with a reason.
+ignore = [
+    # bincode 1.3.3: unmaintained, no known vulnerability; reached only
+    # through madsim, the simulation tool behind wasmkeep-sim (dev-only,
+    # never shipped).
+    { id = "RUSTSEC-2025-0141", reason = "dev-only via madsim (wasmkeep-sim)" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+# The list mirrors scripts/licenses.py; not every entry is in use today.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# The workspace's own crates are unpublished.
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

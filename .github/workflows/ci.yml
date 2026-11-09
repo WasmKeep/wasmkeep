@@ -1,0 +1,316 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all --check
+
+  benchmark-publication:
+    name: benchmark publication paths
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 -I scripts/test_check_benchmark_paths.py
+      - name: Check every introduced commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            python3 -I scripts/check-benchmark-paths.py --range "$BASE_SHA..HEAD"
+          elif [ "${{ github.event_name }}" = push ]; then
+            # A new branch or the first push: no base, so check the whole
+            # history: each root commit's tree, then every commit after it.
+            for root in $(git rev-list --max-parents=0 HEAD); do
+              python3 -I scripts/check-benchmark-paths.py --rev "$root"
+              if [ "$root" != "$(git rev-parse HEAD)" ]; then
+                python3 -I scripts/check-benchmark-paths.py --range "$root..HEAD"
+              fi
+            done
+          else
+            echo "::error::Cannot determine the base commit; refusing a final-tree-only publication check."
+            exit 2
+          fi
+
+  licenses:
+    name: dependency licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/licenses.sh > THIRD_PARTY_LICENSES.md
+
+  deny:
+    name: cargo-deny (advisories, licenses, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --locked --no-tests=pass
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MSRV toolchain from workspace rust-version
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +"$MSRV" check --workspace --all-targets --locked
+
+  sim:
+    name: simulation (madsim, 200 seeds)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg madsim
+      WASMKEEP_SIM_SEEDS: "200"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: madsim
+      # Every simulation but madsim_lease, the retired per-actor lease's:
+      # the server no longer runs that protocol, so only the nightly runs it.
+      - run: >-
+          cargo test -p wasmkeep-sim --locked --target-dir target/madsim
+          --lib --test madsim_admission --test madsim_alarm_index
+          --test madsim_alarm_sweep --test madsim_drain
+          --test madsim_node_lease --test madsim_replication
+
+  s3:
+    # MinIO no longer publishes container images, so this runs against
+    # moto's S3 server, which enforces If-None-Match / If-Match like S3.
+    name: leases on an S3 API (moto)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT: http://127.0.0.1:5055
+      AWS_ALLOW_HTTP: "true"
+      WASMKEEP_TEST_S3_BUCKET: wasmkeep-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: start the S3 server
+        run: |
+          pip install --quiet "moto[server]==5.2.5"
+          moto_server -p 5055 > moto.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:5055/moto-api/ && break
+            sleep 1
+          done
+          curl -sf -X PUT -H "Content-Length: 0" http://127.0.0.1:5055/wasmkeep-test
+      - run: cargo nextest run -p wasmkeep-cluster --test s3 --locked
+      - name: failover (kill the owner, production lease timings)
+        run: cargo nextest run -p wasmkeep-cli --test failover --locked --no-capture
+      - name: two nodes over the cluster listener (mutual TLS)
+        run: cargo nextest run -p wasmkeep-cli --test cluster_tls --locked
+      - name: cluster status against S3
+        run: cargo nextest run -p wasmkeep-cli --test cluster_status --locked
+      - name: deploy configuration against S3
+        run: cargo nextest run -p wasmkeep-cli --test deploy_config --locked
+
+  ltx:
+    name: LTX conformance (Go reference)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: conformance/ltx/go.mod
+          cache-dependency-path: conformance/ltx/go.sum
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: we decode files the reference wrote, and write ours
+        run: cargo nextest run -p wasmkeep-storage --test ltx_conformance --locked
+      - name: the reference verifies the files we wrote
+        working-directory: conformance/ltx
+        run: go run . verify ../../target/ltx-conformance/*.ltx
+      - name: the committed fixtures are what the reference writes today
+        working-directory: conformance/ltx
+        run: |
+          go run . gen ../../crates/wasmkeep-storage/tests/ltx
+          git diff --exit-code -- ../../crates/wasmkeep-storage/tests/ltx
+
+  languages:
+    name: every language passes the same tests
+    runs-on: ubuntu-24.04
+    env:
+      WASMKEEP_REQUIRE_LANGS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,wasm-tools@1.263.0,wit-bindgen-cli@0.63.0
+      - name: toolchains (C, Zig, Python)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld wasi-libc libclang-rt-18-dev-wasm32
+          pip install ziglang==0.17.0 componentize-py==0.25.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"
+      - name: toolchains (Go)
+        run: |
+          curl -sSL https://github.com/tinygo-org/tinygo/releases/download/v0.39.0/tinygo0.39.0.linux-amd64.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
+          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: TypeScript SDK (types and WIT in sync with the host, type-check)
+        working-directory: sdks/typescript
+        run: |
+          npm ci
+          npm run sync
+          git diff --exit-code -- wit types
+          npm run check
+          npm test
+      - name: build every example
+        run: |
+          for ex in examples/ts-*/; do (cd "$ex" && npm ci && npm run build && npm run build:starlingmonkey); done
+          for ex in examples/c-*/; do "$ex/build.sh"; done
+          for ex in examples/zig-*/; do ZIG="python -m ziglang" "$ex/build.sh"; done
+          for ex in examples/py-*/; do "$ex/build.sh"; done
+          for ex in examples/go-*/; do "$ex/build.sh"; done
+      - name: the counter contract and the chat suite, against every language
+        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --locked
+
+  docs:
+    name: docs site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.5.4
+      - name: build the site (fails on broken links)
+        run: ./scripts/docs-site.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: target/book
+
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - example: hello
+            world: ""          # plain wasi:http component
+          - example: counter
+            world: actor       # must conform to wasmkeep:actor/actor
+          - example: rate-limiter
+            world: actor
+          - example: chat-room
+            world: actor
+          - example: watch/monitor
+            world: actor
+            wasm: watch_monitor
+          - example: watch/hub
+            world: actor
+            wasm: watch_hub
+          - example: agent
+            world: actor
+          - example: jobs/kv
+            world: actor
+            wasm: jobs_kv
+          - example: jobs/queue
+            world: actor
+            wasm: jobs_queue
+          - example: jobs/app
+            world: actor
+            wasm: jobs_app
+          - example: workflows/orders
+            world: actor
+            wasm: workflows_orders
+          - example: workflows/ledger
+            world: actor
+            wasm: workflows_ledger
+          - example: workflows/app
+            world: actor
+            wasm: workflows_app
+    defaults:
+      run:
+        working-directory: examples/${{ matrix.example }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/${{ matrix.example }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@1.263.0
+      - run: cargo fmt --check
+      - run: cargo clippy --release --target wasm32-wasip2 --locked -- -D warnings
+      - run: cargo build --release --target wasm32-wasip2 --locked
+      - name: Validate component and print its WIT world
+        run: |
+          name="${{ matrix.wasm }}"
+          [ -n "$name" ] || name=$(echo "${{ matrix.example }}" | tr - _)
+          wasm=target/wasm32-wasip2/release/$name.wasm
+          wasm-tools validate "$wasm"
+          wasm-tools component wit "$wasm"
+          if [ -n "${{ matrix.world }}" ]; then
+            wasm-tools component targets "$GITHUB_WORKSPACE/crates/wasmkeep-wit/wit" \
+              --world "${{ matrix.world }}" "$wasm"
+          fi

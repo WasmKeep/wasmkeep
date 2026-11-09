@@ -1,0 +1,19 @@
+[package]
+name = "test-actor"
+description = "Test-only actor exercising alarms, traps and delete-self."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmkeep-sdk = { path = "../../../../wasmkeep-sdk" }
+
+[profile.release]
+opt-level = "s"
+strip = true

@@ -1,0 +1,23 @@
+[package]
+name = "wasmkeep-wit"
+description = "The wasmkeep:actor WIT package and generated host bindings."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+wasmtime.workspace = true
+
+[dev-dependencies]
+wasmkeep-runtime.workspace = true
+wasmtime-wasi.workspace = true
+wasmtime-wasi-http.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+wit-parser.workspace = true
+
+[lints]
+workspace = true

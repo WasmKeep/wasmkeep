@@ -1,0 +1,500 @@
+//! Requests that reach a node other than the owner are forwarded to it.
+
+use super::*;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forwarding_does_not_require_a_local_resident_slot() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node_with(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    let b = node_configured(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |config| config.mailbox.max_resident = 0,
+    )
+    .await;
+    settle().await;
+    assert_eq!(
+        send(a.addr, "GET", "/actor/t/remote/fired", "")
+            .await
+            .status,
+        200
+    );
+
+    let response = send(b.addr, "GET", "/actor/t/remote/fired", "").await;
+    assert_eq!(
+        (response.status, response.node.as_deref()),
+        (200, Some("a"))
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/actor/t/remote", b.addr))
+        .await
+        .unwrap();
+    ws.send(Message::text("through a full relay"))
+        .await
+        .unwrap();
+    let echo = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap();
+    assert_eq!(
+        echo.unwrap().unwrap(),
+        Message::text("through a full relay")
+    );
+    assert_eq!(
+        b.service.resident(),
+        0,
+        "forwarding created a resident stub"
+    );
+    assert!(!db.path().join("actors/default/t/remote.db").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_calls_do_not_evict_or_compete_with_the_local_caller() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node_with(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    let b = node_configured(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |config| config.mailbox.max_resident = 1,
+    )
+    .await;
+    settle().await;
+    assert_eq!(
+        send(a.addr, "GET", "/actor/t/remote/fired", "")
+            .await
+            .status,
+        200
+    );
+    let response = send(
+        b.addr,
+        "POST",
+        "/actor/t/local/call?to=t/remote&path=/caller",
+        "",
+    )
+    .await;
+    assert_eq!(
+        (response.status, response.body.trim()),
+        (200, "200:default/t/local")
+    );
+    assert_eq!(b.service.resident(), 1, "only the local caller is resident");
+    assert!(!db.path().join("actors/default/t/remote.db").exists());
+}
+
+/// A client's `Connection: close` is for its own hop: the forwarding node
+/// keeps its connection to the owner for the next request instead of
+/// opening one (over TLS, a full handshake) per request. Bodies still
+/// arrive whole, framed by length or chunked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clients_connection_close_does_not_close_the_connection_to_the_owner() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, accepted) = node_counting_peers("a", da.path(), &store, "t", test_actor_wasm()).await;
+    let b = node_with(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    settle().await;
+    assert_eq!(
+        send(a.addr, "GET", "/actor/t/x/fired", "").await.status,
+        200
+    );
+
+    for _ in 0..5 {
+        pooled().await;
+        let r = send(b.addr, "GET", "/actor/t/x/fired", "").await;
+        assert_eq!((r.status, r.node.as_deref()), (200, Some("a")));
+    }
+    pooled().await;
+    let sized = exchange(
+        b.addr,
+        "POST /actor/t/x/body-len HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\
+         Connection: close\r\n\r\nhello",
+    )
+    .await;
+    assert_eq!((sized.status, sized.body.trim()), (200, "5"));
+    pooled().await;
+    let chunked = exchange(
+        b.addr,
+        "POST /actor/t/x/body-len HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\
+         Connection: close\r\n\r\n3\r\nhel\r\n4\r\nlo w\r\n0\r\n\r\n",
+    )
+    .await;
+    assert_eq!((chunked.status, chunked.body.trim()), (200, "7"));
+    // HTTP/1.0 closes after each response unless asked not to: the owner
+    // must not see the client's version either.
+    for _ in 0..3 {
+        pooled().await;
+        let r = exchange(b.addr, "GET /actor/t/x/fired HTTP/1.0\r\nHost: t\r\n\r\n").await;
+        assert_eq!((r.status, r.node.as_deref()), (200, Some("a")));
+    }
+    pooled().await;
+    let old_client = exchange(
+        b.addr,
+        "POST /actor/t/x/body-len HTTP/1.0\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello",
+    )
+    .await;
+    assert_eq!((old_client.status, old_client.body.trim()), (200, "5"));
+    // Eleven requests, one connection. A second is tolerated: the pooled
+    // connection goes back to the pool from a background task, and a
+    // request that checks out just before that starts a connection anyway.
+    // `pooled` makes that rare under load; closing per request would show
+    // eleven.
+    let opened = accepted.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&opened),
+        "{opened} connections to the owner for 11 forwarded requests"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_reaching_another_node_are_forwarded_to_the_owner() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node("a", da.path(), &store, Duration::from_secs(30)).await;
+    let b = node("b", db.path(), &store, Duration::from_secs(30)).await;
+    settle().await;
+
+    let first = send(a.addr, "POST", "/actor/counter/alice", "").await;
+    assert_eq!((first.status, first.body.trim()), (200, "1"));
+    assert_eq!(first.node.as_deref(), Some("a"));
+
+    // Through b: forwarded to a, which owns alice, so the count continues.
+    for expected in ["2", "3"] {
+        let r = send(b.addr, "POST", "/actor/counter/alice", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, expected));
+        assert_eq!(r.node.as_deref(), Some("a"), "served by the owner");
+    }
+
+    // A different actor first reached through b is owned by b.
+    let bob = send(b.addr, "POST", "/actor/counter/bob", "").await;
+    assert_eq!(bob.node.as_deref(), Some("b"));
+    let bob = send(a.addr, "GET", "/actor/counter/bob", "").await;
+    assert_eq!((bob.body.trim(), bob.node.as_deref()), ("1", Some("b")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_request_is_never_forwarded_again() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node("a", da.path(), &store, Duration::from_secs(30)).await;
+    let b = node("b", db.path(), &store, Duration::from_secs(30)).await;
+    settle().await;
+
+    send(a.addr, "POST", "/actor/counter/alice", "").await;
+    // b believes a forwarded this to it, yet a owns the actor: two nodes
+    // disagree, so b answers 503 instead of bouncing it back.
+    let r = send(
+        b.addr,
+        "POST",
+        "/actor/counter/alice",
+        "x-wasmkeep-forwarded: 1\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 503);
+    let r = send(a.addr, "GET", "/actor/counter/alice", "").await;
+    assert_eq!(r.body.trim(), "1", "the refused request did not run");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn awkward_names_work_across_nodes() {
+    async fn admitted(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
+        let mut reply = send(addr, method, path, extra).await;
+        // Names and forwarding stubs exceed the 14-resident budget. Only
+        // retry explicit admission refusals, which ran no actor event.
+        for _ in 0..5 {
+            if reply.status != 503
+                || reply.retry_after.as_deref() != Some("1")
+                || reply.body.trim() != "actor capacity unavailable"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            reply = send(addr, method, path, extra).await;
+        }
+        reply
+    }
+
+    // Forwarding, calls between nodes (and the caller header), failover
+    // with restore, and the alarm sweep, for every awkward name.
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let down = Arc::new(AtomicBool::new(false));
+    let seen_by_a: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_with("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    settle().await;
+
+    for name in awkward_names() {
+        let enc = url_encode(&name);
+        let path = |rest: &str| format!("/actor/t/{enc}/{rest}");
+        // a takes the actor; b forwards to it.
+        let r = admitted(a.addr, "POST", &path("durable"), "").await;
+        assert_eq!(
+            (r.status, r.body.trim(), r.node.as_deref()),
+            (200, "1", Some("a")),
+            "{name:?}"
+        );
+        let r = admitted(b.addr, "POST", &path("durable"), "").await;
+        assert_eq!(
+            (r.status, r.body.trim(), r.node.as_deref()),
+            (200, "2", Some("a")),
+            "{name:?} forwarded"
+        );
+        // An actor first reached on b calls it on a; the callee sees who called.
+        let caller = format!("caller-{}", url_encode(&name).len());
+        let r = admitted(
+            b.addr,
+            "POST",
+            &format!(
+                "/actor/t/{caller}/call?to={}&path=%2Fcaller",
+                url_encode(&format!("t/{name}"))
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.body.trim().to_owned()),
+            (200, format!("200:default/t/{caller}")),
+            "{name:?}: call across nodes"
+        );
+        // And the other way: the awkward name calls; its caller header must
+        // decode back to its name.
+        let r = admitted(
+            a.addr,
+            "POST",
+            &format!("{}?to=t%2Fsink&path=%2Fcaller", path("call")),
+            "",
+        )
+        .await;
+        assert_eq!(r.status, 200, "{name:?}");
+        let header = r
+            .body
+            .trim()
+            .strip_prefix("200:")
+            .unwrap_or_default()
+            .to_owned();
+        let decoded = header
+            .strip_prefix("default/t/")
+            .map(percent_decode_str)
+            .unwrap_or_default();
+        assert_eq!(decoded, name, "caller header {header:?}");
+        // A pending alarm, due soon.
+        let r = admitted(a.addr, "POST", &format!("{}?in=1500", path("alarm")), "").await;
+        assert_eq!(r.status, 200, "{name:?}");
+    }
+
+    // a loses the bucket: b restores every actor with its writes and fires
+    // its alarm (before any request reaches it).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    down.store(true, Ordering::SeqCst);
+    let names = awkward_names();
+    wait_delivered(
+        &shared,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    for name in awkward_names() {
+        let enc = url_encode(&name);
+        let r = admitted(b.addr, "GET", &format!("/actor/t/{enc}/fired"), "").await;
+        assert_eq!(
+            (r.status, r.body.trim(), r.node.as_deref()),
+            (200, "1", Some("b")),
+            "{name:?}: alarm"
+        );
+        let r = admitted(b.addr, "GET", &format!("/actor/t/{enc}/durable"), "").await;
+        assert_eq!((r.status, r.body.trim()), (200, "2"), "{name:?}: writes");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cluster_prefix_that_needs_escaping_works_end_to_end() {
+    // The prefix comes from `--bucket s3://BUCKET/PREFIX` as typed: it must
+    // not break heartbeats, leases, restore or the alarm sweep.
+    let prefix = "team~1 x";
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let down = Arc::new(AtomicBool::new(false));
+    let seen_by_a: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (idle, wall) = (Duration::from_secs(30), Duration::from_secs(30));
+    let a = node_prefixed(
+        "a",
+        da.path(),
+        &seen_by_a,
+        idle,
+        "t",
+        test_actor_wasm(),
+        wall,
+        prefix,
+    )
+    .await;
+    let b = node_prefixed(
+        "b",
+        db.path(),
+        &shared,
+        idle,
+        "t",
+        test_actor_wasm(),
+        wall,
+        prefix,
+    )
+    .await;
+    settle().await;
+
+    let r = send(a.addr, "POST", "/actor/t/Room%201/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "1", Some("a"))
+    );
+    // Forwarded: b sees a's heartbeat and lease under the prefix.
+    let r = send(b.addr, "POST", "/actor/t/Room%201/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "2", Some("a"))
+    );
+    let r = send(a.addr, "POST", "/actor/t/Room%201/alarm?in=1500", "").await;
+    assert_eq!(r.status, 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    down.store(true, Ordering::SeqCst);
+
+    // (The index is under the prefix here: `wait_delivered` reads the
+    // unprefixed one, so this test waits the worst case.)
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let r = send(b.addr, "GET", "/actor/t/Room%201/fired", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "1", Some("b")),
+        "alarm swept"
+    );
+    let r = send(b.addr, "GET", "/actor/t/Room%201/durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "writes restored");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forwarding_reuses_the_owner_it_learned_instead_of_reading_the_bucket_each_time() {
+    // b relays requests for an actor a owns. It must learn the owner once
+    // and reuse that for a while (as the per-actor hint did), not read the
+    // actor's lease from the bucket for every request it relays.
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seen_by_b = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", da.path(), &shared, idle, "t", test_actor_wasm()).await;
+    let b = node_with(
+        "b",
+        db.path(),
+        &(Arc::clone(&seen_by_b) as Arc<dyn ObjectStore>),
+        idle,
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    settle().await;
+    let r = send(a.addr, "POST", "/actor/t/x/fired", "").await;
+    assert_eq!((r.status, r.node.as_deref()), (200, Some("a")));
+
+    let before = seen_by_b.lease_gets.load(Ordering::SeqCst);
+    for _ in 0..20 {
+        let r = send(b.addr, "GET", "/actor/t/x/fired", "").await;
+        assert_eq!((r.status, r.node.as_deref()), (200, Some("a")));
+    }
+    let reads = seen_by_b.lease_gets.load(Ordering::SeqCst) - before;
+    assert!(reads <= 2, "{reads} lease reads for 20 relayed requests");
+}
+
+/// A request whose client hung up while it waited in the actor's queue is
+/// not run: nobody would get its answer (the 12-hour soak: 11 durable
+/// writes whose clients had timed out ran one after another behind a slow
+/// restore, 16 s before the first live answer). Here an event holds the
+/// actor for 1.5 s; a durable write queued behind it is abandoned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_abandoned_while_queued_is_not_run() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let data = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "a",
+        data.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    settle().await;
+    let r = send(a.addr, "GET", "/actor/t/q/durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "0"));
+    let busy = tokio::spawn(send(a.addr, "POST", "/actor/t/q/sleep?ms=1500", ""));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Sent while the sleep holds the actor, then abandoned.
+    let mut stream = TcpStream::connect(a.addr).await.unwrap();
+    stream
+        .write_all(b"POST /actor/t/q/durable HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(stream);
+    assert_eq!(busy.await.unwrap().status, 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = send(a.addr, "GET", "/actor/t/q/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim()),
+        (200, "0"),
+        "the abandoned write ran"
+    );
+    // Skipped by the check, not lost on the way: counted once (this test's
+    // process has the metrics to itself).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics = listener.local_addr().unwrap();
+    tokio::spawn(wasmkeep_server::serve_metrics(
+        listener,
+        None,
+        std::future::pending(),
+    ));
+    let (_, page) = get_raw(metrics, "/metrics").await;
+    assert!(
+        page.lines()
+            .any(|l| l == "wasmkeep_requests_abandoned_total 1"),
+        "{page}"
+    );
+}

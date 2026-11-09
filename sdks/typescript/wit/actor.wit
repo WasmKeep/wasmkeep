@@ -1,0 +1,273 @@
+/// The `wasmkeep:actor` package: everything an actor can call on the host, and
+/// everything the host calls on an actor.
+///
+/// An actor is addressed as `tenant/class/name`. One component implements one
+/// class; each distinct name is an independent instance with its own SQLite
+/// database. The host delivers events (requests, alarms) to an instance one at
+/// a time, in arrival order: an actor never runs concurrently with itself.
+///
+/// Versioning: 0.x minor versions may break guests; every change comes with a
+/// migration note (docs/adr). See docs/adr/0002-wasmkeep-actor-wit-v0.1.md and
+/// docs/adr/0003-websockets-wit-v0.2.md.
+package wasmkeep:actor@0.2.0;
+
+/// Types shared by several interfaces.
+interface types {
+    /// A SQL value, mapping one to one onto SQLite's storage classes.
+    variant value {
+        null,
+        integer(s64),
+        real(f64),
+        text(string),
+        blob(list<u8>),
+    }
+
+    /// The result set of a query: column names, then one list of values per
+    /// row, in column order.
+    record rows {
+        columns: list<string>,
+        values: list<list<value>>,
+    }
+
+    /// Why a statement failed.
+    enum sql-error-kind {
+        /// The SQL did not parse, or referred to a missing table or column.
+        syntax,
+        /// A constraint failed (UNIQUE, NOT NULL, CHECK, FOREIGN KEY).
+        constraint,
+        /// Parameter count or types do not match the statement.
+        bind,
+        /// The text held more than one statement; send one at a time.
+        multiple-statements,
+        /// The database reached its size cap (default 1 GB); reads still work.
+        quota-exceeded,
+        /// The statement tried something actors may not do (ATTACH, a
+        /// PRAGMA outside the allowed set, loading extensions).
+        not-allowed,
+        /// The host failed (disk, I/O). The event should fail.
+        internal,
+    }
+
+    record sql-error {
+        kind: sql-error-kind,
+        /// Human-readable detail, usually SQLite's own message.
+        message: string,
+    }
+}
+
+/// The actor's own SQLite database. Nothing else can read or write it.
+///
+/// Each call runs one statement. Outside an explicit transaction every
+/// statement commits on its own. `BEGIN` ... `COMMIT` across several calls
+/// within one event is allowed; a transaction still open when the event ends
+/// (or traps) is rolled back. A statement that fails in a way that rolls the
+/// open transaction back (it ran past its deadline or the event's SQL CPU
+/// budget, say) ends that transaction: nothing of it is kept, and every
+/// later storage statement of the event is refused with `not-allowed`
+/// (but a `ROLLBACK`, which is what already happened, succeeds).
+interface storage {
+    use types.{value, rows, sql-error};
+
+    /// Runs a statement that returns no rows; returns the number of rows
+    /// changed. Returns once the write is committed to the local database.
+    exec: func(sql: string, params: list<value>) -> result<u64, sql-error>;
+
+    /// Like `exec`, but returns only once the write is durable: replicated to
+    /// the bucket when the node has one, fsynced locally when it does not.
+    /// Inside a transaction it takes only `COMMIT` (or `END`), and makes the
+    /// whole transaction durable; any other statement there is refused with
+    /// `not-allowed` before it runs. Outside one it does not take a
+    /// statement that opens or controls a transaction (`BEGIN`, `SAVEPOINT`):
+    /// run those with `exec`.
+    exec-durable: func(sql: string, params: list<value>) -> result<u64, sql-error>;
+
+    /// Runs a statement and returns its rows.
+    query: func(sql: string, params: list<value>) -> result<rows, sql-error>;
+
+    /// Deletes this actor: its database is removed once the current event
+    /// ends, and its pending alarm is cleared. The next event to this address
+    /// starts a fresh actor.
+    delete-self: func();
+}
+
+/// One pending alarm per actor. Alarms survive restarts and fire at least
+/// once: an `on-alarm` that fails or traps is retried, so handlers must be
+/// idempotent.
+interface alarms {
+    /// Schedules `on-alarm` at `at` (milliseconds since the Unix epoch),
+    /// replacing any pending alarm. A time in the past fires as soon as
+    /// possible.
+    set-alarm: func(at: u64);
+
+    /// The pending alarm time, if any.
+    get-alarm: func() -> option<u64>;
+
+    /// Cancels the pending alarm, if any.
+    clear-alarm: func();
+}
+
+/// Calls between actors of the same tenant.
+interface actors {
+    /// A fully buffered request, delivered to the callee's
+    /// `wasi:http/incoming-handler` like any other request.
+    record request {
+        method: string,
+        /// Path and query, starting with `/`.
+        path: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    variant call-error {
+        /// The address is not `class/name`, or the class does not exist.
+        invalid-address(string),
+        /// The call would re-enter an actor already waiting in this call
+        /// chain (including the caller itself), which would deadlock.
+        reentrant,
+        /// The request or response exceeded the body limit (16 MB).
+        too-large,
+        /// The callee did not answer within the event's wall-clock limit.
+        timeout,
+        /// The callee trapped, or the host could not deliver the call.
+        failed(string),
+    }
+
+    /// Sends `request` to the actor at `address` (`class/name`, within the
+    /// caller's tenant) and waits for its response. The caller's own event
+    /// stays in progress meanwhile: other events to the caller wait.
+    ///
+    /// The callee sees `x-wasmkeep-caller: <tenant>/<class>/<name>`, the name
+    /// percent-encoded (every byte but ASCII letters, digits and `-._~`), so
+    /// `room 1` arrives as `room%201`. The host removes that header from
+    /// requests coming from outside, so the callee can trust it.
+    call: func(address: string, request: request) -> result<response, call-error>;
+
+    /// An actor's address. Within a tenant, `class/name` is what `call`
+    /// takes; the name is decoded (any text without `/` or control characters).
+    record actor-address {
+        tenant: string,
+        class: string,
+        name: string,
+    }
+
+    /// This actor's own address: an actor does not otherwise know its name
+    /// or class (requests arrive with `/actor/<class>/<name>` removed, and
+    /// alarms carry nothing). For links to itself, for telling other actors
+    /// who it is, and for anything keyed by its name.
+    self-address: func() -> actor-address;
+}
+
+/// WebSocket connections to this actor.
+///
+/// The host accepts upgrades on the actor's path and owns the sockets, so a
+/// connection stays open while the actor hibernates; the next message wakes
+/// it. A connection id is only valid in the actor it was opened on.
+interface websockets {
+    /// A WebSocket message.
+    variant message {
+        text(string),
+        binary(list<u8>),
+    }
+
+    variant send-error {
+        /// The connection is closed, or belongs to another actor.
+        unknown-connection,
+        /// The client is not reading fast enough; the message was dropped.
+        backpressure,
+    }
+
+    /// Queues `msg` on the connection.
+    send: func(conn: u64, msg: message) -> result<_, send-error>;
+
+    /// Closes the connection with a close code (1000 = normal) and reason.
+    close: func(conn: u64, code: u16, reason: string);
+
+    /// This actor's open connections, oldest first.
+    connections: func() -> list<u64>;
+}
+
+/// Configuration and secrets the operator gives an actor class: an API
+/// key, a webhook URL, a feature flag. Values come, by name, last wins,
+/// from the deployed version's plain configuration (`wasmkeep deploy
+/// --config CLASS=FILE`), the app's secrets sealed in the bucket (`wasmkeep
+/// secrets set`), and files on the node (`wasmkeep serve --env CLASS=FILE`),
+/// never from the component. They are the same for every actor of the class
+/// and read-only, and change only between events, never during one: when a
+/// deploy or a secrets change lands (the next event runs in a new instance)
+/// or the node restarts.
+interface env {
+    /// The value of `name`, or none if it is not set.
+    get: func(name: string) -> option<string>;
+}
+
+/// WasmKeep's own part of the actor world: what the host bindings and the
+/// guest SDK are generated from.
+world actor-core {
+    import storage;
+    import alarms;
+    import actors;
+    import websockets;
+    import env;
+    use websockets.{message};
+
+    /// Runs before the first event an instance handles with this component
+    /// version: once for a new actor, and again after each deploy. Use it to
+    /// create or migrate tables. An error fails the event; it is retried with
+    /// the next event.
+    export on-init: func() -> result<_, string>;
+
+    /// Runs when the pending alarm is due. An error or trap schedules a retry.
+    export on-alarm: func() -> result<_, string>;
+
+    /// A client upgraded a GET to `path` (the part after the actor's name,
+    /// with its query). Return an error to refuse it: the connection is then
+    /// closed with code 1008 and the error as reason. It runs before the host
+    /// answers the upgrade (101), so the client is connected only once the
+    /// actor has accepted it. What the actor sends meanwhile waits in the
+    /// socket's queue, with its usual cap (`backpressure` past 4 MiB). A
+    /// client that leaves before the 101 (or a node relaying for it, which
+    /// gives up after 30 s) still gets this event if it was already queued,
+    /// followed by `on-websocket-close` with code 1006.
+    export on-websocket-open: func(conn: u64, path: string) -> result<_, string>;
+
+    /// A message arrived on one of this actor's connections.
+    export on-websocket-message: func(conn: u64, msg: message);
+
+    /// A connection closed (by the client, by `close`, or by the host).
+    export on-websocket-close: func(conn: u64, code: u16, reason: string);
+}
+
+/// The world actor components target: WasmKeep's interfaces plus the standard
+/// `wasi:http/proxy` world, whose `incoming-handler` receives requests and
+/// whose imports provide outbound HTTP, clocks, randomness and stdio.
+///
+/// This is also the capability list. Toolchains import more than they use
+/// (ComponentizeJS and componentize-py import `wasi:filesystem`, Python also
+/// `wasi:sockets`), so the host links those too, inert: no preopened
+/// directories, and sockets and name lookups refused.
+world actor {
+    include actor-core;
+    include wasi:http/proxy@0.2.12;
+
+    // Imported by the standard library of Rust (and most languages) on
+    // wasm32-wasip2. The host provides them empty: no arguments, no
+    // environment variables, no terminal. Configuration arrives through
+    // the `env` interface instead.
+    import wasi:cli/environment@0.2.12;
+    import wasi:cli/exit@0.2.12;
+    import wasi:cli/terminal-input@0.2.12;
+    import wasi:cli/terminal-output@0.2.12;
+    import wasi:cli/terminal-stdin@0.2.12;
+    import wasi:cli/terminal-stdout@0.2.12;
+    import wasi:cli/terminal-stderr@0.2.12;
+    // Seeds the standard library's hash maps (Rust's `HashMap`, used by the
+    // SDK's key-value client among others). The host provides it, as every
+    // WASI 0.2 interface it links.
+    import wasi:random/insecure-seed@0.2.12;
+}

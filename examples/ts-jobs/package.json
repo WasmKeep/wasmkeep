@@ -1,0 +1,12 @@
+{
+  "name": "wasmkeep-example-ts-jobs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wasmkeep-ts build src/index.ts -o jobs.wasm",
+    "build:starlingmonkey": "wasmkeep-ts build src/index.ts -o jobs-starlingmonkey.wasm --engine starlingmonkey"
+  },
+  "dependencies": {
+    "@wasmkeep/sdk": "file:../../sdks/typescript"
+  }
+}

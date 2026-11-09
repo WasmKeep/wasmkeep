@@ -1,0 +1,87 @@
+[package]
+name = "wasmkeep-server"
+description = "HTTP front door and router wiring runtime, storage and cluster together."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rustix.workspace = true
+http.workspace = true
+http-body.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+wasmkeep-runtime.workspace = true
+wasmkeep-storage.workspace = true
+wasmkeep-wit.workspace = true
+wasmkeep-cluster.workspace = true
+object_store.workspace = true
+sha2.workspace = true
+ring.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+wasmtime-wasi-http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower-service.workspace = true
+rcgen.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+# Implementing object_store's async trait (the request-counting bucket); already in the tree through object_store.
+async-trait = "=0.1.92"
+
+[dev-dependencies]
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+tokio-tungstenite = { workspace = true, features = ["connect"] }
+futures-util.workspace = true
+wasmkeep-storage = { workspace = true, features = ["fault-injection"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util"] }
+wat.workspace = true
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "http"
+harness = false
+
+[[bench]]
+name = "actors"
+harness = false
+
+[[bench]]
+name = "replication"
+harness = false
+
+[[bench]]
+name = "cluster"
+harness = false
+
+[[bench]]
+name = "restore"
+harness = false
+
+[[bench]]
+name = "restart"
+harness = false
+
+[[bench]]
+name = "alarm_recovery"
+harness = false
+
+[[bench]]
+name = "workflow"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+{
+  "name": "wasmkeep-bench-workerd",
+  "private": true,
+  "description": "Pins the workerd release the comparison benchmark runs against.",
+  "dependencies": {
+    "workerd": "1.20261016.1"
+  }
+}

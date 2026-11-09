@@ -1,0 +1,29 @@
+{
+  "name": "@wasmkeep/sdk",
+  "version": "0.0.0",
+  "description": "Write WasmKeep actors in TypeScript or JavaScript.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": { "type": "git", "url": "https://github.com/wasmkeep/wasmkeep", "directory": "sdks/typescript" },
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "bin": { "wasmkeep-ts": "./bin/wasmkeep-ts.mjs" },
+  "files": ["src", "bin", "wit", "types"],
+  "scripts": {
+    "sync": "node scripts/sync.mjs",
+    "check": "tsc --noEmit",
+    "test": "node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@bytecodealliance/jco": "1.41.0",
+    "esbuild": "0.25.12"
+  },
+  "overrides": {
+    "@bytecodealliance/jco-std": {
+      "minimatch": "11.0.1"
+    }
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,15 @@
+date,commit,host,cpu,cores,rustc,bench,median_ns,median_low_ns,median_high_ns,mean_ns
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","actor/create",3130574,3053266,3227868,3160779
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","actor/wake",851987,814089,916425,873590
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","actor/warm",226730,218222,238118,229766
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","hello/instantiate",16413,16182,16607,16957
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","hello/request_raw-hyper",30353,29990,30994,31561
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","hello/request_wasmkeep",116085,114116,118491,119197
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","instantiate/store+instance+call",2319,2290,2369,2554
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","instantiate/store+instance",1988,1975,2005,2050
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","write/durable",1323621,1287833,1387733,1382813
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","write/local",260733,248002,282635,261061
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","write/replicated",1124993,1102909,1158402,1121832
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","failover/kill9-run1",14029000000,14029000000,14029000000,14029000000
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","failover/kill9-run2",14032000000,14032000000,14032000000,14032000000
+"2026-11-03","60f745a","cloud container","Intel(R) Xeon(R) Processor @ 2.10GHz","4","1.99.1","failover/kill9-run3",14028000000,14028000000,14028000000,14028000000

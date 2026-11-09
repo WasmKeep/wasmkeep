@@ -1,0 +1,22 @@
+[package]
+name = "workflows-ledger"
+description = "Workflows on WasmKeep: the ledger class."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Built for wasm32-wasip2, so it is its own workspace, outside the host one.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmkeep-sdk = { path = "../../../crates/wasmkeep-sdk" }
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
