@@ -16,16 +16,20 @@ Debian 10, Ubuntu 20.04 and later), a tarball with the binary and its
 third-party notices, a CycloneDX SBOM, `SHA256SUMS`, and a Sigstore bundle
 for each file. CI builds and signs them (`.github/workflows/release.yml`);
 no key is involved, the signature's certificate names the workflow and
-the tag. To check a download (cosign 2.4 or newer), here for `v0.1.0`:
+the tag. To check a download with cosign 3 (the version that signs them),
+here for `v0.1.0`:
 
 ```bash
 f=wasmkeep-0.1.0-x86_64-unknown-linux-gnu.tar.gz
 cosign verify-blob --bundle "$f.sigstore.json" \
   --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"
-sha256sum --check --ignore-missing SHA256SUMS
 tar xzf "$f" && cd "${f%.tar.gz}" && sudo install -m 755 wasmkeep /usr/local/bin/wasmkeep
 ```
+
+`SHA256SUMS` lists every file of the release, for tools that check
+checksums; it is signed like the rest, so verify its own bundle the same
+way before trusting it.
 
 Until then, build on the server, or on a machine with the same OS and CPU
 architecture:

@@ -100,7 +100,7 @@ jobs:
           install -m 0755 target/portable/glibc/release/wasmkeep "dist/$name/wasmkeep"
           install -m 0644 LICENSE NOTICE README.md target/notices/THIRD_PARTY_NOTICES.txt "dist/$name/"
           epoch=$(git log -1 --format=%ct)
-          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner --mode=go-w \
             -C dist -cf - "$name" | gzip -n -9 > "dist/$name.tar.gz"
           cp "target/sbom/wasmkeep-$TARGET.cdx.json" "dist/$name.cdx.json"
           rm -r "dist/$name"
@@ -113,13 +113,12 @@ jobs:
           retention-days: 7
 
   sign:
-    name: checksums, signatures, draft release
+    name: checksums and signatures
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: write   # the draft release (tags only)
       id-token: write   # keyless signing: the workflow's OIDC identity
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -156,13 +155,32 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 14
-      - name: Draft pre-release (tags only)
-        if: github.ref_type == 'tag'
+
+  release:
+    name: draft pre-release
+    needs: sign
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # the draft release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: dist
+      - name: Create the draft, or replace its files on a re-run
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" dist/* --draft --prerelease --verify-tag \
-            --title "WasmKeep $TAG" \
-            --notes "Binaries for x86_64 and aarch64 Linux (glibc 2.28 or newer), each with its SBOM and third-party notices. Verify with SHA256SUMS and the Sigstore bundles: see docs/deploy/single-node.md."
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            # Never replace the files of a published release.
+            [ "$draft" = true ] || { echo "::error::release $TAG is already published"; exit 1; }
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --draft --prerelease --verify-tag \
+              --title "WasmKeep $TAG" \
+              --notes "Binaries for x86_64 and aarch64 Linux (glibc 2.28 or newer), each with its SBOM and third-party notices. Verify with the Sigstore bundles: see docs/deploy/single-node.md."
+          fi

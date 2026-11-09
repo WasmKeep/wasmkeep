@@ -21,26 +21,46 @@ mkdir -p "$(dirname "$out")"
 cargo about generate --locked --fail \
   --manifest-path crates/wasmkeep-cli/Cargo.toml \
   --config about.toml --output-file "$out" about.hbs
-# Apache-2.0 section 4(d): a dependency's NOTICE file travels with the
-# binary too. cargo-about gathers licenses, not these, so append each listed
-# crate's NOTICE* file from its source.
+# Two gaps cargo-about leaves, filled from each listed crate's source:
+# - a crate whose license file it cannot match (a combined MIT/Apache file,
+#   a preamble) gets the SPDX template, "Copyright <year> <owner>"; so a
+#   license file whose copyright lines are missing from the output is
+#   appended verbatim;
+# - Apache-2.0 section 4(d): a dependency's NOTICE file travels with the
+#   binary too, and cargo-about does not gather those.
 cargo metadata --format-version 1 --locked | python3 -I -c '
 import json, pathlib, re, sys
 out = pathlib.Path(sys.argv[1])
-listed = set(re.findall(r"^- (\S+) (\d\S*)", out.read_text(), re.M))
-found = []
+text = out.read_text()
+entry = re.compile(r"^- (\S+) (\d+\.\d+\.\d+\S*)(?: \(\S+\))?$", re.M)
+listed = set(entry.findall(text))
+squash = lambda s: " ".join(s.split())
+present = squash(text)
+licenses, notices = [], []
 for pkg in json.load(sys.stdin)["packages"]:
     if (pkg["name"], pkg["version"]) not in listed:
         continue
     root = pathlib.Path(pkg["manifest_path"]).parent
     for f in sorted(root.iterdir()):
-        if f.is_file() and f.name.upper().startswith("NOTICE"):
-            found.append((pkg["name"], pkg["version"], f.read_text().strip()))
-if found:
-    with out.open("a") as w:
-        w.write("=" * 80 + "\nNOTICE files of the crates above\n")
-        for name, version, text in found:
-            w.write(f"\n{name} {version}:\n\n{text}\n")
-print(f"{len(found)} NOTICE file(s) appended", file=sys.stderr)
+        if not f.is_file():
+            continue
+        upper = f.name.upper()
+        body = f.read_text(errors="replace").strip()
+        if upper.startswith("NOTICE"):
+            notices.append((pkg["name"], pkg["version"], f.name, body))
+        elif upper.startswith(("LICENSE", "LICENCE", "COPYING")):
+            lines = [squash(l) for l in body.splitlines()
+                     if re.search(r"copyright", l, re.I) and re.search(r"\d{4}", l)
+                     and not re.search(r"\[yyyy\]|<year>", l)]
+            if any(l not in present for l in lines):
+                licenses.append((pkg["name"], pkg["version"], f.name, body))
+with out.open("a") as w:
+    for title, found in (("License files of crates whose copyright lines are not above", licenses),
+                         ("NOTICE files of the crates above", notices)):
+        if found:
+            w.write("=" * 80 + f"\n{title}\n")
+            for name, version, fname, body in found:
+                w.write(f"\n{name} {version}, {fname}:\n\n{body}\n")
+print(f"{len(listed)} crates; {len(licenses)} license file(s) and {len(notices)} NOTICE file(s) appended", file=sys.stderr)
 ' "$out"
-echo "$out: $(grep -c '^- .* [0-9][^ ]*\( (.*)\)\?$' "$out") crate entries"
+echo "wrote $out"
