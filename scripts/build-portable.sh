@@ -3,20 +3,24 @@
 # than the build machine's:
 #
 #   scripts/build-portable.sh            glibc 2.28 baseline (AlmaLinux 8):
-#                                        runs on any x86_64 Linux with glibc
-#                                        2.28 or newer (RHEL 8, Debian 10,
-#                                        Ubuntu 20.04 and later)
+#                                        runs on any x86_64 or aarch64 Linux
+#                                        with glibc 2.28 or newer (RHEL 8,
+#                                        Debian 10, Ubuntu 20.04 and later)
 #   scripts/build-portable.sh musl       static musl (Alpine): runs anywhere,
 #                                        but measured 2.3x the CPU per request
 #                                        (docs/benchmarks.md#portable-builds)
+#
+# The binary is for the build machine's architecture (x86_64 or aarch64):
+# the release workflow runs it once on each.
 #
 # Output: target/portable/<kind>/release/wasmkeep. The source is mounted
 # read-only; the toolchain (rust-toolchain.toml's channel) and the cargo
 # cache are kept in target/portable/<kind>/cargo. Needs podman or docker.
 #
-# Base images are pinned by the digest pulled on 2026-11-07 (amd64). To
-# refresh, pull the tag and take `podman image inspect --format
-# '{{.Digest}}'`.
+# Base images are pinned by the digest of their multi-architecture index
+# (resolved 2026-11-09; its amd64 image is the one pinned on 2026-11-07). To
+# refresh, take the tag's index digest, for example with `docker buildx
+# imagetools inspect TAG` or `skopeo inspect --raw docker://TAG | sha256sum`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 kind=${1:-glibc}
@@ -25,10 +29,10 @@ engine=$(command -v podman || command -v docker || true)
 toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
 case $kind in
   glibc)
-    image=docker.io/library/almalinux:8@sha256:1965cb10f9c392766b2d544d3c1b997eb008d0e413c808e6a20086e87c802a80
+    image=docker.io/library/almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
     deps="dnf -q -y install gcc gcc-c++ make perl curl >/dev/null" ;;
   musl)
-    image=docker.io/library/alpine:3.22@sha256:9db2934886712d877c932e07249c75a59e6ca27adfbccc05261987a17bef2d63
+    image=docker.io/library/alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
     deps="apk add -q bash gcc g++ musl-dev make perl curl >/dev/null" ;;
   *) echo "usage: $0 [glibc|musl]" >&2; exit 2 ;;
 esac
