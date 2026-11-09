@@ -10,8 +10,25 @@ adding a bucket gives it continuous off-machine backups.
 
 ## 1. Install the binary
 
-There are no release binaries yet. Build on the server, or on a machine
-with the same OS and CPU architecture:
+There are no release binaries yet. Once there are, each release on GitHub
+carries, for x86_64 and aarch64 Linux (glibc 2.28 or newer: RHEL 8,
+Debian 10, Ubuntu 20.04 and later), a tarball with the binary and its
+third-party notices, a CycloneDX SBOM, `SHA256SUMS`, and a Sigstore bundle
+for each file. CI builds and signs them (`.github/workflows/release.yml`);
+no key is involved, the signature's certificate names the workflow and
+the tag. To check a download (cosign 2.4 or newer), here for `v0.1.0`:
+
+```bash
+f=wasmkeep-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cosign verify-blob --bundle "$f.sigstore.json" \
+  --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.1.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf "$f" && cd "${f%.tar.gz}" && sudo install -m 755 wasmkeep /usr/local/bin/wasmkeep
+```
+
+Until then, build on the server, or on a machine with the same OS and CPU
+architecture:
 
 ```bash
 git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep

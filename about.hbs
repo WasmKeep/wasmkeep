@@ -1,0 +1,23 @@
+Third-party notices for the wasmkeep binary
+
+The wasmkeep binary includes the open-source crates listed below. Each
+license text is followed by the crates distributed under it, with their
+versions. WasmKeep itself is under the Apache License 2.0 (LICENSE, NOTICE).
+
+Licenses used:
+{{#each overview}}
+- {{{name}}} ({{count}} crates)
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

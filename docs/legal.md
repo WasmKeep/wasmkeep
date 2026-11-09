@@ -53,10 +53,13 @@ release. The list is an inventory: it does not contain the notices
 themselves. A binary distribution must also carry each dependency's
 copyright lines, NOTICE contents and license texts (Apache-2.0 and MIT
 require the notices to travel with the binary; CDLA-Permissive-2.0 requires
-its text). Gather them with a tool such as `cargo about generate`, add the
-CDLA-Permissive-2.0 text for the Mozilla CA list in `webpki-roots`, and ship
-that file next to the binary. `scripts/sbom.sh` writes a CycloneDX SBOM of
-the `wasmkeep` binary for one target.
+its text). `scripts/notices.sh` gathers them with `cargo about`
+([about.toml](../about.toml)): every crate in the binary for the release
+targets, grouped by license with each license's full text, the
+CDLA-Permissive-2.0 text included, and the NOTICE files dependencies ship.
+The release workflow puts that file in every tarball, next to the binary.
+`scripts/sbom.sh` writes a CycloneDX SBOM of the `wasmkeep` binary for one
+target.
 
 Development-only tools, never part of WasmKeep: workerd (Apache-2.0, in
 `bench/workerd`), the Go LTX conformance tool, wasm-tools and wit-bindgen
