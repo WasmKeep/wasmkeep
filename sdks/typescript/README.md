@@ -74,7 +74,7 @@ curl localhost:8080/actor/hits/alice
 | `new kv.Client(class, shards)` | key-value over Rust shard actors: `get`, `getFresh`, `put`, `putWith`, `compareAndSet`, `delete`, `deleteIf`, `list`, `withReadCache` |
 | `new queue.Client("class/name")` | a Rust queue actor: `send`, `sendDelayed`, `sendBatch`, `lease`, `ack`, `retry`, `settle`, `stats`, `deadLetters` |
 | `queue.isDelivery(req)`, `queue.handleDelivery(req, handle)` | answer a queue's push delivery, one outcome per message |
-| `http.fetch(url, { method, headers, body, timeoutMs, limit })` | outbound HTTP, synchronously: `{ status, headers, body, text(), json() }`; throws `http.FetchError` when there is no response. Works on both engines (QuickJS has no `fetch`, and StarlingMonkey's is asynchronous) |
+| `http.fetch(url, { method, headers, body, timeoutMs, limit })` | outbound HTTP, synchronously: `{ status, headers, body, text(), json() }`; throws `http.FetchError` when there is no response, or when its body breaks before its end (`incomplete body`; a body longer than `limit`, 16 MiB by default, is cut to it without an error). Works on both engines (QuickJS has no `fetch`, and StarlingMonkey's is asynchronous) |
 | `workflow.define(fn, config)`, `new workflow.Client(class)` | durable workflows: `wf.step`, `wf.sleep`, `wf.waitForEvent` ([guide](../../docs/workflows.md#typescript)) |
 
 SQL errors throw `SqlError` (with `kind`), failed calls throw `CallError`.

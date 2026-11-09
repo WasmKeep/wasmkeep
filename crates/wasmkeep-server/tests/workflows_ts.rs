@@ -44,6 +44,11 @@ fn prebuilt(file: &str) -> Option<Vec<u8>> {
 struct Ledger {
     entries: Vec<(String, String)>,
     failing: Vec<(String, u32)>,
+    /// Like `failing`, but the answer is a 200 whose body is cut short:
+    /// its Content-Length promises more than is sent before the close.
+    cutting: Vec<(String, u32)>,
+    /// Successful answers are chunked and end with a trailer.
+    trailers: bool,
     /// Body lengths received, in order.
     bodies: Vec<usize>,
 }
@@ -111,25 +116,47 @@ async fn ledger_server(ledger: Shared) -> SocketAddr {
                 let target = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
                 let query = target.split_once('?').map_or("", |(_, q)| q).to_owned();
                 let (what, key) = (param(&query, "what"), param(&query, "key"));
-                let (status, body) = {
-                    let mut l = ledger.lock().unwrap();
-                    let failing = l
-                        .failing
-                        .iter_mut()
-                        .find(|(prefix, times)| *times > 0 && what.starts_with(prefix.as_str()));
-                    if let Some((_, times)) = failing {
-                        *times -= 1;
-                        (503, format!("{what} failed on purpose"))
-                    } else {
-                        l.entries.push((what.clone(), key.clone()));
-                        let n = l.entries.iter().filter(|(_, k)| *k == key).count();
-                        (200, format!("{what}#{n}"))
-                    }
+                let (status, body, promised) =
+                    {
+                        let mut l = ledger.lock().unwrap();
+                        let cutting = l.cutting.iter_mut().find(|(prefix, times)| {
+                            *times > 0 && what.starts_with(prefix.as_str())
+                        });
+                        let cut = if let Some((_, times)) = cutting {
+                            *times -= 1;
+                            100
+                        } else {
+                            0
+                        };
+                        let failing = l.failing.iter_mut().find(|(prefix, times)| {
+                            *times > 0 && what.starts_with(prefix.as_str())
+                        });
+                        if let Some((_, times)) = failing {
+                            *times -= 1;
+                            let body = format!("{what} failed on purpose");
+                            (503, body.clone(), body.len())
+                        } else if cut > 0 {
+                            let body = format!("{what}#cut");
+                            (200, body.clone(), body.len() + cut)
+                        } else {
+                            l.entries.push((what.clone(), key.clone()));
+                            let n = l.entries.iter().filter(|(_, k)| *k == key).count();
+                            let body = format!("{what}#{n}");
+                            (200, body.clone(), body.len())
+                        }
+                    };
+                let chunked =
+                    status == 200 && promised == body.len() && ledger.lock().unwrap().trailers;
+                let response = if chunked {
+                    format!(
+                        "HTTP/1.1 200 X\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\nx-ledger: done\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: {promised}\r\nConnection: close\r\n\r\n{body}"
+                    )
                 };
-                let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
                 let _ = socket.write_all(response.as_bytes()).await;
             });
         }
@@ -231,8 +258,10 @@ async fn scenario(file: &str) {
     let (addr, _stop) = start(data.path(), &orders, ledger_addr, local()).await;
 
     // Approved, with two charge failures retried. The input is over 4 KiB,
-    // and the reservation sends it as its body: written in chunks.
+    // and the reservation sends it as its body: written in chunks. The
+    // ledger's answers end with trailers, which `http.fetch` reads past.
     ledger.lock().unwrap().failing.push(("charge".into(), 2));
+    ledger.lock().unwrap().trailers = true;
     let input = format!(
         "item=book;cooloff_ms=300;approve_within_ms=10000;note={}",
         "n".repeat(6_000)
@@ -274,7 +303,10 @@ async fn scenario(file: &str) {
         "{entries:?}"
     );
 
-    // Never approved: released, failed, and no more events taken.
+    // Never approved: released, failed, and no more events taken. The
+    // ledger's answers are plain Content-Length 200s from here, so the
+    // reservation's text checked below came through a whole sized body.
+    ledger.lock().unwrap().trailers = false;
     request(
         addr,
         "POST",
@@ -311,6 +343,50 @@ async fn refused_while_sending(file: &str) {
     assert!(failed.contains("destination-IP-prohibited"), "{failed}");
     assert!(!failed.contains("sending the body"), "{failed}");
     assert!(ledger.lock().unwrap().entries.is_empty());
+}
+
+/// A step whose answer is a 200 with its body cut short (the ledger closes
+/// before the promised length) fails, naming the incomplete body: before,
+/// `http.fetch` returned the status and the bytes that came, and the step
+/// was recorded as a success.
+async fn cut_short_body_fails_the_step(file: &str) {
+    let Some(orders) = prebuilt(file) else {
+        return;
+    };
+    let ledger = Shared::default();
+    ledger
+        .lock()
+        .unwrap()
+        .cutting
+        .push(("reserve".into(), u32::MAX));
+    let ledger_addr = ledger_server(Arc::clone(&ledger)).await;
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(data.path(), &orders, ledger_addr, local()).await;
+    let (status, body) = request(addr, "POST", &format!("{APP}/orders/cut"), "item=book").await;
+    assert_eq!(status, 200, "{body}");
+    let failed = until(addr, "cut", "state: failed").await;
+    eprintln!("{failed}");
+    assert!(failed.contains("incomplete body"), "{failed}");
+    assert!(!failed.contains("waiting_for"), "{failed}");
+    let l = ledger.lock().unwrap();
+    // The cut reservation was retried (the step had attempts left), and
+    // no later step ran: none was taken as a success.
+    assert!(
+        l.bodies.len() > 1,
+        "reserve sent {} time(s)",
+        l.bodies.len()
+    );
+    assert!(l.entries.is_empty(), "{:?}", l.entries);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quickjs_cut_short_body() {
+    cut_short_body_fails_the_step("orders.wasm").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starlingmonkey_cut_short_body() {
+    cut_short_body_fails_the_step("orders-starlingmonkey.wasm").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

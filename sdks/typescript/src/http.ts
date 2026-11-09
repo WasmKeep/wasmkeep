@@ -12,9 +12,11 @@
 import { handle } from "wasi:http/outgoing-handler@0.2.12";
 import {
   Fields,
+  IncomingBody,
   OutgoingBody,
   OutgoingRequest,
   RequestOptions,
+  httpErrorCode,
   type Method,
 } from "wasi:http/types@0.2.12";
 import { FetchError, splitUrl } from "./url";
@@ -30,8 +32,8 @@ export interface FetchOptions {
   /** Bounds connecting, the first byte of the response and each gap
    * between bytes; 10 s unless given. */
   timeoutMs?: number;
-  /** Bytes of the response body kept (the rest is dropped); 16 MiB unless
-   * given. */
+  /** Bytes of the response body kept (the rest is dropped unread, and the
+   * response is still returned); 16 MiB unless given. */
   limit?: number;
 }
 
@@ -68,6 +70,34 @@ function describe(e: unknown): string {
   return String(e);
 }
 
+/** The tag of a `stream-error` thrown by a stream read (`closed` or
+ * `last-operation-failed`), however the engine wraps it. */
+function streamErrorTag(e: unknown): string | undefined {
+  const payload = typeof e === "object" && e !== null && "payload" in e ? (e as { payload: unknown }).payload : e;
+  if (typeof payload === "object" && payload !== null && "tag" in payload) {
+    return (payload as { tag: string }).tag;
+  }
+  return undefined;
+}
+
+/** A broken stream's cause: the HTTP error code when the host gives one,
+ * else its debug text. */
+function describeStreamError(e: unknown): string {
+  const payload = typeof e === "object" && e !== null && "payload" in e ? (e as { payload: unknown }).payload : e;
+  const val = typeof payload === "object" && payload !== null ? (payload as { val?: unknown }).val : undefined;
+  if (typeof val === "object" && val !== null && "toDebugString" in val) {
+    const error = val as Parameters<typeof httpErrorCode>[0];
+    try {
+      const code = httpErrorCode(error);
+      if (code !== undefined && code !== null) return describe(code);
+    } catch {
+      // No code: the debug text below.
+    }
+    return error.toDebugString();
+  }
+  return describe(e);
+}
+
 /** Drops a WIT resource handle now (wasi:http refuses to finish a body
  * whose stream is still open). */
 function dispose(handle: unknown): void {
@@ -78,8 +108,11 @@ function dispose(handle: unknown): void {
 
 /** Sends a request and waits for its response. Throws [`FetchError`] when
  * there is none (the status of a response, 404 or 500 included, is not an
- * error). A body cut short (a reset, a timeout between bytes) is returned
- * as far as it came, with the status. */
+ * error), and when its body breaks before its end (a reset, a close short
+ * of the Content-Length or inside a chunk, a timeout between bytes): the
+ * message says `incomplete body`, and the bytes that came are not returned
+ * as a whole answer. A body longer than `limit` is not an error: its first
+ * `limit` bytes are returned, the rest dropped unread. */
 export function fetch(url: string, options: FetchOptions = {}): Fetched {
   const { scheme, authority, path } = splitUrl(url);
   const encoder = new TextEncoder();
@@ -174,12 +207,36 @@ export function fetch(url: string, options: FetchOptions = {}): Fetched {
     let chunk: Uint8Array;
     try {
       chunk = stream.blockingRead(BigInt(Math.min(65_536, limit - total)));
-    } catch {
-      break; // closed: the body has ended
+    } catch (e) {
+      // `closed` is the body's own end; `last-operation-failed` is a
+      // broken one (a reset, a close short of the Content-Length or inside
+      // a chunk, a timeout between bytes).
+      if (streamErrorTag(e) === "closed") break;
+      dispose(stream);
+      throw new FetchError(`${url}: incomplete body: ${describeStreamError(e)}`);
     }
     chunks.push(chunk);
     total += chunk.length;
   }
+  dispose(stream);
+  if (total < limit) {
+    // Closed before the limit: the end, unless the trailers carry an error.
+    const trailers = IncomingBody.finish(incoming);
+    let ended = trailers.get();
+    while (ended === undefined || ended === null) {
+      // The pollable is the future's child: dropped before the future is.
+      const ready = trailers.subscribe();
+      ready.block();
+      dispose(ready);
+      ended = trailers.get();
+    }
+    // Trailers, when there are some, are the future's child too.
+    if (ended.tag === "ok" && ended.val.tag === "ok" && ended.val.val) dispose(ended.val.val);
+    dispose(trailers);
+    if (ended.tag === "err") throw new FetchError(`${url}: incomplete body: its trailers were already taken`);
+    if (ended.val.tag === "err") throw new FetchError(`${url}: incomplete body: ${describe(ended.val.val)}`);
+  }
+  // At the limit, the rest is dropped unread (and not checked).
   const bytes = new Uint8Array(total);
   let at = 0;
   for (const c of chunks) {

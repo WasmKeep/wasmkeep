@@ -60,15 +60,20 @@ pub fn method_name(method: &Method) -> String {
 pub struct Fetched {
     /// The HTTP status.
     pub status: u16,
-    /// The body, up to the limit passed to [`fetch`].
+    /// The whole body, or its first `limit` bytes when it is longer (see
+    /// [`fetch`]).
     pub body: Vec<u8>,
 }
 
 /// Sends an outbound HTTP request and waits for the response: `url` is
 /// `http://` or `https://`, `timeout` bounds connecting, the first byte of the
 /// response, and each gap between bytes. The body is read up to `limit`
-/// bytes (the rest is dropped). Errors are described as text (DNS, refused,
-/// timeout, ...), ready to log or record.
+/// bytes (the rest is dropped unread, and the response still succeeds).
+/// Errors are described as text (DNS, refused, timeout, ...), ready to log
+/// or record. A body that breaks before its end, and before the limit (the
+/// connection closes short of its Content-Length or inside a chunk, a
+/// reset, a timeout between bytes), is an error starting
+/// `<url>: incomplete body:`, not the status with the bytes that came.
 ///
 /// The actor's event waits meanwhile (other events to it queue); waiting
 /// does not count against its CPU budget, but does against the event's
@@ -181,11 +186,61 @@ pub fn fetch(
         .map_err(|()| "response already taken".to_owned())?
         .map_err(|e| format!("{e:?}"))?;
     let status = response.status();
-    let mut body = Vec::new();
-    if let Ok(incoming) = response.consume()
-        && let Ok(mut stream) = incoming.stream()
-    {
-        let _ = (&mut stream).take(limit as u64).read_to_end(&mut body);
-    }
+    let incoming = response
+        .consume()
+        .map_err(|()| format!("{url}: response body already taken"))?;
+    let body = read_response_body(incoming, limit).map_err(|e| format!("{url}: {e}"))?;
     Ok(Fetched { status, body })
+}
+
+/// Reads a response body up to `limit` bytes. Past the limit nothing more is
+/// read (nor checked). Before it, the body must end normally: a stream that
+/// breaks (`last-operation-failed`: a reset, a close short of the
+/// Content-Length or inside a chunk, a timeout between bytes), or an error
+/// reported with the trailers after a normal close, fails with
+/// `incomplete body: ...` rather than passing the bytes that came for the
+/// whole answer.
+fn read_response_body(
+    incoming: wasip2::http::types::IncomingBody,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    use wasip2::http::types::{IncomingBody, http_error_code};
+    use wasip2::io::streams::StreamError;
+
+    let stream = incoming
+        .stream()
+        .map_err(|()| "incomplete body: its stream was already taken".to_owned())?;
+    let mut body = Vec::new();
+    while body.len() < limit {
+        let want = (limit - body.len()).min(65_536) as u64;
+        match stream.blocking_read(want) {
+            Ok(chunk) => body.extend_from_slice(&chunk),
+            Err(StreamError::Closed) => break,
+            Err(StreamError::LastOperationFailed(e)) => {
+                let why =
+                    http_error_code(&e).map_or_else(|| e.to_debug_string(), |c| format!("{c:?}"));
+                return Err(format!("incomplete body: {why}"));
+            }
+        }
+    }
+    if body.len() >= limit {
+        // The rest is dropped unread.
+        return Ok(body);
+    }
+    // Closed: the body's own end, unless the trailers say otherwise.
+    drop(stream);
+    let trailers = IncomingBody::finish(incoming);
+    // Declared after `trailers`, so dropped before it: trailers received are
+    // the future's child.
+    let result = loop {
+        if let Some(result) = trailers.get() {
+            break result;
+        }
+        trailers.subscribe().block();
+    };
+    match result {
+        Ok(Ok(_)) => Ok(body),
+        Ok(Err(code)) => Err(format!("incomplete body: {code:?}")),
+        Err(()) => Err("incomplete body: its trailers were already taken".to_owned()),
+    }
 }
