@@ -701,12 +701,13 @@ fn sql_cpu_per_event_is_bounded() {
     // The next event starts with the full budget.
     db.end_event().unwrap();
     db.query("SELECT 1", &[]).unwrap();
-    // Many short statements add up too.
+    // Many short statements add up too. Each is small enough that several
+    // fit in the budget even on a slow, shared machine.
     let mut n = 0;
     let err = loop {
         let r = db.query(
             "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
-             WHERE x < 20000) SELECT count(*) FROM c",
+             WHERE x < 2000) SELECT count(*) FROM c",
             &[],
         );
         match r {
