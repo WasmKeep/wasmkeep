@@ -324,7 +324,13 @@ export default workflow.define(
   `cancel`; errors are `workflow.WorkflowError` (`kind`: `unknown`,
   `finished`, `call`, `refused`).
 - Steps that call other services use `http.fetch`, the SDK's synchronous
-  outbound HTTP, on either engine.
+  outbound HTTP, on either engine. A response whose body breaks before
+  its end (the connection closes short of its `Content-Length` or inside a
+  chunk, a reset, a timeout between bytes) throws a `FetchError` naming the
+  incomplete body, so a step that checks only the status fails (retried
+  while it has attempts left) rather than recording a cut answer. A body
+  longer than `limit` is not an error: its first `limit` bytes are kept.
+  The Rust SDK's `http::fetch` does the same, returning an error.
 
 [`examples/ts-workflows`](../examples/ts-workflows) is the order of
 `examples/workflows` in TypeScript, started and followed by the Rust app.
