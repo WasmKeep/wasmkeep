@@ -100,7 +100,8 @@ Done:
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md)): ownership records,
   the upgrade path, `wasmkeep cluster fence` and `cluster forget`, then a
   twelve-hour soak against a real bucket: nothing lost or duplicated, but
-  one restore took 90 s and durable writes are slower in the tail than
+  one actor was writable again only 90 s after the kill (most of it a 56 s
+  restore) and durable writes are slower in the tail than
   with per-actor leases
   ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
   The fixes since (bounded segment uploads and restore reads) need a soak

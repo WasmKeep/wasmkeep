@@ -9,6 +9,14 @@
   protocol mechanically before any code. It lands before the first
   public release, since changing leases requires stopping every node at
   once (section 6).
+- Date: 2026-11-07
+- Milestone: [M3](../../ROADMAP.md#-m3-first-public-release)
+- Amends: [ADR 0007](0007-replication-protocol.md),
+  [0009](0009-alarms-in-a-cluster.md),
+  [0012](0012-bucket-garbage-collection.md),
+  [0014](0014-draining-a-node-and-moving-an-actor.md) and
+  [0017](0017-moving-one-actor.md): ownership is a node lease plus an
+  ownership record per actor.
 
 ## Context
 
@@ -469,23 +477,23 @@ Recorded runs:
    node-lease code, and the S3 tests against Cloudflare R2 and OVHcloud
    Object Storage. AWS S3 has not been run.
 4. The 12-hour soak on the same three VPS, bucket and cadence as the
-   per-actor run (commit `82dab61`, the harness commit the result file
-   names carry, before the bounded segment uploads; see
+   per-actor run (build `82dab61`, the label the result file names carry
+   for the build measured, before the bounded segment uploads; see
    [benchmarks](../benchmarks.md#three-nodes-against-a-real-bucket)):
    nothing lost or duplicated over 3,659,687 writes and 35 kills; every
    alarm fired. Renewals are gone from the request counts (PUTs other
    than segments 0.80 per node and second, against 3.1 to 7.4). Failover
    is not quite "no slower": writable again 18.2 s at the median against
-   17.0 s, 24.4 s at p99; the worst, 89.6 s, was one slow restore (55
-   reads in turn, none cut), a restore cost both designs share (the
+   17.0 s, 24.4 s at p99; the worst, 89.6 s, was mostly one slow
+   restore (56 s, 55 reads in turn, none cut), a restore cost both designs share (the
    per-actor run's worst was one too), not the lease. Durable writes ran
    slower during that run; the runs do not tell the bucket's speed from
    the design. Alternating 30-minute blocks run the same night
    ([benchmarks](../benchmarks.md#three-nodes-against-a-real-bucket)) do:
    node leases made 27 % fewer writes than per-actor leases (the tail:
    durable p99 about 1.7 times), with actors writable again 1 to 2 s later
-   at the median. A cost of the design as built at `82dab61`, not of the
-   bucket's speed; where in the durable write it lies is open.
+   at the median. A cost of the design in the measured build `82dab61`,
+   not of the bucket's speed; where in the durable write it lies is open.
 5. Several adversarial review rounds of this record, then a review of
    each code change.
 

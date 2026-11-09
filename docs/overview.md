@@ -30,7 +30,7 @@ Each actor:
    clocks, randomness, and its configuration and secrets (the `env`
    interface). What it prints to stdout or stderr reaches the node's log.
    Each event gets a CPU budget (50 ms by default) and each actor a memory
-   cap (128 MB by default).
+   cap (128 MiB per linear memory, at most two, by default).
 
 Different actors run in parallel, so a server's throughput comes from having
 many actors, not from making one actor busy.

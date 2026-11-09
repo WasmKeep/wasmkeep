@@ -681,8 +681,9 @@ and [`2026-11-07-59f01e8.csv`](../bench/results/2026-11-07-59f01e8.csv).
 
 - **No change worth a dependency.** CPU per request moved 1 to 3%, and
   throughput 1 to 2%: within what one run of this suite varies on its
-  own. Memory per resident actor did not move; the server's total
-  resident memory grew 4 to 7%.
+  own. Memory per resident actor moved under 2%, except TypeScript's,
+  which fell 4%; the server's total resident memory grew 4 to 7% for
+  Rust, Zig, C and TypeScript, and fell 2% for Python.
 - **Latency moves both ways between two runs of the same code.** The
   Rust counter's median write was 77.5 µs in the first run and 67.4 µs
   in the second, its median read 59.5 µs and 67.8 µs: a single run's

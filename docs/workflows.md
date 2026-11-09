@@ -29,7 +29,8 @@ fn order(wf: &mut Run, input: &[u8]) -> Result<Vec<u8>, Stop> {
 ```
 
 - **`step(name, f)`** calls `f` and, once it returns `Ok`, records its result
-  (`String`, `Vec<u8>`, integers, `bool` or `()`); every later run gets
+  (`String`, `Vec<u8>`, `u64`, `i64`, `bool` or `()`: convert other types
+  to one of these, or implement `Stored`); every later run gets
   the recorded result without calling `f`. Until then `f` may run again:
   an error from `f` is retried with backoff (1 s doubling, 5 attempts by
   default), and an attempt cut before its result is recorded runs again

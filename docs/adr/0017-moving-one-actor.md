@@ -5,7 +5,7 @@
   the move, and sent a take call to nodes that
   would have run it as a guest request. A move is now a drain of one
   actor, plus a take call sent only to nodes that advertise it.
-- Amended by ADR 0020 (2026-11-07): ownership is a node lease plus an
+- Amended by [ADR 0020](0020-one-lease-per-node.md) (2026-11-07): ownership is a node lease plus an
   ownership record per actor; where this record says lease, read the
   actor's hold (`LeaseView`: the hold exists and the node lease is valid).
   `sim/tests/madsim_drain.rs` models the node leases of

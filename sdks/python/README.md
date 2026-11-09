@@ -56,7 +56,7 @@ curl localhost:8080/actor/hits/alice
 | `storage.query(sql, *params)` | Rows as dicts, by column name |
 | `storage.delete_self()` | Deletes this actor when the event ends |
 | `alarms.set(at_ms)`, `alarms.get()`, `alarms.clear()` | The actor's single alarm, in ms since the Unix epoch |
-| `env.get(name, default=None)` | The class's configuration value (`--env CLASS=FILE`) |
+| `env.get(name, default=None)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](../../docs/reference/api.md#interface-env)), or `default` |
 | `actors.self_address()` | This actor's `ActorAddress` (`tenant`, `class_name`, `name`) |
 | `actors.call("class/name", method=, path=, headers=, body=)` | Calls another actor; returns a `CallResponse` (`status`, `headers`, `body`, `text()`, `json()`) |
 | `sockets.send(conn, data)`, `broadcast(data, except_conn=)`, `close(conn, code, reason)`, `connections()` | The actor's WebSockets (str is text, bytes binary) |

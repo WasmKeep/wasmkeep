@@ -162,8 +162,8 @@ start without one (or without `--cluster-plaintext accept`). Alone, it
 carries nothing; when a second server joins, move it to an address the
 other nodes reach.
 
-and the credentials to the unit (better: an `EnvironmentFile=` readable
-only by root):
+Then give the unit the bucket credentials (better: from an
+`EnvironmentFile=` readable only by root):
 
 ```ini
 Environment=AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=auto

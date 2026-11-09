@@ -19,11 +19,11 @@
  * import { defineActor, queue } from "@wasmkeep/sdk";
  *
  * const jobs = new queue.Client("queue/jobs");
- * jobs.send("resize 42");
  *
  * export default defineActor({
  *   fetch(req) {
  *     if (queue.isDelivery(req)) return queue.handleDelivery(req, (_queue, m) => "ack");
+ *     jobs.send("resize 42"); // calls run in an event, never at module level
  *     return "ok\n";
  *   },
  * });

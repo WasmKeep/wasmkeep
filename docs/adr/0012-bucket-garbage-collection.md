@@ -3,6 +3,9 @@
 - Status: accepted and implemented (2026-11-05: all five steps of the plan below;
   the open questions are decided below). Revised after an
   adversarial review of the design and one of each code step.
+- Amended by [ADR 0020](0020-one-lease-per-node.md) (2026-11-07): node
+  leases, ownership records and the `leases/` markers are lease state,
+  never collected (see "Not collected here").
 - Date: 2026-11-05
 - Milestone: [M3](../../ROADMAP.md#-m3-first-public-release)
 
