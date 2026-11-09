@@ -201,9 +201,10 @@ yet.
 - **On node leases** (one lease per node, which replaced one per actor:
   [ADR 0020](docs/adr/0020-one-lease-per-node.md)): a twelve-hour soak
   with nothing lost or duplicated over 35 kills, writable again in 18.2 s
-  at the median, 24.4 s at p99. Not passed yet: one actor's restore took
-  90 s, and durable writes are slower in the tail than with per-actor
-  leases (p99 about 1.7 times, measured side by side). Those runs predate
+  at the median, 24.4 s at p99. Not passed yet: one actor was writable
+  again only 90 s after the kill (most of it a 56 s restore), and
+  durable writes are slower in the tail than with per-actor leases (p99
+  about 1.7 times, measured side by side). Those runs predate
   the fixes since (bounded segment uploads and restore reads), which
   still need a soak of their own
   ([benchmarks](docs/benchmarks.md#three-nodes-against-a-real-bucket)).

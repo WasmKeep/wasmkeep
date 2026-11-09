@@ -28,11 +28,17 @@ if [ "$mode" = --full ]; then
   # The examples and languages step (scripts/languages.sh); skip it with
   # CHECK_SKIP_LANGS=1 on a machine without them.
   if [ "${CHECK_SKIP_LANGS:-}" != 1 ]; then
-    for tool in wasm-tools wit-bindgen clang node npm go tinygo wit-bindgen-go zig componentize-py; do
+    for tool in wasm-tools wit-bindgen clang node npm go tinygo wit-bindgen-go componentize-py; do
       if ! command -v "$tool" >/dev/null 2>&1; then
         need "$tool for the examples in every language (see .github/workflows/ci.yml, job languages, for versions), or set CHECK_SKIP_LANGS=1."
       fi
     done
+    # Zig as the examples' build.sh run it: $ZIG (default zig), or the
+    # ziglang Python package (ZIG="python3 -m ziglang").
+    # shellcheck disable=SC2086 # ZIG may hold a command and its arguments
+    if ! ${ZIG:-zig} version >/dev/null 2>&1 && ! python3 -m ziglang version >/dev/null 2>&1; then
+      need 'zig for the examples in every language (zig on PATH, or pip install ziglang and ZIG="python3 -m ziglang"), or set CHECK_SKIP_LANGS=1.'
+    fi
   fi
 fi
 exit "$missing"

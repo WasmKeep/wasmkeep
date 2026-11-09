@@ -7,7 +7,7 @@
   five places a node claims, the hand-over racing its own release, alarms
   and sockets during a hand-over, and the cost of the control listing.
   The first draft's "warm-up" became an alarm hand-off.
-- Amended by ADR 0020 (2026-11-07): ownership is a node lease plus an
+- Amended by [ADR 0020](0020-one-lease-per-node.md) (2026-11-07): ownership is a node lease plus an
   ownership record per actor; where this record says lease, read the
   actor's hold (`LeaseView`: the hold exists and the node lease is valid).
 - Amended 2026-11-07, from the drain simulation on node leases: a peer

@@ -66,7 +66,7 @@ curl localhost:8080/actor/hits/alice
 | `storage.query(sql, ...params)` | rows as objects; integers beyond 2^53 come back as `bigint` |
 | `storage.deleteSelf()` | delete this actor when the event ends |
 | `alarms.set(at)`, `alarms.get()`, `alarms.clear()` | the actor's alarm (ms since epoch or a `Date`) |
-| `env.get(name)` | the class's configuration value (`--env CLASS=FILE`), or `undefined` |
+| `env.get(name)` | the class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](../../docs/reference/api.md#interface-env)), or `undefined` |
 | `actors.self()` | this actor's address: `{ tenant, class, name }` |
 | `actors.call("class/name", { method, path, headers, body })` | call another actor, wherever it runs |
 | `sockets.send(conn, data)`, `sockets.broadcast(data, except?)`, `sockets.close(conn)`, `sockets.connections()` | WebSockets held by the host, open across hibernation |

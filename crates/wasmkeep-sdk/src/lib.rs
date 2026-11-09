@@ -79,7 +79,9 @@ pub fn now_ms() -> u64 {
     now.seconds * 1000 + u64::from(now.nanoseconds / 1_000_000)
 }
 
-/// Lifecycle hooks. Both have no-op defaults.
+/// Lifecycle hooks, all optional: `on_init` and `on_alarm` default to
+/// `Ok(())`, `on_websocket_open` to refusing the connection, and the other
+/// WebSocket hooks to ignoring the event.
 pub trait Actor {
     /// Runs before the first event this instance handles with this component
     /// version: create or migrate tables here.

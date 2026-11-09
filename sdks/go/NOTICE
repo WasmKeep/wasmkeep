@@ -1,0 +1,16 @@
+WasmKeep
+Copyright 2026 Julien Turbide
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on third-party software under their own licenses, all permissive
+(MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0, CDLA-Permissive-2.0 and
+similar); SQLite, bundled through rusqlite, is in the public domain.
+scripts/licenses.sh lists every dependency with its license. Binary
+distributions must also carry each dependency's copyright and license
+notices; see docs/legal.md.
+
+The WASI interface files in crates/wasmkeep-wit/wit/deps/ (copied to
+sdks/typescript/wit/deps/) are Copyright the Contributors to the WASI
+Specification, published by the WebAssembly Community Group under the
+W3C Community Contributor License Agreement.

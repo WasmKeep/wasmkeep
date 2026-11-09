@@ -37,7 +37,10 @@ this follows:
 
 ```bash
 wit-bindgen c crates/wasmkeep-wit/wit --world actor --out-dir gen
-clang --target=wasm32-wasi --sysroot=/usr -O2 -mexec-model=reactor -Igen -Isdks/c \
+# wasi-libc: /usr on Debian, /usr/share/wasi-sysroot on Arch,
+# $WASI_SDK/share/wasi-sysroot with wasi-sdk (also set CC=$WASI_SDK/bin/clang)
+SYSROOT=${SYSROOT:-$([ -d /usr/share/wasi-sysroot ] && echo /usr/share/wasi-sysroot || echo /usr)}
+${CC:-clang} --target=wasm32-wasi --sysroot="$SYSROOT" -O2 -mexec-model=reactor -Igen -Isdks/c \
   app.c sdks/c/wasmkeep.c sdks/c/wasmkeep_kv.c sdks/c/wasmkeep_wire.c sdks/c/wasmkeep_workflow.c \
   gen/actor.c gen/actor_component_type.o -o core.wasm
 scripts/componentize-core.sh core.wasm actor.wasm
@@ -61,7 +64,7 @@ wasmkeep serve --actor hits=actor.wasm
 | `wk_reply(status, fmt, ...)`, `wk_reply_copy`, `wk_reply_static` | Responses |
 | `wk_response_header(&r, name, value)` | Adds a header to a response (copied) |
 | `wk_fail(msg)` | Fails the current `init` or `alarm` event (an alarm is retried) |
-| `wk_env(name)` | The class's configuration value (`--env CLASS=FILE`), or `NULL`; kept for the instance's life |
+| `wk_env(name)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](../../docs/reference/api.md#interface-env)), or `NULL`; kept for the instance's life |
 | `wk_self_address()` | This actor's `wk_address` (`tenant`, `class_name`, `name`; NUL-terminated, kept for the instance's life) |
 | `wk_delete_self()`, `wk_now_ms()` | |
 

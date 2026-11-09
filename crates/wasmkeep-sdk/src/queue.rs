@@ -42,8 +42,10 @@
 //!
 //! Limits: a queue is one actor, so it handles one send, lease or delivery
 //! at a time, and each send waits for a durable write (a bucket round trip
-//! in a cluster): roughly 4 to 10 sends per second per queue, estimated
-//! from the bucket latency targets, not measured.
+//! in a cluster): roughly 18 sends a second with nodes next to their
+//! bucket, under 2 from a desktop to R2. Those figures are the durable
+//! write latencies measured on the actor soak, not on queues alone; see
+//! the [limits](https://github.com/wasmkeep/wasmkeep/blob/main/docs/kv-and-queues.md#limits).
 //! [`Client::send_batch`] shares one write; several queues (by key hash)
 //! multiply it. A push delivery holds the queue's event while the consumer
 //! runs. Ordering is by visibility time then id, so FIFO only with one

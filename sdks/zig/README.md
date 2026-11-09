@@ -51,7 +51,7 @@ of 0.57 MB, measured with huge pages on).
 | `wk.send`, `wk.sendBinary`, `wk.broadcast`, `wk.close`, `wk.connectionCount`, `wk.connections` | WebSockets |
 | `req.method`, `req.path`, `req.body()`, `req.header("name")` | The request |
 | `wk.reply(status, fmt, args)`, `wk.replyBytes(status, content_type, body)` | Responses |
-| `wk.env(name)` | The class's configuration value (`--env CLASS=FILE`), or `null` |
+| `wk.env(name)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](../../docs/reference/api.md#interface-env)), or `null` |
 | `wk.selfAddress()` | This actor's `Address` (`tenant`, `class`, `name`) |
 | `wk.setHeader(&response, name, value)` | Adds a header to a response |
 | `wk.deleteSelf()`, `wk.nowMs()` | |

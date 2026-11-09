@@ -6,8 +6,9 @@ inherit when they build actors. The dependency list is kept current by
 
 ## WasmKeep itself
 
-- **License**: Apache-2.0 for all code in this repository ([LICENSE](../LICENSE)),
-  with its explicit patent grant from every contributor. See [NOTICE](../NOTICE).
+- **License**: Apache-2.0 for all code written for this repository
+  ([LICENSE](../LICENSE)), with its explicit patent grant from every
+  contributor. See [NOTICE](../NOTICE).
 - **Name**: the WasmKeep name (and any logo, once there is one) is reserved
   ([TRADEMARK.md](../TRADEMARK.md)).
 - **Contributions**: under the Contributor License Agreement
@@ -18,7 +19,10 @@ inherit when they build actors. The dependency list is kept current by
   Claude Code, with Codex and Kimi for parts and reviews) under his
   direction and review. The implementation is original; what comes from
   other projects is used as published, under its own licence: the WASI
-  interfaces vendored in `crates/wasmkeep-wit/wit/deps/`, bindings
+  interfaces vendored in `crates/wasmkeep-wit/wit/deps/` (and copied to
+  `sdks/typescript/wit/deps/`), published by the WebAssembly Community
+  Group under the [W3C Community Contributor License
+  Agreement](https://www.w3.org/community/about/agreements/cla/), bindings
   generated from WIT files, and the dependencies listed by
   `scripts/licenses.sh` (see the
   README's [Authors](../README.md#authors) and
@@ -45,10 +49,14 @@ outside that set. `cargo deny check` ([deny.toml](../deny.toml)) checks the
 same set, refuses crates from other registries or git, and fails on known
 vulnerabilities (RustSec); its one accepted advisory is `bincode` being
 unmaintained, reached only by the simulation tool. Run both before a
-release, and ship the license list with any binary (Apache-2.0 and MIT
+release. The list is an inventory: it does not contain the notices
+themselves. A binary distribution must also carry each dependency's
+copyright lines, NOTICE contents and license texts (Apache-2.0 and MIT
 require the notices to travel with the binary; CDLA-Permissive-2.0 requires
-its text). `scripts/sbom.sh` writes a CycloneDX SBOM of the `wasmkeep`
-binary for one target.
+its text). Gather them with a tool such as `cargo about generate`, add the
+CDLA-Permissive-2.0 text for the Mozilla CA list in `webpki-roots`, and ship
+that file next to the binary. `scripts/sbom.sh` writes a CycloneDX SBOM of
+the `wasmkeep` binary for one target.
 
 Development-only tools, never part of WasmKeep: workerd (Apache-2.0, in
 `bench/workerd`), the Go LTX conformance tool, wasm-tools and wit-bindgen

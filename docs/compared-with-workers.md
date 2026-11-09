@@ -17,7 +17,8 @@ Workers strong is the platform, not the runtime.
   ([ADR 0020](adr/0020-one-lease-per-node.md)), over twelve hours and 35
   kills under load next to the bucket: writable again 18.2 s after the
   kill at the median, 24.4 s at p99, with nothing acknowledged lost; one
-  restore took 90 s, which nothing bounds yet
+  actor was writable again only 90 s after the kill, most of it a restore
+  whose total time nothing bounds yet
   ([measured](benchmarks.md#three-nodes-against-a-real-bucket)). workerd
   runs Durable Objects on one machine, without replication or failover
   between machines; that is the hosted platform's.

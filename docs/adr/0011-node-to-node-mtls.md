@@ -115,9 +115,9 @@ providers compiled in).
    which favours pins over a CA key at rest.
 3. Operator-supplied PKI (`--cluster-cert`, `--cluster-key`,
    `--cluster-ca`)? Deferred; it would be a second trust root.
-4. Should refuse mode stop publishing the plain address? Not yet; decided
-   with phase C. (Still open: step 11 left the heartbeat unchanged, so
-   the plain address is still published.)
+4. Should refuse mode stop publishing the plain address? Still open.
+   Phase C (step 11) left the heartbeat unchanged, so the plain address
+   is still published, and peers cannot see a node's mode (step 8).
 
 ## Plan
 
@@ -190,8 +190,8 @@ change who is trusted get an adversarial review.
    sets. Refused signatures are logged once a minute per reason. A TLS
    peer is still never reached in plaintext. The node logs at start that
    it refuses plain HTTP; the heartbeat is unchanged, so peers cannot see
-   the mode (phase C decides whether to stop publishing the plain
-   address). Refusing nodes still serve outside clients on the public
+   the mode (whether to stop publishing the plain address is open
+   question 4). Refusing nodes still serve outside clients on the public
    port, including requests a plain node forwards there.)
 9. Revocation tests. (Done: `crates/wasmkeep-server/tests/revocation.rs`,
    two real nodes over the shared bucket, everything between them over
