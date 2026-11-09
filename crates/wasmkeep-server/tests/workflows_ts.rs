@@ -144,8 +144,12 @@ async fn start(
     ledger: SocketAddr,
     egress: EgressPolicy,
 ) -> (SocketAddr, oneshot::Sender<()>) {
+    // A generous CPU budget: these tests are about workflow steps and the
+    // egress refusal, and a loaded machine must not cut a step that sends a
+    // 64 KiB body (the budget has tests of its own).
     let runtime = Runtime::new(&RuntimeConfig {
         max_instances: 32,
+        cpu_budget: Duration::from_millis(500),
         ..RuntimeConfig::default()
     })
     .unwrap();

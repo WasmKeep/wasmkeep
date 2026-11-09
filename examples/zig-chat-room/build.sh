@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds chat_room.wasm: C bindings with wit-bindgen, the Zig SDK (sdks/zig,
 # over the C SDK in sdks/c), a wasm32-wasi reactor, then the WASI 0.2 adapter.
-#   Zig 0.17 (or `pip install ziglang==0.17.0` and ZIG="python -m ziglang")
+#   Zig 0.17 (or `pip install ziglang==0.17.1` and ZIG="python -m ziglang")
 #   cargo install wit-bindgen-cli --version 0.63.0 && cargo install wasm-tools
 set -euo pipefail
 cd "$(dirname "$0")"
