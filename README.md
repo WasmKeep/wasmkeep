@@ -220,7 +220,9 @@ pull request asks you to sign the [CLA](CLA.md), with one comment.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE). The name is covered by [TRADEMARK.md](TRADEMARK.md).
+Copyright 2026 Julien Turbide. Licensed under the Apache License 2.0
+([LICENSE](LICENSE), [NOTICE](NOTICE)). The name is covered by
+[TRADEMARK.md](TRADEMARK.md).
 Dependencies and what you inherit when you ship an actor:
 [Licensing and compliance](docs/legal.md).
 
