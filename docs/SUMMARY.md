@@ -3,6 +3,7 @@
 [What is WasmKeep?](overview.md)
 [Who it is for, and use cases](use-cases.md)
 [WasmKeep and Cloudflare Workers](compared-with-workers.md)
+[WasmKeep and celld](compared-with-celld.md)
 
 # Getting started
 
