@@ -60,8 +60,9 @@ own machines.**
   addresses only by default, and no data but its own database. A CPU
   budget per event, memory limits and SQL limits per actor: a guest that
   loops forever is stopped and its caller gets a 500, while other actors
-  keep running. All tenants
-  share one process, so this is not a boundary for hostile tenants yet
+  keep running. Every actor
+  of a node shares one process, so this is not a boundary for hostile
+  tenants yet
   ([security model](docs/security.md)).
 - **Survives a dead server.** Run several nodes on one S3-compatible bucket
   and each actor's database is replicated to it; when a node dies, another
@@ -208,8 +209,7 @@ pre-release ([changelog](CHANGELOG.md)).
   the fixes since (bounded segment uploads and restore reads), which
   still need a soak of their own
   ([benchmarks](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
-- **Not yet**: weeks of real traffic, CI-built and signed releases, a run
-  against AWS S3. What is left is on the [roadmap](ROADMAP.md).
+- **Not yet**: weeks of real traffic, a run against AWS S3. What is left is on the [roadmap](ROADMAP.md).
 
 Do not trust it with data you care about yet.
 
@@ -260,10 +260,13 @@ docs.
 What keeps that honest is the same as for any codebase, applied
 strictly:
 
-- **Every change goes through a pull request** and merges only after the
-  full check passes (`./scripts/check.sh --full`): formatting, lints, every test, 200-seed
+- **Every change goes through a pull request.** Before a merge, the
+  full check runs locally (`./scripts/check.sh --full`): formatting, lints, every test, 200-seed
   simulations, the oldest supported Rust, the guest SDKs, dependency
-  audits and the docs build.
+  audits and the docs build; hosted CI adds the other platforms, the S3
+  suites and every language. Some tests are still sensitive to timing
+  on shared runners, and CI on main has failed on them: a release is
+  built only from a commit CI passed on.
 - **A bug fix starts with a failing test**; anything about ordering,
   leases or failover gets a simulation case.
 - **Risky changes get adversarial reviews**: independent reviewers that
@@ -275,5 +278,7 @@ strictly:
 - **Decisions are written down** in the ADRs, including the ones revised
   after a mistake.
 
-Commits are in my name and signed: I answer for every one of them.
+Branch commits and release tags are signed with my key; pull requests
+are squash-merged, so commits on main carry GitHub's signature. They are
+in my name: I answer for every one of them.
 

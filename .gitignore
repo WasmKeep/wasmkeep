@@ -18,3 +18,7 @@ agent.env
 hub.env
 secrets.key
 token.txt
+
+# Local agent settings and notes
+/.claude/
+CLAUDE.local.md
