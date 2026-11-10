@@ -50,7 +50,8 @@ is not run.
 ## 🚧 M3: First public release
 
 More languages, documentation, hardening, and a first release that a
-team could run. There is no release date yet. Measured numbers are in
+team could run: `0.1.0`, a pre-alpha pre-release
+([changelog](CHANGELOG.md)). Measured numbers are in
 [benchmarks](docs/benchmarks.md).
 
 Done:
@@ -121,8 +122,8 @@ Next, in this order:
    ([ADR 0013](docs/adr/0013-access-rules-and-config-in-deploys.md)): a
    node started without `--access` no longer reopens what ADR 0010 closed.
    Secrets went into the bucket in M4 (below)
-3. ⏳ CI with its full matrix (other platforms, the S3 and
-   failover job, every language build)
+3. ✅ CI with its full matrix (other platforms, the S3 and
+   failover job, every language build), on every pull request
 4. ✅ A three-node soak against a real S3 or R2 bucket (M2's open item):
    on R2 and OVHcloud Object Storage, from a desktop and from three VPS
    next to the bucket, 27 kills under load (nine in each run), nothing lost
@@ -144,10 +145,11 @@ Next, in this order:
    together" (mixed versions come after the release)
 7. ⏳ The performance targets on dedicated hardware
 
-Before the first release: the [legal basics](docs/legal.md)
-(licensing, name, export control), binaries and the image built by CI and
-signed, and the first public release, with a write-up and benchmarks
-against celld.
+The first release: ✅ the [legal basics](docs/legal.md)
+(licensing, name, export control), ✅ binaries and the image built by CI
+and signed, with a benchmark regression check on pull requests, ✅ the
+first public release, `0.1.0`, then ⏳ a write-up with benchmarks against
+celld.
 
 Continuing alongside, without holding the release:
 

@@ -3421,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3442,7 +3442,7 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-cluster"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "object_store",
@@ -3452,14 +3452,14 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-compare"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "wasmkeep-server",
 ]
 
 [[package]]
 name = "wasmkeep-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "rustix",
@@ -3473,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-sdk"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "wasip2 2.0.1+wasi-0.2.12",
  "wit-bindgen 0.63.0",
@@ -3481,7 +3481,7 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3520,7 +3520,7 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-sim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "madsim",
  "wasmkeep-cluster",
@@ -3528,7 +3528,7 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-storage"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lz4_flex",
  "rusqlite",
@@ -3540,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "wasmkeep-wit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "tokio",
  "wasmkeep-runtime",

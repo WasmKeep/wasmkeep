@@ -1,0 +1,66 @@
+# Changelog
+
+Changes to WasmKeep, newest first. Before 1.0, any minor version (0.x) may
+change the `wasmkeep:actor` WIT world, the formats in the bucket or the
+command line; its notes say what changed and how to move.
+
+The text under a version's heading is its GitHub release text
+(`.github/workflows/release.yml` copies it).
+
+## 0.1.0
+
+The first release, published as a **pre-alpha pre-release**: for trying
+WasmKeep, side projects and staging, not production. See the
+[roadmap](ROADMAP.md) for what comes next.
+
+### What is in it
+
+- **Actors**: WebAssembly components (`wasmkeep:actor@0.2.0` WIT world),
+  one instance per name, events one at a time, a SQLite database each,
+  hibernation, alarms that fire at least once, calls between actors,
+  WebSockets that stay open while an actor sleeps, outbound HTTP limited to
+  public addresses, and hot reload with `wasmkeep dev`.
+- **Clusters**: several nodes on one S3-compatible bucket with conditional
+  writes, each actor on one node at a time, its database replicated to the
+  bucket and restored on another node when its node dies (free 15 to about
+  21 s after the node's last write, then the restore). One lease per node,
+  checked in deterministic simulation. Mutual TLS between nodes, required
+  by default.
+- **Operating a cluster**: `wasmkeep deploy` (rolling, with rollbacks,
+  access rules and configuration), `wasmkeep cluster status`, `drain`,
+  `fence` and `forget`, `wasmkeep actor move`, `wasmkeep secrets` (sealed
+  in the bucket), garbage collection of old history in the bucket,
+  Prometheus metrics, health and readiness endpoints, and a Grafana
+  dashboard.
+- **Languages**: Rust (recommended); Zig and C/C++; TypeScript (QuickJS
+  by default, StarlingMonkey as an option) and Python; Go through TinyGo
+  (experimental). [Tiers and numbers](docs/languages.md).
+- **SDK patterns on actors**: sharded key-value store, queues and durable
+  workflows ([KV and queues](docs/kv-and-queues.md),
+  [workflows](docs/workflows.md)).
+- **Packaging**: binaries for x86_64 and aarch64 Linux (glibc 2.28 or
+  newer), each with a CycloneDX SBOM and third-party notices; a
+  distroless image for linux/amd64 and linux/arm64 at
+  `ghcr.io/wasmkeep/wasmkeep:0.1.0`; all signed with keyless cosign. A
+  three-node Compose example against MinIO in
+  [`deploy/compose/`](deploy/compose/README.md).
+
+### Known limits
+
+- Not production-ready: soaked against Cloudflare R2 and OVHcloud Object
+  Storage with nodes killed under load, nothing lost, but not yet carrying
+  real users' traffic, and not run against AWS S3
+  ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
+- Upgrade every node of a cluster together: nodes of different versions
+  are not supported in one cluster
+  ([upgrading](docs/cluster.md#upgrading-wasmkeep)).
+- One tenant per process ([security](docs/security.md#known-gaps)).
+- No independent third-party security audit yet
+  ([security](docs/security.md#audits)).
+- The performance targets on dedicated hardware are not measured yet;
+  millions of actors per cluster are a goal, not a measurement.
+
+### Install and verify
+
+[Single node](docs/deploy/single-node.md#1-install-the-binary) checks the
+binaries with cosign; [Compose](deploy/compose/README.md) checks the image.

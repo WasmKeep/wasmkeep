@@ -6,11 +6,11 @@ thousands of requests per second (see [benchmarks](../benchmarks.md)), and
 adding a bucket gives it continuous off-machine backups.
 
 > **Pre-alpha.** Fine for side projects and staging; keep a backup of any
-> data you care about until the first release.
+> data you care about.
 
 ## 1. Install the binary
 
-There are no release binaries yet. Once there are, each release on GitHub
+Each [release on GitHub](https://github.com/WasmKeep/wasmkeep/releases)
 carries, for x86_64 and aarch64 Linux (glibc 2.28 or newer: RHEL 8,
 Debian 10, Ubuntu 20.04 and later), a tarball with the binary and its
 third-party notices, a CycloneDX SBOM, `SHA256SUMS`, and a Sigstore bundle

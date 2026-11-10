@@ -16,13 +16,14 @@ class Runner(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         (self.root / 'scripts').mkdir()
-        for name in ('check.sh', 'doctor.sh'):
+        for name in ('check.sh', 'doctor.sh', 'release-notes.sh'):
             shutil.copy2(SCRIPTS / name, self.root / 'scripts' / name)
+        self.write('CHANGELOG.md', '# Changelog\n\n## 1.2.3\n\nNotes.\n')
         for name in ('docs-site.sh', 'licenses.sh', 's3-suites.sh', 'languages.sh'):
             self.write('scripts/' + name, '#!/bin/sh\necho "' + name + '" >> "$CALLS"\n', executable=True)
         for name in ('test_check_benchmark_paths.py', 'test_check_runner.py'):
             self.write('scripts/' + name, '')
-        self.write('Cargo.toml', '[workspace.package]\nrust-version = "1.97"\n')
+        self.write('Cargo.toml', '[workspace.package]\nversion = "1.2.3"\nrust-version = "1.97"\n')
         self.write('crates/wasmkeep-server/Cargo.toml', '[package]\nname = "wasmkeep-server"\n')
         self.write('sim/Cargo.toml', '[package]\nname = "wasmkeep-sim"\n')
         self.write('sdks/python/test/run.sh', '#!/bin/sh\necho "python-sdk-tests" >> "$CALLS"\n', executable=True)
@@ -116,6 +117,15 @@ esac
         result, _ = self.run_check()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('npm run sync', result.stderr)
+
+    def test_a_version_without_a_changelog_section_fails(self):
+        self.write('Cargo.toml', '[workspace.package]\nversion = "1.3.0"\nrust-version = "1.97"\n')
+        result, _ = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('CHANGELOG.md has no section for 1.3.0', result.stderr)
+        self.write('CHANGELOG.md', '# Changelog\n\n## 1.3.0\n\nNew.\n\n## 1.2.3\n\nNotes.\n')
+        result, _ = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_s3_runs_the_s3_suites(self):
         result, calls = self.run_check('--s3')

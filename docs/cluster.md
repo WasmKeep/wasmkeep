@@ -6,7 +6,7 @@
 > under load and nothing lost
 > ([measured](benchmarks.md#three-nodes-against-a-real-bucket)), but not
 > yet under production load or against AWS S3. Do not trust a cluster with
-> data you care about before the first release (see the [roadmap](../ROADMAP.md)).
+> data you care about yet (see the [roadmap](../ROADMAP.md)).
 
 Nodes share one S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, ...) that
 supports conditional writes (`If-None-Match` / `If-Match`). There is nothing
@@ -609,8 +609,8 @@ never an actor is not created.
 
 Upgrading the `wasmkeep` binary itself (not your application: that is
 [Deploying](#deploying), which rolls from node to node safely): **stop
-every node, upgrade them all, start them all.** Until the first release,
-WasmKeep does not support nodes of different versions in one cluster, even
+every node, upgrade them all, start them all.** WasmKeep does not yet
+support nodes of different versions in one cluster, even
 for the length of a rolling restart. The cluster serves nothing between
 the last stop and the first start, so plan a short window.
 
@@ -626,9 +626,9 @@ the last stop and the first start, so plan a short window.
    version in the summary, no warning.
 
 Going back to the previous binary is the same procedure. Builds made from
-source before the first release all report version `0.0.0`, so the version
-column cannot tell two of them apart: step 3 is what proves no old node is
-left.
+source report the version of the release they follow (`0.1.0` for any
+build since it), so the version column cannot tell two of them apart:
+step 3 is what proves no old node is left.
 
 **What goes wrong if old and new nodes run together** (each is a reason
 for the rule; there may be others nobody has listed):
@@ -649,8 +649,8 @@ for the rule; there may be others nobody has listed):
   Nothing compares WasmKeep versions between nodes; the version in each
   heartbeat is only reported, by `cluster status`.
 
-Rolling upgrades of WasmKeep across mixed versions are planned after the
-first release ([ROADMAP](../ROADMAP.md)).
+Rolling upgrades of WasmKeep across mixed versions are planned
+([ROADMAP](../ROADMAP.md)).
 
 ## History in the bucket
 

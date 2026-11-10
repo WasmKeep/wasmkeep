@@ -145,7 +145,7 @@ There is no `HEALTHCHECK` (nothing in the image could run one); health-check
 LICENSE, NOTICE and, in released images, the third-party notices are in
 `/usr/share/doc/wasmkeep/`.
 
-From the first release on, CI publishes the image for linux/amd64 and
+For each release, CI publishes the image for linux/amd64 and
 linux/arm64 as `ghcr.io/wasmkeep/wasmkeep:<version>`, signed with keyless
 cosign like the release binaries. To check it before running it (cosign 3),
 here for `v0.1.0`:

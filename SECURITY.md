@@ -16,7 +16,8 @@ coordination with you and credit you unless you prefer otherwise.
 
 ## Supported versions
 
-WasmKeep is pre-alpha: only the latest commit on `main` receives fixes.
+WasmKeep is pre-alpha: fixes land on `main` and ship in the next release;
+earlier releases receive none.
 
 ## Scope
 
