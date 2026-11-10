@@ -15,6 +15,12 @@ crate-type = ["cdylib"]
 [dependencies]
 wasmkeep-sdk = { path = "../../crates/wasmkeep-sdk" }
 
+[features]
+# `POST` returns only once the increment is durable (`exec-durable`:
+# replicated to the bucket in a cluster). Used by `bench/compare` to set
+# WasmKeep against runtimes that always wait for durability.
+durable = []
+
 [profile.release]
 opt-level = "s"
 strip = true

@@ -784,8 +784,20 @@ compare memory across that boundary.
 ```bash
 ./bench/run.sh                     # criterion suites + the comparison (if npm is installed)
 WASMKEEP_TEST_S3_BUCKET=... ./bench/run.sh   # also failover, with AWS_* pointing at an S3 API
+WASMKEEP_COMPARE_BUCKET=s3://... ./bench/run.sh   # also the comparison on a bucket (compare-bucket/ rows)
 target/release/compare --quick wasmkeep-rust workerd   # just the comparison, smaller
 ```
+
+`compare --bucket` runs each WasmKeep target as a one-node cluster on the
+bucket `WASMKEEP_COMPARE_BUCKET` names, each run under a prefix of its own,
+so every write is also replicated: its rows are `compare-bucket/...`. Its
+`startup_to_first_response` includes the 15 s every cluster node waits
+before it listens ([cluster](cluster.md#how-it-works)). For a local bucket,
+the MinIO image the [Compose example](../deploy/compose/compose.yaml) pins
+serves on loopback; give it a RAM-backed or a disk-backed data directory
+deliberately, as with `TMPDIR`, and record which. `wasmkeep-rust-durable`
+is the same counter with its `POST` durable before it returns
+(`exec-durable`): fsynced on one node, in the bucket with `--bucket`.
 
 Before publishing evidence, replace personal directory paths and generated
 scratch paths with repository-relative paths, `[repo]` or `[scratch]`. Stage

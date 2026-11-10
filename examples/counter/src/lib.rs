@@ -33,10 +33,7 @@ impl http::Guest for Counter {
     fn handle(request: IncomingRequest, out: ResponseOutparam) {
         let result = match request.method() {
             Method::Get => storage::query("SELECT value FROM counter WHERE id = 1", &[]),
-            Method::Post => storage::query(
-                "UPDATE counter SET value = value + 1 WHERE id = 1 RETURNING value",
-                &[],
-            ),
+            Method::Post => increment(),
             _ => {
                 http::respond(out, 405, "text/plain", b"use GET or POST\n");
                 return;
@@ -49,6 +46,20 @@ impl http::Guest for Counter {
             }
             Err(e) => http::respond(out, 500, "text/plain", format!("{e}\n").as_bytes()),
         }
+    }
+}
+
+/// Adds one and returns the new value: committed locally, or with the
+/// `durable` feature, durable before it returns.
+fn increment() -> Result<storage::Rows, storage::SqlError> {
+    const SQL: &str = "UPDATE counter SET value = value + 1 WHERE id = 1 RETURNING value";
+    if cfg!(feature = "durable") {
+        storage::exec("BEGIN", &[])?;
+        let rows = storage::query(SQL, &[])?;
+        storage::exec_durable("COMMIT", &[])?;
+        Ok(rows)
+    } else {
+        storage::query(SQL, &[])
     }
 }
 
