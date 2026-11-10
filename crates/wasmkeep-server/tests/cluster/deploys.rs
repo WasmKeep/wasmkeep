@@ -958,7 +958,7 @@ async fn deployed_rules_and_configuration_reach_nodes_started_without_any() {
     settle().await;
 
     for node in [a.addr, b.addr] {
-        let r = send(node, "GET", "/actor/m/nobody/inits", "").await;
+        let r = send_reachable(node, "GET", "/actor/m/nobody/inits", "").await;
         assert_eq!(r.status, 404, "{}", r.body);
         assert_eq!(upgrade_status(node, "/actor/m/nobody").await, 404);
     }
@@ -968,7 +968,7 @@ async fn deployed_rules_and_configuration_reach_nodes_started_without_any() {
         "the bucket holds something for a name nobody created: {keys:?}"
     );
 
-    let r = send(
+    let r = send_reachable(
         a.addr,
         "POST",
         "/actor/v/maker/call?to=m/made&path=%2Fdurable",
@@ -977,7 +977,7 @@ async fn deployed_rules_and_configuration_reach_nodes_started_without_any() {
     .await;
     assert_eq!((r.status, r.body.trim()), (200, "200:1"));
     for node in [a.addr, b.addr] {
-        let r = send(node, "GET", "/actor/m/made/env?name=URL", "").await;
+        let r = send_reachable(node, "GET", "/actor/m/made/env?name=URL", "").await;
         assert_eq!(
             (r.status, r.body.trim()),
             (200, "https://one.test wasi=unset")
@@ -998,10 +998,10 @@ async fn deployed_rules_and_configuration_reach_nodes_started_without_any() {
     runs_deploy(&a_service, v2.seq).await;
     runs_deploy(&b_service, v2.seq).await;
     for node in [a.addr, b.addr] {
-        let r = send(node, "GET", "/actor/m/made/env?name=URL", "").await;
+        let r = send_reachable(node, "GET", "/actor/m/made/env?name=URL", "").await;
         assert_eq!(r.status, 403, "{}", r.body);
     }
-    let r = send(
+    let r = send_reachable(
         a.addr,
         "POST",
         "/actor/v/maker/call?to=m/made&path=%2Fdurable",
@@ -1013,7 +1013,7 @@ async fn deployed_rules_and_configuration_reach_nodes_started_without_any() {
         (200, "200:2"),
         "calls still reach it"
     );
-    let r = send(
+    let r = send_reachable(
         b.addr,
         "POST",
         "/actor/v/other/call?to=m/made&path=%2Fdurable",

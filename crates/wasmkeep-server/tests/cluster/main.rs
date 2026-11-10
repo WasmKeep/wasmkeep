@@ -306,6 +306,22 @@ async fn send(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply 
     exchange(addr, &req).await
 }
 
+/// [`send`], sent again (for up to 5 s) while the reply says the actor's
+/// node was not in this node's view: a peer drops out of it when its
+/// heartbeat lapses, which a loaded test machine can make happen with the
+/// test cluster's 1 s lease. Such a request reached no actor (it failed
+/// before being forwarded), so sending it again is safe.
+async fn send_reachable(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let reply = send(addr, method, path, extra).await;
+        if !reply.body.contains("is not reachable") || tokio::time::Instant::now() >= deadline {
+            return reply;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Sends a raw request (which must close the connection) and reads the reply.
 async fn exchange(addr: SocketAddr, req: &str) -> Reply {
     let mut stream = TcpStream::connect(addr).await.unwrap();

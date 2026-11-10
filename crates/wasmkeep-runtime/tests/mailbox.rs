@@ -496,11 +496,21 @@ async fn deregistration_does_not_free_capacity_before_the_state_is_dropped() {
         .submit(&addr("a"), |_| Box::pin(async {}))
         .await
         .unwrap();
-    assert_capacity(mailboxes.submit(&addr("b"), |_| Box::pin(async {})).await);
-    tokio::time::timeout(Duration::from_secs(5), ready)
-        .await
-        .unwrap()
-        .unwrap();
+    // `a`'s caller is answered before `a` marks itself idle again, so a
+    // refusal that lands in between finds no idle actor to ask to go (as a
+    // caller would, it retries). Retry until `a`'s state starts dropping.
+    let mut ready = ready;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert_capacity(mailboxes.submit(&addr("b"), |_| Box::pin(async {})).await);
+        match tokio::time::timeout(Duration::from_millis(50), &mut ready).await {
+            Ok(entered) => break entered.unwrap(),
+            Err(_) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "a was never asked to hibernate"
+            ),
+        }
+    }
     assert_eq!(
         mailboxes.resident(),
         0,

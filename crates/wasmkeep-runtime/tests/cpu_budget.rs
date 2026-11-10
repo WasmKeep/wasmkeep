@@ -234,8 +234,11 @@ fn calibrate(
 fn time_waiting_to_resume_after_a_yield_is_not_counted() {
     // An async guest yields on every tick. On a busy node the executor takes
     // a while to poll it again; that wait is other tasks' time, not this
-    // guest's. Here each resume is 15 ms late: about 10 ms of work then
-    // spans well over 100 ms of wall time, against a 40 ms budget.
+    // guest's. Here each resume is 45 ms late, longer than the whole 40 ms
+    // budget, so a single yield already puts the wall time past it while
+    // the guest's own work stays near 8 ms. (How many yields there are
+    // depends on how often the ticker really wakes, which a loaded machine
+    // stretches: one loaded macOS run saw 2 for 8 ms of work.)
     let runtime = runtime(Duration::from_secs(10));
     let component = runtime.compile(&wat::parse_str(WORK_WAT).unwrap()).unwrap();
     let pre = runtime
@@ -258,10 +261,10 @@ fn time_waiting_to_resume_after_a_yield_is_not_counted() {
                 .unwrap();
             work.call_async(&mut store, (n,)).await
         },
-        Duration::from_millis(15),
+        Duration::from_millis(45),
     );
     let elapsed = started.elapsed();
-    assert!(yields >= 3, "only {yields} yields: the test proves nothing");
+    assert!(yields >= 1, "no yield: the test proves nothing");
     assert!(elapsed > Duration::from_millis(40), "{elapsed:?}");
     result.unwrap_or_else(|e| panic!("trapped after {yields} yields, {elapsed:?}: {e:?}"));
 }
