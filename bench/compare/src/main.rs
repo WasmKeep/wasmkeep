@@ -8,10 +8,21 @@
 //! the same way. Server memory and CPU time come from `/proc/<pid>`.
 //!
 //! ```text
-//! compare [--quick] TARGET...
-//! TARGET = wasmkeep-rust | wasmkeep-zig | wasmkeep-c | wasmkeep-go | wasmkeep-ts |
-//! wasmkeep-ts-starlingmonkey | wasmkeep-py | workerd
+//! compare [--quick] [--bucket] TARGET...
+//! TARGET = wasmkeep-rust | wasmkeep-rust-durable | wasmkeep-zig | wasmkeep-c |
+//! wasmkeep-go | wasmkeep-ts | wasmkeep-ts-starlingmonkey | wasmkeep-py | workerd
 //! ```
+//!
+//! `wasmkeep-rust-durable` is the Rust counter built with its `durable`
+//! feature: `POST` returns once the increment is durable (`exec-durable`),
+//! fsynced on one node, in the bucket with `--bucket`.
+//!
+//! `--bucket` runs each WasmKeep target as a one-node cluster on the bucket
+//! `WASMKEEP_COMPARE_BUCKET` names (`s3://BUCKET[/PREFIX]`, credentials and
+//! endpoint from the `AWS_*` variables, as `wasmkeep serve` reads them), so
+//! every write is also replicated to it; each target gets a prefix of its
+//! own under it. Its rows are named `compare-bucket/...` rather than
+//! `compare/...`: the same benchmark, another setup.
 //!
 //! Prints CSV rows `bench,value,unit` on stdout (`bench/run.sh` adds them to
 //! the results file). Paths come from the environment, with defaults
@@ -33,7 +44,12 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// The bucket of a `--bucket` run (`s3://BUCKET[/PREFIX]`), with a prefix
+/// unique to the run; unset otherwise.
+static BUCKET: OnceLock<String> = OnceLock::new();
 
 /// Connections the server may hold: the harness opens at most ten at once
 /// (eight throughput clients and the setup), and every one beyond its
@@ -131,7 +147,8 @@ fn wasmkeep(label: &str, wasm: &Path) -> Server {
     let dir = TempDir::new(label);
     let addr = free_addr();
     let bin = env_path("WASMKEEP_BIN", "target/release/wasmkeep");
-    let child = Command::new(&bin)
+    let mut command = Command::new(&bin);
+    command
         .args(["serve", "--actor"])
         .arg(format!("counter={}", wasm.display()))
         .arg("--data-dir")
@@ -139,7 +156,18 @@ fn wasmkeep(label: &str, wasm: &Path) -> Server {
         .arg("--cache-dir")
         .arg(dir.0.join("cache"))
         .args(["--listen", &addr.to_string(), "--max-instances", "2000"])
-        .args(["--max-connections", &MAX_CONNECTIONS.to_string()])
+        .args(["--max-connections", &MAX_CONNECTIONS.to_string()]);
+    if let Some(bucket) = BUCKET.get() {
+        // A one-node cluster: a node with a bucket is a cluster node. Plain
+        // HTTP between nodes is accepted, as there are no others.
+        command
+            .arg("--bucket")
+            .arg(format!("{bucket}/{label}"))
+            .args(["--node-id", "compare", "--cluster-plaintext", "accept"])
+            .arg("--advertise")
+            .arg(format!("http://{addr}"));
+    }
+    let child = command
         .env("RUST_LOG", "warn")
         .stdout(log_file(label))
         .stderr(Stdio::null())
@@ -302,7 +330,12 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 }
 
 fn row(target: &str, bench: &str, value: u128, unit: &str) {
-    println!("compare/{target}/{bench},{value},{unit}");
+    let group = if BUCKET.get().is_some() {
+        "compare-bucket"
+    } else {
+        "compare"
+    };
+    println!("{group}/{target}/{bench},{value},{unit}");
 }
 
 fn wait_ready(server: &Server) -> Duration {
@@ -324,6 +357,12 @@ fn component(target: &str) -> Option<(&'static str, &'static str)> {
         "wasmkeep-rust" => (
             "rust",
             "examples/counter/target/wasm32-wasip2/release/counter.wasm",
+        ),
+        // `cargo build --release --target wasm32-wasip2 --features durable
+        // --target-dir target/durable` in examples/counter.
+        "wasmkeep-rust-durable" => (
+            "rust-durable",
+            "examples/counter/target/durable/wasm32-wasip2/release/counter.wasm",
         ),
         // TypeScript on QuickJS, the default engine. Before 2026-11-06 the
         // `wasmkeep-ts` rows were StarlingMonkey, then the default, and
@@ -484,9 +523,23 @@ fn main() {
     let targets: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if targets.is_empty() {
         eprintln!(
-            "usage: compare [--quick] wasmkeep-rust|wasmkeep-zig|wasmkeep-c|wasmkeep-go|wasmkeep-ts|wasmkeep-ts-starlingmonkey|wasmkeep-py|workerd ..."
+            "usage: compare [--quick] [--bucket] wasmkeep-rust|wasmkeep-rust-durable|wasmkeep-zig|wasmkeep-c|wasmkeep-go|wasmkeep-ts|wasmkeep-ts-starlingmonkey|wasmkeep-py|workerd ..."
         );
         std::process::exit(2);
+    }
+    if args.iter().any(|a| a == "--bucket") {
+        let Some(bucket) = std::env::var("WASMKEEP_COMPARE_BUCKET")
+            .ok()
+            .filter(|b| b.starts_with("s3://"))
+        else {
+            eprintln!("--bucket needs WASMKEEP_COMPARE_BUCKET=s3://BUCKET[/PREFIX]");
+            std::process::exit(2);
+        };
+        let run = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let run = format!("compare-{run}-{}", std::process::id());
+        let _ = BUCKET.set([bucket.trim_end_matches('/'), &run].join("/"));
     }
     let workload = Workload::for_quick(quick);
     match Command::new("bash")

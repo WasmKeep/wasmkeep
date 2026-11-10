@@ -53,7 +53,10 @@ fi
 # build is missing are skipped.
 cargo build --release -p wasmkeep-cli -p wasmkeep-compare
 (cd examples/counter && cargo build --release --target wasm32-wasip2 --locked)
-targets="wasmkeep-rust"
+# The same counter, its POST durable before it returns (`exec-durable`).
+(cd examples/counter && cargo build --release --target wasm32-wasip2 --locked \
+  --features durable --target-dir target/durable)
+targets="wasmkeep-rust wasmkeep-rust-durable"
 # The same counter in the other guest languages, when their toolchain is
 # here (see each example's build.sh for what it needs).
 for lang in zig c go py; do
@@ -74,6 +77,13 @@ fi
 target/release/compare $targets | while IFS=, read -r bench value unit; do
   echo "\"$date\",\"$commit\",\"$host\",\"$cpu\",\"$cores\",\"$rustc\",\"$bench\",$value,,,,\"$unit\"" >> "$out"
 done
+# The Rust counter again as a one-node cluster on a bucket (compare-bucket/
+# rows): only with WASMKEEP_COMPARE_BUCKET=s3://... and AWS_* pointing at it.
+if [ -n "${WASMKEEP_COMPARE_BUCKET:-}" ]; then
+  target/release/compare --bucket wasmkeep-rust wasmkeep-rust-durable | while IFS=, read -r bench value unit; do
+    echo "\"$date\",\"$commit\",\"$host\",\"$cpu\",\"$cores\",\"$rustc\",\"$bench\",$value,,,,\"$unit\"" >> "$out"
+  done
+fi
 
 # Every row gets the huge page setting as its last column.
 sed -e '1s/$/,thp/' -e "2,\$s/\$/,\"$thp\"/" "$out" > "$out.tmp" && mv "$out.tmp" "$out"
