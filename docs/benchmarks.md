@@ -802,3 +802,26 @@ commit with `--range BASE..HEAD`, including paths removed before the final commi
 Unchanged files inherited from an old base are not attributed to the PR.
 CI runs after publication, so it cannot prevent the initial push. This checks local paths; review logs
 for other private information before staging them.
+
+## Regression check on pull requests
+
+A pull request that changes the runtime, the server or the benchmarked
+examples runs [`scripts/bench-ab.py`](../scripts/bench-ab.py) in CI: the
+base it merges into and the change are built and measured on the same
+runner, three rounds of the `instantiate`, `http` and `actors` Criterion
+suites with the two sides back to back. Each round gives a ratio per
+benchmark; the check fails if a benchmark's median ratio is more than 20%
+slower. Three rounds at that threshold catch large regressions, not small
+ones, and numbers from shared CI runners are not comparable with each
+other or with the files in `bench/results/`: only the ratio between the two
+sides of one run is, and the job's summary shows it.
+
+`hello/request/raw-hyper` (plain hyper, no WasmKeep code) never fails the
+check; if it moved by more than 15%, the runner was too noisy and the run
+only reports. A base that cannot be built or measured is reported, not
+failed. To run it locally against any revision (it keeps its builds and
+results under `target/bench-ab/`):
+
+```bash
+python3 -I scripts/bench-ab.py main
+```
