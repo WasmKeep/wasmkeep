@@ -13,6 +13,10 @@ publish.workspace = true
 name = "compare"
 path = "src/main.rs"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The workspace's rustix, with `thread` for prctl(PR_SET_THP_DISABLE) in celld.
+rustix = { workspace = true, features = ["thread"] }
+
 [dev-dependencies]
 # Only to check the harness's descriptor floor against the server's budget.
 wasmkeep-server.workspace = true
