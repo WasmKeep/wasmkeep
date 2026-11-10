@@ -107,6 +107,78 @@ a different picture:
   hold none), wake latency per runtime, and workerd with several processes.
   These are next for the comparison harness.
 
+## WasmKeep against celld, every write in a bucket
+
+[celld](https://github.com/denoland/celld) runs Durable Objects on a
+bucket: each object's SQLite changes go to S3, much like WasmKeep's
+replication. Here both runtimes serve the same counter on the same local
+bucket:
+
+- **WasmKeep, durable**: [`examples/counter`](../examples/counter) built
+  with its `durable` feature, so `POST` commits with `exec-durable` and
+  answers once the write is in the bucket. WasmKeep runs as a one-node
+  cluster, since a node with a bucket is a cluster node.
+- **WasmKeep, plain `exec`**: the default build of the same counter. Its
+  `POST` answers before the write reaches the bucket, so it is **not
+  equivalent** to the other two columns and is shown apart.
+- **celld**: the workerd counter
+  ([`bench/workerd/counter.js`](../bench/workerd/counter.js), unchanged),
+  deployed with `celld deploy` to one celld node. One node waits for the
+  bucket on every write (`CELLD_DURABILITY=bucket`, set explicitly).
+
+From [`bench/results/2026-11-10-e3856a5.csv`](../bench/results/2026-11-10-e3856a5.csv)
+(commit `e3856a5`, a clean tree, `compare-bucket/` rows). **Hardware:** the
+AMD Ryzen 9 7950X workstation above, Rust 1.99.1, Wasmtime 50.0.1, celld
+v0.6.3 (the release binary, its build provenance checked by
+[`bench/celld/fetch.sh`](../bench/celld/fetch.sh)). The bucket is MinIO on
+loopback with its data on tmpfs, so a write costs a local round trip and no
+disk; both runtimes keep their actor data on tmpfs too. Nothing else was
+running.
+
+| Counter on a bucket | WasmKeep, durable | celld | WasmKeep, plain `exec` (not equivalent) |
+| --- | --- | --- | --- |
+| Write, resident actor (p50 / p99) | **0.58 / 1.41 ms** | 0.95 / 1.26 ms | 0.49 / 1.62 ms |
+| Read, resident actor (p50 / p99) | **61 / 82 µs** | 116 / 203 µs | 65 / 86 µs |
+| First request to a new actor (p50) | 3.25 ms | 3.19 ms | 2.71 ms |
+| Memory per resident actor | **272 KB** | 348 KB | 248 KB |
+| Server memory, 1000 resident actors | **334 MB** | 609 MB | 309 MB |
+| **Server CPU time per request** (8 clients) | **401 µs** | 478 µs | 389 µs |
+| Throughput, 8 clients, 1000 actors | **10,622 req/s** | 6,517 req/s | 23,953 req/s |
+| Process start to first response | 15.08 s* | **84 ms** | 15.08 s* |
+
+\* Includes the 15 s every WasmKeep cluster node waits before it listens,
+checking that no other process runs with its node id
+([cluster](cluster.md#flags)). celld does not wait.
+
+### How to read it
+
+- **Durable against durable, WasmKeep answers a write faster at p50 and
+  slower at p99.** 0.58 against 0.95 ms at p50; 1.41 against 1.26 ms at
+  p99. Without a bucket the same durable write takes 99 µs
+  (`compare/wasmkeep-rust-durable`), so the bucket round trip is most of
+  either write.
+- **A real bucket changes the scale, not the order.** MinIO on tmpfs and
+  loopback answers in well under a millisecond. A remote S3 bucket takes
+  tens of milliseconds per write, which would dominate both durable write
+  rows; the read, memory and CPU rows do not touch the bucket.
+- **WasmKeep uses about 84% of celld's CPU per request** and holds 78% of
+  its memory per resident actor, and its whole process at 1000 actors is
+  about half of celld's. Its throughput across actors is 1.6× celld's.
+  celld runs as one process, and this row measures that one process.
+- **Plain `exec` on a bucket is barely faster per actor than durable.** The
+  response does not wait for the bucket, but an actor uploads an event's
+  changes before it runs its next event, so the next request to the same
+  actor waits instead. Across many actors the uploads overlap: throughput
+  is 2.3× the durable build's.
+- **One node only.** With two or more nodes, celld acknowledges a write
+  once followers hold it on their disks (`CELLD_DURABILITY=fleet`), before
+  it reaches the bucket. WasmKeep has no such mode: a durable write always
+  waits for the bucket. A three-node comparison has to say which
+  guarantee each side gives; it is not measured yet.
+- **Start time is a design difference.** celld answers 84 ms after it
+  starts; a WasmKeep cluster node waits 15 s first, by design. Restarts on
+  a single node without a bucket do not wait (51 ms above).
+
 ## The same counter in every language
 
 The same actor contract (read, increment, persist) in every guest language
