@@ -236,9 +236,11 @@ fn time_waiting_to_resume_after_a_yield_is_not_counted() {
     // a while to poll it again; that wait is other tasks' time, not this
     // guest's. Here each resume is 45 ms late, longer than the whole 40 ms
     // budget, so a single yield already puts the wall time past it while
-    // the guest's own work stays near 8 ms. (How many yields there are
+    // the guest's own work stays near 8 ms. How many yields there are
     // depends on how often the ticker really wakes, which a loaded machine
-    // stretches: one loaded macOS run saw 2 for 8 ms of work.)
+    // stretches (one loaded macOS run saw 2 for 8 ms of work), and the
+    // budget is only compared at an epoch check, so the claim is checked
+    // on the meter itself: what it charged stays under the budget.
     let runtime = runtime(Duration::from_secs(10));
     let component = runtime.compile(&wat::parse_str(WORK_WAT).unwrap()).unwrap();
     let pre = runtime
@@ -251,10 +253,10 @@ fn time_waiting_to_resume_after_a_yield_is_not_counted() {
     let pre = runtime
         .instantiate_pre(&Linker::<()>::new(runtime.engine()), &component)
         .unwrap();
+    let (mut store, meter) = runtime.new_metered_async_store(());
     let started = Instant::now();
     let (result, yields) = block_on_slowly(
         async {
-            let mut store = runtime.new_async_store(());
             let instance = pre.instantiate_async(&mut store).await.unwrap();
             let work = instance
                 .get_typed_func::<(i64,), ()>(&mut store, "work")
@@ -267,6 +269,11 @@ fn time_waiting_to_resume_after_a_yield_is_not_counted() {
     assert!(yields >= 1, "no yield: the test proves nothing");
     assert!(elapsed > Duration::from_millis(40), "{elapsed:?}");
     result.unwrap_or_else(|e| panic!("trapped after {yields} yields, {elapsed:?}: {e:?}"));
+    let used = meter.used();
+    assert!(
+        used < Duration::from_millis(40),
+        "charged {used:?} for {elapsed:?} of wall time and {yields} delayed resumes"
+    );
 }
 
 #[test]

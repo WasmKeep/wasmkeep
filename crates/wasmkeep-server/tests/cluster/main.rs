@@ -307,19 +307,33 @@ async fn send(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply 
 }
 
 /// [`send`], sent again (for up to 5 s) while the reply says the actor's
-/// node was not in this node's view: a peer drops out of it when its
-/// heartbeat lapses, which a loaded test machine can make happen with the
-/// test cluster's 1 s lease. Such a request reached no actor (it failed
-/// before being forwarded), so sending it again is safe.
+/// node was not in this node's view. A peer drops out of the view when its
+/// heartbeat is older than the horizon (three heartbeats plus the allowed
+/// skew: 400 ms in these tests), which a stalled heartbeat writer or lister
+/// on a loaded machine can cause. Only the two failures that happen before
+/// anything is sent to the owner are retried: a forward refused with
+/// "the actor's node is not reachable" (503), and a `/call` whose
+/// `Cluster::call` failed with "node X is not reachable", which the test
+/// actor answers as `failed:...` (the calling actor ran an event; the
+/// callee did not). Never broaden this to other 503s: "did not answer" can
+/// follow a request the owner processed.
 async fn send_reachable(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let reply = send(addr, method, path, extra).await;
-        if !reply.body.contains("is not reachable") || tokio::time::Instant::now() >= deadline {
+        if !not_in_view(&reply) || tokio::time::Instant::now() >= deadline {
             return reply;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn not_in_view(reply: &Reply) -> bool {
+    let body = reply.body.trim();
+    (reply.status == 503 && body == "the actor's node is not reachable; retry")
+        || (reply.status == 200
+            && body.starts_with("failed:node ")
+            && body.ends_with(" is not reachable"))
 }
 
 /// Sends a raw request (which must close the connection) and reads the reply.
@@ -976,6 +990,21 @@ async fn upgrade_status(addr: SocketAddr, path: &str) -> u16 {
         Ok(_) => 101,
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
         Err(e) => panic!("{path}: {e}"),
+    }
+}
+
+/// [`upgrade_status`], tried again (for up to 5 s) while it is 503: on a
+/// node that does not own the actor, an upgrade is forwarded, and refused
+/// with 503 while the owner is out of this node's view (see
+/// [`send_reachable`]). For tests that expect another status.
+async fn upgrade_status_reachable(addr: SocketAddr, path: &str) -> u16 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = upgrade_status(addr, path).await;
+        if status != 503 || tokio::time::Instant::now() >= deadline {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

@@ -497,8 +497,10 @@ async fn deregistration_does_not_free_capacity_before_the_state_is_dropped() {
         .await
         .unwrap();
     // `a`'s caller is answered before `a` marks itself idle again, so a
-    // refusal that lands in between finds no idle actor to ask to go (as a
-    // caller would, it retries). Retry until `a`'s state starts dropping.
+    // refusal that lands in between finds no idle actor to ask to go.
+    // (`submit_wait`, which the server uses, is woken once `a` is idle and
+    // asks then; a plain `submit` does not wait.) Retry until `a`'s state
+    // starts dropping.
     let mut ready = ready;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

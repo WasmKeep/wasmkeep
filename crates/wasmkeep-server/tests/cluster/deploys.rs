@@ -960,7 +960,7 @@ async fn deployed_rules_and_configuration_reach_nodes_started_without_any() {
     for node in [a.addr, b.addr] {
         let r = send_reachable(node, "GET", "/actor/m/nobody/inits", "").await;
         assert_eq!(r.status, 404, "{}", r.body);
-        assert_eq!(upgrade_status(node, "/actor/m/nobody").await, 404);
+        assert_eq!(upgrade_status_reachable(node, "/actor/m/nobody").await, 404);
     }
     let keys = bucket_keys(&store).await;
     assert!(
