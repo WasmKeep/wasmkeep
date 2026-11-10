@@ -169,6 +169,8 @@ On Linux with Podman 6.1 and podman-compose 1.6 (x86-64): the image
 builds, the cluster starts with mutual TLS and plain HTTP refused, the
 counter answers on every node, a stopped owner hands its actor over with
 the value kept, and a killed one's actor comes back on another node after
-about 15 s. Not tested: Docker Engine with Docker Compose, arm64, and
-`kill` with Docker (whose restart policy may differ from Podman's).
+about 15 s. CI builds the image with Docker's BuildKit for linux/amd64 and
+linux/arm64 and checks each one starts; the cluster itself is not run
+there. Not tested: the cluster on arm64, Docker Compose, and `kill` with
+Docker (whose restart policy may differ from Podman's).
 
