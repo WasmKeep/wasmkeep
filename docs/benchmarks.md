@@ -798,6 +798,10 @@ serves on loopback; give it a RAM-backed or a disk-backed data directory
 deliberately, as with `TMPDIR`, and record which. `wasmkeep-rust-durable`
 is the same counter with its `POST` durable before it returns
 (`exec-durable`): fsynced on one node, in the bucket with `--bucket`.
+The `celld` target (bucket runs only) is the workerd counter deployed to
+one [celld](https://github.com/denoland/celld) node on the same bucket;
+`bench/celld/fetch.sh` downloads the pinned release and checks its build
+provenance with `gh attestation verify` first.
 
 Before publishing evidence, replace personal directory paths and generated
 scratch paths with repository-relative paths, `[repo]` or `[scratch]`. Stage
