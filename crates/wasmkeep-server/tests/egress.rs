@@ -288,3 +288,81 @@ async fn a_body_cut_short_is_an_error_not_a_partial_success() {
     let big = fetch_from_guest(addr, &format!("http://{server}/big")).await;
     assert_eq!(big, format!("200:{}", "y".repeat(4096)));
 }
+
+/// A server that reads a request's whole body (its Content-Length), then
+/// answers `200 early` and closes at once: so fast that its answer and
+/// close can reach the host before the guest's last flush of that body.
+async fn prompt_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let end = loop {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() - end < len {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nearly")
+                    .await;
+                // Closed at once: the whole body was read, so no reset.
+            });
+        }
+    });
+    addr
+}
+
+/// When the server's answer and close beat the guest's last flush of the
+/// body, the body's stream closes under the guest although the request
+/// succeeded: the answer is what it returns, not "sending the body:
+/// StreamError::Closed". An agent test flaked on this under load. It is a
+/// race, so many requests: under load (the full suite) some lose it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_beats_the_last_flush_is_returned() {
+    let server = prompt_server().await;
+    let data = tempfile::tempdir().unwrap();
+    let addr = start(
+        data.path(),
+        EgressPolicy::allowing(vec!["127.0.0.1".parse().unwrap()]),
+    )
+    .await;
+    let url = format!("http://{server}/upload");
+    let tasks: Vec<_> = (0..200)
+        .map(|i| {
+            let url = url.clone();
+            tokio::spawn(async move {
+                fetch_from_guest_sending(addr, &url, 1 + (i % 8) * 1500).await
+            })
+        })
+        .collect();
+    let mut failed = Vec::new();
+    for task in tasks {
+        let answer = task.await.unwrap();
+        if answer != "200:early" {
+            failed.push(answer);
+        }
+    }
+    assert!(failed.is_empty(), "{} of 200: {:?}", failed.len(), &failed[..failed.len().min(3)]);
+}

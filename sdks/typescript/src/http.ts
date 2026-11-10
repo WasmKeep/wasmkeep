@@ -16,6 +16,7 @@ import {
   OutgoingBody,
   OutgoingRequest,
   RequestOptions,
+  type IncomingResponse,
   httpErrorCode,
   type Method,
 } from "wasi:http/types@0.2.12";
@@ -177,14 +178,20 @@ export function fetch(url: string, options: FetchOptions = {}): Fetched {
       dispose(stream);
     }
     if (failure !== undefined) {
-      // The stream closes when the request fails (refused, no
-      // connection): the response says why, where it can.
+      // The body's stream closes when the request ends before the guest
+      // is done with it: either it failed (refused, no connection), and
+      // the response says why where it can, or the server already
+      // answered and closed (it had the whole body, or answered early),
+      // and that answer is the result.
       dispose(outgoing);
       const result = wait();
-      if (result.tag === "ok" && result.val.tag === "err") {
+      if (result.tag !== "ok") {
+        throw new FetchError(`${url}: sending the body: ${describe(failure)}`);
+      }
+      if (result.val.tag === "err") {
         throw new FetchError(`${url}: ${describe(result.val.val)}`);
       }
-      throw new FetchError(`${url}: sending the body: ${describe(failure)}`);
+      return readResponse(url, result.val.val, options);
     }
   }
   try {
@@ -196,8 +203,11 @@ export function fetch(url: string, options: FetchOptions = {}): Fetched {
   const result = wait();
   if (result.tag === "err") throw new FetchError(`${url}: response already taken`);
   if (result.val.tag === "err") throw new FetchError(`${url}: ${describe(result.val.val)}`);
-  const response = result.val.val;
+  return readResponse(url, result.val.val, options);
+}
 
+/** Reads `response`'s body (up to the limit) and headers. */
+function readResponse(url: string, response: IncomingResponse, options: FetchOptions): Fetched {
   const limit = options.limit ?? 16 * 1024 * 1024;
   const chunks: Uint8Array[] = [];
   let total = 0;

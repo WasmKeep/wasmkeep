@@ -161,30 +161,37 @@ pub fn fetch(
         }
         future.subscribe().block();
     };
+    let mut sent = Ok(());
     if !body.is_empty() {
         let mut stream = outgoing
             .write()
             .map_err(|()| "request body unavailable".to_owned())?;
-        let sent = stream
+        sent = stream
             .write_all(body)
             .map_err(|e| e.to_string())
             .and_then(|()| stream.flush().map_err(|e| e.to_string()));
-        if let Err(e) = sent {
-            // The stream closes when the request fails (refused, no
-            // connection): the response says why, where it can.
-            drop(stream);
-            drop(outgoing);
-            return Err(match wait() {
-                Ok(Err(code)) => format!("{code:?}"),
-                _ => format!("sending the body: {e}"),
-            });
-        }
     }
-    OutgoingBody::finish(outgoing, None).map_err(|e| format!("{e:?}"))?;
-
-    let response = wait()
-        .map_err(|()| "response already taken".to_owned())?
-        .map_err(|e| format!("{e:?}"))?;
+    let response = match sent {
+        Ok(()) => {
+            OutgoingBody::finish(outgoing, None).map_err(|e| format!("{e:?}"))?;
+            wait()
+                .map_err(|()| "response already taken".to_owned())?
+                .map_err(|e| format!("{e:?}"))?
+        }
+        // The body's stream closes when the request ends before the guest
+        // is done with it: either it failed (refused, no connection), and
+        // the response says why where it can, or the server already
+        // answered and closed (it had the whole body, or answered early),
+        // and that answer is the result.
+        Err(e) => {
+            drop(outgoing);
+            match wait() {
+                Ok(Ok(response)) => response,
+                Ok(Err(code)) => return Err(format!("{code:?}")),
+                Err(()) => return Err(format!("sending the body: {e}")),
+            }
+        }
+    };
     let status = response.status();
     let incoming = response
         .consume()
