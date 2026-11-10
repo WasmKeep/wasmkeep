@@ -62,8 +62,8 @@ Done:
   they embed a runtime: 2.2× (TypeScript on QuickJS) to 2.5× (Python) the
   CPU per request on a workstation, about 4× on a small VM (TypeScript on
   StarlingMonkey and Python; that run had no QuickJS build), and more
-  memory per actor); Go through TinyGo (experimental: a counter and the
-  key-value, queue and workflow clients pass)
+  memory per actor); Go through TinyGo (experimental at the release; since
+  supported, with an SDK)
 - ✅ A documentation site: concepts, generated API reference, and
   deployment guides (single VPS, three nodes, where to run it, what to put
   in front)

@@ -166,9 +166,8 @@ Trade-offs:
   1.5× for Rust ([measured](benchmarks.md#the-same-counter-in-every-language)).
   Allocating less per event shortens it.
 - **TinyGo, not Go.** TinyGo compiles most of the standard library, not
-  all of it (its [package support](https://tinygo.org/docs/reference/lang-support/stdlib/)
-  page lists what builds); the SDK keeps to packages it handles well (no
-  `fmt` or reflection).
+  all of it (its documentation lists which packages build); the SDK keeps
+  to packages it handles well (no `fmt` or reflection).
 - **Size.** 162 KB for the counter, about twice Rust's; `strconv`'s number
   parsing alone adds about 50 KB, so the SDK reads integers from SQLite
   without it.

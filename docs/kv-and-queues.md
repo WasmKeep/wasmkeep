@@ -332,9 +332,9 @@ The names and semantics follow the Rust ones (`GetFresh`,
   `x-wasmkeep-caller` header (`""` when absent) and the body, and returns
   the status, content type and body to answer. A handler that panics
   traps the event: the queue retries the whole batch with its backoff.
-- **TinyGo, experimental**: Go is experimental in WasmKeep. The module
-  avoids reflection-heavy packages (no `fmt`), so it suits TinyGo's
-  `wasip2` target, and its unit tests run with plain `go test`.
+- **For TinyGo**: the clients avoid reflection-heavy packages (no
+  `fmt`), so they suit TinyGo's `wasip2` target, and their unit tests run
+  with plain `go test`.
 
 ## C
 

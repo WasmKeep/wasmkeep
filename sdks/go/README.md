@@ -59,8 +59,10 @@ committed in `internal/gen`. The `actor-tinygo` world is the actor world
 plus the `wasi:filesystem` imports TinyGo's runtime makes whether or not a
 program uses them (the host provides them inert: no directories).
 
-Until the module is published, reference it from the app's `go.mod` with a
-`replace` directive, as the examples do:
+The `wasmkeep` package is newer than the module's last tag
+(`sdks/go/v0.1.0`, which has only the clients): until the next tag,
+reference a checkout from the app's `go.mod` with a `replace` directive,
+as the examples do:
 
 ```text
 require github.com/wasmkeep/wasmkeep/sdks/go v0.0.0
