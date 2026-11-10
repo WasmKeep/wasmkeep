@@ -325,7 +325,9 @@ async fn prompt_server() -> SocketAddr {
                     buf.extend_from_slice(&chunk[..n]);
                 }
                 let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nearly")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nearly",
+                    )
                     .await;
                 // Closed at once: the whole body was read, so no reset.
             });
@@ -352,9 +354,9 @@ async fn an_answer_that_beats_the_last_flush_is_returned() {
     let tasks: Vec<_> = (0..200)
         .map(|i| {
             let url = url.clone();
-            tokio::spawn(async move {
-                fetch_from_guest_sending(addr, &url, 1 + (i % 8) * 1500).await
-            })
+            tokio::spawn(
+                async move { fetch_from_guest_sending(addr, &url, 1 + (i % 8) * 1500).await },
+            )
         })
         .collect();
     let mut failed = Vec::new();
@@ -364,5 +366,10 @@ async fn an_answer_that_beats_the_last_flush_is_returned() {
             failed.push(answer);
         }
     }
-    assert!(failed.is_empty(), "{} of 200: {:?}", failed.len(), &failed[..failed.len().min(3)]);
+    assert!(
+        failed.is_empty(),
+        "{} of 200: {:?}",
+        failed.len(),
+        &failed[..failed.len().min(3)]
+    );
 }
