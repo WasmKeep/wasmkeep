@@ -265,6 +265,22 @@ fn celld() -> Server {
     );
     let mut command = Command::new(&bin);
     with_bucket(&mut command);
+    // Transparent huge pages off for celld, as `wasmkeep serve` turns them
+    // off for itself: on a kernel set to `always`, celld's resident memory
+    // with 1000 actors read 609 MB with them and 396 MB without
+    // (bench/results/2026-11-10-e3856a5.csv and -f163ba0.csv).
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs in the child between fork and exec and
+        // makes a single prctl system call: it allocates nothing and takes
+        // no lock.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::thread::disable_transparent_huge_pages(true).map_err(Into::into)
+            });
+        }
+    }
     let child = command
         .args(["--listen", &addr.to_string()])
         .env("CELLD_WATCH", dir.0.join("state"))
