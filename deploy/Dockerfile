@@ -9,6 +9,13 @@
 # rust-toolchain.toml; the default (last) stage is the release image. The
 # `demo` stage adds the counter example, for deploy/compose/ only.
 #
+# The image carries LICENSE and NOTICE under /usr/share/doc/wasmkeep/, and
+# the third-party notices when the build is given them as the `notices`
+# context (the release workflow does):
+#
+#   scripts/notices.sh
+#   docker buildx build -f deploy/Dockerfile --build-context notices=target/notices .
+#
 # Base images are pinned by the digest of their multi-architecture index.
 # Both are Debian 13, so the binary's glibc matches the runtime's: move them
 # together. To refresh, resolve the new index digest of each tag (for example
@@ -17,6 +24,11 @@
 
 ARG RUST_IMAGE=docker.io/library/rust:1.99.1-slim-trixie@sha256:7eab7ce19273ce785e0ca7578bdf7bc1fcbae621775a8197379a04c9f6e03cd5
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
+
+# Replaced by a `notices` build context when given one (see above); by
+# default it holds NOTICE alone, so the copy below never reads an empty stage.
+FROM scratch AS notices
+COPY NOTICE /
 
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /src
@@ -29,6 +41,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p wasmkeep-cli \
  && install -D -m 0755 target/release/wasmkeep /out/usr/local/bin/wasmkeep \
+ && install -D -m 0644 -t /out/usr/share/doc/wasmkeep LICENSE NOTICE \
  && install -d -o 65532 -g 65532 /out/var/lib/wasmkeep /out/var/lib/wasmkeep/data /out/var/lib/wasmkeep/cache
 
 # The counter example, built for wasm32-wasip2 (used by the demo stage only;
@@ -42,6 +55,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM ${RUNTIME_IMAGE} AS runtime
 COPY --from=builder /out/ /
+COPY --from=notices / /usr/share/doc/wasmkeep/
 USER 65532:65532
 WORKDIR /var/lib/wasmkeep
 EXPOSE 8080 7443
