@@ -156,9 +156,10 @@ Continuing alongside, without holding the release:
 - 🚧 More languages, in order: ✅ TypeScript on QuickJS, now the default
   engine (4.6× less memory per actor than StarlingMonkey, which stays an
   option for Web APIs; [ADR 0018](docs/adr/0018-quickjs-the-default-typescript-engine.md)),
-  Go (finish TinyGo, then standard Go through componentize-go), D,
-  MoonBit, then a C# spike. Java, Kotlin and PHP cannot produce an actor
-  yet; languages that need Wasm garbage collection wait on a decision of
+  ✅ Go on TinyGo, now supported (the [Go SDK](sdks/go): its counter,
+  chat room and jobs app pass the shared tests), then standard Go through
+  componentize-go, D, MoonBit, then a C# spike. Java, Kotlin and PHP
+  cannot produce an actor yet; languages that need Wasm garbage collection wait on a decision of
   their own
 - 🚧 The benchmark showdown suite (below): the counter comparison runs today
 

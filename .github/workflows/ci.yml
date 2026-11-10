@@ -248,7 +248,9 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.24.7"
-          cache-dependency-path: examples/go-*/go.sum
+          cache-dependency-path: |
+            sdks/go/go.sum
+            examples/go-*/go.sum
       - name: toolchains (Go)
         run: |
           curl -sSL https://github.com/tinygo-org/tinygo/releases/download/v0.39.0/tinygo0.39.0.linux-amd64.tar.gz | tar xz -C "$RUNNER_TEMP"
@@ -263,6 +265,11 @@ jobs:
           git diff --exit-code -- wit types
           npm run check
           npm test
+      - name: Go SDK (bindings and WIT in sync with the host)
+        run: |
+          sdks/go/scripts/generate.sh
+          git add -N sdks/go
+          git diff --exit-code -- sdks/go/internal/gen sdks/go/wit
       - name: build every example
         run: |
           for ex in examples/ts-*/; do (cd "$ex" && npm ci && npm run build && npm run build:starlingmonkey); done
@@ -270,8 +277,9 @@ jobs:
           for ex in examples/zig-*/; do ZIG="python -m ziglang" "$ex/build.sh"; done
           for ex in examples/py-*/; do "$ex/build.sh"; done
           for ex in examples/go-*/; do "$ex/build.sh"; done
+          crates/wasmkeep-server/tests/guests/go-fetch/build.sh
       - name: the counter contract and the chat suite, against every language
-        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --locked
+        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
 
   docs:
     name: docs site
