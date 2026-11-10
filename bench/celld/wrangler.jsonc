@@ -1,0 +1,10 @@
+// The workerd counter (bench/workerd/counter.js, copied in as index.js by
+// bench/compare) deployed to celld: one Durable Object per name, its value
+// in the object's SQLite database.
+{
+  "name": "counter",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "COUNTER", "class_name": "Counter" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }]
+}

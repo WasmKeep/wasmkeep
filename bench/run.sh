@@ -78,9 +78,17 @@ target/release/compare $targets | while IFS=, read -r bench value unit; do
   echo "\"$date\",\"$commit\",\"$host\",\"$cpu\",\"$cores\",\"$rustc\",\"$bench\",$value,,,,\"$unit\"" >> "$out"
 done
 # The Rust counter again as a one-node cluster on a bucket (compare-bucket/
-# rows): only with WASMKEEP_COMPARE_BUCKET=s3://... and AWS_* pointing at it.
+# rows), and celld on the same bucket when bench/celld/fetch.sh has
+# downloaded it: only with WASMKEEP_COMPARE_BUCKET=s3://... and AWS_*
+# pointing at it.
 if [ -n "${WASMKEEP_COMPARE_BUCKET:-}" ]; then
-  target/release/compare --bucket wasmkeep-rust wasmkeep-rust-durable | while IFS=, read -r bench value unit; do
+  bucket_targets="wasmkeep-rust wasmkeep-rust-durable"
+  if [ -x "${CELLD_BIN:-target/celld/v0.6.3/celld}" ]; then
+    bucket_targets="$bucket_targets celld"
+  else
+    echo "skipping celld: run bench/celld/fetch.sh (or set CELLD_BIN)" >&2
+  fi
+  target/release/compare --bucket $bucket_targets | while IFS=, read -r bench value unit; do
     echo "\"$date\",\"$commit\",\"$host\",\"$cpu\",\"$cores\",\"$rustc\",\"$bench\",$value,,,,\"$unit\"" >> "$out"
   done
 fi

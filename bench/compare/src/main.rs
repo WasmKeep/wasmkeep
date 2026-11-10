@@ -10,8 +10,14 @@
 //! ```text
 //! compare [--quick] [--bucket] TARGET...
 //! TARGET = wasmkeep-rust | wasmkeep-rust-durable | wasmkeep-zig | wasmkeep-c |
-//! wasmkeep-go | wasmkeep-ts | wasmkeep-ts-starlingmonkey | wasmkeep-py | workerd
+//! wasmkeep-go | wasmkeep-ts | wasmkeep-ts-starlingmonkey | wasmkeep-py | workerd |
+//! celld
 //! ```
+//!
+//! `celld` (with `--bucket` only: it always replicates to a bucket) is the
+//! workerd counter deployed to one celld node with `celld deploy`; on one
+//! node a write returns once the bucket has it. `bench/celld/fetch.sh`
+//! downloads the pinned release.
 //!
 //! `wasmkeep-rust-durable` is the Rust counter built with its `durable`
 //! feature: `POST` returns once the increment is durable (`exec-durable`),
@@ -27,7 +33,7 @@
 //! Prints CSV rows `bench,value,unit` on stdout (`bench/run.sh` adds them to
 //! the results file). Paths come from the environment, with defaults
 //! relative to the repository root (the working directory):
-//! `WASMKEEP_BIN`, `WORKERD_BIN`.
+//! `WASMKEEP_BIN`, `WORKERD_BIN`, `CELLD_BIN`.
 //!
 //! Requires Bash for `bench/preflight.sh` and an inherited soft descriptor
 //! limit of at least 4096 for the full workload or 1024 in `--quick` mode:
@@ -201,6 +207,75 @@ fn workerd() -> Server {
         .current_dir(&dir.0)
         .stdout(Stdio::null())
         .stderr(log_file("workerd"))
+        .spawn()
+        .unwrap_or_else(|e| panic!("{}: {e}", bin.display()));
+    Server {
+        child,
+        addr,
+        path: |name| format!("/counter/{name}"),
+        _dir: dir,
+    }
+}
+
+/// The celld release `bench/celld/fetch.sh` downloads.
+const CELLD_DEFAULT: &str = "target/celld/v0.6.3/celld";
+
+/// One celld node on the run's bucket, serving the workerd counter. The
+/// project is deployed to the bucket first (`celld deploy`), as celld runs
+/// only what is deployed there. Its local state and its log stay outside the
+/// project directory.
+fn celld() -> Server {
+    let Some(bucket) = BUCKET.get() else {
+        panic!("celld needs --bucket: it always replicates to a bucket");
+    };
+    let bucket = [bucket.as_str(), "celld"].join("/");
+    let dir = TempDir::new("celld");
+    let addr = free_addr();
+    let project = dir.0.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::copy("bench/celld/wrangler.jsonc", project.join("wrangler.jsonc"))
+        .expect("bench/celld/wrangler.jsonc");
+    std::fs::copy("bench/workerd/counter.js", project.join("index.js"))
+        .expect("bench/workerd/counter.js");
+    let bin = env_path("CELLD_BIN", CELLD_DEFAULT);
+    let bin = std::fs::canonicalize(&bin).unwrap_or_else(|_| {
+        panic!(
+            "{}: missing; run bench/celld/fetch.sh or set CELLD_BIN",
+            bin.display()
+        )
+    });
+    let endpoint = std::env::var("AWS_ENDPOINT").ok();
+    let with_bucket = |command: &mut Command| {
+        command.arg("--bucket").arg(&bucket);
+        if let Some(endpoint) = &endpoint {
+            command.arg("--endpoint").arg(endpoint);
+        }
+    };
+    let mut deploy = Command::new(&bin);
+    deploy.arg("deploy").arg(&project);
+    with_bucket(&mut deploy);
+    let deployed = deploy
+        .stdout(Stdio::null())
+        .stderr(log_file("celld-deploy"))
+        .status()
+        .unwrap_or_else(|e| panic!("{}: {e}", bin.display()));
+    assert!(
+        deployed.success(),
+        "celld deploy failed: see target/compare-celld-deploy.log"
+    );
+    let mut command = Command::new(&bin);
+    with_bucket(&mut command);
+    let child = command
+        .args(["--listen", &addr.to_string()])
+        .env("CELLD_WATCH", dir.0.join("state"))
+        // One node: readiness need not wait for the rest of a fleet, and a
+        // write returns once the bucket has it (what `fleet` falls back to
+        // without followers), said explicitly.
+        .env("CELLD_READY_FLEET_GATE_MS", "0")
+        .env("CELLD_DURABILITY", "bucket")
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(log_file("celld"))
         .spawn()
         .unwrap_or_else(|e| panic!("{}: {e}", bin.display()));
     Server {
@@ -395,6 +470,7 @@ fn run(target: &str, workload: Workload) {
             wasmkeep(label, &wasm)
         }
         ("workerd", None) => workerd(),
+        ("celld", None) => celld(),
         (other, None) => panic!("unknown target {other}"),
     };
     let pid = server.child.id();
@@ -523,7 +599,7 @@ fn main() {
     let targets: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if targets.is_empty() {
         eprintln!(
-            "usage: compare [--quick] [--bucket] wasmkeep-rust|wasmkeep-rust-durable|wasmkeep-zig|wasmkeep-c|wasmkeep-go|wasmkeep-ts|wasmkeep-ts-starlingmonkey|wasmkeep-py|workerd ..."
+            "usage: compare [--quick] [--bucket] wasmkeep-rust|wasmkeep-rust-durable|wasmkeep-zig|wasmkeep-c|wasmkeep-go|wasmkeep-ts|wasmkeep-ts-starlingmonkey|wasmkeep-py|workerd|celld ..."
         );
         std::process::exit(2);
     }
