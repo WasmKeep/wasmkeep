@@ -142,6 +142,23 @@ keeps data under `/var/lib/wasmkeep` (mount a volume there), and its entrypoint 
 `docker run --rm wasmkeep serve ...` takes the same flags as the binary.
 There is no `HEALTHCHECK` (nothing in the image could run one); health-check
 `GET /_wasmkeep/ready` from the orchestrator or load balancer instead.
+LICENSE, NOTICE and, in released images, the third-party notices are in
+`/usr/share/doc/wasmkeep/`.
+
+From the first release on, CI publishes the image for linux/amd64 and
+linux/arm64 as `ghcr.io/wasmkeep/wasmkeep:<version>`, signed with keyless
+cosign like the release binaries. To check it before running it (cosign 3),
+here for `v0.1.0`:
+
+```bash
+cosign verify ghcr.io/wasmkeep/wasmkeep:0.1.0 \
+  --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.1.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+It prints the verified digest; pin that digest (`ghcr.io/wasmkeep/wasmkeep@sha256:...`)
+in your deployment rather than the tag. The `dev` tag is a test build of
+the release process, overwritten without notice: do not deploy it.
 
 `scripts/sbom.sh` writes a CycloneDX SBOM of the binary (every crate
 compiled into it, from `Cargo.lock`) to `target/sbom/`.

@@ -12,6 +12,13 @@ name: release
 # Sigstore bundle (<file>.sigstore.json) from keyless cosign signing: the
 # certificate names this workflow and the ref it ran on. docs/deploy/single-node.md
 # says how to verify.
+#
+# The container image (deploy/Dockerfile, with the third-party notices) is
+# built for linux/amd64 and linux/arm64 on native runners, pushed to
+# ghcr.io/wasmkeep/wasmkeep by digest, joined into one index and signed
+# with keyless cosign: tagged X.Y.Z for a tag, `dev` for a run by hand. A
+# pull request builds it without pushing. deploy/compose/README.md says how
+# to verify.
 
 on:
   push:
@@ -26,6 +33,8 @@ on:
       - about.toml
       - about.hbs
       - Cargo.lock
+      - deploy/Dockerfile
+      - .dockerignore
 
 permissions:
   contents: read
@@ -184,3 +193,100 @@ jobs:
               --title "WasmKeep $TAG" \
               --notes "Binaries for x86_64 and aarch64 Linux (glibc 2.28 or newer), each with its SBOM and third-party notices. Verify with the Sigstore bundles: see docs/deploy/single-node.md."
           fi
+
+  image-build:
+    name: image (${{ matrix.platform }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write   # push by digest (not on pull requests)
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      PUSH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-about@0.9.3
+      - name: Third-party notices for the image
+        run: ./scripts/notices.sh
+      - name: BuildKit builder
+        run: docker buildx create --use --name wasmkeep --driver docker-container
+      - name: Build, and check the image runs
+        run: |
+          docker buildx build -f deploy/Dockerfile --platform "$PLATFORM" \
+            --build-context notices=target/notices --provenance=false --sbom=false \
+            --load -t wasmkeep:test .
+          docker run --rm wasmkeep:test --version
+      - name: The documented local build (no notices context) still works
+        run: docker buildx build -f deploy/Dockerfile --platform "$PLATFORM" --provenance=false .
+      - name: Push by digest
+        if: env.PUSH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker buildx build -f deploy/Dockerfile --platform "$PLATFORM" \
+            --build-context notices=target/notices --provenance=false --sbom=false \
+            --output "type=image,name=$image,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file meta.json .
+          digest=$(jq -r '."containerimage.digest"' meta.json)
+          echo "pushed $image@$digest"
+          mkdir -p digests && touch "digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: env.PUSH == 'true'
+        with:
+          name: image-digest-${{ matrix.runner }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    name: image index and signature
+    needs: image-build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: write   # the index and its signature
+      id-token: write   # keyless signing: the workflow's OIDC identity
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: image-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: One index for both platforms, signed and verified
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
+          if [ "$REF_TYPE" = tag ]; then tag=${REF_NAME#v}; else tag=dev; fi
+          [ "$(ls digests | wc -l)" = 2 ] || { echo "::error::expected two platform digests"; ls digests; exit 1; }
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker buildx imagetools create -t "$image:$tag" $(printf "$image@sha256:%s " $(ls digests))
+          digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+          docker buildx imagetools inspect "$image@$digest"
+          cosign sign --yes "$image@$digest"
+          cosign verify "$image@$digest" --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$image:$tag\` = \`$image@$digest\` (signed)" >> "$GITHUB_STEP_SUMMARY"
