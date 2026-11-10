@@ -267,8 +267,8 @@ fn celld() -> Server {
     with_bucket(&mut command);
     // Transparent huge pages off for celld, as `wasmkeep serve` turns them
     // off for itself: on a kernel set to `always`, celld's resident memory
-    // with 1000 actors read about 590 MB with them and 395 MB without,
-    // while its latency and CPU did not move.
+    // with 1000 actors read 609 MB with them and 396 MB without
+    // (bench/results/2026-11-10-e3856a5.csv and -f163ba0.csv).
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
