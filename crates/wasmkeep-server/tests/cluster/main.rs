@@ -328,6 +328,27 @@ async fn send_reachable(addr: SocketAddr, method: &str, path: &str, extra: &str)
     }
 }
 
+/// [`send`], sent again (for up to 10 s) while the node refuses the event
+/// before running it: "this node cannot run the actor now; retry" (503).
+/// A node whose own lease lapsed takes no actor until its next lease write
+/// lands (ADR 0020); a stall past the tests' 1 s ttl causes that, such as
+/// a debug build compiling a new deploy on a loaded machine. Every such
+/// refusal is sent before the actor's handler runs, so a retried write is
+/// not applied twice. Only for a node expected to run the actor: where
+/// the refusal is the expected answer, use [`send`].
+async fn send_runnable(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = send(addr, method, path, extra).await;
+        let refused =
+            reply.status == 503 && reply.body.trim() == "this node cannot run the actor now; retry";
+        if !refused || tokio::time::Instant::now() >= deadline {
+            return reply;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn not_in_view(reply: &Reply) -> bool {
     let body = reply.body.trim();
     (reply.status == 503 && body == "the actor's node is not reachable; retry")
@@ -1124,9 +1145,11 @@ async fn never_runs_older_code(fault_first: bool) {
         .await
         .unwrap();
     runs_deploy(&a_service, 2).await;
+    // Through `send_runnable` until x hibernates: the compile just before
+    // can stall the process past a's lease, which a refuses for a moment.
     if fault_first {
         wasmkeep_storage::faults::fail_next("set_meta:deploy_seq");
-        let r = send(a.addr, "GET", "/actor/c/x/durable", "").await;
+        let r = send_runnable(a.addr, "GET", "/actor/c/x/durable", "").await;
         assert_eq!(
             r.status, 500,
             "the injected fault fails the event: {}",
@@ -1134,9 +1157,9 @@ async fn never_runs_older_code(fault_first: bool) {
         );
     }
     // Only v2 (the test actor) answers `GET /durable` with 0 at first.
-    let r = send(a.addr, "GET", "/actor/c/x/durable", "").await;
-    assert_eq!(r.body.trim(), "0", "a runs v2");
-    let r = send(a.addr, "POST", "/actor/c/x/durable", "").await;
+    let r = send_runnable(a.addr, "GET", "/actor/c/x/durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "0"), "a runs v2");
+    let r = send_runnable(a.addr, "POST", "/actor/c/x/durable", "").await;
     assert_eq!(
         (r.status, r.body.trim(), r.node.as_deref()),
         (200, "1", Some("a"))
