@@ -9,6 +9,8 @@
 //!
 //! ```text
 //! compare [--quick] [--bucket] TARGET...
+//! compare [--quick] --cluster CLUSTER_TARGET...
+//! CLUSTER_TARGET = wasmkeep-rust-durable | wasmkeep-rust | celld-fleet | celld-bucket
 //! TARGET = wasmkeep-rust | wasmkeep-rust-durable | wasmkeep-zig | wasmkeep-c |
 //! wasmkeep-go | wasmkeep-ts | wasmkeep-ts-starlingmonkey | wasmkeep-py | workerd |
 //! celld
@@ -22,6 +24,9 @@
 //! `wasmkeep-rust-durable` is the Rust counter built with its `durable`
 //! feature: `POST` returns once the increment is durable (`exec-durable`),
 //! fsynced on one node, in the bucket with `--bucket`.
+//!
+//! `--cluster` runs three nodes of each target on the bucket (see
+//! `cluster.rs`), with takeovers; its rows are `cluster3/...`.
 //!
 //! `--bucket` runs each WasmKeep target as a one-node cluster on the bucket
 //! `WASMKEEP_COMPARE_BUCKET` names (`s3://BUCKET[/PREFIX]`, credentials and
@@ -45,6 +50,8 @@
 
 // A benchmark harness: a broken setup should stop the run loudly.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod cluster;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -228,59 +235,12 @@ fn celld() -> Server {
     let Some(bucket) = BUCKET.get() else {
         panic!("celld needs --bucket: it always replicates to a bucket");
     };
-    let bucket = [bucket.as_str(), "celld"].join("/");
     let dir = TempDir::new("celld");
     let addr = free_addr();
-    let project = dir.0.join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    std::fs::copy("bench/celld/wrangler.jsonc", project.join("wrangler.jsonc"))
-        .expect("bench/celld/wrangler.jsonc");
-    std::fs::copy("bench/workerd/counter.js", project.join("index.js"))
-        .expect("bench/workerd/counter.js");
-    let bin = env_path("CELLD_BIN", CELLD_DEFAULT);
-    let bin = std::fs::canonicalize(&bin).unwrap_or_else(|_| {
-        panic!(
-            "{}: missing; run bench/celld/fetch.sh or set CELLD_BIN",
-            bin.display()
-        )
-    });
-    let endpoint = std::env::var("AWS_ENDPOINT").ok();
-    let with_bucket = |command: &mut Command| {
-        command.arg("--bucket").arg(&bucket);
-        if let Some(endpoint) = &endpoint {
-            command.arg("--endpoint").arg(endpoint);
-        }
-    };
-    let mut deploy = Command::new(&bin);
-    deploy.arg("deploy").arg(&project);
-    with_bucket(&mut deploy);
-    let deployed = deploy
-        .stdout(Stdio::null())
-        .stderr(log_file("celld-deploy"))
-        .status()
-        .unwrap_or_else(|e| panic!("{}: {e}", bin.display()));
-    assert!(
-        deployed.success(),
-        "celld deploy failed: see target/compare-celld-deploy.log"
-    );
+    let (bin, with_bucket) = celld_deploy(&[bucket.as_str(), "celld"].join("/"), &dir.0);
     let mut command = Command::new(&bin);
     with_bucket(&mut command);
-    // Transparent huge pages off for celld, as `wasmkeep serve` turns them
-    // off for itself: on a kernel set to `always`, celld's resident memory
-    // with 1000 actors read 609 MB with them and 396 MB without
-    // (bench/results/2026-11-10-e3856a5.csv and -f163ba0.csv).
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: the closure runs in the child between fork and exec and
-        // makes a single prctl system call: it allocates nothing and takes
-        // no lock.
-        unsafe {
-            command.pre_exec(|| {
-                rustix::thread::disable_transparent_huge_pages(true).map_err(Into::into)
-            });
-        }
-    }
+    no_huge_pages(&mut command);
     let child = command
         .args(["--listen", &addr.to_string()])
         .env("CELLD_WATCH", dir.0.join("state"))
@@ -300,6 +260,68 @@ fn celld() -> Server {
         path: |name| format!("/counter/{name}"),
         _dir: dir,
     }
+}
+
+/// Deploys the workerd counter to `bucket` with `celld deploy`, from a
+/// project made in `dir`. Returns the celld binary and what every celld
+/// command on that bucket needs (`--bucket`, and `--endpoint` from
+/// `AWS_ENDPOINT`).
+fn celld_deploy(bucket: &str, dir: &Path) -> (PathBuf, impl Fn(&mut Command) + Clone + use<>) {
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::copy("bench/celld/wrangler.jsonc", project.join("wrangler.jsonc"))
+        .expect("bench/celld/wrangler.jsonc");
+    std::fs::copy("bench/workerd/counter.js", project.join("index.js"))
+        .expect("bench/workerd/counter.js");
+    let bin = env_path("CELLD_BIN", CELLD_DEFAULT);
+    let bin = std::fs::canonicalize(&bin).unwrap_or_else(|_| {
+        panic!(
+            "{}: missing; run bench/celld/fetch.sh or set CELLD_BIN",
+            bin.display()
+        )
+    });
+    let endpoint = std::env::var("AWS_ENDPOINT").ok();
+    let bucket = bucket.to_owned();
+    let with_bucket = move |command: &mut Command| {
+        command.arg("--bucket").arg(&bucket);
+        if let Some(endpoint) = &endpoint {
+            command.arg("--endpoint").arg(endpoint);
+        }
+    };
+    let mut deploy = Command::new(&bin);
+    deploy.arg("deploy").arg(&project);
+    with_bucket(&mut deploy);
+    let deployed = deploy
+        .stdout(Stdio::null())
+        .stderr(log_file("celld-deploy"))
+        .status()
+        .unwrap_or_else(|e| panic!("{}: {e}", bin.display()));
+    assert!(
+        deployed.success(),
+        "celld deploy failed: see target/compare-celld-deploy.log"
+    );
+    (bin, with_bucket)
+}
+
+/// Turns transparent huge pages off in the process `command` starts, as
+/// `wasmkeep serve` turns them off for itself: on a kernel set to `always`,
+/// celld's resident memory with 1000 actors read 609 MB with them and
+/// 396 MB without (bench/results/2026-11-10-e3856a5.csv and -f163ba0.csv).
+fn no_huge_pages(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs in the child between fork and exec and
+        // makes a single prctl system call: it allocates nothing and takes
+        // no lock.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::thread::disable_transparent_huge_pages(true).map_err(Into::into)
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
 }
 
 /// The native `workerd` binary npm installed for this platform. The
@@ -352,15 +374,30 @@ impl Client {
     /// Sends a request; returns the status once the whole response is in
     /// (chunked or with a content length).
     fn send(&mut self, method: &str, path: &str) -> u16 {
+        match self.try_send(method, path) {
+            Ok((status, _)) => status,
+            Err(e) => panic!("{method} {path}: {e}"),
+        }
+    }
+
+    /// [`Client::send`] that reports a failed connection instead of
+    /// panicking, and returns the body too (a single chunk, if chunked). A
+    /// connection that failed is not to be used again: a late response may
+    /// still be on it.
+    fn try_send(&mut self, method: &str, path: &str) -> std::io::Result<(u16, String)> {
         write!(
             self.stream,
             "{method} {path} HTTP/1.1\r\nHost: bench\r\nContent-Length: 0\r\n\r\n"
-        )
-        .expect("write");
+        )?;
         let mut total = 0;
         loop {
-            let n = self.stream.read(&mut self.buf[total..]).expect("read");
-            assert!(n > 0, "connection closed");
+            if total == self.buf.len() {
+                self.buf.resize(total * 2, 0);
+            }
+            let n = self.stream.read(&mut self.buf[total..])?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
             total += n;
             let data = &self.buf[..total];
             let Some(head_end) = find(data, b"\r\n\r\n") else {
@@ -378,13 +415,18 @@ impl Client {
                 k.eq_ignore_ascii_case("content-length")
                     .then(|| v.trim().parse::<usize>().ok())?
             });
-            let done = match length {
-                Some(len) => body.len() >= len,
-                None => body.ends_with(b"0\r\n\r\n"),
+            let body = match length {
+                Some(len) if body.len() >= len => &body[..len],
+                None if body.ends_with(b"0\r\n\r\n") => {
+                    // `<size>\r\n<data>\r\n0\r\n\r\n`: the first chunk is enough
+                    // for the short bodies compared here.
+                    let start = find(body, b"\r\n").map_or(0, |i| i + 2);
+                    let end = find(&body[start..], b"\r\n").map_or(start, |i| start + i);
+                    &body[start..end]
+                }
+                _ => continue,
             };
-            if done {
-                return status;
-            }
+            return Ok((status, String::from_utf8_lossy(body).into_owned()));
         }
     }
 }
@@ -615,11 +657,12 @@ fn main() {
     let targets: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if targets.is_empty() {
         eprintln!(
-            "usage: compare [--quick] [--bucket] wasmkeep-rust|wasmkeep-rust-durable|wasmkeep-zig|wasmkeep-c|wasmkeep-go|wasmkeep-ts|wasmkeep-ts-starlingmonkey|wasmkeep-py|workerd|celld ..."
+            "usage: compare [--quick] [--bucket|--cluster] wasmkeep-rust|wasmkeep-rust-durable|wasmkeep-zig|wasmkeep-c|wasmkeep-go|wasmkeep-ts|wasmkeep-ts-starlingmonkey|wasmkeep-py|workerd|celld ..."
         );
         std::process::exit(2);
     }
-    if args.iter().any(|a| a == "--bucket") {
+    let cluster = args.iter().any(|a| a == "--cluster");
+    if cluster || args.iter().any(|a| a == "--bucket") {
         let Some(bucket) = std::env::var("WASMKEEP_COMPARE_BUCKET")
             .ok()
             .filter(|b| b.starts_with("s3://"))
@@ -634,9 +677,14 @@ fn main() {
         let _ = BUCKET.set([bucket.trim_end_matches('/'), &run].join("/"));
     }
     let workload = Workload::for_quick(quick);
+    let descriptors = if cluster {
+        cluster::minimum_descriptors(workload)
+    } else {
+        workload.minimum_descriptors()
+    };
     match Command::new("bash")
         .arg("bench/preflight.sh")
-        .arg(workload.minimum_descriptors().to_string())
+        .arg(descriptors.to_string())
         .status()
     {
         Ok(status) if status.success() => {}
@@ -647,7 +695,13 @@ fn main() {
         }
     }
     for target in targets {
-        run(target, workload);
+        if cluster {
+            // Kills and victim actors per kill.
+            let (kills, victims) = if quick { (1, 30) } else { (3, 90) };
+            cluster::run(target, workload, kills, victims);
+        } else {
+            run(target, workload);
+        }
     }
 }
 

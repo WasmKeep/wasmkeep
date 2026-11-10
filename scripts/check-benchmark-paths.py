@@ -69,6 +69,7 @@ PUBLIC_DOC_ROUTES = {"/metrics"}
 # complete candidates rather than exempting a whole line, directory, or /var.
 REVIEWED_PATHS = {
     "bench/compare/src/main.rs": {"/actor/counter/{name}", "/counter/{name}", "/work"},
+    "bench/compare/src/cluster.rs": {"/actor/counter/{name}", "/counter/{name}"},
     "bench/workerd/config.capnp": {"/workerd/workerd.capnp"},
     "bench/workerd/counter.js": {"/counter/", "/counter/{name}"},
     "docs/benchmarks.md": {"/work"},
@@ -113,6 +114,11 @@ REVIEWED_LITERALS = {
     ),
     # The same reviewed expressions in the soak's runner, and its sed
     # program reading the soak's metric lines.
+    # The same reviewed expressions in the three-node comparison's runner.
+    "bench/cluster.sh": (
+        "'s/^Model name: *//p'",
+        '$(dirname "$0")/..',
+    ),
     "bench/soak.sh": (
         "'s/^Model name: *//p'",
         r"'s/^soak_metric \([^ ]*\) \([0-9]*\) \([a-z]*\)$/\1 \2 \3/p'",
