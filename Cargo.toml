@@ -4,7 +4,7 @@ members = ["crates/*", "sim", "bench/compare"]
 exclude = ["examples"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -94,6 +94,16 @@ undocumented_unsafe_blocks = "deny"
 [profile.dev]
 debug = "line-tables-only"
 
+
+# Release binaries without their symbol table: 40 MB instead of 55 MB. A
+# panic's backtrace then shows addresses, not function names (the code
+# denies unwrap, expect and panic). Benchmarks (the bench profile) keep
+# their symbols, for profilers.
+[profile.release]
+strip = "symbols"
+
+[profile.bench]
+strip = "none"
 
 # Wasmtime's code generator, optimized even in dev builds: compiling a large
 # component (a 13 MB JavaScript actor) takes ~40 s with it unoptimized.

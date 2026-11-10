@@ -1,8 +1,9 @@
 name: release
 
 # A tag `vX.Y.Z` (equal to the workspace version) builds the release
-# binaries, signs them and opens a draft pre-release with them; a maintainer
-# reviews and publishes it. Run by hand (workflow_dispatch) it builds and
+# binaries, signs them and opens a draft pre-release with them, its text
+# taken from the version's section of CHANGELOG.md; a maintainer reviews and
+# publishes it. Run by hand (workflow_dispatch) it builds and
 # signs the same files as a workflow artifact, with no release: a dry run.
 # A pull request that changes the packaging runs the build job alone.
 #
@@ -33,6 +34,7 @@ on:
       - about.toml
       - about.hbs
       - Cargo.lock
+      - scripts/release-notes.sh
       - deploy/Dockerfile
       - .dockerignore
 
@@ -81,6 +83,20 @@ jobs:
             label=$version-dev.$(git rev-parse --short=12 HEAD)
           fi
           echo "LABEL=$label" >> "$GITHUB_ENV"
+      - name: Release notes (a tag needs its section in CHANGELOG.md)
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ./scripts/release-notes.sh "$version" > notes.md || true
+          if [ -s notes.md ]; then
+            cat notes.md
+          elif [ "$REF_TYPE" = tag ]; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          else
+            echo "::warning::CHANGELOG.md has no section for $version yet"
+          fi
       - name: Check the host matches the target
         run: |
           [ "$(uname -m)-unknown-linux-gnu" = "$TARGET" ] \
@@ -174,6 +190,13 @@ jobs:
     permissions:
       contents: write   # the draft release
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            CHANGELOG.md
+            scripts/release-notes.sh
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release
@@ -184,14 +207,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          ./scripts/release-notes.sh "${TAG#v}" > notes.md
+          [ -s notes.md ] || { echo "::error::CHANGELOG.md has no section for ${TAG#v}"; exit 1; }
           if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
             # Never replace the files of a published release.
             [ "$draft" = true ] || { echo "::error::release $TAG is already published"; exit 1; }
             gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
           else
             gh release create "$TAG" dist/* --draft --prerelease --verify-tag \
-              --title "WasmKeep $TAG" \
-              --notes "Binaries for x86_64 and aarch64 Linux (glibc 2.28 or newer), each with its SBOM and third-party notices. Verify with the Sigstore bundles: see docs/deploy/single-node.md."
+              --title "WasmKeep $TAG" --notes-file notes.md
           fi
 
   image-build:

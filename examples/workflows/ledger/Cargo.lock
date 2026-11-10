@@ -186,14 +186,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasmkeep-sdk"
-version = "0.0.0"
-dependencies = [
- "wasip2",
- "wit-bindgen 0.63.0",
-]
-
-[[package]]
 name = "wasm-encoder"
 version = "0.262.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -213,6 +205,14 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasmkeep-sdk"
+version = "0.1.0"
+dependencies = [
+ "wasip2",
+ "wit-bindgen 0.63.0",
 ]
 
 [[package]]

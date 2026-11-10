@@ -184,8 +184,8 @@ All of it also builds as a site: `./scripts/docs-site.sh` (needs
 
 ## Status
 
-WasmKeep is young and **pre-alpha**: version `0.0.0`, with no release
-yet.
+WasmKeep is young and **pre-alpha**: its first release, `0.1.0`, is a
+pre-release ([changelog](CHANGELOG.md)).
 
 - **Works, and is tested**: everything in the status note at the top,
   each feature with tests that run before every merge, the node lease,

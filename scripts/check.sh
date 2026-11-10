@@ -43,6 +43,13 @@ if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/typescript/wit ]; then
     echo 'sdks/typescript/wit differs from crates/wasmkeep-wit/wit: run npm run sync in sdks/typescript' >&2; exit 1;
   }
 fi
+# A tag's release text is its version's section of CHANGELOG.md
+# (release.yml): a version bump adds the section in the same change.
+step 'release notes'
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+[ -n "$(./scripts/release-notes.sh "$version")" ] || {
+  echo "CHANGELOG.md has no section for $version, the workspace version" >&2; exit 1;
+}
 
 rust=false; everything=false; simulation=false; scripts=false; preflight=false
 packages=(); sdk_ts=false; sdk_py=false; sdk_go=false; sdk_c=false

@@ -670,8 +670,12 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         block_on(async {
             beat(&store, "a", NOW, false, "acme/shop").await;
-            let old =
-                |at: u64| format!("wasmkeep-node 2\nb\nhttp://b:8080\n0.0.0\n{at}\nacme/shop\n");
+            // The same version as `a`: only the format is old, so the
+            // format is the one warning.
+            let version = env!("CARGO_PKG_VERSION");
+            let old = |at: u64| {
+                format!("wasmkeep-node 2\nb\nhttp://b:8080\n{version}\n{at}\nacme/shop\n")
+            };
             put(&store, "demo/nodes/b", &old(NOW - 1_000)).await;
             put(
                 &store,
