@@ -188,6 +188,94 @@ checking that no other process runs with its node id
   starts; a WasmKeep cluster node waits 15 s first, by design. A single
   node without a bucket does not wait (51 ms above).
 
+## Three nodes: WasmKeep against celld
+
+The same counter on three nodes of each runtime, sharing one bucket, run by
+[`bench/cluster.sh`](../bench/cluster.sh) (`compare --cluster`, rows
+`cluster3/...`). Durable here means what each runtime means by it:
+
+- **WasmKeep, durable** (`exec-durable`): a write answers once the bucket
+  holds it, on any number of nodes.
+- **celld, fleet** (`CELLD_DURABILITY=fleet`, celld's default with two or
+  more nodes): a write answers once a follower node has it on disk, or once
+  the bucket has it, whichever comes first. Up to two followers per
+  object; the bucket upload follows.
+- **celld, bucket** (`CELLD_DURABILITY=bucket`): a write answers once the
+  bucket holds it, as on WasmKeep.
+- **WasmKeep, plain `exec`**: answers before its upload, **not equivalent**,
+  shown apart.
+
+Every node keeps its data on disk (btrfs on an encrypted NVMe SSD; a
+follower's fsync on tmpfs would cost nothing). Both runtimes keep their
+default lease timings (a dead node's actors move after 15 s on WasmKeep,
+10 s on celld) and talk plain HTTP between nodes, since celld has no TLS
+between peers. Every request goes to a node picked at random, so two in
+three are forwarded to the actor's owner. After the steady-state rows,
+each node in turn is killed with SIGKILL while 90 actors are written every
+20 ms, one client per actor retrying every 100 ms through a random node;
+an actor whose first acknowledged write after the kill takes over a second
+was on the dead node. Each client is the only writer of its actors, so a
+value at or below one it was already handed, or a final value below the
+last acknowledged, is an acknowledged write lost. The killed node then
+restarts on its data.
+
+From [`bench/results/2026-11-10-d2dea43-cluster-minio-tmpfs.csv`](../bench/results/2026-11-10-d2dea43-cluster-minio-tmpfs.csv)
+(commit `d2dea43`, a clean tree). **Hardware:** the workstation above, the
+three nodes of a target as processes on it, one target at a time. The
+bucket is the same local MinIO as above, with its data on tmpfs.
+
+| Three nodes, data on disk | WasmKeep, durable | celld, fleet | celld, bucket | WasmKeep, plain `exec` (not equivalent) |
+| --- | --- | --- | --- | --- |
+| Write, through a random node (p50 / p99) | 2.29 / 6.13 ms | 5.08 / 20.2 ms | 2.69 / 4.37 ms | 0.56 / 6.07 ms |
+| Read, through a random node (p50 / p99) | **96 / 165 µs** | 221 / 308 µs | 221 / 316 µs | 96 / 137 µs |
+| First request to a new actor (p50) | 19.4 ms | 20.5 ms | 17.2 ms | 17.1 ms |
+| Memory, three nodes, 1000 resident actors | **441 MB** | 516 MB | 521 MB | 414 MB |
+| Server CPU time per request (8 clients) | 978 µs | 1,774 µs | **929 µs** | 721 µs |
+| Throughput, 8 clients, 1000 actors | 1,679 req/s | 350 req/s | **1,889 req/s** | 13,205 req/s |
+| **Acknowledged writes lost** (3 kills, 270 actors) | **0** | **0** | **0** | **0** |
+| Values handed out twice | **0** | **0** | **0** | **0** |
+| Writable again after its node died (p50 / max) | 15.1 / 16.2 s | **9.1 / 10.4 s** | 9.5 / 9.9 s | 15.0 / 16.4 s |
+| Actors that were on the dead node (of 270) | 96 | 105 | 113 | 96 |
+| Restarted node ready (at most) | 1.55 s | **0.13 s** | 0.12 s | 1.56 s |
+| Cluster start to first response | 15.2 s* | **0.16 s** | 0.16 s | 18.1 s* |
+
+\* Includes the 15 s node-id check of every WasmKeep start
+([cluster](cluster.md#flags)). A node restarted after a kill waits less:
+the surviving nodes have fenced the old process by then.
+
+### How to read it
+
+- **Nobody lost an acknowledged write.** Every runtime and mode handed out
+  each value once and kept every acknowledged write through three kills,
+  plain `exec` included in this run (its writes may be lost with their
+  node, see [three nodes against a real bucket](#three-nodes-against-a-real-bucket)).
+- **On this setup the bucket is faster than a follower's disk.** MinIO on
+  tmpfs answers in well under a millisecond, while a follower's fsync goes
+  to a real disk. So celld's fleet mode, which waits for followers (or the
+  bucket, whichever is first), is its slowest here: 5.08 ms at p50 and
+  350 req/s, against 2.69 ms and 1,889 req/s in bucket mode. A remote
+  bucket takes milliseconds to tens of milliseconds per write, where the
+  follower's disk should win: the same table against a cloud bucket is
+  next.
+- **Durable against bucket-durable, celld writes more per second and costs
+  less CPU.** WasmKeep answers a write 15% faster at p50 (2.29 against
+  2.69 ms) but is slower at p99 (6.13 against 4.37 ms), handles 11% fewer
+  writes per second (1,679 against 1,889) and uses 5% more CPU per write.
+  This reverses the one-node result on tmpfs above. A likely cause, not
+  yet measured: a WasmKeep actor uploads an event's changes before it runs
+  its next event, so writes to one actor wait on each other's uploads.
+- **WasmKeep reads faster and holds less memory.** Reads take 96 against
+  221 µs at p50 (both forwarded two times in three), and three nodes hold
+  1000 actors in 441 against 516 to 521 MB.
+- **Takeover follows the lease timings.** A dead node's actors are writable
+  again after 15 to 16 s on WasmKeep and 9 to 10 s on celld, close to each
+  one's default (15 s and 10 s). Neither side was tuned. A restarted celld
+  node is ready in about 0.1 s; a WasmKeep node in 1.6 s.
+- **Not measured here:** nodes on separate machines (the network between
+  nodes is loopback, so a follower is as close as it gets), a cloud
+  bucket, and mutual TLS between WasmKeep nodes
+  ([measured above](#between-nodes-plain-http-against-mutual-tls)).
+
 ## The same counter in every language
 
 The same actor contract (read, increment, persist) in every guest language
