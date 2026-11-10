@@ -32,6 +32,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: python3 -I scripts/test_check_benchmark_paths.py
+      - run: python3 -I scripts/test_bench_ab.py
       - name: Check every introduced commit
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -103,6 +104,39 @@ jobs:
           echo "MSRV=$msrv" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo +"$MSRV" check --workspace --all-targets --locked
+
+  bench-regression:
+    # Base and this change built and measured on the same runner, interleaved:
+    # shared runners are too noisy to compare with numbers from another run.
+    name: benchmark regression (base vs this change)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Only for changes that can move the numbers
+        id: scope
+        run: |
+          # The checkout is the PR merged into the current base: its first
+          # parent is that base (pull_request.base.sha can be older).
+          echo "BASE_SHA=$(git rev-parse HEAD^1)" >> "$GITHUB_ENV"
+          if git diff --quiet HEAD^1 HEAD -- crates Cargo.toml Cargo.lock \
+              rust-toolchain.toml examples/hello examples/counter scripts/bench-ab.py; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No change to the runtime, server or benchmarked examples: skipped." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.scope.outputs.run == 'true'
+        with:
+          key: bench-ab
+      - name: Compare (fails past +20% on any benchmark)
+        if: steps.scope.outputs.run == 'true'
+        run: python3 -I scripts/bench-ab.py "$BASE_SHA"
 
   sim:
     name: simulation (madsim, 200 seeds)
