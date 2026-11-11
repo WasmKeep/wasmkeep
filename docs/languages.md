@@ -33,6 +33,7 @@ different target, and does not make a language usable here.
 | **TypeScript / JavaScript** | Supported (embedded runtime) | [`@wasmkeep/sdk`](../sdks/typescript): esbuild, then componentize-qjs (QuickJS embedded, pre-initialized); or [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) (StarlingMonkey) with `--engine starlingmonkey` ([below](#typescript-on-quickjs)) | Counter, chat room and [jobs app](../examples/ts-jobs) (KV and queue clients) pass on both engines. QuickJS, the default: 1.7 MB; 230 µs of CPU per request (2.2× Rust) and 741 KB per actor (3×) ([measured](benchmarks.md#the-same-counter-in-every-language)), few Web APIs. StarlingMonkey: Web APIs and 1.5× faster plain JavaScript, for 4.6× the memory per actor ([measured](benchmarks.md#typescript-on-quickjs-against-starlingmonkey)) |
 | **Python** | Supported (embedded runtime) | [Python SDK](../sdks/python), [componentize-py](https://github.com/bytecodealliance/componentize-py) (CPython embedded) | Counter, chat room and [jobs app](../examples/py-jobs) (KV and queue clients) pass. 18.7 MB, the largest; 259 µs of CPU per request (2.5× Rust) and 7.8 MB per actor (31×) ([measured](benchmarks.md#the-same-counter-in-every-language)) |
 | **Go (TinyGo)** | Experimental | TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2` over `wit-bindgen-go` bindings | The [counter](../examples/go-counter) and the [jobs app](../examples/go-jobs) (the [`sdks/go`](../sdks/go) KV and queue clients) pass; 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)); no full SDK, chat room or guide yet (see [Go](#go)) |
+| **C# / .NET** | Experimental (spike) | [componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet) 0.8.0-preview with NativeAOT-LLVM, straight on its bindings | The [counter](../examples/csharp-counter) passes; 929 KB stripped. No SDK, chat room or numbers from `bench/run.sh`; every tool is preview (see [C#](#c-spike)) |
 
 ### Next, in order
 
@@ -48,10 +49,6 @@ Each needs a counter passing the shared tests, and numbers from
 3. **MoonBit** (`wit-bindgen moonbit`): small components; the language is
    pre-1.0 and its string layout changed in 2026, so tool versions must be
    pinned together.
-4. **C# / .NET** ([componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet),
-   NativeAOT-LLVM): a spike first. Everything upstream is preview, the
-   compiler ships from an experimental feed, and there are no macOS builds.
-
 **Bring your own** through the C SDK, the way Zig does: Odin and Nim should
 work (C-sized components); Swift and Haskell are possible with more effort
 (no bindings generator, larger runtimes). Recipes, not SDKs.
@@ -82,6 +79,7 @@ The same counter, as built by each example's `build.sh` (sizes on disk; see
 | Rust | 81 KB |
 | Go (TinyGo) | 151 KB |
 | C | 170 KB |
+| C# | 929 KB (NativeAOT, debug sections stripped) |
 | TypeScript | 1.7 MB (QuickJS engine, the default) |
 | TypeScript on StarlingMonkey | 13.4 MB (StarlingMonkey JS engine) |
 | Python | 18.7 MB (CPython) |
@@ -169,6 +167,47 @@ because Go's runtime assumes it owns all linear memory past its data, while
 the WASI 0.1 adapter needs memory before Go starts: their allocations
 overlap. A small WASI shim that needs no memory of its own would fix it;
 that is future work.
+
+## C# (spike)
+
+C# can produce a WasmKeep actor today. The
+[counter](../examples/csharp-counter) is built with componentize-dotnet
+0.8.0-preview00011 and NativeAOT-LLVM 10.0.0-rc.1 on the .NET 10 SDK, and
+passes the same counter contract as Rust; CI builds it.
+
+What works:
+
+- **The whole world.** componentize-dotnet runs `wit-bindgen c-sharp` on
+  [`crates/wasmkeep-wit/wit`](../crates/wasmkeep-wit/wit) at every build;
+  the app implements two generated interfaces (`IActorWorldExports` for
+  the five hooks, `IIncomingHandlerExports` for requests) and calls the
+  imports as static methods (`IStorageImports.Exec`, ...).
+- **One build command.** `dotnet build` restores the compiler and the
+  tools it needs and writes a WASI 0.2 component directly; no adapter.
+- **Errors as exceptions.** A WIT error result is thrown as a
+  `WitException`; a hook fails its event by throwing
+  `WitException<string>`.
+
+What is missing:
+
+- **Everything is preview.** The compiler comes from Microsoft's
+  dotnet-experimental feed (a release candidate), the packages are
+  previews, and the first restore is about 800 MB.
+- **No macOS.** At the version componentize-dotnet uses, the
+  NativeAOT-LLVM compiler is published for Linux (x64 and arm64) and
+  Windows x64; the macOS packages on the feed are years older, and
+  `Counter.csproj` names the Linux x64 one.
+- **An older filesystem import.** The component imports
+  `wasi:filesystem@0.2.6` where the world has 0.2.12, so
+  `wasm-tools component targets` rejects it; WasmKeep links the imports
+  semver-compatibly and runs it.
+- **No SDK.** The code names generated types in full
+  (`ActorWorld.wit.Imports.wasi.http.v0_2_12.ITypesImports.OutgoingResponse`)
+  and does its own HTTP plumbing; an SDK on the bindings, the chat room
+  and numbers from `bench/run.sh` come before a tier above experimental.
+- **Size.** 2.5 MB as built, 929 KB with its debug sections stripped
+  (`wasm-tools strip --all`, which `build.sh` runs): NativeAOT compiles
+  the runtime and the garbage collector in.
 
 ## What the tiers require
 

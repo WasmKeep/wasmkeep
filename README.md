@@ -51,7 +51,8 @@ own machines.**
   WebSockets.
 - **Any language.** Actors are standard WASI 0.2 components. Rust,
   TypeScript, Python, C and Zig have SDKs and pass the same tests;
-  Go runs through TinyGo; more are next ([languages](docs/languages.md)). An
+  Go runs through TinyGo, and a C# counter through componentize-dotnet;
+  more are next ([languages](docs/languages.md)). An
   actor imports WasmKeep's own interfaces (`wasmkeep:actor`, for storage,
   alarms, calls and sockets) besides WASI, so it runs on a host that
   implements them: WasmKeep today.

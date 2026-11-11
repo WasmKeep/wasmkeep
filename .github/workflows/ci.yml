@@ -255,6 +255,14 @@ jobs:
           echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
           go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: "10.0.x"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # componentize-dotnet and NativeAOT-LLVM: about 800 MB of preview packages.
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('examples/csharp-*/*.csproj', 'examples/csharp-*/nuget.config') }}
       - name: TypeScript SDK (types and WIT in sync with the host, type-check)
         working-directory: sdks/typescript
         run: |
@@ -270,6 +278,7 @@ jobs:
           for ex in examples/zig-*/; do ZIG="python -m ziglang" "$ex/build.sh"; done
           for ex in examples/py-*/; do "$ex/build.sh"; done
           for ex in examples/go-*/; do "$ex/build.sh"; done
+          for ex in examples/csharp-*/; do "$ex/build.sh"; done
       - name: the counter contract and the chat suite, against every language
         run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --locked
 
