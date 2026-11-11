@@ -331,7 +331,8 @@ jobs:
       # The Python SDK as a package: its unit tests, its WIT copy against the
       # host's, then the wheel built, checked and installed alone in a fresh
       # environment. The counter built from that installed wheel replaces the
-      # one built from the tree, so the contract test below runs on it.
+      # one built from the tree, so the contract test below runs on it (the
+      # chat room and the jobs app are still built from the tree).
       - name: Python SDK (unit tests, WIT in sync, wheel built and installed)
         run: |
           sdks/python/test/run.sh
