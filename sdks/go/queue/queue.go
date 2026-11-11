@@ -14,7 +14,7 @@
 // out, a failover), with the same ID: record the ids you handled when a
 // duplicate would matter.
 //
-//	jobs := queue.New("queue/jobs", callActor)
+//	jobs := queue.New("queue/jobs", wasmkeep.Caller)
 //	id, err := jobs.Send([]byte("resize 42"))
 package queue
 

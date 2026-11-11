@@ -126,21 +126,21 @@ orders.cancel("order-42")?;
 
 ### Go
 
-The Go module ([`sdks/go`](../sdks/go), for TinyGo) has the **client**
-only: package `workflow` starts and follows instances of a workflow class
-written with the Rust runner, over the same protocol
-(the `wasmkeep-workflow/v1` routes). As with its [kv and queue
-clients](kv-and-queues.md#go), the app passes its own `actors.Call`
-binding in as a `call.Caller`.
+The [Go SDK](../sdks/go) (for TinyGo) has the **client** only: package
+`workflow` starts and follows instances of a workflow class written with
+the Rust runner, over the same protocol (the `wasmkeep-workflow/v1`
+routes). As with its [kv and queue clients](kv-and-queues.md#go), it sends
+through `wasmkeep.Caller`.
 
 ```go
 import (
 	"errors"
 
+	"github.com/wasmkeep/wasmkeep/sdks/go/wasmkeep"
 	"github.com/wasmkeep/wasmkeep/sdks/go/workflow"
 )
 
-orders := workflow.New("orders", callActor)               // callActor wraps actors.Call
+orders := workflow.New("orders", wasmkeep.Caller)
 status, err := orders.Start("order-42", []byte("item=book")) // *workflow.Status
 status, err = orders.Status("order-42")                    // State, WakeAt, WaitingFor, Output, Error, Positions
 err = orders.SendEvent("order-42", "approved", nil)

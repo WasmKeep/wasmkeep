@@ -68,6 +68,14 @@ fn zig_room() -> Option<Vec<u8>> {
     prebuilt_room("zig-chat-room")
 }
 
+fn go_room() -> Option<Vec<u8>> {
+    prebuilt_room("go-chat-room")
+}
+
+fn d_room() -> Option<Vec<u8>> {
+    prebuilt_room("d-chat-room")
+}
+
 fn moonbit_room() -> Option<Vec<u8>> {
     prebuilt_room("moonbit-chat-room")
 }
@@ -88,6 +96,8 @@ macro_rules! in_every_language {
         in_every_language!(@prebuilt python_room, py_room, $($test),*);
         in_every_language!(@prebuilt c_room, c_room, $($test),*);
         in_every_language!(@prebuilt zig_room, zig_room, $($test),*);
+        in_every_language!(@prebuilt go_room, go_room, $($test),*);
+        in_every_language!(@prebuilt d_room, d_room, $($test),*);
         in_every_language!(@prebuilt moonbit_room, moonbit_room, $($test),*);
     };
     (@prebuilt $module:ident, $room:ident, $($test:ident),*) => {
