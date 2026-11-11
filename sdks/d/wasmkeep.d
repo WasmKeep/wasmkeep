@@ -28,8 +28,9 @@ Hooks: `init()`, `fetch(ref Request) -> Response`, `alarm()`,
 the current `init` or `alarm` event (an alarm is retried).
 
 Memory: everything the SDK returns (rows, text, bodies, replies) lives
-until the current event ends, when the SDK frees it. Copy what must
-outlive the event (with `malloc`).
+until the current event ends, when the SDK frees it, and so do the
+arguments hooks receive (a WebSocket path, message or close reason). Copy
+what must outlive the event (with `malloc`).
 
 The host delivers one event at a time to an actor, in arrival order, so
 nothing here needs locks. The module wraps the bindings `wit-bindgen d`
@@ -661,7 +662,9 @@ mixin template Actor(H) {
             } else static if (!__traits(hasMember, H, "message")) {
                 wasmkeep.fail("this actor takes no WebSockets");
             }
-            return wasmkeep.__finishHook();
+            auto result = wasmkeep.__finishHook(); // copies a failure first: it may point into path
+            wasmkeep.__freeArg(path.ptr);
+            return result;
         }
 
         @(wit.common.witExport("on-websocket-message"))
@@ -671,6 +674,8 @@ mixin template Actor(H) {
                 if (msg.tag == wit.wasmkeep.actor.websockets.imports.Message.Tag.text) H.message(conn, cast(const(ubyte)[]) msg.getText[], false);
                 else H.message(conn, msg.getBinary[], true);
             }
+            if (msg.tag == wit.wasmkeep.actor.websockets.imports.Message.Tag.text) wasmkeep.__freeArg(msg.getText.ptr);
+            else wasmkeep.__freeArg(msg.getBinary.ptr);
             wasmkeep.__endHook();
         }
 
@@ -678,6 +683,7 @@ mixin template Actor(H) {
         @(wit.common.witInterface("$root"))
         void onWebsocketClose(ulong conn, ushort code, in wit.common.WitString reason) {
             static if (__traits(hasMember, H, "close")) H.close(conn, code, reason[]);
+            wasmkeep.__freeArg(reason.ptr);
             wasmkeep.__endHook();
         }
 
@@ -711,6 +717,12 @@ Result!(void, WitString) __finishHook() @trusted {
     }
     __endHook();
     return Result!(void, WitString).makeOk();
+}
+
+/// (For the Actor mixin.) Frees an argument the host passed to an
+/// export: the generated wrappers leave that to the implementation.
+void __freeArg(const(void)* p) @trusted {
+    if (p) free(cast(void*) p);
 }
 
 /// (For the Actor mixin.)

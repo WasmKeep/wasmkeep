@@ -70,7 +70,8 @@ CI builds with LDC 1.43.0, clang and wasi-libc from Ubuntu 24.04, and
 | `deleteSelf()`, `nowMs()`, `eventAlloc(n)`, `eventCopy(s)` | |
 
 **Memory.** Everything the SDK returns (rows, text, bodies, the bodies of
-`reply`) lives until the current event ends, when the SDK frees it:
+`reply`), and the arguments hooks receive (a WebSocket path, message or
+close reason), live until the current event ends, when the SDK frees them:
 nothing needs freeing by hand, and nothing may be kept past the event
 without copying it (with `malloc`). `eventAlloc` and `eventCopy` give the
 app memory with the same lifetime. `replyText` does not copy its text: pass
