@@ -1,0 +1,14 @@
+WasmKeep Python SDK
+Copyright 2026 Julien Turbide
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The WASI interface files in wasmkeep/wit/deps/ (copied from
+crates/wasmkeep-wit/wit/deps/ in the WasmKeep repository) are Copyright the
+Contributors to the WASI Specification, published by the WebAssembly
+Community Group under the W3C Community Contributor License Agreement.
+
+The SDK is built into a component with componentize-py, installed as a
+separate package under its own license. A component built with it embeds
+CPython and componentize-py's runtime, whose notices travel with that
+component.

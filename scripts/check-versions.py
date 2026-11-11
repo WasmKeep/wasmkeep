@@ -20,7 +20,9 @@ root = pathlib.Path(__file__).resolve().parent.parent
 MANIFESTS = [
     ('sdks/typescript/package.json', 'json', ('version',)),
     ('sdks/typescript/package-lock.json', 'json', ('version',)),
-    ('sdks/typescript/package-lock.json', 'json', ('packages', '', 'version')),    ('examples/ts-counter/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
+    ('sdks/typescript/package-lock.json', 'json', ('packages', '', 'version')),
+    ('sdks/python/pyproject.toml', 'toml', ('project', 'version')),
+    ('examples/ts-counter/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-chat-room/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-jobs/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-workflows/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),

@@ -25,6 +25,12 @@ class Versions(unittest.TestCase):
         self.lock('1.2.3', '1.2.3')
         for example in EXAMPLES:
             self.example(example, '1.2.3')
+        self.python('1.2.3')
+
+    def python(self, version):
+        path = self.root / 'sdks/python/pyproject.toml'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'[project]\nname = "sdk"\nversion = "{version}"\n')
 
     def example(self, name, linked):
         # An example's lockfile records the SDK it links by path.
@@ -76,6 +82,10 @@ class Versions(unittest.TestCase):
     def test_another_lockfile_root_package_version_fails(self):
         self.lock('1.2.3', '0.0.0')
         self.fails(f'{LOCK}: packages."".version is 0.0.0')
+
+    def test_another_python_package_version_fails(self):
+        self.python('1.2.2')
+        self.fails('sdks/python/pyproject.toml: project.version is 1.2.2')
 
     def test_an_example_lockfile_with_another_sdk_version_fails(self):
         self.example('ts-jobs', '0.0.0')
