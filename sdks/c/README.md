@@ -31,7 +31,14 @@ void wk_ws_message(uint64_t conn, wk_bytes data, bool binary) {
 }
 ```
 
-Build it (clang with wasi-libc, or wasi-sdk) and serve it; see
+Starting with the release after 0.1.0, a release carries this SDK as
+`wasmkeep-c-sdk-<version>.tar.gz`, signed like its other files: the
+sources with the bindings already generated, the WIT and the componentize
+script, so building needs no clone and no wit-bindgen. Its README has the
+build command for the extracted directory. `WASMKEEP_SDK_VERSION` in
+`wasmkeep.h` is the release's version.
+
+From a clone, build it (clang with wasi-libc, or wasi-sdk) and serve it; see
 [`examples/c-counter/build.sh`](../../examples/c-counter/build.sh), which
 this follows:
 

@@ -4,9 +4,13 @@ The workspace version is `[workspace.package] version` in Cargo.toml (the
 server's, and every workspace crate's). Each entry of MANIFESTS names a file
 and where its version is; a file that is missing, has no version there, or
 has another version fails the check. Add a manifest as one line.
+
+Formats: JSON and TOML (a path of keys), a C header (`#define NAME "x.y.z"`)
+and a Zig file (`pub const name = "x.y.z";`), both by the constant's name.
 """
 import json
 import pathlib
+import re
 import sys
 
 try:
@@ -22,6 +26,8 @@ MANIFESTS = [
     ('sdks/typescript/package-lock.json', 'json', ('version',)),
     ('sdks/typescript/package-lock.json', 'json', ('packages', '', 'version')),
     ('sdks/python/pyproject.toml', 'toml', ('project', 'version')),
+    ('sdks/c/wasmkeep.h', 'c', ('WASMKEEP_SDK_VERSION',)),
+    ('sdks/zig/wasmkeep.zig', 'zig', ('version',)),
     ('examples/ts-counter/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-chat-room/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-jobs/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
@@ -34,6 +40,10 @@ def load(path, kind):
         return json.loads(path.read_text())
     if kind == 'toml':
         return tomllib.loads(path.read_text())
+    if kind == 'c':
+        return dict(re.findall(r'^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+"([^"\n]*)"', path.read_text(), re.M))
+    if kind == 'zig':
+        return dict(re.findall(r'^pub const (\w+)(?: *: *\[\]const u8)? *= *"([^"\n]*)";', path.read_text(), re.M))
     raise ValueError(f'unknown format {kind}')
 
 

@@ -1,0 +1,18 @@
+WasmKeep C SDK
+Copyright 2026 Julien Turbide
+
+This SDK is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Its release archive, wasmkeep-c-sdk-<version>.tar.gz, also contains:
+
+- wit/, a copy of crates/wasmkeep-wit/wit in the WasmKeep repository. The
+  WASI interface files in wit/deps/ are Copyright the Contributors to the
+  WASI Specification, published by the WebAssembly Community Group under
+  the W3C Community Contributor License Agreement.
+- gen/, the C bindings generated from wit/ by wit-bindgen for the `actor`
+  world (actor.h, actor.c, actor_component_type.o), which carry the
+  documentation comments of those files.
+- scripts/componentize-core.sh, from the WasmKeep repository (Apache
+  License, Version 2.0). On its first run it downloads the WASI 0.1
+  adapter from crates.io; the adapter is not in the archive and comes
+  under its own license.

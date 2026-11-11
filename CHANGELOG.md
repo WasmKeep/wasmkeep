@@ -43,6 +43,13 @@ The text under a version's heading is its GitHub release text
   compiled into them come with them, in
   `THIRD_PARTY_NOTICES-components.txt`. The tarball has a short README of
   its own.
+- **C and Zig SDK archives**: a release carries
+  `wasmkeep-c-sdk-<version>.tar.gz` and `wasmkeep-zig-sdk-<version>.tar.gz`,
+  signed like its other files: each SDK with the C bindings already
+  generated, the WIT and the componentize script, and a README whose build
+  command works in the extracted directory, without a clone or
+  wit-bindgen ([C](sdks/c/README.md), [Zig](sdks/zig/README.md)).
+  `WASMKEEP_SDK_VERSION` (C) and `wk.version` (Zig) carry the version.
 - **Releases**: a tag's release waits for CI to pass on the tagged
   commit, and a version's image tag is written once. Publishing the
   release publishes the SDKs to crates.io, npm and PyPI from its tag,
