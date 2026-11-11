@@ -40,7 +40,7 @@
 )]
 pub mod bindings {
     wit_bindgen::generate!({
-        path: "../wasmkeep-wit/wit",
+        path: "wit",
         world: "actor-core",
         pub_export_macro: true,
         export_macro_name: "export_core",

@@ -19,7 +19,8 @@ class Runner(unittest.TestCase):
         for name in ('check.sh', 'doctor.sh', 'release-notes.sh'):
             shutil.copy2(SCRIPTS / name, self.root / 'scripts' / name)
         self.write('CHANGELOG.md', '# Changelog\n\n## 1.2.3\n\nNotes.\n')
-        for name in ('docs-site.sh', 'licenses.sh', 's3-suites.sh', 'languages.sh'):
+        for name in ('docs-site.sh', 'licenses.sh', 's3-suites.sh', 'languages.sh',
+                     'package-rust-sdk.sh'):
             self.write('scripts/' + name, '#!/bin/sh\necho "' + name + '" >> "$CALLS"\n', executable=True)
         for name in ('test_check_benchmark_paths.py', 'test_check_runner.py'):
             self.write('scripts/' + name, '')
@@ -117,6 +118,16 @@ esac
         result, _ = self.run_check()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('npm run sync', result.stderr)
+
+    def test_a_rust_sdk_wit_copy_that_differs_fails(self):
+        self.write('crates/wasmkeep-wit/wit/deps/io.wit', 'package wasi:io;\n')
+        self.write('crates/wasmkeep-sdk/wit/deps/io.wit', 'package wasi:io;\n')
+        result, _ = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write('crates/wasmkeep-sdk/wit/deps/io.wit', 'package wasi:other;\n')
+        result, _ = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('crates/wasmkeep-sdk/wit differs', result.stderr)
 
     def test_a_version_without_a_changelog_section_fails(self):
         self.write('Cargo.toml', '[workspace.package]\nversion = "1.3.0"\nrust-version = "1.97"\n')
