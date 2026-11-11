@@ -79,6 +79,7 @@ step 'one version'
 python3 -I scripts/check-versions.py
 
 rust=false; everything=false; simulation=false; scripts=false; preflight=false
+workflows=false
 packages=(); sdk_ts=false; sdk_py=false; sdk_go=false; sdk_c=false
 for path in "${changed[@]}"; do
   case "$path" in
@@ -97,6 +98,7 @@ for path in "${changed[@]}"; do
       simulation=true ;;
   esac
   case "$path" in scripts/*) scripts=true ;; esac
+  case "$path" in .github/workflows/*) workflows=true ;; esac
   case "$path" in
     sdks/typescript/*) sdk_ts=true ;;
     sdks/python/*) sdk_py=true ;;
@@ -111,6 +113,16 @@ if $full; then
   ./scripts/doctor.sh
 elif $rust || $simulation || $preflight; then
   ./scripts/doctor.sh --rust
+fi
+# A workflow GitHub cannot load starts no job at all, so no check reports
+# it: lint the workflows here (actionlint finds a duplicate key, an unknown
+# context, a job that needs a missing one).
+if $full || $workflows; then
+  if command -v actionlint >/dev/null; then
+    step 'workflows (actionlint)'; actionlint -shellcheck= .github/workflows/*.yml
+  else
+    skip 'the workflow lint (actionlint not installed)'
+  fi
 fi
 if $full || $scripts; then
   step 'script tests'
