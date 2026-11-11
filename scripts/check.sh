@@ -50,6 +50,10 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 [ -n "$(./scripts/release-notes.sh "$version")" ] || {
   echo "CHANGELOG.md has no section for $version, the workspace version" >&2; exit 1;
 }
+# The SDKs carry the server's version: a manifest left behind by a bump
+# would be released under another number than the binary's.
+step 'one version'
+python3 -I scripts/check-versions.py
 
 rust=false; everything=false; simulation=false; scripts=false; preflight=false
 packages=(); sdk_ts=false; sdk_py=false; sdk_go=false; sdk_c=false

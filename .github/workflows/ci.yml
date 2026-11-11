@@ -44,6 +44,10 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ -n "$(./scripts/release-notes.sh "$version")" ] \
             || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+      - name: Every SDK manifest carries the workspace version
+        run: |
+          python3 -I scripts/test_check_versions.py
+          python3 -I scripts/check-versions.py
       - name: Check every introduced commit
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

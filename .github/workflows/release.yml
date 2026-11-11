@@ -127,6 +127,8 @@ jobs:
             label=$version-dev.$(git rev-parse --short=12 HEAD)
           fi
           echo "LABEL=$label" >> "$GITHUB_ENV"
+      - name: Versions (every SDK manifest equals the workspace version, so the tag)
+        run: python3 -I scripts/check-versions.py
       - name: Release notes (a tag needs its section in CHANGELOG.md)
         env:
           REF_TYPE: ${{ github.ref_type }}
