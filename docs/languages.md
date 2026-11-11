@@ -318,7 +318,10 @@ that interface does.
 
 `scripts/check-versions.py` (run by `./scripts/check.sh` and CI) fails when a
 manifest it lists has another version than the workspace's in `Cargo.toml`;
-an SDK that gains a manifest with a version is added to that list.
+an SDK that gains a manifest with a version is added to that list. The C
+SDK's is `WASMKEEP_SDK_VERSION` in `wasmkeep.h`, the Zig SDK's `version` in
+`wasmkeep.zig`; a release carries both SDKs as archives of that version
+(`wasmkeep-c-sdk-<version>.tar.gz`, `wasmkeep-zig-sdk-<version>.tar.gz`).
 
 ## What the tiers require
 

@@ -17,7 +17,9 @@ Those callers need no Rust toolchain: a release carries the two classes
 of [`examples/jobs`](../examples/jobs) already built, as `kv.wasm` (the
 ready-made shard) and `queue.wasm` (its queue class: three attempts, a
 short backoff, pull-only except `queue/jobs`, which pushes to
-`app/worker`), signed like its other files. They start with the release
+`app/worker`), signed like its other files, with the notices of the
+libraries compiled into them in `THIRD_PARTY_NOTICES-components.txt`.
+They start with the release
 after 0.1.0, which has neither: until then, build them from a clone, as
 [the example's README](../examples/jobs/README.md#run-it) does.
 

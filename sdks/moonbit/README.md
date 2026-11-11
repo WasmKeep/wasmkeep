@@ -1,11 +1,17 @@
 # WasmKeep actors in MoonBit
 
-Write [WasmKeep](../../README.md) actors in MoonBit. The SDK is one
-package, [`wasmkeep`](wasmkeep/wasmkeep.mbt), over the bindings
-`wit-bindgen moonbit` generates, and [`build.sh`](build.sh) turns an app
+Write [WasmKeep](https://github.com/WasmKeep/wasmkeep/blob/main/README.md) actors in MoonBit. The SDK is one
+package, [`wasmkeep`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/moonbit/wasmkeep/wasmkeep.mbt), over the bindings
+`wit-bindgen moonbit` generates, and [`build.sh`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/moonbit/build.sh) turns an app
 package into a component. MoonBit is **experimental**
-([languages](../../docs/languages.md#moonbit)): the language is pre-1.0,
-and its tool versions must be pinned together.
+([languages](https://github.com/WasmKeep/wasmkeep/blob/main/docs/languages.md#moonbit)): the language is pre-1.0,
+and its tool versions must be pinned together. Linux only for now.
+
+The SDK is one package with no third-party dependencies (only MoonBit's
+core library and the generated bindings). It is not published on its
+own: use it from the source of the WasmKeep release your server runs (a
+clone at its tag, or the release's source archive), whose version it
+has. It targets the `wasmkeep:actor@0.2.0` WIT world.
 
 An app is a MoonBit package (its `.mbt` files and a `moon.pkg`) that
 defines its hooks as `actor`:
@@ -35,7 +41,7 @@ import {
 
 (`init` is MoonBit's package initializer, so the hook takes another name.)
 
-Build it and serve it:
+Build it from the root of that source tree and serve it:
 
 ```bash
 sdks/moonbit/build.sh path/to/app actor.wasm
@@ -45,10 +51,13 @@ wasmkeep serve --actor hits=actor.wasm
 `build.sh` generates the bindings into `<app>/gen` (a MoonBit module named
 `wasmkeep/actor`), copies the SDK in as package `wasmkeep` and the app as
 package `app`, adds the glue that exports the app's hooks
-([`glue/`](glue)), builds the core module with `moon build --target wasm`,
+([`glue/`](https://github.com/WasmKeep/wasmkeep/tree/main/sdks/moonbit/glue)), builds the core module with `moon build --target wasm`,
 and makes the component with `wasm-tools component embed --encoding utf16`
 (MoonBit strings are UTF-16) and `component new`. It needs `moon`,
-`wit-bindgen` 0.63.0 and `wasm-tools`.
+`wit-bindgen` 0.63.0 and `wasm-tools`. `<app>/gen` is replaced on
+every build; a `gen` directory the script did not write stops the build
+instead. `WASMKEEP_WIT` names another WIT directory than the tree's
+`crates/wasmkeep-wit/wit`.
 
 CI pins MoonBit `0.10.20+65efd5b93` (the toolchain of `moon
 0.1.20261104`), from `https://cli.moonbitlang.com/binaries/<version>/`
@@ -80,9 +89,13 @@ workflow clients.
 
 ## Examples
 
-- [`examples/moonbit-counter`](../../examples/moonbit-counter): the counter.
-- [`examples/moonbit-chat-room`](../../examples/moonbit-chat-room): the chat room.
+- [`examples/moonbit-counter`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/moonbit-counter): the counter.
+- [`examples/moonbit-chat-room`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/moonbit-chat-room): the chat room.
 
 They pass the same black-box tests as the Rust examples
 (`crates/wasmkeep-server/tests/languages.rs` and `chat.rs`). The SDK has no
 unit tests of its own.
+
+## License
+
+Apache-2.0; see `LICENSE` and `NOTICE`. WasmKeep is pre-alpha.

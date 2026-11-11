@@ -1,9 +1,15 @@
 # WasmKeep actors in D
 
-Write [WasmKeep](../../README.md) actors in D with LDC and `-betterC`: no
+Write [WasmKeep](https://github.com/WasmKeep/wasmkeep/blob/main/README.md) actors in D with LDC and `-betterC`: no
 garbage collector, no D runtime. The SDK is one module,
-[`wasmkeep.d`](wasmkeep.d), over the bindings `wit-bindgen d` generates.
-D is **experimental** ([languages](../../docs/languages.md#d)).
+[`wasmkeep.d`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/d/wasmkeep.d), over the bindings `wit-bindgen d` generates.
+D is **experimental** ([languages](https://github.com/WasmKeep/wasmkeep/blob/main/docs/languages.md#d)),
+and Linux only for now.
+
+The SDK is not published on its own: use it from the source of the
+WasmKeep release your server runs (a clone at its tag, or the release's
+source archive), whose version it has. It targets the
+`wasmkeep:actor@0.2.0` WIT world.
 
 ```d
 import wasmkeep;
@@ -32,10 +38,22 @@ mixin Actor!Hits;
 ```
 
 Build it and serve it; see
-[`examples/d-counter/build.sh`](../../examples/d-counter/build.sh), which
-this follows. LDC compiles to objects for `wasm32-unknown-wasi`, clang
-links them against wasi-libc as a reactor, and the WASI 0.1 adapter makes
-the component:
+[`examples/d-counter/build.sh`](https://github.com/WasmKeep/wasmkeep/blob/main/examples/d-counter/build.sh),
+which this follows. LDC compiles to objects for `wasm32-unknown-wasi`,
+clang links them against wasi-libc as a reactor, and the WASI 0.1 adapter
+makes the component. It needs:
+
+- LDC 1.43 ([releases](https://github.com/ldc-developers/ldc/releases);
+  Arch: `pacman -S ldc`);
+- clang, lld, wasi-libc and compiler-rt for wasm32 (Ubuntu/Debian:
+  `apt install clang lld wasi-libc libclang-rt-18-dev-wasm32`; Arch:
+  `pacman -S clang lld wasi-libc wasi-compiler-rt`);
+- wit-bindgen 0.63.0 and wasm-tools
+  (`cargo install wit-bindgen-cli --version 0.63.0 && cargo install wasm-tools`);
+- curl and tar: `scripts/componentize-core.sh` downloads the adapter from
+  crates.io on its first run.
+
+From the root of that source tree, with your actor in `app.d`:
 
 ```bash
 wit-bindgen d crates/wasmkeep-wit/wit --world actor --out-dir gen
@@ -47,6 +65,8 @@ clang --target=wasm32-wasi --sysroot=/usr/share/wasi-sysroot -mexec-model=reacto
 scripts/componentize-core.sh core.wasm actor.wasm
 wasmkeep serve --actor hits=actor.wasm
 ```
+
+`gen/` is the build's own directory: start it empty.
 
 CI builds with LDC 1.43.0, clang and wasi-libc from Ubuntu 24.04, and
 `wit-bindgen` 0.63.0.
@@ -83,9 +103,13 @@ workflow clients.
 
 ## Examples
 
-- [`examples/d-counter`](../../examples/d-counter): the counter.
-- [`examples/d-chat-room`](../../examples/d-chat-room): the chat room.
+- [`examples/d-counter`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/d-counter): the counter.
+- [`examples/d-chat-room`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/d-chat-room): the chat room.
 
 They pass the same black-box tests as the Rust examples
 (`crates/wasmkeep-server/tests/languages.rs` and `chat.rs`). The SDK has no
 unit tests of its own.
+
+## License
+
+Apache-2.0; see `LICENSE` and `NOTICE`. WasmKeep is pre-alpha.

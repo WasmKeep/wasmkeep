@@ -26,6 +26,19 @@ class Versions(unittest.TestCase):
         for example in EXAMPLES:
             self.example(example, '1.2.3')
         self.python('1.2.3')
+        self.header('1.2.3')
+        self.zig('1.2.3')
+
+    def header(self, version):
+        # Another string constant comes first: only the SDK's version counts.
+        path = self.root / 'sdks/c/wasmkeep.h'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'#ifndef WASMKEEP_H\n#define OTHER "9.9.9"\n#define WASMKEEP_SDK_VERSION "{version}"\n#endif\n')
+
+    def zig(self, version):
+        path = self.root / 'sdks/zig/wasmkeep.zig'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'const std = @import("std");\npub const other = "9.9.9";\npub const version = "{version}";\n')
 
     def python(self, version):
         path = self.root / 'sdks/python/pyproject.toml'
@@ -86,6 +99,18 @@ class Versions(unittest.TestCase):
     def test_another_python_package_version_fails(self):
         self.python('1.2.2')
         self.fails('sdks/python/pyproject.toml: project.version is 1.2.2')
+
+    def test_another_c_header_version_fails(self):
+        self.header('1.2.4')
+        self.fails('sdks/c/wasmkeep.h: WASMKEEP_SDK_VERSION is 1.2.4')
+
+    def test_a_c_header_without_the_version_fails(self):
+        (self.root / 'sdks/c/wasmkeep.h').write_text('#define OTHER "1.2.3"\n')
+        self.fails('sdks/c/wasmkeep.h: no version at WASMKEEP_SDK_VERSION')
+
+    def test_another_zig_version_fails(self):
+        self.zig('1.2.4')
+        self.fails('sdks/zig/wasmkeep.zig: version is 1.2.4')
 
     def test_an_example_lockfile_with_another_sdk_version_fails(self):
         self.example('ts-jobs', '0.0.0')

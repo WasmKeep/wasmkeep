@@ -7,14 +7,18 @@ name: release
 # publishes it. Run by hand (workflow_dispatch) it builds and
 # signs the same files as a workflow artifact, with no release: a dry run.
 # A pull request that changes the packaging runs the build jobs alone
-# (binaries, example components, images): nothing is signed or pushed.
+# (binaries, example components, SDK archives, images): nothing is signed
+# or pushed.
 #
 # Per target: the binary built against glibc 2.28 (scripts/build-portable.sh),
 # its CycloneDX SBOM (scripts/sbom.sh) and the third-party notices
 # (scripts/notices.sh), in a tarball with a short README of its own
 # (deploy/tarball/README.md). Once for every target: example components
-# built for wasm32-wasip2 (the `components` job), so that trying WasmKeep
-# needs no toolchain. SHA256SUMS lists every file, and each file has a
+# built for wasm32-wasip2 with their third-party notices (the `components`
+# job), so that trying WasmKeep needs no toolchain; and the C and Zig SDKs
+# as archives with their generated bindings, wasmkeep-c-sdk-<version>.tar.gz
+# and wasmkeep-zig-sdk-<version>.tar.gz (the `sdks` job,
+# scripts/package-c-sdk.sh). SHA256SUMS lists every file, and each file has a
 # Sigstore bundle (<file>.sigstore.json) from keyless cosign signing: the
 # certificate names this workflow and the ref it ran on. docs/deploy/single-node.md
 # says how to verify.
@@ -43,6 +47,11 @@ on:
       - deploy/Dockerfile
       - .dockerignore
       - deploy/tarball/README.md
+      - scripts/package-c-sdk.sh
+      - scripts/componentize-core.sh
+      - sdks/c/**
+      - sdks/zig/**
+      - crates/wasmkeep-wit/wit/**
 
 permissions:
   contents: read
@@ -99,9 +108,11 @@ jobs:
 
   # The example components a release carries: the counter of the README's
   # quickstart, and the Rust classes that the key-value, queue and workflow
-  # guides have actors in other languages call. Built once: a component is
-  # the same file on every platform. The artifact's name starts with
-  # `build-`, so the `sign` job takes these files with the binaries.
+  # guides have actors in other languages call, with the third-party
+  # notices of the crates they link (THIRD_PARTY_NOTICES-components.txt).
+  # Built once: a component is the same file on every platform. The
+  # artifact's name starts with `build-`, so the `sign` job takes these
+  # files with the binaries.
   components:
     name: example components
     needs: ci
@@ -113,8 +124,8 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: wasm-tools@1.263.0
-      - name: Build with the pinned toolchain, validate, name
+          tool: wasm-tools@1.263.0,cargo-about@0.9.3
+      - name: Build with the pinned toolchain, validate, name; their notices
         run: |
           # The file in the release, the example's directory, the file
           # cargo writes there. `counter` is the default build (no feature).
@@ -142,11 +153,64 @@ jobs:
             install -m 0644 "$wasm" "dist/$file"
             echo "::endgroup::"
           done <<<"$components"
-          [ "$(ls dist | wc -l)" = 5 ] || { echo "::error::expected five components"; ls dist; exit 1; }
+          [ "$(ls dist/*.wasm | wc -l)" = 5 ] || { echo "::error::expected five components"; ls dist; exit 1; }
+          # They link the Rust SDK's dependencies: one file with those
+          # crates' notices travels with them (docs/legal.md).
+          mapfile -t dirs < <(awk 'NF { print "examples/" $2 }' <<<"$components")
+          ./scripts/notices.sh --components dist/THIRD_PARTY_NOTICES-components.txt "${dirs[@]}"
           ls -l dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: build-components
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # The C SDK, and the Zig SDK over it, as archives with the bindings
+  # `wit-bindgen c` generates (users need no wit-bindgen), each checked as a
+  # user gets it: extracted into an empty directory, the counter built with
+  # the README's commands, wit-bindgen made to fail. The artifact's name
+  # starts with `build-`, so the `sign` job takes these files too.
+  sdks:
+    name: C and Zig SDK archives
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: wasm-tools@1.263.0,wit-bindgen-cli@0.63.0
+      # A Python of its own for pip (Zig comes as the ziglang package, as in CI).
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - name: Toolchains (C, Zig)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld wasi-libc libclang-rt-18-dev-wasm32
+          pip install ziglang==0.17.1
+      - name: Package and build the counter from each archive
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # The same label as the binaries' (the `build` job checks the tag).
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$REF_TYPE" = tag ]; then
+            label=$version
+            ref=$REF_NAME
+          else
+            label=$version-dev.$(git rev-parse --short=12 HEAD)
+            ref=$(git rev-parse HEAD)
+          fi
+          ZIG="python -m ziglang" ./scripts/package-c-sdk.sh dist "$label" "$ref"
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-sdks
           path: dist/*
           if-no-files-found: error
           retention-days: 7
@@ -258,9 +322,8 @@ jobs:
 
   sign:
     name: checksums and signatures
-    # `build` needs `components`; named here too, since this job signs
-    # that job's files.
-    needs: [build, components]
+    # Every job whose files this one signs.
+    needs: [build, components, sdks]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20

@@ -166,7 +166,9 @@ wasmkeep serve --actor counter=examples/counter/target/wasm32-wasip2/release/cou
 
 Starting with the release after 0.1.0, a release also carries that
 counter already built, `counter.wasm`, signed like its other files, so the
-first minute needs no toolchain (0.1.0 has no `counter.wasm`):
+first minute needs no toolchain (0.1.0 has no `counter.wasm`). The
+release's `THIRD_PARTY_NOTICES-components.txt` holds the notices of the
+libraries compiled into it and the other example components:
 
 ```bash
 # $v as in Install, and later than 0.1.0

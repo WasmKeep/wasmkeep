@@ -1,0 +1,10 @@
+WasmKeep MoonBit SDK
+Copyright 2026 Julien Turbide
+
+This SDK is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It contains no third-party files. build.sh generates MoonBit bindings with
+wit-bindgen from the WIT in crates/wasmkeep-wit/wit of the WasmKeep
+repository; the WASI interface files in its deps/ directory are Copyright
+the Contributors to the WASI Specification, published by the WebAssembly
+Community Group under the W3C Community Contributor License Agreement.

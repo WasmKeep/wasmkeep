@@ -1,8 +1,12 @@
 # WasmKeep actors in Zig
 
-Write [WasmKeep](../../README.md) actors as a Zig file with a few public
-functions. The SDK, [`wasmkeep.zig`](wasmkeep.zig), wraps the [C SDK](../c)
-(translated with `zig translate-c`). Needs Zig 0.17.
+Write [WasmKeep](https://github.com/WasmKeep/wasmkeep/blob/main/README.md)
+actors as a Zig file with a few public functions. The SDK,
+[`wasmkeep.zig`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/zig/wasmkeep.zig),
+wraps the [C SDK](https://github.com/WasmKeep/wasmkeep/tree/main/sdks/c)
+(translated with `zig translate-c`). Needs Zig 0.17. It carries the
+server's version (`wk.version`) and targets the `wasmkeep:actor@0.2.0`
+WIT world.
 
 ```zig
 const std = @import("std");
@@ -30,7 +34,14 @@ comptime {
 }
 ```
 
-Build it with [`examples/zig-counter/build.sh`](../../examples/zig-counter/build.sh)
+Starting with the release after 0.1.0, a release carries this SDK as
+`wasmkeep-zig-sdk-<version>.tar.gz`, signed like its other files: the Zig
+files, the C SDK with its bindings already generated, the WIT and the
+componentize script, so building needs no clone and no wit-bindgen. Its
+README has the build command for the extracted directory.
+
+From a clone, build it with
+[`examples/zig-counter/build.sh`](https://github.com/WasmKeep/wasmkeep/blob/main/examples/zig-counter/build.sh)
 as a template (it sets up the `wasmkeep` and `wasmkeep_c` modules), then
 `wasmkeep serve --actor hits=actor.wasm`. Keep its `--stack 1048576`: Zig's
 default stack is 16 MiB, and it is reserved in every actor's memory, so
@@ -51,17 +62,17 @@ of 0.57 MB, measured with huge pages on).
 | `wk.send`, `wk.sendBinary`, `wk.broadcast`, `wk.close`, `wk.connectionCount`, `wk.connections` | WebSockets |
 | `req.method`, `req.path`, `req.body()`, `req.header("name")` | The request |
 | `wk.reply(status, fmt, args)`, `wk.replyBytes(status, content_type, body)` | Responses |
-| `wk.env(name)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](../../docs/reference/api.md#interface-env)), or `null` |
+| `wk.env(name)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/main/docs/reference/api.md#interface-env)), or `null` |
 | `wk.selfAddress()` | This actor's `Address` (`tenant`, `class`, `name`) |
 | `wk.setHeader(&response, name, value)` | Adds a header to a response |
 | `wk.deleteSelf()`, `wk.nowMs()` | |
 
 ## Key-value and queues
 
-`wk.kv` and `wk.queue` ([`kv.zig`](kv.zig), [`queue.zig`](queue.zig))
+`wk.kv` and `wk.queue` ([`kv.zig`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/zig/kv.zig), [`queue.zig`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/zig/queue.zig))
 wrap the C SDK's clients of
-[ADR 0015](../../docs/adr/0015-kv-and-queues-as-sdk-patterns.md) for the
-Rust shard and queue classes ([`examples/jobs`](../../examples/jobs)), with
+[ADR 0015](https://github.com/WasmKeep/wasmkeep/blob/main/docs/adr/0015-kv-and-queues-as-sdk-patterns.md) for the
+Rust shard and queue classes ([`examples/jobs`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/jobs)), with
 Zig errors (`wk.kv.Error`, `wk.queue.Error`; details in `lastError()`) and
 slices:
 
@@ -75,15 +86,15 @@ _ = try jobs.send("resize 42");
 // In fetch: if (wk.queue.isDelivery(req)) return wk.queue.handleDelivery(req, work);
 ```
 
-The guide is [Key-value and queues](../../docs/kv-and-queues.md#zig); the
-jobs app is [`examples/zig-jobs`](../../examples/zig-jobs).
+The guide is [Key-value and queues](https://github.com/WasmKeep/wasmkeep/blob/main/docs/kv-and-queues.md#zig); the
+jobs app is [`examples/zig-jobs`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/zig-jobs).
 
 ## Workflows
 
-`wk.workflow` ([`workflow.zig`](workflow.zig)) wraps the C SDK's client
-of [ADR 0019](../../docs/adr/0019-workflows-as-an-sdk-pattern.md)'s
+`wk.workflow` ([`workflow.zig`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/zig/workflow.zig)) wraps the C SDK's client
+of [ADR 0019](https://github.com/WasmKeep/wasmkeep/blob/main/docs/adr/0019-workflows-as-an-sdk-pattern.md)'s
 workflows, for a workflow class run by the Rust SDK
-([`examples/workflows`](../../examples/workflows)), with Zig errors
+([`examples/workflows`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/workflows)), with Zig errors
 (`wk.workflow.Error`: `Unknown`, `Finished`, `Call`, `Refused`; details in
 `lastError()`):
 
@@ -95,7 +106,13 @@ defer status.deinit(); // status.state, .wake_at, .waitingFor(i), .output, .fail
 try orders.sendEvent("order-42", "approved", "");
 ```
 
-The guide is [Workflows](../../docs/workflows.md#zig); the jobs app's
+The guide is [Workflows](https://github.com/WasmKeep/wasmkeep/blob/main/docs/workflows.md#zig); the jobs app's
 order routes use it.
 
-Examples: [counter](../../examples/zig-counter), [chat room](../../examples/zig-chat-room), [jobs](../../examples/zig-jobs).
+Examples: [counter](https://github.com/WasmKeep/wasmkeep/tree/main/examples/zig-counter),
+[chat room](https://github.com/WasmKeep/wasmkeep/tree/main/examples/zig-chat-room),
+[jobs](https://github.com/WasmKeep/wasmkeep/tree/main/examples/zig-jobs).
+
+## License
+
+Apache-2.0; see `LICENSE` and `NOTICE`. WasmKeep is pre-alpha.

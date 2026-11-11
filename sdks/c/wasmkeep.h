@@ -28,6 +28,10 @@
 #ifndef WASMKEEP_H
 #define WASMKEEP_H
 
+/* This SDK's version: the WasmKeep release it comes with, the server's
+ * version (scripts/check-versions.py keeps them equal). */
+#define WASMKEEP_SDK_VERSION "0.1.0"
+
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
