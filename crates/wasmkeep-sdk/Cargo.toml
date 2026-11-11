@@ -5,13 +5,28 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-repository.workspace = true
+repository = "https://github.com/WasmKeep/wasmkeep"
 authors.workspace = true
-publish.workspace = true
+readme = "README.md"
+keywords = ["wasm", "wasi", "component-model", "actor", "sqlite"]
+categories = ["wasm", "api-bindings"]
+# The one workspace crate meant for a registry: an actor depends on it
+# without a clone of the repository.
+publish = true
+# `wit/` is a copy of crates/wasmkeep-wit/wit (scripts/check.sh compares
+# them): a packaged crate cannot read files outside its own directory.
+include = ["src/**", "wit/**", "README.md", "LICENSE", "NOTICE"]
 
+# Its own requirements, not the workspace's exact pins: `=` requirements in
+# a packaged crate would keep its users from taking a patch release.
 [dependencies]
-wit-bindgen.workspace = true
-wasip2.workspace = true
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "realloc"] }
+wasip2 = "2.0.1"
+
+# The crate is a guest library: document it for the target actors build for.
+[package.metadata.docs.rs]
+default-target = "wasm32-wasip2"
+targets = ["wasm32-wasip2"]
 
 [lints]
 workspace = true

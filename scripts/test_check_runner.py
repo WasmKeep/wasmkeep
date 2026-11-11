@@ -118,6 +118,16 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('npm run sync', result.stderr)
 
+    def test_a_rust_sdk_wit_copy_that_differs_fails(self):
+        self.write('crates/wasmkeep-wit/wit/deps/io.wit', 'package wasi:io;\n')
+        self.write('crates/wasmkeep-sdk/wit/deps/io.wit', 'package wasi:io;\n')
+        result, _ = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write('crates/wasmkeep-sdk/wit/deps/io.wit', 'package wasi:other;\n')
+        result, _ = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('crates/wasmkeep-sdk/wit differs', result.stderr)
+
     def test_a_version_without_a_changelog_section_fails(self):
         self.write('Cargo.toml', '[workspace.package]\nversion = "1.3.0"\nrust-version = "1.97"\n')
         result, _ = self.run_check()

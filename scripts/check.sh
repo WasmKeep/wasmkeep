@@ -43,6 +43,14 @@ if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/typescript/wit ]; then
     echo 'sdks/typescript/wit differs from crates/wasmkeep-wit/wit: run npm run sync in sdks/typescript' >&2; exit 1;
   }
 fi
+# The Rust SDK carries its own copy too: a packaged crate cannot read files
+# outside its directory.
+if [ -d crates/wasmkeep-wit/wit ] && [ -d crates/wasmkeep-sdk/wit ]; then
+  step 'WIT copy in the Rust SDK'
+  diff -r crates/wasmkeep-wit/wit crates/wasmkeep-sdk/wit >/dev/null || {
+    echo 'crates/wasmkeep-sdk/wit differs from crates/wasmkeep-wit/wit: run rm -r crates/wasmkeep-sdk/wit && cp -r crates/wasmkeep-wit/wit crates/wasmkeep-sdk/wit' >&2; exit 1;
+  }
+fi
 # A tag's release text is its version's section of CHANGELOG.md
 # (release.yml): a version bump adds the section in the same change.
 step 'release notes'
