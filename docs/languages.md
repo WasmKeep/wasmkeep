@@ -298,12 +298,12 @@ What is missing:
 
 The SDKs carry the server's version: one number for the `wasmkeep` binary,
 the Rust crate and every other SDK manifest, changed together. Use the SDK
-with the same version as the server you run; each is tested against the
-other at that version only.
+with the same version as the server you run: other pairings are not
+tested.
 
 | SDK | Server | WIT package |
 | --- | --- | --- |
-| 0.1 | 0.1 | `wasmkeep:actor@0.2.0` |
+| 0.1.0 | 0.1.0 | `wasmkeep:actor@0.2.0` |
 
 The WIT package version is another number: it is the version of the
 interface between a component and the host

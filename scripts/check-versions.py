@@ -8,7 +8,11 @@ has another version fails the check. Add a manifest as one line.
 import json
 import pathlib
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit('check-versions.py needs Python 3.11 or later (tomllib)')
 
 root = pathlib.Path(__file__).resolve().parent.parent
 
@@ -16,7 +20,10 @@ root = pathlib.Path(__file__).resolve().parent.parent
 MANIFESTS = [
     ('sdks/typescript/package.json', 'json', ('version',)),
     ('sdks/typescript/package-lock.json', 'json', ('version',)),
-    ('sdks/typescript/package-lock.json', 'json', ('packages', '', 'version')),
+    ('sdks/typescript/package-lock.json', 'json', ('packages', '', 'version')),    ('examples/ts-counter/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
+    ('examples/ts-chat-room/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
+    ('examples/ts-jobs/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
+    ('examples/ts-workflows/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
 ]
 
 
