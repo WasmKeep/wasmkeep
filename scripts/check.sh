@@ -170,7 +170,10 @@ if $full; then
     skip 'the examples and every language (CHECK_SKIP_LANGS=1)'
   else
     step 'examples and languages'
-    ./scripts/languages.sh
+    langs_skipped=$(mktemp)
+    LANGUAGES_SKIPPED="$langs_skipped" ./scripts/languages.sh
+    while IFS= read -r line; do not_run+=("$line"); done < "$langs_skipped"
+    rm -f "$langs_skipped"
   fi
   msrv=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
   step MSRV; cargo +"$msrv" check --workspace --all-targets --locked
