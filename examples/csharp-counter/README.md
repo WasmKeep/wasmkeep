@@ -14,7 +14,9 @@ cargo run -p wasmkeep-cli -- serve --actor counter=examples/csharp-counter/count
 ```
 
 The first build restores about 800 MB of preview packages from nuget.org
-and the dotnet-experimental feed ([`nuget.config`](nuget.config)).
+and the dotnet-experimental feed ([`nuget.config`](nuget.config)), so
+`./scripts/check.sh --full` builds it only with `CHECK_CSHARP=1`; CI
+always does.
 
 In another terminal:
 

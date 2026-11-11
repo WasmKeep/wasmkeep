@@ -28,7 +28,7 @@ if [ "$mode" = --full ]; then
   # The examples and languages step (scripts/languages.sh); skip it with
   # CHECK_SKIP_LANGS=1 on a machine without them.
   if [ "${CHECK_SKIP_LANGS:-}" != 1 ]; then
-    for tool in wasm-tools wit-bindgen clang node npm go tinygo wit-bindgen-go componentize-py dotnet; do
+    for tool in wasm-tools wit-bindgen clang node npm go tinygo wit-bindgen-go componentize-py; do
       if ! command -v "$tool" >/dev/null 2>&1; then
         need "$tool for the examples in every language (see .github/workflows/ci.yml, job languages, for versions), or set CHECK_SKIP_LANGS=1."
       fi

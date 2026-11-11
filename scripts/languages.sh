@@ -14,6 +14,17 @@
 # runs `npm ci` where a TypeScript package has no node_modules yet.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Languages whose tools need setup beyond installing a package are built
+# only when that setup is there; otherwise they are skipped, listed in
+# $LANGUAGES_SKIPPED (check.sh shows them as not run), and their tests
+# are left out. CI builds them all.
+skipped_list=${LANGUAGES_SKIPPED:-/dev/null}
+tests='all()'
+skip_lang() { # name, the tests to leave out
+  echo "skipped: $1"
+  echo "$1" >> "$skipped_list"
+  tests="$tests - ($2)"
+}
 root=$(pwd)
 wit="$root/crates/wasmkeep-wit/wit"
 
@@ -64,15 +75,26 @@ for ex in examples/ts-*/; do
   echo "-- $ex"
   (cd "$ex" && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm run --silent build:starlingmonkey)
 done
-for ex in examples/c-*/ examples/py-*/ examples/go-*/ examples/csharp-*/; do
+for ex in examples/c-*/ examples/py-*/ examples/go-*/; do
   echo "-- $ex"
   "$ex/build.sh"
 done
+# C#: opt-in (CHECK_CSHARP=1), since the first build restores about 800 MB
+# of preview packages into the NuGet cache ($NUGET_PACKAGES, default
+# ~/.nuget/packages).
+if [ "${CHECK_CSHARP:-}" = 1 ] && command -v dotnet >/dev/null 2>&1; then
+  for ex in examples/csharp-*/; do
+    echo "-- $ex"
+    "$ex/build.sh"
+  done
+else
+  skip_lang 'C# (CHECK_CSHARP=1 with dotnet: restores ~800 MB of packages)' 'test(csharp)'
+fi
 for ex in examples/zig-*/; do
   echo "-- $ex"
   ZIG="${ZIG:-zig}" "$ex/build.sh"
 done
 
 echo '-- every language against the same tests'
-WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked \
+WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked -E "$tests" \
   --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs
