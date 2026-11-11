@@ -159,8 +159,9 @@ interfaces, with no compiled `.d.ts`: `tsc` checks the SDK's sources with
 your project's options. The options the SDK is written for are in
 [`examples/ts-counter/tsconfig.json`](../../examples/ts-counter/tsconfig.json):
 `"moduleResolution": "Bundler"`, the `ES2022` and `ESNext.Disposable`
-libraries, and `"types": []`. Copy that file, then run `npx tsc --noEmit`
-with TypeScript 5.9 or later. `wasmkeep-ts build` does not type-check.
+libraries, and `"types": []`. Copy that file, add `typescript` to your
+devDependencies (the SDK is checked with 5.9.3), and run
+`npx tsc --noEmit`. `wasmkeep-ts build` does not type-check.
 
 ## Developing the SDK
 

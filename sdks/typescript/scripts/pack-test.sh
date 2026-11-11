@@ -42,6 +42,10 @@ cp -R "$example/src" "$example/tsconfig.json" .
 # A package.json of its own, so that npm installs here and not in a parent.
 printf '{ "name": "pack-test", "private": true, "type": "module" }\n' > package.json
 npm install --loglevel=error --no-audit --no-fund "$tarball" "typescript@$typescript"
+# What the NOTICE names, and what a consumer imports, is in the package.
+for f in LICENSE NOTICE README.md wit/deps types/actor.d.ts; do
+  [ -e "node_modules/@wasmkeep/sdk/$f" ] || { echo "pack-test: $f is not in the package" >&2; exit 1; }
+done
 
 # Nothing may come from the checkout: a link would hide a file the tarball lacks.
 installed=$(node -p 'require("node:fs").realpathSync("node_modules/@wasmkeep/sdk")')
@@ -51,12 +55,12 @@ case "$installed/" in
 esac
 
 version=$(node -p 'require(process.argv[1]).version' "$sdk/package.json")
-[ "$(npx wasmkeep-ts --version)" = "$version" ] || { echo 'pack-test: --version is not the package version' >&2; exit 1; }
-npx wasmkeep-ts --help >/dev/null
+[ "$(npx --no -- wasmkeep-ts --version)" = "$version" ] || { echo 'pack-test: --version is not the package version' >&2; exit 1; }
+npx --no -- wasmkeep-ts --help >/dev/null
 
-npx wasmkeep-ts build src/index.ts -o counter.wasm
-npx wasmkeep-ts build src/index.ts -o counter-starlingmonkey.wasm --engine starlingmonkey
+npx --no -- wasmkeep-ts build src/index.ts -o counter.wasm
+npx --no -- wasmkeep-ts build src/index.ts -o counter-starlingmonkey.wasm --engine starlingmonkey
 [ -s counter.wasm ]
 [ -s counter-starlingmonkey.wasm ]
-npx tsc --noEmit
+npx --no -- tsc --noEmit
 echo 'pack-test: the packed SDK installs, builds on both engines and type-checks'
