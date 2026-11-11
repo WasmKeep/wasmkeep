@@ -197,6 +197,20 @@ async fn go() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn d() {
+    if let Some(wasm) = prebuilt("d", "examples/d-counter/counter.wasm") {
+        counter_contract("d", &wasm).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moonbit() {
+    if let Some(wasm) = prebuilt("moonbit", "examples/moonbit-counter/counter.wasm") {
+        counter_contract("moonbit", &wasm).await;
+    }
+}
+
 /// C# with componentize-dotnet (preview), straight on its bindings.
 #[tokio::test(flavor = "multi_thread")]
 async fn csharp() {

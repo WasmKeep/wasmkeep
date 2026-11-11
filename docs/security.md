@@ -194,7 +194,7 @@ class needs `--allow-reopen`.
 
 ## Known gaps
 
-- Hostile multi-tenancy: one process for every tenant (see the note above).
+- Hostile multi-tenancy: every actor of a node shares one process (see the note above).
 - Node-to-node traffic goes over mutual TLS by default
   ([ADR 0011](adr/0011-node-to-node-mtls.md)): a node in a cluster needs
   `--cluster-listen` and `--cluster-advertise`, and refuses plain HTTP

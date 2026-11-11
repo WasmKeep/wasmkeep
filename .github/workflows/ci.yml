@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# `bash` by name runs every step with `-eo pipefail`: a failure on the left
+# of a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -248,13 +254,38 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.24.7"
-          cache-dependency-path: examples/go-*/go.sum
+          cache-dependency-path: |
+            sdks/go/go.sum
+            examples/go-*/go.sum
       - name: toolchains (Go)
         run: |
           curl -sSL https://github.com/tinygo-org/tinygo/releases/download/v0.39.0/tinygo0.39.0.linux-amd64.tar.gz | tar xz -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
           go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: toolchains (D)
+        run: |
+          curl -sSL https://github.com/ldc-developers/ldc/releases/download/v1.43.0/ldc2-1.43.0-linux-x86_64.tar.xz | tar xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/ldc2-1.43.0-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: toolchains (MoonBit)
+        # Pinned by its moonc version (dated versions are not served) and
+        # checked by SHA-256; the core library is bundled for wasm here.
+        run: |
+          v=0.10.20%2B65efd5b93
+          home="$RUNNER_TEMP/moon"
+          mkdir -p "$home/lib"
+          curl -sSfL -o "$RUNNER_TEMP/moonbit.tar.gz" "https://cli.moonbitlang.com/binaries/$v/moonbit-linux-x86_64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/moonbit-core.tar.gz" "https://cli.moonbitlang.com/cores/core-$v.tar.gz"
+          sha256sum -c <<SUMS
+          80d987523308fa490eba9f1baf98df996a5a7891e118357553b7c2608c0597c5  $RUNNER_TEMP/moonbit.tar.gz
+          8ec2a2c01335501d703867bb4eef5f92d3cd7e1ae1ee5f7f14d54d16d2c7c2b5  $RUNNER_TEMP/moonbit-core.tar.gz
+          SUMS
+          tar xzf "$RUNNER_TEMP/moonbit.tar.gz" -C "$home"
+          find "$home/bin" -maxdepth 1 -type f -exec chmod +x {} +   # the tarball has no execute bits
+          tar xzf "$RUNNER_TEMP/moonbit-core.tar.gz" -C "$home/lib"
+          (cd "$home/lib/core" && MOON_HOME="$home" PATH="$home/bin:$PATH" moon bundle --target wasm --release)
+          echo "MOON_HOME=$home" >> "$GITHUB_ENV"
+          echo "$home/bin" >> "$GITHUB_PATH"
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           dotnet-version: "10.0.x"
@@ -271,6 +302,11 @@ jobs:
           git diff --exit-code -- wit types
           npm run check
           npm test
+      - name: Go SDK (bindings and WIT in sync with the host)
+        run: |
+          sdks/go/scripts/generate.sh
+          git add -N sdks/go
+          git diff --exit-code -- sdks/go/internal/gen sdks/go/wit
       - name: build every example
         run: |
           for ex in examples/ts-*/; do (cd "$ex" && npm ci && npm run build && npm run build:starlingmonkey); done
@@ -278,9 +314,12 @@ jobs:
           for ex in examples/zig-*/; do ZIG="python -m ziglang" "$ex/build.sh"; done
           for ex in examples/py-*/; do "$ex/build.sh"; done
           for ex in examples/go-*/; do "$ex/build.sh"; done
+          crates/wasmkeep-server/tests/guests/go-fetch/build.sh
+          for ex in examples/d-*/; do "$ex/build.sh"; done
+          for ex in examples/moonbit-*/; do "$ex/build.sh"; done
           for ex in examples/csharp-*/; do "$ex/build.sh"; done
       - name: the counter contract and the chat suite, against every language
-        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --locked
+        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
 
   docs:
     name: docs site

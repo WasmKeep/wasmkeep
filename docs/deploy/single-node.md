@@ -31,7 +31,7 @@ tar xzf "$f" && cd "${f%.tar.gz}" && sudo install -m 755 wasmkeep /usr/local/bin
 checksums; it is signed like the rest, so verify its own bundle the same
 way before trusting it.
 
-Until then, build on the server, or on a machine with the same OS and CPU
+Or build on the server, or on a machine with the same OS and CPU
 architecture:
 
 ```bash
