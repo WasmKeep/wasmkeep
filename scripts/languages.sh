@@ -6,7 +6,7 @@
 #   2. the TypeScript SDK: its WIT and types in sync with the host, the type
 #      check and its tests;
 #   3. every example in another language built (TypeScript on both engines,
-#      C, Zig, Python, Go);
+#      C, Zig, Python, Go, MoonBit);
 #   4. the counter contract, the chat suite, jobs and workflows against every
 #      language, with WASMKEEP_REQUIRE_LANGS=1: a component that is missing
 #      fails instead of being skipped.
@@ -64,7 +64,7 @@ for ex in examples/ts-*/; do
   echo "-- $ex"
   (cd "$ex" && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm run --silent build:starlingmonkey)
 done
-for ex in examples/c-*/ examples/py-*/ examples/go-*/; do
+for ex in examples/c-*/ examples/py-*/ examples/go-*/ examples/moonbit-*/; do
   echo "-- $ex"
   "$ex/build.sh"
 done

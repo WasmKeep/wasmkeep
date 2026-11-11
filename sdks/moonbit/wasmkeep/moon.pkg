@@ -1,0 +1,13 @@
+import {
+  "wasmkeep/actor/interface/wasmkeep/actor/types" @types,
+  "wasmkeep/actor/interface/wasmkeep/actor/storage" @storage,
+  "wasmkeep/actor/interface/wasmkeep/actor/alarms" @alarms,
+  "wasmkeep/actor/interface/wasmkeep/actor/actors" @actors,
+  "wasmkeep/actor/interface/wasmkeep/actor/websockets" @websockets,
+  "wasmkeep/actor/interface/wasmkeep/actor/env" @env,
+  "wasmkeep/actor/interface/wasi/http/types" @http,
+  "wasmkeep/actor/interface/wasi/clocks/wall-clock" @clock,
+  "moonbitlang/core/encoding/utf8" @utf8,
+}
+
+warnings = "-44"

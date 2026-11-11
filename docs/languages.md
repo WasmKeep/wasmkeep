@@ -33,6 +33,7 @@ different target, and does not make a language usable here.
 | **TypeScript / JavaScript** | Supported (embedded runtime) | [`@wasmkeep/sdk`](../sdks/typescript): esbuild, then componentize-qjs (QuickJS embedded, pre-initialized); or [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) (StarlingMonkey) with `--engine starlingmonkey` ([below](#typescript-on-quickjs)) | Counter, chat room and [jobs app](../examples/ts-jobs) (KV and queue clients) pass on both engines. QuickJS, the default: 1.7 MB; 230 µs of CPU per request (2.2× Rust) and 741 KB per actor (3×) ([measured](benchmarks.md#the-same-counter-in-every-language)), few Web APIs. StarlingMonkey: Web APIs and 1.5× faster plain JavaScript, for 4.6× the memory per actor ([measured](benchmarks.md#typescript-on-quickjs-against-starlingmonkey)) |
 | **Python** | Supported (embedded runtime) | [Python SDK](../sdks/python), [componentize-py](https://github.com/bytecodealliance/componentize-py) (CPython embedded) | Counter, chat room and [jobs app](../examples/py-jobs) (KV and queue clients) pass. 18.7 MB, the largest; 259 µs of CPU per request (2.5× Rust) and 7.8 MB per actor (31×) ([measured](benchmarks.md#the-same-counter-in-every-language)) |
 | **Go (TinyGo)** | Experimental | TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2` over `wit-bindgen-go` bindings | The [counter](../examples/go-counter) and the [jobs app](../examples/go-jobs) (the [`sdks/go`](../sdks/go) KV and queue clients) pass; 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)); no full SDK, chat room or guide yet (see [Go](#go)) |
+| **MoonBit** | Experimental | [MoonBit SDK](../sdks/moonbit) over `wit-bindgen moonbit`; `moon build --target wasm` (MoonBit 0.10.20 in CI), then `wasm-tools component embed --encoding utf16` and `component new` | Counter and [chat room](../examples/moonbit-chat-room) pass; 49 KB. The language is pre-1.0; no numbers from `bench/run.sh` yet, no outbound HTTP or key-value and queue clients (see [MoonBit](#moonbit)) |
 
 ### Next, in order
 
@@ -45,10 +46,7 @@ Each needs a counter passing the shared tests, and numbers from
    blocked us (below).
 2. **D** (LDC with `-betterC` and `wit-bindgen d`): no GC, no runtime; the
    generator handles our world.
-3. **MoonBit** (`wit-bindgen moonbit`): small components; the language is
-   pre-1.0 and its string layout changed in 2026, so tool versions must be
-   pinned together.
-4. **C# / .NET** ([componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet),
+3. **C# / .NET** ([componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet),
    NativeAOT-LLVM): a spike first. Everything upstream is preview, the
    compiler ships from an experimental feed, and there are no macOS builds.
 
@@ -79,6 +77,7 @@ The same counter, as built by each example's `build.sh` (sizes on disk; see
 | Language | Component |
 | --- | --- |
 | Zig | 30 KB |
+| MoonBit | 49 KB |
 | Rust | 81 KB |
 | Go (TinyGo) | 151 KB |
 | C | 170 KB |
@@ -169,6 +168,29 @@ because Go's runtime assumes it owns all linear memory past its data, while
 the WASI 0.1 adapter needs memory before Go starts: their allocations
 overlap. A small WASI shim that needs no memory of its own would fix it;
 that is future work.
+
+## MoonBit
+
+`wit-bindgen moonbit` generates the bindings as a MoonBit module whose
+world package declares the hooks (`declare pub fn on_init`, ...); the
+[MoonBit SDK](../sdks/moonbit)'s `build.sh` adds the SDK package, the app
+package and a small glue file that implements those declarations by
+calling the app's `actor` (an `@wasmkeep.Actor` of optional hooks). `moon
+build --target wasm` makes a core module with no WASI imports of its own,
+and `wasm-tools` makes the component, with UTF-16 strings (MoonBit's).
+The SDK wraps storage (`exec`, `query`, `Rows`), alarms, `call`,
+WebSockets, `env` and `self_address`; failures are MoonBit errors
+(`Failure`), raised from the SDK and caught at the hooks.
+
+The [counter](../examples/moonbit-counter) and
+[chat room](../examples/moonbit-chat-room) pass the shared tests.
+MoonBit stays experimental: the language is pre-1.0 (its string layout
+changed in 2026, so the compiler, core library and `wit-bindgen` are
+pinned together), `bench/run.sh` does not measure it yet, and the SDK has
+no outbound HTTP, key-value, queue or workflow clients. MoonBit's servers
+publish versions by their compiler version (`0.10.20+65efd5b93`, as
+`moon version --all` prints it), not by `moon`'s dated version; CI pins
+that one, checked by SHA-256.
 
 ## What the tiers require
 

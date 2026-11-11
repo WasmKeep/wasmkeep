@@ -157,7 +157,8 @@ Continuing alongside, without holding the release:
   engine (4.6× less memory per actor than StarlingMonkey, which stays an
   option for Web APIs; [ADR 0018](docs/adr/0018-quickjs-the-default-typescript-engine.md)),
   Go (finish TinyGo, then standard Go through componentize-go), D,
-  MoonBit, then a C# spike. Java, Kotlin and PHP cannot produce an actor
+  ✅ MoonBit (experimental: the [MoonBit SDK](sdks/moonbit), its counter
+  and chat room pass), then a C# spike. Java, Kotlin and PHP cannot produce an actor
   yet; languages that need Wasm garbage collection wait on a decision of
   their own
 - 🚧 The benchmark showdown suite (below): the counter comparison runs today
