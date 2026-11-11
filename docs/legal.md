@@ -95,7 +95,7 @@ conditional writes; WAL shipping as in Litestream and LiteFS).
 ## Trademarks of others
 
 WasmKeep's docs compare it with, or name, other products (Cloudflare Workers
-and Durable Objects, workerd, wasmCloud, Spin, Rivet, Microsoft Orleans,
+and Durable Objects, workerd, celld (Deno), wasmCloud, Spin, Rivet, Microsoft Orleans,
 Litestream, LiteFS, Fly.io, AWS S3, Cloudflare R2, OVHcloud Object
 Storage, MinIO, Ceph, Hetzner, DigitalOcean, Scaleway, Kubernetes,
 Firecracker). The names are used only to identify those products; they belong to

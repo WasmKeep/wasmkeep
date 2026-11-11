@@ -51,7 +51,9 @@ leans on. Where the repository has a working example, it is linked.
   order, without a pub/sub layer between servers.
 - **Example**: [`examples/chat-room`](../examples/chat-room), also in
   [TypeScript](../examples/ts-chat-room), [Python](../examples/py-chat-room),
-  [C](../examples/c-chat-room) and [Zig](../examples/zig-chat-room).
+  [C](../examples/c-chat-room), [Zig](../examples/zig-chat-room),
+  [Go](../examples/go-chat-room), [D](../examples/d-chat-room) and
+  [MoonBit](../examples/moonbit-chat-room).
 
 ### Rate limits and quotas
 

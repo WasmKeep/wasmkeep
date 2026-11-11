@@ -165,9 +165,9 @@ due, `on-alarm` runs as an event.
 - Alarms survive hibernation, restarts and moves between nodes. In a
   cluster, if an actor's node dies, another node fires its alarm a lease
   period plus grace after it was due, plus up to 10 s, plus restoring the
-  actor (with the defaults, 20 s late at the median and 25 s at worst
-  with nodes next to their bucket,
-  [measured](benchmarks.md#three-nodes-against-a-real-bucket) before
+  actor (with the defaults, 24 s late at the median and 36 s at worst
+  with nodes next to their bucket, over twelve hours,
+  [measured](benchmarks.md#three-nodes-against-a-real-bucket) on
   [one lease per node](adr/0020-one-lease-per-node.md);
   [ADR 0009](adr/0009-alarms-in-a-cluster.md)). An alarm is as
   durable as the rest of the event that set it.
@@ -246,7 +246,7 @@ WEBHOOK_URL="https://hooks.slack.com/services/..."
 and serves the class with it: `wasmkeep serve --actor hub=hub.wasm --env
 hub=/etc/wasmkeep/hub.env` (also `wasmkeep dev`). Actors read it with
 `env::get("ADMIN_TOKEN")` (Rust), `env.get(...)` (TypeScript and Python),
-`wk_env(...)` (C) or `wk.env(...)` (Zig), and get nothing for a name that is
+`wk_env(...)` (C), `wk.env(...)` (Zig) or `wasmkeep.Env(...)` (Go), and get nothing for a name that is
 not set.
 
 - **Per class.** A class sees only its own files; every actor of the class

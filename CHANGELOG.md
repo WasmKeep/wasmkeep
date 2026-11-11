@@ -7,6 +7,23 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
+## Unreleased
+
+- **Languages**: Go through TinyGo is supported, with a full
+  [Go SDK](sdks/go) and its counter, chat room and jobs app; D and
+  MoonBit are experimental, each with an SDK, a counter and a chat room;
+  a C# counter (componentize-dotnet) and a standard-Go counter
+  (componentize-go) pass the shared tests.
+  [Tiers and numbers](docs/languages.md).
+- **Compared with celld**: the same counter on one node and on three, a
+  node killed under writes, with a check for lost writes that gives every
+  write a token of its own, repeats the takeovers with the killed node's
+  disk removed, and includes a run that must lose writes
+  ([WasmKeep and celld](docs/compared-with-celld.md),
+  [benchmarks](docs/benchmarks.md#three-nodes-wasmkeep-against-celld)).
+- **Releases**: a tag's release waits for CI to pass on the tagged
+  commit, and a version's image tag is written once.
+
 ## 0.1.0
 
 The first release, published as a **pre-alpha pre-release**: for trying

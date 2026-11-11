@@ -4,9 +4,10 @@ A WasmKeep cluster: three servers sharing one S3-compatible bucket, behind a
 load balancer. Any node can lose its machine; its actors continue on the
 others 15 to about 21 s after its last heartbeat, then a restore
 ([how](../cluster.md#how-it-works)), with no acknowledged durable write
-lost ([measured](../benchmarks.md#three-nodes-against-a-real-bucket)
-before [one lease per node](../adr/0020-one-lease-per-node.md); not
-measured again since).
+lost ([measured](../benchmarks.md#three-nodes-against-a-real-bucket):
+twelve hours and 35 kills on
+[one lease per node](../adr/0020-one-lease-per-node.md), writable again
+18.2 s after the kill at the median).
 
 Read [Running a cluster](../cluster.md) for how ownership, forwarding and
 replication work. This page is the setup. Each node is installed as in
@@ -75,8 +76,8 @@ credentials to the nodes and to whoever deploys, no one else.
 Every node needs:
 
 - a **unique node id** (`[a-z0-9-]`): `a`, `b`, `c`. A node checks its id
-  at start: it watches `nodes/<id>` in the bucket for about 15 s before
-  taking any actor, and exits with an error if another process still
+  at start: it watches `nodes/<id>` in the bucket for up to about 15 s
+  (less after a clean stop or a fence) before taking any actor, and exits with an error if another process still
   writes it. Two processes started at the same moment can both pass that
   check; one then finds the other at its next write and exits, but until
   then both may run the same actor. When replacing a machine, stop the old

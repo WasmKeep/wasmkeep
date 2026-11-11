@@ -88,7 +88,7 @@ own machines.**
 ## Who it is for
 
 - **Teams that like the Durable Objects programming model** but want to run
-  it themselves, in Rust, TypeScript, Python, C or Zig.
+  it themselves, in Rust, TypeScript, Python, C, Zig or Go.
 - **Companies that need on-premises or sovereign deployments**: everything
   runs on your hardware, and replication goes to any S3-compatible bucket
   (AWS S3, Cloudflare R2, MinIO, Ceph...).
@@ -118,7 +118,9 @@ Cloudflare can run Rust and other languages, compiled to Wasm and hosted inside
 a V8 JavaScript isolate with JavaScript glue, against Cloudflare's own APIs.
 WasmKeep runs standard components directly on Wasmtime, with no JavaScript in
 between, and you run it. [WasmKeep and Cloudflare Workers](docs/compared-with-workers.md)
-says where each is the better choice, and why.
+says where each is the better choice, and why;
+[WasmKeep and celld](docs/compared-with-celld.md) does the same for
+celld, measured on one node and on three.
 
 Our numbers come from [`bench/`](bench/) and are reproducible with
 `./bench/run.sh`: see [Benchmarks](docs/benchmarks.md), including a first
@@ -168,14 +170,15 @@ To run several nodes on one bucket, with replication, failover and
 - [Your first actor in 10 minutes](docs/tutorials/first-actor.md) (Rust)
 - [Languages](docs/languages.md): which languages work today and how
 - [Concepts](docs/concepts.md): addresses, events, life cycle, storage, alarms, calls, WebSockets
-- [API reference](docs/reference/api.md): every host function and hook, with its name in each SDK
+- [API reference](docs/reference/api.md): every host function and hook, with its name in the Rust, TypeScript, Python, C and Zig SDKs
 - Deploying: [one server (VPS)](docs/deploy/single-node.md), [three nodes](docs/deploy/three-nodes.md)
 - Examples: [counter](examples/counter), [chat room](examples/chat-room) (WebSockets),
   [rate limiter](examples/rate-limiter) (alarms), [AI agent](examples/agent) (a model over
   HTTP, a reminder tool on an alarm), [jobs](examples/jobs) (the SDK's
   [key-value and queue](docs/kv-and-queues.md) patterns, with its clients in every SDK), and
-  the counter, chat room and jobs app in TypeScript, Python, C, Zig and Go, and the counter
-  and chat room in D and MoonBit (`examples/`)
+  the counter, chat room and jobs app in TypeScript, Python, C, Zig and Go, the counter
+  and chat room in D and MoonBit, a counter in C# and in standard Go,
+  [workflows](examples/workflows) and [Watch](examples/watch), an uptime monitor (`examples/`)
 - [Running a cluster](docs/cluster.md): replication, failover, forwarding, `wasmkeep deploy`
 - [Roadmap](ROADMAP.md): what is built, what comes next, and what is not planned
 - Design decisions: [docs/adr](docs/adr); how the pieces fit: [Concepts](docs/concepts.md) and [Running a cluster](docs/cluster.md#how-it-works)
@@ -263,11 +266,13 @@ strictly:
 
 - **Every change goes through a pull request.** Before a merge, the
   full check runs locally (`./scripts/check.sh --full`): formatting, lints, every test, 200-seed
-  simulations, the oldest supported Rust, the guest SDKs, dependency
-  audits and the docs build; hosted CI adds the other platforms, the S3
-  suites and every language. Some tests are still sensitive to timing
-  on shared runners, and CI on main has failed on them: a release is
-  built only from a commit CI passed on.
+  simulations, the oldest supported Rust, the guest SDKs, every example
+  and language whose tools are installed, dependency audits and the docs
+  build; hosted CI adds the other platforms, the S3 suites, the LTX
+  conformance and the languages a machine lacks. Some tests are still sensitive to timing
+  on shared runners, and CI on main has failed on them: since 0.1.0 a
+  release is built only from a commit CI passed on (0.1.0 itself was
+  tagged before its CI run had finished).
 - **A bug fix starts with a failing test**; anything about ordering,
   leases or failover gets a simulation case.
 - **Risky changes get adversarial reviews**: independent reviewers that

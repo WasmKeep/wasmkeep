@@ -489,8 +489,8 @@ The differences from Rust are the C ones, in Zig terms:
   node takes it over: 15 to about 21 s after its node's last heartbeat,
   then a restore ([how](cluster.md#how-it-works); on actors, before ADR
   0020: 15.5 to 17.0 s at the median with nodes next to their bucket,
-  [measured](benchmarks.md#three-nodes-against-a-real-bucket); not yet
-  measured again with node leases). Pending
+  and 18.2 s on node leases,
+  [measured](benchmarks.md#three-nodes-against-a-real-bucket)). Pending
   push deliveries and expiry are alarms, fired after a failover as for
   any actor ([Alarms](concepts.md#alarms)).
 

@@ -36,9 +36,11 @@ filesystem paths.
 Before merging any code change, run `./scripts/check.sh --full`. It adds all
 workspace tests, scanner/runner tests, every guest SDK's unit tests,
 200-seed simulations, the exact CI MSRV
-check, dependency checks and the full docs site. It does not replace CI's OS and
-architecture matrix, S3/failover tests, LTX Go conformance, every language/example
-build, or real-bucket durability validation. Run the relevant additional checks
+check, dependency checks and the full docs site, and builds every example and
+language whose tools are installed (the ones it skipped are listed as not run;
+`CHECK_SKIP_LANGS=1` skips them all). It does not replace CI's OS and
+architecture matrix, S3/failover tests (`--s3`), LTX Go conformance, or
+real-bucket durability validation. Run the relevant additional checks
 for changes in those areas. The light documentation check validates relative
 links and Markdown anchors, not remote links.
 

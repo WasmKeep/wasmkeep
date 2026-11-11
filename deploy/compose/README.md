@@ -62,8 +62,9 @@ curl -i -X POST http://127.0.0.1:8081/actor/counter/alice
 ```
 
 `docker compose kill b` instead shows a crash: the actor comes back on
-another node after about 15 s or a little more (10 s lease plus 5 s
-grace, then a restore from the bucket).
+another node 15 to about 21 s after the node's last heartbeat (10 s
+lease plus 5 s grace, up to a watch period more, then a restore from the
+bucket).
 `docker compose start b` brings the node back. Logs:
 `docker compose logs -f a b c` (each node logs `cluster enabled` with its
 cluster address at start).

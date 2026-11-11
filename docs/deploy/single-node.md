@@ -177,6 +177,11 @@ lost disk is restored from it on the next request to each actor. Add to
   --cluster-listen 127.0.0.1:7443 --cluster-advertise https://127.0.0.1:7443
 ```
 
+With `--node-id`, a start also checks its node id in the bucket before it
+listens, for up to 15 s: all of it the first time or after a crash, and
+after a clean stop only what is left of 15 s since the node stopped
+([why](../cluster.md#flags)).
+
 The last two flags give the node a cluster listener on loopback: nodes
 talk to each other over mutual TLS, and a node in a cluster refuses to
 start without one (or without `--cluster-plaintext accept`). Alone, it

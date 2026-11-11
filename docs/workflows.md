@@ -358,8 +358,8 @@ export default workflow.define(
 - **Failover**: an instance is unavailable until a peer frees its dead
   node's actors (15 to about 21 s after that node's last write,
   [how](cluster.md#how-it-works)) and its actor is restored, and its alarm
-  fires late, as for any actor: 20 s at the median and 25 s at worst with
-  nodes next to their bucket, measured before ADR 0020
+  fires late, as for any actor: 24 s at the median and 36 s at worst with
+  nodes next to their bucket, over twelve hours
   ([measured](benchmarks.md#three-nodes-against-a-real-bucket)).
 
 The example in [`examples/workflows`](../examples/workflows) runs an order

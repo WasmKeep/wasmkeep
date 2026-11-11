@@ -149,7 +149,7 @@ curl -i -X POST localhost:8082/actor/counter/alice   # 2, forwarded to a
 sharing an id would be treated as one node and could both run the same
 actor. A node therefore checks its id when it starts, before its first
 heartbeat and before any lease. It reads `nodes/<id>` every half period for
-at least the lease's ttl plus grace (15 s by default), the time any other
+the lease's ttl plus grace (15 s by default), the time any other
 node waits before taking a dead node's actors, even when there is no such
 object (a process whose object was deleted while it ran is given time to
 show itself). A process still running rewrites it: the new one then exits
@@ -163,9 +163,11 @@ a process renews its per-actor leases on a task of its own. Unchanged until
 the end: the previous process is gone, and the new one writes its first
 heartbeat, conditioned on the version it read last. So:
 
-- Every start waits at least those 15 s before `wasmkeep serve` listens (it
-  logs "checking that no other process runs with this node id"), less
-  after a clean stop or a fence of the previous process.
+- A first start, or a restart while the previous heartbeat is still live,
+  waits those 15 s before `wasmkeep serve` listens (it logs "checking that
+  no other process runs with this node id"). After a clean stop or a
+  fence of the previous process it waits only until that process's last
+  live write is 15 s old: about 1.5 s when that has already passed.
 - A restart while the old process still runs, or still finishes its
   graceful shutdown, is refused: let the service manager retry it.
 - If the bucket cannot be read, the node keeps retrying and does not
@@ -483,14 +485,14 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE    STATE    VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
-a     yes   979ms  serving  0.0.0    acme/shop  http://a:8080  https://a:7443   pinned
-b     yes   2.2s   serving  0.0.0    acme/shop  http://b:8080  -                plain
-c     no    14m    serving  0.0.0    acme/shop  http://c:8080  https://c:7443   pinned
+a     yes   979ms  serving  0.1.0    acme/shop  http://a:8080  https://a:7443   pinned
+b     yes   2.2s   serving  0.1.0    acme/shop  http://b:8080  -                plain
+c     no    14m    serving  0.1.0    acme/shop  http://c:8080  https://c:7443   pinned
 
 APP        DEPLOYED VERSION  SEQ
 acme/shop  9cf4de9152d8dd29  1
 
-2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.0.0
+2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.1.0
 warning: mixed plain and TLS nodes: b still plain while a use the cluster listener; give every node a cluster listener, then drop --cluster-plaintext accept (ADR 0011)
 ```
 

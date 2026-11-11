@@ -126,7 +126,8 @@ Next, in this order:
    failover job, every language build), on every pull request
 4. ✅ A three-node soak against a real S3 or R2 bucket (M2's open item):
    on R2 and OVHcloud Object Storage, from a desktop and from three VPS
-   next to the bucket, 27 kills under load (nine in each run), nothing lost
+   next to the bucket, 36 kills under load (nine in each of four runs),
+   nothing lost
    ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
    One failover in 267 took 32 s, a restore stalled by one slow GET;
    fixed, and the VPS soak with the fix passed: writable again
@@ -142,7 +143,7 @@ Next, in this order:
    leaves out draining nodes and other tenants' nodes
 6. ✅ `wasmkeep cluster status` (nodes, TLS and deploys read from the bucket
    alone), and upgrades of WasmKeep itself documented as "upgrade every node
-   together" (mixed versions come after the release)
+   together" (mixed versions are not supported yet)
 7. ⏳ The performance targets on dedicated hardware
 
 The first release: ✅ the [legal basics](docs/legal.md)
@@ -168,9 +169,10 @@ Continuing alongside, without holding the release:
   [findings](docs/languages.md#c-spike)). Java, Kotlin and PHP cannot
   produce an actor yet; languages that need Wasm garbage collection wait on a decision of
   their own
-- 🚧 The benchmark showdown suite (below): the counter comparison runs today
+- 🚧 The benchmark showdown suite (below): the counter comparison runs today,
+  against workerd and celld, on one node and on three
 
-After the release: mixed versions during an upgrade, the other operator
+Next, not yet scheduled: mixed versions during an upgrade, the other operator
 commands (inspect or export an actor, verify the bucket), and traces.
 
 ## 🚧 M4: Operating a cluster
@@ -193,14 +195,15 @@ What teams running WasmKeep need next.
   ([ADR 0019](docs/adr/0019-workflows-as-an-sdk-pattern.md),
   [guide](docs/workflows.md)): runners in Rust and TypeScript
   (TypeScript with synchronous outbound HTTP, `http.fetch`), clients in
-  every other SDK
+  the Go, Python, C and Zig SDKs
 - ⏳ Several tenants per process, with limits per tenant, when a multi-team
   user asks
 - ✅ Key-value and queues in the SDKs first: one API (`kv`, `queue`, a read
   cache) backed by actors (sharded key-value actors, batching queue
   actors), so a platform primitive can replace the backend later without
-  changing application code. Done in every SDK: Rust, TypeScript, Python,
-  Go, C and Zig ([guide](docs/kv-and-queues.md),
+  changing application code. Done in the Rust, TypeScript, Python, Go, C
+  and Zig SDKs; the experimental D and MoonBit SDKs have no clients yet
+  ([guide](docs/kv-and-queues.md),
   [ADR 0015](docs/adr/0015-kv-and-queues-as-sdk-patterns.md)); the shard and
   queue actors stay Rust, and the other SDKs have the client side, each
   tested against them with its own jobs app
@@ -236,9 +239,11 @@ benchmarkers such as [Anton Putra](https://www.youtube.com/@AntonPutra): same
 hardware, real load, latency percentiles, throughput, CPU and memory on a
 dashboard.
 
-Today `bench/compare`, run by `bench/run.sh`, compares one workload, a
-counter, on WasmKeep (in every guest language) and `workerd`, as plain
-processes on one machine; the results are in [benchmarks](docs/benchmarks.md). The plan is a
+Today `bench/compare` compares one workload, a counter, on WasmKeep
+(Rust, Zig, C, Go on TinyGo, TypeScript and Python), `workerd` and celld,
+as plain processes on one machine (`bench/run.sh`), and three nodes of
+WasmKeep and celld with a node killed under writes (`bench/cluster.sh`);
+the results are in [benchmarks](docs/benchmarks.md). The plan is a
 comparison suite anyone can run unchanged:
 
 - The same workloads implemented on each platform: a stateless "hello", a

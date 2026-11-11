@@ -20,7 +20,7 @@ different target, and does not make a language usable here.
 | --- | --- |
 | **Recommended** | SDK, tutorial, examples passing the shared tests, and benchmark rows close to the best measured; a small component with no embedded runtime. |
 | **Supported** | SDK; its counter and chat room pass the shared tests in CI with pinned tools; trade-offs stated with numbers from the bench files. |
-| **Experimental** | A counter passes the shared tests, but no SDK or chat room yet, or upstream tooling is preview. No compatibility promise. |
+| **Experimental** | A counter passes the shared tests, but something Supported requires is missing: an SDK, a chat room, numbers from the bench files, or stable upstream tooling. No compatibility promise. |
 | **Not yet** | Cannot produce a working actor today; the entry says what blocks it. |
 
 ### Today
@@ -307,8 +307,8 @@ What is missing:
   benchmark rows close to the best measured.
 
 Languages that embed an interpreter or a garbage-collected runtime
-(JavaScript, Python, C#) produce larger components and wake more slowly than
-Rust, C or Zig. Their numbers are published from `bench/run.sh` like the
+(JavaScript, Python, Go, C#) produce larger components and wake more slowly than
+Rust, C or Zig. The supported ones' numbers are published from `bench/run.sh` like the
 others, so the trade-off is visible before you choose.
 
 ## Bring your own
