@@ -36,8 +36,8 @@ different target, and does not make a language usable here.
 
 ### Next, in order
 
-Each needs a counter passing the shared tests, and numbers from
-`bench/run.sh`, before it gets a tier.
+Each is experimental once a counter passes the shared tests; numbers
+from `bench/run.sh` come before it is supported.
 
 1. **Standard Go** (not TinyGo) through [componentize-go](https://github.com/bytecodealliance/componentize-go),
    which allocates through Go's runtime before Go starts: the clash that
