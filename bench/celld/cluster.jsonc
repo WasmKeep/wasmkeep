@@ -1,0 +1,15 @@
+// The three-node comparison's worker (bench/celld/cluster.js, copied in as
+// index.js next to bench/workerd/counter.js by bench/compare): the workerd
+// counter, and a ledger for the takeover check.
+{
+  "name": "counter",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "COUNTER", "class_name": "Counter" },
+      { "name": "LEDGER", "class_name": "Ledger" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter", "Ledger"] }]
+}

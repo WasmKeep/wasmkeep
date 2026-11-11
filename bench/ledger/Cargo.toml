@@ -1,0 +1,27 @@
+[package]
+name = "ledger"
+description = "Benchmark-only actor: records one token per write, for the cluster comparison's lost-write check."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Built for wasm32-wasip2, so it is its own workspace, outside the host one.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmkeep-sdk = { path = "../../crates/wasmkeep-sdk" }
+
+[features]
+# `POST` returns only once the token is durable (`exec-durable`), as the
+# counter's `durable` feature does for its increment.
+durable = []
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1

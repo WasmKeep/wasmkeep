@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! compare [--quick] [--bucket] TARGET...
-//! compare [--quick] --cluster CLUSTER_TARGET...
+//! compare [--quick] --cluster [--wipe|--control] CLUSTER_TARGET...
 //! CLUSTER_TARGET = wasmkeep-rust-durable | wasmkeep-rust | celld-fleet | celld-bucket
 //! TARGET = wasmkeep-rust | wasmkeep-rust-durable | wasmkeep-zig | wasmkeep-c |
 //! wasmkeep-go | wasmkeep-ts | wasmkeep-ts-starlingmonkey | wasmkeep-py | workerd |
@@ -26,7 +26,9 @@
 //! fsynced on one node, in the bucket with `--bucket`.
 //!
 //! `--cluster` runs three nodes of each target on the bucket (see
-//! `cluster.rs`), with takeovers; its rows are `cluster3/...`.
+//! `cluster.rs`), with takeovers; its rows are `cluster3/...`. With `--wipe`
+//! a killed node also loses its disk (`cluster3-wipe/...`), and `--control`
+//! is the run that must lose writes (`cluster3-control/...`).
 //!
 //! `--bucket` runs each WasmKeep target as a one-node cluster on the bucket
 //! `WASMKEEP_COMPARE_BUCKET` names (`s3://BUCKET[/PREFIX]`, credentials and
@@ -237,7 +239,7 @@ fn celld() -> Server {
     };
     let dir = TempDir::new("celld");
     let addr = free_addr();
-    let (bin, with_bucket) = celld_deploy(&[bucket.as_str(), "celld"].join("/"), &dir.0);
+    let (bin, with_bucket) = celld_deploy(&[bucket.as_str(), "celld"].join("/"), &dir.0, false);
     let mut command = Command::new(&bin);
     with_bucket(&mut command);
     no_huge_pages(&mut command);
@@ -266,13 +268,30 @@ fn celld() -> Server {
 /// project made in `dir`. Returns the celld binary and what every celld
 /// command on that bucket needs (`--bucket`, and `--endpoint` from
 /// `AWS_ENDPOINT`).
-fn celld_deploy(bucket: &str, dir: &Path) -> (PathBuf, impl Fn(&mut Command) + Clone + use<>) {
+fn celld_deploy(
+    bucket: &str,
+    dir: &Path,
+    with_ledger: bool,
+) -> (PathBuf, impl Fn(&mut Command) + Clone + use<>) {
     let project = dir.join("project");
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::copy("bench/celld/wrangler.jsonc", project.join("wrangler.jsonc"))
-        .expect("bench/celld/wrangler.jsonc");
-    std::fs::copy("bench/workerd/counter.js", project.join("index.js"))
-        .expect("bench/workerd/counter.js");
+    // With the ledger (three-node runs): bench/celld/cluster.js, which
+    // imports the counter unchanged and adds the takeover check's ledger.
+    let files: &[(&str, &str)] = if with_ledger {
+        &[
+            ("bench/celld/cluster.jsonc", "wrangler.jsonc"),
+            ("bench/celld/cluster.js", "index.js"),
+            ("bench/workerd/counter.js", "counter.js"),
+        ]
+    } else {
+        &[
+            ("bench/celld/wrangler.jsonc", "wrangler.jsonc"),
+            ("bench/workerd/counter.js", "index.js"),
+        ]
+    };
+    for (from, to) in files {
+        std::fs::copy(from, project.join(to)).unwrap_or_else(|e| panic!("{from}: {e}"));
+    }
     let bin = env_path("CELLD_BIN", CELLD_DEFAULT);
     let bin = std::fs::canonicalize(&bin).unwrap_or_else(|_| {
         panic!(
@@ -381,7 +400,7 @@ impl Client {
     }
 
     /// [`Client::send`] that reports a failed connection instead of
-    /// panicking, and returns the body too (a single chunk, if chunked). A
+    /// panicking, and returns the body too. A
     /// connection that failed is not to be used again: a late response may
     /// still be on it.
     fn try_send(&mut self, method: &str, path: &str) -> std::io::Result<(u16, String)> {
@@ -416,18 +435,35 @@ impl Client {
                     .then(|| v.trim().parse::<usize>().ok())?
             });
             let body = match length {
-                Some(len) if body.len() >= len => &body[..len],
-                None if body.ends_with(b"0\r\n\r\n") => {
-                    // `<size>\r\n<data>\r\n0\r\n\r\n`: the first chunk is enough
-                    // for the short bodies compared here.
-                    let start = find(body, b"\r\n").map_or(0, |i| i + 2);
-                    let end = find(&body[start..], b"\r\n").map_or(start, |i| start + i);
-                    &body[start..end]
-                }
+                Some(len) if body.len() >= len => body[..len].to_vec(),
+                None => match dechunk(body) {
+                    Some(body) => body,
+                    None => continue,
+                },
                 _ => continue,
             };
-            return Ok((status, String::from_utf8_lossy(body).into_owned()));
+            return Ok((status, String::from_utf8_lossy(&body).into_owned()));
         }
+    }
+}
+
+/// The data of a complete chunked body (`<hex size>\r\n<data>\r\n` repeated,
+/// ended by a chunk of size 0), or `None` while some of it is still to come.
+fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line = find(body, b"\r\n")?;
+        let size = std::str::from_utf8(&body[..line]).ok()?;
+        let size = usize::from_str_radix(size.split(';').next()?.trim(), 16).ok()?;
+        let rest = &body[line + 2..];
+        if size == 0 {
+            return rest.starts_with(b"\r\n").then_some(out);
+        }
+        if rest.len() < size + 2 {
+            return None;
+        }
+        out.extend_from_slice(&rest[..size]);
+        body = &rest[size + 2..];
     }
 }
 
@@ -676,6 +712,13 @@ fn main() {
         let run = format!("compare-{run}-{}", std::process::id());
         let _ = BUCKET.set([bucket.trim_end_matches('/'), &run].join("/"));
     }
+    let fault = if args.iter().any(|a| a == "--control") {
+        cluster::Fault::Control
+    } else if args.iter().any(|a| a == "--wipe") {
+        cluster::Fault::Wipe
+    } else {
+        cluster::Fault::Kill
+    };
     let workload = Workload::for_quick(quick);
     let descriptors = if cluster {
         cluster::minimum_descriptors(workload)
@@ -698,7 +741,13 @@ fn main() {
         if cluster {
             // Kills and victim actors per kill.
             let (kills, victims) = if quick { (1, 30) } else { (3, 90) };
-            cluster::run(target, workload, kills, victims);
+            let lost = cluster::run(target, workload, kills, victims, fault);
+            if fault == cluster::Fault::Control && lost == 0 {
+                eprintln!(
+                    "the control lost no acknowledged write: the check cannot be shown to find one"
+                );
+                std::process::exit(1);
+            }
         } else {
             run(target, workload);
         }
@@ -707,6 +756,22 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_chunked_body_is_whole_only_once_its_last_chunk_is_in() {
+        use super::dechunk;
+        assert_eq!(dechunk(b"3\r\nabc\r\n0\r\n\r\n"), Some(b"abc".to_vec()));
+        // Two chunks, the second of 16 bytes (hex 10).
+        assert_eq!(
+            dechunk(b"2\r\nab\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n"),
+            Some(b"ab0123456789abcdef".to_vec())
+        );
+        assert_eq!(dechunk(b"0\r\n\r\n"), Some(Vec::new()));
+        // Data ending in what looks like the last chunk is not the end.
+        assert_eq!(dechunk(b"5\r\n0\r\n\r\n"), None);
+        assert_eq!(dechunk(b"3\r\nab"), None);
+        assert_eq!(dechunk(b"3\r\nabc\r\n"), None);
+    }
 
     #[test]
     fn the_native_workerd_binary_is_preferred_to_the_npm_launcher() {
