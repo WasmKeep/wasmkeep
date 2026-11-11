@@ -14,6 +14,17 @@
 # runs `npm ci` where a TypeScript package has no node_modules yet.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Languages whose tools need setup beyond installing a package are built
+# only when that setup is there; otherwise they are skipped, listed in
+# $LANGUAGES_SKIPPED (check.sh shows them as not run), and their tests
+# are left out. CI builds them all.
+skipped_list=${LANGUAGES_SKIPPED:-/dev/null}
+tests='all()'
+skip_lang() { # name, the tests to leave out
+  echo "skipped: $1"
+  echo "$1" >> "$skipped_list"
+  tests="$tests - ($2)"
+}
 root=$(pwd)
 wit="$root/crates/wasmkeep-wit/wit"
 
@@ -65,14 +76,23 @@ for ex in examples/ts-*/; do
   (cd "$ex" && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm run --silent build:starlingmonkey)
 done
 for ex in examples/c-*/ examples/py-*/ examples/go-*/; do
+  [ "$ex" = examples/go-std-counter/ ] && continue
   echo "-- $ex"
   "$ex/build.sh"
 done
+# Standard Go: componentize-go on PATH (it downloads its own binary into
+# the user's cache directory on first use) and Go 1.27.1+ ($GO_STD, or go).
+if command -v "${COMPONENTIZE_GO:-componentize-go}" >/dev/null 2>&1; then
+  echo '-- examples/go-std-counter/'
+  examples/go-std-counter/build.sh
+else
+  skip_lang 'standard Go (componentize-go on PATH, Go 1.27.1+)' 'test(go_standard)'
+fi
 for ex in examples/zig-*/; do
   echo "-- $ex"
   ZIG="${ZIG:-zig}" "$ex/build.sh"
 done
 
 echo '-- every language against the same tests'
-WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked \
+WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked -E "$tests" \
   --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs
