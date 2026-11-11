@@ -33,6 +33,7 @@
 - [Licensing and compliance](legal.md)
 - [Usage ping](telemetry.md)
 - [Dogfood log](dogfood.md)
+- [Releasing](releasing.md)
 
 # Design decisions
 
