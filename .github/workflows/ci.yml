@@ -23,8 +23,34 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Documentation and benchmark result files are read by no code job: a pull
+  # request that changes nothing else runs this job, "benchmark publication
+  # paths" and "docs site" only. scripts/ci-changes.sh holds the list.
+  #
+  # Every other job needs this one and runs unless it answered the literal
+  # "false". `!cancelled()` is what makes them run when this job fails:
+  # without a status function they would be skipped, and a skipped job
+  # counts as passed. A push to main always runs everything.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2 # a pull request's merge commit and its first parent, the base
+          persist-credentials: false
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: ./scripts/ci-changes.sh "$EVENT" | tee -a "$GITHUB_OUTPUT"
+
   fmt:
     name: rustfmt
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -39,6 +65,7 @@ jobs:
           fetch-depth: 0
       - run: python3 -I scripts/test_check_benchmark_paths.py
       - run: python3 -I scripts/test_bench_ab.py
+      - run: python3 -I scripts/test_ci_changes.py
       - name: CHANGELOG.md has a section for the workspace version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -70,6 +97,8 @@ jobs:
 
   licenses:
     name: dependency licenses
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -77,6 +106,8 @@ jobs:
 
   deny:
     name: cargo-deny (advisories, licenses, sources)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -86,19 +117,47 @@ jobs:
 
   clippy:
     name: clippy
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
-    runs-on: ${{ matrix.os }}
+  # Three jobs, not a matrix: a matrix skipped as a whole reports one check
+  # under its unexpanded name, and each of these names is a required check.
+  test-linux:
+    name: test (ubuntu-latest)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --locked --no-tests=pass
+
+  test-linux-arm:
+    name: test (ubuntu-24.04-arm)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --locked --no-tests=pass
+
+  test-macos:
+    name: test (macos-latest)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -109,6 +168,8 @@ jobs:
 
   msrv:
     name: MSRV
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -124,7 +185,8 @@ jobs:
     # Base and this change built and measured on the same runner, interleaved:
     # shared runners are too noisy to compare with numbers from another run.
     name: benchmark regression (base vs this change)
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -155,6 +217,8 @@ jobs:
 
   sim:
     name: simulation (madsim, 200 seeds)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: --cfg madsim
@@ -176,6 +240,8 @@ jobs:
     # MinIO no longer publishes container images, so this runs against
     # moto's S3 server, which enforces If-None-Match / If-Match like S3.
     name: leases on an S3 API (moto)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: test
@@ -211,6 +277,8 @@ jobs:
 
   ltx:
     name: LTX conformance (Go reference)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -235,6 +303,8 @@ jobs:
 
   languages:
     name: every language passes the same tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     env:
       WASMKEEP_REQUIRE_LANGS: "1"
@@ -370,81 +440,80 @@ jobs:
           path: target/book
 
   examples:
+    # One job for every Rust example, each its own Cargo workspace. An
+    # example that fails does not stop the others; the job fails at the end.
     name: examples
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - example: hello
-            world: ""          # plain wasi:http component
-          - example: counter
-            world: actor       # must conform to wasmkeep:actor/actor
-          - example: rate-limiter
-            world: actor
-          - example: chat-room
-            world: actor
-          - example: watch/monitor
-            world: actor
-            wasm: watch_monitor
-          - example: watch/hub
-            world: actor
-            wasm: watch_hub
-          - example: agent
-            world: actor
-          - example: jobs/kv
-            world: actor
-            wasm: jobs_kv
-          - example: jobs/queue
-            world: actor
-            wasm: jobs_queue
-          - example: jobs/app
-            world: actor
-            wasm: jobs_app
-          - example: workflows/orders
-            world: actor
-            wasm: workflows_orders
-          - example: workflows/ledger
-            world: actor
-            wasm: workflows_ledger
-          - example: workflows/app
-            world: actor
-            wasm: workflows_app
-    defaults:
-      run:
-        working-directory: examples/${{ matrix.example }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: examples/${{ matrix.example }}
+          workspaces: |
+            examples/hello
+            examples/counter
+            examples/rate-limiter
+            examples/chat-room
+            examples/watch/monitor
+            examples/watch/hub
+            examples/agent
+            examples/jobs/kv
+            examples/jobs/queue
+            examples/jobs/app
+            examples/workflows/orders
+            examples/workflows/ledger
+            examples/workflows/app
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: wasm-tools@1.263.0
-      - run: cargo fmt --check
-      - run: cargo clippy --release --target wasm32-wasip2 --locked -- -D warnings
-      - run: cargo build --release --target wasm32-wasip2 --locked
-      - name: Validate component and print its WIT world
+      - name: Format, lint, build and validate each example
         run: |
-          name="${{ matrix.wasm }}"
-          [ -n "$name" ] || name=$(echo "${{ matrix.example }}" | tr - _)
-          wasm=target/wasm32-wasip2/release/$name.wasm
-          wasm-tools validate "$wasm"
-          wasm-tools component wit "$wasm"
-          if [ -n "${{ matrix.world }}" ]; then
-            wasm-tools component targets "$GITHUB_WORKSPACE/crates/wasmkeep-wit/wit" \
-              --world "${{ matrix.world }}" "$wasm"
+          # Directory, WIT world ("-": a plain wasi:http component), then
+          # the component's file name when it is not the directory's.
+          examples='
+            hello             -
+            counter           actor
+            rate-limiter      actor
+            chat-room         actor
+            watch/monitor     actor  watch_monitor
+            watch/hub         actor  watch_hub
+            agent             actor
+            jobs/kv           actor  jobs_kv
+            jobs/queue        actor  jobs_queue
+            jobs/app          actor  jobs_app
+            workflows/orders  actor  workflows_orders
+            workflows/ledger  actor  workflows_ledger
+            workflows/app     actor  workflows_app
+          '
+          # One && chain: `set -e` is off inside a function called on the
+          # left of `||`, so a failed command would not stop it otherwise.
+          check() {
+            local dir=$1 world=$2 wasm=target/wasm32-wasip2/release/${3:-${1//-/_}}.wasm
+            cd "$GITHUB_WORKSPACE/examples/$dir" &&
+              cargo fmt --check &&
+              cargo clippy --release --target wasm32-wasip2 --locked -- -D warnings &&
+              cargo build --release --target wasm32-wasip2 --locked &&
+              wasm-tools validate "$wasm" &&
+              wasm-tools component wit "$wasm" &&
+              if [ "$world" != - ]; then
+                wasm-tools component targets "$GITHUB_WORKSPACE/crates/wasmkeep-wit/wit" \
+                  --world "$world" "$wasm"
+              fi
+          }
+          failed=()
+          while read -r dir world wasm; do
+            [ -n "$dir" ] || continue
+            echo "::group::examples/$dir"
+            check "$dir" "$world" "$wasm" || failed+=("$dir")
+            echo "::endgroup::"
+          done <<<"$examples"
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf '::error::examples/%s failed\n' "${failed[@]}"
+            exit 1
           fi
-
-  sdk-rust-package:
-    # The Rust SDK as a registry would receive it, and a consumer built
-    # against the unpacked package. Nothing is published.
-    name: Rust SDK package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: sdk-rust-package
-      - name: cargo package, then examples/counter against the unpacked crate
+          echo "every example passed"
+      # The Rust SDK as a registry would receive it, and a consumer built
+      # against the unpacked package. Nothing is published.
+      - name: the Rust SDK packaged, then examples/counter against the unpacked crate
         run: ./scripts/package-rust-sdk.sh
