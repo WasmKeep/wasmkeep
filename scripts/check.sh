@@ -43,6 +43,13 @@ if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/typescript/wit ]; then
     echo 'sdks/typescript/wit differs from crates/wasmkeep-wit/wit: run npm run sync in sdks/typescript' >&2; exit 1;
   }
 fi
+# The Python package carries a copy too, so an installed wheel has the world.
+if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/python/wasmkeep/wit ]; then
+  step 'WIT copy (Python)'
+  diff -r crates/wasmkeep-wit/wit sdks/python/wasmkeep/wit >/dev/null || {
+    echo 'sdks/python/wasmkeep/wit differs from crates/wasmkeep-wit/wit: run sdks/python/scripts/sync-wit.sh' >&2; exit 1;
+  }
+fi
 # A tag's release text is its version's section of CHANGELOG.md
 # (release.yml): a version bump adds the section in the same change.
 step 'release notes'

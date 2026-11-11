@@ -328,6 +328,17 @@ jobs:
           for ex in examples/d-*/; do "$ex/build.sh"; done
           for ex in examples/moonbit-*/; do "$ex/build.sh"; done
           for ex in examples/csharp-*/; do "$ex/build.sh"; done
+      # The Python SDK as a package: its unit tests, its WIT copy against the
+      # host's, then the wheel built, checked and installed alone in a fresh
+      # environment. The counter built from that installed wheel replaces the
+      # one built from the tree, so the contract test below runs on it.
+      - name: Python SDK (unit tests, WIT in sync, wheel built and installed)
+        run: |
+          sdks/python/test/run.sh
+          diff -r crates/wasmkeep-wit/wit sdks/python/wasmkeep/wit
+          pip install build==1.6.1 twine==7.0.0
+          sdks/python/scripts/package.sh "$RUNNER_TEMP/python-package"
+          cp "$RUNNER_TEMP/python-package/counter.wasm" examples/py-counter/counter.wasm
       - name: the counter contract and the chat suite, against every language
         run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
 

@@ -1,0 +1,33 @@
+[build-system]
+# 1.27 is the first hatchling that writes `license-files` (metadata 2.4).
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wasmkeep"
+version = "0.1.0"
+description = "Write WasmKeep actors in Python."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["wasmkeep", "actors", "webassembly", "wasi", "component-model"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python :: 3",
+]
+# The SDK is plain Python that componentize-py bundles into a component; the
+# bindings it imports are the ones this exact version generates.
+dependencies = ["componentize-py==0.25.1"]
+
+[project.urls]
+Repository = "https://github.com/WasmKeep/wasmkeep"
+Documentation = "https://github.com/WasmKeep/wasmkeep/tree/main/sdks/python"
+
+# The wheel is the `wasmkeep` package and nothing else: the modules and the
+# WIT world they are written against (wasmkeep/wit, see scripts/sync-wit.sh).
+[tool.hatch.build.targets.wheel]
+packages = ["wasmkeep"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/wasmkeep", "/test", "/README.md", "/LICENSE", "/NOTICE"]
