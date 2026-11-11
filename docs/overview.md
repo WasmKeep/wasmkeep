@@ -82,8 +82,8 @@ Next: [Concepts](concepts.md) for how actors behave, or
   HTTP, plus WasmKeep's storage, alarms, actor calls and WebSockets.
 - **Languages**: anything that builds a WASI 0.2 component. Rust,
   TypeScript, Python, C, Zig and Go (TinyGo) have SDKs and pass the same
-  tests; D, MoonBit and a C# spike come next (see
-  [languages](languages.md)).
+  tests; D and MoonBit have experimental SDKs, and standard Go and C#
+  each build a counter (see [languages](languages.md)).
 - **Storage**: SQLite in WAL mode, one file per actor, sandboxed (no `ATTACH`,
   no extensions, no state-changing pragmas).
 - **Clustering**: each actor's changes stream to an S3-compatible bucket;

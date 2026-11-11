@@ -41,7 +41,7 @@ Workers strong is the platform, not the runtime.
   servers and its bucket (on R2, its requests too:
   [measured](benchmarks.md#three-nodes-against-a-real-bucket)).
 - **Durable workflows as a library**, on actors and alarms, in Rust and
-  TypeScript with clients in every SDK ([workflows](workflows.md)).
+  TypeScript with clients in the Go, Python, C and Zig SDKs ([workflows](workflows.md)).
 
 ## Where Workers is the better choice
 

@@ -44,12 +44,12 @@ WebAssembly. Isolating tenants who may be hostile needs a stronger tier
 
 ## What is measured so far
 
-The numbers in [Benchmarks](../benchmarks.md) come from a shared cloud
-container: good for comparing commits and languages, not for capacity
-claims. A three-node soak ran against R2 and OVHcloud Object Storage,
+The numbers in [Benchmarks](../benchmarks.md) come from one workstation
+and a shared cloud VM: good for comparing commits, languages and
+runtimes, not for capacity claims. A three-node soak ran against R2 and OVHcloud Object Storage,
 from a desktop and from three VPS next to the bucket
 ([results](../benchmarks.md#three-nodes-against-a-real-bucket)): nothing
-lost over 27 kills. Put the nodes in the same region as the bucket: a
+lost over 36 kills in four runs. Put the nodes in the same region as the bucket: a
 durable write waits for one PUT (54 ms next to it, 587 ms from a desktop
 to R2), and a failover for a restore of many GETs. The suite has not
 yet run on dedicated hardware.
