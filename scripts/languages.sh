@@ -6,7 +6,8 @@
 #   2. the TypeScript SDK: its WIT and types in sync with the host, the type
 #      check and its tests;
 #   3. every example in another language built (TypeScript on both engines,
-#      C, Zig, Python, Go, D, MoonBit, C#);
+#      C, Zig, Python, Go on TinyGo and standard Go, D,
+#      MoonBit, C#);
 #   4. the counter contract, the chat suite, jobs, workflows and outbound
 #      fetch against every language, with WASMKEEP_REQUIRE_LANGS=1: a
 #      component that is missing fails instead of being skipped.
@@ -76,11 +77,20 @@ for ex in examples/ts-*/; do
   (cd "$ex" && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm run --silent build:starlingmonkey)
 done
 for ex in examples/c-*/ examples/py-*/ examples/go-*/ examples/d-*/; do
+  [ "$ex" = examples/go-std-counter/ ] && continue
   echo "-- $ex"
   "$ex/build.sh"
 done
 echo '-- crates/wasmkeep-server/tests/guests/go-fetch'
 crates/wasmkeep-server/tests/guests/go-fetch/build.sh
+# Standard Go: componentize-go on PATH (it downloads its own binary into
+# the user's cache directory on first use) and Go 1.27.1+ ($GO_STD, or go).
+if command -v "${COMPONENTIZE_GO:-componentize-go}" >/dev/null 2>&1; then
+  echo '-- examples/go-std-counter/'
+  examples/go-std-counter/build.sh
+else
+  skip_lang 'standard Go (componentize-go on PATH, Go 1.27.1+)' 'test(go_standard)'
+fi
 # MoonBit: moon, and its core library bundled for wasm (the official
 # installer bundles it; some distribution packages do not).
 if command -v moon >/dev/null 2>&1 && [ -d "${MOON_HOME:-$HOME/.moon}/lib/core/_build/wasm/release/bundle" ]; then

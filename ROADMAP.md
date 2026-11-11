@@ -158,9 +158,11 @@ Continuing alongside, without holding the release:
   engine (4.6× less memory per actor than StarlingMonkey, which stays an
   option for Web APIs; [ADR 0018](docs/adr/0018-quickjs-the-default-typescript-engine.md)),
   ✅ Go on TinyGo, now supported (the [Go SDK](sdks/go): its counter,
-  chat room and jobs app pass the shared tests), then standard Go through
-  componentize-go, ✅ D (experimental: the [D SDK](sdks/d), its counter and
-  chat room pass), ✅ MoonBit (experimental: the [MoonBit SDK](sdks/moonbit),
+  chat room and jobs app pass the shared tests), ✅ standard Go through
+  componentize-go (a counter passes;
+  [findings](docs/languages.md#standard-go-through-componentize-go)),
+  ✅ D (experimental: the [D SDK](sdks/d), its counter and chat room
+  pass), ✅ MoonBit (experimental: the [MoonBit SDK](sdks/moonbit),
   its counter and chat room pass), then ✅ a C# spike (a counter passes
   with componentize-dotnet, all preview;
   [findings](docs/languages.md#c-spike)). Java, Kotlin and PHP cannot
