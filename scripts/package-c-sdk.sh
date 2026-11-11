@@ -14,8 +14,8 @@
 # Then, unless CHECK=0, it checks each archive as a user gets it: extracted
 # into an empty directory outside the repository, with only the counter
 # example's source beside it, it runs the README's build block as written,
-# with a wit-bindgen on PATH that fails, and checks the component against
-# the archive's WIT. That needs clang with wasi-libc, Zig 0.17 ($ZIG),
+# with a wit-bindgen on PATH that fails, and checks that the component is
+# valid and exports the actor world's hooks. That needs clang with wasi-libc, Zig 0.17 ($ZIG),
 # wasm-tools, curl and tar.
 set -euo pipefail
 [ $# -ge 2 ] || { echo 'usage: scripts/package-c-sdk.sh OUT LABEL [REF]' >&2; exit 2; }
@@ -26,6 +26,9 @@ cd "$(dirname "$0")/.."
 ref=${3:-$(git rev-parse HEAD)}
 wit=crates/wasmkeep-wit/wit
 wit_version=$(sed -n 's/^package wasmkeep:actor@\(.*\);$/\1/p' "$wit/actor.wit")
+# The version the sources carry, which a dev label does not change.
+sdk_version=$(sed -n 's/^#define WASMKEEP_SDK_VERSION "\(.*\)"$/\1/p' sdks/c/wasmkeep.h)
+[ -n "$sdk_version" ] || { echo 'no WASMKEEP_SDK_VERSION in sdks/c/wasmkeep.h' >&2; exit 1; }
 [ -n "$wit_version" ] || { echo "$wit/actor.wit: no package wasmkeep:actor@<version>" >&2; exit 1; }
 bindgen=$(wit-bindgen --version 2>/dev/null || true)
 case $bindgen in
@@ -39,7 +42,8 @@ trap 'rm -rf "$work"' EXIT
 # README: the template with its placeholders filled; a tarball resolves no
 # relative link, and no placeholder stays.
 readme() {
-  sed -e "s/@VERSION@/$label/g" -e "s/@REF@/$ref/g" -e "s/@WIT_VERSION@/$wit_version/g" "$1" > "$2"
+  sed -e "s/@VERSION@/$label/g" -e "s/@SDK_VERSION@/$sdk_version/g" -e "s/@REF@/$ref/g" \
+    -e "s/@WIT_VERSION@/$wit_version/g" "$1" > "$2"
   if grep -nP '@[A-Z_]+@|\]\((?!https://)' "$2"; then
     echo "$1: a placeholder left, or a link that is not absolute" >&2; exit 1
   fi
@@ -47,13 +51,15 @@ readme() {
 # The C SDK's sources into directory $1, and its bindings into $1/gen.
 c_files() {
   mkdir -p "$1/gen"
-  install -m 0644 sdks/c/wasmkeep.h sdks/c/wasmkeep.c sdks/c/wasmkeep_kv.h sdks/c/wasmkeep_kv.c \
-    sdks/c/wasmkeep_wire.h sdks/c/wasmkeep_wire.c sdks/c/wasmkeep_workflow.h sdks/c/wasmkeep_workflow.c "$1/"
+  # Every source of the SDK: a new file is in the archive without a list
+  # to keep (its tests and the archive's README are in subdirectories).
+  install -m 0644 sdks/c/*.h sdks/c/*.c "$1/"
   wit-bindgen c "$wit" --world actor --out-dir "$1/gen" >/dev/null
   chmod 0644 "$1"/gen/*
 }
 common() {
   cp -r "$wit" "$1/wit"
+  chmod -R u=rwX,go=rX "$1/wit"
   mkdir -p "$1/scripts"
   install -m 0755 scripts/componentize-core.sh "$1/scripts/"
   install -m 0644 LICENSE "$1/"

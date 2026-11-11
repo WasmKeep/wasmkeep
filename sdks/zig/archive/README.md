@@ -10,7 +10,7 @@ building an actor needs no wit-bindgen. Needs Zig 0.17.
 In this directory:
 
 - `zig/`: the SDK (`wasmkeep.zig`, with `kv.zig`, `queue.zig` and
-  `workflow.zig`); `version` in `wasmkeep.zig` is `"@VERSION@"`.
+  `workflow.zig`); `version` in `wasmkeep.zig` is `"@SDK_VERSION@"`.
 - `c/`: the C SDK it wraps, and `c/gen/`, the generated bindings.
 - `wit/`: the WIT they were generated from.
 - `scripts/componentize-core.sh`: turns the core module Zig writes into a

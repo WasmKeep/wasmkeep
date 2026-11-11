@@ -58,7 +58,7 @@ for pkg in "$world" "$handler"; do
 done
 (cd "$gen" && "$MOON" build --target wasm --release) || {
   echo "moon build failed. If it cannot load the core library: MoonBit's core must be bundled for wasm" >&2
-  echo "(moon bundle --target wasm --release in \$MOON_HOME/lib/core; the official installer does it)." >&2
+  echo "(moon bundle --target wasm --release in \$MOON_HOME/lib/core)." >&2
   exit 1
 }
 core="$gen/_build/wasm/release/build/gen/gen.wasm"

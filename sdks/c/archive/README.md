@@ -11,7 +11,7 @@ In this directory:
 
 - `wasmkeep.h` (includes `wasmkeep_kv.h` and `wasmkeep_workflow.h`) and
   `wasmkeep.c`, `wasmkeep_kv.c`, `wasmkeep_wire.c`, `wasmkeep_workflow.c`:
-  the SDK. `WASMKEEP_SDK_VERSION` in `wasmkeep.h` is `"@VERSION@"`.
+  the SDK. `WASMKEEP_SDK_VERSION` in `wasmkeep.h` is `"@SDK_VERSION@"`.
 - `gen/`: the generated bindings (`actor.h`, `actor.c`,
   `actor_component_type.o`).
 - `wit/`: the WIT they were generated from.
