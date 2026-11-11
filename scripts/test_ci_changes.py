@@ -13,6 +13,10 @@ BASE = {
     'bench/results/2026-01-01-abc.csv': 'a,b\n',
     'crates/wasmkeep-server/src/lib.rs': 'pub fn f() {}\n' * 20,
     '.github/workflows/ci.yml': 'name: CI\n',
+    'deploy/compose/README.md': 'compose\n',
+    'deploy/systemd/units/README.md': 'units\n',
+    'sdks/go/README.md': 'go\n',
+    'examples/jobs/app/README.md': 'jobs\n',
 }
 
 
@@ -44,6 +48,9 @@ class Changes(unittest.TestCase):
         self.git('commit', '-q', '--allow-empty', '-m', message)
 
     def answer(self, *args, cwd=None):
+        # A pull request into main, unless the case names another base.
+        if args == ('pull_request',):
+            args += ('main',)
         result = subprocess.run([str(SCRIPT), *args], cwd=cwd or self.root, env=self.env,
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -71,6 +78,26 @@ class Changes(unittest.TestCase):
             'docs/overview.md', 'docs/adr/0001-plain-cargo.md', 'docs/book.toml',
             'deploy/compose/README.md', 'deploy/systemd/units/README.md',
             'sdks/go/README.md', 'examples/jobs/app/README.md')))
+
+    def test_a_new_readme_beside_code_is_code(self):
+        # A new example or a generated directory: a build globs over the
+        # first and regenerates the second, so a README alone can break it.
+        for path in ('examples/ts-new/README.md', 'sdks/go/internal/gen/README.md',
+                     'sdks/typescript/wit/README.md', 'deploy/new/README.md'):
+            with self.subTest(path=path):
+                self.assertTrue(self.code(self.writes(path)))
+
+    def test_a_pull_request_into_another_branch_runs_everything(self):
+        # Its base may hold code main never tested; retargeting it to main
+        # starts no new run.
+        self.git('switch', '-q', '-c', 'change', 'main')
+        self.write('docs/overview.md')
+        self.commit('change')
+        self.git('switch', '-q', '--detach', 'main')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge', 'change')
+        self.assertFalse(self.answer('pull_request', 'main'))
+        self.assertTrue(self.answer('pull_request', 'feature-x'))
+        self.assertTrue(self.answer('pull_request', ''))
 
     def test_results_only(self):
         self.assertFalse(self.code(self.writes(
