@@ -25,7 +25,8 @@ Run `./scripts/check.sh` before committing:
   suite, since the examples build on it. A missing toolchain (no `go`, or no
   `node_modules` until `npm ci`) is skipped with a note. The Zig SDK
   (`sdks/zig`) wraps the C SDK and has no unit tests of its own; nor has
-  the D SDK (`sdks/d`), which its examples cover.
+  the D SDK (`sdks/d`) and the MoonBit SDK (`sdks/moonbit`), which their
+  examples cover.
 
 The base is the merge base with `origin/main`; fetch first. Set `CHECK_BASE` to
 an explicit PR base when needed. Checks include staged, unstaged and untracked

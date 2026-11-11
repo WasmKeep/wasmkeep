@@ -267,6 +267,25 @@ jobs:
         run: |
           curl -sSL https://github.com/ldc-developers/ldc/releases/download/v1.43.0/ldc2-1.43.0-linux-x86_64.tar.xz | tar xJ -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/ldc2-1.43.0-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: toolchains (MoonBit)
+        # Pinned by its moonc version (dated versions are not served) and
+        # checked by SHA-256; the core library is bundled for wasm here.
+        run: |
+          v=0.10.20%2B65efd5b93
+          home="$RUNNER_TEMP/moon"
+          mkdir -p "$home/lib"
+          curl -sSfL -o "$RUNNER_TEMP/moonbit.tar.gz" "https://cli.moonbitlang.com/binaries/$v/moonbit-linux-x86_64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/moonbit-core.tar.gz" "https://cli.moonbitlang.com/cores/core-$v.tar.gz"
+          sha256sum -c <<SUMS
+          80d987523308fa490eba9f1baf98df996a5a7891e118357553b7c2608c0597c5  $RUNNER_TEMP/moonbit.tar.gz
+          8ec2a2c01335501d703867bb4eef5f92d3cd7e1ae1ee5f7f14d54d16d2c7c2b5  $RUNNER_TEMP/moonbit-core.tar.gz
+          SUMS
+          tar xzf "$RUNNER_TEMP/moonbit.tar.gz" -C "$home"
+          find "$home/bin" -maxdepth 1 -type f -exec chmod +x {} +   # the tarball has no execute bits
+          tar xzf "$RUNNER_TEMP/moonbit-core.tar.gz" -C "$home/lib"
+          (cd "$home/lib/core" && MOON_HOME="$home" PATH="$home/bin:$PATH" moon bundle --target wasm --release)
+          echo "MOON_HOME=$home" >> "$GITHUB_ENV"
+          echo "$home/bin" >> "$GITHUB_PATH"
       - name: TypeScript SDK (types and WIT in sync with the host, type-check)
         working-directory: sdks/typescript
         run: |
@@ -289,6 +308,7 @@ jobs:
           for ex in examples/go-*/; do "$ex/build.sh"; done
           crates/wasmkeep-server/tests/guests/go-fetch/build.sh
           for ex in examples/d-*/; do "$ex/build.sh"; done
+          for ex in examples/moonbit-*/; do "$ex/build.sh"; done
       - name: the counter contract and the chat suite, against every language
         run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
 

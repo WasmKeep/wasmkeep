@@ -6,7 +6,7 @@
 #   2. the TypeScript SDK: its WIT and types in sync with the host, the type
 #      check and its tests;
 #   3. every example in another language built (TypeScript on both engines,
-#      C, Zig, Python, Go, D);
+#      C, Zig, Python, Go, D, MoonBit);
 #   4. the counter contract, the chat suite, jobs, workflows and outbound
 #      fetch against every language, with WASMKEEP_REQUIRE_LANGS=1: a
 #      component that is missing fails instead of being skipped.
@@ -14,6 +14,17 @@
 # runs `npm ci` where a TypeScript package has no node_modules yet.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Languages whose tools need setup beyond installing a package are built
+# only when that setup is there; otherwise they are skipped, listed in
+# $LANGUAGES_SKIPPED (check.sh shows them as not run), and their tests
+# are left out. CI builds them all.
+skipped_list=${LANGUAGES_SKIPPED:-/dev/null}
+tests='all()'
+skip_lang() { # name, the tests to leave out
+  echo "skipped: $1"
+  echo "$1" >> "$skipped_list"
+  tests="$tests - ($2)"
+}
 root=$(pwd)
 wit="$root/crates/wasmkeep-wit/wit"
 
@@ -70,11 +81,21 @@ for ex in examples/c-*/ examples/py-*/ examples/go-*/ examples/d-*/; do
 done
 echo '-- crates/wasmkeep-server/tests/guests/go-fetch'
 crates/wasmkeep-server/tests/guests/go-fetch/build.sh
+# MoonBit: moon, and its core library bundled for wasm (the official
+# installer bundles it; some distribution packages do not).
+if command -v moon >/dev/null 2>&1 && [ -d "${MOON_HOME:-$HOME/.moon}/lib/core/_build/wasm/release/bundle" ]; then
+  for ex in examples/moonbit-*/; do
+    echo "-- $ex"
+    "$ex/build.sh"
+  done
+else
+  skip_lang 'MoonBit (moon, with its core bundled: moon bundle --target wasm --release in $MOON_HOME/lib/core)' 'test(moonbit)'
+fi
 for ex in examples/zig-*/; do
   echo "-- $ex"
   ZIG="${ZIG:-zig}" "$ex/build.sh"
 done
 
 echo '-- every language against the same tests'
-WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked \
+WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked -E "$tests" \
   --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs
