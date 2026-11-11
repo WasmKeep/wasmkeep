@@ -19,7 +19,8 @@ class Runner(unittest.TestCase):
         for name in ('check.sh', 'doctor.sh', 'release-notes.sh'):
             shutil.copy2(SCRIPTS / name, self.root / 'scripts' / name)
         self.write('CHANGELOG.md', '# Changelog\n\n## 1.2.3\n\nNotes.\n')
-        for name in ('docs-site.sh', 'licenses.sh', 's3-suites.sh', 'languages.sh'):
+        for name in ('docs-site.sh', 'licenses.sh', 's3-suites.sh', 'languages.sh',
+                     'package-rust-sdk.sh'):
             self.write('scripts/' + name, '#!/bin/sh\necho "' + name + '" >> "$CALLS"\n', executable=True)
         for name in ('test_check_benchmark_paths.py', 'test_check_runner.py'):
             self.write('scripts/' + name, '')

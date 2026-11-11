@@ -5,14 +5,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-repository = "https://github.com/WasmKeep/wasmkeep"
+repository.workspace = true
 authors.workspace = true
 readme = "README.md"
 keywords = ["wasm", "wasi", "component-model", "actor", "sqlite"]
 categories = ["wasm", "api-bindings"]
 # The one workspace crate meant for a registry: an actor depends on it
-# without a clone of the repository.
-publish = true
+# without a clone of the repository. It packages already
+# (scripts/package-rust-sdk.sh); `publish` turns true with the change that
+# publishes it.
+publish = false
 # `wit/` is a copy of crates/wasmkeep-wit/wit (scripts/check.sh compares
 # them): a packaged crate cannot read files outside its own directory.
 include = ["src/**", "wit/**", "README.md", "LICENSE", "NOTICE"]

@@ -6,10 +6,16 @@
 # (--allow-dirty while trying an uncommitted change).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-root=$PWD
+# The crate carries its own copy of the WIT: it must be the host's.
+diff -r crates/wasmkeep-wit/wit crates/wasmkeep-sdk/wit || {
+  echo 'crates/wasmkeep-sdk/wit differs from crates/wasmkeep-wit/wit' >&2; exit 1;
+}
 cargo package -p wasmkeep-sdk --locked "$@"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-package="$root/target/package/wasmkeep-sdk-$version"
+# Wherever cargo keeps its target directory on this machine.
+target=$(cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+package="$target/package/wasmkeep-sdk-$version"
 [ -f "$package/wit/actor.wit" ] || { echo "$package has no wit/actor.wit" >&2; exit 1; }
 
 work=$(mktemp -d)
