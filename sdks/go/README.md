@@ -53,21 +53,39 @@ tinygo build -target=wasip2 -no-debug -opt=2 \
 wasmkeep serve --actor hits=actor.wasm
 ```
 
-TinyGo 0.39 (with Go 1.24) is what CI builds with; 0.43 is tested too.
+TinyGo 0.39 (with Go 1.24) is what CI builds with; 0.43 (with Go 1.27) was
+tried by hand: the three examples build with it.
 Nothing else is needed: the bindings `wit-bindgen-go` generates are
 committed in `internal/gen`. The `actor-tinygo` world is the actor world
 plus the `wasi:filesystem` imports TinyGo's runtime makes whether or not a
 program uses them (the host provides them inert: no directories).
 
-The `wasmkeep` package is newer than the module's last tag
-(`sdks/go/v0.1.0`, which has only the clients): until the next tag,
-reference a checkout from the app's `go.mod` with a `replace` directive,
-as the examples do:
+## Install
+
+Add the module to an app at the version of the WasmKeep release it runs
+on:
+
+```bash
+go get github.com/wasmkeep/wasmkeep/sdks/go@vX.Y.Z
+go mod tidy   # once the app imports a package: records the module's one dependency
+```
+
+The module carries the same version number as the server, so `vX.Y.Z` is
+the release's tag (in the repository, the module's own tag is
+`sdks/go/vX.Y.Z`). The `wasmkeep` package is newer than `v0.1.0`, which
+has only the clients: it needs a later release. Until there is one,
+`@latest` resolves to `v0.1.0`, and an app references a checkout with a
+`replace` directive instead, as the examples in this repository do:
 
 ```text
 require github.com/wasmkeep/wasmkeep/sdks/go v0.0.0
 replace github.com/wasmkeep/wasmkeep/sdks/go => ../../sdks/go
 ```
+
+Outside the repository (an example copied elsewhere, for instance), delete
+both lines and run the two commands above. `go get` writes the `require`
+line at the release's version; it fails while the line still names
+`v0.0.0`, which is not a published version.
 
 ## API
 

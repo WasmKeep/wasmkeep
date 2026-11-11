@@ -44,6 +44,10 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ -n "$(./scripts/release-notes.sh "$version")" ] \
             || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+      - name: Every SDK manifest carries the workspace version
+        run: |
+          python3 -I scripts/test_check_versions.py
+          python3 -I scripts/check-versions.py
       - name: Check every introduced commit
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -312,11 +316,18 @@ jobs:
           git diff --exit-code -- wit types
           npm run check
           npm test
+      - name: TypeScript SDK (the packed tarball, installed outside the checkout)
+        run: sdks/typescript/scripts/pack-test.sh "$RUNNER_TEMP/ts-sdk-pack"
       - name: Go SDK (bindings and WIT in sync with the host)
         run: |
           sdks/go/scripts/generate.sh
           git add -N sdks/go
           git diff --exit-code -- sdks/go/internal/gen sdks/go/wit
+      - name: Go SDK (vet, unit tests)
+        working-directory: sdks/go
+        run: |
+          go vet ./...
+          go test ./...
       - name: build every example
         run: |
           for ex in examples/ts-*/; do (cd "$ex" && npm ci && npm run build && npm run build:starlingmonkey); done
@@ -328,6 +339,18 @@ jobs:
           for ex in examples/d-*/; do "$ex/build.sh"; done
           for ex in examples/moonbit-*/; do "$ex/build.sh"; done
           for ex in examples/csharp-*/; do "$ex/build.sh"; done
+      # The Python SDK as a package: its unit tests, its WIT copy against the
+      # host's, then the wheel built, checked and installed alone in a fresh
+      # environment. The counter built from that installed wheel replaces the
+      # one built from the tree, so the contract test below runs on it (the
+      # chat room and the jobs app are still built from the tree).
+      - name: Python SDK (unit tests, WIT in sync, wheel built and installed)
+        run: |
+          sdks/python/test/run.sh
+          diff -r crates/wasmkeep-wit/wit sdks/python/wasmkeep/wit
+          pip install build==1.6.1 twine==7.0.0
+          sdks/python/scripts/package.sh "$RUNNER_TEMP/python-package"
+          cp "$RUNNER_TEMP/python-package/counter.wasm" examples/py-counter/counter.wasm
       - name: the counter contract and the chat suite, against every language
         run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
 
@@ -412,3 +435,16 @@ jobs:
             wasm-tools component targets "$GITHUB_WORKSPACE/crates/wasmkeep-wit/wit" \
               --world "${{ matrix.world }}" "$wasm"
           fi
+
+  sdk-rust-package:
+    # The Rust SDK as a registry would receive it, and a consumer built
+    # against the unpacked package. Nothing is published.
+    name: Rust SDK package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: sdk-rust-package
+      - name: cargo package, then examples/counter against the unpacked crate
+        run: ./scripts/package-rust-sdk.sh

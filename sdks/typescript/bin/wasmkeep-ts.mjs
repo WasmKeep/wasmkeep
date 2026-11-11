@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // wasmkeep-ts build <entry.ts> [-o out.wasm] [--engine quickjs|starlingmonkey]
+// wasmkeep-ts --help | --version
 //
 // Bundles a TypeScript (or JavaScript) actor whose default export is
 // `defineActor({...})`, and turns it into a WebAssembly component
@@ -20,13 +21,26 @@ const here = dirname(fileURLToPath(import.meta.url));
 const sdkRoot = resolve(here, "..");
 const require = createRequire(import.meta.url);
 
+const usageLine = "usage: wasmkeep-ts build <entry.ts> [-o out.wasm] [--engine quickjs|starlingmonkey]";
+
 function usage(msg) {
   if (msg) console.error(`error: ${msg}`);
-  console.error("usage: wasmkeep-ts build <entry.ts> [-o out.wasm] [--engine quickjs|starlingmonkey]");
+  console.error(usageLine);
   process.exit(2);
 }
 
 const args = process.argv.slice(2);
+if (args[0] === "--help" || args[0] === "-h") {
+  console.log(usageLine);
+  console.log("       wasmkeep-ts --help | --version");
+  console.log("\nBuilds a TypeScript or JavaScript actor into a WebAssembly component,");
+  console.log("with the QuickJS engine unless --engine says otherwise.");
+  process.exit(0);
+}
+if (args[0] === "--version" || args[0] === "-V") {
+  console.log(require("../package.json").version);
+  process.exit(0);
+}
 if (args[0] !== "build") usage(args[0] ? `unknown command ${args[0]}` : undefined);
 const entry = args[1] ? resolve(args[1]) : usage("no entry file");
 const oi = args.indexOf("-o");

@@ -32,7 +32,7 @@ different target, and does not make a language usable here.
 | **C / C++** | Supported | [C SDK](../sdks/c) over `wit-bindgen c`; clang + wasi-libc, the WASI 0.1 adapter | Counter, [chat room](../examples/c-chat-room) and [jobs app](../examples/c-jobs) (KV and queue clients) pass; 170 KB. Performs like Rust: 110 µs of CPU per request, 244 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)). Recommended once it has a guide |
 | **TypeScript / JavaScript** | Supported (embedded runtime) | [`@wasmkeep/sdk`](../sdks/typescript): esbuild, then componentize-qjs (QuickJS embedded, pre-initialized); or [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) (StarlingMonkey) with `--engine starlingmonkey` ([below](#typescript-on-quickjs)) | Counter, chat room and [jobs app](../examples/ts-jobs) (KV and queue clients) pass on both engines. QuickJS, the default: 1.7 MB; 230 µs of CPU per request (2.2× Rust) and 741 KB per actor (3×) ([measured](benchmarks.md#the-same-counter-in-every-language)), few Web APIs. StarlingMonkey: Web APIs and 1.5× faster plain JavaScript, for 4.6× the memory per actor ([measured](benchmarks.md#typescript-on-quickjs-against-starlingmonkey)) |
 | **Python** | Supported (embedded runtime) | [Python SDK](../sdks/python), [componentize-py](https://github.com/bytecodealliance/componentize-py) (CPython embedded) | Counter, chat room and [jobs app](../examples/py-jobs) (KV and queue clients) pass. 18.7 MB, the largest; 259 µs of CPU per request (2.5× Rust) and 7.8 MB per actor (31×) ([measured](benchmarks.md#the-same-counter-in-every-language)) |
-| **Go (TinyGo)** | Supported | [Go SDK](../sdks/go); TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2`, which writes a component directly | Counter, [chat room](../examples/go-chat-room) and [jobs app](../examples/go-jobs) (KV, queue and workflow clients) pass; 162 KB. 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language), on the counter before the SDK: the same host calls without the wrapper); see [Go](#go) |
+| **Go (TinyGo)** | Supported | [Go SDK](../sdks/go); TinyGo (0.39 in CI, 0.43 tried by hand) `-target=wasip2`, which writes a component directly | Counter, [chat room](../examples/go-chat-room) and [jobs app](../examples/go-jobs) (KV, queue and workflow clients) pass; 162 KB. 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language), on the counter before the SDK: the same host calls without the wrapper); see [Go](#go) |
 | **Go (standard)** | Experimental | [componentize-go](https://github.com/bytecodealliance/componentize-go) 0.5.1 with Go 1.27, straight on its bindings | The [counter](../examples/go-std-counter) passes; 2.7 MB. No SDK yet (the Go SDK is for TinyGo's bindings), no numbers from `bench/run.sh` (see [standard Go](#standard-go-through-componentize-go)) |
 | **D** | Experimental | [D SDK](../sdks/d) over `wit-bindgen d`; LDC (1.43 in CI) with `-betterC`, clang + wasi-libc, the WASI 0.1 adapter | Counter and [chat room](../examples/d-chat-room) pass; 88 KB. No numbers from `bench/run.sh` yet, no outbound HTTP or key-value and queue clients (see [D](#d)) |
 | **MoonBit** | Experimental | [MoonBit SDK](../sdks/moonbit) over `wit-bindgen moonbit`; `moon build --target wasm` (MoonBit 0.10.20 in CI), then `wasm-tools component embed --encoding utf16` and `component new` | Counter and [chat room](../examples/moonbit-chat-room) pass; 49 KB. The language is pre-1.0; no numbers from `bench/run.sh` yet, no outbound HTTP or key-value and queue clients (see [MoonBit](#moonbit)) |
@@ -154,6 +154,12 @@ needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
 `wasi:filesystem` whether or not the program uses it, so the module's
 `wit/` adds those imports to the actor world (`actor-tinygo`); the host
 provides them inert (no directories).
+
+An app adds the module with `go get
+github.com/wasmkeep/wasmkeep/sdks/go@vX.Y.Z`, where `vX.Y.Z` is the
+release's tag: the module carries the server's version number. The
+`wasmkeep` package needs a release after `v0.1.0`; see the SDK's
+[Install](../sdks/go/README.md#install).
 
 The [counter](../examples/go-counter), [chat room](../examples/go-chat-room)
 and [jobs app](../examples/go-jobs) pass the shared tests, and
@@ -293,6 +299,26 @@ What is missing:
 - **Size.** 2.5 MB as built, 929 KB with its debug sections stripped
   (`wasm-tools strip --all`, which `build.sh` runs): NativeAOT compiles
   the runtime and the garbage collector in.
+
+## Versions
+
+The SDKs carry the server's version: one number for the `wasmkeep` binary,
+the Rust crate and every other SDK manifest, changed together. Use the SDK
+with the same version as the server you run: other pairings are not
+tested.
+
+| SDK | Server | WIT package |
+| --- | --- | --- |
+| 0.1.0 | 0.1.0 | `wasmkeep:actor@0.2.0` |
+
+The WIT package version is another number: it is the version of the
+interface between a component and the host
+([`actor.wit`](../crates/wasmkeep-wit/wit/actor.wit)), and changes only when
+that interface does.
+
+`scripts/check-versions.py` (run by `./scripts/check.sh` and CI) fails when a
+manifest it lists has another version than the workspace's in `Cargo.toml`;
+an SDK that gains a manifest with a version is added to that list.
 
 ## What the tiers require
 

@@ -43,6 +43,29 @@ if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/typescript/wit ]; then
     echo 'sdks/typescript/wit differs from crates/wasmkeep-wit/wit: run npm run sync in sdks/typescript' >&2; exit 1;
   }
 fi
+# The Rust SDK carries its own copy too: a packaged crate cannot read files
+# outside its directory.
+if [ -d crates/wasmkeep-wit/wit ] && [ -d crates/wasmkeep-sdk/wit ]; then
+  step 'WIT copy in the Rust SDK'
+  diff -r crates/wasmkeep-wit/wit crates/wasmkeep-sdk/wit >/dev/null || {
+    echo 'crates/wasmkeep-sdk/wit differs from crates/wasmkeep-wit/wit: run rm -r crates/wasmkeep-sdk/wit && cp -r crates/wasmkeep-wit/wit crates/wasmkeep-sdk/wit' >&2; exit 1;
+  }
+fi
+# The Go SDK ships a copy too, beside tinygo.wit (its own world over the
+# actor's, which sdks/go/scripts/generate.sh writes).
+if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/go/wit ]; then
+  step 'WIT copy (Go)'
+  diff -r -x tinygo.wit crates/wasmkeep-wit/wit sdks/go/wit >/dev/null || {
+    echo 'sdks/go/wit differs from crates/wasmkeep-wit/wit: run sdks/go/scripts/generate.sh' >&2; exit 1;
+  }
+fi
+# The Python package carries a copy too, so an installed wheel has the world.
+if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/python/wasmkeep/wit ]; then
+  step 'WIT copy (Python)'
+  diff -r crates/wasmkeep-wit/wit sdks/python/wasmkeep/wit >/dev/null || {
+    echo 'sdks/python/wasmkeep/wit differs from crates/wasmkeep-wit/wit: run sdks/python/scripts/sync-wit.sh' >&2; exit 1;
+  }
+fi
 # A tag's release text is its version's section of CHANGELOG.md
 # (release.yml): a version bump adds the section in the same change.
 step 'release notes'
@@ -50,6 +73,10 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 [ -n "$(./scripts/release-notes.sh "$version")" ] || {
   echo "CHANGELOG.md has no section for $version, the workspace version" >&2; exit 1;
 }
+# The SDKs carry the server's version: a manifest left behind by a bump
+# would be released under another number than the binary's.
+step 'one version'
+python3 -I scripts/check-versions.py
 
 rust=false; everything=false; simulation=false; scripts=false; preflight=false
 packages=(); sdk_ts=false; sdk_py=false; sdk_go=false; sdk_c=false
@@ -175,6 +202,7 @@ if $full; then
     while IFS= read -r line; do not_run+=("$line"); done < "$langs_skipped"
     rm -f "$langs_skipped"
   fi
+  step 'Rust SDK package'; ./scripts/package-rust-sdk.sh --allow-dirty >/dev/null
   msrv=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
   step MSRV; cargo +"$msrv" check --workspace --all-targets --locked
   step dependencies; cargo deny check; ./scripts/licenses.sh >/dev/null
