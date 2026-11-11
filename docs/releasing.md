@@ -52,10 +52,13 @@ registry.
 ## If a run stops half-way
 
 - **A registry refused, or an approval was rejected or ran out**: use
-  "Re-run failed jobs" on the run. It publishes the same files.
-- **`publish.yml` itself had to be fixed**: merge the fix, then run the
-  workflow by hand from `main` with the tag (`workflow_dispatch`). The
-  packages still come from the tag's commit.
+  "Re-run failed jobs" on the run, or run the workflow by hand on the tag
+  (Run workflow, with the tag as the ref). It publishes the same files.
+- **`publish.yml` itself is wrong at the tag**: it cannot be fixed for
+  that tag, since a run always uses the tag's own copy. Publish what is
+  missing by hand from a checkout of the tag (`cargo publish`,
+  `npm publish`, `twine upload`), and fix the workflow for the next
+  release.
 
 Either way a registry that has the version starts no job and asks for no
 approval, and PyPI is asked file by file, so a release that got its wheel
@@ -71,8 +74,8 @@ identity. The `registries` environment is therefore the boundary, and its
 settings matter.
 
 - **GitHub, the `registries` environment**: required reviewers;
-  deployment limited to the tags `v*` and the branch `main` (for a run by
-  hand); administrators not allowed to bypass it; "prevent self-review"
+  deployment limited to the tags `v*`; administrators not allowed to
+  bypass it; "prevent self-review"
   once there is more than one maintainer. `publish.yml` refuses to run if
   the environment is missing, has no reviewers or accepts any ref.
 - **GitHub, the tags**: the ruleset that keeps `v*` and `sdks/go/v*` from

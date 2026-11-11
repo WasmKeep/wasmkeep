@@ -6,7 +6,10 @@ name: publish
 # workflow by name: docs/releasing.md says how each is set up).
 #
 # It runs when a maintainer publishes the draft that release.yml opened, or
-# by hand for a tag, to finish a release whose run stopped half-way.
+# by hand on the release's tag (Run workflow, with the tag as the ref), to
+# finish a release whose run stopped half-way. Either way it runs the copy
+# of this file that the tag holds, on the tag's commit: no input names what
+# to publish.
 #
 # How it is laid out, and why:
 # - `gate` and `packages` hold no publishing identity. They check the
@@ -29,10 +32,6 @@ on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: The release's tag (vX.Y.Z)
-        required: true
 
 permissions:
   contents: read
@@ -43,11 +42,11 @@ defaults:
     shell: bash
 
 concurrency:
-  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  TAG: ${{ github.ref_name }}
 
 jobs:
   # Refuses anything but a published release of main whose tag is the
@@ -61,11 +60,16 @@ jobs:
       actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
-      sha: ${{ steps.version.outputs.sha }}
+      sha: ${{ github.sha }}
     steps:
+      - name: this run is on a tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          [ "$REF_TYPE" = tag ] || {
+            echo "::error::run this workflow on the release's tag, not on a branch"; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
       - id: version
         name: the tag is the version of every manifest
@@ -79,7 +83,6 @@ jobs:
             echo "::error::tag $TAG is not v$version, the workspace version"; exit 1; }
           python3 -I scripts/check-versions.py
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: the Rust SDK is marked publishable
         run: |
           cargo metadata --no-deps --format-version 1 | python3 -c '
@@ -92,7 +95,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          SHA: ${{ steps.version.outputs.sha }}
+          SHA: ${{ github.sha }}
         run: |
           draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
           [ "$draft" = false ] || { echo "::error::the release $TAG is still a draft"; exit 1; }
@@ -122,7 +125,7 @@ jobs:
           [ "$(jq '.deployment_branch_policy != null' <<<"$environment")" = true ] || {
             echo "::error::the registries environment accepts any branch or tag: see docs/releasing.md"; exit 1; }
 
-  # Builds every package from the commit the gate checked, with no
+  # Builds every package from the tag's commit, the one this run is on, with no
   # publishing identity, and asks each registry what it already has.
   packages:
     name: build the packages, ask the registries
@@ -138,7 +141,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
@@ -244,7 +246,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
       - id: auth
         # rust-lang/crates-io-auth-action v1.0.6: a token for this run only
