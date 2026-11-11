@@ -1,12 +1,32 @@
 # WasmKeep actors in Python
 
-Write [WasmKeep](../../README.md) actors as plain Python classes. The SDK is
-one module, [`wasmkeep`](wasmkeep/__init__.py), bundled into your component by
+Write [WasmKeep](https://github.com/WasmKeep/wasmkeep) actors as plain Python
+classes. WasmKeep is a self-hosted platform for actors: WebAssembly
+components, each with its own SQLite database, handling one event at a time.
+This package is the SDK and the command that builds your module into such a
+component, with
 [componentize-py](https://github.com/bytecodealliance/componentize-py)
-(CPython embedded):
+(CPython embedded). WasmKeep is pre-alpha.
+
+## Install
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install wasmkeep
+```
+
+That is all a build needs: the package carries the WIT files of the
+`wasmkeep:actor` world, and componentize-py comes with it at the version
+the SDK is written for. To run the result you need the `wasmkeep` server:
+[install a release](https://github.com/WasmKeep/wasmkeep#install) of the
+same version as the package.
+
+## A first actor
+
+`app.py`:
 
 ```python
-from wasmkeep import Actor, Response, alarms, actors, json, sockets, storage
+from wasmkeep import Actor, storage
 
 
 class Hits(Actor):
@@ -20,6 +40,38 @@ class Hits(Actor):
         [row] = storage.query("SELECT count(*) AS n FROM hits")
         return {"hits": row["n"], "path": req.path}   # a dict is sent as JSON
 
+
+WitWorld, IncomingHandler = Hits.exports()
+```
+
+Build it into a component and serve it:
+
+```bash
+python -m wasmkeep build app -o actor.wasm
+wasmkeep serve --actor hits=actor.wasm
+```
+
+In another terminal:
+
+```bash
+curl localhost:8080/actor/hits/alice   # {"hits": 1, "path": "/"}
+curl localhost:8080/actor/hits/alice   # {"hits": 2, "path": "/"}
+curl localhost:8080/actor/hits/bob     # {"hits": 1, "path": "/"}: another actor, its own database
+```
+
+`build` takes the module's name (`app` for `app.py`), found in the current
+directory; `-p DIR` (repeatable) names other directories to find it and
+what it imports in. Pure-Python packages installed in the same environment
+are bundled too. The last line of `app.py` is what the component exports:
+keep it at module level.
+
+The other hooks, all optional:
+
+```python
+from wasmkeep import Actor, sockets
+
+
+class Room(Actor):
     # The alarm set with alarms.set(...) fired (at least once).
     def alarm(self):
         pass
@@ -32,20 +84,30 @@ class Hits(Actor):
 
     def websocket_close(self, conn, code, reason):
         pass
-
-
-WitWorld, IncomingHandler = Hits.exports()
 ```
 
-Build it into a component and serve it:
+## Versions
 
-```bash
-pip install componentize-py==0.25.1
-componentize-py -d crates/wasmkeep-wit/wit -w actor componentize app \
-  -p . -p sdks/python -o actor.wasm
-wasmkeep serve --actor hits=actor.wasm
-curl localhost:8080/actor/hits/alice
-```
+| | |
+| --- | --- |
+| The package | The version of the WasmKeep server it is released with; use the two at the same version |
+| componentize-py | 0.25.1 exactly, installed with the package: the SDK imports the bindings that version generates |
+| Python, to run the build | 3.10 or later (CI builds with 3.13) |
+| Python, in the component | CPython 3.14, the one componentize-py 0.25.1 embeds, whatever Python ran the build |
+| The interface | `wasmkeep:actor@0.2.0`, versioned on its own: `wasmkeep.WIT_VERSION`, the WIT files in the package's `wit/` |
+
+`python -m wasmkeep --version` prints the package's version and the
+interface's.
+
+## Outside a component
+
+The host's functions (`storage`, `alarms`, `actors`, `sockets`, `env`, and
+`exports()`) exist only inside a built component, running on a WasmKeep
+node. Under plain CPython the package imports, so an editor resolves it and
+the build command runs, but calling one of them raises `RuntimeError`: an
+actor is tried by building it and serving it (`wasmkeep serve` runs on a
+laptop). Keep logic you want to unit-test in functions that take and return
+plain values.
 
 ## API
 
@@ -56,7 +118,7 @@ curl localhost:8080/actor/hits/alice
 | `storage.query(sql, *params)` | Rows as dicts, by column name |
 | `storage.delete_self()` | Deletes this actor when the event ends |
 | `alarms.set(at_ms)`, `alarms.get()`, `alarms.clear()` | The actor's single alarm, in ms since the Unix epoch |
-| `env.get(name, default=None)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](../../docs/reference/api.md#interface-env)), or `default` |
+| `env.get(name, default=None)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/main/docs/reference/api.md#interface-env)), or `default` |
 | `actors.self_address()` | This actor's `ActorAddress` (`tenant`, `class_name`, `name`) |
 | `actors.call("class/name", method=, path=, headers=, body=)` | Calls another actor; returns a `CallResponse` (`status`, `headers`, `body`, `text()`, `json()`) |
 | `sockets.send(conn, data)`, `broadcast(data, except_conn=)`, `close(conn, code, reason)`, `connections()` | The actor's WebSockets (str is text, bytes binary) |
@@ -74,10 +136,11 @@ anything that must survive in `storage`, not on `self`.
 ## Key-value and queues
 
 `wasmkeep.kv` and `wasmkeep.queue` are clients for key-value shards and
-queues built from actors ([ADR 0015](../../docs/adr/0015-kv-and-queues-as-sdk-patterns.md)).
-The shard and queue classes are the Rust SDK's (deploy the components from
-[`examples/jobs`](../../examples/jobs) as classes `kv` and `queue`); these
-clients speak their protocol over `actors.call`, byte for byte like the
+queues built from actors ([ADR 0015](https://github.com/WasmKeep/wasmkeep/blob/main/docs/adr/0015-kv-and-queues-as-sdk-patterns.md)).
+The shard and queue classes are the Rust SDK's: deploy the components of
+[`examples/jobs`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/jobs)
+as classes `kv` and `queue` (a release carries them already built, `kv.wasm`
+and `queue.wasm`). These clients speak their protocol over `actors.call`, byte for byte like the
 Rust and TypeScript clients, so all of them share the same data.
 
 ```python
@@ -117,15 +180,16 @@ WitWorld, IncomingHandler = App.exports()
 Failures raise `kv.KvError` (`.kind`: conflict, key-too-long, storage, call,
 refused with `.status`) and `queue.QueueError` (storage, call, refused);
 numbers outside Rust's `u32`/`u64` raise `ValueError`. The
-[guide](../../docs/kv-and-queues.md#python) covers the semantics and
-limits; [`examples/py-jobs`](../../examples/py-jobs) is a working app.
+[guide](https://github.com/WasmKeep/wasmkeep/blob/main/docs/kv-and-queues.md#python) covers the semantics and
+limits; [`examples/py-jobs`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/py-jobs) is a working app.
 
 ## Workflows
 
 `wasmkeep.workflow` starts and follows durable workflows
-([ADR 0019](../../docs/adr/0019-workflows-as-an-sdk-pattern.md)): the
+([ADR 0019](https://github.com/WasmKeep/wasmkeep/blob/main/docs/adr/0019-workflows-as-an-sdk-pattern.md)): the
 workflow class is written with the Rust SDK's runner (as
-[`examples/workflows/orders`](../../examples/workflows/orders)), one actor
+[`examples/workflows/orders`](https://github.com/WasmKeep/wasmkeep/tree/main/examples/workflows/orders),
+which a release carries already built, `workflows-orders.wasm`), one actor
 per instance, and this client speaks its protocol over `actors.call`, like
 the Rust `workflow::Client`. Only the client side is in Python.
 
@@ -148,19 +212,27 @@ orders.cancel("order-42")
 | `Status` | `state` (`"running"`, `"waiting"`, `"completed"`, `"failed"`, `"cancelled"`), `wake_at`, `waiting_for`, `output`, `error`, `positions`, `is_finished` |
 
 Failures raise `workflow.WorkflowError` (`.kind`: unknown, finished, call,
-refused with `.status`). The [guide](../../docs/workflows.md#python) covers
+refused with `.status`). The [guide](https://github.com/WasmKeep/wasmkeep/blob/main/docs/workflows.md#python) covers
 the semantics.
 
-## Unit tests and examples
+## From a clone
 
-The protocol code (`wasmkeep/wire.py`) imports no host bindings, so the unit
-tests run under plain CPython, without componentize-py:
+The [examples](https://github.com/WasmKeep/wasmkeep/tree/main/examples) build
+against the SDK in the repository, with the same command
+(`examples/py-counter/build.sh`): [counter](https://github.com/WasmKeep/wasmkeep/tree/main/examples/py-counter),
+[chat room](https://github.com/WasmKeep/wasmkeep/tree/main/examples/py-chat-room),
+[jobs](https://github.com/WasmKeep/wasmkeep/tree/main/examples/py-jobs)
+(key-value, queues and workflow orders). The protocol code
+(`wasmkeep/wire.py`) imports no host bindings, so the SDK's unit tests run
+under plain CPython, without componentize-py:
 
 ```bash
 sdks/python/test/run.sh          # python3 -m unittest discover -s test
 ```
 
-Examples: [counter](../../examples/py-counter), [chat room](../../examples/py-chat-room),
-[jobs](../../examples/py-jobs) (key-value, queues and workflow orders).
 Python components are large (about 19 MB, CPython included) and slower than
-Rust: see [languages](../../docs/languages.md).
+Rust: see [languages](https://github.com/WasmKeep/wasmkeep/blob/main/docs/languages.md).
+
+## License
+
+Apache-2.0; see `LICENSE` and `NOTICE` in the package.
