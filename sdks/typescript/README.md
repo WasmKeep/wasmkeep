@@ -141,7 +141,9 @@ engines, pre-initialized with your bundle:
   ([ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS)):
   those Web APIs, and faster on JavaScript-heavy code, for components of
   about 13 MB and about 4.6× the memory per resident actor. Its engine,
-  SpiderMonkey, is MPL-2.0 ([legal](../../docs/legal.md)).
+  SpiderMonkey, is MPL-2.0: a component built this way contains it, so
+  distributing the component requires making SpiderMonkey's source
+  available ([legal](../../docs/legal.md)).
 
 Code that uses a global QuickJS lacks fails with an error that says to
 build with `--engine starlingmonkey`: at build time if module code uses
@@ -149,6 +151,16 @@ it, otherwise from the handler that does. The first load of a component
 on a node compiles it (cached afterwards). See
 [TypeScript engines](../../docs/languages.md#typescript-on-quickjs) for the
 measurements and the full list.
+
+## Type-checking your actor
+
+The package ships its TypeScript sources and the declarations of the host
+interfaces, with no compiled `.d.ts`: `tsc` checks the SDK's sources with
+your project's options. The options the SDK is written for are in
+[`examples/ts-counter/tsconfig.json`](../../examples/ts-counter/tsconfig.json):
+`"moduleResolution": "Bundler"`, the `ES2022` and `ESNext.Disposable`
+libraries, and `"types": []`. Copy that file, then run `npx tsc --noEmit`
+with TypeScript 5.9 or later. `wasmkeep-ts build` does not type-check.
 
 ## Developing the SDK
 
@@ -158,6 +170,15 @@ type-checks the SDK and its tests. `npm test` runs the unit tests (the kv
 and queue framing, the shard hash against values from the Rust SDK, and the
 clients against fake actors) with node's test runner, bundled by esbuild;
 no other dependency.
+
+`scripts/pack-test.sh` checks the package as another project gets it: it
+runs `npm pack`, installs the tarball into an empty directory outside the
+repository with a copy of `examples/ts-counter`, builds the actor on both
+engines and runs `tsc --noEmit`. CI runs it; nothing is published.
+
+The package pins `@bytecodealliance/jco` and `esbuild` to exact versions
+and ships no `npm-shrinkwrap.json`: what those two depend on is resolved
+when the package is installed, within the ranges they declare.
 
 The build dependencies currently override `@bytecodealliance/jco-std`'s
 `minimatch` to 11.0.1 for
