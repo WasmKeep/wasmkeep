@@ -158,7 +158,9 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --locked --no-tests=pass
+      # A pull request leaves out part of the cluster suite's TLS copy
+      # (.config/nextest.toml, profile `pr`); a push to main runs all of it.
+      - run: cargo nextest run --workspace --locked --no-tests=pass ${{ github.event_name == 'pull_request' && '--profile pr' || '' }}
 
   test-linux-arm:
     name: test (ubuntu-24.04-arm)
@@ -174,7 +176,9 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --locked --no-tests=pass
+      # A pull request leaves out part of the cluster suite's TLS copy
+      # (.config/nextest.toml, profile `pr`); a push to main runs all of it.
+      - run: cargo nextest run --workspace --locked --no-tests=pass ${{ github.event_name == 'pull_request' && '--profile pr' || '' }}
 
   # Not on pull requests: macOS is no release target and has no code path of
   # its own, its runners are the scarcest, and this is the slowest job. It

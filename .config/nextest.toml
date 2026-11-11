@@ -1,5 +1,6 @@
-# cargo-nextest settings for the local gate (scripts/check.sh) and anyone
-# running the suites by hand.
+# cargo-nextest settings for the local gate (scripts/check.sh), anyone
+# running the suites by hand, and CI (which runs pull requests with the
+# `pr` profile below).
 
 [profile.default]
 # A test running past a minute is reported, and ended after two: a hung test
@@ -27,3 +28,12 @@ test-group = 'cluster'
 # never ended for it.
 filter = 'binary(soak) | binary(failover)'
 slow-timeout = { period = "300s" }
+
+# Pull requests (ci.yml). The cluster suite is compiled twice, plain and
+# over mutual TLS (tests/cluster_over_tls.rs); the TLS copy differs only
+# where nodes talk to each other. A pull request runs it without the
+# modules that talk to the bucket alone, keeping their two tests that do
+# cross nodes; pushes to main run all of it. Written as what is left out,
+# so a new or renamed module runs until someone lists it here.
+[profile.pr]
+default-filter = 'not (binary(cluster_over_tls) & test(/^suite::(alarms|bucket|deploys|durable_writes)::/)) | test(=suite::deploys::existing_access_checks_the_bucket_and_leaves_nothing_for_unknown_names) | test(=suite::deploys::deployed_rules_and_configuration_reach_nodes_started_without_any)'
