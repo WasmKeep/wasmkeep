@@ -62,8 +62,8 @@ Done:
   they embed a runtime: 2.2× (TypeScript on QuickJS) to 2.5× (Python) the
   CPU per request on a workstation, about 4× on a small VM (TypeScript on
   StarlingMonkey and Python; that run had no QuickJS build), and more
-  memory per actor); Go through TinyGo (experimental: a counter and the
-  key-value, queue and workflow clients pass)
+  memory per actor); Go through TinyGo (experimental at the release; since
+  supported, with an SDK)
 - ✅ A documentation site: concepts, generated API reference, and
   deployment guides (single VPS, three nodes, where to run it, what to put
   in front)
@@ -157,9 +157,10 @@ Continuing alongside, without holding the release:
 - 🚧 More languages, in order: ✅ TypeScript on QuickJS, now the default
   engine (4.6× less memory per actor than StarlingMonkey, which stays an
   option for Web APIs; [ADR 0018](docs/adr/0018-quickjs-the-default-typescript-engine.md)),
-  Go (finish TinyGo, then standard Go through componentize-go), D,
-  MoonBit, then a C# spike. Java, Kotlin and PHP cannot produce an actor
-  yet; languages that need Wasm garbage collection wait on a decision of
+  ✅ Go on TinyGo, now supported (the [Go SDK](sdks/go): its counter,
+  chat room and jobs app pass the shared tests), then standard Go through
+  componentize-go, D, MoonBit, then a C# spike. Java, Kotlin and PHP
+  cannot produce an actor yet; languages that need Wasm garbage collection wait on a decision of
   their own
 - 🚧 The benchmark showdown suite (below): the counter comparison runs today
 

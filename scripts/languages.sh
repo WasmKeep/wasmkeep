@@ -7,9 +7,9 @@
 #      check and its tests;
 #   3. every example in another language built (TypeScript on both engines,
 #      C, Zig, Python, Go);
-#   4. the counter contract, the chat suite, jobs and workflows against every
-#      language, with WASMKEEP_REQUIRE_LANGS=1: a component that is missing
-#      fails instead of being skipped.
+#   4. the counter contract, the chat suite, jobs, workflows and outbound
+#      fetch against every language, with WASMKEEP_REQUIRE_LANGS=1: a
+#      component that is missing fails instead of being skipped.
 # It installs no toolchain (see `scripts/doctor.sh --full`), except that it
 # runs `npm ci` where a TypeScript package has no node_modules yet.
 set -euo pipefail
@@ -68,6 +68,8 @@ for ex in examples/c-*/ examples/py-*/ examples/go-*/; do
   echo "-- $ex"
   "$ex/build.sh"
 done
+echo '-- crates/wasmkeep-server/tests/guests/go-fetch'
+crates/wasmkeep-server/tests/guests/go-fetch/build.sh
 for ex in examples/zig-*/; do
   echo "-- $ex"
   ZIG="${ZIG:-zig}" "$ex/build.sh"
@@ -75,4 +77,4 @@ done
 
 echo '-- every language against the same tests'
 WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked \
-  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs
+  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs

@@ -1,29 +1,10 @@
-// Package call is how the kv and queue clients reach other actors: through
-// a function the app supplies, wrapping its own generated `actors.Call`
-// binding. The SDK imports no generated bindings, so it works whatever
-// module path an app's bindings have, and its tests run with plain
-// `go test` on the host.
+// Package call is how the kv, queue and workflow clients reach other
+// actors: through a function the app supplies. In an actor that is
+// wasmkeep.Caller, the SDK's own call; the clients import no bindings
+// themselves, so their tests run with plain `go test` on the host
+// against a fake caller.
 //
-// An adapter over wit-bindgen-go bindings:
-//
-//	func callActor(address, method, path string, headers [][2]string, body []byte) (uint16, []byte, error) {
-//		r := actors.Call(address, actors.Request{
-//			Method:  method,
-//			Path:    path,
-//			Headers: cm.ToList(headers),
-//			Body:    cm.ToList(body),
-//		})
-//		if e := r.Err(); e != nil {
-//			detail := ""
-//			if s := e.InvalidAddress(); s != nil {
-//				detail = *s
-//			} else if s := e.Failed(); s != nil {
-//				detail = *s
-//			}
-//			return 0, nil, call.Failure(address, e.String(), detail)
-//		}
-//		return r.OK().Status, r.OK().Body.Slice(), nil
-//	}
+//	store := kv.New("kv", 8, wasmkeep.Caller)
 package call
 
 // Caller sends one request to the actor at address (`class/name`) and

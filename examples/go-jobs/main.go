@@ -51,90 +51,31 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/wasmkeep/wasmkeep/sdks/go/call"
 	"github.com/wasmkeep/wasmkeep/sdks/go/kv"
 	"github.com/wasmkeep/wasmkeep/sdks/go/queue"
+	"github.com/wasmkeep/wasmkeep/sdks/go/wasmkeep"
 	"github.com/wasmkeep/wasmkeep/sdks/go/workflow"
-	"go.bytecodealliance.org/cm"
-	incominghandler "wasmkeep.example/go-jobs/gen/wasi/http/incoming-handler"
-	httptypes "wasmkeep.example/go-jobs/gen/wasi/http/types"
-	"wasmkeep.example/go-jobs/gen/wasmkeep/actor/actor"
-	actorcore "wasmkeep.example/go-jobs/gen/wasmkeep/actor/actor-core"
-	"wasmkeep.example/go-jobs/gen/wasmkeep/actor/actors"
 )
-
-// callActor adapts this app's generated actors.Call binding to the SDK's
-// call.Caller.
-func callActor(address, method, path string, headers [][2]string, body []byte) (uint16, []byte, error) {
-	r := actors.Call(address, actors.Request{
-		Method:  method,
-		Path:    path,
-		Headers: cm.ToList(headers),
-		Body:    cm.ToList(body),
-	})
-	if e := r.Err(); e != nil {
-		detail := ""
-		if s := e.InvalidAddress(); s != nil {
-			detail = *s
-		} else if s := e.Failed(); s != nil {
-			detail = *s
-		}
-		return 0, nil, call.Failure(address, e.String(), detail)
-	}
-	return r.OK().Status, r.OK().Body.Slice(), nil
-}
 
 const shards = 4
 
 // Keys over 4 shards, with a 60 s read cache: Get may use it, writes
 // through this client update it, GetFresh skips it.
 var (
-	store  = kv.New("kv", shards, callActor).WithReadCache(60_000)
-	jobs   = queue.New("queue/jobs", callActor)
-	inbox  = queue.New("queue/inbox", callActor)
-	orders = workflow.New("orders", callActor)
+	store  = kv.New("kv", shards, wasmkeep.Caller).WithReadCache(60_000)
+	jobs   = queue.New("queue/jobs", wasmkeep.Caller)
+	inbox  = queue.New("queue/inbox", wasmkeep.Caller)
+	orders = workflow.New("orders", wasmkeep.Caller)
 )
 
-type hookResult = cm.Result[string, struct{}, string]
-
 func init() {
-	actor.Exports.OnInit = func() hookResult { return cm.OK[hookResult](struct{}{}) }
-	actor.Exports.OnAlarm = func() hookResult { return cm.OK[hookResult](struct{}{}) }
-	actor.Exports.OnWebsocketOpen = func(uint64, string) hookResult {
-		return cm.Err[hookResult]("no WebSockets here")
-	}
-	actor.Exports.OnWebsocketMessage = func(uint64, actorcore.Message) {}
-	actor.Exports.OnWebsocketClose = func(uint64, uint16, string) {}
-	incominghandler.Exports.Handle = handle
+	wasmkeep.Serve(wasmkeep.Actor{Fetch: route})
 }
 
-// request is an incoming request, read whole.
-type request struct {
-	method  string // upper case
-	path    string // with the query
-	headers [][2]string
-	body    []byte
-}
-
-func (r *request) header(name string) (string, bool) {
-	for _, h := range r.headers {
-		if strings.EqualFold(h[0], name) {
-			return h[1], true
-		}
-	}
-	return "", false
-}
-
-// response is what a route answers.
-type response struct {
-	status      uint16
-	contentType string
-	etag        string
-	body        []byte
-}
+type response = wasmkeep.Response
 
 func text(status uint16, body string) response {
-	return response{status: status, contentType: "text/plain", body: []byte(body)}
+	return wasmkeep.Text(status, body)
 }
 
 func param(path, name string) (string, bool) {
@@ -176,17 +117,17 @@ func failure(err error) response {
 	return text(502, err.Error()+"\n")
 }
 
-func kvRoute(req *request, key string) response {
-	match, hasMatch := req.header("if-match")
+func kvRoute(req *wasmkeep.Request, key string) response {
+	match, hasMatch := req.LookupHeader("if-match")
 	version, hasVersion := number(strings.ReplaceAll(match, `"`, ""), hasMatch)
 	if hasMatch && !hasVersion {
 		return text(400, "if-match is not a version\n")
 	}
-	switch req.method {
+	switch req.Method {
 	case "GET":
 		var entry *kv.Entry
 		var err error
-		if c, _ := param(req.path, "cached"); c == "1" {
+		if c, _ := param(req.Path, "cached"); c == "1" {
 			entry, err = store.Get(key)
 		} else {
 			entry, err = store.GetFresh(key)
@@ -197,10 +138,10 @@ func kvRoute(req *request, key string) response {
 		if entry == nil {
 			return text(404, "no such key\n")
 		}
-		return response{status: 200, contentType: "application/octet-stream", etag: u(entry.Version), body: entry.Value}
+		return wasmkeep.Bytes(200, "application/octet-stream", entry.Value).WithHeader("etag", u(entry.Version))
 	case "PUT":
-		ttl, hasTTL := number(param(req.path, "ttl_ms"))
-		none, _ := req.header("if-none-match")
+		ttl, hasTTL := number(param(req.Path, "ttl_ms"))
+		none, _ := req.LookupHeader("if-none-match")
 		absent := none == "*"
 		var v uint64
 		var err error
@@ -212,20 +153,18 @@ func kvRoute(req *request, key string) response {
 			} else if absent {
 				expect = kv.Absent()
 			}
-			v, err = store.PutWith(key, req.body, kv.PutOptions{Expect: expect, TTLMs: ttl})
+			v, err = store.PutWith(key, req.Body(), kv.PutOptions{Expect: expect, TTLMs: ttl})
 		case hasVersion:
-			v, err = store.CompareAndSet(key, kv.Version(version), req.body)
+			v, err = store.CompareAndSet(key, kv.Version(version), req.Body())
 		case absent:
-			v, err = store.CompareAndSet(key, kv.Absent(), req.body)
+			v, err = store.CompareAndSet(key, kv.Absent(), req.Body())
 		default:
-			v, err = store.Put(key, req.body)
+			v, err = store.Put(key, req.Body())
 		}
 		if err != nil {
 			return failure(err)
 		}
-		r := text(200, u(v)+"\n")
-		r.etag = u(v)
-		return r
+		return text(200, u(v)+"\n").WithHeader("etag", u(v))
 	case "DELETE":
 		var removed bool
 		var err error
@@ -389,145 +328,65 @@ func orderReply(s *workflow.Status, err error) response {
 
 // orderRoute is `/orders/<id>[/approve|/cancel]`; rest is what follows
 // `/orders/`.
-func orderRoute(req *request, rest string) response {
+func orderRoute(req *wasmkeep.Request, rest string) response {
 	id, action, _ := strings.Cut(rest, "/")
 	if id == "" {
 		return text(404, "not found\n")
 	}
 	switch {
-	case action == "" && req.method == "POST":
-		return orderReply(orders.Start(id, req.body))
-	case action == "" && req.method == "GET":
+	case action == "" && req.Method == "POST":
+		return orderReply(orders.Start(id, req.Body()))
+	case action == "" && req.Method == "GET":
 		return orderReply(orders.Status(id))
-	case action == "approve" && req.method == "POST":
+	case action == "approve" && req.Method == "POST":
 		if err := orders.SendEvent(id, "approved", []byte{}); err != nil {
 			return orderReply(nil, err)
 		}
 		return orderReply(orders.Status(id))
-	case action == "cancel" && req.method == "POST":
+	case action == "cancel" && req.Method == "POST":
 		return orderReply(orders.Cancel(id))
 	}
 	return text(404, "not found\n")
 }
 
-func route(req *request) response {
-	if queue.IsDelivery(req.method, req.path) {
-		r := queue.HandleDelivery(queue.CallerFrom(req.headers), req.body, func(_ string, m queue.Message) queue.Outcome {
+func route(req *wasmkeep.Request) response {
+	body, err := req.ReadBody()
+	if err != nil {
+		return text(400, "could not read the request\n")
+	}
+	if queue.IsDelivery(req.Method, req.Path) {
+		r := queue.HandleDelivery(queue.CallerFrom(req.Headers), body, func(_ string, m queue.Message) queue.Outcome {
 			return work(m)
 		})
-		return response{status: r.Status, contentType: r.ContentType, body: r.Body}
+		return wasmkeep.Bytes(r.Status, r.ContentType, r.Body)
 	}
-	path, _, _ := strings.Cut(req.path, "?")
-	get, post := req.method == "GET", req.method == "POST"
+	path, _, _ := strings.Cut(req.Path, "?")
+	get, post := req.Method == "GET", req.Method == "POST"
 	switch {
 	case path == "/kv" && get:
-		return list(req.path)
+		return list(req.Path)
 	case strings.HasPrefix(path, "/kv/") && len(path) > 4:
 		return kvRoute(req, path[4:])
 	case path == "/jobs" && post:
-		return send(jobs, req.body)
+		return send(jobs, body)
 	case path == "/jobs/stats" && get:
 		return stats(jobs)
 	case path == "/jobs/dead" && get:
 		return dead(jobs)
 	case path == "/inbox" && post:
-		return send(inbox, req.body)
+		return send(inbox, body)
 	case path == "/inbox/batch" && post:
-		return sendBatch(req.body)
+		return sendBatch(body)
 	case path == "/inbox/stats" && get:
 		return stats(inbox)
 	case path == "/inbox/lease" && post:
-		return lease(req.path)
+		return lease(req.Path)
 	case path == "/inbox/ack" && post:
-		return ack(req.path)
+		return ack(req.Path)
 	case strings.HasPrefix(path, "/orders/"):
 		return orderRoute(req, strings.Trim(path[len("/orders/"):], "/"))
 	}
 	return text(404, "see the README for routes\n")
-}
-
-// ------------------------------------------------------------ wasi:http
-
-func handle(in httptypes.IncomingRequest, out httptypes.ResponseOutparam) {
-	req, ok := read(in)
-	in.ResourceDrop()
-	if !ok {
-		respond(out, text(400, "could not read the request\n"))
-		return
-	}
-	respond(out, route(&req))
-}
-
-// read takes the method, path, headers and body of in, dropping every
-// child resource it opens (before in itself is dropped).
-func read(in httptypes.IncomingRequest) (request, bool) {
-	method := in.Method()
-	req := request{method: strings.ToUpper(method.String())}
-	if other := method.Other(); other != nil {
-		req.method = *other
-	}
-	if p := in.PathWithQuery(); p.Some() != nil {
-		req.path = *p.Some()
-	}
-	headers := in.Headers()
-	for _, e := range headers.Entries().Slice() {
-		req.headers = append(req.headers, [2]string{string(e.F0), string(cm.List[uint8](e.F1).Slice())})
-	}
-	headers.ResourceDrop()
-
-	consumed := in.Consume()
-	if consumed.IsErr() {
-		return req, false
-	}
-	body := *consumed.OK()
-	streamed := body.Stream()
-	if streamed.IsErr() {
-		body.ResourceDrop()
-		return req, false
-	}
-	stream := *streamed.OK()
-	ok := true
-	for {
-		chunk := stream.BlockingRead(64 * 1024)
-		if e := chunk.Err(); e != nil {
-			ok = e.Closed()
-			break
-		}
-		req.body = append(req.body, chunk.OK().Slice()...)
-	}
-	stream.ResourceDrop()
-	httptypes.IncomingBodyFinish(body).ResourceDrop()
-	if req.body == nil {
-		req.body = []byte{}
-	}
-	return req, ok
-}
-
-func respond(out httptypes.ResponseOutparam, r response) {
-	headers := httptypes.NewFields()
-	add := func(name, value string) {
-		headers.Append(httptypes.FieldName(name), httptypes.FieldValue(cm.ToList([]byte(value))))
-	}
-	add("content-type", r.contentType)
-	add("content-length", strconv.Itoa(len(r.body)))
-	if r.etag != "" {
-		add("etag", r.etag)
-	}
-	resp := httptypes.NewOutgoingResponse(headers)
-	resp.SetStatusCode(httptypes.StatusCode(r.status))
-	bodyResult := resp.Body()
-	outBody := *bodyResult.OK()
-	httptypes.ResponseOutparamSet(out, cm.OK[cm.Result[httptypes.ErrorCodeShape, httptypes.OutgoingResponse, httptypes.ErrorCode]](resp))
-	streamResult := outBody.Write()
-	stream := *streamResult.OK()
-	// blocking-write-and-flush takes at most 4096 bytes per call.
-	for rest := r.body; len(rest) > 0; {
-		n := min(len(rest), 4096)
-		stream.BlockingWriteAndFlush(cm.ToList(rest[:n]))
-		rest = rest[n:]
-	}
-	stream.ResourceDrop()
-	httptypes.OutgoingBodyFinish(outBody, cm.None[httptypes.Trailers]())
 }
 
 func main() {}

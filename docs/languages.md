@@ -32,17 +32,16 @@ different target, and does not make a language usable here.
 | **C / C++** | Supported | [C SDK](../sdks/c) over `wit-bindgen c`; clang + wasi-libc, the WASI 0.1 adapter | Counter, [chat room](../examples/c-chat-room) and [jobs app](../examples/c-jobs) (KV and queue clients) pass; 170 KB. Performs like Rust: 110 µs of CPU per request, 244 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)). Recommended once it has a guide |
 | **TypeScript / JavaScript** | Supported (embedded runtime) | [`@wasmkeep/sdk`](../sdks/typescript): esbuild, then componentize-qjs (QuickJS embedded, pre-initialized); or [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) (StarlingMonkey) with `--engine starlingmonkey` ([below](#typescript-on-quickjs)) | Counter, chat room and [jobs app](../examples/ts-jobs) (KV and queue clients) pass on both engines. QuickJS, the default: 1.7 MB; 230 µs of CPU per request (2.2× Rust) and 741 KB per actor (3×) ([measured](benchmarks.md#the-same-counter-in-every-language)), few Web APIs. StarlingMonkey: Web APIs and 1.5× faster plain JavaScript, for 4.6× the memory per actor ([measured](benchmarks.md#typescript-on-quickjs-against-starlingmonkey)) |
 | **Python** | Supported (embedded runtime) | [Python SDK](../sdks/python), [componentize-py](https://github.com/bytecodealliance/componentize-py) (CPython embedded) | Counter, chat room and [jobs app](../examples/py-jobs) (KV and queue clients) pass. 18.7 MB, the largest; 259 µs of CPU per request (2.5× Rust) and 7.8 MB per actor (31×) ([measured](benchmarks.md#the-same-counter-in-every-language)) |
-| **Go (TinyGo)** | Experimental | TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2` over `wit-bindgen-go` bindings | The [counter](../examples/go-counter) and the [jobs app](../examples/go-jobs) (the [`sdks/go`](../sdks/go) KV and queue clients) pass; 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)); no full SDK, chat room or guide yet (see [Go](#go)) |
+| **Go (TinyGo)** | Supported | [Go SDK](../sdks/go); TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2`, which writes a component directly | Counter, [chat room](../examples/go-chat-room) and [jobs app](../examples/go-jobs) (KV, queue and workflow clients) pass; 162 KB. 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language), on the counter before the SDK: the same host calls without the wrapper); see [Go](#go) |
 
 ### Next, in order
 
-Each needs a counter passing the shared tests, and numbers from
-`bench/run.sh`, before it gets a tier.
+Each is experimental once a counter passes the shared tests; numbers
+from `bench/run.sh` come before it is supported.
 
-1. **Go:** finish TinyGo (a `wasmkeep` package, the chat room, a guide), then
-   try standard Go through [componentize-go](https://github.com/bytecodealliance/componentize-go),
+1. **Standard Go** (not TinyGo) through [componentize-go](https://github.com/bytecodealliance/componentize-go),
    which allocates through Go's runtime before Go starts: the clash that
-   blocked us (below).
+   blocked us ([below](#go)).
 2. **D** (LDC with `-betterC` and `wit-bindgen d`): no GC, no runtime; the
    generator handles our world.
 3. **MoonBit** (`wit-bindgen moonbit`): small components; the language is
@@ -80,7 +79,7 @@ The same counter, as built by each example's `build.sh` (sizes on disk; see
 | --- | --- |
 | Zig | 30 KB |
 | Rust | 81 KB |
-| Go (TinyGo) | 151 KB |
+| Go (TinyGo) | 162 KB |
 | C | 170 KB |
 | TypeScript | 1.7 MB (QuickJS engine, the default) |
 | TypeScript on StarlingMonkey | 13.4 MB (StarlingMonkey JS engine) |
@@ -147,19 +146,34 @@ What does not work, or works differently, on QuickJS:
 ## Go
 
 TinyGo's `wasip2` target writes a component directly, against a WIT world
-it is given. The [counter](../examples/go-counter) uses the bindings
-`wit-bindgen-go` generates from the actor world, with no SDK in between:
-about 100 lines, most of them HTTP plumbing an SDK would hide. TinyGo's
-runtime imports `wasi:filesystem` whether or not the program uses it, so
-`build.sh` encodes the component against the actor world plus those
-imports; the host provides them inert (no directories).
+it is given. The [Go SDK](../sdks/go) is a `wasmkeep` package over the
+bindings `wit-bindgen-go` generates (committed in the module, so an app
+needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
+`Rows`, alarms, `Call`, WebSockets, `Env`, `Self` and a synchronous
+`Fetch`, plus the [key-value, queue](kv-and-queues.md#go) and
+[workflow](workflows.md#go) clients. TinyGo's runtime imports
+`wasi:filesystem` whether or not the program uses it, so the module's
+`wit/` adds those imports to the actor world (`actor-tinygo`); the host
+provides them inert (no directories).
 
-The [`sdks/go`](../sdks/go) module has the key-value and queue clients
-([guide](kv-and-queues.md#go)), and [`examples/go-jobs`](../examples/go-jobs)
-uses them. It imports no generated bindings: the app passes its own
-`actors.Call` binding in. What is missing before Go counts as supported:
-the rest of a `wasmkeep` package (the role the C and Zig SDKs play: rows, a
-request and a response type, `Reply`), the chat room, and a guide.
+The [counter](../examples/go-counter), [chat room](../examples/go-chat-room)
+and [jobs app](../examples/go-jobs) pass the shared tests, and
+`fetch_langs` checks `Fetch` against the Rust SDK's `http::fetch`.
+Trade-offs:
+
+- **A garbage collector.** TinyGo's runs inside the request: the
+  counter's p99 is 10× (reads) to 40× (writes) its median, against under
+  1.5× for Rust ([measured](benchmarks.md#the-same-counter-in-every-language)).
+  Allocating less per event shortens it.
+- **TinyGo, not Go.** TinyGo compiles most of the standard library, not
+  all of it (its documentation lists which packages build); the SDK keeps
+  to packages it handles well (no `fmt` or reflection).
+- **Size.** 162 KB for the counter, about twice Rust's; `strconv`'s number
+  parsing alone adds about 50 KB, so the SDK reads integers from SQLite
+  without it.
+- **Not covered by the shared tests:** `SetAlarm` and the `Alarm` hook,
+  `ExecDurable` and `DeleteSelf` from Go (`Call` is, through the jobs
+  app's clients).
 
 Standard Go (not TinyGo) remains blocked. Go 1.24 can export functions to
 Wasm, and we got as far as a
