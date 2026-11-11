@@ -10,30 +10,36 @@ trying it, side projects and staging.
 
 ## Now
 
-The next release, `0.2.0`: **a team can install WasmKeep and run a real
-app on it.** Three pieces of work, in this order.
+The next release, `0.2.0`: **installable.** Until now the SDKs were used
+from a clone of this repository. `0.2.0` brings:
 
-1. **Installable.** Today the SDKs are used from a clone of this
-   repository. For `0.2.0`: the Rust, TypeScript, Python and Go SDKs from
-   their registries (crates.io, npm, PyPI, a Go module tag), the C and Zig
-   SDKs as archives in the release, prebuilt example components, and a
-   getting-started path that needs no clone. Releases publish the SDKs.
-2. **Our own app on it.** Watch, the uptime monitor in
-   [`examples/watch`](examples/watch), running on a three-node cluster on a
-   released build, behind HTTPS, with dashboards, alerts and a nightly copy
-   of the bucket. What that shows is missing goes on this page.
-3. **Reliable enough to leave running.** A snapshot upload gets a timeout
-   and stops failing silently; a restore gets one deadline for the whole of
-   it (one took 56 s in the soak,
-   [measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)); a
-   forwarded request is sent again when its connection had just closed;
-   the tests that depend on timing wait on events instead; and the release
-   candidate passes a twelve-hour soak. Done so far: a durable write on a
-   cluster node no longer syncs to the local disk as well as the bucket.
+- the Rust, TypeScript, Python and Go SDKs from their registries
+  (crates.io, npm, PyPI, a Go module tag), published by the release itself
+  ([releasing](docs/releasing.md));
+- the C SDK as an archive in the release, and prebuilt example components,
+  so trying WasmKeep needs no toolchain;
+- a getting-started path that starts from a release, not a clone.
+
+Already in, and part of it: a durable write on a cluster node no longer
+syncs to the local disk as well as the bucket.
 
 ## Next
 
-`0.3.0`: **operable by someone who did not write it.**
+`0.3.0`: **our own app on it, and reliable enough to leave running.**
+
+1. **Our own app.** Watch, the uptime monitor in
+   [`examples/watch`](examples/watch), on a three-node cluster on a
+   released build, behind HTTPS, with dashboards, alerts and a nightly copy
+   of the bucket. What that shows is missing goes on this page.
+2. **The known ways it stalls.** A snapshot upload gets a timeout and stops
+   failing silently; a restore gets one deadline for the whole of it (one
+   took 56 s in the soak,
+   [measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)); a
+   forwarded request is sent again when its connection had just closed.
+3. **Tests that depend on timing** wait on events instead of the clock.
+4. **A twelve-hour soak** of the release candidate.
+
+`0.4.0`: **operable by someone who did not write it.**
 
 1. **Mixed versions during an upgrade.** Today every node is upgraded
    together ([how](docs/cluster.md#upgrading-wasmkeep)).
@@ -44,7 +50,7 @@ app on it.** Three pieces of work, in this order.
 
 ## After that
 
-Not before the two releases above.
+Not before the releases above.
 
 - **Faster, and compared.** Performance targets on dedicated hardware
   with a stated scale envelope; a plain write that does not hold its
@@ -127,7 +133,8 @@ Several nodes on one S3-compatible bucket
 ### M3: First public release
 
 Languages, documentation, hardening, and `0.1.0`
-([changelog](CHANGELOG.md)). What is left of it is under [Now](#now).
+([changelog](CHANGELOG.md)). What is left of it is under [Now](#now) and
+[Next](#next).
 
 - Languages ([tiers and numbers](docs/languages.md)). Recommended: Rust.
   Supported: Zig, C/C++, TypeScript (QuickJS by default,
