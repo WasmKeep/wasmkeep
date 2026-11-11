@@ -255,6 +255,16 @@ jobs:
           echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
           go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: toolchains (standard Go, componentize-go)
+        # Go 1.27 beside TinyGo's 1.24, for examples/go-std-counter (GO_STD).
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/go1.27.3.tar.gz" https://go.dev/dl/go1.27.3.linux-amd64.tar.gz
+          echo "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40  $RUNNER_TEMP/go1.27.3.tar.gz" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/go127"
+          tar xzf "$RUNNER_TEMP/go1.27.3.tar.gz" -C "$RUNNER_TEMP/go127"
+          GOTOOLCHAIN=local GOBIN="$RUNNER_TEMP/go127/tools" "$RUNNER_TEMP/go127/go/bin/go" install github.com/bytecodealliance/componentize-go@v0.5.1
+          echo "GO_STD=$RUNNER_TEMP/go127/go/bin/go" >> "$GITHUB_ENV"
+          echo "COMPONENTIZE_GO=$RUNNER_TEMP/go127/tools/componentize-go" >> "$GITHUB_ENV"
       - name: TypeScript SDK (types and WIT in sync with the host, type-check)
         working-directory: sdks/typescript
         run: |

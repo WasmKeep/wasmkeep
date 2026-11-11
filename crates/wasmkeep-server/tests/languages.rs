@@ -196,3 +196,12 @@ async fn go() {
         counter_contract("go", &wasm).await;
     }
 }
+
+/// Standard Go (not TinyGo) through componentize-go, straight on its
+/// bindings.
+#[tokio::test(flavor = "multi_thread")]
+async fn go_standard() {
+    if let Some(wasm) = prebuilt("go-std", "examples/go-std-counter/counter.wasm") {
+        counter_contract("go-std", &wasm).await;
+    }
+}

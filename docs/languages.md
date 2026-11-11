@@ -33,16 +33,16 @@ different target, and does not make a language usable here.
 | **TypeScript / JavaScript** | Supported (embedded runtime) | [`@wasmkeep/sdk`](../sdks/typescript): esbuild, then componentize-qjs (QuickJS embedded, pre-initialized); or [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) (StarlingMonkey) with `--engine starlingmonkey` ([below](#typescript-on-quickjs)) | Counter, chat room and [jobs app](../examples/ts-jobs) (KV and queue clients) pass on both engines. QuickJS, the default: 1.7 MB; 230 µs of CPU per request (2.2× Rust) and 741 KB per actor (3×) ([measured](benchmarks.md#the-same-counter-in-every-language)), few Web APIs. StarlingMonkey: Web APIs and 1.5× faster plain JavaScript, for 4.6× the memory per actor ([measured](benchmarks.md#typescript-on-quickjs-against-starlingmonkey)) |
 | **Python** | Supported (embedded runtime) | [Python SDK](../sdks/python), [componentize-py](https://github.com/bytecodealliance/componentize-py) (CPython embedded) | Counter, chat room and [jobs app](../examples/py-jobs) (KV and queue clients) pass. 18.7 MB, the largest; 259 µs of CPU per request (2.5× Rust) and 7.8 MB per actor (31×) ([measured](benchmarks.md#the-same-counter-in-every-language)) |
 | **Go (TinyGo)** | Experimental | TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2` over `wit-bindgen-go` bindings | The [counter](../examples/go-counter) and the [jobs app](../examples/go-jobs) (the [`sdks/go`](../sdks/go) KV and queue clients) pass; 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)); no full SDK, chat room or guide yet (see [Go](#go)) |
+| **Go (standard)** | Experimental | [componentize-go](https://github.com/bytecodealliance/componentize-go) 0.5.1 with Go 1.27, straight on its bindings | The [counter](../examples/go-std-counter) passes; 2.7 MB. No SDK yet (the Go SDK is for TinyGo's bindings), no numbers from `bench/run.sh` (see [standard Go](#standard-go-through-componentize-go)) |
 
 ### Next, in order
 
 Each needs a counter passing the shared tests, and numbers from
 `bench/run.sh`, before it gets a tier.
 
-1. **Go:** finish TinyGo (a `wasmkeep` package, the chat room, a guide), then
-   try standard Go through [componentize-go](https://github.com/bytecodealliance/componentize-go),
-   which allocates through Go's runtime before Go starts: the clash that
-   blocked us (below).
+1. **Go:** finish TinyGo (a `wasmkeep` package, the chat room, a guide);
+   then an SDK for standard Go, which now builds actors through
+   componentize-go ([below](#standard-go-through-componentize-go)).
 2. **D** (LDC with `-betterC` and `wit-bindgen d`): no GC, no runtime; the
    generator handles our world.
 3. **MoonBit** (`wit-bindgen moonbit`): small components; the language is
@@ -161,14 +161,42 @@ uses them. It imports no generated bindings: the app passes its own
 the rest of a `wasmkeep` package (the role the C and Zig SDKs play: rows, a
 request and a response type, `Reply`), the chat room, and a guide.
 
-Standard Go (not TinyGo) remains blocked. Go 1.24 can export functions to
-Wasm, and we got as far as a
-component that instantiates (generated bindings adapted to standard Go's
-`go:wasmimport` rules, a Go `cabi_realloc`, lazy runtime start). It fails
-because Go's runtime assumes it owns all linear memory past its data, while
-the WASI 0.1 adapter needs memory before Go starts: their allocations
-overlap. A small WASI shim that needs no memory of its own would fix it;
-that is future work.
+### Standard Go, through componentize-go
+
+Standard Go (not TinyGo) builds actors through
+[componentize-go](https://github.com/bytecodealliance/componentize-go)
+0.5.1 with Go 1.27: the [counter](../examples/go-std-counter) passes the
+same counter contract as Rust, and CI builds it. What blocked our own
+attempt before (Go's runtime assumes it owns all linear memory past its
+data, while the WASI 0.1 adapter needs memory before Go starts) does not
+show: the component instantiates, survives hibernation and restarts.
+
+What works:
+
+- **The whole world.** `componentize-go bindings` generates Go packages
+  for every interface of [`crates/wasmkeep-wit/wit`](../crates/wasmkeep-wit/wit),
+  and the app implements two packages it names: `export_wit_world` (the
+  five hooks, returning `witTypes.Result[witTypes.Unit, string]`) and
+  `export_wasi_http_incoming_handler` (`Handle`). The component imports
+  exactly the world's 0.2.12 interfaces.
+- **Go's own compiler and runtime**, not TinyGo's subset of them: what
+  builds with `go build` for `wasip1` builds here.
+
+What is missing:
+
+- **An SDK.** componentize-go's bindings (`go.bytecodealliance.org/pkg`)
+  are not the `wit-bindgen-go` ones the [Go SDK](../sdks/go) wraps for
+  TinyGo, so the SDK does not build on standard Go yet. Its `kv`,
+  `queue` and `workflow` clients import no bindings and would carry over.
+- **Size.** 2.7 MB, most of it Go's runtime (stripping custom sections
+  saves under 3%), against 151 KB on TinyGo; no numbers from
+  `bench/run.sh` for CPU or memory per actor yet.
+- **Rough edges.** The module must be named `wit_component` (the
+  bindings import it by that path), `bindings` rewrites `go.mod` from its
+  own template on every run (the example's `build.sh` keeps the committed
+  one), the build needs `-buildvcs=false` inside a git checkout, and the
+  tool downloads its own binary from its GitHub release into the user's
+  cache directory on first use.
 
 ## What the tiers require
 
