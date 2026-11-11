@@ -6,7 +6,7 @@
 #   2. the TypeScript SDK: its WIT and types in sync with the host, the type
 #      check and its tests;
 #   3. every example in another language built (TypeScript on both engines,
-#      C, Zig, Python, Go, D, MoonBit);
+#      C, Zig, Python, Go, D, MoonBit, C#);
 #   4. the counter contract, the chat suite, jobs, workflows and outbound
 #      fetch against every language, with WASMKEEP_REQUIRE_LANGS=1: a
 #      component that is missing fails instead of being skipped.
@@ -90,6 +90,17 @@ if command -v moon >/dev/null 2>&1 && [ -d "${MOON_HOME:-$HOME/.moon}/lib/core/_
   done
 else
   skip_lang 'MoonBit (moon, with its core bundled: moon bundle --target wasm --release in $MOON_HOME/lib/core)' 'test(moonbit)'
+fi
+# C#: opt-in (CHECK_CSHARP=1), since the first build restores about 800 MB
+# of preview packages into the NuGet cache ($NUGET_PACKAGES, default
+# ~/.nuget/packages).
+if [ "${CHECK_CSHARP:-}" = 1 ] && command -v dotnet >/dev/null 2>&1; then
+  for ex in examples/csharp-*/; do
+    echo "-- $ex"
+    "$ex/build.sh"
+  done
+else
+  skip_lang 'C# (CHECK_CSHARP=1 with dotnet: restores ~800 MB of packages)' 'test(csharp)'
 fi
 for ex in examples/zig-*/; do
   echo "-- $ex"

@@ -161,8 +161,10 @@ Continuing alongside, without holding the release:
   chat room and jobs app pass the shared tests), then standard Go through
   componentize-go, ✅ D (experimental: the [D SDK](sdks/d), its counter and
   chat room pass), ✅ MoonBit (experimental: the [MoonBit SDK](sdks/moonbit),
-  its counter and chat room pass), then a C# spike. Java, Kotlin and PHP
-  cannot produce an actor yet; languages that need Wasm garbage collection wait on a decision of
+  its counter and chat room pass), then ✅ a C# spike (a counter passes
+  with componentize-dotnet, all preview;
+  [findings](docs/languages.md#c-spike)). Java, Kotlin and PHP cannot
+  produce an actor yet; languages that need Wasm garbage collection wait on a decision of
   their own
 - 🚧 The benchmark showdown suite (below): the counter comparison runs today
 

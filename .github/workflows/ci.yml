@@ -286,6 +286,14 @@ jobs:
           (cd "$home/lib/core" && MOON_HOME="$home" PATH="$home/bin:$PATH" moon bundle --target wasm --release)
           echo "MOON_HOME=$home" >> "$GITHUB_ENV"
           echo "$home/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: "10.0.x"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # componentize-dotnet and NativeAOT-LLVM: about 800 MB of preview packages.
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('examples/csharp-*/*.csproj', 'examples/csharp-*/nuget.config') }}
       - name: TypeScript SDK (types and WIT in sync with the host, type-check)
         working-directory: sdks/typescript
         run: |
@@ -309,6 +317,7 @@ jobs:
           crates/wasmkeep-server/tests/guests/go-fetch/build.sh
           for ex in examples/d-*/; do "$ex/build.sh"; done
           for ex in examples/moonbit-*/; do "$ex/build.sh"; done
+          for ex in examples/csharp-*/; do "$ex/build.sh"; done
       - name: the counter contract and the chat suite, against every language
         run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
 

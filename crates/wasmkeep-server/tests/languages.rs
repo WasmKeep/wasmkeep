@@ -210,3 +210,11 @@ async fn moonbit() {
         counter_contract("moonbit", &wasm).await;
     }
 }
+
+/// C# with componentize-dotnet (preview), straight on its bindings.
+#[tokio::test(flavor = "multi_thread")]
+async fn csharp() {
+    if let Some(wasm) = prebuilt("csharp", "examples/csharp-counter/counter.wasm") {
+        counter_contract("csharp", &wasm).await;
+    }
+}
