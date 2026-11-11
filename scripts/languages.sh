@@ -6,10 +6,11 @@
 #   2. the TypeScript SDK: its WIT and types in sync with the host, the type
 #      check and its tests;
 #   3. every example in another language built (TypeScript on both engines,
-#      C, Zig, Python, Go on TinyGo and standard Go);
-#   4. the counter contract, the chat suite, jobs and workflows against every
-#      language, with WASMKEEP_REQUIRE_LANGS=1: a component that is missing
-#      fails instead of being skipped.
+#      C, Zig, Python, Go on TinyGo and standard Go, D,
+#      MoonBit, C#);
+#   4. the counter contract, the chat suite, jobs, workflows and outbound
+#      fetch against every language, with WASMKEEP_REQUIRE_LANGS=1: a
+#      component that is missing fails instead of being skipped.
 # It installs no toolchain (see `scripts/doctor.sh --full`), except that it
 # runs `npm ci` where a TypeScript package has no node_modules yet.
 set -euo pipefail
@@ -75,11 +76,13 @@ for ex in examples/ts-*/; do
   echo "-- $ex"
   (cd "$ex" && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm run --silent build:starlingmonkey)
 done
-for ex in examples/c-*/ examples/py-*/ examples/go-*/; do
+for ex in examples/c-*/ examples/py-*/ examples/go-*/ examples/d-*/; do
   [ "$ex" = examples/go-std-counter/ ] && continue
   echo "-- $ex"
   "$ex/build.sh"
 done
+echo '-- crates/wasmkeep-server/tests/guests/go-fetch'
+crates/wasmkeep-server/tests/guests/go-fetch/build.sh
 # Standard Go: componentize-go on PATH (it downloads its own binary into
 # the user's cache directory on first use) and Go 1.27.1+ ($GO_STD, or go).
 if command -v "${COMPONENTIZE_GO:-componentize-go}" >/dev/null 2>&1; then
@@ -88,6 +91,27 @@ if command -v "${COMPONENTIZE_GO:-componentize-go}" >/dev/null 2>&1; then
 else
   skip_lang 'standard Go (componentize-go on PATH, Go 1.27.1+)' 'test(go_standard)'
 fi
+# MoonBit: moon, and its core library bundled for wasm (the official
+# installer bundles it; some distribution packages do not).
+if command -v moon >/dev/null 2>&1 && [ -d "${MOON_HOME:-$HOME/.moon}/lib/core/_build/wasm/release/bundle" ]; then
+  for ex in examples/moonbit-*/; do
+    echo "-- $ex"
+    "$ex/build.sh"
+  done
+else
+  skip_lang 'MoonBit (moon, with its core bundled: moon bundle --target wasm --release in $MOON_HOME/lib/core)' 'test(moonbit)'
+fi
+# C#: opt-in (CHECK_CSHARP=1), since the first build restores about 800 MB
+# of preview packages into the NuGet cache ($NUGET_PACKAGES, default
+# ~/.nuget/packages).
+if [ "${CHECK_CSHARP:-}" = 1 ] && command -v dotnet >/dev/null 2>&1; then
+  for ex in examples/csharp-*/; do
+    echo "-- $ex"
+    "$ex/build.sh"
+  done
+else
+  skip_lang 'C# (CHECK_CSHARP=1 with dotnet: restores ~800 MB of packages)' 'test(csharp)'
+fi
 for ex in examples/zig-*/; do
   echo "-- $ex"
   ZIG="${ZIG:-zig}" "$ex/build.sh"
@@ -95,4 +119,4 @@ done
 
 echo '-- every language against the same tests'
 WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked -E "$tests" \
-  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs
+  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs

@@ -7,7 +7,7 @@
 // speaks its protocol (`/wasmkeep-workflow/v1`) through the app's
 // [call.Caller]:
 //
-//	orders := workflow.New("orders", callActor)
+//	orders := workflow.New("orders", wasmkeep.Caller)
 //	status, err := orders.Start("order-42", []byte("item=book"))
 //	err = orders.SendEvent("order-42", "approved", nil)
 //	status, err = orders.Status("order-42")

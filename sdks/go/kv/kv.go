@@ -8,7 +8,7 @@
 // SDK's ready-made shard, deployed from examples/jobs/kv; this client
 // speaks its protocol (`/wasmkeep-kv/v1`) through the app's [call.Caller].
 //
-//	store := kv.New("kv", 8, callActor)
+//	store := kv.New("kv", 8, wasmkeep.Caller)
 //	version, err := store.Put("user:42", []byte("Ada"))
 //	entry, err := store.Get("user:42")      // nil if absent
 //	_, err = store.CompareAndSet("user:42", kv.Version(version), []byte("Ada L."))

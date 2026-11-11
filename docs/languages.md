@@ -32,25 +32,19 @@ different target, and does not make a language usable here.
 | **C / C++** | Supported | [C SDK](../sdks/c) over `wit-bindgen c`; clang + wasi-libc, the WASI 0.1 adapter | Counter, [chat room](../examples/c-chat-room) and [jobs app](../examples/c-jobs) (KV and queue clients) pass; 170 KB. Performs like Rust: 110 µs of CPU per request, 244 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)). Recommended once it has a guide |
 | **TypeScript / JavaScript** | Supported (embedded runtime) | [`@wasmkeep/sdk`](../sdks/typescript): esbuild, then componentize-qjs (QuickJS embedded, pre-initialized); or [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) (StarlingMonkey) with `--engine starlingmonkey` ([below](#typescript-on-quickjs)) | Counter, chat room and [jobs app](../examples/ts-jobs) (KV and queue clients) pass on both engines. QuickJS, the default: 1.7 MB; 230 µs of CPU per request (2.2× Rust) and 741 KB per actor (3×) ([measured](benchmarks.md#the-same-counter-in-every-language)), few Web APIs. StarlingMonkey: Web APIs and 1.5× faster plain JavaScript, for 4.6× the memory per actor ([measured](benchmarks.md#typescript-on-quickjs-against-starlingmonkey)) |
 | **Python** | Supported (embedded runtime) | [Python SDK](../sdks/python), [componentize-py](https://github.com/bytecodealliance/componentize-py) (CPython embedded) | Counter, chat room and [jobs app](../examples/py-jobs) (KV and queue clients) pass. 18.7 MB, the largest; 259 µs of CPU per request (2.5× Rust) and 7.8 MB per actor (31×) ([measured](benchmarks.md#the-same-counter-in-every-language)) |
-| **Go (TinyGo)** | Experimental | TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2` over `wit-bindgen-go` bindings | The [counter](../examples/go-counter) and the [jobs app](../examples/go-jobs) (the [`sdks/go`](../sdks/go) KV and queue clients) pass; 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language)); no full SDK, chat room or guide yet (see [Go](#go)) |
+| **Go (TinyGo)** | Supported | [Go SDK](../sdks/go); TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2`, which writes a component directly | Counter, [chat room](../examples/go-chat-room) and [jobs app](../examples/go-jobs) (KV, queue and workflow clients) pass; 162 KB. 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language), on the counter before the SDK: the same host calls without the wrapper); see [Go](#go) |
 | **Go (standard)** | Experimental | [componentize-go](https://github.com/bytecodealliance/componentize-go) 0.5.1 with Go 1.27, straight on its bindings | The [counter](../examples/go-std-counter) passes; 2.7 MB. No SDK yet (the Go SDK is for TinyGo's bindings), no numbers from `bench/run.sh` (see [standard Go](#standard-go-through-componentize-go)) |
+| **D** | Experimental | [D SDK](../sdks/d) over `wit-bindgen d`; LDC (1.43 in CI) with `-betterC`, clang + wasi-libc, the WASI 0.1 adapter | Counter and [chat room](../examples/d-chat-room) pass; 88 KB. No numbers from `bench/run.sh` yet, no outbound HTTP or key-value and queue clients (see [D](#d)) |
+| **MoonBit** | Experimental | [MoonBit SDK](../sdks/moonbit) over `wit-bindgen moonbit`; `moon build --target wasm` (MoonBit 0.10.20 in CI), then `wasm-tools component embed --encoding utf16` and `component new` | Counter and [chat room](../examples/moonbit-chat-room) pass; 49 KB. The language is pre-1.0; no numbers from `bench/run.sh` yet, no outbound HTTP or key-value and queue clients (see [MoonBit](#moonbit)) |
+| **C# / .NET** | Experimental (spike) | [componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet) 0.8.0-preview with NativeAOT-LLVM, straight on its bindings | The [counter](../examples/csharp-counter) passes; 929 KB stripped. No SDK, chat room or numbers from `bench/run.sh`; every tool is preview (see [C#](#c-spike)) |
 
 ### Next, in order
 
-Each needs a counter passing the shared tests, and numbers from
-`bench/run.sh`, before it gets a tier.
+Each is experimental once a counter passes the shared tests; numbers
+from `bench/run.sh` come before it is supported.
 
-1. **Go:** finish TinyGo (a `wasmkeep` package, the chat room, a guide);
-   then an SDK for standard Go, which now builds actors through
+1. **An SDK for standard Go**, which now builds actors through
    componentize-go ([below](#standard-go-through-componentize-go)).
-2. **D** (LDC with `-betterC` and `wit-bindgen d`): no GC, no runtime; the
-   generator handles our world.
-3. **MoonBit** (`wit-bindgen moonbit`): small components; the language is
-   pre-1.0 and its string layout changed in 2026, so tool versions must be
-   pinned together.
-4. **C# / .NET** ([componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet),
-   NativeAOT-LLVM): a spike first. Everything upstream is preview, the
-   compiler ships from an experimental feed, and there are no macOS builds.
 
 **Bring your own** through the C SDK, the way Zig does: Odin and Nim should
 work (C-sized components); Swift and Haskell are possible with more effort
@@ -79,10 +73,14 @@ The same counter, as built by each example's `build.sh` (sizes on disk; see
 | Language | Component |
 | --- | --- |
 | Zig | 30 KB |
+| MoonBit | 49 KB |
 | Rust | 81 KB |
-| Go (TinyGo) | 151 KB |
+| D | 88 KB |
+| Go (TinyGo) | 162 KB |
 | C | 170 KB |
+| C# | 929 KB (NativeAOT, debug sections stripped) |
 | TypeScript | 1.7 MB (QuickJS engine, the default) |
+| Go (standard) | 2.7 MB (componentize-go; Go's runtime) |
 | TypeScript on StarlingMonkey | 13.4 MB (StarlingMonkey JS engine) |
 | Python | 18.7 MB (CPython) |
 
@@ -147,19 +145,34 @@ What does not work, or works differently, on QuickJS:
 ## Go
 
 TinyGo's `wasip2` target writes a component directly, against a WIT world
-it is given. The [counter](../examples/go-counter) uses the bindings
-`wit-bindgen-go` generates from the actor world, with no SDK in between:
-about 100 lines, most of them HTTP plumbing an SDK would hide. TinyGo's
-runtime imports `wasi:filesystem` whether or not the program uses it, so
-`build.sh` encodes the component against the actor world plus those
-imports; the host provides them inert (no directories).
+it is given. The [Go SDK](../sdks/go) is a `wasmkeep` package over the
+bindings `wit-bindgen-go` generates (committed in the module, so an app
+needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
+`Rows`, alarms, `Call`, WebSockets, `Env`, `Self` and a synchronous
+`Fetch`, plus the [key-value, queue](kv-and-queues.md#go) and
+[workflow](workflows.md#go) clients. TinyGo's runtime imports
+`wasi:filesystem` whether or not the program uses it, so the module's
+`wit/` adds those imports to the actor world (`actor-tinygo`); the host
+provides them inert (no directories).
 
-The [`sdks/go`](../sdks/go) module has the key-value and queue clients
-([guide](kv-and-queues.md#go)), and [`examples/go-jobs`](../examples/go-jobs)
-uses them. It imports no generated bindings: the app passes its own
-`actors.Call` binding in. What is missing before Go counts as supported:
-the rest of a `wasmkeep` package (the role the C and Zig SDKs play: rows, a
-request and a response type, `Reply`), the chat room, and a guide.
+The [counter](../examples/go-counter), [chat room](../examples/go-chat-room)
+and [jobs app](../examples/go-jobs) pass the shared tests, and
+`fetch_langs` checks `Fetch` against the Rust SDK's `http::fetch`.
+Trade-offs:
+
+- **A garbage collector.** TinyGo's runs inside the request: the
+  counter's p99 is 10× (reads) to 40× (writes) its median, against under
+  1.5× for Rust ([measured](benchmarks.md#the-same-counter-in-every-language)).
+  Allocating less per event shortens it.
+- **TinyGo, not Go.** TinyGo compiles most of the standard library, not
+  all of it (its documentation lists which packages build); the SDK keeps
+  to packages it handles well (no `fmt` or reflection).
+- **Size.** 162 KB for the counter, about twice Rust's; `strconv`'s number
+  parsing alone adds about 50 KB, so the SDK reads integers from SQLite
+  without it.
+- **Not covered by the shared tests:** `SetAlarm` and the `Alarm` hook,
+  `ExecDurable` and `DeleteSelf` from Go (`Call` is, through the jobs
+  app's clients).
 
 ### Standard Go, through componentize-go
 
@@ -189,7 +202,7 @@ What is missing:
   TinyGo, so the SDK does not build on standard Go yet. Its `kv`,
   `queue` and `workflow` clients import no bindings and would carry over.
 - **Size.** 2.7 MB, most of it Go's runtime (stripping custom sections
-  saves under 3%), against 151 KB on TinyGo; no numbers from
+  saves under 3%), against 162 KB on TinyGo; no numbers from
   `bench/run.sh` for CPU or memory per actor yet.
 - **Rough edges.** The module must be named `wit_component` (the
   bindings import it by that path), `bindings` rewrites `go.mod` from its
@@ -197,6 +210,89 @@ What is missing:
   one), the build needs `-buildvcs=false` inside a git checkout, and the
   tool downloads its own binary from its GitHub release into the user's
   cache directory on first use.
+
+## D
+
+LDC compiles D with `-betterC` (no garbage collector, no D runtime, no
+exceptions) to objects for `wasm32-unknown-wasi`; clang links them
+against wasi-libc as a reactor, and the WASI 0.1 adapter makes the
+component, as for C. `wit-bindgen d` generates the bindings, and the
+[D SDK](../sdks/d) wraps them: a struct of static hooks exported with
+`mixin Actor!S`, `exec`, `query` and `Rows` with parameters as plain D
+arguments, alarms, `call`, WebSockets, `env` and `self`. Without a
+garbage collector, everything the SDK returns lives until the event ends
+and is freed then.
+
+The [counter](../examples/d-counter) and [chat room](../examples/d-chat-room)
+pass the shared tests. D stays experimental until `bench/run.sh` measures
+it; the SDK has no outbound HTTP, key-value, queue or workflow clients
+yet. `-betterC` also means no D standard library parts that need the
+runtime (most of Phobos): text is built with `reply`'s printf formats or
+arena memory.
+
+## MoonBit
+
+`wit-bindgen moonbit` generates the bindings as a MoonBit module whose
+world package declares the hooks (`declare pub fn on_init`, ...); the
+[MoonBit SDK](../sdks/moonbit)'s `build.sh` adds the SDK package, the app
+package and a small glue file that implements those declarations by
+calling the app's `actor` (an `@wasmkeep.Actor` of optional hooks). `moon
+build --target wasm` makes a core module with no WASI imports of its own,
+and `wasm-tools` makes the component, with UTF-16 strings (MoonBit's).
+The SDK wraps storage (`exec`, `query`, `Rows`), alarms, `call`,
+WebSockets, `env` and `self_address`; failures are MoonBit errors
+(`Failure`), raised from the SDK and caught at the hooks.
+
+The [counter](../examples/moonbit-counter) and
+[chat room](../examples/moonbit-chat-room) pass the shared tests.
+MoonBit stays experimental: the language is pre-1.0 (its string layout
+changed in 2026, so the compiler, core library and `wit-bindgen` are
+pinned together), `bench/run.sh` does not measure it yet, and the SDK has
+no outbound HTTP, key-value, queue or workflow clients. MoonBit's servers
+publish versions by their compiler version (`0.10.20+65efd5b93`, as
+`moon version --all` prints it), not by `moon`'s dated version; CI pins
+that one, checked by SHA-256.
+
+## C# (spike)
+
+C# can produce a WasmKeep actor today. The
+[counter](../examples/csharp-counter) is built with componentize-dotnet
+0.8.0-preview00011 and NativeAOT-LLVM 10.0.0-rc.1 on the .NET 10 SDK, and
+passes the same counter contract as Rust; CI builds it.
+
+What works:
+
+- **The whole world.** componentize-dotnet runs `wit-bindgen c-sharp` on
+  [`crates/wasmkeep-wit/wit`](../crates/wasmkeep-wit/wit) at every build;
+  the app implements two generated interfaces (`IActorWorldExports` for
+  the five hooks, `IIncomingHandlerExports` for requests) and calls the
+  imports as static methods (`IStorageImports.Exec`, ...).
+- **One build command.** `dotnet build` restores the compiler and the
+  tools it needs and writes a WASI 0.2 component directly; no adapter.
+- **Errors as exceptions.** A WIT error result is thrown as a
+  `WitException`; a hook fails its event by throwing
+  `WitException<string>`.
+
+What is missing:
+
+- **Everything is preview.** The compiler comes from Microsoft's
+  dotnet-experimental feed (a release candidate), the packages are
+  previews, and the first restore is about 800 MB.
+- **No macOS.** At the version componentize-dotnet uses, the
+  NativeAOT-LLVM compiler is published for Linux (x64 and arm64) and
+  Windows x64; the macOS packages on the feed are years older, and
+  `Counter.csproj` names the Linux x64 one.
+- **An older filesystem import.** The component imports
+  `wasi:filesystem@0.2.6` where the world has 0.2.12, so
+  `wasm-tools component targets` rejects it; WasmKeep links the imports
+  semver-compatibly and runs it.
+- **No SDK.** The code names generated types in full
+  (`ActorWorld.wit.Imports.wasi.http.v0_2_12.ITypesImports.OutgoingResponse`)
+  and does its own HTTP plumbing; an SDK on the bindings, the chat room
+  and numbers from `bench/run.sh` come before a tier above experimental.
+- **Size.** 2.5 MB as built, 929 KB with its debug sections stripped
+  (`wasm-tools strip --all`, which `build.sh` runs): NativeAOT compiles
+  the runtime and the garbage collector in.
 
 ## What the tiers require
 

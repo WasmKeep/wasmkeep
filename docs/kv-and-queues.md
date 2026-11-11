@@ -267,14 +267,13 @@ with these differences:
 
 ## Go
 
-The Go module ([`sdks/go`](../sdks/go), for TinyGo) has the **client
-side** only, like TypeScript: the `kv` client, the `queue` client and
+The [Go SDK](../sdks/go) (for TinyGo) has the **client side**, like
+TypeScript: the `kv` client, the `queue` client and
 `queue.HandleDelivery` for push consumers, talking to the Rust shard and
 queue classes from [`examples/jobs`](../examples/jobs) with the same
-protocol, hash and status codes. Go has no SDK for the rest of an actor
-yet, so the module imports no generated bindings: an app passes its own
-`actors.Call` binding in as a `call.Caller` (about fifteen lines, shown in
-[`examples/go-jobs`](../examples/go-jobs), the jobs app in Go).
+protocol, hash and status codes. The clients send through a `call.Caller`:
+`wasmkeep.Caller`, the SDK's own call to another actor
+([`examples/go-jobs`](../examples/go-jobs) is the jobs app in Go).
 
 ```go
 import (
@@ -282,9 +281,10 @@ import (
 
 	"github.com/wasmkeep/wasmkeep/sdks/go/kv"
 	"github.com/wasmkeep/wasmkeep/sdks/go/queue"
+	"github.com/wasmkeep/wasmkeep/sdks/go/wasmkeep"
 )
 
-store := kv.New("kv", 8, callActor)                  // callActor wraps actors.Call
+store := kv.New("kv", 8, wasmkeep.Caller)
 v1, err := store.Put("user:42", []byte("Ada"))      // the new version, once durable
 entry, err := store.Get("user:42")                  // *kv.Entry, nil if absent
 _, err = store.CompareAndSet("user:42", kv.Version(v1), []byte("Ada L."))
@@ -293,21 +293,21 @@ _, err = store.CompareAndSet("user:43", kv.Absent(), []byte("Bob"))
 _, err = store.PutWith("session:9", []byte("..."), kv.PutOptions{TTLMs: 60_000})
 keys, err := store.List("user:", 100)               // in byte order; ListAfter pages
 
-emails := queue.New("queue/emails", callActor)
+emails := queue.New("queue/emails", wasmkeep.Caller)
 id, err := emails.Send([]byte("welcome ada@example.com"))
 ids, err := emails.SendBatch([][]byte{[]byte("a"), []byte("b")})
 
-inbox := queue.New("queue/inbox", callActor)
+inbox := queue.New("queue/inbox", wasmkeep.Caller)
 messages, err := inbox.Lease(10, 30_000)
 for _, m := range messages {
 	acked, err := inbox.Ack(m)                      // false if the lease ran out
 }
 
-// A push consumer, in the wasi:http handler:
-if queue.IsDelivery(method, pathWithQuery) {
-	reply := queue.HandleDelivery(queue.CallerFrom(headers), body,
+// A push consumer, in the Fetch hook:
+if queue.IsDelivery(req.Method, req.Path) {
+	reply := queue.HandleDelivery(queue.CallerFrom(req.Headers), req.Body(),
 		func(_ string, m queue.Message) queue.Outcome { return queue.Ack() }) // or queue.Retry(), queue.RetryAfter(500)
-	// answer reply.Status, reply.ContentType, reply.Body
+	return wasmkeep.Bytes(reply.Status, reply.ContentType, reply.Body)
 }
 ```
 
@@ -332,9 +332,9 @@ The names and semantics follow the Rust ones (`GetFresh`,
   `x-wasmkeep-caller` header (`""` when absent) and the body, and returns
   the status, content type and body to answer. A handler that panics
   traps the event: the queue retries the whole batch with its backoff.
-- **TinyGo, experimental**: Go is experimental in WasmKeep. The module
-  avoids reflection-heavy packages (no `fmt`), so it suits TinyGo's
-  `wasip2` target, and its unit tests run with plain `go test`.
+- **For TinyGo**: the clients avoid reflection-heavy packages (no
+  `fmt`), so they suit TinyGo's `wasip2` target, and their unit tests run
+  with plain `go test`.
 
 ## C
 

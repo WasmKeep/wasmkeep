@@ -1,23 +1,20 @@
 # Jobs, in Go
 
 The [jobs app](../jobs/app) in Go (TinyGo), with the
-[Go module](../../sdks/go)'s `kv` and `queue` clients
+[Go SDK](../../sdks/go)'s `kv` and `queue` clients
 ([guide](../../docs/kv-and-queues.md#go)): the same routes and response
 bodies as [`examples/ts-jobs`](../ts-jobs). Only the app is Go: the shard
 and queue classes are the Rust components from [`examples/jobs`](../jobs)
 (`kv` and `queue`), which the Go clients call over `actors.call` with the
 same protocol as the Rust clients. Its `/orders` routes start, approve,
 query and cancel orders of the Rust `orders` workflow class from
-[`examples/workflows`](../workflows) with the module's `workflow` client
+[`examples/workflows`](../workflows) with the SDK's `workflow` client
 ([guide](../../docs/workflows.md#go)), as the Rust app there does.
 
 Deploy it as class `app`: the `queue/jobs` queue pushes to `app/worker`,
 which answers with `queue.HandleDelivery`. The routes are listed at the top
-of [`main.go`](main.go). Like [go-counter](../go-counter), it uses the
-bindings `wit-bindgen-go` generates into `gen/` (ignored by git); the
-`callActor` function in `main.go` adapts their `actors.Call` to the
-module's `call.Caller`, and `go.mod` points at the module with a `replace`
-directive.
+of [`main.go`](main.go). The clients send through `wasmkeep.Caller`, and
+`go.mod` points at the SDK with a `replace` directive.
 
 ```bash
 (cd examples/go-jobs && ./build.sh)   # writes examples/go-jobs/jobs.wasm (see build.sh for the tools)

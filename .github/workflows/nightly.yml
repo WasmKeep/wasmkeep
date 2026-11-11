@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# `bash` by name runs every step with `-eo pipefail`: a failure on the left
+# of a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   sim:
     name: simulation (madsim, 20,000 seeds)

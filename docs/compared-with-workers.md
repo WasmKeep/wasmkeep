@@ -23,8 +23,8 @@ Workers strong is the platform, not the runtime.
   runs Durable Objects on one machine, without replication or failover
   between machines; that is the hosted platform's.
 - **Any language, as an equal.** Actors are standard WebAssembly
-  components run by Wasmtime: Rust, TypeScript, Python, C and Zig, with
-  Go (TinyGo) experimental ([languages](languages.md)). Workers are built around JavaScript; other
+  components run by Wasmtime: Rust, TypeScript, Python, C, Zig and Go
+  (TinyGo) ([languages](languages.md)). Workers are built around JavaScript; other
   languages run as WebAssembly inside a JavaScript isolate, with
   JavaScript glue.
 - **Less CPU for compiled languages.** On the same counter, WasmKeep with

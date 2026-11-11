@@ -140,8 +140,8 @@ for itself and the harness sets for celld. The run before that change
 ([`e3856a5`](../bench/results/2026-11-10-e3856a5.csv)) left celld on the
 kernel's `always`: its memory at 1000 actors read 609 MB instead of
 396 MB, and 348 KB per actor instead of 294 KB, while its write latency,
-CPU and throughput were within 2% of this file (its reads were 12% faster
-there, run-to-run variation on a 0.1 ms row).
+CPU and throughput were within 2% of this file. Its reads were 12% faster
+there, which is not explained: each file is one run.
 
 | Counter on a bucket | WasmKeep, durable | celld | WasmKeep, plain `exec` (not equivalent) |
 | --- | --- | --- | --- |
@@ -182,10 +182,11 @@ checking that no other process runs with its node id
 - **One node only.** With two or more nodes, celld acknowledges a write
   once followers hold it on their disks (`CELLD_DURABILITY=fleet`), before
   it reaches the bucket. WasmKeep has no such mode: a durable write always
-  waits for the bucket. A three-node comparison has to say which
-  guarantee each side gives; it is not measured yet.
+  waits for the bucket. Three nodes are measured
+  [below](#three-nodes-wasmkeep-against-celld).
 - **Start time is a design difference.** celld answers 95 ms after it
-  starts; a WasmKeep cluster node waits 15 s first, by design. A single
+  starts, with its wait for the rest of a fleet turned off for this
+  one-node run (`CELLD_READY_FLEET_GATE_MS=0`); a WasmKeep cluster node waits 15 s first, by design. A single
   node without a bucket does not wait (51 ms above).
 
 ## Three nodes: WasmKeep against celld
@@ -232,8 +233,8 @@ bucket is the same local MinIO as above, with its data on tmpfs.
 | Memory, three nodes, 1000 resident actors | **441 MB** | 516 MB | 521 MB | 414 MB |
 | Server CPU time per request (8 clients) | 978 µs | 1,774 µs | **929 µs** | 721 µs |
 | Throughput, 8 clients, 1000 actors | 1,679 req/s | 350 req/s | **1,889 req/s** | 13,205 req/s |
-| **Acknowledged writes lost** (3 kills, 270 actors) | **0** | **0** | **0** | **0** |
-| Values handed out twice | **0** | **0** | **0** | **0** |
+| **Acknowledged writes found lost** (3 kills, 90 actors each) | **0** | **0** | **0** | **0** |
+| Values found handed out twice | **0** | **0** | **0** | **0** |
 | Writable again after its node died (p50 / max) | 15.1 / 16.2 s | **9.1 / 10.4 s** | 9.5 / 9.9 s | 15.0 / 16.4 s |
 | Actors that were on the dead node (of 270) | 96 | 105 | 113 | 96 |
 | Restarted node ready (at most) | 1.55 s | **0.13 s** | 0.12 s | 1.56 s |
@@ -245,25 +246,38 @@ the surviving nodes have fenced the old process by then.
 
 ### How to read it
 
-- **Nobody lost an acknowledged write.** Every runtime and mode handed out
-  each value once and kept every acknowledged write through three kills,
-  plain `exec` included in this run (its writes may be lost with their
-  node, see [three nodes against a real bucket](#three-nodes-against-a-real-bucket)).
-- **On this setup the bucket is faster than a follower's disk.** MinIO on
-  tmpfs answers in well under a millisecond, while a follower's fsync goes
-  to a real disk. So celld's fleet mode, which waits for followers (or the
-  bucket, whichever is first), is its slowest here: 5.08 ms at p50 and
-  350 req/s, against 2.69 ms and 1,889 req/s in bucket mode. A remote
-  bucket takes milliseconds to tens of milliseconds per write, where the
-  follower's disk should win: the same table against a cloud bucket is
-  next.
-- **Durable against bucket-durable, celld writes more per second and costs
-  less CPU.** WasmKeep answers a write 15% faster at p50 (2.29 against
-  2.69 ms) but is slower at p99 (6.13 against 4.37 ms), handles 11% fewer
-  writes per second (1,679 against 1,889) and uses 5% more CPU per write.
-  This reverses the one-node result on tmpfs above. A likely cause, not
-  yet measured: a WasmKeep actor uploads an event's changes before it runs
-  its next event, so writes to one actor wait on each other's uploads.
+- **No lost acknowledged write was found, which is weaker than proving
+  none was lost.** The check has limits. Increments are interchangeable,
+  so a write that was applied without its answer reaching the client (a
+  request that timed out) can hide one lost acknowledged write. Plain
+  `exec` also reads 0 here although its writes may be lost with their
+  node ([three nodes against a real bucket](#three-nodes-against-a-real-bucket)),
+  so this run has not shown that the check catches a loss. And SIGKILL
+  keeps the operating system's page cache, so an acknowledgement that
+  relies on a follower's fsync is not really tested. The
+  [soak](#three-nodes-against-a-real-bucket) checks WasmKeep's durable
+  writes more strictly, over hours.
+- **This is one run of each target, eight seconds of throughput.** Two
+  one-node files above differ by 5 to 12% on some rows, so read
+  differences of that size here as "about the same".
+- **celld's fleet mode is its slowest here, and that is not explained.**
+  5.08 ms at p50 and 350 req/s, against 2.69 ms and 1,889 req/s in bucket
+  mode. An acknowledgement that takes whichever of the followers and the
+  bucket comes first should not be slower than waiting for the bucket.
+  The three nodes share one disk, so a write is fsynced by the owner and
+  by its followers on the same device: this row probably measures one
+  machine, and needs nodes with a disk each.
+- **Durable against bucket-durable, the two are close.** WasmKeep answers
+  a write sooner at p50 (2.29 against 2.69 ms) and later at p99 (6.13
+  against 4.37 ms); the eight clients, each waiting for its answer,
+  completed 1,679 writes per second against 1,889, at 978 against 929 µs
+  of CPU per write. The one-node comparison above had WasmKeep ahead, but
+  it kept data on tmpfs and this one on disk, so nodes and disk changed
+  together. One thing the disk does change: on a cluster node,
+  `exec-durable` fsyncs the local file and then uploads. Durable minus
+  plain is 0.07 ms on tmpfs (0.55 against 0.48 ms) and 1.73 ms on disk
+  (2.29 against 0.56 ms). One node on disk and three on tmpfs would
+  separate the two; not run yet.
 - **WasmKeep reads faster and holds less memory.** Reads take 96 against
   221 µs at p50 (both forwarded two times in three), and three nodes hold
   1000 actors in 441 against 516 to 521 MB.
@@ -271,9 +285,9 @@ the surviving nodes have fenced the old process by then.
   again after 15 to 16 s on WasmKeep and 9 to 10 s on celld, close to each
   one's default (15 s and 10 s). Neither side was tuned. A restarted celld
   node is ready in about 0.1 s; a WasmKeep node in 1.6 s.
-- **Not measured here:** nodes on separate machines (the network between
-  nodes is loopback, so a follower is as close as it gets), a cloud
-  bucket, and mutual TLS between WasmKeep nodes
+- **Not measured here:** nodes on separate machines, each with its own
+  disk (here the network between nodes is loopback and the disk is
+  shared), a cloud bucket, repeated runs, and mutual TLS between WasmKeep nodes
   ([measured above](#between-nodes-plain-http-against-mutual-tls)).
 
 ## The same counter in every language
