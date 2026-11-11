@@ -36,7 +36,8 @@ pub fn fail_next(point: &str) {
 
 /// Makes the next operation at `point` wait `delay` first (on its blocking
 /// thread), once: to hold an event at a known step while a test changes
-/// something around it. Points: `open` (opening an actor's database).
+/// something around it. Points: `open` (opening an actor's database),
+/// `alarm_scan` (the startup scan for pending alarms, with a database open).
 pub fn delay_next(point: &str, delay: std::time::Duration) {
     DELAYS
         .lock()

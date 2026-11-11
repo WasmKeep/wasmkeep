@@ -377,3 +377,98 @@ async fn a_durable_write_on_a_cluster_node_is_not_synced_locally() {
         r.body
     );
 }
+
+/// A node that starts scans its data directory for pending alarms, opening
+/// each database for a moment, and nothing makes a restore wait for it: a
+/// restore can replace a database while the scan has it open. That is safe
+/// only because SQLite, closing a connection whose database file was moved
+/// away, neither checkpoints nor removes the WAL and the shared-memory file
+/// by name, which by then are the new database's. If it did, the actor
+/// would go on writing to a file nobody can read, its writes would be
+/// captured as "nothing changed", and `exec-durable` would acknowledge
+/// writes that never reached the bucket. Pinned here: the durable write
+/// after such a restore is in the bucket.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_restored_under_the_alarm_scan_keeps_replicating() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cut = || {
+        let down = Arc::new(AtomicBool::new(false));
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+        (store, down)
+    };
+    let start = |data: std::path::PathBuf, store: Arc<dyn ObjectStore>| async move {
+        node_with(
+            "a",
+            &data,
+            &store,
+            Duration::from_secs(30),
+            "t",
+            test_actor_wasm(),
+        )
+        .await
+    };
+    let da = tempfile::tempdir().unwrap();
+    let path = "/actor/t/x/durable";
+
+    let (store, down) = cut();
+    let a = start(da.path().to_owned(), store).await;
+    a.service.node_id_checked().await.unwrap();
+    settle().await;
+    let r = send(a.addr, "POST", path, "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+    down.store(true, Ordering::SeqCst);
+    stop_listening(a).await;
+    // As after a crash, the local file is not known to be current (here:
+    // no sidecar), so the next owner restores it from the bucket.
+    let wal = da.path().join("actors/default/t/x.db-wal");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while wal.exists() {
+        assert!(std::time::Instant::now() < deadline, "still open");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::remove_file(da.path().join("actors/default/t/x.db.replica")).unwrap();
+
+    // The restarted node's scan holds x's database open for a while.
+    wasmkeep_storage::faults::delay_next("alarm_scan", Duration::from_millis(2_500));
+    let (store, down) = cut();
+    let again = start(da.path().to_owned(), store).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !wasmkeep_storage::faults::held("alarm_scan") {
+        assert!(std::time::Instant::now() < deadline, "the scan never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    again.service.node_id_checked().await.unwrap();
+    // A read first: it takes the actor (a restore) and leaves it resident.
+    let r = send(again.addr, "GET", path, "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+    assert!(
+        wasmkeep_storage::faults::held("alarm_scan"),
+        "the restore ran while the scan had the database open"
+    );
+    assert!(
+        da.path().join("actors/default/t/x.db.replaced").exists(),
+        "the database was replaced from the bucket"
+    );
+    while wasmkeep_storage::faults::held("alarm_scan") {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await; // the scan's close
+    let r = send(again.addr, "POST", path, "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+
+    // Acknowledged, so in the bucket: a node with an empty disk has it.
+    down.store(true, Ordering::SeqCst);
+    stop_listening(again).await;
+    let fresh = tempfile::tempdir().unwrap();
+    let (store, _down) = cut();
+    let third = start(fresh.path().to_owned(), store).await;
+    third.service.node_id_checked().await.unwrap();
+    let r = send(third.addr, "GET", path, "").await;
+    assert_eq!(
+        (r.status, r.body.trim()),
+        (200, "2"),
+        "the acknowledged write is in the bucket: {}",
+        r.body
+    );
+}
