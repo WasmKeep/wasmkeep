@@ -7,12 +7,61 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
-## Unreleased
+## 0.2.0
 
-- **Languages**: Go through TinyGo is supported, with a full
-  [Go SDK](sdks/go) and its counter, chat room and jobs app; D and
-  MoonBit are experimental, each with an SDK, a counter and a chat room;
-  a C# counter (componentize-dotnet) and a standard-Go counter
+**The installable release.** With 0.1.0 the SDKs were used from a clone of
+the repository; from this release each comes from where its language
+expects it, and trying WasmKeep needs no toolchain. Still a **pre-alpha
+pre-release**: for trying WasmKeep, side projects and staging, not
+production. The interface between an actor and the host is unchanged
+(`wasmkeep:actor@0.2.0`, a version of its own), so a component built for
+0.1.0 runs as it is. See the [roadmap](ROADMAP.md) for what comes next.
+
+### What is new
+
+- **The SDKs install from their registries**, each at the server's
+  version, `0.2.0`:
+
+  | Language | Install | Then |
+  | --- | --- | --- |
+  | Rust | `cargo add wasmkeep-sdk` | [crate](crates/wasmkeep-sdk/README.md), [tutorial](docs/tutorials/first-actor.md) |
+  | TypeScript | `npm install @wasmkeep/sdk` | `npx wasmkeep-ts build` ([package](sdks/typescript/README.md)) |
+  | Python | `pip install wasmkeep` | `python -m wasmkeep build`, new in this release ([package](sdks/python/README.md)) |
+  | Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0` | [module](sdks/go/README.md) |
+  | C, Zig | `wasmkeep-c-sdk-0.2.0.tar.gz` and `wasmkeep-zig-sdk-0.2.0.tar.gz`, attached to this release | [C](sdks/c/README.md), [Zig](sdks/zig/README.md) |
+
+  The crate, the npm package and the wheel are published from this
+  release's tag once a maintainer approves each, so a registry can be a
+  little behind this page. The server and every SDK carry one version;
+  use an SDK with the server of the same version
+  ([versions](docs/languages.md#versions)).
+- **Prebuilt components**: the release carries `counter.wasm`, `kv.wasm`,
+  `queue.wasm`, `workflows-orders.wasm` and `workflows-ledger.wasm`, built
+  from the examples and signed like its other files. The
+  [quickstart](README.md#quickstart) is now a download and one command,
+  and the callers of the [key-value, queue](docs/kv-and-queues.md) and
+  [workflow](docs/workflows.md#the-workflow-class) classes in other
+  languages need no Rust toolchain. The notices of the libraries compiled
+  into them are in `THIRD_PARTY_NOTICES-components.txt`. The binary's
+  tarball has a short README of its own.
+- **The C and Zig SDKs as archives**, signed like the other files: each
+  SDK with the C bindings already generated, the WIT and the componentize
+  script, and a README whose build command works in the extracted
+  directory, without a clone or wit-bindgen. `WASMKEEP_SDK_VERSION` (C)
+  and `wk.version` (Zig) carry the version.
+- **A durable write on a cluster node is no longer synced to the local
+  disk as well as uploaded.** `exec-durable` answers once the bucket holds
+  the write, as it was documented to: one disk sync less on every durable
+  write. The bucket is the only durable copy of such a write, and a node
+  trusts a local file again only after checking it against the bucket. For
+  whoever runs a cluster: start a node again on the same bucket and
+  prefix, since after a crash or a power loss its local files may lack
+  writes the bucket has ([replication](docs/cluster.md#replication)). A
+  node without a bucket still syncs to its disk.
+- **Languages**: Go through TinyGo moves from experimental to supported,
+  with a full [Go SDK](sdks/go) and its counter, chat room and jobs app. D
+  and MoonBit are experimental, each with an SDK, a counter and a chat
+  room; a C# counter (componentize-dotnet) and a standard-Go counter
   (componentize-go) pass the shared tests.
   [Tiers and numbers](docs/languages.md).
 - **Compared with celld**: the same counter on one node and on three, a
@@ -21,40 +70,46 @@ The text under a version's heading is its GitHub release text
   disk removed, and includes a run that must lose writes
   ([WasmKeep and celld](docs/compared-with-celld.md),
   [benchmarks](docs/benchmarks.md#three-nodes-wasmkeep-against-celld)).
-- **Durable writes on a cluster node** are no longer fsynced locally as
-  well as uploaded: `exec-durable` answers once the bucket holds the
-  write, as documented, and a node trusts a local file again only after
-  checking it against the bucket. The bucket is the only durable copy of
-  such a write ([running a cluster](docs/cluster.md#how-it-works)). A
-  node without a bucket still fsyncs.
-- **Installing**: the README starts from a release, not a clone: download
-  and check a binary, or run the image. The Rust, TypeScript and Python
-  SDKs now build as packages on their own (a crate, an npm tarball, a
-  wheel), and the Go module is ready for its tag; none is on a registry
-  yet. The server and every SDK carry one version, checked in CI
-  ([languages](docs/languages.md#versions)).
-- **Prebuilt components**: a release carries `counter.wasm`, `kv.wasm`,
-  `queue.wasm`, `workflows-orders.wasm` and `workflows-ledger.wasm`,
-  built from the examples and signed like its other files, so the
-  [quickstart](README.md#quickstart) and the callers of the
-  [key-value, queue](docs/kv-and-queues.md) and
-  [workflow](docs/workflows.md#the-workflow-class) classes in other
-  languages need no Rust toolchain. The notices of the libraries
-  compiled into them come with them, in
-  `THIRD_PARTY_NOTICES-components.txt`. The tarball has a short README of
-  its own.
-- **C and Zig SDK archives**: a release carries
-  `wasmkeep-c-sdk-<version>.tar.gz` and `wasmkeep-zig-sdk-<version>.tar.gz`,
-  signed like its other files: each SDK with the C bindings already
-  generated, the WIT and the componentize script, and a README whose build
-  command works in the extracted directory, without a clone or
-  wit-bindgen ([C](sdks/c/README.md), [Zig](sdks/zig/README.md)).
-  `WASMKEEP_SDK_VERSION` (C) and `wk.version` (Zig) carry the version.
-- **Releases**: a tag's release waits for CI to pass on the tagged
-  commit, and a version's image tag is written once. Publishing the
-  release publishes the SDKs to crates.io, npm and PyPI from its tag,
-  without stored tokens, each after a maintainer's approval
-  ([releasing](docs/releasing.md)).
+- **How releases are made**: a tag's release waits for CI to pass on the
+  tagged commit (0.1.0 was tagged before its run had finished), and a
+  version's image tag is written once. Publishing the release publishes
+  the SDKs to crates.io, npm and PyPI from its tag, without stored tokens,
+  each after a maintainer's approval ([releasing](docs/releasing.md)).
+
+### Upgrading from 0.1.0
+
+- Upgrade every node of a cluster together, as before
+  ([upgrading](docs/cluster.md#upgrading-wasmkeep)). The formats in the
+  bucket and the command line are unchanged.
+- Components built for 0.1.0 need no rebuild. To move an actor's source
+  to a published SDK, replace the path into a clone with the registry's
+  package at `0.2.0`.
+- The Go module's `v0.1.0` has only the key-value, queue and workflow
+  clients; the `wasmkeep` package (hooks, storage, alarms) starts at
+  `v0.2.0`.
+
+### Known limits
+
+The limits listed for 0.1.0 still hold:
+
+- Not production-ready: soaked against Cloudflare R2 and OVHcloud Object
+  Storage with nodes killed under load, nothing lost, but not yet carrying
+  real users' traffic, and not run against AWS S3
+  ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
+- Nodes of different versions are not supported in one cluster; one
+  tenant per process ([security](docs/security.md#known-gaps)); no
+  independent third-party security audit yet
+  ([security](docs/security.md#audits)).
+- Binaries are for Linux; on macOS and Windows, use the image or build
+  from source. The Zig SDK is an archive, not yet a package `zig fetch`
+  resolves; D and MoonBit are used from the source.
+
+### Install and verify
+
+[Install](README.md#install) downloads a binary or runs the image.
+[Single node](docs/deploy/single-node.md#1-install-the-binary) checks the
+binaries, the components and the archives with cosign;
+[Compose](deploy/compose/README.md) checks the image.
 
 ## 0.1.0
 
