@@ -34,7 +34,7 @@ comptime {
 }
 ```
 
-Starting with the release after 0.1.0, a release carries this SDK as
+A release carries this SDK (from 0.2.0 on) as
 `wasmkeep-zig-sdk-<version>.tar.gz`, signed like its other files: the Zig
 files, the C SDK with its bindings already generated, the WIT and the
 componentize script, so building needs no clone and no wit-bindgen. Its

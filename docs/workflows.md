@@ -102,12 +102,11 @@ carries the example's workflow already built: `workflows-orders.wasm`
 `workflows-ledger.wasm` (the `ledger` class its steps call, so it needs
 both), signed like the release's other files, with the notices of the
 libraries compiled into them in `THIRD_PARTY_NOTICES-components.txt`.
-They start with the release
-after 0.1.0, which has neither: until then, build them from a clone, as
-[the example's README](../examples/workflows/README.md#run-it) does.
+[The example's README](../examples/workflows/README.md#run-it) builds them
+from a clone instead.
 
 ```bash
-# $v: the version of your wasmkeep binary, later than 0.1.0
+# $v: the version of your wasmkeep binary
 for f in workflows-orders.wasm workflows-ledger.wasm; do
   curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/$f"
 done

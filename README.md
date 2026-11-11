@@ -138,7 +138,7 @@ On Linux, x86_64 or aarch64 (glibc 2.28 or newer), download a release. Name
 the version: releases are pre-releases for now, so there is no `latest`.
 
 ```bash
-v=0.1.0
+v=0.2.0
 f=wasmkeep-$v-$(uname -m)-unknown-linux-gnu.tar.gz
 curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/$f"
 tar xzf "$f" && sudo install -m 755 "${f%.tar.gz}/wasmkeep" /usr/local/bin/wasmkeep
@@ -147,37 +147,22 @@ wasmkeep --version
 
 Every file of a release is signed:
 [check a download](docs/deploy/single-node.md#1-install-the-binary) before
-you trust it. Or use the container image, `ghcr.io/wasmkeep/wasmkeep:0.1.0`,
+you trust it. Or use the container image, `ghcr.io/wasmkeep/wasmkeep:0.2.0`,
 for linux/amd64 and linux/arm64
 ([running it](deploy/compose/README.md#the-image-on-its-own)). On macOS and Windows,
 use the image or build from source (below).
 
 ## Quickstart
 
-A node serves components: build the counter example, then serve it. You
-need [rustup](https://rustup.rs); the pinned toolchain and the
-`wasm32-wasip2` target install automatically.
+A node serves components. A release carries the counter example already
+built, `counter.wasm`, signed like its other files: download it and serve
+it, with no toolchain.
 
 ```bash
-git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep
-(cd examples/counter && cargo build --release --target wasm32-wasip2)
-wasmkeep serve --actor counter=examples/counter/target/wasm32-wasip2/release/counter.wasm
-```
-
-Starting with the release after 0.1.0, a release also carries that
-counter already built, `counter.wasm`, signed like its other files, so the
-first minute needs no toolchain (0.1.0 has no `counter.wasm`). The
-release's `THIRD_PARTY_NOTICES-components.txt` holds the notices of the
-libraries compiled into it and the other example components:
-
-```bash
-# $v as in Install, and later than 0.1.0
+# $v as in Install
 curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/counter.wasm"
 wasmkeep serve --actor counter=counter.wasm
 ```
-
-Without the release binary, build the server from the same clone:
-`cargo run -p wasmkeep-cli -- serve --actor counter=...`.
 
 In another terminal:
 
@@ -188,7 +173,22 @@ curl localhost:8080/actor/counter/bob             # 0, a separate actor
 ```
 
 Each name is its own actor with its own SQLite database under `.wasmkeep/data/`.
-Restart the server and the counts are still there.
+Restart the server and the counts are still there. The release's
+`THIRD_PARTY_NOTICES-components.txt` holds the notices of the libraries
+compiled into `counter.wasm` and the other example components.
+
+Or build the counter yourself, from a clone. You need
+[rustup](https://rustup.rs); the pinned toolchain and the `wasm32-wasip2`
+target install automatically.
+
+```bash
+git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep
+(cd examples/counter && cargo build --release --target wasm32-wasip2)
+wasmkeep serve --actor counter=examples/counter/target/wasm32-wasip2/release/counter.wasm
+```
+
+Without the release binary, build the server from the same clone:
+`cargo run -p wasmkeep-cli -- serve --actor counter=...`.
 
 To develop with hot reload (rebuilds and swaps on every save, keeping data;
 `dev` keeps it under `.wasmkeep/dev`, not the `.wasmkeep/data` of `serve`):
@@ -197,8 +197,44 @@ To develop with hot reload (rebuilds and swaps on every save, keeping data;
 wasmkeep dev examples/counter   # from a clone
 ```
 
-To run several nodes on one bucket, with replication, failover and
-`wasmkeep deploy`, see [Running a cluster](docs/cluster.md).
+To write your own actor, install the SDK of your language, at the version
+of your server:
+
+| Language | Install | Start from |
+| --- | --- | --- |
+| Rust | `cargo add wasmkeep-sdk` | [Your first actor in 10 minutes](docs/tutorials/first-actor.md) |
+| TypeScript | `npm install @wasmkeep/sdk` | [its README](sdks/typescript/README.md) |
+| Python | `pip install wasmkeep` | [its README](sdks/python/README.md) |
+| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0` | [its README](sdks/go/README.md) |
+| C, Zig | `wasmkeep-c-sdk-0.2.0.tar.gz`, `wasmkeep-zig-sdk-0.2.0.tar.gz` from the release | the README in each archive |
+
+[Languages](docs/languages.md) has the trade-offs of each, with numbers.
+
+## See it survive a kill
+
+[`deploy/compose/`](deploy/compose/README.md) runs three nodes on one
+machine, sharing a MinIO bucket, with mutual TLS between them, serving the
+same counter. Kill the node that runs an actor, and another node restores
+it from the bucket:
+
+```bash
+git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep/deploy/compose
+docker compose up -d --build                                # the first build takes a few minutes
+curl -i -X POST http://127.0.0.1:8081/actor/counter/alice   # x-wasmkeep-node: the node that runs alice
+docker compose kill b                                       # that node (a, b or c)
+curl -i -X POST http://127.0.0.1:8081/actor/counter/alice   # about 20 s later, on a node still up (8081 a, 8082 b, 8083 c)
+```
+
+The actor is free 15 to about 21 s after the killed node's last heartbeat;
+then another node restores it from the bucket and answers. The count goes
+on from what the bucket holds: the
+counter's writes are uploaded as each request ends, and a write made with
+`exec-durable` is acknowledged only once it is there. This was tried with
+Podman (`podman compose`); with Docker, the kill is not tested yet. The
+[example's README](deploy/compose/README.md) has the clean stop, a new
+deploy, and Prometheus and Grafana on the same cluster;
+[Running a cluster](docs/cluster.md) has replication, failover and
+`wasmkeep deploy` on your own nodes.
 
 ## Learn more
 
@@ -225,8 +261,8 @@ All of it also builds as a site: `./scripts/docs-site.sh` (needs
 
 ## Status
 
-WasmKeep is young and **pre-alpha**: its first release, `0.1.0`, is a
-pre-release ([changelog](CHANGELOG.md)).
+WasmKeep is young and **pre-alpha**: its releases so far, `0.1.0` and
+`0.2.0`, are pre-releases ([changelog](CHANGELOG.md)).
 
 - **Works, and is tested**: everything in the status note at the top,
   each feature with tests that run before every merge, the node lease,

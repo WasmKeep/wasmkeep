@@ -16,19 +16,19 @@ Debian 10, Ubuntu 20.04 and later), a tarball with the binary and its
 third-party notices, a CycloneDX SBOM, `SHA256SUMS`, and a Sigstore bundle
 for each file. CI builds and signs them (`.github/workflows/release.yml`);
 no key is involved, the signature's certificate names the workflow and
-the tag. Starting with the release after 0.1.0, the example
-components (`counter.wasm` and the others) are attached too, with
-`THIRD_PARTY_NOTICES-components.txt`, the notices of the libraries
-compiled into them; each has its own bundle, checked the same way. To check a download with cosign 3 (the version that signs them),
-here for `v0.1.0`:
+the tag. The example components (`counter.wasm` and the others) are
+attached too, with `THIRD_PARTY_NOTICES-components.txt`, the notices of
+the libraries compiled into them, and the C and Zig SDKs as archives; each
+has its own bundle, checked the same way. To check a download with cosign 3
+(the version that signs them), here for `v0.2.0`:
 
 ```bash
-f=wasmkeep-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+f=wasmkeep-0.2.0-x86_64-unknown-linux-gnu.tar.gz
 for file in "$f" "$f.sigstore.json"; do
-  curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v0.1.0/$file"
+  curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v0.2.0/$file"
 done
 cosign verify-blob --bundle "$f.sigstore.json" \
-  --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.1.0 \
+  --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"
 tar xzf "$f" && cd "${f%.tar.gz}" && sudo install -m 755 wasmkeep /usr/local/bin/wasmkeep
 ```

@@ -19,12 +19,11 @@ ready-made shard) and `queue.wasm` (its queue class: three attempts, a
 short backoff, pull-only except `queue/jobs`, which pushes to
 `app/worker`), signed like its other files, with the notices of the
 libraries compiled into them in `THIRD_PARTY_NOTICES-components.txt`.
-They start with the release
-after 0.1.0, which has neither: until then, build them from a clone, as
-[the example's README](../examples/jobs/README.md#run-it) does.
+[The example's README](../examples/jobs/README.md#run-it) builds them from
+a clone instead.
 
 ```bash
-# $v: the version of your wasmkeep binary, later than 0.1.0
+# $v: the version of your wasmkeep binary
 curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/kv.wasm"
 curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/queue.wasm"
 wasmkeep serve --actor kv=kv.wasm --actor queue=queue.wasm --actor app=your-app.wasm \

@@ -66,16 +66,17 @@ Add the module to an app at the version of the WasmKeep release it runs
 on:
 
 ```bash
-go get github.com/wasmkeep/wasmkeep/sdks/go@vX.Y.Z
+go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0
 go mod tidy   # once the app imports a package: records the module's one dependency
 ```
 
-The module carries the same version number as the server, so `vX.Y.Z` is
-the release's tag (in the repository, the module's own tag is
-`sdks/go/vX.Y.Z`). The `wasmkeep` package is newer than `v0.1.0`, which
-has only the clients: it needs a later release. Until there is one,
-`@latest` resolves to `v0.1.0`, and an app references a checkout with a
-`replace` directive instead, as the examples in this repository do:
+The module carries the same version number as the server (in the
+repository, the module's own tag is `sdks/go/v0.2.0`). The `wasmkeep`
+package starts at `v0.2.0`: `v0.1.0` has only the `kv`, `queue` and
+`workflow` clients.
+
+The examples in this repository reference the checkout with a `replace`
+directive instead:
 
 ```text
 require github.com/wasmkeep/wasmkeep/sdks/go v0.0.0

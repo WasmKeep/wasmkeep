@@ -3,49 +3,47 @@
 You will write a small actor in Rust, build it into a WebAssembly component,
 serve it with WasmKeep, and see its state survive a restart.
 
-Applies to: WasmKeep `main` (pre-alpha). Commands assume Linux
-or macOS.
+Applies to: WasmKeep `0.2.0` (pre-alpha). Commands assume Linux; on macOS,
+build the server from source (step 1).
 
 ## 1. Get WasmKeep
 
-You need [rustup](https://rustup.rs). The repository pins its Rust version and
-the `wasm32-wasip2` target, so rustup installs both on first use.
+Install the `wasmkeep` binary from a release, as in
+[Install](../../README.md#install) (Linux, x86_64 or aarch64), and check it
+answers:
 
 ```bash
-git clone https://github.com/wasmkeep/wasmkeep
-cd wasmkeep
-cargo build --release -p wasmkeep-cli
+wasmkeep --version
 ```
 
-The CLI is now at `target/release/wasmkeep`.
+On macOS, or to run the server from source: `git clone
+https://github.com/wasmkeep/wasmkeep`, then `cargo build --release -p
+wasmkeep-cli` in it writes `target/release/wasmkeep`.
+
+To build the actor you need [rustup](https://rustup.rs) with Rust 1.97 or
+later, and the WebAssembly target:
+
+```bash
+rustup target add wasm32-wasip2
+```
 
 ## 2. Create the actor
 
-An actor is a Rust library compiled to a component. Create a directory for
-it next to the examples (not with `cargo new`, which would add it to the
-WasmKeep workspace; an actor is built for a different target and is its own
-workspace):
+An actor is a Rust library compiled to a component. Create it anywhere
+outside a clone of WasmKeep, and add the SDK from crates.io:
 
 ```bash
-mkdir -p examples/visits/src
+cargo new --lib visits && cd visits
+cargo add wasmkeep-sdk
 ```
 
-Create `examples/visits/Cargo.toml`:
+`cargo add` takes the newest version: the SDK carries the version of the
+server it is released with, so keep the two the same
+(`cargo add wasmkeep-sdk@0.2.0` names one). Add to `Cargo.toml`:
 
 ```toml
-[package]
-name = "visits"
-version = "0.1.0"
-edition = "2024"
-
-# The actor builds for wasm32-wasip2, so it is its own workspace.
-[workspace]
-
 [lib]
 crate-type = ["cdylib"]
-
-[dependencies]
-wasmkeep-sdk = { path = "../../crates/wasmkeep-sdk" }
 
 # Keeps the component small, as in every example.
 [profile.release]
@@ -55,6 +53,7 @@ lto = true
 codegen-units = 1
 ```
 
+Replace `src/lib.rs` with:
 Create `examples/visits/src/lib.rs`:
 
 ```rust
@@ -109,20 +108,16 @@ Two traits, one macro:
 ## 3. Build it
 
 ```bash
-cd examples/visits
 cargo build --release --target wasm32-wasip2
-cd ../..
 ```
 
-The component is `examples/visits/target/wasm32-wasip2/release/visits.wasm`,
-close to the 81 KB of the Rust counter, which uses the same release
-profile.
+The component is `target/wasm32-wasip2/release/visits.wasm`, close to the
+81 KB of the Rust counter, which uses the same release profile.
 
 ## 4. Serve it
 
 ```bash
-target/release/wasmkeep serve \
-  --actor visits=examples/visits/target/wasm32-wasip2/release/visits.wasm
+wasmkeep serve --actor visits=target/wasm32-wasip2/release/visits.wasm
 ```
 
 Every actor lives at `/actor/<class>/<name>/...`. The class is `visits`; the
@@ -139,7 +134,8 @@ curl 'localhost:8080/actor/visits/about?who=carol'
 ```
 
 `home` and `about` are two actors, each with its own SQLite database under
-`.wasmkeep/data/actors/default/visits/`.
+`.wasmkeep/data/actors/default/visits/`, in the directory the server
+started in.
 
 ## 5. Restart it
 
@@ -173,11 +169,13 @@ The count survived because it lives in the actor's database, not in memory.
 
 ## Next
 
-- `target/release/wasmkeep dev examples/visits` rebuilds and reloads your actor
-  every time you save, keeping its data.
-
-- `examples/rate-limiter` uses **alarms**: code that runs later, at least once,
-  even across restarts.
+- `wasmkeep dev .` rebuilds and reloads your actor every time you save,
+  keeping its data.
+- [`examples/rate-limiter`](../../examples/rate-limiter) uses **alarms**:
+  code that runs later, at least once, even across restarts.
+- The release carries more to try without building:
+  [key-value and queues](../kv-and-queues.md) and
+  [workflows](../workflows.md), as classes your actor calls.
 - `wasmkeep_sdk::actors::call` lets one actor call another.
 - The design and its guarantees are in [Concepts](../concepts.md), with an
   [overview](../overview.md) of the architecture.

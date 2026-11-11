@@ -20,7 +20,7 @@ every SDK manifest carries (`scripts/check-versions.py`).
 
 ## Steps
 
-The SDKs are published with the releases after 0.1.0, which is on no
+The SDKs are published with every release from 0.2.0 on; 0.1.0 is on no
 registry.
 
 1. **Prepare.** In one pull request: the version in `Cargo.toml` and every
