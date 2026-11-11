@@ -123,6 +123,11 @@ REVIEWED_LITERALS = {
         "'s/^Model name: *//p'",
         '$(dirname "$0")/..',
     ),
+    # The same reviewed expressions in the one-node bucket comparison's runner.
+    "bench/bucket.sh": (
+        "'s/^Model name: *//p'",
+        '$(dirname "$0")/..',
+    ),
     "bench/soak.sh": (
         "'s/^Model name: *//p'",
         r"'s/^soak_metric \([^ ]*\) \([0-9]*\) \([a-z]*\)$/\1 \2 \3/p'",
