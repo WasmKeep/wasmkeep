@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    # A draft starts nothing (see the jobs' conditions): marking it ready
+    # for review starts the run.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -37,6 +40,7 @@ jobs:
   # counts as passed. A push to main always runs everything.
   changes:
     name: changes
+    if: ${{ github.event.pull_request.draft != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -54,8 +58,9 @@ jobs:
 
   fmt:
     name: rustfmt
+    timeout-minutes: 10
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -63,6 +68,8 @@ jobs:
 
   benchmark-publication:
     name: benchmark publication paths
+    if: ${{ github.event.pull_request.draft != true }}
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -102,8 +109,9 @@ jobs:
 
   licenses:
     name: dependency licenses
+    timeout-minutes: 15
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -111,8 +119,9 @@ jobs:
 
   deny:
     name: cargo-deny (advisories, licenses, sources)
+    timeout-minutes: 15
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -122,8 +131,9 @@ jobs:
 
   clippy:
     name: clippy
+    timeout-minutes: 20
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -136,8 +146,9 @@ jobs:
   # under its unexpanded name, and each of these names is a required check.
   test-linux:
     name: test (ubuntu-latest)
+    timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -151,8 +162,9 @@ jobs:
 
   test-linux-arm:
     name: test (ubuntu-24.04-arm)
+    timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -166,8 +178,9 @@ jobs:
 
   test-macos:
     name: test (macos-latest)
+    timeout-minutes: 60
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -181,8 +194,9 @@ jobs:
 
   msrv:
     name: MSRV
+    timeout-minutes: 20
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -201,7 +215,7 @@ jobs:
     # shared runners are too noisy to compare with numbers from another run.
     name: benchmark regression (base vs this change)
     needs: changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -233,8 +247,9 @@ jobs:
 
   sim:
     name: simulation (madsim, 200 seeds)
+    timeout-minutes: 20
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: --cfg madsim
@@ -257,8 +272,9 @@ jobs:
     # MinIO no longer publishes container images, so this runs against
     # moto's S3 server, which enforces If-None-Match / If-Match like S3.
     name: leases on an S3 API (moto)
+    timeout-minutes: 25
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: test
@@ -296,8 +312,9 @@ jobs:
 
   ltx:
     name: LTX conformance (Go reference)
+    timeout-minutes: 15
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -324,8 +341,9 @@ jobs:
 
   languages:
     name: every language passes the same tests
+    timeout-minutes: 40
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-24.04
     env:
       WASMKEEP_REQUIRE_LANGS: "1"
@@ -457,6 +475,8 @@ jobs:
 
   docs:
     name: docs site
+    if: ${{ github.event.pull_request.draft != true }}
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -474,8 +494,9 @@ jobs:
     # One job for every Rust example, each its own Cargo workspace. An
     # example that fails does not stop the others; the job fails at the end.
     name: examples
+    timeout-minutes: 25
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
