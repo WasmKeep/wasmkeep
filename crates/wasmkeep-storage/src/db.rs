@@ -698,8 +698,29 @@ impl ActorDb {
     /// refused with `not-allowed` before it runs, since nothing in a
     /// transaction is durable before its commit.
     pub fn exec_durable(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
+        self.commit_point(sql, params, true)
+    }
+
+    /// [`exec_durable`](Self::exec_durable) without the local fsync, for a
+    /// caller that makes the commit durable itself before it acknowledges
+    /// it: a cluster node, whose replica uploads the commit to the bucket
+    /// and trusts a local file again only after checking it against the
+    /// bucket's head. The rules about transactions are the same; the commit
+    /// is written as any `exec` writes it (`synchronous = NORMAL`).
+    pub fn exec_commit(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
+        self.commit_point(sql, params, false)
+    }
+
+    /// One statement that must leave no transaction open: alone, or the
+    /// `COMMIT` of the open one. With `sync`, fsynced before returning.
+    fn commit_point(
+        &mut self,
+        sql: &str,
+        params: &[SqlValue],
+        sync: bool,
+    ) -> Result<u64, SqlError> {
         if self.in_transaction() {
-            return self.commit_durable(sql, params);
+            return self.commit_durable(sql, params, sync);
         }
         // Refused before anything runs: a statement that opens or controls
         // a transaction makes nothing durable, and `synchronous` could not
@@ -717,6 +738,11 @@ impl ActorDb {
                  and the transaction's statements with exec, then exec-durable(\"COMMIT\")",
             ));
         }
+        if !sync {
+            return self.exec(sql, params);
+        }
+        #[cfg(feature = "fault-injection")]
+        crate::faults::note_local_sync();
         self.internal_pragma("synchronous", "FULL")?;
         self.sync_full = true;
         let result = self.exec(sql, params);
@@ -731,10 +757,15 @@ impl ActorDb {
 
     /// `exec-durable` with a transaction open. SQLite refuses to change
     /// `synchronous` inside a transaction, so the statement runs as is and,
-    /// once it has committed, the WAL is fsynced (what `synchronous = FULL`
-    /// does at commit). No checkpoint: while capturing, the WAL must keep
+    /// once it has committed, with `sync` the WAL is fsynced (what
+    /// `synchronous = FULL` does at commit). No checkpoint: while capturing, the WAL must keep
     /// its frames until [`take_changes`](Self::take_changes).
-    fn commit_durable(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
+    fn commit_durable(
+        &mut self,
+        sql: &str,
+        params: &[SqlValue],
+        sync: bool,
+    ) -> Result<u64, SqlError> {
         let refused = || {
             SqlError::new(
                 crate::SqlErrorKind::NotAllowed,
@@ -757,7 +788,11 @@ impl ActorDb {
         let Some((changed, true)) = ended else {
             return Err(refused());
         };
-        self.sync_wal()?;
+        if sync {
+            #[cfg(feature = "fault-injection")]
+            crate::faults::note_local_sync();
+            self.sync_wal()?;
+        }
         Ok(u64::try_from(changed).unwrap_or(u64::MAX))
     }
 

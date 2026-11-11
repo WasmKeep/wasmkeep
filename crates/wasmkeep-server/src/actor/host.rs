@@ -90,7 +90,10 @@ impl ActorHost {
                 .await?;
             return Ok(r.map_err(from_db_error));
         };
-        // In a cluster, durable means uploaded while the lease was valid.
+        // In a cluster, durable means uploaded while the lease was valid:
+        // the commit is not fsynced locally as well. A node trusts a local
+        // file again only if it is exactly the bucket's head
+        // (`Replica::restore`), so nothing rests on what the disk kept.
         let mut replica = slot.lock().await;
         if let Some(reason) = replica.failed() {
             // The local database may be ahead of the bucket: run nothing
@@ -106,7 +109,7 @@ impl ActorHost {
                 // anything else before it runs): nothing in a transaction is
                 // durable before then. Either way no transaction is open
                 // past this point, so what follows uploads committed state.
-                let changed = db.exec_durable(&sql, &params).map_err(from_db_error)?;
+                let changed = db.exec_commit(&sql, &params).map_err(from_db_error)?;
                 debug_assert!(!db.in_transaction());
                 let alarm = db.alarm().map_err(from_db_error)?;
                 let indexed = db

@@ -21,6 +21,12 @@ The text under a version's heading is its GitHub release text
   disk removed, and includes a run that must lose writes
   ([WasmKeep and celld](docs/compared-with-celld.md),
   [benchmarks](docs/benchmarks.md#three-nodes-wasmkeep-against-celld)).
+- **Durable writes on a cluster node** are no longer fsynced locally as
+  well as uploaded: `exec-durable` answers once the bucket holds the
+  write, as documented, and a node trusts a local file again only after
+  checking it against the bucket. The bucket is the only durable copy of
+  such a write ([running a cluster](docs/cluster.md#how-it-works)). A
+  node without a bucket still fsyncs.
 - **Releases**: a tag's release waits for CI to pass on the tagged
   commit, and a version's image tag is written once.
 

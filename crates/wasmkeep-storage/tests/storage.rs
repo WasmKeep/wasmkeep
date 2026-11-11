@@ -795,3 +795,40 @@ fn a_busy_open_is_tried_again_then_given_up() {
     assert!(err.contains("database is locked"), "{err}");
     assert!(err.contains("(SQLite code 5)"), "{err}");
 }
+
+/// `exec_commit` is `exec_durable` for a caller that makes the commit
+/// durable itself: the same rules about transactions, and no fsync of its
+/// own. With the WAL unreadable to a new handle, the fsync `exec_durable`
+/// does after a transaction's `COMMIT` fails; `exec_commit` does not try.
+#[cfg(unix)]
+#[test]
+fn a_commit_without_a_local_sync_keeps_the_rules_and_skips_the_fsync() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = storage(&dir).open("t", "c", "a").unwrap();
+        db.exec("CREATE TABLE t (x)", &[]).unwrap();
+        for sql in ["BEGIN", "SAVEPOINT s", "RELEASE s", "ROLLBACK", "COMMIT"] {
+            let err = db.exec_commit(sql, &[]).unwrap_err();
+            assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{sql}: {err:?}");
+            assert!(!db.in_transaction(), "{sql} opened a transaction");
+        }
+        assert_eq!(db.exec_commit("INSERT INTO t VALUES (1)", &[]).unwrap(), 1);
+        // Inside a transaction only its COMMIT runs.
+        db.exec("BEGIN", &[]).unwrap();
+        db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+        let err = db.exec_commit("INSERT INTO t VALUES (3)", &[]).unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{err:?}");
+        let mut wal = db.path().as_os_str().to_owned();
+        wal.push("-wal");
+        let perms = |mode| std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(mode));
+        perms(0o000).unwrap();
+        let r = db.exec_commit("COMMIT", &[]);
+        perms(0o644).unwrap();
+        r.unwrap();
+        assert!(!db.in_transaction());
+        assert!(!db.end_event().unwrap(), "nothing left to roll back");
+    }
+    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    assert_eq!(db.query("SELECT x FROM t", &[]).unwrap().values.len(), 2);
+}
