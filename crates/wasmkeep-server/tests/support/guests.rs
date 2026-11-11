@@ -40,9 +40,18 @@ pub(crate) fn compile(runtime: &Runtime, wasm: &[u8]) -> Component {
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"),
         PathBuf::from,
     );
-    let dir = tmp.join("components");
-    ComponentCache::new(runtime.clone(), dir)
-        .unwrap()
-        .get_or_compile(wasm)
-        .unwrap()
+    let cache = ComponentCache::new(runtime.clone(), tmp.join("components")).unwrap();
+    // On a miss, one compile per component across test processes: the
+    // others wait here, then load what the first one wrote. Without it,
+    // every test of a freshly built guest compiled it at once (eighteen
+    // compiles of seven components, each test taking the whole time).
+    let path = cache.path_for(wasm);
+    let _lock = if path.exists() {
+        None
+    } else {
+        let lock = std::fs::File::create(path.with_extension("lock")).unwrap();
+        lock.lock().unwrap();
+        Some(lock)
+    };
+    cache.get_or_compile(wasm).unwrap()
 }
