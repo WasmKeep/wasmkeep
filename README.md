@@ -154,26 +154,24 @@ use the image or build from source (below).
 
 ## Quickstart
 
-A node serves components. Starting with the release after 0.1.0, a
-release carries the [counter example](examples/counter) already built,
-`counter.wasm`, signed like its other files: the first minute needs no
-toolchain. 0.1.0 has no `counter.wasm`: with it, build the counter
-yourself (below).
-
-```bash
-# $v as in Install, and later than 0.1.0
-curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/counter.wasm"
-wasmkeep serve --actor counter=counter.wasm
-```
-
-Or build it yourself, with any version. You need
-[rustup](https://rustup.rs); the pinned toolchain and the `wasm32-wasip2`
-target install automatically.
+A node serves components: build the counter example, then serve it. You
+need [rustup](https://rustup.rs); the pinned toolchain and the
+`wasm32-wasip2` target install automatically.
 
 ```bash
 git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep
 (cd examples/counter && cargo build --release --target wasm32-wasip2)
 wasmkeep serve --actor counter=examples/counter/target/wasm32-wasip2/release/counter.wasm
+```
+
+Starting with the release after 0.1.0, a release also carries that
+counter already built, `counter.wasm`, signed like its other files, so the
+first minute needs no toolchain (0.1.0 has no `counter.wasm`):
+
+```bash
+# $v as in Install, and later than 0.1.0
+curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/counter.wasm"
+wasmkeep serve --actor counter=counter.wasm
 ```
 
 Without the release binary, build the server from the same clone:

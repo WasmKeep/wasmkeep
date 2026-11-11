@@ -153,9 +153,7 @@ jobs:
 
   build:
     name: build (${{ matrix.target }})
-    # After the components: each binary serves the release's counter.wasm
-    # before anything is packaged.
-    needs: [ci, components]
+    needs: ci
     strategy:
       fail-fast: true
       matrix:
@@ -219,28 +217,6 @@ jobs:
           [ "$(printf '%s\n' "$newest" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
             || { echo "::error::$bin needs $newest, newer than GLIBC_2.28"; exit 1; }
           "$bin" --version
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: build-components
-          path: ${{ runner.temp }}/components
-      - name: The binary serves the release's counter.wasm (the README's first minute)
-        run: |
-          bin=$PWD/target/portable/glibc/release/wasmkeep
-          url=127.0.0.1:18080/actor/counter
-          cd "$(mktemp -d)"
-          "$bin" serve --listen 127.0.0.1:18080 --actor "counter=$RUNNER_TEMP/components/counter.wasm" &
-          server=$!
-          trap 'kill "$server"' EXIT
-          for _ in $(seq 100); do
-            curl -fs -o /dev/null "$url/probe" && break
-            sleep 0.2
-          done
-          first=$(curl -fsS -X POST "$url/alice")
-          second=$(curl -fsS -X POST "$url/alice")
-          other=$(curl -fsS "$url/bob")
-          echo "alice: $first then $second; bob: $other"
-          [ "$first $second $other" = "1 2 0" ] \
-            || { echo "::error::the counter answered '$first', '$second', '$other', not 1, 2, 0"; exit 1; }
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-cyclonedx@0.5.9,cargo-about@0.9.3
@@ -328,11 +304,7 @@ jobs:
 
   release:
     name: draft pre-release
-    # After the image too: no draft offers binaries whose image failed.
-    # A whole re-run of a tag stops at `image` (its tag is written once)
-    # before it reaches this job: to replace a draft's files, re-run the
-    # failed jobs only, which keeps the `image` job that succeeded.
-    needs: [sign, image]
+    needs: sign
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

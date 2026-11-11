@@ -40,7 +40,7 @@ The text under a version's heading is its GitHub release text
   [key-value, queue](docs/kv-and-queues.md) and
   [workflow](docs/workflows.md#the-workflow-class) classes in other
   languages need no Rust toolchain. The tarball has a short README of
-  its own, and a draft release waits for the image.
+  its own.
 - **Releases**: a tag's release waits for CI to pass on the tagged
   commit, and a version's image tag is written once.
 
