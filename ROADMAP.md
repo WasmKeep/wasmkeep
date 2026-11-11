@@ -1,60 +1,67 @@
 # Roadmap
 
 What is being worked on, what comes after, and what is already built.
-Dates are not promised; the order is. For what each release contained, see
-the [changelog](CHANGELOG.md); for the numbers behind every claim here,
-[benchmarks](docs/benchmarks.md).
+Dates are not promised; the order is, and features come before speed.
+For what each release contained, see the [changelog](CHANGELOG.md); for
+the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its first release, `0.1.0`, is a pre-release for
 trying it, side projects and staging.
 
 ## Now
 
-What the next release is waiting for.
+The next release, `0.2.0`: **a team can install WasmKeep and run a real
+app on it.** Three pieces of work, in this order.
 
-- **The comparison with celld on a cloud bucket**, with a node per machine.
-  One machine and a local bucket are measured
-  ([WasmKeep and celld](docs/compared-with-celld.md)); what they cannot
-  show is the cost of a real bucket and of a disk per node.
-- **The durable write on a cluster node.** With its data on disk a durable
-  write takes about 1.7 ms longer than a plain one
-  ([measured](docs/benchmarks.md#three-nodes-wasmkeep-against-celld)).
-  To do: time its stages, remove the local sync the bucket's guarantee
-  does not need, and bound a snapshot upload and a whole restore as
-  segment uploads and restore reads already are.
-- **A soak on the current code.** The twelve-hour soak on node leases lost
-  nothing, but one actor was writable again only 90 s after a kill and
-  durable writes were slower in the tail
-  ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)). The
-  fixes made since have not had a soak of their own.
-- **Tests that depend on timing.** A few cluster tests still fail now and
-  then on shared CI runners; they get a test cluster that waits on events
-  instead of the clock.
+1. **Installable.** Today the SDKs are used from a clone of this
+   repository. For `0.2.0`: the Rust, TypeScript, Python and Go SDKs from
+   their registries (crates.io, npm, PyPI, a Go module tag), the C and Zig
+   SDKs as archives in the release, prebuilt example components, and a
+   getting-started path that needs no clone. Releases publish the SDKs.
+2. **Our own app on it.** Watch, the uptime monitor in
+   [`examples/watch`](examples/watch), running on a three-node cluster on a
+   released build, behind HTTPS, with dashboards, alerts and a nightly copy
+   of the bucket. What that shows is missing goes on this page.
+3. **Reliable enough to leave running.** A snapshot upload gets a timeout
+   and stops failing silently; a restore gets one deadline for the whole of
+   it (one took 56 s in the soak,
+   [measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)); a
+   forwarded request is sent again when its connection had just closed;
+   the tests that depend on timing wait on events instead; and the release
+   candidate passes a twelve-hour soak. Done so far: a durable write on a
+   cluster node no longer syncs to the local disk as well as the bucket.
 
 ## Next
 
-Planned, in this order.
+`0.3.0`: **operable by someone who did not write it.**
 
-1. **Performance targets on dedicated hardware**, with a stated scale
-   envelope: how many actors, writes and nodes the numbers hold for.
-2. **A run against AWS S3.** Cloudflare R2 and OVHcloud Object Storage are
-   measured; AWS S3 is not.
-3. **Mixed versions during an upgrade.** Today every node is upgraded
+1. **Mixed versions during an upgrade.** Today every node is upgraded
    together ([how](docs/cluster.md#upgrading-wasmkeep)).
-4. **The remaining operator commands**: inspect or export one actor,
+2. **The remaining operator commands**: inspect or export one actor,
    verify a bucket.
-5. **Traces.**
-6. **Languages**: an SDK for standard Go; outbound HTTP and the key-value,
-   queue and workflow clients for D and MoonBit; benchmark rows for the
-   experimental languages ([tiers](docs/languages.md)). Java, Kotlin and
-   PHP cannot produce an actor yet, and languages that need Wasm garbage
-   collection wait on a decision of their own.
-7. **Several tenants per process**, with limits per tenant, when a
-   multi-team user asks.
+3. **Traces.**
+4. Whatever running our own app shows is missing.
 
-Ideas, each needing a design first: encrypting actor state in the bucket,
-exporting many actors' data for analytics, composing components at deploy
-time.
+## After that
+
+Not before the two releases above.
+
+- **Faster, and compared.** Performance targets on dedicated hardware
+  with a stated scale envelope; a plain write that does not hold its
+  actor during the upload; the comparison with celld on a cloud bucket
+  with a node per machine
+  ([one machine is measured](docs/compared-with-celld.md)); a run against
+  AWS S3.
+- **Languages**: an SDK for standard Go; outbound HTTP and the key-value,
+  queue and workflow clients for D and MoonBit
+  ([tiers](docs/languages.md)). Java, Kotlin and PHP cannot produce an
+  actor yet, and languages that need Wasm garbage collection wait on a
+  decision of their own.
+- **Several tenants per process**, with limits per tenant, when a
+  multi-team user asks.
+- Ideas, each needing a design first: encrypting actor state in the
+  bucket, exporting many actors' data for analytics, composing components
+  at deploy time.
 
 ## Later, on demand
 
@@ -120,8 +127,7 @@ Several nodes on one S3-compatible bucket
 ### M3: First public release
 
 Languages, documentation, hardening, and `0.1.0`
-([changelog](CHANGELOG.md)). What is left of it is under [Now](#now) and
-the first two items of [Next](#next).
+([changelog](CHANGELOG.md)). What is left of it is under [Now](#now).
 
 - Languages ([tiers and numbers](docs/languages.md)). Recommended: Rust.
   Supported: Zig, C/C++, TypeScript (QuickJS by default,
