@@ -3,10 +3,10 @@
 # three nodes each on one bucket, steady state then a takeover per node
 # (cluster3/ rows); the takeovers again with the killed node's disk removed
 # (cluster3-wipe/ rows); and a control that must lose writes, which shows
-# the lost-write check finds them (cluster3-control/ rows). Writes
-# bench/results/<date>-<commit>-cluster-<label>.csv in bench/run.sh's
-# columns, only if every run finished and the control lost writes. Numbers
-# in docs must come from these files.
+# the lost-write check finds them (cluster3-control/ rows, on an http://
+# endpoint only). Writes bench/results/<date>-<commit>-cluster-<label>.csv
+# in bench/run.sh's columns, only if every run finished and the control,
+# if it ran, lost writes. Numbers in docs must come from these files.
 #
 # Needs WASMKEEP_COMPARE_BUCKET=s3://BUCKET[/PREFIX] and AWS_* for it, a
 # label for the store (CLUSTER_LABEL=minio-tmpfs, CLUSTER_LABEL=r2), and
@@ -56,8 +56,14 @@ rows() {
 target/release/compare --cluster "$@" $durable wasmkeep-rust | rows
 # shellcheck disable=SC2086
 target/release/compare --cluster --wipe "$@" $durable | rows
-# Fails, and so writes no file, if the control loses nothing.
-target/release/compare --cluster --control "$@" wasmkeep-rust | rows
+# The control reaches the bucket through a plain-TCP relay, so it runs only
+# on an http:// endpoint (a local store); elsewhere the file has no
+# cluster3-control/ rows. If it runs and loses nothing, it fails, and no
+# file is written.
+case "${AWS_ENDPOINT:-}" in
+  http://*) target/release/compare --cluster --control "$@" wasmkeep-rust | rows ;;
+  *) echo "no control: AWS_ENDPOINT is not http://, see bench/compare/src/cluster.rs" >&2 ;;
+esac
 mv "$partial" "$out"
 trap - EXIT
 echo "wrote $out"

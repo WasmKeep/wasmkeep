@@ -40,10 +40,8 @@
 //! its upload, on nodes that reach the bucket through a relay of the
 //! harness. Half a second before the kill the relay cuts the node off, so
 //! each of its actors acknowledges one write the bucket never gets; the
-//! node is then killed and wiped. Without the cut the loss is rare: a small
-//! upload has usually left the node by the time its answer reaches the
-//! client. The relay forwards plain TCP, so the control needs an `http://`
-//! endpoint in `AWS_ENDPOINT`.
+//! node is then killed and wiped. The relay forwards plain TCP, so the
+//! control needs an `http://` endpoint in `AWS_ENDPOINT`.
 //!
 //! Settings that differ from each runtime's defaults: WasmKeep nodes run
 //! with `--max-instances 2000`, `--max-connections 512` and
@@ -482,6 +480,22 @@ impl Clients {
         }
     }
 
+    /// The value a request was answered with, or `None` and one more in
+    /// `failed` (an error, or a status other than 200).
+    fn answered(&mut self, method: &str, path: &str, failed: &mut u64) -> Option<i64> {
+        match self.send(method, path) {
+            Ok((200, body)) => body.trim().parse().ok(),
+            other => {
+                // The first few, for the run's log.
+                if *failed < 3 {
+                    eprintln!("{method} {path}: {other:?}");
+                }
+                *failed += 1;
+                None
+            }
+        }
+    }
+
     /// [`Clients::send`] that must succeed with a 200 and a value.
     fn value(&mut self, method: &str, path: &str) -> i64 {
         match self.send(method, path) {
@@ -546,6 +560,23 @@ fn longest_wait(acks: &[Duration], killed_at: Duration) -> Option<(Duration, Dur
         previous = at;
     }
     longest
+}
+
+/// How a victim came through a kill: `None` if it was not being
+/// acknowledged at the end (not writable again), `Some(None)` if it never
+/// waited longer than [`AFFECTED`] (on a surviving node), `Some(Some(t))` if
+/// its longest wait ended `t` after the kill (its takeover).
+fn recovery(
+    acks: &[Duration],
+    killed_at: Duration,
+    stopped_at: Duration,
+) -> Option<Option<Duration>> {
+    let last = *acks.last()?;
+    if stopped_at.saturating_sub(last) >= AFFECTED {
+        return None;
+    }
+    let (wait, end) = longest_wait(acks, killed_at)?;
+    Some((wait > AFFECTED).then(|| end - killed_at))
 }
 
 fn percentile_of(mut samples: Vec<Duration>, p: f64) -> Duration {
@@ -687,16 +718,19 @@ fn steady_state(
     secs: u64,
 ) -> u64 {
     let path = cluster.path;
+    // Requests not answered 200 with a value: counted, and left out of the
+    // latencies and the throughput.
+    let mut failed = 0u64;
     // Latency to one resident actor through a random node.
     for (name, method) in [("warm_post", "POST"), ("warm_get", "GET")] {
         for _ in 0..100 {
             clients.value(method, &path("warm"));
         }
         let samples = (0..iters)
-            .map(|_| {
+            .filter_map(|_| {
                 let t = Instant::now();
-                clients.value(method, &path("warm"));
-                t.elapsed()
+                let answered = clients.answered(method, &path("warm"), &mut failed);
+                answered.map(|_| t.elapsed())
             })
             .collect::<Vec<_>>();
         for (suffix, p) in [("p50", 0.5), ("p99", 0.99)] {
@@ -708,10 +742,10 @@ fn steady_state(
     // First request to new actors; memory across the three nodes.
     let (rss_before, _) = cluster.stats();
     let samples = (0..actors)
-        .map(|i| {
+        .filter_map(|i| {
             let t = Instant::now();
-            clients.value("POST", &path(&format!("new-{i}")));
-            t.elapsed()
+            let answered = clients.answered("POST", &path(&format!("new-{i}")), &mut failed);
+            answered.map(|_| t.elapsed())
         })
         .collect::<Vec<_>>();
     rows.row("create_p50", percentile_of(samples, 0.5).as_nanos(), "ns");
@@ -735,20 +769,28 @@ fn steady_state(
                 let mut clients = Clients::new(addrs, 100 + t);
                 let mine: Vec<usize> = (t as usize..actors).step_by(8).collect();
                 let mut seen: Vec<Vec<i64>> = vec![Vec::new(); mine.len()];
-                let mut n = 0u64;
+                let (mut n, mut turn, mut failed) = (0u64, 0usize, 0u64);
                 while Instant::now() < deadline {
-                    let j = n as usize % mine.len();
-                    seen[j].push(clients.value("POST", &path(&format!("new-{}", mine[j]))));
-                    n += 1;
+                    let j = turn % mine.len();
+                    turn += 1;
+                    let name = path(&format!("new-{}", mine[j]));
+                    if let Some(value) = clients.answered("POST", &name, &mut failed) {
+                        seen[j].push(value);
+                        n += 1;
+                    }
                 }
-                (n, seen.iter().map(|s| reissued(s)).sum::<u64>())
+                (n, seen.iter().map(|s| reissued(s)).sum::<u64>(), failed)
             })
         })
         .collect();
-    let (requests, handed_twice) = handles
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .fold((0, 0), |(a, b), (n, r)| (a + n, b + r));
+    let (requests, handed_twice) =
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .fold((0, 0), |(a, b), (n, r, f)| {
+                failed += f;
+                (a + n, b + r)
+            });
     let elapsed = started.elapsed();
     let (_, cpu_after) = cluster.stats();
     rows.row(
@@ -761,6 +803,7 @@ fn steady_state(
         (cpu_after - cpu_before).as_nanos() / u128::from(requests.max(1)),
         "ns",
     );
+    rows.row("steady_failed_requests", u128::from(failed), "requests");
     handed_twice
 }
 
@@ -804,6 +847,15 @@ impl Tally {
         self.duplicated = self.duplicated.max(duplicated);
         self.unacknowledged = self.unacknowledged.max(unacknowledged);
     }
+}
+
+/// Removes a killed node's directory. It must hold the node's files, or the
+/// run would report a wipe that removed nothing.
+fn wipe(dir: &Path) {
+    let files = std::fs::read_dir(dir).map_or(0, Iterator::count);
+    assert!(files > 0, "{}: nothing to wipe", dir.display());
+    std::fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    assert!(!dir.exists(), "{}: still there", dir.display());
 }
 
 struct Takeover {
@@ -864,7 +916,7 @@ fn takeover(cluster: &mut Cluster, node: usize, names: &[String], fault: Fault) 
     }
     let killed_at = cluster.nodes[node].kill() - base;
     if fault != Fault::Kill {
-        let _ = std::fs::remove_dir_all(&cluster.nodes[node].dir);
+        wipe(&cluster.nodes[node].dir);
     }
     if let Some(relay) = cluster.relays.get(node) {
         relay.restore();
@@ -884,6 +936,7 @@ fn takeover(cluster: &mut Cluster, node: usize, names: &[String], fault: Fault) 
         }
     }
     std::thread::sleep(Duration::from_secs(2));
+    let stopped_at = base.elapsed();
     stop.store(true, Ordering::Relaxed);
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
@@ -901,9 +954,9 @@ fn takeover(cluster: &mut Cluster, node: usize, names: &[String], fault: Fault) 
     for (name, (acked, failures)) in names.iter().zip(results) {
         out.failures += failures;
         let times: Vec<Duration> = acked.iter().map(|(at, _)| *at).collect();
-        match longest_wait(&times, killed_at) {
-            Some((wait, end)) if wait > AFFECTED => out.waits.push(end - killed_at),
-            Some(_) => {}
+        match recovery(&times, killed_at, stopped_at) {
+            Some(Some(wait)) => out.waits.push(wait),
+            Some(None) => {}
             None => out.not_writable += 1,
         }
         out.written.push(Written {
@@ -962,6 +1015,23 @@ mod tests {
             Some((ms(20), ms(1030)))
         );
         assert_eq!(longest_wait(&[ms(900)], ms(1000)), None);
+    }
+
+    #[test]
+    fn a_victim_no_longer_acknowledged_at_the_end_is_not_writable() {
+        let ms = Duration::from_millis;
+        let acks = [ms(900), ms(1001), ms(16_000), ms(16_020)];
+        assert_eq!(
+            recovery(&acks, ms(1000), ms(16_040)),
+            Some(Some(ms(15_000)))
+        );
+        assert_eq!(
+            recovery(&[ms(990), ms(1010), ms(1030)], ms(1000), ms(1040)),
+            Some(None)
+        );
+        // One answer already on its way, then nothing until the stop.
+        assert_eq!(recovery(&[ms(900), ms(1001)], ms(1000), ms(60_000)), None);
+        assert_eq!(recovery(&[], ms(1000), ms(60_000)), None);
     }
 
     #[test]
