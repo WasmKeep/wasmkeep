@@ -69,7 +69,11 @@ PUBLIC_DOC_ROUTES = {"/metrics"}
 # complete candidates rather than exempting a whole line, directory, or /var.
 REVIEWED_PATHS = {
     "bench/compare/src/main.rs": {"/actor/counter/{name}", "/counter/{name}", "/work"},
-    "bench/compare/src/cluster.rs": {"/actor/counter/{name}", "/counter/{name}"},
+    "bench/compare/src/cluster.rs": {
+        "/actor/counter/{name}", "/counter/{name}",
+        "/actor/ledger/{name}", "/ledger/{name}",
+    },
+    "bench/celld/cluster.js": {"/ledger/", "/ledger/{name}"},
     "bench/workerd/config.capnp": {"/workerd/workerd.capnp"},
     "bench/workerd/counter.js": {"/counter/", "/counter/{name}"},
     "docs/benchmarks.md": {"/work"},

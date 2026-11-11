@@ -17,19 +17,43 @@
 //! two in three are forwarded to the actor's owner.
 //!
 //! After the steady-state rows (as in a one-node run), each node in turn is
-//! killed with SIGKILL while one client per victim actor writes to it every
-//! 20 ms, retrying every 100 ms through a random node until a write is
-//! acknowledged. A victim whose first acknowledgement after the kill takes
-//! longer than [`AFFECTED`] was on the dead node: its wait is its
-//! takeover. Each client writes to its actors alone, so the values it is
-//! handed must only grow; a value at or below one already acknowledged
-//! means an acknowledged write was lost, and so does a final value below the
-//! last one acknowledged. The killed node is then restarted on its data.
+//! killed with SIGKILL while one client per victim writes to it every 20 ms,
+//! retrying every 100 ms through a random node until a write is
+//! acknowledged. A victim whose longest wait between acknowledgements after
+//! the kill exceeds [`AFFECTED`] was on the dead node: the end of that wait
+//! is its takeover. The killed node is then restarted on its data.
 //!
-//! Rows are `cluster3/<target>/<bench>`.
+//! Victims are ledgers, not counters (`bench/ledger`, and the `Ledger`
+//! class of `bench/celld/cluster.js`): every attempt writes a token of its
+//! own, never sent twice. A counter's increments are interchangeable, so a
+//! write that applied without an acknowledgement would hide an acknowledged
+//! one that was lost. After each restart, and once more after the last one,
+//! every victim's tokens are read back: an acknowledged token that is
+//! missing is a lost write ([`audit`]), and a token present twice was
+//! applied twice. The counter serves the steady-state rows unchanged.
+//!
+//! SIGKILL leaves the dead node's files, page cache included. With
+//! [`Fault::Wipe`] the node's directory is removed before it restarts, so
+//! what it alone held is gone (`cluster3-wipe/...`, takeover rows only).
+//! [`Fault::Control`] is the run that must lose writes, to show the check
+//! finds them (`cluster3-control/...`): plain `exec`, which answers before
+//! its upload, on nodes that reach the bucket through a relay of the
+//! harness. Half a second before the kill the relay cuts the node off, so
+//! each of its actors acknowledges one write the bucket never gets; the
+//! node is then killed and wiped. The relay forwards plain TCP, so the
+//! control needs an `http://` endpoint in `AWS_ENDPOINT`.
+//!
+//! Settings that differ from each runtime's defaults: WasmKeep nodes run
+//! with `--max-instances 2000`, `--max-connections 512` and
+//! `--idle-timeout-secs 3600` (no actor hibernates during the run); celld
+//! nodes with transparent huge pages off, as WasmKeep turns them off for
+//! itself.
+//!
+//! Rows are `<prefix>/<target>/<bench>`.
 
 use super::*;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -53,8 +77,32 @@ pub(crate) fn minimum_descriptors(workload: Workload) -> usize {
         .next_power_of_two()
 }
 
+/// What happens to a node in a takeover.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// SIGKILL: the node restarts on its files.
+    Kill,
+    /// SIGKILL, then its directory is removed: it restarts empty.
+    Wipe,
+    /// [`Fault::Wipe`] of a node cut off from the bucket just before: with
+    /// plain `exec` this must lose acknowledged writes.
+    Control,
+}
+
+impl Fault {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Kill => "cluster3",
+            Self::Wipe => "cluster3-wipe",
+            Self::Control => "cluster3-control",
+        }
+    }
+}
+
 struct Node {
     addr: SocketAddr,
+    /// Everything the node keeps on disk.
+    dir: PathBuf,
     start: Box<dyn Fn() -> Child>,
     child: Option<Child>,
 }
@@ -64,17 +112,25 @@ impl Node {
         self.child.as_ref().map(Child::id)
     }
 
-    fn kill(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    /// Kills the node; returns when the signal was sent.
+    fn kill(&mut self) -> Instant {
+        let Some(mut child) = self.child.take() else {
+            return Instant::now();
+        };
+        let _ = child.kill();
+        let killed = Instant::now();
+        let _ = child.wait();
+        killed
     }
 }
 
 struct Cluster {
     nodes: Vec<Node>,
     path: fn(&str) -> String,
+    /// A ledger's path, by name.
+    ledger: fn(&str) -> String,
+    /// Each node's way to the bucket, in a control run.
+    relays: Vec<Relay>,
     _dir: TempDir,
 }
 
@@ -101,9 +157,11 @@ impl Cluster {
     }
 }
 
-/// A scratch directory on the repository's disk (not tmpfs), removed on drop.
+/// A scratch directory, removed on drop: on the repository's disk (not
+/// tmpfs), or under `CLUSTER_DATA_DIR` to choose what the nodes write to.
 fn disk_dir(label: &str) -> TempDir {
-    let dir = Path::new("target/compare-cluster").join(format!("{label}-{}", std::process::id()));
+    let root = env_path("CLUSTER_DATA_DIR", "target/compare-cluster");
+    let dir = root.join(format!("{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("cluster dir");
     TempDir(std::fs::canonicalize(&dir).expect("cluster dir"))
@@ -119,21 +177,135 @@ fn node_log(label: &str, node: usize) -> Stdio {
         .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
-fn wasmkeep_cluster(label: &'static str, wasm: &Path, bucket: &str) -> Cluster {
+/// A TCP relay to the bucket's endpoint that can cut its node off: open
+/// connections are dropped with what they had not yet forwarded, and new
+/// ones are closed at once, until [`Relay::restore`].
+struct Relay {
+    addr: SocketAddr,
+    cut: Arc<AtomicBool>,
+    /// Raised by each cut: a connection opened before it is dead.
+    generation: Arc<AtomicU64>,
+}
+
+impl Relay {
+    fn to(upstream: SocketAddr) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("relay");
+        let addr = listener.local_addr().expect("relay");
+        let cut = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (is_cut, current) = (cut.clone(), generation.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                if is_cut.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                let born = current.load(Ordering::SeqCst);
+                for (from, to) in [(&client, &server), (&server, &client)] {
+                    let (Ok(mut from), Ok(mut to)) = (from.try_clone(), to.try_clone()) else {
+                        continue;
+                    };
+                    let current = current.clone();
+                    let _ = from.set_read_timeout(Some(Duration::from_millis(20)));
+                    std::thread::spawn(move || {
+                        let mut buf = [0; 16384];
+                        loop {
+                            let read = from.read(&mut buf);
+                            if current.load(Ordering::SeqCst) != born {
+                                break;
+                            }
+                            match read {
+                                Ok(0) => break,
+                                Ok(n) if to.write_all(&buf[..n]).is_ok() => {}
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) => {}
+                                _ => break,
+                            }
+                        }
+                        let _ = from.shutdown(std::net::Shutdown::Both);
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Self {
+            addr,
+            cut,
+            generation,
+        }
+    }
+
+    fn cut(&self) {
+        self.cut.store(true, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn restore(&self) {
+        self.cut.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The address behind an `http://host:port` endpoint.
+fn http_endpoint(endpoint: &str) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let authority = endpoint.strip_prefix("http://")?.split('/').next()?;
+    let authority = if authority.contains(':') {
+        authority.to_owned()
+    } else {
+        format!("{authority}:80")
+    };
+    authority.to_socket_addrs().ok()?.next()
+}
+
+fn wasmkeep_cluster(label: &'static str, wasm: &Path, bucket: &str, relayed: bool) -> Cluster {
+    let relays: Vec<Relay> = if relayed {
+        let endpoint = std::env::var("AWS_ENDPOINT").unwrap_or_default();
+        let upstream = http_endpoint(&endpoint)
+            .unwrap_or_else(|| panic!("--control needs AWS_ENDPOINT=http://HOST:PORT"));
+        (0..NODES).map(|_| Relay::to(upstream)).collect()
+    } else {
+        Vec::new()
+    };
     let dir = disk_dir(label);
     let bin = std::fs::canonicalize(env_path("WASMKEEP_BIN", "target/release/wasmkeep"))
         .expect("WASMKEEP_BIN");
     let wasm = std::fs::canonicalize(wasm).expect("component");
+    // The ledger built as the counter was: with `durable` or without.
+    let ledger = if label == "rust-durable" {
+        "bench/ledger/target/durable/wasm32-wasip2/release/ledger.wasm"
+    } else {
+        "bench/ledger/target/wasm32-wasip2/release/ledger.wasm"
+    };
+    let ledger = std::fs::canonicalize(ledger)
+        .unwrap_or_else(|e| panic!("{ledger}: {e} (bench/cluster.sh builds it)"));
     let bucket = format!("{bucket}/{label}");
     let nodes = (0..NODES)
         .map(|i| {
             let addr = free_addr();
             let (bin, wasm, bucket) = (bin.clone(), wasm.clone(), bucket.clone());
+            let ledger = ledger.clone();
             let data = dir.0.join(format!("n{i}"));
+            let node_dir = data.clone();
+            let relay = relays.get(i).map(|r| format!("http://{}", r.addr));
             let start = move || {
-                Command::new(&bin)
+                let mut command = Command::new(&bin);
+                if let Some(relay) = &relay {
+                    command
+                        .env("AWS_ENDPOINT", relay)
+                        .env("AWS_ENDPOINT_URL", relay);
+                }
+                command
                     .args(["serve", "--actor"])
                     .arg(format!("counter={}", wasm.display()))
+                    .arg("--actor")
+                    .arg(format!("ledger={}", ledger.display()))
+                    .args(["--idle-timeout-secs", "3600"])
                     .arg("--data-dir")
                     .arg(data.join("data"))
                     .arg("--cache-dir")
@@ -158,6 +330,7 @@ fn wasmkeep_cluster(label: &'static str, wasm: &Path, bucket: &str) -> Cluster {
             };
             Node {
                 addr,
+                dir: node_dir,
                 start: Box::new(start),
                 child: None,
             }
@@ -166,18 +339,21 @@ fn wasmkeep_cluster(label: &'static str, wasm: &Path, bucket: &str) -> Cluster {
     Cluster {
         nodes,
         path: |name| format!("/actor/counter/{name}"),
+        ledger: |name| format!("/actor/ledger/{name}"),
+        relays,
         _dir: dir,
     }
 }
 
 fn celld_cluster(label: &'static str, durability: &'static str, bucket: &str) -> Cluster {
     let dir = disk_dir(label);
-    let (bin, with_bucket) = celld_deploy(&format!("{bucket}/{label}"), &dir.0);
+    let (bin, with_bucket) = celld_deploy(&format!("{bucket}/{label}"), &dir.0, true);
     let nodes = (0..NODES)
         .map(|i| {
             let (addr, internal) = (free_addr(), free_addr());
             let (bin, with_bucket) = (bin.clone(), with_bucket.clone());
             let state = dir.0.join(format!("n{i}"));
+            let node_dir = state.clone();
             let start = move || {
                 let mut command = Command::new(&bin);
                 with_bucket(&mut command);
@@ -196,6 +372,7 @@ fn celld_cluster(label: &'static str, durability: &'static str, bucket: &str) ->
             };
             Node {
                 addr,
+                dir: node_dir,
                 start: Box::new(start),
                 child: None,
             }
@@ -204,12 +381,24 @@ fn celld_cluster(label: &'static str, durability: &'static str, bucket: &str) ->
     Cluster {
         nodes,
         path: |name| format!("/counter/{name}"),
+        ledger: |name| format!("/ledger/{name}"),
+        relays: Vec::new(),
         _dir: dir,
     }
 }
 
-fn cluster_row(target: &str, bench: &str, value: u128, unit: &str) {
-    println!("cluster3/{target}/{bench},{value},{unit}");
+/// Prints the rows of one target under one prefix.
+#[derive(Clone, Copy)]
+struct Rows<'a> {
+    prefix: &'a str,
+    target: &'a str,
+}
+
+impl Rows<'_> {
+    fn row(self, bench: &str, value: u128, unit: &str) {
+        let Self { prefix, target } = self;
+        println!("{prefix}/{target}/{bench},{value},{unit}");
+    }
 }
 
 fn wait_ready(addr: SocketAddr, path: fn(&str) -> String, started: Instant) -> Duration {
@@ -277,19 +466,32 @@ impl Clients {
         }
     }
 
-    /// A `GET` of the value, retried through other nodes for up to
+    /// A `GET`'s body, retried through other nodes for up to
     /// [`TAKEOVER_LIMIT`] (a node may still be settling after a restart).
-    fn value_retrying(&mut self, path: &str) -> i64 {
+    /// `None` if no node answered 200 in that time.
+    fn body_retrying(&mut self, path: &str) -> Option<String> {
         let limit = Instant::now() + TAKEOVER_LIMIT;
         loop {
             match self.send("GET", path) {
-                Ok((200, body)) => {
-                    return body.trim().parse().unwrap_or_else(|_| {
-                        panic!("GET {path}: not a value: {body:?}");
-                    });
-                }
-                other if Instant::now() > limit => panic!("GET {path}: {other:?}"),
+                Ok((200, body)) => return Some(body),
+                _ if Instant::now() > limit => return None,
                 _ => std::thread::sleep(RETRY_EVERY),
+            }
+        }
+    }
+
+    /// The value a request was answered with, or `None` and one more in
+    /// `failed` (an error, or a status other than 200).
+    fn answered(&mut self, method: &str, path: &str, failed: &mut u64) -> Option<i64> {
+        match self.send(method, path) {
+            Ok((200, body)) => body.trim().parse().ok(),
+            other => {
+                // The first few, for the run's log.
+                if *failed < 3 {
+                    eprintln!("{method} {path}: {other:?}");
+                }
+                *failed += 1;
+                None
             }
         }
     }
@@ -320,25 +522,93 @@ fn reissued(values: &[i64]) -> u64 {
     count
 }
 
+/// What a ledger holds against what its one writer was told.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Audit {
+    /// Acknowledged tokens the ledger does not hold: lost writes.
+    lost: Vec<u64>,
+    /// Tokens held more than once, counted once per extra copy.
+    duplicated: u64,
+    /// Tokens held that were never acknowledged (the request failed or timed
+    /// out after the write applied): allowed.
+    unacknowledged: u64,
+}
+
+fn audit(acked: &[u64], present: &[u64]) -> Audit {
+    let held: HashSet<u64> = present.iter().copied().collect();
+    let told: HashSet<u64> = acked.iter().copied().collect();
+    let mut lost: Vec<u64> = told.difference(&held).copied().collect();
+    lost.sort_unstable();
+    Audit {
+        lost,
+        duplicated: (present.len() - held.len()) as u64,
+        unacknowledged: held.difference(&told).count() as u64,
+    }
+}
+
+/// From the kill, the longest wait between two acknowledgements in a row
+/// (the kill counting as one), and when it ended. `None` if nothing was
+/// acknowledged after the kill.
+fn longest_wait(acks: &[Duration], killed_at: Duration) -> Option<(Duration, Duration)> {
+    let mut previous = killed_at;
+    let mut longest = None;
+    for &at in acks.iter().filter(|&&at| at > killed_at) {
+        let wait = at - previous;
+        if longest.is_none_or(|(w, _)| wait > w) {
+            longest = Some((wait, at));
+        }
+        previous = at;
+    }
+    longest
+}
+
+/// How a victim came through a kill: `None` if it was not being
+/// acknowledged at the end (not writable again), `Some(None)` if it never
+/// waited longer than [`AFFECTED`] (on a surviving node), `Some(Some(t))` if
+/// its longest wait ended `t` after the kill (its takeover).
+fn recovery(
+    acks: &[Duration],
+    killed_at: Duration,
+    stopped_at: Duration,
+) -> Option<Option<Duration>> {
+    let last = *acks.last()?;
+    if stopped_at.saturating_sub(last) >= AFFECTED {
+        return None;
+    }
+    let (wait, end) = longest_wait(acks, killed_at)?;
+    Some((wait > AFFECTED).then(|| end - killed_at))
+}
+
 fn percentile_of(mut samples: Vec<Duration>, p: f64) -> Duration {
     samples.sort();
     percentile(&samples, p)
 }
 
-pub(crate) fn run(target: &str, workload: Workload, kills: usize, victims: usize) {
+/// Runs one target; returns the acknowledged writes found lost.
+pub(crate) fn run(
+    target: &str,
+    workload: Workload,
+    kills: usize,
+    victims: usize,
+    fault: Fault,
+) -> u64 {
     let bucket = BUCKET
         .get()
         .expect("--cluster needs WASMKEEP_COMPARE_BUCKET");
     let mut cluster = match target {
         "wasmkeep-rust-durable" | "wasmkeep-rust" => {
             let (label, wasm) = component(target).expect("component");
-            wasmkeep_cluster(label, Path::new(wasm), bucket)
+            wasmkeep_cluster(label, Path::new(wasm), bucket, fault == Fault::Control)
         }
         "celld-fleet" => celld_cluster("celld-fleet", "fleet", bucket),
         "celld-bucket" => celld_cluster("celld-bucket", "bucket", bucket),
         other => panic!("unknown cluster target {other}"),
     };
     let path = cluster.path;
+    let rows = Rows {
+        prefix: fault.prefix(),
+        target,
+    };
 
     // Start every node at once; the cluster is up when the last answers.
     let started = Instant::now();
@@ -351,7 +621,6 @@ pub(crate) fn run(target: &str, workload: Workload, kills: usize, victims: usize
         .map(|addr| wait_ready(addr, path, started))
         .max()
         .unwrap_or_default();
-    cluster_row(target, "startup_to_first_response", ready.as_nanos(), "ns");
 
     let Workload {
         iters,
@@ -359,53 +628,137 @@ pub(crate) fn run(target: &str, workload: Workload, kills: usize, victims: usize
         secs,
     } = workload;
     let mut clients = Clients::new(cluster.addrs(), 1);
+    let mut handed_twice = 0;
+    if fault == Fault::Kill {
+        rows.row("startup_to_first_response", ready.as_nanos(), "ns");
+        handed_twice = steady_state(&cluster, &mut clients, rows, iters, actors, secs);
+    } else {
+        // The nodes hold as many resident actors as in the main run.
+        for i in 0..actors {
+            clients.value("POST", &path(&format!("new-{i}")));
+        }
+    }
 
+    // Takeovers: each node in turn killed under writes, then restarted.
+    let mut waits = Vec::new();
+    let (mut failures, mut not_writable) = (0, 0);
+    let mut restarts = Vec::new();
+    let mut written: Vec<Written> = Vec::new();
+    let mut tally = Tally::default();
+    for k in 0..kills {
+        let names: Vec<String> = (0..victims).map(|i| format!("v{k}-{i}")).collect();
+        let t = takeover(&mut cluster, k % NODES, &names, fault);
+        waits.extend(t.waits);
+        failures += t.failures;
+        not_writable += t.not_writable;
+        restarts.push(t.restart);
+        let from = written.len();
+        written.extend(t.written);
+        tally.sweep(&cluster, &written[from..], from);
+        // Let the restarted node settle before the next kill.
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    // Once more, every victim of every kill, after the last restart.
+    tally.sweep(&cluster, &written, 0);
+
+    if kills > 0 {
+        rows.row("takeover_victims", written.len() as u128, "actors");
+        rows.row("takeover_affected", waits.len() as u128, "actors");
+        if !waits.is_empty() {
+            let max = waits.iter().max().copied().unwrap_or_default();
+            rows.row(
+                "takeover_writable_p50",
+                percentile_of(waits, 0.5).as_nanos(),
+                "ns",
+            );
+            rows.row("takeover_writable_max", max.as_nanos(), "ns");
+        }
+        rows.row("takeover_not_writable", not_writable as u128, "actors");
+        rows.row("takeover_failed_requests", u128::from(failures), "requests");
+        let restart = restarts.into_iter().max().unwrap_or_default();
+        rows.row("restart_to_ready_max", restart.as_nanos(), "ns");
+    }
+    let acked: usize = written.iter().map(|w| w.acked.len()).sum();
+    rows.row("acked_writes_checked", acked as u128, "writes");
+    rows.row("acked_writes_lost", tally.lost.len() as u128, "writes");
+    rows.row(
+        "writes_applied_twice",
+        u128::from(tally.duplicated),
+        "writes",
+    );
+    rows.row(
+        "unacked_writes_applied",
+        u128::from(tally.unacknowledged),
+        "writes",
+    );
+    rows.row(
+        "ledgers_unreadable",
+        tally.unreadable.len() as u128,
+        "actors",
+    );
+    if fault == Fault::Kill {
+        rows.row(
+            "values_handed_out_twice",
+            u128::from(handed_twice),
+            "values",
+        );
+    }
+    tally.lost.len() as u64
+}
+
+/// The one-node run's rows on three nodes, through a random node: latency,
+/// first requests, memory, throughput. Returns the counter values handed out
+/// twice in the throughput phase.
+fn steady_state(
+    cluster: &Cluster,
+    clients: &mut Clients,
+    rows: Rows<'_>,
+    iters: usize,
+    actors: usize,
+    secs: u64,
+) -> u64 {
+    let path = cluster.path;
+    // Requests not answered 200 with a value: counted, and left out of the
+    // latencies and the throughput.
+    let mut failed = 0u64;
     // Latency to one resident actor through a random node.
     for (name, method) in [("warm_post", "POST"), ("warm_get", "GET")] {
         for _ in 0..100 {
             clients.value(method, &path("warm"));
         }
         let samples = (0..iters)
-            .map(|_| {
+            .filter_map(|_| {
                 let t = Instant::now();
-                clients.value(method, &path("warm"));
-                t.elapsed()
+                let answered = clients.answered(method, &path("warm"), &mut failed);
+                answered.map(|_| t.elapsed())
             })
             .collect::<Vec<_>>();
         for (suffix, p) in [("p50", 0.5), ("p99", 0.99)] {
             let value = percentile_of(samples.clone(), p).as_nanos();
-            cluster_row(target, &format!("{name}_{suffix}"), value, "ns");
+            rows.row(&format!("{name}_{suffix}"), value, "ns");
         }
     }
 
     // First request to new actors; memory across the three nodes.
     let (rss_before, _) = cluster.stats();
     let samples = (0..actors)
-        .map(|i| {
+        .filter_map(|i| {
             let t = Instant::now();
-            clients.value("POST", &path(&format!("new-{i}")));
-            t.elapsed()
+            let answered = clients.answered("POST", &path(&format!("new-{i}")), &mut failed);
+            answered.map(|_| t.elapsed())
         })
         .collect::<Vec<_>>();
-    cluster_row(
-        target,
-        "create_p50",
-        percentile_of(samples, 0.5).as_nanos(),
-        "ns",
-    );
+    rows.row("create_p50", percentile_of(samples, 0.5).as_nanos(), "ns");
     std::thread::sleep(Duration::from_millis(200));
     let (rss_after, _) = cluster.stats();
     let per_actor = rss_after.saturating_sub(rss_before) / actors as u64;
-    cluster_row(
-        target,
-        "memory_per_resident_actor",
-        u128::from(per_actor),
-        "bytes",
-    );
-    cluster_row(target, "memory_rss_total", u128::from(rss_after), "bytes");
+    rows.row("memory_per_resident_actor", u128::from(per_actor), "bytes");
+    rows.row("memory_rss_total", u128::from(rss_after), "bytes");
 
     // Throughput: 8 clients, writes spread over the resident actors, each
-    // actor written by one client alone (actor i by client i % 8).
+    // actor written by one client alone (actor i by client i % 8). Each
+    // client sends its next write when the last is answered, so this is what
+    // eight such clients complete, not the cluster's capacity.
     let (_, cpu_before) = cluster.stats();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(secs);
@@ -416,97 +769,108 @@ pub(crate) fn run(target: &str, workload: Workload, kills: usize, victims: usize
                 let mut clients = Clients::new(addrs, 100 + t);
                 let mine: Vec<usize> = (t as usize..actors).step_by(8).collect();
                 let mut seen: Vec<Vec<i64>> = vec![Vec::new(); mine.len()];
-                let mut n = 0u64;
+                let (mut n, mut turn, mut failed) = (0u64, 0usize, 0u64);
                 while Instant::now() < deadline {
-                    let j = n as usize % mine.len();
-                    seen[j].push(clients.value("POST", &path(&format!("new-{}", mine[j]))));
-                    n += 1;
+                    let j = turn % mine.len();
+                    turn += 1;
+                    let name = path(&format!("new-{}", mine[j]));
+                    if let Some(value) = clients.answered("POST", &name, &mut failed) {
+                        seen[j].push(value);
+                        n += 1;
+                    }
                 }
-                (n, seen.iter().map(|s| reissued(s)).sum::<u64>())
+                (n, seen.iter().map(|s| reissued(s)).sum::<u64>(), failed)
             })
         })
         .collect();
-    let (requests, mut handed_twice) = handles
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .fold((0, 0), |(a, b), (n, r)| (a + n, b + r));
+    let (requests, handed_twice) =
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .fold((0, 0), |(a, b), (n, r, f)| {
+                failed += f;
+                (a + n, b + r)
+            });
     let elapsed = started.elapsed();
     let (_, cpu_after) = cluster.stats();
-    cluster_row(
-        target,
+    rows.row(
         "throughput_8_clients",
         (requests as f64 / elapsed.as_secs_f64()) as u128,
         "req/s",
     );
-    cluster_row(
-        target,
+    rows.row(
         "server_cpu_per_request",
         (cpu_after - cpu_before).as_nanos() / u128::from(requests.max(1)),
         "ns",
     );
+    rows.row("steady_failed_requests", u128::from(failed), "requests");
+    handed_twice
+}
 
-    // Takeovers: each node in turn killed under writes, then restarted.
-    let mut waits = Vec::new();
-    let (mut victims_total, mut lost, mut failures) = (0, 0, 0);
-    let mut restarts = Vec::new();
-    for k in 0..kills {
-        let node = k % NODES;
-        let names: Vec<String> = (0..victims)
-            .map(|i| format!("new-{}", (k * victims + i) % actors))
-            .collect();
-        let t = takeover(&mut cluster, node, &names);
-        victims_total += names.len();
-        waits.extend(t.waits);
-        lost += t.lost;
-        handed_twice += t.reissued;
-        failures += t.failures;
-        restarts.push(t.restart);
-    }
-    if kills > 0 {
-        cluster_row(target, "takeover_victims", victims_total as u128, "actors");
-        cluster_row(target, "takeover_affected", waits.len() as u128, "actors");
-        if !waits.is_empty() {
-            let max = waits.iter().max().copied().unwrap_or_default();
-            cluster_row(
-                target,
-                "takeover_writable_p50",
-                percentile_of(waits, 0.5).as_nanos(),
-                "ns",
-            );
-            cluster_row(target, "takeover_writable_max", max.as_nanos(), "ns");
+/// One victim ledger and the tokens its writer was acknowledged.
+struct Written {
+    name: String,
+    acked: Vec<u64>,
+}
+
+/// What the sweeps found, over every victim. A token lost in one sweep
+/// stays lost, whatever a later sweep reads.
+#[derive(Default)]
+struct Tally {
+    /// (victim, token) of each acknowledged write a sweep did not find.
+    lost: HashSet<(usize, u64)>,
+    /// The most copies beyond the first, and the most unacknowledged tokens,
+    /// any one sweep found (the last sweep covers every victim).
+    duplicated: u64,
+    unacknowledged: u64,
+    /// Victims a sweep could not read from any node.
+    unreadable: HashSet<usize>,
+}
+
+impl Tally {
+    /// Reads back `written` (victims `from..`) and audits each.
+    fn sweep(&mut self, cluster: &Cluster, written: &[Written], from: usize) {
+        let mut clients = Clients::new(cluster.addrs(), 7);
+        let (mut duplicated, mut unacknowledged) = (0, 0);
+        for (i, w) in written.iter().enumerate() {
+            let Some(body) = clients.body_retrying(&(cluster.ledger)(&w.name)) else {
+                self.unreadable.insert(from + i);
+                continue;
+            };
+            let present: Vec<u64> = body.lines().filter_map(|l| l.trim().parse().ok()).collect();
+            let found = audit(&w.acked, &present);
+            self.lost
+                .extend(found.lost.into_iter().map(|t| (from + i, t)));
+            duplicated += found.duplicated;
+            unacknowledged += found.unacknowledged;
         }
-        cluster_row(
-            target,
-            "takeover_failed_requests",
-            u128::from(failures),
-            "requests",
-        );
-        let restart = restarts.into_iter().max().unwrap_or_default();
-        cluster_row(target, "restart_to_ready_max", restart.as_nanos(), "ns");
+        self.duplicated = self.duplicated.max(duplicated);
+        self.unacknowledged = self.unacknowledged.max(unacknowledged);
     }
-    cluster_row(target, "acked_writes_lost", u128::from(lost), "writes");
-    cluster_row(
-        target,
-        "values_handed_out_twice",
-        u128::from(handed_twice),
-        "values",
-    );
+}
+
+/// Removes a killed node's directory. It must hold the node's files, or the
+/// run would report a wipe that removed nothing.
+fn wipe(dir: &Path) {
+    let files = std::fs::read_dir(dir).map_or(0, Iterator::count);
+    assert!(files > 0, "{}: nothing to wipe", dir.display());
+    std::fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    assert!(!dir.exists(), "{}: still there", dir.display());
 }
 
 struct Takeover {
-    /// For each victim on the dead node: from the kill to its first
-    /// acknowledged write.
+    /// For each victim on the dead node: from the kill to the end of its
+    /// longest wait for an acknowledgement.
     waits: Vec<Duration>,
-    /// Victims whose final value is below one acknowledged before.
-    lost: u64,
-    /// Values handed out again (see [`reissued`]).
-    reissued: u64,
+    /// Victims with no acknowledged write after the kill.
+    not_writable: usize,
     failures: u64,
     restart: Duration,
+    written: Vec<Written>,
 }
 
-fn takeover(cluster: &mut Cluster, node: usize, names: &[String]) -> Takeover {
-    let path = cluster.path;
+fn takeover(cluster: &mut Cluster, node: usize, names: &[String], fault: Fault) -> Takeover {
+    let (path, ledger) = (cluster.path, cluster.ledger);
     let base = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     // Nanoseconds since `base` of each victim's last acknowledgement.
@@ -516,17 +880,19 @@ fn takeover(cluster: &mut Cluster, node: usize, names: &[String]) -> Takeover {
         .enumerate()
         .map(|(i, name)| {
             let (stop, last_ack) = (stop.clone(), last_ack.clone());
-            let (addrs, name) = (cluster.addrs(), name.clone());
+            let (addrs, name) = (cluster.addrs(), ledger(name));
             std::thread::spawn(move || {
                 let mut clients = Clients::new(addrs, 1000 + i as u64);
                 let mut acked = Vec::new();
                 let mut failures = 0u64;
+                // A token per attempt: one that failed is not sent again.
+                let mut token = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    match clients.send("POST", &path(&name)) {
-                        Ok((200, body)) => {
+                    let sent = clients.send("POST", &format!("{name}?t={token}"));
+                    match sent {
+                        Ok((200, _)) => {
                             let at = base.elapsed();
-                            let value: i64 = body.trim().parse().expect("a value");
-                            acked.push((at, value));
+                            acked.push((at, token));
                             last_ack[i].store(at.as_nanos() as u64, Ordering::Relaxed);
                             std::thread::sleep(WRITE_EVERY);
                         }
@@ -535,6 +901,7 @@ fn takeover(cluster: &mut Cluster, node: usize, names: &[String]) -> Takeover {
                             std::thread::sleep(RETRY_EVERY);
                         }
                     }
+                    token += 1;
                 }
                 (acked, failures)
             })
@@ -543,18 +910,33 @@ fn takeover(cluster: &mut Cluster, node: usize, names: &[String]) -> Takeover {
 
     // Writes flow to every victim, then the node dies.
     std::thread::sleep(Duration::from_secs(3));
-    let killed_at = base.elapsed();
-    cluster.nodes[node].kill();
-    let limit = Instant::now() + TAKEOVER_LIMIT;
-    while Instant::now() < limit
-        && last_ack
-            .iter()
-            .any(|a| Duration::from_nanos(a.load(Ordering::Relaxed)) <= killed_at)
-    {
-        std::thread::sleep(Duration::from_millis(50));
+    if let Some(relay) = cluster.relays.get(node) {
+        relay.cut();
+        std::thread::sleep(Duration::from_millis(500));
     }
-    // A little longer: writes after the takeover are checked too.
+    let killed_at = cluster.nodes[node].kill() - base;
+    if fault != Fault::Kill {
+        wipe(&cluster.nodes[node].dir);
+    }
+    if let Some(relay) = cluster.relays.get(node) {
+        relay.restore();
+    }
+    // Until every victim is being acknowledged again, a little after the
+    // kill at the earliest: writes after the takeover are checked too.
+    let limit = Instant::now() + TAKEOVER_LIMIT;
+    let settled = Duration::from_secs(1);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = base.elapsed();
+        let writing = last_ack
+            .iter()
+            .all(|a| now.saturating_sub(Duration::from_nanos(a.load(Ordering::Relaxed))) < settled);
+        if (writing && now > killed_at + Duration::from_secs(2)) || Instant::now() > limit {
+            break;
+        }
+    }
     std::thread::sleep(Duration::from_secs(2));
+    let stopped_at = base.elapsed();
     stop.store(true, Ordering::Relaxed);
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
@@ -564,28 +946,24 @@ fn takeover(cluster: &mut Cluster, node: usize, names: &[String]) -> Takeover {
 
     let mut out = Takeover {
         waits: Vec::new(),
-        lost: 0,
-        reissued: 0,
+        not_writable: 0,
         failures: 0,
         restart,
+        written: Vec::new(),
     };
-    let mut check = Clients::new(cluster.addrs(), 7);
     for (name, (acked, failures)) in names.iter().zip(results) {
         out.failures += failures;
-        match acked.iter().find(|(at, _)| *at > killed_at) {
-            Some((at, _)) if *at - killed_at > AFFECTED => out.waits.push(*at - killed_at),
-            Some(_) => {}
-            None => panic!("{name} was not writable again within {TAKEOVER_LIMIT:?}"),
+        let times: Vec<Duration> = acked.iter().map(|(at, _)| *at).collect();
+        match recovery(&times, killed_at, stopped_at) {
+            Some(Some(wait)) => out.waits.push(wait),
+            Some(None) => {}
+            None => out.not_writable += 1,
         }
-        let values: Vec<i64> = acked.iter().map(|(_, v)| *v).collect();
-        out.reissued += reissued(&values);
-        let last = values.iter().copied().max().unwrap_or(0);
-        if check.value_retrying(&path(name)) < last {
-            out.lost += 1;
-        }
+        out.written.push(Written {
+            name: name.clone(),
+            acked: acked.into_iter().map(|(_, token)| token).collect(),
+        });
     }
-    // Let the restarted node settle before the next kill.
-    std::thread::sleep(Duration::from_secs(5));
     out
 }
 
@@ -600,6 +978,60 @@ mod tests {
         // 3 was handed out after 5: the writes that made 4 and 5 were lost.
         assert_eq!(reissued(&[1, 2, 5, 3, 6]), 1);
         assert_eq!(reissued(&[4, 4]), 1);
+    }
+
+    #[test]
+    fn an_acknowledged_token_the_ledger_lacks_is_lost() {
+        assert_eq!(audit(&[], &[]), Audit::default());
+        assert_eq!(audit(&[0, 1, 2], &[0, 1, 2]), Audit::default());
+        // 1 was acknowledged and is gone. 3 failed but applied: with a
+        // counter it would have hidden the loss (three writes, value 3).
+        let found = audit(&[0, 1, 2], &[0, 2, 3]);
+        assert_eq!(found.lost, vec![1]);
+        assert_eq!(found.unacknowledged, 1);
+        assert_eq!(found.duplicated, 0);
+    }
+
+    #[test]
+    fn a_token_held_twice_is_counted_once_per_extra_copy() {
+        let found = audit(&[0, 1], &[0, 1, 1, 1]);
+        assert_eq!(found.duplicated, 2);
+        assert!(found.lost.is_empty());
+    }
+
+    #[test]
+    fn the_takeover_is_the_longest_wait_not_the_first_acknowledgement() {
+        let ms = Duration::from_millis;
+        // An answer already on its way arrives 1 ms after the kill; the
+        // actor is writable again 15 s later.
+        let acks = [ms(900), ms(1001), ms(16_000), ms(16_020)];
+        assert_eq!(
+            longest_wait(&acks, ms(1000)),
+            Some((ms(14_999), ms(16_000)))
+        );
+        // On a surviving node: no wait to speak of.
+        assert_eq!(
+            longest_wait(&[ms(990), ms(1010), ms(1030)], ms(1000)),
+            Some((ms(20), ms(1030)))
+        );
+        assert_eq!(longest_wait(&[ms(900)], ms(1000)), None);
+    }
+
+    #[test]
+    fn a_victim_no_longer_acknowledged_at_the_end_is_not_writable() {
+        let ms = Duration::from_millis;
+        let acks = [ms(900), ms(1001), ms(16_000), ms(16_020)];
+        assert_eq!(
+            recovery(&acks, ms(1000), ms(16_040)),
+            Some(Some(ms(15_000)))
+        );
+        assert_eq!(
+            recovery(&[ms(990), ms(1010), ms(1030)], ms(1000), ms(1040)),
+            Some(None)
+        );
+        // One answer already on its way, then nothing until the stop.
+        assert_eq!(recovery(&[ms(900), ms(1001)], ms(1000), ms(60_000)), None);
+        assert_eq!(recovery(&[], ms(1000), ms(60_000)), None);
     }
 
     #[test]
