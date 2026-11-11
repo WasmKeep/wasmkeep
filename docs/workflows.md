@@ -100,7 +100,9 @@ To try a client in another language without a Rust toolchain, a release
 carries the example's workflow already built: `workflows-orders.wasm`
 (the `orders` class of [`examples/workflows`](../examples/workflows)) and
 `workflows-ledger.wasm` (the `ledger` class its steps call, so it needs
-both), signed like the release's other files. They start with the release
+both), signed like the release's other files, with the notices of the
+libraries compiled into them in `THIRD_PARTY_NOTICES-components.txt`.
+They start with the release
 after 0.1.0, which has neither: until then, build them from a clone, as
 [the example's README](../examples/workflows/README.md#run-it) does.
 

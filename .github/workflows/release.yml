@@ -13,8 +13,8 @@ name: release
 # its CycloneDX SBOM (scripts/sbom.sh) and the third-party notices
 # (scripts/notices.sh), in a tarball with a short README of its own
 # (deploy/tarball/README.md). Once for every target: example components
-# built for wasm32-wasip2 (the `components` job), so that trying WasmKeep
-# needs no toolchain. SHA256SUMS lists every file, and each file has a
+# built for wasm32-wasip2 with their third-party notices (the `components`
+# job), so that trying WasmKeep needs no toolchain. SHA256SUMS lists every file, and each file has a
 # Sigstore bundle (<file>.sigstore.json) from keyless cosign signing: the
 # certificate names this workflow and the ref it ran on. docs/deploy/single-node.md
 # says how to verify.
@@ -99,9 +99,11 @@ jobs:
 
   # The example components a release carries: the counter of the README's
   # quickstart, and the Rust classes that the key-value, queue and workflow
-  # guides have actors in other languages call. Built once: a component is
-  # the same file on every platform. The artifact's name starts with
-  # `build-`, so the `sign` job takes these files with the binaries.
+  # guides have actors in other languages call, with the third-party
+  # notices of the crates they link (THIRD_PARTY_NOTICES-components.txt).
+  # Built once: a component is the same file on every platform. The
+  # artifact's name starts with `build-`, so the `sign` job takes these
+  # files with the binaries.
   components:
     name: example components
     needs: ci
@@ -113,8 +115,8 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: wasm-tools@1.263.0
-      - name: Build with the pinned toolchain, validate, name
+          tool: wasm-tools@1.263.0,cargo-about@0.9.3
+      - name: Build with the pinned toolchain, validate, name; their notices
         run: |
           # The file in the release, the example's directory, the file
           # cargo writes there. `counter` is the default build (no feature).
@@ -142,7 +144,11 @@ jobs:
             install -m 0644 "$wasm" "dist/$file"
             echo "::endgroup::"
           done <<<"$components"
-          [ "$(ls dist | wc -l)" = 5 ] || { echo "::error::expected five components"; ls dist; exit 1; }
+          [ "$(ls dist/*.wasm | wc -l)" = 5 ] || { echo "::error::expected five components"; ls dist; exit 1; }
+          # They link the Rust SDK's dependencies: one file with those
+          # crates' notices travels with them (docs/legal.md).
+          mapfile -t dirs < <(awk 'NF { print "examples/" $2 }' <<<"$components")
+          ./scripts/notices.sh --components dist/THIRD_PARTY_NOTICES-components.txt "${dirs[@]}"
           ls -l dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

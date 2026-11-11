@@ -39,7 +39,9 @@ The text under a version's heading is its GitHub release text
   [quickstart](README.md#quickstart) and the callers of the
   [key-value, queue](docs/kv-and-queues.md) and
   [workflow](docs/workflows.md#the-workflow-class) classes in other
-  languages need no Rust toolchain. The tarball has a short README of
+  languages need no Rust toolchain. The notices of the libraries
+  compiled into them come with them, in
+  `THIRD_PARTY_NOTICES-components.txt`. The tarball has a short README of
   its own.
 - **Releases**: a tag's release waits for CI to pass on the tagged
   commit, and a version's image tag is written once. Publishing the

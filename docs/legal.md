@@ -60,6 +60,10 @@ its text). `scripts/notices.sh` gathers them with `cargo about`
 targets, grouped by license with each license's full text, the
 CDLA-Permissive-2.0 text included, and the NOTICE files dependencies ship.
 The release workflow puts that file in every tarball, next to the binary.
+The example components a release carries (`counter.wasm` and the others)
+link the Rust SDK's dependencies: `scripts/notices.sh --components` writes
+their notices the same way, for wasm32-wasip2, and the release attaches
+that file, `THIRD_PARTY_NOTICES-components.txt`, next to them.
 `scripts/sbom.sh` writes a CycloneDX SBOM of the `wasmkeep` binary for one
 target.
 
