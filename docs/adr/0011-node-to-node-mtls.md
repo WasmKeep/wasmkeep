@@ -6,7 +6,7 @@
   recommended option and can be revisited (question 4 is still open,
   see below).
 - Date: 2026-11-05
-- Milestone: [M3](../../ROADMAP.md#-m3-first-public-release)
+- Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
 ## Context
 

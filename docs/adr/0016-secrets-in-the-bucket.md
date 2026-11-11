@@ -11,7 +11,7 @@
   - three value layers, and a follower of its own;
   - recovery from a lost key.
 - Date: 2026-11-05
-- Milestone: [M4](../../ROADMAP.md#-m4-operating-a-cluster)
+- Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster)
 
 ## Context
 

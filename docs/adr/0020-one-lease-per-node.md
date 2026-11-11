@@ -10,7 +10,7 @@
   public release, since changing leases requires stopping every node at
   once (section 6).
 - Date: 2026-11-07
-- Milestone: [M3](../../ROADMAP.md#-m3-first-public-release)
+- Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 - Amends: [ADR 0007](0007-replication-protocol.md),
   [0009](0009-alarms-in-a-cluster.md),
   [0012](0012-bucket-garbage-collection.md),

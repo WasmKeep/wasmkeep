@@ -13,7 +13,7 @@
     - an actor created on one node is reachable through another;
     - an `internal` actor answers a call from another node, and refuses outside requests even with forged node and caller headers.
 - Date: 2026-11-04
-- Milestone: [M3](../../ROADMAP.md#-m3-first-public-release)
+- Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
 ## Context
 

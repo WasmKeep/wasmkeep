@@ -151,7 +151,7 @@ static host, the rest to your load balancer.
 A few small files embedded in a component (an admin page, a favicon) are
 fine; anything larger, changing often, or large media belongs on the
 static origin. Serving assets directly from the nodes, without an actor,
-is a possible built-in for later ([roadmap](../../ROADMAP.md#-later-on-demand)).
+is a possible built-in for later ([roadmap](../../ROADMAP.md#later-on-demand)).
 
 ## WAF and rate limits
 

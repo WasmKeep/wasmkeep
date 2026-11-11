@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-11-02
-- Milestone: [M1](../../ROADMAP.md#-m1-actors-on-one-node)
+- Milestone: [M1](../../ROADMAP.md#m1-actors-on-one-node)
 - Supersedes: nothing; extends [ADR 0002](0002-wasmkeep-actor-wit-v0.1.md), which deferred WebSockets
 
 ## Context

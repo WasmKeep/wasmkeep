@@ -2,7 +2,7 @@
 
 - Status: **accepted: madsim**, after the bake-off below (it reversed the initial proposal)
 - Date: 2026-11-02
-- Milestone: [M2](../../ROADMAP.md#-m2-cluster-and-durability)
+- Milestone: [M2](../../ROADMAP.md#m2-cluster-and-durability)
 
 ## Context
 

@@ -11,7 +11,7 @@
   `sim/tests/madsim_drain.rs` models the node leases of
   [ADR 0020](0020-one-lease-per-node.md).
 - Date: 2026-11-05
-- Milestone: [M4](../../ROADMAP.md#-m4-operating-a-cluster) (the part [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) left open)
+- Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster) (the part [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) left open)
 
 ## Context
 

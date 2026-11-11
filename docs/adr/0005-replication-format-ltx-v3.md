@@ -2,7 +2,7 @@
 
 - Status: accepted (2026-11-02: the codec round-trips against `superfly/ltx` v0.5.3 in CI)
 - Date: 2026-11-02
-- Milestone: [M2](../../ROADMAP.md#-m2-cluster-and-durability)
+- Milestone: [M2](../../ROADMAP.md#m2-cluster-and-durability)
 
 ## Context
 
