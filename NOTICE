@@ -11,6 +11,6 @@ distributions must also carry each dependency's copyright and license
 notices; see docs/legal.md.
 
 The WASI interface files in crates/wasmkeep-wit/wit/deps/ (copied to
-sdks/typescript/wit/deps/) are Copyright the Contributors to the WASI
-Specification, published by the WebAssembly Community Group under the
-W3C Community Contributor License Agreement.
+sdks/typescript/wit/deps/ and sdks/go/wit/deps/) are Copyright the
+Contributors to the WASI Specification, published by the WebAssembly
+Community Group under the W3C Community Contributor License Agreement.

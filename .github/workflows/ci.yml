@@ -317,6 +317,11 @@ jobs:
           sdks/go/scripts/generate.sh
           git add -N sdks/go
           git diff --exit-code -- sdks/go/internal/gen sdks/go/wit
+      - name: Go SDK (vet, unit tests)
+        working-directory: sdks/go
+        run: |
+          go vet ./...
+          go test ./...
       - name: build every example
         run: |
           for ex in examples/ts-*/; do (cd "$ex" && npm ci && npm run build && npm run build:starlingmonkey); done
