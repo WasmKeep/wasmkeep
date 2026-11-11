@@ -133,7 +133,8 @@ Several nodes on one S3-compatible bucket
 ### M3: First public release
 
 Languages, documentation, hardening, and `0.1.0`
-([changelog](CHANGELOG.md)). What is left of it is under [Now](#now).
+([changelog](CHANGELOG.md)). What is left of it is under [Now](#now) and
+[Next](#next).
 
 - Languages ([tiers and numbers](docs/languages.md)). Recommended: Rust.
   Supported: Zig, C/C++, TypeScript (QuickJS by default,
