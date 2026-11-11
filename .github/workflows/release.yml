@@ -6,11 +6,15 @@ name: release
 # taken from the version's section of CHANGELOG.md; a maintainer reviews and
 # publishes it. Run by hand (workflow_dispatch) it builds and
 # signs the same files as a workflow artifact, with no release: a dry run.
-# A pull request that changes the packaging runs the build job alone.
+# A pull request that changes the packaging runs the build jobs alone
+# (binaries, example components, images): nothing is signed or pushed.
 #
 # Per target: the binary built against glibc 2.28 (scripts/build-portable.sh),
 # its CycloneDX SBOM (scripts/sbom.sh) and the third-party notices
-# (scripts/notices.sh). SHA256SUMS lists every file, and each file has a
+# (scripts/notices.sh), in a tarball with a short README of its own
+# (deploy/tarball/README.md). Once for every target: example components
+# built for wasm32-wasip2 (the `components` job), so that trying WasmKeep
+# needs no toolchain. SHA256SUMS lists every file, and each file has a
 # Sigstore bundle (<file>.sigstore.json) from keyless cosign signing: the
 # certificate names this workflow and the ref it ran on. docs/deploy/single-node.md
 # says how to verify.
@@ -38,6 +42,7 @@ on:
       - scripts/release-notes.sh
       - deploy/Dockerfile
       - .dockerignore
+      - deploy/tarball/README.md
 
 permissions:
   contents: read
@@ -92,9 +97,65 @@ jobs:
           echo "::error::no finished CI run on main for $SHA: a release tag belongs on a commit of main"
           exit 1
 
+  # The example components a release carries: the counter of the README's
+  # quickstart, and the Rust classes that the key-value, queue and workflow
+  # guides have actors in other languages call. Built once: a component is
+  # the same file on every platform. The artifact's name starts with
+  # `build-`, so the `sign` job takes these files with the binaries.
+  components:
+    name: example components
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: wasm-tools@1.263.0
+      - name: Build with the pinned toolchain, validate, name
+        run: |
+          # The file in the release, the example's directory, the file
+          # cargo writes there. `counter` is the default build (no feature).
+          components='
+            counter.wasm           counter           counter
+            kv.wasm                jobs/kv           jobs_kv
+            queue.wasm             jobs/queue        jobs_queue
+            workflows-orders.wasm  workflows/orders  workflows_orders
+            workflows-ledger.wasm  workflows/ledger  workflows_ledger
+          '
+          # rustup installs what rust-toolchain.toml names, target included,
+          # on first use: check that this is the compiler that answers.
+          pinned=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustc -V
+          [ -n "$pinned" ] && [ "$(rustc -V | cut -d' ' -f2)" = "$pinned" ] \
+            || { echo "::error::rustc is not the pinned toolchain ($pinned)"; exit 1; }
+          mkdir dist
+          while read -r file dir built; do
+            [ -n "$file" ] || continue
+            echo "::group::$file (examples/$dir)"
+            (cd "examples/$dir" && cargo build --release --target wasm32-wasip2 --locked)
+            wasm=examples/$dir/target/wasm32-wasip2/release/$built.wasm
+            wasm-tools validate "$wasm"
+            wasm-tools component targets crates/wasmkeep-wit/wit --world actor "$wasm"
+            install -m 0644 "$wasm" "dist/$file"
+            echo "::endgroup::"
+          done <<<"$components"
+          [ "$(ls dist | wc -l)" = 5 ] || { echo "::error::expected five components"; ls dist; exit 1; }
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-components
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     name: build (${{ matrix.target }})
-    needs: ci
+    # After the components: each binary serves the release's counter.wasm
+    # before anything is packaged.
+    needs: [ci, components]
     strategy:
       fail-fast: true
       matrix:
@@ -158,6 +219,28 @@ jobs:
           [ "$(printf '%s\n' "$newest" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
             || { echo "::error::$bin needs $newest, newer than GLIBC_2.28"; exit 1; }
           "$bin" --version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-components
+          path: ${{ runner.temp }}/components
+      - name: The binary serves the release's counter.wasm (the README's first minute)
+        run: |
+          bin=$PWD/target/portable/glibc/release/wasmkeep
+          url=127.0.0.1:18080/actor/counter
+          cd "$(mktemp -d)"
+          "$bin" serve --listen 127.0.0.1:18080 --actor "counter=$RUNNER_TEMP/components/counter.wasm" &
+          server=$!
+          trap 'kill "$server"' EXIT
+          for _ in $(seq 100); do
+            curl -fs -o /dev/null "$url/probe" && break
+            sleep 0.2
+          done
+          first=$(curl -fsS -X POST "$url/alice")
+          second=$(curl -fsS -X POST "$url/alice")
+          other=$(curl -fsS "$url/bob")
+          echo "alice: $first then $second; bob: $other"
+          [ "$first $second $other" = "1 2 0" ] \
+            || { echo "::error::the counter answered '$first', '$second', '$other', not 1, 2, 0"; exit 1; }
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-cyclonedx@0.5.9,cargo-about@0.9.3
@@ -166,11 +249,24 @@ jobs:
           ./scripts/sbom.sh "$TARGET"
           ./scripts/notices.sh
       - name: Package
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           name=wasmkeep-$LABEL-$TARGET
           mkdir -p "dist/$name"
           install -m 0755 target/portable/glibc/release/wasmkeep "dist/$name/wasmkeep"
-          install -m 0644 LICENSE NOTICE README.md target/notices/THIRD_PARTY_NOTICES.txt "dist/$name/"
+          install -m 0644 LICENSE NOTICE target/notices/THIRD_PARTY_NOTICES.txt "dist/$name/"
+          # The tarball's own README, not the repository's: its links are
+          # absolute, to the files of the commit this binary was built from.
+          [ "$REF_TYPE" = tag ] && ref=$REF_NAME || ref=$(git rev-parse HEAD)
+          sed -e "s/@VERSION@/$LABEL/g" -e "s/@REF@/$ref/g" deploy/tarball/README.md > "dist/$name/README.md"
+          # A tarball resolves no relative link, and no placeholder stays.
+          if grep -nP '@[A-Z]+@|\]\((?!https://)' "dist/$name/README.md"; then
+            echo "::error::deploy/tarball/README.md: a placeholder left, or a link that is not absolute"
+            exit 1
+          fi
+          chmod 0644 "dist/$name/README.md"
           epoch=$(git log -1 --format=%ct)
           tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner --mode=go-w \
             -C dist -cf - "$name" | gzip -n -9 > "dist/$name.tar.gz"
@@ -186,7 +282,9 @@ jobs:
 
   sign:
     name: checksums and signatures
-    needs: build
+    # `build` needs `components`; named here too, since this job signs
+    # that job's files.
+    needs: [build, components]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -230,7 +328,11 @@ jobs:
 
   release:
     name: draft pre-release
-    needs: sign
+    # After the image too: no draft offers binaries whose image failed.
+    # A whole re-run of a tag stops at `image` (its tag is written once)
+    # before it reaches this job: to replace a draft's files, re-run the
+    # failed jobs only, which keeps the `image` job that succeeded.
+    needs: [sign, image]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

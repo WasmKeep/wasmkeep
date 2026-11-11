@@ -13,6 +13,22 @@ be Rust or any other SDK: the [TypeScript](#typescript),
 [Python](#python), [Go](#go), [C](#c) and [Zig](#zig) SDKs have the same
 clients and talk to the same Rust classes.
 
+Those callers need no Rust toolchain: a release carries the two classes
+of [`examples/jobs`](../examples/jobs) already built, as `kv.wasm` (the
+ready-made shard) and `queue.wasm` (its queue class: three attempts, a
+short backoff, pull-only except `queue/jobs`, which pushes to
+`app/worker`), signed like its other files. They start with the release
+after 0.1.0, which has neither: until then, build them from a clone, as
+[the example's README](../examples/jobs/README.md#run-it) does.
+
+```bash
+# $v: the version of your wasmkeep binary, later than 0.1.0
+curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/kv.wasm"
+curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/queue.wasm"
+wasmkeep serve --actor kv=kv.wasm --actor queue=queue.wasm --actor app=your-app.wasm \
+  --access kv=internal --access queue=internal
+```
+
 ## Key-value
 
 Deploy a shard class: a component that exports the SDK's ready-made shard.
@@ -139,7 +155,8 @@ consumers. The shard and queue classes stay Rust: deploy them as the
 components from [`examples/jobs`](../examples/jobs), `kv`
 ([`examples/jobs/kv`](../examples/jobs/kv), the SDK's ready-made shard)
 and `queue` ([`examples/jobs/queue`](../examples/jobs/queue), or your own
-Rust queue class when you need other settings), and call them from a
+Rust queue class when you need other settings), built from a clone or
+[downloaded from a release](#key-value-and-queues), and call them from a
 TypeScript actor. The wire protocol, the shard hash and the status codes
 are the same byte for byte in every SDK, so callers in any language share
 the same data. [`examples/ts-jobs`](../examples/ts-jobs) is the jobs app in

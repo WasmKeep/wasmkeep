@@ -96,6 +96,23 @@ spends on new steps before continuing in a new event (20 s of the 30 s).
 Serve the class with `--access orders=internal`: only other actors start
 and query workflows (the runner also refuses outside requests, `403`).
 
+To try a client in another language without a Rust toolchain, a release
+carries the example's workflow already built: `workflows-orders.wasm`
+(the `orders` class of [`examples/workflows`](../examples/workflows)) and
+`workflows-ledger.wasm` (the `ledger` class its steps call, so it needs
+both), signed like the release's other files. They start with the release
+after 0.1.0, which has neither: until then, build them from a clone, as
+[the example's README](../examples/workflows/README.md#run-it) does.
+
+```bash
+# $v: the version of your wasmkeep binary, later than 0.1.0
+for f in workflows-orders.wasm workflows-ledger.wasm; do
+  curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/$f"
+done
+wasmkeep serve --actor orders=workflows-orders.wasm --actor ledger=workflows-ledger.wasm \
+  --actor app=your-app.wasm --access orders=internal
+```
+
 ## Starting and following instances
 
 From any other actor:
@@ -154,7 +171,8 @@ empty output is non-nil), `Error` empty when there is none. Errors are
 `*workflow.Error` with the Rust SDK's kinds and messages (`ErrUnknown`,
 `ErrFinished`, `ErrCall`, `ErrRefused`). [`examples/go-jobs`](../examples/go-jobs)
 drives the `orders` class of [`examples/workflows`](../examples/workflows)
-with the same order routes as its Rust app.
+with the same order routes as its Rust app; that class is also
+[in a release, already built](#the-workflow-class).
 
 ### Python
 
@@ -163,7 +181,8 @@ The Python SDK (`sdks/python`, module `wasmkeep.workflow`) has the
 written with the Rust runner, over the same protocol, as
 [its key-value and queue clients](kv-and-queues.md#python) do.
 [`examples/py-jobs`](../examples/py-jobs) drives the `orders` class of
-[`examples/workflows`](../examples/workflows) this way.
+[`examples/workflows`](../examples/workflows) this way (the class is also
+[in a release, already built](#the-workflow-class)).
 
 ```python
 from wasmkeep import Actor, workflow
