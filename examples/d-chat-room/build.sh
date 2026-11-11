@@ -16,7 +16,7 @@ if [ -z "${SYSROOT:-}" ]; then
 fi
 rm -rf gen
 mkdir -p gen
-wit-bindgen d "$WIT" --world actor --out-dir gen >/dev/null 2>&1
+wit-bindgen d "$WIT" --world actor --out-dir gen >/dev/null
 SDK=../../sdks/d
 "$LDC" -mtriple=wasm32-unknown-wasi -betterC -O2 -release -Igen -I"$SDK" -od=gen/obj -oq -c \
   chat_room.d "$SDK/wasmkeep.d" $(find gen/wit -name '*.d')
