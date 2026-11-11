@@ -81,9 +81,9 @@ Next: [Concepts](concepts.md) for how actors behave, or
   the standard `wasi:http/proxy`, so the request handler is ordinary WASI
   HTTP, plus WasmKeep's storage, alarms, actor calls and WebSockets.
 - **Languages**: anything that builds a WASI 0.2 component. Rust,
-  TypeScript, Python, C and Zig have SDKs and pass the same tests; Go
-  (TinyGo) is experimental (a counter and the jobs app pass, no full SDK
-  yet), and C# is a later spike (see [languages](languages.md)).
+  TypeScript, Python, C, Zig and Go (TinyGo) have SDKs and pass the same
+  tests; D, MoonBit and a C# spike come next (see
+  [languages](languages.md)).
 - **Storage**: SQLite in WAL mode, one file per actor, sandboxed (no `ATTACH`,
   no extensions, no state-changing pragmas).
 - **Clustering**: each actor's changes stream to an S3-compatible bucket;

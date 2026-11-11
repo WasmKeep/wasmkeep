@@ -1,7 +1,8 @@
 name: release
 
 # A tag `vX.Y.Z` (equal to the workspace version) builds the release
-# binaries, signs them and opens a draft pre-release with them, its text
+# binaries, signs them and opens a draft pre-release with them, once CI has
+# passed on the tagged commit (the `ci` job waits for it), its text
 # taken from the version's section of CHANGELOG.md; a maintainer reviews and
 # publishes it. Run by hand (workflow_dispatch) it builds and
 # signs the same files as a workflow artifact, with no release: a dry run.
@@ -41,6 +42,12 @@ on:
 permissions:
   contents: read
 
+# `bash` by name runs every step with `-eo pipefail`: a failure on the left
+# of a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -49,8 +56,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release is built only from a commit CI has passed on. For a tag, this
+  # waits for the CI workflow's run on the tagged commit (its push to main)
+  # and fails unless it succeeded: run CI again, then this workflow again.
+  # Anything else (a dry run, a pull request) passes at once.
+  ci:
+    name: CI passed on this commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+        run: |
+          [ "$REF_TYPE" = tag ] || { echo "not a tag: nothing to wait for"; exit 0; }
+          for _ in $(seq 160); do
+            # The latest CI run on main for this commit (a re-run replaces
+            # its conclusion).
+            read -r status conclusion < <(gh run list --workflow ci.yml --commit "$SHA" \
+              --branch main --event push --limit 1 --json status,conclusion \
+              --jq '.[0] | "\(.status) \(.conclusion)"') || true
+            echo "CI on $SHA: $status $conclusion"
+            if [ "$status" = completed ]; then
+              [ "$conclusion" = success ] && exit 0
+              echo "::error::CI did not pass on $SHA ($conclusion): run it again, then this workflow"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "::error::no finished CI run on main for $SHA: a release tag belongs on a commit of main"
+          exit 1
+
   build:
     name: build (${{ matrix.target }})
+    needs: ci
     strategy:
       fail-fast: true
       matrix:
@@ -108,6 +152,7 @@ jobs:
           bin=target/portable/glibc/release/wasmkeep
           newest=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
           echo "newest glibc symbol: $newest"
+          [ -n "$newest" ] || { echo "::error::no glibc symbol read from $bin"; exit 1; }
           [ "$(printf '%s\n' "$newest" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
             || { echo "::error::$bin needs $newest, newer than GLIBC_2.28"; exit 1; }
           "$bin" --version
@@ -221,6 +266,7 @@ jobs:
 
   image-build:
     name: image (${{ matrix.platform }})
+    needs: ci
     strategy:
       fail-fast: true
       matrix:
@@ -281,7 +327,8 @@ jobs:
 
   image:
     name: image index and signature
-    needs: image-build
+    # After the binaries are signed: the image is not public before them.
+    needs: [image-build, sign]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -307,6 +354,12 @@ jobs:
           if [ "$REF_TYPE" = tag ]; then tag=${REF_NAME#v}; else tag=dev; fi
           [ "$(ls digests | wc -l)" = 2 ] || { echo "::error::expected two platform digests"; ls digests; exit 1; }
           echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          # A version's tag is written once: a second run of a tag's workflow
+          # must not point X.Y.Z at another image. (`dev` moves.)
+          if [ "$REF_TYPE" = tag ] && docker buildx imagetools inspect "$image:$tag" > /dev/null 2>&1; then
+            echo "::error::$image:$tag exists already: a published version's image is not replaced (delete the tag by hand if it never was released)"
+            exit 1
+          fi
           docker buildx imagetools create -t "$image:$tag" $(printf "$image@sha256:%s " $(ls digests))
           digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Manifest}}' | jq -r .digest)
           docker buildx imagetools inspect "$image@$digest"

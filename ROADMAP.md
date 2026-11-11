@@ -34,7 +34,7 @@ is not run.
   protocols is tested under thousands of seeded failure scenarios
   ([ADR 0006](docs/adr/0006-simulation-tool.md))
 - ✅ Actor leases on the bucket: exactly one owner per actor, safe under clock
-  skew, proven in simulation (since replaced by one lease per node,
+  skew, checked in simulation (since replaced by one lease per node,
   [ADR 0020](docs/adr/0020-one-lease-per-node.md), in M3)
 - ✅ Replication: each actor's changes streamed to the bucket as LTX files,
   compatible with Litestream's tooling
@@ -62,8 +62,8 @@ Done:
   they embed a runtime: 2.2× (TypeScript on QuickJS) to 2.5× (Python) the
   CPU per request on a workstation, about 4× on a small VM (TypeScript on
   StarlingMonkey and Python; that run had no QuickJS build), and more
-  memory per actor); Go through TinyGo (experimental: a counter and the
-  key-value, queue and workflow clients pass)
+  memory per actor); Go through TinyGo (experimental at the release; since
+  supported, with an SDK)
 - ✅ A documentation site: concepts, generated API reference, and
   deployment guides (single VPS, three nodes, where to run it, what to put
   in front)
@@ -76,7 +76,7 @@ Done:
 - ✅ Actors know their own address; configuration and secrets from files
   on each node; outbound HTTP limited to public addresses and to the
   ports browsers allow, with private CAs for HTTPS
-- ✅ A security audit in ten parts ([security](docs/security.md)), and
+- ✅ An internal security review in ten parts ([security](docs/security.md)), and
   dependency checks (advisories, licenses, sources)
 - ✅ Mutual TLS between nodes ([ADR 0011](docs/adr/0011-node-to-node-mtls.md)),
   each node's certificate pinned in its heartbeat, plain HTTP between
@@ -148,18 +148,20 @@ Next, in this order:
 The first release: ✅ the [legal basics](docs/legal.md)
 (licensing, name, export control), ✅ binaries and the image built by CI
 and signed, with a benchmark regression check on pull requests, ✅ the
-first public release, `0.1.0`, then ⏳ a write-up with benchmarks against
-celld.
+first public release, `0.1.0`, ✅ a first comparison with celld on one
+machine ([WasmKeep and celld](docs/compared-with-celld.md)), then ⏳ the
+same on a cloud bucket with a node per machine.
 
 Continuing alongside, without holding the release:
 
 - 🚧 More languages, in order: ✅ TypeScript on QuickJS, now the default
   engine (4.6× less memory per actor than StarlingMonkey, which stays an
   option for Web APIs; [ADR 0018](docs/adr/0018-quickjs-the-default-typescript-engine.md)),
-  Go (finish TinyGo, then standard Go through componentize-go), ✅ D
-  (experimental: the [D SDK](sdks/d), its counter and chat room pass),
-  MoonBit, then a C# spike. Java, Kotlin and PHP cannot produce an actor
-  yet; languages that need Wasm garbage collection wait on a decision of
+  ✅ Go on TinyGo, now supported (the [Go SDK](sdks/go): its counter,
+  chat room and jobs app pass the shared tests), then standard Go through
+  componentize-go, ✅ D (experimental: the [D SDK](sdks/d), its counter and
+  chat room pass), MoonBit, then a C# spike. Java, Kotlin and PHP
+  cannot produce an actor yet; languages that need Wasm garbage collection wait on a decision of
   their own
 - 🚧 The benchmark showdown suite (below): the counter comparison runs today
 
