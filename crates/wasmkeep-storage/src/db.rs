@@ -184,6 +184,8 @@ impl Storage {
         config: &StorageConfig,
     ) -> Result<Option<(String, String, String, u64)>, StorageError> {
         let mut db = ActorDb::open(file, config)?;
+        #[cfg(feature = "fault-injection")]
+        crate::faults::pause("alarm_scan");
         let meta_err = |source| StorageError::Meta {
             path: file.to_owned(),
             source,
