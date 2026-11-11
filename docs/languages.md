@@ -294,6 +294,26 @@ What is missing:
   (`wasm-tools strip --all`, which `build.sh` runs): NativeAOT compiles
   the runtime and the garbage collector in.
 
+## Versions
+
+The SDKs carry the server's version: one number for the `wasmkeep` binary,
+the Rust crate and every other SDK manifest, changed together. Use the SDK
+with the same version as the server you run; each is tested against the
+other at that version only.
+
+| SDK | Server | WIT package |
+| --- | --- | --- |
+| 0.1 | 0.1 | `wasmkeep:actor@0.2.0` |
+
+The WIT package version is another number: it is the version of the
+interface between a component and the host
+([`actor.wit`](../crates/wasmkeep-wit/wit/actor.wit)), and changes only when
+that interface does.
+
+`scripts/check-versions.py` (run by `./scripts/check.sh` and CI) fails when a
+manifest it lists has another version than the workspace's in `Cargo.toml`;
+an SDK that gains a manifest with a version is added to that list.
+
 ## What the tiers require
 
 - **Experimental:** a counter passes the **same black-box test** as the Rust
