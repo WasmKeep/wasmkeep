@@ -164,6 +164,16 @@ git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep
 wasmkeep serve --actor counter=examples/counter/target/wasm32-wasip2/release/counter.wasm
 ```
 
+Starting with the release after 0.1.0, a release also carries that
+counter already built, `counter.wasm`, signed like its other files, so the
+first minute needs no toolchain (0.1.0 has no `counter.wasm`):
+
+```bash
+# $v as in Install, and later than 0.1.0
+curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/counter.wasm"
+wasmkeep serve --actor counter=counter.wasm
+```
+
 Without the release binary, build the server from the same clone:
 `cargo run -p wasmkeep-cli -- serve --actor counter=...`.
 
@@ -182,7 +192,7 @@ To develop with hot reload (rebuilds and swaps on every save, keeping data;
 `dev` keeps it under `.wasmkeep/dev`, not the `.wasmkeep/data` of `serve`):
 
 ```bash
-wasmkeep dev examples/counter
+wasmkeep dev examples/counter   # from a clone
 ```
 
 To run several nodes on one bucket, with replication, failover and

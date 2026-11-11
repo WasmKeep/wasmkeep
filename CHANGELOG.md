@@ -33,6 +33,14 @@ The text under a version's heading is its GitHub release text
   wheel), and the Go module is ready for its tag; none is on a registry
   yet. The server and every SDK carry one version, checked in CI
   ([languages](docs/languages.md#versions)).
+- **Prebuilt components**: a release carries `counter.wasm`, `kv.wasm`,
+  `queue.wasm`, `workflows-orders.wasm` and `workflows-ledger.wasm`,
+  built from the examples and signed like its other files, so the
+  [quickstart](README.md#quickstart) and the callers of the
+  [key-value, queue](docs/kv-and-queues.md) and
+  [workflow](docs/workflows.md#the-workflow-class) classes in other
+  languages need no Rust toolchain. The tarball has a short README of
+  its own.
 - **Releases**: a tag's release waits for CI to pass on the tagged
   commit, and a version's image tag is written once.
 
