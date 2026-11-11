@@ -132,16 +132,40 @@ QuickJS, the default engine) used about twice Rust's CPU per request.
 We want this comparison measured independently too: see the
 [benchmark showdown goal](ROADMAP.md#stretch-goal-the-benchmark-showdown).
 
+## Install
+
+On Linux, x86_64 or aarch64 (glibc 2.28 or newer), download a release. Name
+the version: releases are pre-releases for now, so there is no `latest`.
+
+```bash
+v=0.1.0
+f=wasmkeep-$v-$(uname -m)-unknown-linux-gnu.tar.gz
+curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/$f"
+tar xzf "$f" && sudo install -m 755 "${f%.tar.gz}/wasmkeep" /usr/local/bin/wasmkeep
+wasmkeep --version
+```
+
+Every file of a release is signed:
+[check a download](docs/deploy/single-node.md#1-install-the-binary) before
+you trust it. Or use the container image, `ghcr.io/wasmkeep/wasmkeep:0.1.0`,
+for linux/amd64 and linux/arm64
+([running it](deploy/compose/README.md#the-image-on-its-own)). On macOS and Windows,
+use the image or build from source (below).
+
 ## Quickstart
 
-You need [rustup](https://rustup.rs); the pinned toolchain and the
+A node serves components: build the counter example, then serve it. You
+need [rustup](https://rustup.rs); the pinned toolchain and the
 `wasm32-wasip2` target install automatically.
 
 ```bash
 git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep
 (cd examples/counter && cargo build --release --target wasm32-wasip2)
-cargo run -p wasmkeep-cli -- serve --actor counter=examples/counter/target/wasm32-wasip2/release/counter.wasm
+wasmkeep serve --actor counter=examples/counter/target/wasm32-wasip2/release/counter.wasm
 ```
+
+Without the release binary, build the server from the same clone:
+`cargo run -p wasmkeep-cli -- serve --actor counter=...`.
 
 In another terminal:
 
@@ -158,7 +182,7 @@ To develop with hot reload (rebuilds and swaps on every save, keeping data;
 `dev` keeps it under `.wasmkeep/dev`, not the `.wasmkeep/data` of `serve`):
 
 ```bash
-cargo run -p wasmkeep-cli -- dev examples/counter
+wasmkeep dev examples/counter
 ```
 
 To run several nodes on one bucket, with replication, failover and

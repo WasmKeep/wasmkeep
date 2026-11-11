@@ -21,6 +21,9 @@ here for `v0.1.0`:
 
 ```bash
 f=wasmkeep-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+for file in "$f" "$f.sigstore.json"; do
+  curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v0.1.0/$file"
+done
 cosign verify-blob --bundle "$f.sigstore.json" \
   --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"

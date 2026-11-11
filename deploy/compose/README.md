@@ -161,6 +161,18 @@ It prints the verified digest; pin that digest (`ghcr.io/wasmkeep/wasmkeep@sha25
 in your deployment rather than the tag. The `dev` tag is a test build of
 the release process, overwritten without notice: do not deploy it.
 
+To serve one component with it, mount the component and a volume for the
+data, and listen on every address of the container:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$PWD/counter.wasm:/counter.wasm:ro" -v wasmkeep-data:/var/lib/wasmkeep \
+  ghcr.io/wasmkeep/wasmkeep:0.1.0 serve --listen 0.0.0.0:8080 --actor counter=/counter.wasm
+```
+
+The component must be readable by user 65532 (on SELinux hosts, add `,Z`
+to its mount).
+
 `scripts/sbom.sh` writes a CycloneDX SBOM of the binary (every crate
 compiled into it, from `Cargo.lock`) to `target/sbom/`.
 
