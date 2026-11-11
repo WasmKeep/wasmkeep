@@ -332,3 +332,19 @@ async fn awkward_names_keep_their_data_and_alarms_across_a_restart() {
         );
     }
 }
+
+/// Without a bucket, `exec-durable` is the local fsync and nothing else:
+/// it stays, whatever a cluster node does with its own durable writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_write_without_a_bucket_is_synced_locally() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    assert_eq!(call_at(addr, "POST", "/actor/t/x/plain").await.0, 200);
+    let before = wasmkeep_storage::faults::local_syncs();
+    assert_eq!(call_at(addr, "POST", "/actor/t/x/durable").await.1, "1");
+    assert_eq!(
+        wasmkeep_storage::faults::local_syncs(),
+        before + 1,
+        "one durable statement, one local sync"
+    );
+}

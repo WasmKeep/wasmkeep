@@ -1,6 +1,7 @@
 //! Failure injection for tests (feature `fault-injection`, never in a
 //! release build): makes a named host operation fail once, to test what
-//! callers do with an I/O error between two writes.
+//! callers do with an I/O error between two writes. Also counts the local
+//! syncs of durable statements, for tests of which callers ask for one.
 //!
 //! Points are process-wide, so a test arming one must run in its own
 //! process: `cargo nextest` (the project's runner) does that. Under plain
@@ -80,4 +81,16 @@ pub(crate) fn take(point: &str) -> bool {
         }
         None => false,
     }
+}
+
+static LOCAL_SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many durable statements asked for a local fsync of their commit in
+/// this process so far (`exec_durable`, not `exec_commit`).
+pub fn local_syncs() -> u64 {
+    LOCAL_SYNCS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(crate) fn note_local_sync() {
+    LOCAL_SYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
