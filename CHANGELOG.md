@@ -27,6 +27,12 @@ The text under a version's heading is its GitHub release text
   checking it against the bucket. The bucket is the only durable copy of
   such a write ([running a cluster](docs/cluster.md#how-it-works)). A
   node without a bucket still fsyncs.
+- **Installing**: the README starts from a release, not a clone: download
+  and check a binary, or run the image. The Rust, TypeScript and Python
+  SDKs now build as packages on their own (a crate, an npm tarball, a
+  wheel), and the Go module is ready for its tag; none is on a registry
+  yet. The server and every SDK carry one version, checked in CI
+  ([languages](docs/languages.md#versions)).
 - **Releases**: a tag's release waits for CI to pass on the tagged
   commit, and a version's image tag is written once.
 
