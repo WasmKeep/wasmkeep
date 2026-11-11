@@ -1,0 +1,229 @@
+name: publish
+
+# Publishes a release's SDKs to their registries: the Rust crate to
+# crates.io, the TypeScript package to npm and the Python package to PyPI,
+# each from the release's tag, without a stored token (the registries trust
+# this workflow by name: docs/releasing.md says how each is set up).
+#
+# It runs when a maintainer publishes the draft that release.yml opened, or
+# by hand for a tag, to finish a release whose run stopped half-way: a
+# registry that already has the version is skipped, so it can run again.
+# Nothing here can be undone: a published version stays published.
+#
+# The jobs stay in this file, not in a reusable workflow, and the file keeps
+# its name: the registries match the calling workflow's file name.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release's tag (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+# `bash` by name runs every step with `-eo pipefail`.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  # Refuses anything but a published release of main whose tag is the
+  # version of every manifest and whose commit CI passed on.
+  gate:
+    name: the release is what the manifests say
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - id: version
+        name: the tag is the version of every manifest
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$TAG" = "v$version" ] || {
+            echo "::error::tag $TAG is not v$version, the workspace version"; exit 1; }
+          python3 -I scripts/check-versions.py
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: the release is published, and CI passed on its commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          [ "$draft" = false ] || { echo "::error::the release $TAG is still a draft"; exit 1; }
+          sha=$(git rev-parse HEAD)
+          read -r status conclusion < <(gh run list --workflow ci.yml --commit "$sha" \
+            --branch main --event push --limit 1 --json status,conclusion \
+            --jq '.[0] | "\(.status) \(.conclusion)"') || true
+          echo "CI on $sha: $status $conclusion"
+          [ "$status" = completed ] && [ "$conclusion" = success ] || {
+            echo "::error::CI did not pass on $sha: nothing is published"; exit 1; }
+      # An environment that does not exist is created without reviewers
+      # by the first job that names it: refuse rather than publish with
+      # nobody in between.
+      - name: the registries environment has required reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          reviewers=$(gh api "repos/$GH_REPO/environments/registries" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length') \
+            || { echo "::error::no environment named registries: see docs/releasing.md"; exit 1; }
+          [ "$reviewers" -gt 0 ] || {
+            echo "::error::the registries environment has no required reviewers: see docs/releasing.md"; exit 1; }
+
+  pypi:
+    name: PyPI (wasmkeep)
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: registries
+    permissions:
+      id-token: write # the registry trusts this workflow's identity
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - id: have
+        name: is this version already on PyPI?
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/wasmkeep/$VERSION/json")
+          case "$code" in
+            200) echo "wasmkeep $VERSION is on PyPI already: nothing to do"; echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::PyPI answered $code"; exit 1 ;;
+          esac
+      - if: steps.have.outputs.published == 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - if: steps.have.outputs.published == 'false'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - if: steps.have.outputs.published == 'false'
+        name: build the wheel and the source archive
+        run: |
+          pip install build==1.6.1 twine==7.0.0
+          python -m build --outdir dist sdks/python
+          twine check dist/*
+      - if: steps.have.outputs.published == 'false'
+        # pypa/gh-action-pypi-publish v1.14.3
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086
+        with:
+          packages-dir: dist
+
+  crates:
+    name: crates.io (wasmkeep-sdk)
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: registries
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - id: have
+        name: is this version already on crates.io?
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A 'wasmkeep-release-workflow' \
+            "https://crates.io/api/v1/crates/wasmkeep-sdk/$VERSION")
+          case "$code" in
+            200) echo "wasmkeep-sdk $VERSION is on crates.io already: nothing to do"; echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::crates.io answered $code"; exit 1 ;;
+          esac
+      - if: steps.have.outputs.published == 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - if: steps.have.outputs.published == 'false'
+        id: auth
+        # rust-lang/crates-io-auth-action v1.0.6: a token for this run only
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9
+      - if: steps.have.outputs.published == 'false'
+        run: cargo publish -p wasmkeep-sdk --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  npm:
+    name: npm (@wasmkeep/sdk)
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: registries
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - id: have
+        name: is this version already on npm?
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/@wasmkeep%2fsdk/$VERSION")
+          case "$code" in
+            200) echo "@wasmkeep/sdk $VERSION is on npm already: nothing to do"; echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::npm answered $code"; exit 1 ;;
+          esac
+      - if: steps.have.outputs.published == 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - if: steps.have.outputs.published == 'false'
+        name: publish, with the workflow's identity and a provenance statement
+        working-directory: sdks/typescript
+        run: |
+          # Publishing without a token needs npm 11.5.1 or later.
+          node -e '
+            const [a, b, c] = process.argv[1].split(".").map(Number);
+            const ok = a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1)));
+            if (!ok) { console.error(`::error::npm ${process.argv[1]} cannot publish without a token (11.5.1 or later)`); process.exit(1); }
+          ' "$(npm --version)"
+          npm ci
+          npm publish
+
+  # The Go module has no registry: its version is a tag of this repository,
+  # sdks/go/vX.Y.Z, which a maintainer pushes signed on the release's commit.
+  # This asks the module proxy for it, so pkg.go.dev shows it at once.
+  go:
+    name: Go module (the proxy sees its tag)
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - run: |
+          url="https://proxy.golang.org/github.com/wasmkeep/wasmkeep/sdks/go/@v/v$VERSION.info"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$url")
+          if [ "$code" = 200 ]; then
+            echo "the proxy has sdks/go v$VERSION"
+          else
+            echo "::warning::the proxy answered $code for sdks/go v$VERSION: push the signed tag sdks/go/v$VERSION on the release's commit, then run this workflow again"
+          fi

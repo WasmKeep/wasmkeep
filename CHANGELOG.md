@@ -42,7 +42,10 @@ The text under a version's heading is its GitHub release text
   languages need no Rust toolchain. The tarball has a short README of
   its own.
 - **Releases**: a tag's release waits for CI to pass on the tagged
-  commit, and a version's image tag is written once.
+  commit, and a version's image tag is written once. Publishing the
+  release publishes the SDKs to crates.io, npm and PyPI from its tag,
+  without stored tokens, each after a maintainer's approval
+  ([releasing](docs/releasing.md)).
 
 ## 0.1.0
 
