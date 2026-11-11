@@ -7,7 +7,7 @@
   the node's log since 2026-11-06, not in M1 as planned (until
   then the host discarded them).
 - Date: 2026-11-02
-- Milestone: [M1](../../ROADMAP.md#-m1-actors-on-one-node)
+- Milestone: [M1](../../ROADMAP.md#m1-actors-on-one-node)
 - Source: [`crates/wasmkeep-wit/wit/actor.wit`](../../crates/wasmkeep-wit/wit/actor.wit)
 
 ## Context

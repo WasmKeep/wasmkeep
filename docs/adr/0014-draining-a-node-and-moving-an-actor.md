@@ -19,7 +19,7 @@
   had not listed the drain yet left the alarm to it, and nobody fired it
   until the sweep (`a_handed_alarm_waits_for_the_senders_release`).
 - Date: 2026-11-05
-- Milestone: [M4](../../ROADMAP.md#-m4-operating-a-cluster)
+- Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster)
 
 ## Context
 

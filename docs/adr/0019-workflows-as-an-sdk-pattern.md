@@ -12,7 +12,7 @@
   review of the first draft; the decisions on its open questions are at
   the end.
 - Date: 2026-11-06
-- Milestone: [M4](../../ROADMAP.md#-m4-operating-a-cluster), alongside ADR 0015
+- Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster), alongside ADR 0015
 
 ## Context
 

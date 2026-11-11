@@ -2,7 +2,7 @@
 
 - Status: accepted and implemented (2026-11-06)
 - Date: 2026-11-06
-- Milestone: [M3](../../ROADMAP.md#-m3-first-public-release) (languages), before the first public release
+- Milestone: [M3](../../ROADMAP.md#m3-first-public-release) (languages), before the first public release
 
 ## Context
 

@@ -2,7 +2,7 @@
 
 - Status: accepted (implemented 2026-11-02; the mixed-version test refuses old code, and removing the check fails it)
 - Date: 2026-11-02
-- Milestone: [M2](../../ROADMAP.md#-m2-cluster-and-durability)
+- Milestone: [M2](../../ROADMAP.md#m2-cluster-and-durability)
 
 ## Context
 

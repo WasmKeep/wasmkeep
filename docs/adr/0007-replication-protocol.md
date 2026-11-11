@@ -7,7 +7,7 @@
   record says lease, read the actor's hold (`LeaseView`: the hold exists and
   the node lease is valid).
 - Date: 2026-11-02
-- Milestone: [M2](../../ROADMAP.md#-m2-cluster-and-durability)
+- Milestone: [M2](../../ROADMAP.md#m2-cluster-and-durability)
 
 ## Context
 

@@ -6,7 +6,7 @@
   SDK (TypeScript, Python, Go, C, Zig) on 2026-11-06, tested against the
   Rust classes by `crates/wasmkeep-server/tests/jobs_langs.rs`.
 - Date: 2026-11-05
-- Milestone: [M4](../../ROADMAP.md#-m4-operating-a-cluster)
+- Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster)
 
 ## Context
 

@@ -7,7 +7,7 @@
   leases, ownership records and the `leases/` markers are lease state,
   never collected (see "Not collected here").
 - Date: 2026-11-05
-- Milestone: [M3](../../ROADMAP.md#-m3-first-public-release)
+- Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
 ## Context
 

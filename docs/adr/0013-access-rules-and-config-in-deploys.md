@@ -8,7 +8,7 @@
   rollback across the migration, the class an event takes, sockets,
   instances kept with old values).
 - Date: 2026-11-05
-- Milestone: [M3](../../ROADMAP.md#-m3-first-public-release)
+- Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
 ## Context
 
