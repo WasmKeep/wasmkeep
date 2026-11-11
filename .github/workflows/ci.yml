@@ -316,6 +316,8 @@ jobs:
           git diff --exit-code -- wit types
           npm run check
           npm test
+      - name: TypeScript SDK (the packed tarball, installed outside the checkout)
+        run: sdks/typescript/scripts/pack-test.sh "$RUNNER_TEMP/ts-sdk-pack"
       - name: Go SDK (bindings and WIT in sync with the host)
         run: |
           sdks/go/scripts/generate.sh

@@ -20,6 +20,9 @@
  */
 
 /// <reference path="./globals.d.ts" />
+// The host interfaces imported below (`wasmkeep:actor/*`, `wasi:*`): this
+// reference is how a project that installed the package finds their types.
+/// <reference path="../types/actor.d.ts" />
 // First: installs TextEncoder/TextDecoder on engines without them (QuickJS).
 import "./text";
 import "./console";
