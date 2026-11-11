@@ -9,6 +9,7 @@ import unittest
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 PACKAGE = 'sdks/typescript/package.json'
 LOCK = 'sdks/typescript/package-lock.json'
+EXAMPLES = ('ts-counter', 'ts-chat-room', 'ts-jobs', 'ts-workflows')
 
 
 class Versions(unittest.TestCase):
@@ -22,6 +23,14 @@ class Versions(unittest.TestCase):
         self.workspace('1.2.3')
         self.package('1.2.3')
         self.lock('1.2.3', '1.2.3')
+        for example in EXAMPLES:
+            self.example(example, '1.2.3')
+
+    def example(self, name, linked):
+        # An example's lockfile records the SDK it links by path.
+        path = self.root / 'examples' / name / 'package-lock.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'packages': {'../../sdks/typescript': {'version': linked}}}))
 
     def workspace(self, version):
         # A dependency's version comes first: only [workspace.package] counts.
@@ -67,6 +76,10 @@ class Versions(unittest.TestCase):
     def test_another_lockfile_root_package_version_fails(self):
         self.lock('1.2.3', '0.0.0')
         self.fails(f'{LOCK}: packages."".version is 0.0.0')
+
+    def test_an_example_lockfile_with_another_sdk_version_fails(self):
+        self.example('ts-jobs', '0.0.0')
+        self.fails('examples/ts-jobs/package-lock.json: packages.../../sdks/typescript.version is 0.0.0')
 
     def test_a_workspace_bump_alone_fails_for_every_manifest(self):
         self.workspace('1.3.0')
