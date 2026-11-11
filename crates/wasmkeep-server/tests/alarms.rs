@@ -347,4 +347,10 @@ async fn a_durable_write_without_a_bucket_is_synced_locally() {
         before + 1,
         "one durable statement, one local sync"
     );
+    // A transaction ended by exec-durable("COMMIT") syncs too.
+    assert_eq!(
+        call_at(addr, "POST", "/actor/t/x/durable-commit").await.1,
+        "2"
+    );
+    assert_eq!(wasmkeep_storage::faults::local_syncs(), before + 2);
 }

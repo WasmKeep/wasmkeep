@@ -186,10 +186,15 @@ enum Lost {
     /// The WAL's frames are gone (an empty file) while the sidecar names
     /// the bucket's head: the main file is older than the sidecar claims.
     Wal,
-    /// The WAL kept only its first half.
+    /// The WAL kept only its first half. (The restarted node's scan for
+    /// pending alarms may open the database first and fold that half into
+    /// the main file; either way the file is not the bucket's head.)
     HalfTheWal,
     /// The sidecar is gone; the database and its WAL are whole.
     Sidecar,
+    /// The sidecar is an empty file (written, its rename kept, its content
+    /// not), beside an emptied WAL.
+    SidecarContent,
     /// Everything is as it was after the first of three writes.
     TwoWrites,
 }
@@ -288,6 +293,11 @@ async fn acknowledged_durable_writes_survive_losing(lost: Lost) {
             put(beside("-wal"), &wal);
             std::fs::remove_file(beside(".replica")).unwrap();
         }
+        Lost::SidecarContent => {
+            put(db.clone(), &main);
+            put(beside("-wal"), &[]);
+            put(beside(".replica"), &[]);
+        }
         Lost::TwoWrites => {
             put(db.clone(), &after_one.0);
             put(beside("-wal"), &after_one.1);
@@ -326,6 +336,11 @@ async fn a_durable_write_survives_a_power_loss_that_cuts_the_wal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_durable_write_survives_a_power_loss_that_takes_the_sidecar() {
     acknowledged_durable_writes_survive_losing(Lost::Sidecar).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_write_survives_a_power_loss_that_empties_the_sidecar() {
+    acknowledged_durable_writes_survive_losing(Lost::SidecarContent).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

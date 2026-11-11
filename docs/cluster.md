@@ -72,7 +72,11 @@ Each actor's database follows it from node to node (ADR 0007):
   If the node dies in between, that write can be lost. `storage.exec-durable`
   returns only once the write is in the bucket, uploaded while the node still
   held the actor's lease: an acknowledged durable write survives any node
-  failure.
+  failure. The bucket is its only durable copy: the node does not fsync
+  it locally as well, and trusts its local file again only after checking
+  it against the bucket. So start a node again on the same bucket and
+  prefix: after a crash or a power loss its local files may lack writes
+  the bucket has.
 - If an upload fails, the node gives the actor up; the next request restores
   it from the bucket, possibly on another node.
 - `storage.delete-self` is recorded in the bucket, so a deleted actor stays
