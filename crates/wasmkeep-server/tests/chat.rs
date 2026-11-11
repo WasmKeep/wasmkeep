@@ -72,6 +72,10 @@ fn go_room() -> Option<Vec<u8>> {
     prebuilt_room("go-chat-room")
 }
 
+fn d_room() -> Option<Vec<u8>> {
+    prebuilt_room("d-chat-room")
+}
+
 /// Runs each room test against every room: they must behave the same.
 macro_rules! in_every_language {
     ($($test:ident),* $(,)?) => {
@@ -89,6 +93,7 @@ macro_rules! in_every_language {
         in_every_language!(@prebuilt c_room, c_room, $($test),*);
         in_every_language!(@prebuilt zig_room, zig_room, $($test),*);
         in_every_language!(@prebuilt go_room, go_room, $($test),*);
+        in_every_language!(@prebuilt d_room, d_room, $($test),*);
     };
     (@prebuilt $module:ident, $room:ident, $($test:ident),*) => {
         mod $module {

@@ -159,7 +159,8 @@ Continuing alongside, without holding the release:
   option for Web APIs; [ADR 0018](docs/adr/0018-quickjs-the-default-typescript-engine.md)),
   ✅ Go on TinyGo, now supported (the [Go SDK](sdks/go): its counter,
   chat room and jobs app pass the shared tests), then standard Go through
-  componentize-go, D, MoonBit, then a C# spike. Java, Kotlin and PHP
+  componentize-go, ✅ D (experimental: the [D SDK](sdks/d), its counter and
+  chat room pass), MoonBit, then a C# spike. Java, Kotlin and PHP
   cannot produce an actor yet; languages that need Wasm garbage collection wait on a decision of
   their own
 - 🚧 The benchmark showdown suite (below): the counter comparison runs today

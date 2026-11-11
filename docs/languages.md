@@ -33,6 +33,7 @@ different target, and does not make a language usable here.
 | **TypeScript / JavaScript** | Supported (embedded runtime) | [`@wasmkeep/sdk`](../sdks/typescript): esbuild, then componentize-qjs (QuickJS embedded, pre-initialized); or [ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS) (StarlingMonkey) with `--engine starlingmonkey` ([below](#typescript-on-quickjs)) | Counter, chat room and [jobs app](../examples/ts-jobs) (KV and queue clients) pass on both engines. QuickJS, the default: 1.7 MB; 230 µs of CPU per request (2.2× Rust) and 741 KB per actor (3×) ([measured](benchmarks.md#the-same-counter-in-every-language)), few Web APIs. StarlingMonkey: Web APIs and 1.5× faster plain JavaScript, for 4.6× the memory per actor ([measured](benchmarks.md#typescript-on-quickjs-against-starlingmonkey)) |
 | **Python** | Supported (embedded runtime) | [Python SDK](../sdks/python), [componentize-py](https://github.com/bytecodealliance/componentize-py) (CPython embedded) | Counter, chat room and [jobs app](../examples/py-jobs) (KV and queue clients) pass. 18.7 MB, the largest; 259 µs of CPU per request (2.5× Rust) and 7.8 MB per actor (31×) ([measured](benchmarks.md#the-same-counter-in-every-language)) |
 | **Go (TinyGo)** | Supported | [Go SDK](../sdks/go); TinyGo (0.39 in CI, 0.43 tested) `-target=wasip2`, which writes a component directly | Counter, [chat room](../examples/go-chat-room) and [jobs app](../examples/go-jobs) (KV, queue and workflow clients) pass; 162 KB. 248 µs of CPU per request (2.4× Rust) with a p99 up to 40× its median (the garbage collector), 390 KB per actor ([measured](benchmarks.md#the-same-counter-in-every-language), on the counter before the SDK: the same host calls without the wrapper); see [Go](#go) |
+| **D** | Experimental | [D SDK](../sdks/d) over `wit-bindgen d`; LDC (1.43 in CI) with `-betterC`, clang + wasi-libc, the WASI 0.1 adapter | Counter and [chat room](../examples/d-chat-room) pass; 88 KB. No numbers from `bench/run.sh` yet, no outbound HTTP or key-value and queue clients (see [D](#d)) |
 
 ### Next, in order
 
@@ -42,12 +43,10 @@ from `bench/run.sh` come before it is supported.
 1. **Standard Go** (not TinyGo) through [componentize-go](https://github.com/bytecodealliance/componentize-go),
    which allocates through Go's runtime before Go starts: the clash that
    blocked us ([below](#go)).
-2. **D** (LDC with `-betterC` and `wit-bindgen d`): no GC, no runtime; the
-   generator handles our world.
-3. **MoonBit** (`wit-bindgen moonbit`): small components; the language is
+2. **MoonBit** (`wit-bindgen moonbit`): small components; the language is
    pre-1.0 and its string layout changed in 2026, so tool versions must be
    pinned together.
-4. **C# / .NET** ([componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet),
+3. **C# / .NET** ([componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet),
    NativeAOT-LLVM): a spike first. Everything upstream is preview, the
    compiler ships from an experimental feed, and there are no macOS builds.
 
@@ -79,6 +78,7 @@ The same counter, as built by each example's `build.sh` (sizes on disk; see
 | --- | --- |
 | Zig | 30 KB |
 | Rust | 81 KB |
+| D | 88 KB |
 | Go (TinyGo) | 162 KB |
 | C | 170 KB |
 | TypeScript | 1.7 MB (QuickJS engine, the default) |
@@ -183,6 +183,25 @@ because Go's runtime assumes it owns all linear memory past its data, while
 the WASI 0.1 adapter needs memory before Go starts: their allocations
 overlap. A small WASI shim that needs no memory of its own would fix it;
 that is future work.
+
+## D
+
+LDC compiles D with `-betterC` (no garbage collector, no D runtime, no
+exceptions) to objects for `wasm32-unknown-wasi`; clang links them
+against wasi-libc as a reactor, and the WASI 0.1 adapter makes the
+component, as for C. `wit-bindgen d` generates the bindings, and the
+[D SDK](../sdks/d) wraps them: a struct of static hooks exported with
+`mixin Actor!S`, `exec`, `query` and `Rows` with parameters as plain D
+arguments, alarms, `call`, WebSockets, `env` and `self`. Without a
+garbage collector, everything the SDK returns lives until the event ends
+and is freed then.
+
+The [counter](../examples/d-counter) and [chat room](../examples/d-chat-room)
+pass the shared tests. D stays experimental until `bench/run.sh` measures
+it; the SDK has no outbound HTTP, key-value, queue or workflow clients
+yet. `-betterC` also means no D standard library parts that need the
+runtime (most of Phobos): text is built with `reply`'s printf formats or
+arena memory.
 
 ## What the tiers require
 

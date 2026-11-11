@@ -196,3 +196,10 @@ async fn go() {
         counter_contract("go", &wasm).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn d() {
+    if let Some(wasm) = prebuilt("d", "examples/d-counter/counter.wasm") {
+        counter_contract("d", &wasm).await;
+    }
+}

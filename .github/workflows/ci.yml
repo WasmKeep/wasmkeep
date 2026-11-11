@@ -263,6 +263,10 @@ jobs:
           echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
           go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: toolchains (D)
+        run: |
+          curl -sSL https://github.com/ldc-developers/ldc/releases/download/v1.43.0/ldc2-1.43.0-linux-x86_64.tar.xz | tar xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/ldc2-1.43.0-linux-x86_64/bin" >> "$GITHUB_PATH"
       - name: TypeScript SDK (types and WIT in sync with the host, type-check)
         working-directory: sdks/typescript
         run: |
@@ -284,6 +288,7 @@ jobs:
           for ex in examples/py-*/; do "$ex/build.sh"; done
           for ex in examples/go-*/; do "$ex/build.sh"; done
           crates/wasmkeep-server/tests/guests/go-fetch/build.sh
+          for ex in examples/d-*/; do "$ex/build.sh"; done
       - name: the counter contract and the chat suite, against every language
         run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
 

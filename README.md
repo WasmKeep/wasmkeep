@@ -51,7 +51,7 @@ own machines.**
   WebSockets.
 - **Any language.** Actors are standard WASI 0.2 components. Rust,
   TypeScript, Python, C, Zig and Go (TinyGo) have SDKs and pass the same
-  tests; more are next ([languages](docs/languages.md)). An
+  tests; D is experimental; more are next ([languages](docs/languages.md)). An
   actor imports WasmKeep's own interfaces (`wasmkeep:actor`, for storage,
   alarms, calls and sockets) besides WASI, so it runs on a host that
   implements them: WasmKeep today.
@@ -173,7 +173,8 @@ To run several nodes on one bucket, with replication, failover and
   [rate limiter](examples/rate-limiter) (alarms), [AI agent](examples/agent) (a model over
   HTTP, a reminder tool on an alarm), [jobs](examples/jobs) (the SDK's
   [key-value and queue](docs/kv-and-queues.md) patterns, with its clients in every SDK), and
-  the counter, chat room and jobs app in TypeScript, Python, C, Zig and Go (`examples/`)
+  the counter, chat room and jobs app in TypeScript, Python, C, Zig and Go, and the counter
+  and chat room in D (`examples/`)
 - [Running a cluster](docs/cluster.md): replication, failover, forwarding, `wasmkeep deploy`
 - [Roadmap](ROADMAP.md): what is built, what comes next, and what is not planned
 - Design decisions: [docs/adr](docs/adr); how the pieces fit: [Concepts](docs/concepts.md) and [Running a cluster](docs/cluster.md#how-it-works)
