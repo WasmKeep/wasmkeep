@@ -51,6 +51,14 @@ if [ -d crates/wasmkeep-wit/wit ] && [ -d crates/wasmkeep-sdk/wit ]; then
     echo 'crates/wasmkeep-sdk/wit differs from crates/wasmkeep-wit/wit: run rm -r crates/wasmkeep-sdk/wit && cp -r crates/wasmkeep-wit/wit crates/wasmkeep-sdk/wit' >&2; exit 1;
   }
 fi
+# The Go SDK ships a copy too, beside tinygo.wit (its own world over the
+# actor's, which sdks/go/scripts/generate.sh writes).
+if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/go/wit ]; then
+  step 'WIT copy (Go)'
+  diff -r -x tinygo.wit crates/wasmkeep-wit/wit sdks/go/wit >/dev/null || {
+    echo 'sdks/go/wit differs from crates/wasmkeep-wit/wit: run sdks/go/scripts/generate.sh' >&2; exit 1;
+  }
+fi
 # A tag's release text is its version's section of CHANGELOG.md
 # (release.yml): a version bump adds the section in the same change.
 step 'release notes'

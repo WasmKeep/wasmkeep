@@ -20,8 +20,9 @@ inherit when they build actors. The dependency list is kept current by
   direction and review. The implementation is original; what comes from
   other projects is used as published, under its own licence: the WASI
   interfaces vendored in `crates/wasmkeep-wit/wit/deps/` (and copied to
-  `sdks/typescript/wit/deps/` and `crates/wasmkeep-sdk/wit/deps/`),
-  published by the WebAssembly Community
+  `sdks/typescript/wit/deps/`, `crates/wasmkeep-sdk/wit/deps/`,
+  `sdks/go/wit/deps/` and `sdks/python/wasmkeep/wit/deps/`), published by
+  the WebAssembly Community
   Group under the [W3C Community Contributor License
   Agreement](https://www.w3.org/community/about/agreements/cla/), bindings
   generated from WIT files, and the dependencies listed by

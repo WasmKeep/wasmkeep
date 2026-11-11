@@ -238,6 +238,18 @@ esac
         # Examples build on the SDKs, so the Rust suite runs too.
         self.assertIn('nextest run --workspace --locked', calls)
 
+    def test_go_wit_copy_must_match_the_host(self):
+        self.write('crates/wasmkeep-wit/wit/actor.wit', 'world actor {}\n')
+        self.write('sdks/go/wit/actor.wit', 'world actor {}\n')
+        # The world the Go SDK adds for TinyGo is not part of the copy.
+        self.write('sdks/go/wit/tinygo.wit', 'world actor-tinygo {}\n')
+        result, _ = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write('sdks/go/wit/actor.wit', 'world other {}\n')
+        result, _ = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('sdks/go/wit differs', result.stderr)
+
     def test_failure_propagates(self):
         for failure in ('check-benchmark-paths.py', 'check-docs.py', 'test_check_runner.py',
                         'cargo clippy', 'cargo nextest run', 'cargo test -p wasmkeep-sim',
