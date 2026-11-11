@@ -34,7 +34,7 @@ is not run.
   protocols is tested under thousands of seeded failure scenarios
   ([ADR 0006](docs/adr/0006-simulation-tool.md))
 - ✅ Actor leases on the bucket: exactly one owner per actor, safe under clock
-  skew, proven in simulation (since replaced by one lease per node,
+  skew, checked in simulation (since replaced by one lease per node,
   [ADR 0020](docs/adr/0020-one-lease-per-node.md), in M3)
 - ✅ Replication: each actor's changes streamed to the bucket as LTX files,
   compatible with Litestream's tooling
@@ -76,7 +76,7 @@ Done:
 - ✅ Actors know their own address; configuration and secrets from files
   on each node; outbound HTTP limited to public addresses and to the
   ports browsers allow, with private CAs for HTTPS
-- ✅ A security audit in ten parts ([security](docs/security.md)), and
+- ✅ An internal security review in ten parts ([security](docs/security.md)), and
   dependency checks (advisories, licenses, sources)
 - ✅ Mutual TLS between nodes ([ADR 0011](docs/adr/0011-node-to-node-mtls.md)),
   each node's certificate pinned in its heartbeat, plain HTTP between
@@ -148,8 +148,9 @@ Next, in this order:
 The first release: ✅ the [legal basics](docs/legal.md)
 (licensing, name, export control), ✅ binaries and the image built by CI
 and signed, with a benchmark regression check on pull requests, ✅ the
-first public release, `0.1.0`, then ⏳ a write-up with benchmarks against
-celld.
+first public release, `0.1.0`, ✅ a first comparison with celld on one
+machine ([WasmKeep and celld](docs/compared-with-celld.md)), then ⏳ the
+same on a cloud bucket with a node per machine.
 
 Continuing alongside, without holding the release:
 
