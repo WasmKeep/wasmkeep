@@ -884,44 +884,80 @@ async fn an_upgrade_refused_at_the_handshake_is_sent_again_once_the_relay_is_liv
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // b's heartbeat stops reaching the bucket until a refuses b.
-    b.gate.beats.store(false, Ordering::SeqCst);
-    let (b_addr, since) = (b.addr, Instant::now());
-    within("a refusing b", since, HORIZON + SLACK, move || async move {
-        let r = send(b_addr, "GET", "/actor/t/on-a/fired").await;
-        (r.status == 503 && r.body == "the actor's node did not answer; retry").then_some(())
-    })
-    .await;
+    // A refusal usually reaches b as a's alert, or as the upgrade handed
+    // back unsent; b then sends the upgrade again. But a drops a refused
+    // connection without reading what b wrote on it, and the reset that
+    // can follow may reach b in place of the alert: b cannot tell that
+    // from a connection lost after a read the upgrade, and answers 503 at
+    // once. Both stages below allow for that 503 and try again, within a
+    // bound.
+    const UNREAD: &str = "the actor's node did not answer; retry";
+    let b_addr = b.addr;
+    let mut tries = 0;
+    let took = loop {
+        tries += 1;
+        // b's heartbeat stops reaching the bucket until a refuses b.
+        b.gate.beats.store(false, Ordering::SeqCst);
+        let since = Instant::now();
+        within("a refusing b", since, HORIZON + SLACK, move || async move {
+            let r = send(b_addr, "GET", "/actor/t/on-a/fired").await;
+            (r.status == 503 && r.body == UNREAD).then_some(())
+        })
+        .await;
 
-    // The upgrade goes out while a refuses b; b's heartbeat lands right
-    // after.
-    let asked = Instant::now();
-    let relayed = tokio::spawn(async move { upgrade(b_addr, "/actor/t/on-a/ws").await });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    b.gate.beats.store(true, Ordering::SeqCst);
-    let (status, body) = relayed.await.unwrap();
-    let took = asked.elapsed();
-    assert_eq!(status, 101, "b's upgrade to a: {status} {body}");
+        // The upgrade goes out while a refuses b; b's heartbeat lands
+        // right after.
+        let asked = Instant::now();
+        let relayed = tokio::spawn(async move { upgrade(b_addr, "/actor/t/on-a/ws").await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        b.gate.beats.store(true, Ordering::SeqCst);
+        let (status, body) = relayed.await.unwrap();
+        let took = asked.elapsed();
+        if status == 101 {
+            break took;
+        }
+        // Anything but the 503 for a refusal b could not recognise fails
+        // at once; so does that 503 every time.
+        assert_eq!(
+            (status, body.as_str()),
+            (503, UNREAD),
+            "b's upgrade to a, try {tries}"
+        );
+        assert!(
+            tries < 5,
+            "b's upgrade to a was answered 503 {tries} times, in {took:?} the last time: \
+             not sent again"
+        );
+        eprintln!("try {tries}: 503 in {took:?}; trying again");
+    };
+    eprintln!("101 after {took:?}, try {tries}");
     // Sent again: after b's heartbeat landed, two periods.
     assert!(
         took >= 2 * PERIOD,
         "answered in {took:?}: the first attempt was not refused, the retry not covered"
     );
 
-    // While b's heartbeat stays out of the bucket, the upgrade is not
-    // sent again: the client gets the 503, once b waited two periods for
-    // a heartbeat that did not land. (Every upgrade opens a connection: one
-    // that carried a WebSocket never goes back to b's pool.)
+    // While b's heartbeat stays out of the bucket, the client gets the
+    // 503, and only once b waited two periods for a heartbeat that did not
+    // land. Until a refuses b again the answer is still 101, and a refusal
+    // that reached b as a reset is a 503 at once: so each try is timed,
+    // and the stage ends on a 503 that took the two periods. (That b then
+    // gives up without sending the upgrade again is not seen from here:
+    // a would refuse it too.) Every upgrade opens a connection: one that
+    // carried a WebSocket never goes back to b's pool.
     b.gate.beats.store(false, Ordering::SeqCst);
     let since = Instant::now();
-    within(
-        "b's upgrades refused",
+    let (waited, at) = within(
+        "b's upgrades refused after the wait",
         since,
-        HORIZON + SLACK,
+        HORIZON + SLACK + 2 * PERIOD,
         move || async move {
+            let asked = Instant::now();
             let (status, body) = upgrade(b_addr, "/actor/t/on-a/ws").await;
-            (status == 503 && body == "the actor's node did not answer; retry").then_some(())
+            let waited = asked.elapsed();
+            (status == 503 && body == UNREAD && waited >= 2 * PERIOD).then_some(waited)
         },
     )
     .await;
+    eprintln!("503 after a wait of {waited:?}, {at:?} after b's heartbeat stopped");
 }
