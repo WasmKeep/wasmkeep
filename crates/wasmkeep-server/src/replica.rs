@@ -632,13 +632,21 @@ fn write_sidecar(db_path: &Path, head: SegmentId, sum: DbChecksum) -> Result<(),
 /// Moves a database the bucket is about to replace out of the way, as
 /// `<db>.replaced` (with its WAL as `<db>.replaced-wal`), instead of
 /// deleting it: it may hold data from before the node joined a cluster.
-/// One generation of it is kept.
+/// One generation of it is kept: the previous copy's WAL and shared
+/// memory are removed first, so an older WAL never sits beside a newer
+/// copy (SQLite would apply it when the copy is opened).
 fn set_aside(db_path: &Path) -> std::io::Result<()> {
     let with = |suffix: &str| {
         let mut p = db_path.as_os_str().to_owned();
         p.push(suffix);
         PathBuf::from(p)
     };
+    for gone in [".replaced-wal", ".replaced-shm"] {
+        match std::fs::remove_file(with(gone)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
     for (from, to) in [("", ".replaced"), ("-wal", ".replaced-wal")] {
         match std::fs::rename(with(from), with(to)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
@@ -1912,6 +1920,29 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
+
+    #[test]
+    fn set_aside_never_leaves_an_older_wal_beside_the_newer_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("a.db");
+        let at = |suffix: &str| dir.path().join(format!("a.db{suffix}"));
+        // The first replacement sets aside a database with its WAL.
+        std::fs::write(&db, "first").unwrap();
+        std::fs::write(at("-wal"), "first wal").unwrap();
+        set_aside(&db).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(at(".replaced-wal")).unwrap(),
+            "first wal"
+        );
+        // The second sets aside one without a WAL: the first one's WAL must
+        // not stay next to it, or SQLite would apply it on open.
+        std::fs::write(&db, "second").unwrap();
+        std::fs::write(at(".replaced-shm"), "stale").unwrap();
+        set_aside(&db).unwrap();
+        assert_eq!(std::fs::read_to_string(at(".replaced")).unwrap(), "second");
+        assert!(!at(".replaced-wal").exists());
+        assert!(!at(".replaced-shm").exists());
+    }
 
     async fn replica(dir: &Path) -> Replica {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
