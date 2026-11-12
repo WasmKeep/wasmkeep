@@ -37,7 +37,9 @@ else to run: no consensus cluster, no coordinator.
   it was written, since a request that was written may have run there,
   and the 503 does not say which it was. Only a connection kept open
   that the node had already closed costs nothing: it is replaced before
-  the request is written. A release that fails is retried in the
+  the request is written. (One exception: a WebSocket upgrade that node
+  refused at the TLS handshake is sent once more; see "A caller its peer
+  briefly stopped trusting" below.) A release that fails is retried in the
   background; until it lands, the record keeps naming the node.
 - A node that stops cleanly (`SIGTERM` or Ctrl-C) finishes its in-flight
   events, then releases its actors: the next request for one of them
@@ -314,8 +316,10 @@ bucket controls the cluster, as with the call secret.
   more periods passed (12 s at most with the defaults; it is not sent
   again if that heartbeat does not land within two periods); the peer
   never read the first one. Then it fails with "refused this node's certificate". A
-  forwarded request or WebSocket upgrade gets a 503 asking the client to
-  retry.
+  relayed WebSocket upgrade, which has no body, is sent once more the
+  same way, the client waiting meanwhile; if it is refused again, or the
+  heartbeat does not land, the client gets a 503 asking it to retry. A
+  forwarded request gets that 503 at once: its body is not kept.
 
 An upgrade of WasmKeep itself, including one that changes the format of
 signed calls, upgrades every node together ([below](#upgrading-wasmkeep)).

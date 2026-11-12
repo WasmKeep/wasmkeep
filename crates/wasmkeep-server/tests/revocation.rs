@@ -849,3 +849,78 @@ async fn a_call_refused_at_the_handshake_is_sent_again_once_the_caller_is_live()
         "failed:node a refused this node's certificate (this node's heartbeat is not live there)"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgrade_refused_at_the_handshake_is_sent_again_once_the_relay_is_live() {
+    // As for the call above: `b`'s heartbeat ages out in `a`'s view for a
+    // moment, and `b`'s first WebSocket upgrade to `a` opens a new
+    // connection on which `a` refuses `b`'s certificate. `a` never read
+    // the upgrade, and it has no body, so `b` sends it again once its
+    // heartbeat is live there instead of answering the client 503.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node("a", da.path(), &store).await;
+    let b = node("b", db.path(), &store).await;
+    let r = send(a.addr, "GET", "/actor/t/on-a/fired").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("a")),
+        "{}",
+        r.body
+    );
+    // b reaches a (a forwarded request; b's upgrade pool stays empty, so
+    // its first upgrade opens a connection).
+    let started = Instant::now();
+    while send(b.addr, "GET", "/actor/t/on-a/fired")
+        .await
+        .node
+        .as_deref()
+        != Some("a")
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "b never reached a"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // b's heartbeat stops reaching the bucket until a refuses b.
+    b.gate.beats.store(false, Ordering::SeqCst);
+    let (b_addr, since) = (b.addr, Instant::now());
+    within("a refusing b", since, HORIZON + SLACK, move || async move {
+        let r = send(b_addr, "GET", "/actor/t/on-a/fired").await;
+        (r.status == 503 && r.body == "the actor's node did not answer; retry").then_some(())
+    })
+    .await;
+
+    // The upgrade goes out while a refuses b; b's heartbeat lands right
+    // after.
+    let asked = Instant::now();
+    let relayed = tokio::spawn(async move { upgrade(b_addr, "/actor/t/on-a/ws").await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    b.gate.beats.store(true, Ordering::SeqCst);
+    let (status, body) = relayed.await.unwrap();
+    let took = asked.elapsed();
+    assert_eq!(status, 101, "b's upgrade to a: {status} {body}");
+    // Sent again: after b's heartbeat landed, two periods.
+    assert!(
+        took >= 2 * PERIOD,
+        "answered in {took:?}: the first attempt was not refused, the retry not covered"
+    );
+
+    // While b's heartbeat stays out of the bucket, the upgrade is not
+    // sent again: the client gets the 503. (b's pooled connection to a is
+    // refused first, with a's 503; then b handshakes again.)
+    b.gate.beats.store(false, Ordering::SeqCst);
+    let since = Instant::now();
+    within(
+        "b's upgrades refused",
+        since,
+        HORIZON + SLACK,
+        move || async move {
+            let (status, body) = upgrade(b_addr, "/actor/t/on-a/ws").await;
+            (status == 503 && body == "the actor's node did not answer; retry").then_some(())
+        },
+    )
+    .await;
+}

@@ -766,6 +766,14 @@ impl Cluster {
     /// Sends a WebSocket upgrade to the node that owns the actor and, once
     /// it answers 101, joins the client's connection to it. The owner holds
     /// the socket; this node only relays bytes.
+    ///
+    /// If the owner refuses this node's certificate at the handshake, the
+    /// upgrade is sent once more as [`Cluster::call`] sends a call again:
+    /// after this node's next heartbeat reached the bucket and two more
+    /// periods passed, the client waiting meanwhile; a 503 if that
+    /// heartbeat does not land within two periods, or if the second try
+    /// fails. Any other failure is a 503 at once: the owner may have read
+    /// the upgrade.
     pub(crate) async fn forward_upgrade(
         &self,
         owner: &str,
@@ -774,41 +782,63 @@ impl Cluster {
         if never_forward(&req) {
             return unavailable("actor ownership is changing; retry\n");
         }
-        let Some(base) = self.address_of(owner) else {
-            return unavailable("the actor's node is not reachable; retry\n");
-        };
-        let Some(path) = req.extensions().get::<OriginalPath>().map(|p| p.0.clone()) else {
-            return unavailable("cannot forward this request\n");
-        };
-        crate::metrics::inc(
-            &crate::metrics::METRICS
-                .forwards
-                .get(&[("kind", "websocket")]),
-        );
-        let mut out = Request::builder().method(hyper::Method::GET);
-        if let Some(headers) = out.headers_mut() {
-            *headers = upgrade_headers(req.headers());
-        }
-        let out = out
-            .uri(format!("{}{path}", base.trim_end_matches('/')))
-            .header(FORWARDED, "1")
-            .body(http_body_util::Empty::new());
-        let Ok(out) = out else {
-            return unavailable("bad advertised address\n");
-        };
-        if let Err(e) = self.check_tls_target(&base) {
-            tracing::warn!(owner, error = %e, "forwarding an upgrade refused");
-            return unavailable("the actor's node is not reachable; retry\n");
-        }
-        let revocation = self.revocation(&base);
-        let upgrade = self.clients().upgrade.clone();
-        let response = match tokio::time::timeout(FORWARD_TIMEOUT, upgrade.request(out)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                tracing::warn!(owner, error = %e, "forwarding an upgrade failed");
-                return unavailable("the actor's node did not answer; retry\n");
+        // Sent at most twice: the upgrade has no body, so it can be built
+        // again, and it is sent again only when the owner never read it.
+        let mut first = true;
+        let (base, revocation, response) = loop {
+            let Some(base) = self.address_of(owner) else {
+                return unavailable("the actor's node is not reachable; retry\n");
+            };
+            let Some(path) = req.extensions().get::<OriginalPath>().map(|p| p.0.clone()) else {
+                return unavailable("cannot forward this request\n");
+            };
+            if first {
+                crate::metrics::inc(
+                    &crate::metrics::METRICS
+                        .forwards
+                        .get(&[("kind", "websocket")]),
+                );
             }
-            Err(_) => return unavailable("the actor's node did not answer in time; retry\n"),
+            let mut out = Request::builder().method(hyper::Method::GET);
+            if let Some(headers) = out.headers_mut() {
+                *headers = upgrade_headers(req.headers());
+            }
+            let out = out
+                .uri(format!("{}{path}", base.trim_end_matches('/')))
+                .header(FORWARDED, "1")
+                .body(http_body_util::Empty::new());
+            let Ok(out) = out else {
+                return unavailable("bad advertised address\n");
+            };
+            if let Err(e) = self.check_tls_target(&base) {
+                tracing::warn!(owner, error = %e, "forwarding an upgrade refused");
+                return unavailable("the actor's node is not reachable; retry\n");
+            }
+            let revocation = self.revocation(&base);
+            let upgrade = self.clients().upgrade.clone();
+            match tokio::time::timeout(FORWARD_TIMEOUT, upgrade.request(out)).await {
+                Ok(Ok(r)) => break (base, revocation, r),
+                // As for `actors.call` (`Cluster::call`): refused at the
+                // handshake, so never read by the owner. Sent once more
+                // when this node's heartbeat is live there again; a 503
+                // at once if that heartbeat does not land.
+                Ok(Err(e)) if first && never_read_by_peer(&base, &e) => {
+                    first = false;
+                    tracing::info!(
+                        owner,
+                        "an upgrade's handshake was refused (this node's heartbeat is not live \
+                         there); sending it again after the next heartbeat"
+                    );
+                    if !self.heartbeat_lands_then_two_periods().await {
+                        return unavailable("the actor's node did not answer; retry\n");
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(owner, error = %e, "forwarding an upgrade failed");
+                    return unavailable("the actor's node did not answer; retry\n");
+                }
+                Err(_) => return unavailable("the actor's node did not answer in time; retry\n"),
+            }
         };
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             // The owner refused (or it moved again): pass its answer on,
@@ -1189,12 +1219,7 @@ impl Cluster {
             // Never read by the peer, so sent again once this node's
             // heartbeat is live there: a refused handshake, or a TLS
             // connection the refusal closed before the request was written.
-            Ok(Err(e))
-                if crate::cluster_tls::handshake_refused(&e)
-                    || (base.starts_with("https://") && crate::cluster_tls::request_unsent(&e)) =>
-            {
-                Err(CallFailure::HandshakeRefused)
-            }
+            Ok(Err(e)) if never_read_by_peer(&base, &e) => Err(CallFailure::HandshakeRefused),
             Ok(Err(e)) => Err(CallFailure::Other(format!("node {owner}: {e}"))),
             Err(_) => Err(CallFailure::Other(format!(
                 "node {owner} did not answer in time"
@@ -1507,9 +1532,11 @@ impl Cluster {
             // finds closed when it takes it from the pool.) The body
             // streams from the client, so the first two cannot be sent
             // again here either. Of the three users of the peer clients,
-            // only `actors.call` (`Cluster::call`) sends again, and only
-            // a request the owner refused at the handshake; this path and
-            // `Cluster::forward_upgrade` answer 503 for all of them.
+            // `actors.call` (`Cluster::call`) and a WebSocket upgrade
+            // (`Cluster::forward_upgrade`, which has no body) send again,
+            // once, a request the owner refused at the handshake
+            // (`never_read_by_peer`), and nothing else; this path answers
+            // 503 for all of them.
             Ok(Err(e)) => {
                 tracing::warn!(owner, error = %e, "forwarding failed");
                 unavailable("the actor's node did not answer; retry\n")
@@ -1523,6 +1550,18 @@ impl Cluster {
             }
         }
     }
+}
+
+/// Whether a request to the peer at `base` failed in a way that proves the
+/// peer never read it, so that sending it again cannot run it twice: the
+/// peer refused the TLS handshake (the request may have been written, TLS
+/// 1.3 letting this side write before the refusal arrives, but a peer
+/// whose handshake failed decrypts nothing), or, over TLS, the client
+/// handed the request back before writing any of it, as it does when the
+/// refusal closes a new connection first.
+fn never_read_by_peer(base: &str, error: &hyper_util::client::legacy::Error) -> bool {
+    crate::cluster_tls::handshake_refused(error)
+        || (base.starts_with("https://") && crate::cluster_tls::request_unsent(error))
 }
 
 /// Why a call to another node failed.
