@@ -94,8 +94,18 @@ pub(crate) fn body_sha256(body: &[u8]) -> String {
 /// the wire cannot be sent again. Each is remembered until its own
 /// timestamp leaves the window (after which [`verify`] refuses it anyway),
 /// and forgotten in expiry order, so the cost per call stays logarithmic.
-#[derive(Debug, Default)]
-pub(crate) struct SeenSignatures(Mutex<Seen>);
+#[derive(Debug)]
+pub(crate) struct SeenSignatures {
+    seen: Mutex<Seen>,
+    /// Which record this is, for the metric of refusals when full.
+    name: &'static str,
+}
+
+impl Default for SeenSignatures {
+    fn default() -> Self {
+        Self::named("calls")
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Seen {
@@ -114,10 +124,18 @@ pub(crate) struct Seen {
 pub(super) const MAX_SEEN: usize = 500_000;
 
 impl SeenSignatures {
+    /// An empty record, `name` in the metric of refusals when full.
+    pub(super) fn named(name: &'static str) -> Self {
+        Self {
+            seen: Mutex::default(),
+            name,
+        }
+    }
+
     /// Records `mac`, signed at `ts`; false if it was already used (or the
     /// record is full).
     pub(super) fn first_use(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {
-        let mut seen = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         seen.horizon = seen.horizon.max(now);
         let horizon = seen.horizon;
         while let Some(&(expiry, old)) = seen.by_expiry.first() {
@@ -133,7 +151,15 @@ impl SeenSignatures {
         if ts.saturating_add(SIGNATURE_WINDOW_MS) < horizon {
             return false;
         }
-        if seen.macs.len() >= MAX_SEEN || seen.macs.contains(&mac) {
+        if seen.macs.contains(&mac) {
+            return false;
+        }
+        if seen.macs.len() >= MAX_SEEN {
+            crate::metrics::inc(
+                &crate::metrics::METRICS
+                    .signatures_refused_full
+                    .get(&[("record", self.name)]),
+            );
             return false;
         }
         seen.macs.insert(mac);
@@ -144,7 +170,11 @@ impl SeenSignatures {
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).macs.len()
+        self.seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .macs
+            .len()
     }
 }
 

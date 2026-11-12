@@ -190,6 +190,9 @@ pub(crate) struct Metrics {
     /// still land later): a periodic one is tried again, see
     /// `Replica::snapshot_due`.
     pub(crate) snapshot_upload_failures: AtomicU64,
+    /// Node calls refused because the record of used signatures was full,
+    /// by record (`calls`; `control`, takes and alarm hand-offs).
+    pub(crate) signatures_refused_full: Family<AtomicU64>,
 }
 
 /// The process's metrics.
@@ -434,6 +437,12 @@ pub fn render(gauges: Gauges) -> String {
         "wasmkeep_snapshot_upload_failures_total",
         "Snapshot uploads not acknowledged; a periodic one is tried again.",
         m.snapshot_upload_failures.load(Ordering::Relaxed),
+    );
+    family(
+        &mut out,
+        "wasmkeep_signatures_refused_full_total",
+        "Node calls refused because the record of used signatures was full, by record.",
+        &m.signatures_refused_full,
     );
     out
 }

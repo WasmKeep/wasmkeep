@@ -292,6 +292,10 @@ pub(crate) struct Cluster {
     serves: String,
     /// Node signatures already accepted (replay protection).
     seen: SeenSignatures,
+    /// The same for take and alarm hand-off calls (ADR 0014, 0017), kept
+    /// apart: a flood of other signed calls that fills `seen` cannot
+    /// refuse the calls a drain and a move depend on.
+    seen_control: SeenSignatures,
     /// When each reason for refusing a node signature was last logged
     /// (ms): one slot per reason, so junk on the public port cannot hide a
     /// real refusal.
@@ -541,7 +545,8 @@ impl Cluster {
         let connector = ClusterConnector::new(tls.clone(), refuse_plaintext);
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
-            seen: SeenSignatures::default(),
+            seen: SeenSignatures::named("calls"),
+            seen_control: SeenSignatures::named("control"),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(
@@ -1017,8 +1022,11 @@ impl Cluster {
         let now = now_ms();
         match verify(secret, given, now, &self.node_id, method, path, headers) {
             Some(signed) if public_port => {
-                // Burnt, never honoured here.
-                self.seen.first_use(signed.mac, signed.ts, now);
+                // Burnt, never honoured here, in the record a node's call
+                // with the same markers would be checked against (both
+                // markers are signed).
+                let control = headers.contains_key(TAKE) || headers.contains_key(ALARM_HANDOFF);
+                self.record(control).first_use(signed.mac, signed.ts, now);
                 self.note_refused("signed call on the public port, treated as from outside (--cluster-plaintext refuse)");
                 None
             }
@@ -1034,13 +1042,25 @@ impl Cluster {
 
     /// Records a signature whose body matched; false if it was already used.
     /// Only then is it spent: a copy sent ahead with another body is
-    /// refused without using up the real call's signature.
-    pub(crate) fn first_use(&self, signed: &Signed) -> bool {
-        let fresh = self.seen.first_use(signed.mac, signed.ts, now_ms());
+    /// refused without using up the real call's signature. `control`: a
+    /// take or an alarm hand-off, recorded apart from other calls.
+    pub(crate) fn first_use(&self, signed: &Signed, control: bool) -> bool {
+        let fresh = self
+            .record(control)
+            .first_use(signed.mac, signed.ts, now_ms());
         if !fresh {
             self.note_refused("signature already used");
         }
         fresh
+    }
+
+    /// The record of used signatures for control calls, or for the rest.
+    fn record(&self, control: bool) -> &SeenSignatures {
+        if control {
+            &self.seen_control
+        } else {
+            &self.seen
+        }
     }
 
     /// A nonce for one signed call: this process's random seed and a

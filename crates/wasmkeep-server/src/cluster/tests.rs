@@ -2785,3 +2785,35 @@ async fn only_a_connection_that_could_not_be_opened_counts_as_a_failed_connect()
     let error = get(closing).await.unwrap_err();
     assert!(!error.is_connect(), "{error:?}");
 }
+
+/// Signatures of take and alarm hand-off calls are remembered apart: a
+/// flood of other node calls (or of signed upgrades) that fills the record
+/// must not refuse the calls a drain and a move depend on.
+#[tokio::test]
+async fn a_full_signature_record_still_accepts_control_calls() {
+    let cluster = node("a");
+    let now = now_ms();
+    let signed = |n: u32| {
+        let mut mac = [0u8; 32];
+        mac[..4].copy_from_slice(&n.to_le_bytes());
+        Signed {
+            mac,
+            ts: now,
+            body: String::new(),
+        }
+    };
+    for n in 0..u32::try_from(MAX_SEEN).unwrap() {
+        assert!(cluster.first_use(&signed(n), false), "refused call {n}");
+    }
+    let next = u32::try_from(MAX_SEEN).unwrap();
+    assert!(
+        !cluster.first_use(&signed(next), false),
+        "the record of calls is full"
+    );
+    assert!(
+        cluster.first_use(&signed(next + 1), true),
+        "a control call was refused"
+    );
+    // Still used once only, in its own record.
+    assert!(!cluster.first_use(&signed(next + 1), true), "replayed");
+}
