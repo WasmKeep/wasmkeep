@@ -229,8 +229,10 @@ it, and again after every WasmKeep upgrade:
    `wasmkeep serve --app acme/shop --bucket s3://scratch/prod --node-id drill ...`.
    Restored actors fire their overdue alarms and call out, and outbound
    HTTP reaches public addresses by default: if the actors send webhooks
-   or call an API, cut that machine's route to the internet first, and
-   give it no `--allow-outbound`.
+   or call an API, first block that machine's outbound traffic except to
+   the scratch bucket's endpoint (a firewall rule that allows only the
+   bucket), and give it no `--allow-outbound`. The node itself must
+   still reach the bucket: without it, it never starts serving.
 3. Request a sample of actors, including the largest databases and some
    that had not been written for a long time. A `500` is an actor that
    did not restore: look at the node's log for the missing object.
