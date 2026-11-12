@@ -132,11 +132,18 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   this node), and TLS peers are never reached in plaintext. The forwarded
   header gives no privilege on any port: it only stops a request being
   forwarded again.
-- One app per bucket prefix. A node refuses to start while a node of
-  another app of its tenant is live on the prefix; nothing else checks it
-  (`wasmkeep deploy` does not), and actors are keyed by tenant, class and
-  name, so a second app of the tenant on the same prefix shares the first
-  one's actors. Give each app its own prefix.
+- One app per tenant per bucket prefix, until each app owns its state
+  (planned for 0.4.0, [ADR 0021](adr/0021-the-app-model.md)). Actors are
+  keyed by tenant, class and name, so a second app of the tenant on the
+  same prefix would share the first one's actors. The first `wasmkeep
+  deploy` of an app refuses when another app of its tenant is deployed on
+  the prefix, and a node refuses to start while a node of another app of
+  its tenant is live there. Not caught: two apps of one tenant deployed on
+  one prefix before this check (they keep sharing actors; `deploy` and
+  `serve --app` warn), two first deploys at the same moment, and a deploy
+  by a CLI older than 0.3.0. Deploy the second app on another prefix, or
+  under another tenant if another owner runs it
+  ([deploying](cluster.md#deploying)).
 - One bucket prefix is one trust domain: every node on it signs calls with
   the same cluster secret, whatever app or tenant it serves.
 

@@ -1126,7 +1126,7 @@ async fn a_second_app_of_a_tenant_on_a_prefix_is_refused_and_an_existing_pair_ke
     for part in [
         "acme/shop",
         "another tenant",
-        "another bucket prefix",
+        "a bucket prefix other than",
         "apps/acme/shop/",
         "actors/acme/",
     ] {

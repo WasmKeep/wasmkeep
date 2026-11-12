@@ -24,7 +24,9 @@ Class and tenant are identifiers: lowercase letters, digits and `-`,
 starting with a letter, up to 64 bytes (`[a-z][a-z0-9-]{0,63}`). So is
 the app name in `--app TENANT/APP`: the first `wasmkeep deploy` of an app
 refuses a tenant or app name outside it. An app deployed before that rule
-keeps its name.
+keeps its name. Only the first deploy checks it: `wasmkeep secrets set`
+before that accepts any name, so set secrets after the first deploy, or
+check the name yourself.
 
 Over HTTP, an actor lives at `/actor/<class>/<name>`, and anything after the
 name is the path it sees:

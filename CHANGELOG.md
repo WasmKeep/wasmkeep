@@ -125,13 +125,14 @@ Since 0.2.0, in no release yet.
   WebSocket upgrades and actor calls a node refused before their event
   ran: `access`, `capacity`, `overloaded` or `unavailable`
   ([monitoring](docs/monitoring.md#metrics)).
-- **`deploy` refuses a second app of a tenant on a bucket prefix.** Its
-  actors are keyed by tenant, class and name, so it would share the first
-  app's actors without a word: until now only a node refused to start, and
+- **`deploy` refuses a second app of a tenant on a bucket prefix.**
+  Actors are keyed by tenant, class and name, so a second app would share
+  the first app's actors without a word: until now only a node refused to start, and
   only while a node of the other app was live. The first deploy of an app
   now lists `apps/<tenant>/` and refuses when another app there has a
-  `current`, naming it and saying what to do: another tenant or another
-  prefix, or, for an abandoned app, the keys to delete. Two apps of one
+  `current`, naming it and saying what to do: another prefix, or another
+  tenant when another owner runs the app, or, for an abandoned app, the
+  keys to delete. Two apps of one
   tenant already deployed on one prefix are left as they were (a node of
   one still refuses to start while a node of the other is live), and `deploy` and
   `serve --app` warn about them by name; a third is refused. This lasts

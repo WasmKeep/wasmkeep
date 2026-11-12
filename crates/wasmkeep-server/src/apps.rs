@@ -81,33 +81,51 @@ pub enum DeployError {
 /// keys an abandoned app leaves.
 fn other_apps_message(app: &str, others: &[String], prefix: &str) -> String {
     let (tenant, name) = app.split_once('/').unwrap_or((app, ""));
-    let keys = others
-        .iter()
-        .map(|o| format!("{prefix}apps/{o}/"))
-        .collect::<Vec<_>>();
-    let (listed, its, abandoned, keys) = match others {
+    let folder = |o: &String| format!("{prefix}apps/{o}/");
+    let here = if prefix.is_empty() {
+        "the bucket root".to_owned()
+    } else {
+        prefix.to_owned()
+    };
+    let (listed, its, free) = match others {
         [one] => (
             format!("{one} is"),
             "its",
-            format!("{one} is"),
-            keys.join(""),
+            format!(
+                "If {one} is abandoned, stop its nodes and delete {f}current: that alone frees \
+                 the tenant and keeps its versions and secrets; to remove the app, delete every \
+                 key under {f}.",
+                f = folder(one)
+            ),
         ),
         _ => (
             format!("{} are", others.join(" and ")),
             "their",
-            "one is".to_owned(),
-            format!("its folder ({})", keys.join(", ")),
+            format!(
+                "The new app is refused while any of them has a current, so this frees the \
+                 tenant only if every one of them is abandoned: stop their nodes and delete \
+                 each one's current ({}), which keeps their versions and secrets; to remove \
+                 them, delete every key under each folder ({}).",
+                others
+                    .iter()
+                    .map(|o| format!("{}current", folder(o)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                others.iter().map(folder).collect::<Vec<_>>().join(", ")
+            ),
         ),
     };
     format!(
         "{listed} already deployed on this bucket prefix: another app of tenant {tenant} \
          would share {its} actors, which are keyed by tenant, class and name, until each \
-         app owns its state (planned for 0.4.0). Deploy {app} under another tenant \
-         (--app OTHER/{name}) or another bucket prefix (--bucket s3://BUCKET/{name}). \
-         If {abandoned} abandoned, stop its nodes and delete every key under {keys} (its \
-         versions, current and secrets). Actors' data stays under {prefix}actors/{tenant}/, \
-         {prefix}owners/{tenant}/, {prefix}leases/{tenant}/ and {prefix}alarms/{tenant}/: \
-         a new app of {tenant} with a class of the same name finds those actors"
+         app owns its state (planned for 0.4.0). Deploy {app} on a bucket prefix other than \
+         {here} (--bucket s3://BUCKET/OTHER), or under another tenant if another owner runs \
+         it (--app OTHER/{name}); either way it starts with no data and no secrets. Another \
+         prefix is a separate cluster, and an app cannot move between prefixes later (its \
+         secrets are sealed to its prefix). {free} Actors' data stays under \
+         {prefix}actors/{tenant}/, {prefix}owners/{tenant}/, {prefix}leases/{tenant}/ and \
+         {prefix}alarms/{tenant}/: a new app of {tenant} with a class of the same name finds \
+         those actors"
     )
 }
 
@@ -1243,6 +1261,25 @@ mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
     use super::*;
+
+    #[test]
+    fn the_second_app_error_says_every_other_app_must_go_and_keeps_the_prefix() {
+        let two = vec!["acme/legacy".to_owned(), "acme/shop".to_owned()];
+        let e = other_apps_message("acme/blog", &two, "team/prod/");
+        // Deleting one of two still leaves the other: both must go.
+        assert!(e.contains("every one of them"), "{e}");
+        assert!(!e.contains("If one is abandoned"), "{e}");
+        assert!(e.contains("team/prod/apps/acme/legacy/current"), "{e}");
+        assert!(e.contains("team/prod/apps/acme/shop/current"), "{e}");
+        // The other-prefix hint names a prefix other than the one in use.
+        assert!(e.contains("other than team/prod/"), "{e}");
+        assert!(e.contains("sealed to its prefix"), "{e}");
+        let one = other_apps_message("acme/blog", &two[..1], "");
+        assert!(e.contains("acme/legacy and acme/shop are"), "{e}");
+        assert!(one.contains("If acme/legacy is abandoned"), "{one}");
+        assert!(one.contains("apps/acme/legacy/current"), "{one}");
+        assert!(one.contains("other than the bucket root"), "{one}");
+    }
 
     fn two_classes() -> Manifest {
         Manifest {

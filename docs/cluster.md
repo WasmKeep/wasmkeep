@@ -614,18 +614,31 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   Actors are keyed by tenant, class and name, so two apps of one tenant on
   the same prefix would share actors. The first `deploy` of an app refuses
   when another app of its tenant is deployed on the prefix (it has
-  `apps/<tenant>/<app>/current`), naming that app: deploy the new one under
-  another tenant (`--app acme-admin/admin`) or prefix
-  (`s3://bucket/admin`). A node also refuses to start when a live node on
-  its prefix serves another app of its tenant. Two apps of one tenant
-  deployed on one prefix before this check are left as they were (in a
-  cluster, still not running at the same time), and `deploy` and `serve`
-  warn about them by name; a third is refused. There is no `app
-  delete` yet: to free the tenant from an app nobody runs, stop its nodes
-  and delete every key under `apps/<tenant>/<app>/` (its versions,
-  `current` and secrets). Its actors' data stays under `actors/<tenant>/`,
-  `owners/<tenant>/`, `leases/<tenant>/` and `alarms/<tenant>/`, and the
-  next app of the tenant finds the actors of any class with the same name.
+  `apps/<tenant>/<app>/current`), naming that app: deploy the new one on
+  another prefix (`s3://bucket/admin`), or under another tenant if
+  another owner runs it (`--app globex/admin`). Another prefix is a
+  separate cluster with its own cluster secret: the app starts there with
+  no data, its secrets are set again, and it cannot be moved to another
+  prefix later (its secrets are sealed to the prefix). A node also refuses
+  to start when a live node on its prefix serves another app of its
+  tenant. Two apps of one tenant deployed on one prefix before this check
+  are left as they were (in a cluster, still not running at the same
+  time), and `deploy` and `serve` warn about them by name; a further one
+  is refused while any of them has a `current`. The first deploy needs
+  list access to `<prefix>apps/<tenant>/` (a listing that fails refuses);
+  two first deploys at the same moment can both pass it. There is no `app
+  delete` yet. To free the tenant from an app nobody runs, stop its nodes
+  and delete its `current`, which keeps its versions and secrets:
+
+  ```bash
+  aws s3 rm s3://wasmkeep-demo/apps/acme/legacy/current
+  # or remove the app entirely (its versions, current and secrets):
+  aws s3 rm --recursive s3://wasmkeep-demo/apps/acme/legacy/
+  ```
+
+  Its actors' data stays under `actors/<tenant>/`, `owners/<tenant>/`,
+  `leases/<tenant>/` and `alarms/<tenant>/`, and the next app of the
+  tenant finds the actors of any class with the same name.
 - The tenant and app names of a new app match `[a-z][a-z0-9-]{0,63}`; an
   app deployed earlier keeps its name.
 - `deploy` compiles and checks every component before uploading anything;

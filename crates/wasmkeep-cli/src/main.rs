@@ -661,8 +661,10 @@ pub(crate) fn shared_prefix_warning(app: &str, others: &[String]) -> Option<Stri
              (keyed by tenant, class and name), and a class of the same name in both reaches \
              the same actors. Nothing else changes for them (in a cluster, a node still refuses to \
              start while a node of the other app is live); a further app of the tenant is refused. \
-             To separate them, deploy one under another tenant or bucket prefix (it starts \
-             with no data) and stop the old one",
+             To separate them, deploy one on another bucket prefix, or under another tenant if \
+             another owner runs it: it starts with no data and its secrets are set again, and an \
+             app cannot move between prefixes later (its secrets are sealed to its prefix). Then \
+             stop the old one",
             others.join(" and ")
         )
     })
@@ -1073,8 +1075,8 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         anyhow::ensure!(
             mixed.is_empty(),
             "another app of this tenant already runs on this bucket prefix ({}): \
-             their actors would share data. Give each app its own --bucket prefix \
-             (s3://bucket/<app>).",
+             their actors would share data. Deploy one on another --bucket prefix, or under \
+             another tenant if another owner runs it (docs/cluster.md, Deploying).",
             mixed.join(", ")
         );
         if let Some((app_ref, _)) = follow.take() {

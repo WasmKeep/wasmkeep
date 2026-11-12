@@ -48,8 +48,8 @@ app is not one thing yet:
   unrelated once apps own their state.
 - **Actor**: one instance of a class, by name, with its own database.
   Inside an app it is addressed `class/name`. The address a guest sees
-  stays `tenant/class/name`, relative to its own app: no WIT change, no
-  rebuild.
+  stays `tenant/class/name` (planned, 0.4.0: read relative to its own
+  app), so no WIT change and no rebuild.
 - **Front** (planned, 0.4.0): the app's optional stateless `wasi:http`
   component. It receives every request outside `/actor/` and
   `/_wasmkeep/`, holds no state, calls the app's actors with the same
@@ -63,8 +63,9 @@ is checked by the first deploy, while the app has no `current`.
 
 ### An app owns its actors (planned, 0.4.0)
 
-Two apps never share actors, whatever bucket prefix they use. Each app's
-actor state lives under its own root in the bucket and on disk. Existing
+Two apps never share actors, whatever bucket prefix they use: each app's
+actor state is kept apart from other apps', in the bucket and on disk
+(the layout is fixed by its own ADR). Existing
 data moves there once, by a migration, rather than keeping today's layout
 beside the new one for good. The layout and the migration are fixed by
 their own ADR.
@@ -72,8 +73,8 @@ their own ADR.
 Until then, **one app per tenant per bucket prefix**, enforced by
 `deploy`: the first deploy of an app lists `apps/<tenant>/` and refuses
 when another app there has a `current`, naming it and saying what to do
-(another tenant or another prefix; for an abandoned app, the keys to
-delete). A listing that fails refuses too. Two apps of one tenant already
+(another prefix, or another tenant when another owner runs the app; for
+an abandoned app, the keys to delete). A listing that fails refuses too. Two apps of one tenant already
 deployed together on one prefix are left as they were, and `deploy` and
 `serve --app` warn about them by name; a further one is refused. The check adds
 no object to the bucket. The node's start check against a live node of
@@ -99,8 +100,11 @@ they are not isolation from a hostile one
 
 ## Consequences
 
-- No app shares actors with another app by mistake after 0.3.0: the
-  sharing that was possible without a word is refused at deploy.
+- A first deploy with a 0.3.0 CLI no longer creates a second app of a
+  tenant on a prefix without a word. It does not catch pairs deployed
+  before the check (they keep sharing actors, with a warning), deploys by
+  older CLIs, two first deploys at the same moment, or a new app that
+  finds the actors an abandoned app left.
 - A tenant is blocked on a prefix by an app nobody runs any more, until
   someone deletes its keys under `apps/<tenant>/<app>/`. There is no
   `app delete`; the error and [the deploy docs](../cluster.md#deploying)
@@ -112,8 +116,8 @@ they are not isolation from a hostile one
 - Apps split onto separate prefixes to satisfy the check stay where they
   are when 0.4.0 lifts it: moving an app to another prefix breaks its
   sealed secrets (ADR 0016).
-- Metric labels, `cluster status` and errors use the same words: tenant,
-  app, class, actor.
+- Metric labels, `cluster status` and errors are to use the same words
+  (tenant, app, class, actor) as they gain app-level detail (planned).
 
 ## Alternatives
 
