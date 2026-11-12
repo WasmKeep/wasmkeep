@@ -909,8 +909,9 @@ async fn an_upgrade_refused_at_the_handshake_is_sent_again_once_the_relay_is_liv
     );
 
     // While b's heartbeat stays out of the bucket, the upgrade is not
-    // sent again: the client gets the 503. (b's pooled connection to a is
-    // refused first, with a's 503; then b handshakes again.)
+    // sent again: the client gets the 503, once b waited two periods for
+    // a heartbeat that did not land. (Every upgrade opens a connection: one
+    // that carried a WebSocket never goes back to b's pool.)
     b.gate.beats.store(false, Ordering::SeqCst);
     let since = Instant::now();
     within(
