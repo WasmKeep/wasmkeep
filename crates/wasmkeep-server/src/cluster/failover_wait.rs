@@ -19,7 +19,9 @@ const FAILOVER_WAIT_PER_ACTOR: usize = 64;
 
 /// The least time between two tries of one kept request: past the time a
 /// node trusts "another node holds this actor" without asking the bucket,
-/// so a try is never answered from memory.
+/// so a try is not answered from what an earlier try of the same request
+/// left in memory. (`ActorService::hold` also forgets the owner before
+/// each try; what another request learnt meanwhile can still answer one.)
 const RETRY_MS: u64 = crate::actor::HINT_MS + 100;
 
 /// The first try once an actor looks free waits up to this long, by actor:
@@ -162,8 +164,13 @@ impl FailoverWait {
         }
     }
 
-    /// A connection to `node` could not be opened. A hint for requests that
-    /// arrive later; the request that found it out has its answer.
+    /// A connection to `node` could not be opened, as far as the HTTP
+    /// client tells: its `is_connect` also covers a failure on this side
+    /// (no socket or port left) and, rarely, a pooled connection that
+    /// could not be handed out. A hint for requests that arrive later;
+    /// the request that found it out has its answer. A wrong mark on a
+    /// live node costs those requests a few seconds, until a listing shows
+    /// its next lease write.
     pub(super) fn connect_failed(&self, node: &str, error: &hyper_util::client::legacy::Error) {
         if self.enabled() && error.is_connect() {
             self.watch().connect_failed(node, now_ms());

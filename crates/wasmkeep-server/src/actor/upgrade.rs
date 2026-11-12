@@ -41,7 +41,8 @@ impl ActorService {
         }
         // An upgrade from outside can wait for a dead node's actor to be
         // taken over (`ActorService::hold`): nothing of it was sent on, and
-        // it has no body. Its deadline counts from now.
+        // nothing of a body is read or buffered while it is kept. Its
+        // deadline counts from now.
         let deadline = self
             .inner
             .cluster

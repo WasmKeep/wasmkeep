@@ -2733,8 +2733,10 @@ async fn a_fence_or_a_listing_wakes_a_kept_request_and_a_renewal_releases_it() {
 }
 
 /// The mark behind a suspected peer relies on the HTTP client saying
-/// `is_connect` only for a connection it could not open, so before any
-/// request was handed to one. To check again when hyper-util moves.
+/// `is_connect` only before a request was handed to a connection: for a
+/// connection it could not open (checked here), and for a pooled one it
+/// could not hand out (rare, not checked). To check again when hyper-util
+/// moves.
 #[tokio::test]
 async fn only_a_connection_that_could_not_be_opened_counts_as_a_failed_connect() {
     let client = peer_client_builder(Duration::from_secs(1))

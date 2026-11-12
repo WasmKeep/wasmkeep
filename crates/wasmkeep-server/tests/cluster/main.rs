@@ -248,6 +248,10 @@ struct PeerProxy {
     next: Arc<AtomicU8>,
     /// Bumped to close every connection open now.
     close: tokio::sync::watch::Sender<u64>,
+    /// Where it listens.
+    addr: SocketAddr,
+    /// Set to stop listening: connections to it are refused from then on.
+    refuse: tokio::sync::watch::Sender<bool>,
 }
 
 impl PeerProxy {
@@ -255,6 +259,23 @@ impl PeerProxy {
     /// does to one it kept idle too long.
     fn close_connections(&self) {
         self.close.send_modify(|n| *n += 1);
+    }
+
+    /// Stops listening and closes every connection: from now on a peer's
+    /// connection to the node behind is refused, as by a firewall or a
+    /// listener that is gone, while the node itself runs on.
+    async fn refuse_connections(&self) {
+        self.refuse.send_replace(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(self.addr).await.is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the proxy at {} still accepts connections",
+                self.addr
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.close_connections();
     }
 
     /// The next bytes a peer sends are dropped and their connection closed.
@@ -276,9 +297,18 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
     let accepted = Arc::new(AtomicUsize::new(0));
     let next = Arc::new(AtomicU8::new(PROXY_PASS));
     let (close, closed) = tokio::sync::watch::channel(0u64);
+    let (refuse, mut refused) = tokio::sync::watch::channel(false);
     let (count, mode) = (Arc::clone(&accepted), Arc::clone(&next));
     tokio::spawn(async move {
-        while let Ok((inbound, _)) = listener.accept().await {
+        loop {
+            let inbound = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((inbound, _)) => inbound,
+                    Err(_) => break,
+                },
+                // Dropping the listener is what refuses connections.
+                Ok(()) = refused.changed() => break,
+            };
             count.fetch_add(1, Ordering::SeqCst);
             let (mode, mut closed) = (Arc::clone(&mode), closed.clone());
             closed.mark_unchanged();
@@ -300,6 +330,8 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
             accepted,
             next,
             close,
+            addr,
+            refuse,
         },
     )
 }

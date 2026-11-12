@@ -24,15 +24,18 @@ struct Duo {
     fa: Arc<Flaky>,
     fb: Arc<Flaky>,
     shared: Arc<dyn ObjectStore>,
+    /// What b reaches a through, if the test asked for one.
+    proxy: Option<PeerProxy>,
     metrics: SocketAddr,
     _dirs: [tempfile::TempDir; 2],
 }
 
 async fn duo(wait: Duration, max: usize) -> Duo {
-    duo_with(wait, max, "t", test_actor_wasm()).await
+    duo_with(wait, max, "t", test_actor_wasm(), false).await
 }
 
-async fn duo_with(wait: Duration, max: usize, class: &str, wasm: &[u8]) -> Duo {
+/// `proxied`: b reaches a through a [`PeerProxy`].
+async fn duo_with(wait: Duration, max: usize, class: &str, wasm: &[u8], proxied: bool) -> Duo {
     let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let flaky = || {
         Arc::new(Flaky::new(
@@ -42,8 +45,8 @@ async fn duo_with(wait: Duration, max: usize, class: &str, wasm: &[u8]) -> Duo {
     };
     let (fa, fb) = (flaky(), flaky());
     let dirs = [(); 2].map(|()| tempfile::tempdir().unwrap());
-    let start = async |id: &str, store: Arc<dyn ObjectStore>, dir: &Path| {
-        node_configured(
+    let start = async |id: &str, store: Arc<dyn ObjectStore>, dir: &Path, proxied: bool| {
+        start_node(
             id,
             dir,
             &store,
@@ -57,11 +60,24 @@ async fn duo_with(wait: Duration, max: usize, class: &str, wasm: &[u8]) -> Duo {
                 cluster.failover_wait = Some(wait);
                 cluster.failover_wait_max = max;
             },
+            proxied,
         )
         .await
     };
-    let a = start("a", Arc::clone(&fa) as Arc<dyn ObjectStore>, dirs[0].path()).await;
-    let b = start("b", Arc::clone(&fb) as Arc<dyn ObjectStore>, dirs[1].path()).await;
+    let (a, proxy) = start(
+        "a",
+        Arc::clone(&fa) as Arc<dyn ObjectStore>,
+        dirs[0].path(),
+        proxied,
+    )
+    .await;
+    let (b, _) = start(
+        "b",
+        Arc::clone(&fb) as Arc<dyn ObjectStore>,
+        dirs[1].path(),
+        false,
+    )
+    .await;
     settle().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let metrics = listener.local_addr().unwrap();
@@ -76,6 +92,7 @@ async fn duo_with(wait: Duration, max: usize, class: &str, wasm: &[u8]) -> Duo {
         fa,
         fb,
         shared,
+        proxy,
         metrics,
         _dirs: dirs,
     }
@@ -235,7 +252,7 @@ async fn an_upgrade_for_a_dead_nodes_actor_waits_and_opens_on_the_new_owner() {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
-    let mut d = duo_with(KEPT, 100, "chat", chat_wasm()).await;
+    let mut d = duo_with(KEPT, 100, "chat", chat_wasm(), false).await;
     let (mut alice, _) = connect_async(format!("ws://{}/actor/chat/lobby", d.a()))
         .await
         .unwrap();
@@ -247,7 +264,7 @@ async fn an_upgrade_for_a_dead_nodes_actor_waits_and_opens_on_the_new_owner() {
     d.kill_a().await;
     // Until a left b's view (an upgrade that finds a's ports closed gets
     // the 503 as ever).
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    d.a_left_the_view("/actor/chat/lobby").await;
     let last_write = d.a_last_wrote_ms().await;
 
     // One upgrade, never sent again: 101 once b took the room over.
@@ -515,6 +532,68 @@ async fn a_live_owner_that_is_only_slow_is_not_treated_as_dead() {
         owner_record(&d.shared, "x").await.unwrap(),
         (Some("a".to_owned()), generation),
         "a still holds x, never taken over"
+    );
+}
+
+/// A node that is alive, and renews its lease, but refuses this node's
+/// connections: the requests after the one that found it out are kept only
+/// until its next lease write shows it alive, then answered as without
+/// the wait. Nobody waits out the bound, and nobody takes its actors.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_that_is_alive_but_refuses_connections_is_not_waited_out() {
+    const DID_NOT_ANSWER: &str = "the actor's node did not answer; retry";
+    let d = duo_with(KEPT, 100, "t", test_actor_wasm(), true).await;
+    let r = send(d.a(), "POST", "/actor/t/x/durable", "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("a")),
+        "{}",
+        r.body
+    );
+    let generation = owner_record(&d.shared, "x").await.unwrap().1;
+    d.proxy.as_ref().unwrap().refuse_connections().await;
+
+    // The first GET finds the refusal out and marks a; one after it is
+    // kept, until b lists a lease write of a later than the refusal. Each
+    // gets the answer of a refused connection, long before the wait's
+    // bound.
+    let mut asked = 0;
+    while d.waits("request", "owner_alive").await == 0 {
+        asked += 1;
+        assert!(asked <= 20, "no request was kept and then released");
+        let started = std::time::Instant::now();
+        let r = send(d.b.addr, "GET", "/actor/t/x/durable", "").await;
+        assert_eq!(
+            (r.status, r.body.trim(), r.retry_after.as_deref()),
+            (503, DID_NOT_ANSWER, Some("1")),
+        );
+        assert!(
+            started.elapsed() < KEPT / 2,
+            "a live owner was waited for {:?}",
+            started.elapsed()
+        );
+    }
+    assert!(
+        asked >= 2,
+        "the request that found the refusal out was kept"
+    );
+    for outcome in ["served", "forwarded", "expired", "answered_other"] {
+        assert_eq!(d.waits("request", outcome).await, 0, "{outcome}");
+    }
+
+    // a lost nothing: it still holds x at the same generation, was never
+    // fenced, and serves what reaches it.
+    assert_eq!(d.metric("wasmkeep_node_fences_total").await, 0);
+    assert_eq!(d.metric("wasmkeep_failovers_total").await, 0);
+    assert_eq!(
+        owner_record(&d.shared, "x").await.unwrap(),
+        (Some("a".to_owned()), generation),
+        "a still holds x, never taken over"
+    );
+    let r = send(d.a(), "GET", "/actor/t/x/durable", "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref(), r.body.trim()),
+        (200, Some("a"), "1")
     );
 }
 
