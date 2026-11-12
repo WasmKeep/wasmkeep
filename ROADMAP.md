@@ -27,37 +27,44 @@ leave running.**
    instead of being refused meanwhile. The wait before a takeover does not
    change: one writer at a time is what it protects.
 4. **What running Watch showed is missing**: a guide to back up and restore
-   a cluster's bucket, alert rules as a file, updating a stateless
-   component across a cluster, and a page that says plainly what happens
-   when a node dies, what scales and what does not.
+   a cluster's bucket, alert rules as a file, and a page that says plainly
+   what happens when a node dies, what scales and what does not.
 5. **Tests that depend on timing** wait on events instead of the clock.
 6. **A twelve-hour soak** of the release candidate.
 
 ## Next
 
-`0.4.0`: **operable by someone who did not write it.**
+`0.4.0`: **an app is one thing.**
 
-1. **Mixed versions during an upgrade.** Today every node is upgraded
-   together ([how](docs/cluster.md#upgrading-wasmkeep)).
-2. **The remaining operator commands**: inspect or export one actor,
-   verify a bucket.
-3. **Load you can see**: actors and work per node, in the metrics and in
-   `wasmkeep cluster status`.
-4. **Traces.**
-5. Whatever running our own app shows is missing.
+1. **A front for each app**: the stateless component receives every
+   request outside `/actor/`, calls the app's actors with the same call
+   actors use between themselves, and is deployed, versioned and rolled
+   back with them. Routing, sign-in and hostnames are handled there, in
+   the app's own code. Rust and TypeScript first.
+2. **A project file**, `wasmkeep.toml`, read by `wasmkeep deploy` and
+   `wasmkeep dev`: the deployed app is what the file says.
+3. **An app owns its actors**: two apps never share actors, whatever bucket
+   they use. Each class says who may reach it; with a project file a class
+   is reachable only from inside the app unless it says otherwise.
+4. **Load you can see**: actors and work per node and per app, in the
+   metrics and in `wasmkeep cluster status`.
 
 ## Then
 
-`0.5.0`: **several apps and tenants on the same nodes.**
+`0.5.0`: **several apps on the same nodes.** For one owner's apps and for
+tenants the operator trusts: the limits are protection against a noisy
+neighbour, not isolation from a hostile one
+([security](docs/security.md)).
 
-1. **Several tenants per process**, with limits per tenant.
-2. **Placement when an actor wakes**: on a node with room, not only where
+1. **Several apps per process**, and a table from hostname to app kept by
+   the operator.
+2. **Limits per app** on each node, and suspending an app.
+3. **Placement when an actor wakes**: on a node with room, not only where
    its request arrived. Most actors sleep most of the time, so this spreads
    load without moving anything that is running.
-3. **Automatic moves of running actors**, slowly and within limits, if
+4. **Automatic moves of running actors**, slowly and within limits, if
    placement at wake-up is not enough. Until then an operator moves an
-   actor or drains a node
-   ([how](docs/cluster.md)).
+   actor or drains a node ([how](docs/cluster.md)).
 
 An actor runs on one node at a time, by design: a single actor that is too
 busy is split into more actors by its application, not by the platform.
@@ -66,6 +73,10 @@ busy is split into more actors by its application, not by the platform.
 
 Not before the releases above.
 
+- **Operating without the author**: mixed versions during an upgrade
+  (today every node is upgraded together,
+  [how](docs/cluster.md#upgrading-wasmkeep)); inspect or export one actor;
+  verify a bucket; traces.
 - **Faster, and compared.** Performance targets on dedicated hardware
   with a stated scale envelope; a plain write that does not hold its
   actor during the upload; the comparison with celld on a cloud bucket
