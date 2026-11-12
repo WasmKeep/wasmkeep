@@ -59,3 +59,4 @@
 - [0018 QuickJS, the default TypeScript engine](adr/0018-quickjs-the-default-typescript-engine.md)
 - [0019 Workflows as an SDK pattern](adr/0019-workflows-as-an-sdk-pattern.md)
 - [0020 One lease per node](adr/0020-one-lease-per-node.md)
+- [0021 The app model](adr/0021-the-app-model.md)

@@ -610,7 +610,7 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
 ```
 
 - **One app per tenant per bucket prefix**, until each app owns its
-  actors' state (planned for 0.4.0).
+  actors' state (planned for 0.4.0, [ADR 0021](adr/0021-the-app-model.md)).
   Actors are keyed by tenant, class and name, so two apps of one tenant on
   the same prefix would share actors. The first `deploy` of an app refuses
   when another app of its tenant is deployed on the prefix (it has

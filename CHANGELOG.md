@@ -136,6 +136,12 @@ Since 0.2.0, in no release yet.
   `serve --app` warn about them by name; a third is refused. This lasts
   until apps own their state (planned for 0.4.0,
   [deploying](docs/cluster.md#deploying)).
+- **ADR 0021, the app model**: an app is `tenant/app`, the unit of deploy,
+  rollback, secrets and (from 0.4.0) state; the tenant is the owner of
+  apps; what 0.4.0 plans (a front deployed with the app, app-owned state
+  with a one-time migration, classes `internal` by default with a project
+  file) and later (shared nodes for trusted tenants)
+  ([ADR 0021](docs/adr/0021-the-app-model.md)).
 - **A new app's tenant and app names follow the class grammar**,
   `[a-z][a-z0-9-]{0,63}`: the first `wasmkeep deploy` of an app refuses
   others, and writes nothing. Actor addresses already required it of the

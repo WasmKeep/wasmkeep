@@ -14,8 +14,11 @@ An actor's address is `tenant/class/name`:
 - **name**: 1 to 256 bytes of any text without `/` or control characters,
   other than `.` and `..`. Every distinct name is a separate actor with its
   own database. There is no "create" step: the first event to a name creates it.
-- **tenant**: the owner of a set of classes. A node started with `--actor`
-  serves the tenant `default`; `--app acme/shop` serves tenant `acme`.
+- **tenant**: the owner of apps (a team, or a client of the operator; not
+  a customer of your app, which is an actor name). A node started with
+  `--actor` serves the tenant `default`; `--app acme/shop` serves app
+  `shop` of tenant `acme`. What an app is, and what is planned for it, is
+  in [ADR 0021](adr/0021-the-app-model.md).
 
 Class and tenant are identifiers: lowercase letters, digits and `-`,
 starting with a letter, up to 64 bytes (`[a-z][a-z0-9-]{0,63}`). So is
