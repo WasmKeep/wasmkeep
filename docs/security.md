@@ -26,8 +26,9 @@ limits below are enforced by the code (each has a test), not aspirations.
 - Request bodies: 16 MB (413 when declared larger; a failed read past it).
   What a handler leaves unread is read and discarded, within the same
   16 MB and for at most 30 s after the handler let go of the body
-  (not the body of a client still waiting for `100 Continue`: it is
-  never asked for).
+  (not the body of a request sent with `Expect: 100-continue` whose
+  handler read none of it: it is never asked for, see
+  [concepts](concepts.md)).
 - WebSockets: 1 MiB per client message, 256 messages or 4 MiB queued per
   client, 1,000 sockets per actor and 50,000 per node, idle clients pinged
   then closed.
