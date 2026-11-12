@@ -168,7 +168,9 @@ impl ReadTime {
 /// bytes counted in flight. Held while the bucket is asked and answers,
 /// and given up for the pause before a resend ([`READ_PAUSE`]): a read
 /// that only waits keeps no other restore's read waiting, and its bytes,
-/// which nobody is reading, add nothing to the other reads' limits.
+/// which nobody is reading, add nothing to the other reads' limits. A
+/// read keeps nothing of a failed try's answer while it is without its
+/// megabytes, which are what bounds the memory of the node's reads.
 struct Turn {
     megabytes: u32,
     counted: u64,
@@ -246,9 +248,9 @@ const READ_ATTEMPTS: u32 = 3;
 /// cut half-way) is sent again after this pause, doubled each time, and
 /// counts among the read's [`READ_ATTEMPTS`]: a GET changes nothing, so
 /// sending it again is always safe. The read gives up its place under
-/// the node's limits on reads while it pauses ([`Turn`]). Without it one such answer among a
-/// chain's reads failed the whole restore and the event that woke the
-/// actor.
+/// the node's limits on reads while it pauses ([`Turn`]). Without a
+/// resend one such answer among a chain's reads failed the whole restore
+/// and the event that woke the actor.
 const READ_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A restore's reads together (every object, every resend) end within
@@ -299,9 +301,9 @@ const READ_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 /// The worst case. Bytes in flight on the node never pass
 /// [`RESTORE_READ_MIB`] megabytes (a read counts for at most
 /// [`RESTORE_READ_ONE_MIB`], as its permits do), so a try's lift is at
-/// most 256 s and an object's, three tries, 768 s. A restore's waits for
-/// the bucket therefore end within its allowed time plus 768 s per object
-/// it reads:
+/// most 256 s and an object's, three tries, 768 s. The waits that count
+/// (for the bucket to give the next object, the read having its place)
+/// therefore end within the allowed time plus 768 s per object read:
 /// reached only while other restores keep 256 MiB in flight and every
 /// one of its reads uses three tries to the end of their lifted limits.
 /// That is no more than the reads' own bounds give, which is what bounded
@@ -320,9 +322,9 @@ const READ_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 ///   ([`RESTORE_READS`], [`RESTORE_READ_MIB`]) before it is even asked
 ///   for, as it is not in a read's own time, or waits for it again after
 ///   the pause before a resend ([`Turn`]; the pause itself counts). The
-///   queue always moves,
-///   since every read holding a place in it is bounded; while it lasts,
-///   the deadline does not bound what a caller waits;
+///   queue always moves, since every read holding a place in it is
+///   bounded; while it lasts, the deadline does not bound what a caller
+///   waits;
 /// - checking the local file, creating the file the database is built
 ///   in, applying an object to it or putting the finished database in
 ///   place: local work, sized by the database and not by the compressed
@@ -1802,6 +1804,9 @@ async fn bounded_get(
                     return Err(ReplicaError::Bucket(e.to_string()));
                 }
                 Ok(Some(Err(e))) => {
+                    // Nothing of this answer is kept through the pause:
+                    // the read has no megabytes then to count it by.
+                    drop((body, bytes));
                     last = refused(e).await?;
                     continue 'attempts;
                 }
@@ -2057,6 +2062,11 @@ mod tests {
         fail_next: std::sync::atomic::AtomicU32,
         /// The next segment reads (a read-back's HEAD or GET) fail.
         fail_get_next: std::sync::atomic::AtomicU32,
+        /// The next segment reads are answered, then their body breaks
+        /// half-way; `cut_bodies` is held by each such body while it
+        /// lives.
+        cut_get_next: std::sync::atomic::AtomicU32,
+        cut_bodies: Arc<()>,
         /// Runs `on_put` right before the segment upload of this number
         /// (1 is the first; 0: never): the lease lapsing as a resend goes.
         call_at_put: std::sync::atomic::AtomicU32,
@@ -2140,6 +2150,33 @@ mod tests {
                     source: "connection reset".into(),
                 });
             }
+            if location.as_ref().contains("/wal/") && take(&self.cut_get_next) {
+                use futures_util::StreamExt;
+                let got = self.inner.get_opts(location, options).await?;
+                let (meta, range, attributes) =
+                    (got.meta.clone(), got.range.clone(), got.attributes.clone());
+                let extensions = got.extensions.clone();
+                let half = usize::try_from(meta.size / 2).unwrap();
+                let half = got.bytes().await?.slice(..half);
+                let alive = Arc::clone(&self.cut_bodies);
+                let pieces = [
+                    Ok(half),
+                    Err(object_store::Error::Generic {
+                        store: "PutFaults",
+                        source: "connection reset".into(),
+                    }),
+                ];
+                let stream = futures_util::stream::iter(pieces).inspect(move |_| {
+                    let _ = &alive;
+                });
+                return Ok(object_store::GetResult {
+                    payload: object_store::GetResultPayload::Stream(Box::pin(stream)),
+                    meta,
+                    range,
+                    attributes,
+                    extensions,
+                });
+            }
             self.inner.get_opts(location, options).await
         }
 
@@ -2193,6 +2230,8 @@ mod tests {
             refuse_next: std::sync::atomic::AtomicU32::new(refuse),
             fail_next: std::sync::atomic::AtomicU32::new(0),
             fail_get_next: std::sync::atomic::AtomicU32::new(0),
+            cut_get_next: std::sync::atomic::AtomicU32::new(0),
+            cut_bodies: Arc::default(),
             call_at_put: std::sync::atomic::AtomicU32::new(0),
             puts: std::sync::atomic::AtomicU32::new(0),
             on_put: std::sync::Mutex::new(None),
@@ -2741,19 +2780,19 @@ mod tests {
         );
     }
 
-    /// A read the bucket refused pauses before it is sent again without
-    /// its place under the node's limits on reads: no slot, no megabytes,
-    /// no bytes counted in flight. It held all three through the pause,
-    /// keeping other restores' reads waiting for a read that only waited.
-    #[tokio::test]
-    async fn a_read_that_pauses_before_a_resend_gives_up_its_place() {
+    /// Reads one object of 3 MiB whose first try fails as `fail_get_next`
+    /// and `cut_get_next` say, and looks at what the read holds half-way
+    /// through the pause before its resend.
+    async fn pauses_without_its_place(fail_get_next: u32, cut_get_next: u32) {
         let store = Arc::new(PutFaults {
             inner: InMemory::new(),
             hang_next: 0.into(),
             land_then_hang_next: 0.into(),
             refuse_next: 0.into(),
             fail_next: 0.into(),
-            fail_get_next: 1.into(),
+            fail_get_next: fail_get_next.into(),
+            cut_get_next: cut_get_next.into(),
+            cut_bodies: Arc::default(),
             call_at_put: 0.into(),
             puts: 0.into(),
             on_put: std::sync::Mutex::new(None),
@@ -2796,19 +2835,41 @@ mod tests {
                 .await
             })
         };
-        // The refusal comes at once; the pause lasts half a second.
+        // The failure comes at once; the pause lasts half a second.
         tokio::time::sleep(READ_PAUSE / 2).await;
+        let left = |n: &std::sync::atomic::AtomicU32| n.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            store
-                .fail_get_next
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the read was refused"
+            (left(&store.fail_get_next), left(&store.cut_get_next)),
+            (0, 0),
+            "the first try failed"
         );
         assert_eq!(places(), free, "nothing held during the pause");
+        assert_eq!(
+            Arc::strong_count(&store.cut_bodies),
+            1,
+            "the answer that broke is dropped before the pause"
+        );
         assert!(*has_turn.borrow(), "the pause is not a wait for a place");
         assert_eq!(read.await.unwrap().unwrap().len(), body.len());
         assert_eq!(places(), free, "and gave it back when the read ended");
+    }
+
+    /// A read the bucket refused pauses before it is sent again without
+    /// its place under the node's limits on reads: no slot, no megabytes,
+    /// no bytes counted in flight. It held all three through the pause,
+    /// keeping other restores' reads waiting for a read that only waited.
+    #[tokio::test]
+    async fn a_read_that_pauses_before_a_resend_gives_up_its_place() {
+        pauses_without_its_place(1, 0).await;
+    }
+
+    /// So does a read whose body broke half-way, and it keeps nothing of
+    /// that answer through the pause, neither its stream nor the part
+    /// read: without its megabytes, nothing counts that memory, and the
+    /// wait for a place after the pause can be long.
+    #[tokio::test]
+    async fn a_read_whose_body_broke_keeps_nothing_of_it_while_it_pauses() {
+        pauses_without_its_place(0, 1).await;
     }
 
     /// A read's limit counts every byte in flight on the node; its lift is
