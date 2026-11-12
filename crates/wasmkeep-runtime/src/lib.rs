@@ -15,7 +15,7 @@ mod mailbox;
 mod residency;
 mod runtime;
 
-pub use address::{ActorAddress, AddressError, MAX_IDENT_LEN, MAX_NAME_LEN};
+pub use address::{ActorAddress, AddressError, MAX_IDENT_LEN, MAX_NAME_LEN, is_identifier};
 pub use cache::ComponentCache;
 pub use config::RuntimeConfig;
 pub use cpu::{CpuBudgetExceeded, CpuMeter, cpu_budget_exceeded_total};

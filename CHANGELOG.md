@@ -121,6 +121,34 @@ Since 0.2.0, in no release yet.
   a move depend on. Refusals because a record is full are counted in
   `wasmkeep_signatures_refused_full_total`, and logged as a full record
   rather than as a replay. The take and hand-off record holds 50,000.
+- **`wasmkeep_admission_refused_total{reason}`** counts the requests,
+  WebSocket upgrades and actor calls a node refused before their event
+  ran: `access`, `capacity`, `overloaded` or `unavailable`
+  ([monitoring](docs/monitoring.md#metrics)).
+- **`deploy` refuses a second app of a tenant on a bucket prefix.**
+  Actors are keyed by tenant, class and name, so a second app would share
+  the first app's actors without a word: until now only a node refused to start, and
+  only while a node of the other app was live. The first deploy of an app
+  now lists `apps/<tenant>/` and refuses when another app there has a
+  `current`, naming it and saying what to do: another prefix, or another
+  tenant when another owner runs the app, or, for an abandoned app, the
+  keys to delete. Two apps of one
+  tenant already deployed on one prefix are left as they were (a node of
+  one still refuses to start while a node of the other is live), and `deploy` and
+  `serve --app` warn about them by name; a third is refused. This lasts
+  until apps own their state (planned for 0.4.0,
+  [deploying](docs/cluster.md#deploying)).
+- **ADR 0021, the app model**: an app is `tenant/app`, the unit of deploy,
+  rollback, secrets and (from 0.4.0) state; the tenant is the owner of
+  apps; what 0.4.0 plans (a front deployed with the app, app-owned state
+  with a one-time migration, classes `internal` by default with a project
+  file) and later (shared nodes for trusted tenants)
+  ([ADR 0021](docs/adr/0021-the-app-model.md)).
+- **A new app's tenant and app names follow the class grammar**,
+  `[a-z][a-z0-9-]{0,63}`: the first `wasmkeep deploy` of an app refuses
+  others, and writes nothing. Actor addresses already required it of the
+  tenant; the app name had no rule. An app deployed before keeps its name, and
+  every later deploy and rollback of it works as before.
 - **Releases**: the npm job of the release workflow passed the tarball as
   a bare path, which npm read as a GitHub repository; it now publishes the
   file. See the correction under 0.2.0.

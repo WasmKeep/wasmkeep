@@ -70,6 +70,7 @@ impl ActorService {
         // its owner, so that check is immediate. Refused early here; the
         // event decides with the rules of the class it takes (ADR 0013).
         if !internal && self.early_rule(class, address.name()) == crate::access::Access::Internal {
+            crate::metrics::refused(crate::metrics::Refusal::Access);
             return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
         }
         let outside = !internal;
@@ -355,22 +356,34 @@ impl ActorService {
             }
             Ok(Outcome::Refused(why)) => {
                 tracing::debug!(actor = %address, %why, "event refused");
+                crate::metrics::refused(crate::metrics::Refusal::Unavailable);
                 Ok(crate::cluster::unavailable(
                     "this node cannot run the actor now; retry\n",
                 ))
             }
-            Ok(Outcome::Missing) => Ok(text_response(StatusCode::NOT_FOUND, "no such actor\n")),
-            Ok(Outcome::Forbidden) => Ok(text_response(
-                StatusCode::FORBIDDEN,
-                "not reachable from outside\n",
-            )),
+            Ok(Outcome::Missing) => {
+                crate::metrics::refused(crate::metrics::Refusal::Access);
+                Ok(text_response(StatusCode::NOT_FOUND, "no such actor\n"))
+            }
+            Ok(Outcome::Forbidden) => {
+                crate::metrics::refused(crate::metrics::Refusal::Access);
+                Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "not reachable from outside\n",
+                ))
+            }
             Err(_) => Ok(match event.await {
-                Ok(Err(MailboxError::Capacity(_))) => capacity_response(),
+                Ok(Err(MailboxError::Capacity(_))) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                    capacity_response()
+                }
                 Ok(Err(MailboxError::Full(_))) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Overloaded);
                     text_response(StatusCode::TOO_MANY_REQUESTS, "actor overloaded\n")
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(actor = %address, error = %e, "event not run");
+                    crate::metrics::refused(crate::metrics::Refusal::Unavailable);
                     text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n")
                 }
                 _ => text_response(StatusCode::INTERNAL_SERVER_ERROR, "actor error\n"),

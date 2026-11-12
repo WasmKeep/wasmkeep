@@ -199,6 +199,51 @@ pub(crate) struct Metrics {
     pub(crate) websocket_owner_closes: Family<AtomicU64>,
     /// Ownership records the WebSocket owner sweep read.
     pub(crate) websocket_sweep_reads: AtomicU64,
+    /// Requests, WebSocket upgrades and actor calls refused before their
+    /// event ran, by [`Refusal`].
+    pub(crate) admission_refused: [AtomicU64; Refusal::ALL.len()],
+}
+
+/// Why an event was refused before it ran: the fixed `reason` label of
+/// `wasmkeep_admission_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The class's access rule (ADR 0010): an internal class reached from
+    /// outside (403), or a new name of an `existing` class (404).
+    Access,
+    /// No resident capacity on the node (503 with `Retry-After`).
+    Capacity,
+    /// The actor's queue is full (429).
+    Overloaded,
+    /// The node cannot run the actor now (503): a required value not set,
+    /// the deployed version or the app's secrets not applied, the bucket
+    /// not answering for its ownership.
+    Unavailable,
+}
+
+impl Refusal {
+    const ALL: [Self; 4] = [
+        Self::Access,
+        Self::Capacity,
+        Self::Overloaded,
+        Self::Unavailable,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Access => "access",
+            Self::Capacity => "capacity",
+            Self::Overloaded => "overloaded",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Counts one admission refusal ([`Metrics::admission_refused`]).
+pub(crate) fn refused(why: Refusal) {
+    if let Some(i) = Refusal::ALL.iter().position(|r| *r == why) {
+        inc(&METRICS.admission_refused[i]);
+    }
 }
 
 /// Counts `n` WebSockets closed for `reason` ([`Metrics::websocket_owner_closes`]).
@@ -472,6 +517,20 @@ pub fn render(gauges: Gauges) -> String {
         "Ownership records the WebSocket owner sweep read.",
         m.websocket_sweep_reads.load(Ordering::Relaxed),
     );
+    head(
+        &mut out,
+        "wasmkeep_admission_refused_total",
+        "counter",
+        "Requests, WebSocket upgrades and actor calls refused before their event ran, by reason.",
+    );
+    for (reason, n) in Refusal::ALL.iter().zip(&m.admission_refused) {
+        let _ = writeln!(
+            out,
+            "wasmkeep_admission_refused_total{{{}}} {}",
+            render_labels(&[("reason", reason.label())]),
+            n.load(Ordering::Relaxed)
+        );
+    }
     out
 }
 

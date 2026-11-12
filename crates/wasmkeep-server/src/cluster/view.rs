@@ -301,7 +301,7 @@ impl Cluster {
                     tracing::error!(
                         serves = %self.serves,
                         others = %mixed.join(", "),
-                        "another app of this tenant runs on the same bucket prefix: they share actor keys; give each app its own --bucket prefix"
+                        "another app of this tenant runs on the same bucket prefix: they share actor keys; deploy one on another --bucket prefix, or under another tenant if another owner runs it"
                     );
                 }
                 if let Some(tls) = &self.tls

@@ -1,6 +1,7 @@
 //! Deploys, versions, access rules and apps as every node sees them.
 
 use super::*;
+use object_store::ObjectStoreExt as _;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn existing_access_checks_the_bucket_and_leaves_nothing_for_unknown_names() {
@@ -1038,4 +1039,188 @@ async fn a_deploy_sequence_that_failed_to_record_is_recorded_on_the_next_event()
     // Recording the deploy sequence fails once: the next event must record
     // it, or a node on the older deploy later runs old code on this data.
     never_runs_older_code(true).await;
+}
+
+/// Copies every object of app `from` to app `to` (both `tenant/app`) in
+/// the same bucket: an app deployed before a check refused it.
+async fn copy_app(store: &Arc<dyn ObjectStore>, from: &str, to: &str) {
+    for key in bucket_keys(store).await {
+        if let Some(rest) = key.strip_prefix(&format!("apps/{from}/")) {
+            object_store::ObjectStoreExt::copy(
+                store.as_ref(),
+                &object_store::path::Path::from(key.as_str()),
+                &object_store::path::Path::from(format!("apps/{to}/{rest}")),
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_apps_need_tenant_and_app_names_of_the_class_grammar() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = deploy_runtime();
+    let code = || vec![("c".into(), counter_wasm().to_vec())];
+    for (tenant, name) in [
+        ("Acme", "shop"),
+        ("acme", "Shop"),
+        ("acme", "shop_1"),
+        ("1acme", "shop"),
+        ("acme", "-shop"),
+        ("acme", &"s".repeat(65)),
+    ] {
+        let app = AppRef::new(Arc::clone(&store), "", tenant, name);
+        let e = app.deploy(&rt, code()).await.unwrap_err().to_string();
+        assert!(e.contains("[a-z][a-z0-9-]{0,63}"), "{tenant}/{name}: {e}");
+        assert_eq!(app.current().await.unwrap(), None, "{tenant}/{name}");
+    }
+    assert!(bucket_keys(&store).await.is_empty(), "nothing was written");
+
+    // An app that already has such a name keeps deploying and rolling back.
+    AppRef::new(Arc::clone(&store), "", "default", "seed")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    copy_app(&store, "default/seed", "Old_Tenant/My~App").await;
+    let old = AppRef::new(Arc::clone(&store), "", "Old_Tenant", "My~App");
+    let v2 = old
+        .deploy_changes(&rt, changes(vec![("c".into(), test_actor_wasm().to_vec())]))
+        .await
+        .unwrap();
+    assert_eq!(v2.current.seq, 2);
+    // Its own folder, however the bucket spells it, is not another app.
+    assert_eq!(v2.others, Vec::<String>::new());
+    assert_eq!(old.rollback(false).await.unwrap().current.seq, 3);
+
+    // The longest valid names are fine.
+    let long = "a".repeat(64);
+    AppRef::new(Arc::clone(&store), "", &long, &long)
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_app_of_a_tenant_on_a_prefix_is_refused_and_an_existing_pair_keeps_working() {
+    // Actors are keyed tenant/class/name: two apps of one tenant on one
+    // prefix would share them.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = deploy_runtime();
+    let code = || vec![("c".into(), counter_wasm().to_vec())];
+    let app = |prefix: &str, tenant: &str, name: &str| {
+        AppRef::new(Arc::clone(&store), prefix, tenant, name)
+    };
+    let first = app("", "acme", "shop")
+        .deploy_changes(&rt, changes(code()))
+        .await;
+    assert_eq!(first.unwrap().others, Vec::<String>::new());
+
+    // A second app of acme: refused, naming the first, what to do, and
+    // the keys to delete if it is abandoned. Nothing written.
+    let e = app("", "acme", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap_err()
+        .to_string();
+    for part in [
+        "acme/shop",
+        "another tenant",
+        "a bucket prefix other than",
+        "apps/acme/shop/",
+        "actors/acme/",
+    ] {
+        assert!(e.contains(part), "{part:?} missing from: {e}");
+    }
+    assert_eq!(app("", "acme", "admin").current().await.unwrap(), None);
+    assert!(
+        !bucket_keys(&store)
+            .await
+            .iter()
+            .any(|k| k.starts_with("apps/acme/admin/")),
+        "nothing written for the refused app"
+    );
+
+    // Another tenant (even one whose name starts the same), and another
+    // prefix, are fine. The app itself redeploys.
+    app("", "acme-2", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    app("other", "acme", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    let again = app("", "acme", "shop")
+        .deploy_changes(&rt, changes(vec![("c".into(), test_actor_wasm().to_vec())]))
+        .await
+        .unwrap();
+    assert_eq!((again.current.seq, again.others), (2, Vec::new()));
+
+    // Secrets set for an app never deployed do not make it an app.
+    store
+        .put(
+            &object_store::path::Path::from("apps/acme/draft/secrets/current"),
+            object_store::PutPayload::from_static(b"0000000000000001\n"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        app("", "acme", "shop").other_apps().await.unwrap(),
+        Vec::<String>::new()
+    );
+
+    // Two apps of acme deployed before this check: both keep deploying
+    // and rolling back, each told about the other.
+    copy_app(&store, "acme/shop", "acme/legacy").await;
+    let shop = app("", "acme", "shop").rollback(false).await.unwrap();
+    assert_eq!(shop.others, ["acme/legacy"]);
+    let legacy = app("", "acme", "legacy")
+        .deploy_changes(&rt, changes(code()))
+        .await
+        .unwrap();
+    assert_eq!(legacy.others, ["acme/shop"]);
+    // A third is refused, naming both.
+    let e = app("", "acme", "blog")
+        .deploy(&rt, code())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("acme/legacy") && e.contains("acme/shop"), "{e}");
+
+    // An abandoned app removed as the error says: the name is free.
+    for key in bucket_keys(&store).await {
+        if key.starts_with("apps/acme/legacy/") || key.starts_with("apps/acme/shop/") {
+            store
+                .delete(&object_store::path::Path::from(key.as_str()))
+                .await
+                .unwrap();
+        }
+    }
+    app("", "acme", "blog").deploy(&rt, code()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_second_app_check_names_the_keys_under_the_bucket_prefix() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = deploy_runtime();
+    let code = || vec![("c".into(), counter_wasm().to_vec())];
+    AppRef::new(Arc::clone(&store), "team/prod", "acme", "shop")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    let e = AppRef::new(Arc::clone(&store), "team/prod/", "acme", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("team/prod/apps/acme/shop/"), "{e}");
+    assert!(e.contains("team/prod/actors/acme/"), "{e}");
+}
+
+fn changes(classes: Vec<(String, Vec<u8>)>) -> wasmkeep_server::apps::Changes {
+    wasmkeep_server::apps::Changes {
+        classes: Some(classes),
+        ..Default::default()
+    }
 }

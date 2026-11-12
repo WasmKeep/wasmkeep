@@ -74,13 +74,18 @@ impl fmt::Display for ActorAddress {
     }
 }
 
-fn validate_ident(s: &str, what: &'static str) -> Result<(), AddressError> {
-    let ok = !s.is_empty()
+/// Whether `s` is a valid tenant or class: `[a-z][a-z0-9-]{0,63}`. The
+/// grammar of new apps' tenant and app names too.
+pub fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
         && s.len() <= MAX_IDENT_LEN
         && s.starts_with(|c: char| c.is_ascii_lowercase())
         && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if ok {
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn validate_ident(s: &str, what: &'static str) -> Result<(), AddressError> {
+    if is_identifier(s) {
         Ok(())
     } else {
         Err(AddressError(match what {

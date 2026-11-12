@@ -132,9 +132,19 @@ impl ServiceInner {
 
             match response_rx.await {
                 Ok(Outcome::Served(response)) => collect_response(response).await,
-                Ok(Outcome::Failed(e) | Outcome::Refused(e)) => Err(CallError::Failed(e)),
-                Ok(Outcome::Missing) => Err(CallError::Failed("no such actor".into())),
-                Ok(Outcome::Forbidden) => Err(CallError::Failed("refused".into())),
+                Ok(Outcome::Failed(e)) => Err(CallError::Failed(e)),
+                Ok(Outcome::Refused(e)) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Unavailable);
+                    Err(CallError::Failed(e))
+                }
+                Ok(Outcome::Missing) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Access);
+                    Err(CallError::Failed("no such actor".into()))
+                }
+                Ok(Outcome::Forbidden) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Access);
+                    Err(CallError::Failed("refused".into()))
+                }
                 Ok(Outcome::NotOwner(owner, req)) => {
                     self.mailboxes.hibernate(&target);
                     self.remember_owner(&target, &owner);
@@ -166,12 +176,17 @@ impl ServiceInner {
                 }
                 Err(_) => match event.await {
                     Ok(Err(MailboxError::Capacity(_))) => {
+                        crate::metrics::refused(crate::metrics::Refusal::Capacity);
                         collect_response(capacity_response()).await
                     }
                     Ok(Err(MailboxError::Full(_))) => {
+                        crate::metrics::refused(crate::metrics::Refusal::Overloaded);
                         Err(CallError::Failed("callee overloaded".to_owned()))
                     }
-                    Ok(Err(e)) => Err(CallError::Failed(e.to_string())),
+                    Ok(Err(e)) => {
+                        crate::metrics::refused(crate::metrics::Refusal::Unavailable);
+                        Err(CallError::Failed(e.to_string()))
+                    }
                     _ => Err(CallError::Failed("callee unavailable".to_owned())),
                 },
             }
