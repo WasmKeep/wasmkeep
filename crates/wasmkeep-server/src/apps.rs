@@ -53,6 +53,17 @@ pub enum DeployError {
     /// A rollback would make these classes more open (ADR 0013).
     #[error("rolling back would reopen {0}; pass --allow-reopen to do it anyway")]
     Reopens(String),
+    /// A new app's tenant or app name is outside the grammar.
+    #[error(
+        "{what} {name:?} must match [a-z][a-z0-9-]{{0,63}} (lowercase letters, digits and \
+         '-', starting with a letter) for a new app; apps deployed before keep their names"
+    )]
+    Name {
+        /// `tenant` or `app`.
+        what: &'static str,
+        /// The name given.
+        name: String,
+    },
 }
 
 fn bucket(e: impl std::fmt::Display) -> DeployError {
@@ -65,6 +76,8 @@ pub struct AppRef {
     store: Arc<dyn ObjectStore>,
     /// `<prefix>apps/<tenant>/<app>/`
     base: String,
+    tenant: String,
+    app: String,
 }
 
 /// Longest wait between attempts after a failed update.
@@ -83,7 +96,23 @@ impl AppRef {
             // Counted for the metrics page while `serve` follows the app.
             store: crate::counted_store::counted(store),
             base: format!("{prefix}apps/{tenant}/{app}/"),
+            tenant: tenant.to_owned(),
+            app: app.to_owned(),
         }
+    }
+
+    /// What a first deploy checks before it creates the app: the names'
+    /// grammar (apps that exist keep theirs).
+    fn check_new(&self) -> Result<(), DeployError> {
+        for (what, name) in [("tenant", &self.tenant), ("app", &self.app)] {
+            if !wasmkeep_runtime::is_identifier(name) {
+                return Err(DeployError::Name {
+                    what,
+                    name: name.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn path(&self, key: &str) -> StorePath {
@@ -314,6 +343,9 @@ impl AppRef {
         }
 
         let read = self.read_current().await?;
+        if read.is_none() {
+            self.check_new()?;
+        }
         let base = match &read {
             Some((current, _)) => {
                 let manifest = self.manifest(&current.version).await?;

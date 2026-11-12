@@ -121,6 +121,11 @@ Since 0.2.0, in no release yet.
   a move depend on. Refusals because a record is full are counted in
   `wasmkeep_signatures_refused_full_total`, and logged as a full record
   rather than as a replay. The take and hand-off record holds 50,000.
+- **A new app's tenant and app names follow the class grammar**,
+  `[a-z][a-z0-9-]{0,63}`: the first `wasmkeep deploy` of an app refuses
+  others, and writes nothing. Actor addresses already required it of the
+  tenant; the app name had no rule. An app deployed before keeps its name, and
+  every later deploy and rollback of it works as before.
 - **Releases**: the npm job of the release workflow passed the tarball as
   a bare path, which npm read as a GitHub repository; it now publishes the
   file. See the correction under 0.2.0.

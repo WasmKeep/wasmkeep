@@ -1039,3 +1039,61 @@ async fn a_deploy_sequence_that_failed_to_record_is_recorded_on_the_next_event()
     // it, or a node on the older deploy later runs old code on this data.
     never_runs_older_code(true).await;
 }
+
+/// Copies every object of app `from` to app `to` (both `tenant/app`) in
+/// the same bucket: an app deployed before a check refused it.
+async fn copy_app(store: &Arc<dyn ObjectStore>, from: &str, to: &str) {
+    for key in bucket_keys(store).await {
+        if let Some(rest) = key.strip_prefix(&format!("apps/{from}/")) {
+            object_store::ObjectStoreExt::copy(
+                store.as_ref(),
+                &object_store::path::Path::from(key.as_str()),
+                &object_store::path::Path::from(format!("apps/{to}/{rest}")),
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_apps_need_tenant_and_app_names_of_the_class_grammar() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = deploy_runtime();
+    let code = || vec![("c".into(), counter_wasm().to_vec())];
+    for (tenant, name) in [
+        ("Acme", "shop"),
+        ("acme", "Shop"),
+        ("acme", "shop_1"),
+        ("1acme", "shop"),
+        ("acme", "-shop"),
+        ("acme", &"s".repeat(65)),
+    ] {
+        let app = AppRef::new(Arc::clone(&store), "", tenant, name);
+        let e = app.deploy(&rt, code()).await.unwrap_err().to_string();
+        assert!(e.contains("[a-z][a-z0-9-]{0,63}"), "{tenant}/{name}: {e}");
+        assert_eq!(app.current().await.unwrap(), None, "{tenant}/{name}");
+    }
+    assert!(bucket_keys(&store).await.is_empty(), "nothing was written");
+
+    // An app that already has such a name keeps deploying and rolling back.
+    AppRef::new(Arc::clone(&store), "", "default", "seed")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    copy_app(&store, "default/seed", "Old_Tenant/My.App").await;
+    let old = AppRef::new(Arc::clone(&store), "", "Old_Tenant", "My.App");
+    let v2 = old
+        .deploy(&rt, vec![("c".into(), test_actor_wasm().to_vec())])
+        .await
+        .unwrap();
+    assert_eq!(v2.seq, 2);
+    assert_eq!(old.rollback(false).await.unwrap().current.seq, 3);
+
+    // The longest valid names are fine.
+    let long = "a".repeat(64);
+    AppRef::new(Arc::clone(&store), "", &long, &long)
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+}
