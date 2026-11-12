@@ -252,8 +252,9 @@ const READ_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 ///   for, as it is not in a read's own time. The queue always moves,
 ///   since every read holding a place in it is bounded; while it lasts,
 ///   the deadline does not bound what a caller waits;
-/// - checking the local file, applying an object to it or putting the
-///   finished database in place: local work, sized by the database and not by the compressed
+/// - checking the local file, creating the file the database is built
+///   in, applying an object to it or putting the finished database in
+///   place: local work, sized by the database and not by the compressed
 ///   bytes read, and never cut. The reads ahead go on meanwhile.
 pub(crate) const RESTORE_BUDGET: std::time::Duration = READ_IDLE.saturating_mul(6);
 const RESTORE_PER_MIB: std::time::Duration = std::time::Duration::from_secs(1);
@@ -736,7 +737,6 @@ impl Replica {
                 .map(|key| sizes.get(key).copied().unwrap_or(0))
                 .fold(0, u64::saturating_add),
         );
-        let mut deadline = tokio::time::Instant::now() + allowed;
         let objects = keys.len();
         // What other restores' bytes added to its reads' limits, so far.
         let mut lifted = std::time::Duration::ZERO;
@@ -769,6 +769,9 @@ impl Replica {
             .await
             .map_err(|e| ReplicaError::Local(e.to_string()))??
         };
+        // Its clock starts here, with its first read: creating the file
+        // above is local work, not a wait for the bucket.
+        let mut deadline = tokio::time::Instant::now() + allowed;
         // Reads on tasks of their own, so they go on while an object is
         // applied; aborted if the restore ends early.
         let mut pending = keys.into_iter().peekable();
