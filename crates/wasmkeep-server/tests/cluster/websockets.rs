@@ -395,3 +395,35 @@ async fn the_owner_sweep_closes_a_listening_client_of_a_room_taken_elsewhere() {
     assert_eq!(code, 1012, "{reason}");
     eventually("a forgot the socket", async || a.service.websockets() == 0).await;
 }
+
+/// A node whose lease runs out (the bucket out of reach for longer than
+/// ttl minus safety) may no longer own anything, and a peer may claim its
+/// actors once ttl plus grace passed: its sockets close with 1012 when
+/// the validity ends, before any peer can claim, without waiting for the
+/// bucket to answer again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lapsed_node_lease_closes_its_sockets() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let down = Arc::new(AtomicBool::new(false));
+    let seen_by_a: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let da = tempfile::tempdir().unwrap();
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", da.path(), &seen_by_a, idle, "chat", chat_wasm()).await;
+    settle().await;
+    let mut client = join_lobby(a.addr).await;
+    let cut = std::time::Instant::now();
+    down.store(true, Ordering::SeqCst);
+    // Valid for ttl minus safety (800 ms here) after the last write.
+    let (code, reason) = closed_within(&mut client, Duration::from_secs(5)).await;
+    assert_eq!((code, reason.as_str()), (1012, "node lost its lease"));
+    assert!(
+        cut.elapsed() < Duration::from_secs(3),
+        "closed after {:?}",
+        cut.elapsed()
+    );
+    assert!(
+        down.load(Ordering::SeqCst),
+        "the bucket is still out of reach"
+    );
+}

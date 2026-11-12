@@ -191,7 +191,11 @@ impl ActorService {
                 Arc::downgrade(&service.inner),
                 Arc::clone(&cluster),
             ));
-            // Close sockets whose actor another node took.
+            // Close sockets whose actor this node no longer owns.
+            tokio::spawn(socket_owners::close_sockets_at_lapse(
+                Arc::downgrade(&service.inner),
+                cluster.validity.subscribe(),
+            ));
             tokio::spawn(socket_owners::sweep_sockets(
                 Arc::downgrade(&service.inner),
                 cluster,
