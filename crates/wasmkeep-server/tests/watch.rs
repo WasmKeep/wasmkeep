@@ -390,6 +390,76 @@ async fn the_hub_needs_its_token_and_monitors_take_changes_from_the_hub_only() {
     assert_eq!(s, 200, "{body}");
 }
 
+/// A check says who is asking, and the header the monitor sets is the one
+/// on the wire: some sites answer a client they cannot name with an error
+/// although they are up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_names_watch_in_its_user_agent() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let heads = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&heads);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&raw).into_owned());
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 X\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    let (addr, _stop) = start(data.path()).await;
+
+    let spec = format!(r#"{{"url":"http://{target}/health","every_s":1,"timeout_ms":1000}}"#);
+    let (s, body) = request(addr, "PUT", "/actor/hub/main/monitors/api", &spec).await;
+    assert_eq!(s, 200, "{body}");
+    wait_for("the first check", Duration::from_secs(10), || {
+        !heads.lock().unwrap().is_empty()
+    })
+    .await;
+
+    let head = heads.lock().unwrap()[0].clone();
+    assert!(head.starts_with("GET /health HTTP/1.1\r\n"), "{head}");
+    let agents: Vec<&str> = head
+        .lines()
+        .filter_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("user-agent")
+                .then(|| value.trim())
+        })
+        .collect();
+    // The monitor crate's version follows the name.
+    let [agent] = agents[..] else {
+        panic!("one User-Agent expected: {head}");
+    };
+    let version = agent.strip_prefix("wasmkeep-watch/").unwrap_or_default();
+    assert!(
+        version.split('.').count() == 3
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+        "{head}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn actors_cannot_reach_private_addresses_by_default() {
     // Server-side request forgery: a monitor (any actor) asking for

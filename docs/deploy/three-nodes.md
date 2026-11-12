@@ -216,6 +216,10 @@ it exits with 1 if no node is live. See
   in-flight requests, then hands its actors over: the other nodes serve
   them on their next request. WebSockets to that node close and clients
   reconnect.
+- **Updating the stateless component** (the file given to `serve` for
+  paths outside `/actor/` and `/_wasmkeep/`): it is not part of a deploy.
+  Copy the new file to every node and restart them one at a time (see
+  [Updating the stateless component](../cluster.md#updating-the-stateless-component)).
 - **Adding a node**: start it with a new id. It serves new actors and any
   whose node is fenced; existing actors stay where they are.
 - **Secrets**: keep them in the bucket rather than in each node's `--env`
@@ -241,9 +245,10 @@ it exits with 1 if no node is live. See
   a peer fences its heartbeat (15 to about 21 s after its last write) and
   a restore, and their alarms arrive
   later still ([measured](../benchmarks.md#three-nodes-against-a-real-bucket)).
-- **Stop timeouts**: a clean stop can take up to about 25 s (10 s for
-  in-flight requests, 10 s for actors to finish their queued events, a few
-  seconds for the handover). Allow 30 s: `TimeoutStopSec=30` in systemd,
+- **Stop timeouts**: a clean stop can take up to about 29 s (10 s for
+  in-flight requests, 10 s for actors to finish their queued events, 3 s
+  for the handover to reach the bucket, about 6 s for the node to release
+  its own lease). Allow 30 s: `TimeoutStopSec=30` in systemd,
   `--stop-timeout 30` for Docker (its default is 10 s),
   `terminationGracePeriodSeconds: 30` in Kubernetes. A node killed earlier
   is treated as a crash, which is safe, only slower.
@@ -252,6 +257,9 @@ it exits with 1 if no node is live. See
   last event may be lost (see [Running a cluster](../cluster.md#replication)).
 - **Logs**: each node logs to the journal; `RUST_LOG=wasmkeep_server=debug`
   shows leases, forwarding and replication decisions.
+- **Backups**: the bucket is the only durable copy. Copy it somewhere the
+  nodes cannot write, and restore that copy once before you need it (see
+  [Back up and restore a cluster's bucket](backup-and-restore.md)).
 - **Bucket growth**: each actor's history older than an hour
   (`--history-retention-secs`) is collected after its periodic snapshot,
   a deleted actor's at once, and `wasmkeep deploy` keeps the current

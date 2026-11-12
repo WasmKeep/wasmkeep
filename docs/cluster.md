@@ -12,6 +12,10 @@ Nodes share one S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, ...) that
 supports conditional writes (`If-None-Match` / `If-Match`). There is nothing
 else to run: no consensus cluster, no coordinator.
 
+For the short version of what callers see when a node stops or dies, and
+of what adding nodes does, read
+[When a node dies, and how it scales](failover-and-scaling.md).
+
 ## How it works
 
 - Each node writes a **heartbeat** to `nodes/<id>` with its address, every
@@ -474,6 +478,50 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   versions a rollback stepped back from, and a version whose manifest
   this WasmKeep cannot read. Those stay in the bucket (they are small).
 
+### Updating the stateless component
+
+A deploy carries actor classes, with their access rules, configuration
+and required names. It does not carry the stateless component, the
+positional argument of `wasmkeep serve` that answers every path outside
+`/actor/` and `/_wasmkeep/`: that one is a file on each node, read once
+when the node starts, also with `--app`:
+
+```bash
+wasmkeep serve site.wasm --app acme/shop --bucket s3://wasmkeep-demo --node-id a ...
+```
+
+Nothing in the bucket names it, so `wasmkeep deploy` does not change it,
+`--rollback` does not bring an older one back, and `cluster status` does
+not show which one a node runs. To update it today:
+
+1. Copy the new file to every node, at the path its `serve` command names.
+2. Restart the nodes one at a time (`systemctl restart wasmkeep`), waiting
+   for each to be listed live by `wasmkeep cluster status` and to answer
+   `/_wasmkeep/ready` before the next.
+
+What happens meanwhile:
+
+- **The restarting node** makes a clean stop: requests under way get up
+  to 10 s to finish, its actors are given up and start on the other nodes
+  at their next request, and its WebSockets close with 1012. The load
+  balancer's check of `/_wasmkeep/ready` takes it out. At its start it
+  checks its node id first, which takes what is left of 15 s since it
+  stopped ([Flags](#flags)).
+- **The other nodes** keep answering, each with the file it was started
+  with. Until the last node has restarted, two versions of the component
+  answer side by side, and a client may get either one from one request to
+  the next. Keep two consecutive versions compatible with each other and
+  with the deployed actors.
+- **A file that does not compile or instantiate** makes `serve` exit at
+  start. Restarting one node first shows it while the others still run
+  the previous file.
+- **Going back** is the same procedure with the previous file.
+
+The stateless component has no `actors.call`: it is linked against WASI
+and `wasi:http` only. It reaches actors as any client does, over HTTP,
+under the same outbound rules as actors (public addresses only, unless
+the node allows a range with `--allow-outbound`).
+
 ### Access rules and configuration
 
 Access rules ([ADR 0010](adr/0010-who-may-create-an-actor.md)) and plain
@@ -560,7 +608,9 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   secrets.
 - **Restoring the bucket from a backup** can put `current` below what the
   running nodes opened; they refuse it (and block after 30 s) until
-  restarted: restart the nodes after a restore. Deleting `current` by hand
+  restarted: restart the nodes after a restore
+  ([Back up and restore a cluster's bucket](deploy/backup-and-restore.md)
+  has the whole procedure). Deleting `current` by hand
   leaves running nodes with the set they have and restarted ones with
   none.
 - **Older nodes.** `set`, `unset` and `reset` refuse, without `--force`,
@@ -745,7 +795,7 @@ the last stop and the first start, so plan a short window.
 1. `wasmkeep cluster status --bucket ...`: note the nodes it lists as live.
 2. Stop every node cleanly (`systemctl stop wasmkeep`, `SIGTERM`). Each
    finishes its requests and releases its actors; a clean stop takes up to
-   about 25 s.
+   about 29 s.
 3. Wait until `cluster status` exits with 1 (no live node), about 10 s after
    the last stop. A node still listed as live is still running the old
    binary: stop it first. This check does not depend on version strings.

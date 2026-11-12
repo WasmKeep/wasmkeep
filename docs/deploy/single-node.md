@@ -205,6 +205,10 @@ Environment=AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=auto
 Environment=AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 ```
 
+The bucket is then the only copy that survives the machine, and it needs
+a backup of its own:
+[Back up and restore a cluster's bucket](backup-and-restore.md).
+
 Use `exec-durable` for writes that must survive the machine. Growing to
 more servers later means starting them on the same bucket, with
 `--advertise` set to an address the others can reach
