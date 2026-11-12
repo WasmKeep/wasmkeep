@@ -199,7 +199,7 @@ What a restored cluster is:
   nodes is free: the first request for an actor starts it. In a copy made
   while nodes ran, the leases say `live` and records name the processes
   of that time. A node started under the same id replaces its lease after
-  the start check (15 s when the copy's lease says `live`), which frees
+  the start check (about 15 s when the copy's lease says `live`), which frees
   the records naming its old process. An id nobody starts again is fenced
   by the other nodes, or with `wasmkeep cluster fence <node>`.
 - **Alarms that came due since the backup fire** soon after the start,
