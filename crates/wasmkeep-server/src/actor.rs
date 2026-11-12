@@ -68,7 +68,7 @@ use self::{
 
 /// How long a node trusts "node X holds this actor" without asking the
 /// bucket again.
-const HINT_MS: u64 = 1_000;
+pub(crate) const HINT_MS: u64 = 1_000;
 
 /// Let ordinary hibernation finish before refusing a cold activation.
 const ADMISSION_WAIT: Duration = Duration::from_millis(250);
@@ -465,6 +465,11 @@ impl ActorService {
         self.inner
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        // Requests kept for a takeover are answered now: a stopping node
+        // takes no actor.
+        if let Some(cluster) = &self.inner.cluster {
+            cluster.failover.close();
+        }
     }
 
     /// Why this node should not get traffic, if it should not (`/_wasmkeep/ready`):

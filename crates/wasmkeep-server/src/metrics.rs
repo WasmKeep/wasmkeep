@@ -143,6 +143,9 @@ pub(crate) struct Metrics {
     /// Requests and calls sent to the node that owns the actor, by kind
     /// (`request`, `websocket`, `call`).
     pub(crate) forwards: Family<AtomicU64>,
+    /// Requests kept until a dead node's actor could be taken over, by
+    /// kind (`request`, `websocket`) and how the wait ended.
+    pub(crate) failover_waits: Family<AtomicU64>,
     /// `exec-durable`, from the call to durable.
     pub(crate) durable_write_seconds: Histogram,
     /// One listing of the cluster's heartbeats, with the view and pins it
@@ -326,6 +329,12 @@ pub fn render(gauges: Gauges) -> String {
         "wasmkeep_forwards_total",
         "Requests and calls sent to the node owning the actor, by kind.",
         &m.forwards,
+    );
+    family(
+        &mut out,
+        "wasmkeep_failover_waits_total",
+        "Requests kept for an actor whose node was dead or stopping instead of a 503 at once, by kind and how the wait ended.",
+        &m.failover_waits,
     );
     head(
         &mut out,

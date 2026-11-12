@@ -29,6 +29,7 @@ use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
 use crate::http::{ArrivedOnClusterPort, OriginalPath, text_response};
 
+mod failover_wait;
 mod forwarding;
 mod handoff;
 mod identity;
@@ -37,6 +38,8 @@ mod node_lease_task;
 mod signing;
 mod view;
 
+pub use failover_wait::failover_wait_default;
+pub(crate) use failover_wait::{FailoverWait, Kept, Ticket, Waited};
 pub(crate) use forwarding::*;
 pub(crate) use handoff::*;
 pub(crate) use identity::*;
@@ -124,6 +127,15 @@ pub struct ClusterConfig {
     /// This node reads the app's secrets from the bucket (heartbeat line
     /// 10, ADR 0016); `false` with `--no-secrets`.
     pub reads_secrets: bool,
+    /// How long a request for a dead node's actor is kept until the actor
+    /// can be taken over, instead of a 503 at once (a GET or HEAD without
+    /// a body, or a WebSocket upgrade, arriving from outside): `None` for
+    /// [`failover_wait_default`], derived from the lease timing; zero
+    /// turns it off.
+    pub failover_wait: Option<Duration>,
+    /// Requests kept that way at once on this node; more get the 503 at
+    /// once. `serve` sets a quarter of its connection limit.
+    pub failover_wait_max: usize,
 }
 
 /// Plain HTTP between nodes, for a node with a cluster listener (ADR 0011).
@@ -178,6 +190,8 @@ impl ClusterConfig {
             history_retention: Duration::from_secs(3600),
             snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
             reads_secrets: true,
+            failover_wait: None,
+            failover_wait_max: crate::http::ServeLimits::default().max_connections / 4,
         }
     }
 }
@@ -370,6 +384,8 @@ pub(crate) struct Cluster {
     /// Nodes the listing found due for a fence, for the fence task
     /// (`fence_loop`): the listing never waits for a fence.
     fences_due: tokio::sync::mpsc::UnboundedSender<Vec<FenceDue>>,
+    /// Requests kept until a dead node's actor can be taken over.
+    pub(crate) failover: FailoverWait,
 }
 
 /// Where a live node is reached, as its heartbeat says.
@@ -578,6 +594,7 @@ impl Cluster {
                 u64::try_from(lease_attempt(&config.lease).as_millis()).unwrap_or(u64::MAX),
             )),
             fences_due,
+            failover: FailoverWait::new(config),
         });
         if refuse_plaintext {
             tracing::info!(
@@ -857,6 +874,7 @@ impl Cluster {
                     }
                 }
                 Ok(Err(e)) => {
+                    self.failover.connect_failed(owner, &e);
                     tracing::warn!(owner, error = %e, "forwarding an upgrade failed");
                     return unavailable("the actor's node did not answer; retry\n");
                 }
@@ -1246,7 +1264,10 @@ impl Cluster {
             // heartbeat is live there: a refused handshake, or a TLS
             // connection the refusal closed before the request was written.
             Ok(Err(e)) if never_read_by_peer(&base, &e) => Err(CallFailure::HandshakeRefused),
-            Ok(Err(e)) => Err(CallFailure::Other(format!("node {owner}: {e}"))),
+            Ok(Err(e)) => {
+                self.failover.connect_failed(owner, &e);
+                Err(CallFailure::Other(format!("node {owner}: {e}")))
+            }
             Err(_) => Err(CallFailure::Other(format!(
                 "node {owner} did not answer in time"
             ))),
@@ -1571,6 +1592,10 @@ impl Cluster {
             // handed back unsent on a new TLS connection), and nothing
             // else; this path answers 503 for all of them.
             Ok(Err(e)) => {
+                // No connection could be opened: requests that arrive
+                // later for this node's actors may be kept (`keep`). This
+                // one is answered as ever.
+                self.failover.connect_failed(owner, &e);
                 tracing::warn!(owner, error = %e, "forwarding failed");
                 unavailable("the actor's node did not answer; retry\n")
             }

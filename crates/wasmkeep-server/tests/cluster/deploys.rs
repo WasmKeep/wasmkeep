@@ -122,6 +122,7 @@ async fn two_apps_of_one_tenant_on_one_prefix_are_detected() {
         let mut cluster = ClusterConfig::new(id, format!("http://{id}"), Arc::clone(&store));
         cluster.heartbeat = Duration::from_millis(100);
         cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
+        cluster.failover_wait = Some(Duration::ZERO);
         cluster.app = app.into();
         config.cluster = Some(cluster);
         ActorService::new(

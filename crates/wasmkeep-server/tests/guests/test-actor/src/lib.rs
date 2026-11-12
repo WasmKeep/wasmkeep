@@ -258,6 +258,15 @@ impl http::Guest for TestActor {
                 }
             }
             (Method::Get, "/durable") => get("durable").to_string(),
+            // A GET that leaves a trace: how many of them ran.
+            (Method::Get, "/visit") => {
+                let _ = storage::exec_durable(
+                    "INSERT INTO config (key, value) VALUES ('visits', 1)
+                     ON CONFLICT (key) DO UPDATE SET value = value + 1",
+                    &[],
+                );
+                get("visits").to_string()
+            }
             (Method::Post, "/plain") => {
                 let r = storage::exec(
                     "INSERT INTO config (key, value) VALUES ('plain', 1)
