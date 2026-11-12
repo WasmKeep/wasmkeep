@@ -131,8 +131,9 @@ async fn snapshots_of(p: &Pair, name: &str) -> Vec<u64> {
 
 /// When the bucket leaves every snapshot upload hanging, a periodic
 /// snapshot holds the actor for one short attempt (6 s for a small
-/// database), and the events after it are not held at all: it used to be
-/// sent again for 21 s, and tried again by the very next event.
+/// database), and the events after it are not held at all. In 0.2.0 the
+/// upload was one attempt with no bound of its own, which held the actor
+/// until the bucket client ended the request (30 s by default).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_periodic_snapshot_holds_the_actor_for_one_short_attempt() {
     let p = pair(Duration::from_secs(30), NO_HIBERNATION).await;
@@ -147,9 +148,10 @@ async fn a_hung_periodic_snapshot_holds_the_actor_for_one_short_attempt() {
     // The write the snapshot was due after, and the one behind it.
     write(&p, "hung", written + 1).await;
     let held = started.elapsed();
-    // One attempt of 6 s and two writes: well under the 21 s it used to
-    // be sent again for (which no write here waits out: 15 s each), with
-    // room for a machine that takes seconds over the writes.
+    // One attempt of 6 s and two writes: well under the 30 s an upload
+    // with no bound of its own could hold the actor (which no write here
+    // waits out: 15 s each), with room for a machine that takes seconds
+    // over the writes.
     assert!(held < Duration::from_secs(15), "held for {held:?}");
     // No event tries again at once, write or read: one that did would be
     // held for the 6 s of an attempt.

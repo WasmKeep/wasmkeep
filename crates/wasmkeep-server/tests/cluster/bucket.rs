@@ -396,13 +396,13 @@ async fn a_restore_the_bucket_never_answers_ends_within_its_deadline() {
 }
 
 /// Reads that are each answered in time still add up: here every segment
-/// read takes 2 s, under any one read's limit, so the 30 segments, read
-/// eight at a time, take 8 s. The restore has 6 s (1 s, a second for the
-/// megabyte started, a second per eight objects) for its reads: it is given
-/// up then,
-/// answered as a bucket that does not answer is, and the next request
-/// restores every write once the bucket is fast again. Without a deadline
-/// for the reads together, the caller waited as long as the chain took.
+/// read takes 2 s, under any one read's limit, so the 30 objects (one
+/// snapshot, read at once, and 29 segments), read eight at a time, take
+/// 8 s. The restore has 6 s (1 s, a second for the megabyte started, a
+/// second per eight objects) for its reads: it is given up then, answered
+/// as a bucket that does not answer is, and the next request restores
+/// every write once the bucket is fast again. Without a deadline for the
+/// reads together, the caller waited as long as the chain took.
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_reads_that_add_up_past_the_deadline_end_a_restore() {
     let path = "/actor/t/slow/durable";
