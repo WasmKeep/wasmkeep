@@ -201,7 +201,7 @@ impl ActorService {
             .inner
             .cluster
             .as_ref()
-            .is_none_or(|cluster| !cluster.first_use(&signed));
+            .is_none_or(|cluster| !cluster.first_use(&signed, handoff || take));
         if replayed {
             return text_response(StatusCode::FORBIDDEN, "signature already used\n");
         }

@@ -52,6 +52,7 @@ mod host;
 mod moving;
 mod requests;
 mod routing;
+mod socket_owners;
 mod sockets;
 mod start;
 mod state;
@@ -130,6 +131,14 @@ pub struct ActorConfig {
     /// Join a cluster: actors run only on the node holding their lease, and
     /// requests reaching another node are forwarded. `None` runs alone.
     pub cluster: Option<ClusterConfig>,
+    /// How long a WebSocket client may stay silent before the server pings
+    /// it: 25 s, under a load balancer's usual 60 s idle timeout. Tests
+    /// shorten it.
+    pub websocket_ping_after: Duration,
+    /// How long a WebSocket the server closed waits for the client's close
+    /// frame before it is dropped: 5 s. Until then it delivers nothing and
+    /// keeps its slot. Tests shorten it.
+    pub websocket_close_wait: Duration,
 }
 
 impl ActorConfig {
@@ -152,6 +161,8 @@ impl ActorConfig {
             access: crate::access::AccessRules::default(),
             flag_access: None,
             deploy_seq: 0,
+            websocket_ping_after: crate::websocket::PING_AFTER,
+            websocket_close_wait: crate::websocket::CLOSE_WAIT,
         }
     }
 }
@@ -166,6 +177,10 @@ struct ServiceInner {
     tenant: String,
     wall: Duration,
     sockets: Arc<Sockets>,
+    /// [`ActorConfig::websocket_ping_after`] and
+    /// [`ActorConfig::websocket_close_wait`].
+    ping_after: Duration,
+    close_wait: Duration,
     classes: Classes,
     /// Kept so new class versions can be linked (`replace_class`).
     linker: Linker<ActorHost>,

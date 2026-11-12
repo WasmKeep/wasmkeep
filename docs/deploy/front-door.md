@@ -28,8 +28,9 @@ node a     node b     node c       any node takes any request;
   ([monitoring](../monitoring.md)). `/_wasmkeep/health` only says the
   process answers.
 - **WebSockets** need the upgrade passed through and a tunnel or idle
-  timeout above 90 s (WasmKeep pings an idle socket after 60 s and closes
-  it 30 s later if there is no answer).
+  timeout above 30 s; the usual default of 60 s works (WasmKeep pings a
+  socket whose client has been silent for 25 s, and closes it 30 s later
+  if there is no answer).
 - **A server timeout above the failover wait.** When a node dies, the
   others keep a `GET`, a `HEAD` or a WebSocket upgrade for one of its
   actors until they took the actor over, up to 25 s by default
@@ -325,7 +326,7 @@ it, and the provider stops using that connector.
   the connectors can reach HAProxy and the nodes
   ([Client addresses](#client-addresses)).
 - **WebSockets** need the provider to pass the upgrade and to keep an idle
-  connection open for more than 90 s, as for any proxy in front.
+  connection open for more than 30 s, as for any proxy in front.
 
 ### Plain DNS round robin, no proxy at all
 

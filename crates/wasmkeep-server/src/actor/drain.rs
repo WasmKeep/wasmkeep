@@ -9,7 +9,9 @@
 //! and releases the lease, waiting for the release to be written. The
 //! actor is then dropped from memory; events queued behind the job find no
 //! lease and go to the chosen peer, which claims. Its alarm, if any, is
-//! handed to that peer, which arms it in its own timer.
+//! handed to that peer, which arms it in its own timer. Sockets of rooms
+//! that hibernated with them open (not resident, so not handed over) are
+//! closed too; their close events are lost.
 
 use std::collections::HashMap;
 
@@ -173,7 +175,8 @@ impl ActorService {
 /// over its resident actors and the alarms its timer holds for actors it
 /// does not hold (failed hand-offs, alarms other nodes handed it before it
 /// drained), and publishes `draining`, `drained` or `stuck` on heartbeat
-/// line 9; it is `drained` only with no actor and no alarm left, so
+/// line 9; it is `drained` only with no actor, no alarm and no socket left
+/// (it closes the sockets of rooms that hibernated with them open), so
 /// stopping it then leaves nothing to the sweep. Otherwise it acts on move
 /// requests (ADR 0017).
 pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: Arc<Cluster>) {
@@ -208,6 +211,19 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
                     hand_off(&inner, &cluster, &address, at).await;
                 }
             }
+            // Rooms that hibernated with sockets open are not resident, so
+            // no hand-over closes them: close them here, and their clients
+            // reconnect to the peer. Their close events find no hold on
+            // this draining node and are lost.
+            for address in inner.sockets.owners() {
+                if !inner.mailboxes.contains(&address) {
+                    let closed =
+                        inner
+                            .sockets
+                            .close_owner(&address, 1012, "node draining; reconnect");
+                    crate::metrics::owner_closes("drain", closed);
+                }
+            }
         }
         // After the pass: what is still here decides the state. `resident`
         // counts every registered mailbox, including one delivering an
@@ -215,7 +231,11 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
         // `drained` (and stopped) in the middle of an alarm. Counting only
         // actors that hold a lease would bring that race back (found by
         // the drain simulation).
-        let left = inner.mailboxes.resident() + inner.alarms.registered().await.len();
+        // Sockets too, closing ones included: a node that still holds a
+        // socket is not drained.
+        let left = inner.mailboxes.resident()
+            + inner.alarms.registered().await.len()
+            + inner.sockets.len();
         // Drained only once no release is pending either: no record is left
         // naming this node while it no longer serves the actor (ADR 0020,
         // section 4).

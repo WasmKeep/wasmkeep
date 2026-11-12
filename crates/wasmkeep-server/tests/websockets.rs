@@ -25,6 +25,14 @@ async fn start_with_limits(
     max_resident: usize,
     queue_capacity: usize,
 ) -> (SocketAddr, tempfile::TempDir, ActorService) {
+    start_configured(max_resident, queue_capacity, |_| {}).await
+}
+
+async fn start_configured(
+    max_resident: usize,
+    queue_capacity: usize,
+    configure: impl FnOnce(&mut ActorConfig),
+) -> (SocketAddr, tempfile::TempDir, ActorService) {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     let wasm = WASM.get_or_init(|| guests::build_guest("tests/guests/test-actor", "test_actor"));
     let runtime = Runtime::new(&RuntimeConfig {
@@ -39,6 +47,7 @@ async fn start_with_limits(
     config.mailbox.queue_capacity = queue_capacity;
     config.mailbox.idle_timeout = Duration::from_secs(600);
     config.egress = wasmkeep_server::EgressPolicy::allowing(vec!["127.0.0.1".parse().unwrap()]);
+    configure(&mut config);
     let service =
         ActorService::new(runtime, config, vec![("t".into(), component, wasm.clone())]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -409,4 +418,28 @@ async fn oversized_client_messages_close_the_socket() {
     .await
     .expect("the socket stayed open after an oversized message");
     assert!(matches!(ended, Some(1009) | None), "{ended:?}");
+}
+
+/// A silent client is pinged, by default after 25 s, so the socket carries
+/// traffic before a load balancer's usual idle timeout (60 s for nginx and
+/// AWS ALB) cuts it. It used to wait 60 s, exactly that timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_client_is_pinged() {
+    let default = ActorConfig::new("unused").websocket_ping_after;
+    assert_eq!(default, Duration::from_secs(25));
+    let (addr, _dir, _service) = start_configured(7, 256, |c| {
+        c.websocket_ping_after = Duration::from_millis(200);
+    })
+    .await;
+    ready_actor(addr, "quiet").await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/actor/t/quiet"))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("never pinged");
+    assert!(
+        matches!(frame, Some(Ok(Message::Ping(_)))),
+        "first frame: {frame:?}"
+    );
 }

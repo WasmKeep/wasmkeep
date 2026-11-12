@@ -231,8 +231,18 @@ impl Cluster {
     fn publish_validity(&self, lease: &NodeLease<ObjectStoreBucket, SystemClock>) {
         if self.validity.publish(lease.valid_until_ms()) {
             tracing::warn!("this node's lease ran out: every actor it held is released");
-            self.pending.end_all(true);
+            self.end_holds_after_lapse();
         }
+    }
+
+    /// The lease had run out: runs [`Cluster::on_lease_lapse`]'s hook (the
+    /// service's WebSockets close), then ends every hold into the pending
+    /// releases.
+    pub(super) fn end_holds_after_lapse(&self) {
+        if let Some(hook) = self.lapse_hook.get() {
+            hook();
+        }
+        self.pending.end_all(true);
     }
 
     /// Makes this node's lease invalid here at once: every hold ends (as

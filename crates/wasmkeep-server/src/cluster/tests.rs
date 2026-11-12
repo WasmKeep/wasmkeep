@@ -287,6 +287,17 @@ fn identical_calls_in_one_millisecond_get_distinct_signatures() {
     assert_ne!(sign("01"), sign("02"));
 }
 
+/// A full record refuses fresh signatures as full, not as replays, so
+/// the log tells exhaustion from a replay.
+#[test]
+fn a_full_record_tells_full_from_used() {
+    let seen = SeenSignatures::with_cap("control", 2);
+    assert_eq!(seen.spend([1; 32], 1_000, 1_000), Spent::Fresh);
+    assert_eq!(seen.spend([2; 32], 1_000, 1_000), Spent::Fresh);
+    assert_eq!(seen.spend([3; 32], 1_000, 1_000), Spent::Full);
+    assert_eq!(seen.spend([1; 32], 1_000, 1_000), Spent::Used);
+}
+
 #[test]
 fn a_signature_is_accepted_once() {
     let seen = SeenSignatures::default();
@@ -1046,6 +1057,12 @@ fn a_relayed_upgrade_carries_no_node_or_framing_headers() {
         (CHAIN, "default/t/y"),
         (FORWARDED, "0"),
         ("x-wasmkeep-actor", "default/t/z"),
+        // Markers only a node may set, and any other name in the reserved
+        // range: a client must not choose any of them for the owner.
+        (TAKE, "1"),
+        (ALARM_HANDOFF, "1"),
+        (HOLDER, "a"),
+        ("X-WasmKeep-Something-New", "1"),
         ("content-length", "5"),
         ("transfer-encoding", "chunked"),
         ("connection", "keep-alive, upgrade, x-custom"),
@@ -1067,6 +1084,10 @@ fn a_relayed_upgrade_carries_no_node_or_framing_headers() {
         CHAIN,
         FORWARDED,
         "x-wasmkeep-actor",
+        TAKE,
+        ALARM_HANDOFF,
+        HOLDER,
+        "x-wasmkeep-something-new",
         "content-length",
         "transfer-encoding",
         "te",
@@ -1074,6 +1095,10 @@ fn a_relayed_upgrade_carries_no_node_or_framing_headers() {
     ] {
         assert!(!out.contains_key(gone), "{gone} relayed");
     }
+    assert!(
+        !out.keys().any(|k| k.as_str().starts_with("x-wasmkeep-")),
+        "a reserved header was relayed: {out:?}"
+    );
     assert_eq!(out["connection"], "upgrade");
     assert_eq!(out["upgrade"], "websocket");
     for kept in [
@@ -2770,4 +2795,50 @@ async fn only_a_connection_that_could_not_be_opened_counts_as_a_failed_connect()
     });
     let error = get(closing).await.unwrap_err();
     assert!(!error.is_connect(), "{error:?}");
+}
+
+/// Signatures of take and alarm hand-off calls are remembered apart: a
+/// flood of other node calls (or of signed upgrades) that fills the record
+/// must not refuse the calls a drain and a move depend on.
+#[tokio::test]
+async fn a_full_signature_record_still_accepts_control_calls() {
+    let cluster = node("a");
+    let now = now_ms();
+    let signed = |n: u32| {
+        let mut mac = [0u8; 32];
+        mac[..4].copy_from_slice(&n.to_le_bytes());
+        Signed {
+            mac,
+            ts: now,
+            body: String::new(),
+        }
+    };
+    for n in 0..u32::try_from(MAX_SEEN).unwrap() {
+        assert!(cluster.first_use(&signed(n), false), "refused call {n}");
+    }
+    let next = u32::try_from(MAX_SEEN).unwrap();
+    assert!(
+        !cluster.first_use(&signed(next), false),
+        "the record of calls is full"
+    );
+    assert!(
+        cluster.first_use(&signed(next + 1), true),
+        "a control call was refused"
+    );
+    // Still used once only, in its own record.
+    assert!(!cluster.first_use(&signed(next + 1), true), "replayed");
+}
+
+/// A lease write that finds the lease ran out runs the lapse hook (the
+/// service closes its WebSockets there) before ending every hold.
+#[tokio::test]
+async fn a_lapse_runs_its_hook_before_ending_the_holds() {
+    let cluster = node("a");
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&ran);
+    cluster.on_lease_lapse(Box::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    cluster.end_holds_after_lapse();
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

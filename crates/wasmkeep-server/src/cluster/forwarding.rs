@@ -90,20 +90,21 @@ pub(super) fn strip_hop_by_hop(headers: &mut hyper::HeaderMap, framing: Framing)
 }
 
 /// The headers of a WebSocket upgrade relayed to the actor's owner: the
-/// client's, without its host, hop-by-hop headers, or anything only a node
-/// or the host sets (signature, caller, chain, forwarded mark, actor), then
-/// the upgrade itself. The relay is an outside client's request.
+/// client's, without its host, hop-by-hop headers, or any `x-wasmkeep-*`
+/// header (the signature, caller, chain, forwarded mark and the markers
+/// of node calls are set by nodes and the host only, and a name added to
+/// that range later is covered too), then the upgrade itself. The relay
+/// is an outside client's request.
 pub(super) fn upgrade_headers(client: &hyper::HeaderMap) -> hyper::HeaderMap {
     let mut out = client.clone();
     strip_hop_by_hop(&mut out, Framing::Drop);
-    for name in [
-        hyper::header::HOST.as_str(),
-        INTERNAL,
-        CALLER,
-        CHAIN,
-        FORWARDED,
-        "x-wasmkeep-actor",
-    ] {
+    out.remove(hyper::header::HOST);
+    let reserved: Vec<hyper::header::HeaderName> = out
+        .keys()
+        .filter(|name| name.as_str().starts_with(RESERVED_PREFIX))
+        .cloned()
+        .collect();
+    for name in reserved {
         out.remove(name);
     }
     out.insert(
@@ -116,6 +117,10 @@ pub(super) fn upgrade_headers(client: &hyper::HeaderMap) -> hyper::HeaderMap {
     );
     out
 }
+
+/// The range of header names nodes and the host set (header names are
+/// lowercase in a `HeaderMap`).
+const RESERVED_PREFIX: &str = "x-wasmkeep-";
 
 /// Whether a request must not be forwarded to another node: another node
 /// already forwarded it, or it arrived on the cluster port (ADR 0011).

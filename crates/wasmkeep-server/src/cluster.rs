@@ -103,6 +103,11 @@ pub struct ClusterConfig {
     /// How often this node looks in the bucket for alarms whose owner did
     /// not fire them (it died): those it delivers itself.
     pub alarm_sweep: Duration,
+    /// How often this node reads the ownership record of each actor that
+    /// has WebSockets here but no hold (it hibernated with them open), and
+    /// closes them with 1012 if another node holds it: 60 s. Tests shorten
+    /// it.
+    pub socket_sweep: Duration,
     /// The deployed app this node serves (`tenant/app`), or empty for
     /// classes given on the command line. Two apps of one tenant would
     /// share actor keys in the bucket, so nodes refuse to mix them.
@@ -190,6 +195,7 @@ impl ClusterConfig {
             lease: LeaseConfig::default_safe(),
             heartbeat: DEFAULT_HEARTBEAT,
             alarm_sweep: Duration::from_secs(10),
+            socket_sweep: Duration::from_secs(60),
             app: String::new(),
             cluster_tls: None,
             cluster_plaintext: ClusterPlaintext::Accept,
@@ -292,6 +298,10 @@ pub(crate) struct Cluster {
     serves: String,
     /// Node signatures already accepted (replay protection).
     seen: SeenSignatures,
+    /// The same for take and alarm hand-off calls (ADR 0014, 0017), kept
+    /// apart: a flood of other signed calls that fills `seen` cannot
+    /// refuse the calls a drain and a move depend on.
+    seen_control: SeenSignatures,
     /// When each reason for refusing a node signature was last logged
     /// (ms): one slot per reason, so junk on the public port cannot hide a
     /// real refusal.
@@ -338,6 +348,9 @@ pub(crate) struct Cluster {
     /// period plus grace, by which its owner fired it or lost the actor.
     pub(crate) alarm_overdue: Duration,
     pub(crate) alarm_sweep: Duration,
+    /// How often sockets of actors this node does not hold are checked
+    /// against their ownership record ([`ClusterConfig::socket_sweep`]).
+    pub(crate) socket_sweep: Duration,
     /// ADR 0012's retention window ([`ClusterConfig::history_retention`]).
     pub(crate) history_retention: Duration,
     /// [`ClusterConfig::snapshot_retry_min`].
@@ -381,6 +394,10 @@ pub(crate) struct Cluster {
     lease_attempt: Duration,
     /// This node's lease validity, shared with every hold.
     pub(crate) validity: Arc<NodeValidity>,
+    /// Run when a lease write finds the lease had run out, before every
+    /// hold ends: the service closes its WebSockets there, so none is
+    /// still open once the holds' releases are queued.
+    lapse_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Set by a clean stop: the lease task writes `released` and ends.
     lease_stop: tokio::sync::watch::Sender<bool>,
     /// Set once the lease task has ended, whatever the way.
@@ -483,6 +500,12 @@ impl std::fmt::Debug for Cluster {
 }
 
 impl Cluster {
+    /// Sets the hook a lapsed lease runs before ending every hold (once;
+    /// a later call is ignored).
+    pub(crate) fn on_lease_lapse(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.lapse_hook.set(hook);
+    }
+
     /// `serves`: what this node serves (see [`NodeInfo::app`]).
     pub(crate) fn new(config: &ClusterConfig, serves: &str) -> Result<Arc<Self>, crate::Error> {
         let invalid_id =
@@ -541,7 +564,8 @@ impl Cluster {
         let connector = ClusterConnector::new(tls.clone(), refuse_plaintext);
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
-            seen: SeenSignatures::default(),
+            seen: SeenSignatures::named("calls"),
+            seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(
@@ -578,6 +602,7 @@ impl Cluster {
                     .saturating_add(config.lease.grace_ms()),
             ),
             alarm_sweep: config.alarm_sweep,
+            socket_sweep: config.socket_sweep,
             history_retention: config.history_retention,
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,
@@ -596,6 +621,7 @@ impl Cluster {
             lease_every: lease_every(config.heartbeat, &config.lease),
             lease_attempt: lease_attempt(&config.lease),
             validity: Arc::new(NodeValidity::new()),
+            lapse_hook: std::sync::OnceLock::new(),
             lease_stop: tokio::sync::watch::Sender::new(false),
             lease_done: tokio::sync::watch::Sender::new(false),
             old_heartbeats: Mutex::new(HashMap::new()),
@@ -1017,8 +1043,11 @@ impl Cluster {
         let now = now_ms();
         match verify(secret, given, now, &self.node_id, method, path, headers) {
             Some(signed) if public_port => {
-                // Burnt, never honoured here.
-                self.seen.first_use(signed.mac, signed.ts, now);
+                // Burnt, never honoured here, in the record a node's call
+                // with the same markers would be checked against (both
+                // markers are signed).
+                let control = headers.contains_key(TAKE) || headers.contains_key(ALARM_HANDOFF);
+                self.record(control).first_use(signed.mac, signed.ts, now);
                 self.note_refused("signed call on the public port, treated as from outside (--cluster-plaintext refuse)");
                 None
             }
@@ -1034,13 +1063,36 @@ impl Cluster {
 
     /// Records a signature whose body matched; false if it was already used.
     /// Only then is it spent: a copy sent ahead with another body is
-    /// refused without using up the real call's signature.
-    pub(crate) fn first_use(&self, signed: &Signed) -> bool {
-        let fresh = self.seen.first_use(signed.mac, signed.ts, now_ms());
-        if !fresh {
-            self.note_refused("signature already used");
+    /// refused without using up the real call's signature. `control`: a
+    /// take or an alarm hand-off, recorded apart from other calls.
+    pub(crate) fn first_use(&self, signed: &Signed, control: bool) -> bool {
+        match self.record(control).spend(signed.mac, signed.ts, now_ms()) {
+            signing::Spent::Fresh => true,
+            signing::Spent::Used => {
+                self.note_refused("signature already used");
+                false
+            }
+            // Not a replay: more node calls than the record holds.
+            signing::Spent::Full if control => {
+                self.note_refused(
+                    "record of used signatures full (control: takes and alarm hand-offs)",
+                );
+                false
+            }
+            signing::Spent::Full => {
+                self.note_refused("record of used signatures full (calls)");
+                false
+            }
         }
-        fresh
+    }
+
+    /// The record of used signatures for control calls, or for the rest.
+    fn record(&self, control: bool) -> &SeenSignatures {
+        if control {
+            &self.seen_control
+        } else {
+            &self.seen
+        }
     }
 
     /// A nonce for one signed call: this process's random seed and a

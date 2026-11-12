@@ -26,8 +26,14 @@ pub(crate) const MAX_SOCKETS_PER_ACTOR: usize = 1_000;
 pub(crate) const MAX_SOCKETS_PER_NODE: usize = 50_000;
 /// A silent client is pinged after this long, and closed if still silent
 /// after [`PONG_WAIT`] more (half-open connections otherwise never end).
-pub(crate) const PING_AFTER: Duration = Duration::from_secs(60);
+/// Under a load balancer's usual idle timeout (60 s for nginx and AWS
+/// ALB), so an idle socket carries a frame before the balancer cuts it.
+pub(crate) const PING_AFTER: Duration = Duration::from_secs(25);
 pub(crate) const PONG_WAIT: Duration = Duration::from_secs(30);
+/// How long a socket the server closed waits for the client's close frame
+/// before it is dropped. A client that never answers (and keeps sending
+/// pings, say) cannot keep it, and its slot, any longer.
+pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// The protocol limits for every socket the host accepts.
 pub(crate) fn config() -> WebSocketConfig {
@@ -58,6 +64,9 @@ struct Conn {
     /// `on-websocket-open` accepted it: until then it is invisible to the
     /// actor's other events (no broadcast reaches a socket it may refuse).
     accepted: bool,
+    /// Notified when the server closes it, so its reader stops delivering
+    /// frames and waits for the client's close for a bounded time only.
+    closing: Arc<tokio::sync::Notify>,
 }
 
 /// Why `send` failed.
@@ -104,6 +113,8 @@ pub(crate) struct Opened {
     pub(crate) id: u64,
     pub(crate) outgoing: mpsc::Receiver<Outgoing>,
     pub(crate) queued: Arc<AtomicUsize>,
+    /// Notified once the server closes it ([`Self::close_all`] and the like).
+    pub(crate) closing: Arc<tokio::sync::Notify>,
 }
 
 impl Sockets {
@@ -139,6 +150,7 @@ impl Sockets {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, outgoing) = mpsc::channel(SEND_QUEUE);
         let queued = Arc::new(AtomicUsize::new(0));
+        let closing = Arc::new(tokio::sync::Notify::new());
         registry
             .by_owner
             .entry(owner.clone())
@@ -151,12 +163,14 @@ impl Sockets {
                 tx: Some(tx),
                 queued: Arc::clone(&queued),
                 accepted: false,
+                closing: Arc::clone(&closing),
             },
         );
         Ok(Opened {
             id,
             outgoing,
             queued,
+            closing,
         })
     }
 
@@ -221,24 +235,80 @@ impl Sockets {
         if let Some(conn) = registry.conns.get_mut(&id)
             && &conn.owner == owner
         {
-            conn.accepted = false;
-            // If the queue is full the socket is dropped instead: still closed.
-            if let Some(tx) = conn.tx.take() {
-                let _ = tx.try_send(Outgoing::Close(code, reason));
-            }
+            Self::close_conn(conn, code, &reason);
         }
     }
 
-    /// Closes every connection on the node (shutdown). Each task releases
-    /// its own slot after finishing cleanup.
-    pub(crate) fn close_all(&self, code: u16, reason: &str) {
+    /// Closes every connection on the node (shutdown, a lapsed node
+    /// lease). Each task releases its own slot after finishing cleanup.
+    /// Returns how many were open (not closing already).
+    pub(crate) fn close_all(&self, code: u16, reason: &str) -> usize {
         let mut registry = self.lock();
+        let mut closed = 0;
         for conn in registry.conns.values_mut() {
-            conn.accepted = false;
-            if let Some(tx) = conn.tx.take() {
-                let _ = tx.try_send(Outgoing::Close(code, reason.to_owned()));
+            closed += usize::from(Self::close_conn(conn, code, reason));
+        }
+        closed
+    }
+
+    /// Closes every connection of `owner`, pending ones included (this
+    /// node no longer owns the actor). Returns how many were open.
+    pub(crate) fn close_owner(&self, owner: &ActorAddress, code: u16, reason: &str) -> usize {
+        let mut registry = self.lock();
+        let Registry { conns, by_owner } = &mut *registry;
+        let mut closed = 0;
+        for id in by_owner.get(owner).into_iter().flatten() {
+            if let Some(conn) = conns.get_mut(id) {
+                closed += usize::from(Self::close_conn(conn, code, reason));
             }
         }
+        closed
+    }
+
+    /// Asks the writer to close `conn` and hides it; false if it was
+    /// closing already.
+    fn close_conn(conn: &mut Conn, code: u16, reason: &str) -> bool {
+        conn.accepted = false;
+        // If the queue is full the socket is dropped instead: still closed.
+        match conn.tx.take() {
+            Some(tx) => {
+                let _ = tx.try_send(Outgoing::Close(code, reason.to_owned()));
+                // Kept as a permit if the reader is not waiting yet.
+                conn.closing.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `id` is one of `owner`'s accepted connections, not closing:
+    /// a frame read from it may still be delivered.
+    pub(crate) fn is_open(&self, owner: &ActorAddress, id: u64) -> bool {
+        self.lock()
+            .conns
+            .get(&id)
+            .is_some_and(|c| &c.owner == owner && c.accepted && c.tx.is_some())
+    }
+
+    /// The actors with at least one connection on this node that is not
+    /// closing.
+    pub(crate) fn open_owners(&self) -> Vec<ActorAddress> {
+        let registry = self.lock();
+        registry
+            .by_owner
+            .iter()
+            .filter(|(_, ids)| {
+                ids.iter()
+                    .any(|id| registry.conns.get(id).is_some_and(|c| c.tx.is_some()))
+            })
+            .map(|(owner, _)| owner.clone())
+            .collect()
+    }
+
+    /// The actors with at least one slot on this node, closing sockets
+    /// included.
+    pub(crate) fn owners(&self) -> Vec<ActorAddress> {
+        self.lock().by_owner.keys().cloned().collect()
     }
 
     /// `owner`'s accepted connections (and `opening`, if it is one of its
@@ -401,6 +471,34 @@ mod tests {
         ));
         sockets.remove(opened.id);
         assert_eq!(sockets.len(), 0);
+    }
+
+    #[test]
+    fn closing_an_actors_sockets_leaves_other_actors_alone() {
+        let sockets = Sockets::default();
+        let (a, b) = (actor("a"), actor("b"));
+        let mut first = sockets.open(a.clone()).unwrap();
+        sockets.accept(first.id);
+        // Pending: its open event has not run yet. Closed too.
+        let mut pending = sockets.open(a.clone()).unwrap();
+        let mut other = sockets.open(b.clone()).unwrap();
+        sockets.accept(other.id);
+        assert_eq!(sockets.owners().len(), 2);
+        assert_eq!(sockets.close_owner(&a, 1012, "moved"), 2);
+        assert_eq!(sockets.close_owner(&a, 1012, "moved"), 0, "closed once");
+        for conn in [&mut first, &mut pending] {
+            assert!(matches!(
+                conn.outgoing.try_recv(),
+                Ok(Outgoing::Close(1012, _))
+            ));
+        }
+        assert!(matches!(
+            other.outgoing.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(sockets.of(&b, None), vec![other.id]);
+        // Slots stay until each close event ran.
+        assert_eq!(sockets.reserved_by(&a), 2);
     }
 
     #[test]

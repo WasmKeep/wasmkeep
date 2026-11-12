@@ -226,7 +226,7 @@ next message wakes it.
 - `connections` lists the actor's sockets, so broadcasting is a loop.
 - Limits: messages from clients up to 1 MiB (larger closes the socket with
   1009); 1,000 sockets per actor and 50,000 per node (more get 503); a
-  client silent for 60 s is pinged, and closed if it does not answer within
+  client silent for 25 s is pinged, and closed if it does not answer within
   30 s.
 - In a cluster, a client may connect to any node: the socket is relayed to
   the actor's node. If the actor moves, its sockets close with code 1012 and
