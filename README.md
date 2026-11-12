@@ -252,6 +252,7 @@ deploy, and Prometheus and Grafana on the same cluster;
   and chat room in D and MoonBit, a counter in C# and in standard Go,
   [workflows](examples/workflows) and [Watch](examples/watch), an uptime monitor (`examples/`)
 - [Running a cluster](docs/cluster.md): replication, failover, forwarding, `wasmkeep deploy`
+- [When a node dies, and how it scales](docs/failover-and-scaling.md): what callers get meanwhile, what adding a node does, what does not happen, and when to keep a database
 - [Roadmap](ROADMAP.md): what is built, what comes next, and what is not planned
 - Design decisions: [docs/adr](docs/adr); how the pieces fit: [Concepts](docs/concepts.md) and [Running a cluster](docs/cluster.md#how-it-works)
 - [Security model](docs/security.md): what is protected, the limits, the known gaps; report vulnerabilities as in [SECURITY.md](SECURITY.md)

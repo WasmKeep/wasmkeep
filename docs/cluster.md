@@ -12,6 +12,10 @@ Nodes share one S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, ...) that
 supports conditional writes (`If-None-Match` / `If-Match`). There is nothing
 else to run: no consensus cluster, no coordinator.
 
+For the short version of what callers see when a node stops or dies, and
+of what adding nodes does, read
+[When a node dies, and how it scales](failover-and-scaling.md).
+
 ## How it works
 
 - Each node writes a **heartbeat** to `nodes/<id>` with its address, every

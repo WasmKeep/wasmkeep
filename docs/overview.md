@@ -93,4 +93,6 @@ Next: [Concepts](concepts.md) for how actors behave, or
 
 Design details and the reasoning behind each decision are in
 [`docs/adr`](adr/); [Concepts](concepts.md) and [Running a cluster](cluster.md)
-describe how it behaves.
+describe how it behaves, and
+[When a node dies, and how it scales](failover-and-scaling.md) says what
+an application sees of it.

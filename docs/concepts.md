@@ -240,7 +240,9 @@ own lease; requests that reach another node are forwarded, and each actor's
 writes are replicated to the bucket after every event. A node that stops
 cleanly hands its actors over at once; if a node dies, they move to another
 node in about 15 to 21 s, with no acknowledged durable write lost. See
-[Running a cluster](cluster.md) for how it works and
+[Running a cluster](cluster.md) for how it works,
+[When a node dies, and how it scales](failover-and-scaling.md) for what
+callers see meanwhile and what adding nodes does, and
 [Deploying](deploy/three-nodes.md) for a setup.
 
 ## Configuration and secrets
