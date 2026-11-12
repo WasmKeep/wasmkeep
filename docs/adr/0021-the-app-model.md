@@ -74,8 +74,8 @@ Until then, **one app per tenant per bucket prefix**, enforced by
 when another app there has a `current`, naming it and saying what to do
 (another tenant or another prefix; for an abandoned app, the keys to
 delete). A listing that fails refuses too. Two apps of one tenant already
-deployed together on one prefix keep working, and `deploy` and `serve
---app` warn about them by name; a further one is refused. The check adds
+deployed together on one prefix are left as they were, and `deploy` and
+`serve --app` warn about them by name; a further one is refused. The check adds
 no object to the bucket. The node's start check against a live node of
 another app of its tenant stays.
 

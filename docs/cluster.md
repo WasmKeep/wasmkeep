@@ -618,8 +618,9 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   another tenant (`--app acme-admin/admin`) or prefix
   (`s3://bucket/admin`). A node also refuses to start when a live node on
   its prefix serves another app of its tenant. Two apps of one tenant
-  deployed on one prefix before this check keep working, and `deploy` and
-  `serve` warn about them by name; a third is refused. There is no `app
+  deployed on one prefix before this check are left as they were (in a
+  cluster, still not running at the same time), and `deploy` and `serve`
+  warn about them by name; a third is refused. There is no `app
   delete` yet: to free the tenant from an app nobody runs, stop its nodes
   and delete every key under `apps/<tenant>/<app>/` (its versions,
   `current` and secrets). Its actors' data stays under `actors/<tenant>/`,

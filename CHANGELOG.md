@@ -132,7 +132,8 @@ Since 0.2.0, in no release yet.
   now lists `apps/<tenant>/` and refuses when another app there has a
   `current`, naming it and saying what to do: another tenant or another
   prefix, or, for an abandoned app, the keys to delete. Two apps of one
-  tenant already deployed on one prefix keep working, and `deploy` and
+  tenant already deployed on one prefix are left as they were (a node of
+  one still refuses to start while a node of the other is live), and `deploy` and
   `serve --app` warn about them by name; a third is refused. This lasts
   until apps own their state (planned for 0.4.0,
   [deploying](docs/cluster.md#deploying)).

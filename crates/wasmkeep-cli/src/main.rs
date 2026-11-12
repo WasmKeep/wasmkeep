@@ -659,7 +659,8 @@ pub(crate) fn shared_prefix_warning(app: &str, others: &[String]) -> Option<Stri
         format!(
             "{app} and {} are apps of one tenant on one bucket prefix: they share actors \
              (keyed by tenant, class and name), and a class of the same name in both reaches \
-             the same actors. They keep working; a further app of the tenant is refused. \
+             the same actors. Nothing else changes for them (in a cluster, a node still refuses to \
+             start while a node of the other app is live); a further app of the tenant is refused. \
              To separate them, deploy one under another tenant or bucket prefix (it starts \
              with no data) and stop the old one",
             others.join(" and ")
