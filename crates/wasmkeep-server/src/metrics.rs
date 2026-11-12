@@ -180,6 +180,10 @@ pub(crate) struct Metrics {
     /// Garbage-collection passes that failed (a bucket error); the next
     /// snapshot tries again.
     pub(crate) history_collect_failures: AtomicU64,
+    /// Snapshot uploads that were not acknowledged (given up; one may
+    /// still land later): a periodic one is tried again, see
+    /// `Replica::snapshot_due`.
+    pub(crate) snapshot_upload_failures: AtomicU64,
 }
 
 /// The process's metrics.
@@ -406,6 +410,12 @@ pub fn render(gauges: Gauges) -> String {
         "wasmkeep_history_collect_failures_total",
         "Garbage-collection passes that failed; the next snapshot tries again.",
         m.history_collect_failures.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_snapshot_upload_failures_total",
+        "Snapshot uploads not acknowledged; a periodic one is tried again.",
+        m.snapshot_upload_failures.load(Ordering::Relaxed),
     );
     out
 }

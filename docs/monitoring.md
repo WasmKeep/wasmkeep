@@ -131,6 +131,7 @@ class names, event kinds and fixed reasons, never actor names.
 | `wasmkeep_failovers_total` | counter | Actors this node took over whose ownership record still named another node, freed because that node was fenced, released or replaced by a new process. See below. |
 | `wasmkeep_history_collected_total` | counter | Objects of actors' history deleted from the bucket by garbage collection ([ADR 0012](adr/0012-bucket-garbage-collection.md)). |
 | `wasmkeep_history_collect_failures_total` | counter | Garbage-collection passes that failed (a bucket error); the next snapshot tries again. Steadily rising: the bucket refuses deletes. |
+| `wasmkeep_snapshot_upload_failures_total` | counter | Snapshot uploads that were not acknowledged: the node gave the upload up, which does not say the bucket lacks it (an attempt given up can still land later, and is then an ordinary snapshot). A periodic snapshot has one attempt (one call to the bucket client, which may send the request again within it after an error answer), given up after 5 s plus a second per megabyte of the database, 10 s at most. One not acknowledged loses nothing and fails no event: the writes already uploaded are the history, and it is tried again once the actor has made one more write and 30 s have passed, then 8 writes later, then every 64 while it keeps failing (the node keeps these waits while an idle actor is out of memory; a node that takes the actor over, or one that restarted, tries at the actor's first event there). Until one succeeds, a restore of that actor replays more writes; a database the bucket cannot take within 10 s counts here at every try. An actor's first snapshot and the snapshot after a delete are sent again as a write is (an attempt is given up after 5 s plus a second per megabyte, the next one after twice that, three at most, the whole upload within 20 s plus that second per megabyte; the bucket client ends any single request after 30 s by default and does not send it again after that): the snapshot after a delete counts here and in `wasmkeep_history_collect_failures_total`, and does not delay the periodic one; an actor's first snapshot counts here, and its event fails. Steadily rising: the bucket refuses or stalls large uploads. |
 
 Not there yet: per-tenant labels (one tenant per process until
 multi-tenancy), traps by reason (`wasmkeep_events_total{outcome="failed"}`
@@ -176,7 +177,8 @@ should stay near zero.
 every metric above except `wasmkeep_classes`, the guest log counters
 (`wasmkeep_guest_log_lines_total`, `wasmkeep_guest_log_dropped_total`),
 the history collection counters (`wasmkeep_history_collected_total`,
-`wasmkeep_history_collect_failures_total`), the listing and restore-read
+`wasmkeep_history_collect_failures_total`),
+`wasmkeep_snapshot_upload_failures_total`, the listing and restore-read
 histograms (`wasmkeep_listing_seconds`, `wasmkeep_restore_read_seconds`),
 the node lease write and fence counters (`wasmkeep_node_lease_writes_total`,
 `wasmkeep_node_fences_total`) and `wasmkeep_requests_abandoned_total`. To

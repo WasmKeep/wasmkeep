@@ -68,6 +68,43 @@ Each actor's database follows it from node to node (ADR 0007):
   file under `actors/<tenant>/<class>/<name>/wal/`, and a snapshot every 64
   uploads. A node that takes an actor over rebuilds its database from the
   bucket first, unless its local copy is already current.
+- An upload the bucket leaves unanswered is given up and sent again: an
+  attempt after 5 s plus a second per megabyte (the next one after twice
+  that), three attempts at most, the whole upload within 20 s plus that
+  second per megabyte. This holds for a write's file, for an actor's first
+  snapshot and for the snapshot after a delete. An attempt is one call to
+  the bucket client, which sends the request again within it when the
+  bucket answers with an error (a 5xx, 429 or 408) or the request could
+  not be sent. The client also ends any single request after 30 s by
+  default, and does not send an upload again after that or after a broken
+  connection: the attempt fails. So a request lasts 30 s at most whatever
+  the object's size, and an attempt as long as the bounds above allow: the
+  second per megabyte gives a first attempt's request more time up to
+  25 MB and no further, and an object the bucket cannot take within 30 s
+  in one request is not uploaded.
+- A periodic snapshot is an optimisation, and the actor is held while it
+  uploads, so it gets one attempt, which the node does not send again
+  (the client may, within the attempt, after an error answer): given up
+  after 5 s plus a second per megabyte, 10 s at most (6 s under a
+  megabyte), a third of
+  the 30 s a queued caller waits for an actor (the default wall-clock
+  limit, for `actors.call`, and the wait for a forwarded request's
+  answer). One that
+  fails costs no write and fails no event (the files already uploaded are
+  the history). It is tried again once the actor has made one more write
+  and 30 s have passed, then, while it keeps failing, 8 writes later, then
+  every 64. With a bucket that leaves every snapshot upload hanging, the
+  worst case is 10 s of hold per try and three tries in any 64 writes
+  (30 s), never two within 30 s, then one try per 64 writes (10 s); an
+  actor that only reads does not try again. The node remembers these waits
+  while an idle actor is out of its memory, so waking it does not try
+  again either; a node that takes the actor over from another, or one
+  that restarted, knows of no wait and tries at the actor's first event
+  there when 64 writes or more have no snapshot. A
+  database the bucket cannot take within those 10 s gets no periodic
+  snapshot: each try is one bounded attempt, and a restore replays every
+  write since the last snapshot. Uploads not acknowledged are counted by
+  `wasmkeep_snapshot_upload_failures_total` ([monitoring](monitoring.md)).
 - `storage.exec` commits locally; its upload follows when the event ends.
   If the node dies in between, that write can be lost. `storage.exec-durable`
   returns only once the write is in the bucket, uploaded while the node still
@@ -661,7 +698,8 @@ Rolling upgrades of WasmKeep across mixed versions are planned
 ## History in the bucket
 
 Every write an actor commits becomes an object in the bucket, and every 64
-writes its owner adds a snapshot. After such a snapshot, the owner deletes
+writes its owner adds a snapshot (tried again later when its upload fails,
+see [Replication](#replication)). After such a snapshot, the owner deletes
 the history it makes unnecessary: older writes and snapshots, and uploads
 of earlier owners that no restore would use
 ([ADR 0012](adr/0012-bucket-garbage-collection.md)). It keeps what a
