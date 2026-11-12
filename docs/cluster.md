@@ -433,8 +433,8 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
 A deploy carries actor classes, with their access rules, configuration
 and required names. It does not carry the stateless component, the
 positional argument of `wasmkeep serve` that answers every path outside
-`/actor/`: that one is a file on each node, read once when the node
-starts, also with `--app`:
+`/actor/` and `/_wasmkeep/`: that one is a file on each node, read once
+when the node starts, also with `--app`:
 
 ```bash
 wasmkeep serve site.wasm --app acme/shop --bucket s3://wasmkeep-demo --node-id a ...

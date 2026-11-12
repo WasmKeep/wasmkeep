@@ -158,8 +158,9 @@ Load per node in the metrics, and placement, are on the
 ## Stateless components
 
 The component given to `wasmkeep serve` as its positional argument answers
-every path outside `/actor/`. It has no database, no lease and nothing in
-the bucket: each request gets a new instance on the node that received it,
+every path outside `/actor/` and `/_wasmkeep/` (the node answers that one
+itself). It has no database, no lease and nothing in the bucket: each
+request gets a new instance on the node that received it,
 so any node answers and the nodes do not coordinate. It scales with the
 nodes behind the load balancer, within each node's connection and instance
 limits and a 30 s wall clock per request.
