@@ -69,8 +69,8 @@ short: a plain `exec` among them may not be in the bucket, and is then
 not in the copy either. Once every process has exited nothing writes or
 deletes any more, as long as nobody runs `wasmkeep deploy` or
 `wasmkeep secrets` meanwhile, and the copy is the bucket at one moment.
-This is the one way I can show to be restorable from the code. Its cost
-is the cluster being down while the copy runs.
+This is the one way the code shows to be restorable. Its cost is the
+cluster being down while the copy runs.
 
 ### With the cluster running: not established
 
@@ -100,12 +100,13 @@ afterwards, while nodes keep writing and collecting. From the code:
   after it, carries a lower generation than those segments, and the next
   hold would use a generation that is already in the history. An alarm
   index copied before or after its actor's database can list an alarm
-  the database does not have, or miss one it has. I do not know what a
-  cluster started on such a copy does in each of these cases.
+  the database does not have, or miss one it has. What a cluster
+  started on such a copy does in each of these cases is not established.
 
 So: a copy of a running cluster is better than none, and most actors in
-it restore. It is not a backup I can vouch for. If the cluster cannot
-stop, bucket versioning is the other way, with unknowns of its own.
+it restore. It is not a backup the code shows to be restorable. If the
+cluster cannot stop, bucket versioning is the other way, with unknowns
+of its own.
 
 ### Bucket versioning
 
@@ -118,7 +119,7 @@ whose nodes all died at that moment would leave: nodes that die give
 nothing up, and the next ones take their actors from the bucket, which is
 what failover does.
 
-What it costs and what I have not checked:
+What it costs and what is not checked:
 
 - Rebuilding "every key as it was at time T" into another prefix is a job
   for the provider's tools or a script over the version listing. WasmKeep
