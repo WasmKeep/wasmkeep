@@ -13,6 +13,11 @@ Since 0.2.0, in no release yet.
 
 ### What changed
 
+- **A bucket a later version migrated is refused.** Every command that
+  opens a bucket first checks for the markers a later version writes while
+  it moves actor state to a new layout (`cluster/migration`,
+  `cluster/migrated/`), and stops with a message naming the marker. One
+  read and one listing per command, bounded to 10 s.
 - **A request waits for a takeover.** When an actor's node dies, a GET or
   HEAD without a body, or a WebSocket upgrade, for one of its actors is
   kept by the node that received it until the actor can be taken over (15
