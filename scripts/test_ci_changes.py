@@ -13,6 +13,8 @@ BASE = {
     'bench/results/2026-01-01-abc.csv': 'a,b\n',
     'crates/wasmkeep-server/src/lib.rs': 'pub fn f() {}\n' * 20,
     '.github/workflows/ci.yml': 'name: CI\n',
+    '.github/workflows/release.yml': 'name: release\n',
+    '.github/workflows/publish.yml': 'name: publish\n',
     'deploy/compose/README.md': 'compose\n',
     'deploy/systemd/units/README.md': 'units\n',
     'sdks/go/README.md': 'go\n',
@@ -108,6 +110,16 @@ class Changes(unittest.TestCase):
 
     def test_the_workflow_alone(self):
         self.assertTrue(self.code(self.writes('.github/workflows/ci.yml')))
+
+    def test_the_release_workflows_alone(self):
+        self.assertFalse(self.code(self.writes('.github/workflows/release.yml', '.github/workflows/publish.yml')))
+
+    def test_a_release_workflow_and_the_ci_workflow(self):
+        self.assertTrue(self.code(self.writes('.github/workflows/publish.yml', '.github/workflows/ci.yml')))
+
+    def test_another_workflow_is_code(self):
+        self.assertTrue(self.code(self.writes('.github/workflows/nightly.yml')))
+        self.assertTrue(self.code(self.writes('.github/workflows/sub/publish.yml')))
 
     def test_this_script_alone(self):
         self.assertTrue(self.code(self.writes('scripts/ci-changes.sh')))

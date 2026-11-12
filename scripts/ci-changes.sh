@@ -5,8 +5,8 @@
 #   scripts/ci-changes.sh <event> <base branch>      in the checkout CI made
 #
 # code=false only for a pull request whose every changed path is on the
-# list below: documentation and benchmark result files, which no code job
-# reads. The "docs site" and "benchmark publication paths" jobs check those
+# list below: documentation, benchmark result files and the two release
+# workflows, which no code job reads. The "docs site" and "benchmark publication paths" jobs check those
 # and always run. Everything else answers code=true: another event, a
 # pull request into another branch than main (its base may hold code main
 # never tested), a checkout that is not a pull request's merge commit, a
@@ -39,6 +39,9 @@ classify() {
       README.md|ROADMAP.md|CHANGELOG.md|CONTRIBUTING.md|CLAUDE.md) continue ;;
       docs/*.md|docs/book.toml) continue ;;
       bench/results/*) continue ;;
+      # The release workflows run on a tag or a published release only: no
+      # job here executes them. ci.yml and the others stay code.
+      .github/workflows/release.yml|.github/workflows/publish.yml) continue ;;
       deploy/*/README.md|sdks/*/README.md|examples/*/README.md)
         git cat-file -e "HEAD^1:$f" 2>/dev/null && continue ;;
     esac
