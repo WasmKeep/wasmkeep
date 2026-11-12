@@ -73,10 +73,10 @@ Each actor's database follows it from node to node (ADR 0007):
   that), three attempts at most, the whole upload within 20 s plus that
   second per megabyte. This holds for a write's file, for an actor's first
   snapshot and for the snapshot after a delete. The bucket client also
-  ends any single request after 30 s and does not send an upload again
-  after that, so an attempt lasts 30 s at most whatever its size: the
-  second per megabyte lengthens a first attempt up to 25 MB and no
-  further, and an object the bucket cannot take within 30 s is not
+  ends any single request after 30 s by default, and does not send an
+  upload again after that, so an attempt lasts 30 s at most whatever its
+  size: the second per megabyte lengthens a first attempt up to 25 MB and
+  no further, and an object the bucket cannot take within 30 s is not
   uploaded.
 - A periodic snapshot is an optimisation, and the actor is held while it
   uploads, so it gets one attempt, not sent again: given up after 5 s plus

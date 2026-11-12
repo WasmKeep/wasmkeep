@@ -89,8 +89,8 @@ const READ_ATTEMPTS: u32 = 3;
 /// actor given up (seen in a smoke run against a real bucket).
 ///
 /// The bucket's client has a timeout of its own on every request, 30 s
-/// from connecting to the last byte of the answer (its default;
-/// `wasmkeep serve` builds the client without changing it), and it does
+/// from connecting to the last byte of the answer (its default, which
+/// `wasmkeep serve` leaves as the environment has it), and it does
 /// not send a conditional create again once that has passed. So an
 /// attempt ends at the bound above or after 30 s, whichever comes first:
 /// the second per megabyte lengthens a first attempt up to 25 MB and no
@@ -120,11 +120,11 @@ const UPLOAD_BUDGET_IDLES: u32 = 4;
 /// hanging. A caller queued behind the actor waits 30 s at most where its
 /// wait is bounded at all (`wall_per_event` for `actors.call`,
 /// `FORWARD_TIMEOUT` for a request another node forwards; a request the
-/// owner received itself waits unbounded). So a periodic snapshot gets one
-/// attempt, not sent again, given up after [`UPLOAD_IDLE`] plus a second
-/// per started megabyte and at most this many [`UPLOAD_IDLE`]s: 6 s under
-/// a megabyte, 10 s from 5 MB on, a third of that wait and under the
-/// bucket client's own 30 s.
+/// owner received itself has no limit of its own). So a periodic snapshot
+/// gets one attempt, not sent again, given up after [`UPLOAD_IDLE`] plus a
+/// second per started megabyte and at most this many [`UPLOAD_IDLE`]s: 6 s
+/// under a megabyte, 10 s from 5 MB on, a third of that wait and under
+/// the bucket client's own 30 s.
 ///
 /// After a failure the next try waits for one more segment, then
 /// [`SNAPSHOT_RETRY_GROWTH`] times as many each time up to
