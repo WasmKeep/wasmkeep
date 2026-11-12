@@ -513,6 +513,60 @@ mod tests {
         );
     }
 
+    /// The alert rules in `deploy/prometheus` name only metrics this page
+    /// has, with labels it gives them.
+    #[test]
+    fn the_alert_rules_use_only_metrics_that_exist() {
+        let rules = include_str!("../../../deploy/prometheus/alerts.yml");
+        // Without the comments: the header is prose about the file.
+        let exprs: String = rules
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(exprs.matches("- alert: ").count(), 8, "{exprs}");
+        // Label families get a series when first used.
+        inc(&METRICS
+            .events
+            .get(&[("class", "c"), ("kind", "request"), ("outcome", "failed")]));
+        inc(&METRICS
+            .bucket_requests
+            .get(&[("operation", "get"), ("status", "error")]));
+        let page = render(Gauges::default());
+        let mut names = std::collections::BTreeSet::new();
+        let mut rest = exprs.as_str();
+        while let Some(at) = rest.find("wasmkeep_") {
+            let name: String = rest[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+                .collect();
+            rest = &rest[at + name.len()..];
+            names.insert(name);
+        }
+        assert!(names.len() >= 7, "{names:?}");
+        for name in &names {
+            let base = name
+                .strip_suffix("_bucket")
+                .filter(|b| page.contains(&format!("# TYPE {b} histogram\n")))
+                .unwrap_or(name);
+            assert!(
+                page.contains(&format!("# TYPE {base} ")),
+                "an alert rule names {name}, which the metrics page does not have"
+            );
+        }
+        for (metric, label) in [
+            ("wasmkeep_events_total", "outcome=\"failed\""),
+            ("wasmkeep_events_total", "class=\""),
+            ("wasmkeep_bucket_requests_total", "status=\"error\""),
+        ] {
+            assert!(
+                page.lines()
+                    .any(|l| l.starts_with(&format!("{metric}{{")) && l.contains(label)),
+                "the metrics page has no {metric} series with {label}"
+            );
+        }
+    }
+
     /// The Grafana dashboard in `deploy/grafana` queries only metrics this
     /// page has.
     #[test]

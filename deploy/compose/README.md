@@ -106,6 +106,11 @@ ports), then kill a node: within about 15 s "Nodes ready" drops to 2,
 counters keep their values. Stop everything, monitoring included, with the
 same `-f` options and `down`.
 
+Prometheus also loads the alert rules of
+[`deploy/prometheus/alerts.yml`](../prometheus/alerts.yml): its Alerts
+page (<http://127.0.0.1:9090/alerts>) lists them with their state. The
+example runs no Alertmanager, so nothing is sent anywhere.
+
 ## What is in it
 
 | Service | Image | Role |
@@ -120,7 +125,7 @@ same `-f` options and `down`.
   digest of `cgr.dev/chainguard/minio:latest`.
 - The nodes advertise their compose service names (`http://a:8080`,
   `https://a:7443`); the cluster port is not published to the host.
-- `stop_grace_period: 30s`: a clean stop can take about 25 s, and
+- `stop_grace_period: 30s`: a clean stop can take about 29 s, and
   Compose's default of 10 s would turn it into a crash.
 - Each node and MinIO keep their data in a named volume. Start over with
   `docker compose down -v`.

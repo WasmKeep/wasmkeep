@@ -14,6 +14,7 @@
 
 - [Concepts](concepts.md)
 - [Running a cluster](cluster.md)
+- [When a node dies, and how it scales](failover-and-scaling.md)
 - [Key-value and queues](kv-and-queues.md)
 - [Workflows](workflows.md)
 
@@ -23,6 +24,7 @@
 - [One server (VPS)](deploy/single-node.md)
 - [Three nodes](deploy/three-nodes.md)
 - [Load balancer, WAF and routing](deploy/front-door.md)
+- [Back up and restore the bucket](deploy/backup-and-restore.md)
 - [Monitoring](monitoring.md)
 
 # Reference

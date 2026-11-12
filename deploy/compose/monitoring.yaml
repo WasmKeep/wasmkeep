@@ -1,5 +1,6 @@
 # Monitoring for the three-node example: each node's metrics, Prometheus
-# scraping them, and Grafana with the WasmKeep dashboard
+# scraping them and evaluating the alert rules
+# (deploy/prometheus/alerts.yml), and Grafana with the WasmKeep dashboard
 # (deploy/grafana/wasmkeep.json). An overlay on compose.yaml:
 #
 #   docker compose -f compose.yaml -f monitoring.yaml up -d --build
@@ -62,6 +63,7 @@ services:
       - --storage.tsdb.retention.time=1d
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
       - "127.0.0.1:9090:9090"
     restart: unless-stopped

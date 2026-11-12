@@ -98,13 +98,17 @@ fn recent(limit: i64) -> Vec<Check> {
         .collect()
 }
 
+/// What a check calls itself: the site's operator sees who is asking, and
+/// which build. Some sites answer a client they cannot name with an error.
+const USER_AGENT: &str = concat!("wasmkeep-watch/", env!("CARGO_PKG_VERSION"));
+
 /// One check: a GET, ok for any status below 400.
 fn check(cfg: &Config) -> Check {
     let started = now();
     let result = http::fetch(
         "GET",
         &cfg.url,
-        &[("user-agent", "wasmkeep-watch/0")],
+        &[("user-agent", USER_AGENT)],
         &[],
         std::time::Duration::from_millis(cfg.timeout_ms),
         0,

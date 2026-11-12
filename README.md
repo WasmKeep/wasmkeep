@@ -243,7 +243,7 @@ deploy, and Prometheus and Grafana on the same cluster;
 - [Languages](docs/languages.md): which languages work today and how
 - [Concepts](docs/concepts.md): addresses, events, life cycle, storage, alarms, calls, WebSockets
 - [API reference](docs/reference/api.md): every host function and hook, with its name in the Rust, TypeScript, Python, C and Zig SDKs
-- Deploying: [one server (VPS)](docs/deploy/single-node.md), [three nodes](docs/deploy/three-nodes.md)
+- Deploying: [one server (VPS)](docs/deploy/single-node.md), [three nodes](docs/deploy/three-nodes.md), [back up and restore the bucket](docs/deploy/backup-and-restore.md)
 - Examples: [counter](examples/counter), [chat room](examples/chat-room) (WebSockets),
   [rate limiter](examples/rate-limiter) (alarms), [AI agent](examples/agent) (a model over
   HTTP, a reminder tool on an alarm), [jobs](examples/jobs) (the SDK's
@@ -252,6 +252,7 @@ deploy, and Prometheus and Grafana on the same cluster;
   and chat room in D and MoonBit, a counter in C# and in standard Go,
   [workflows](examples/workflows) and [Watch](examples/watch), an uptime monitor (`examples/`)
 - [Running a cluster](docs/cluster.md): replication, failover, forwarding, `wasmkeep deploy`
+- [When a node dies, and how it scales](docs/failover-and-scaling.md): what callers get meanwhile, what adding a node does, what does not happen, and when to keep a database
 - [Roadmap](ROADMAP.md): what is built, what comes next, and what is not planned
 - Design decisions: [docs/adr](docs/adr); how the pieces fit: [Concepts](docs/concepts.md) and [Running a cluster](docs/cluster.md#how-it-works)
 - [Security model](docs/security.md): what is protected, the limits, the known gaps; report vulnerabilities as in [SECURITY.md](SECURITY.md)

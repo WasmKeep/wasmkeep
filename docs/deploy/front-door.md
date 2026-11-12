@@ -212,6 +212,7 @@ those themselves.
 | **DNS round robin, Caddy on every node** | No extra machine; automatic certificates; the simplest | A dead node keeps getting a share of new connections until DNS caches expire (browsers usually retry another address, many API clients do not); no health checks; no routing by actor, so more forwarding |
 | **A floating IP moved by keepalived, HAProxy on the nodes** | No extra machine; failover in seconds; health checks and routing by actor | One node takes all incoming traffic at a time; keepalived to set up |
 | **A managed load balancer** (Hetzner, DigitalOcean, AWS...) | Nothing to run; health checks | A small monthly cost; some cannot hash on a path prefix |
+| **An outbound tunnel, HAProxy on the nodes** | No inbound port and no public address on the nodes; TLS ends at the provider | Every request goes through the provider; a connector to run on each node; needs the loopback load balancer [below](#an-outbound-tunnel) |
 
 ### DNS round robin with Caddy
 
@@ -266,6 +267,63 @@ DigitalOcean), call it from keepalived's `notify_master` script instead of
 announcing the address with `virtual_ipaddress`. Bind HAProxy to the
 floating address with `net.ipv4.ip_nonlocal_bind = 1`, so every node can
 start it before holding the address.
+
+### An outbound tunnel
+
+Some providers reach your servers through a connector: a process on each
+machine that dials out to the provider and receives the traffic for your
+name over that connection. No inbound port is opened, the nodes need no
+public address, and TLS ends at the provider. Run one connector on each
+node, all for the same name; the provider spreads requests over the
+connectors that are connected.
+
+The obvious configuration is wrong for a cluster. A connector that sends
+its traffic to the node on its own machine (`http://10.0.0.11:8080`) has
+that node as its only origin. The connector is its own process: it stays
+connected while WasmKeep on that machine is stopped, restarting or not
+ready, so it keeps receiving its share of the requests, and answers each
+with a gateway error for as long as its node is down. The other nodes are
+healthy the whole time and get none of that share.
+
+Put this guide's load balancer between each connector and the nodes,
+bound to loopback. HAProxy on every node, with the `wasmkeep` backend
+[above](#route-by-actor-recommended) (all three nodes, checked on
+`/_wasmkeep/ready`, hashed by actor), and this frontend in place of the
+public one:
+
+```haproxy
+frontend tunnel
+    # Only the connector on this machine connects here.
+    bind 127.0.0.1:8081
+    # Whatever the client sent; see "Client addresses" below.
+    http-request del-header X-Forwarded-For
+    default_backend wasmkeep
+```
+
+Point each connector at `http://127.0.0.1:8081`. A request now reaches a
+node that is ready whichever connector received it, and the same node for
+the same actor from all three, as long as every HAProxy lists the same
+servers in the same order (the consistent hash depends on it; not
+exercised here). A machine that is down takes its connector down with
+it, and the provider stops using that connector.
+
+- **TLS** is the provider's: no certificate on the nodes, so no `ssl` on
+  the `bind` line.
+- **The nodes still listen on the private network** (`--listen
+  10.0.0.11:8080`): the HAProxy of the other machines sends to them
+  there. Nodes forward to each other on the cluster listener (port 7443
+  in the [three-node guide](three-nodes.md)), which must stay reachable
+  between the machines.
+- **Client addresses.** HAProxy sees the connector, at 127.0.0.1, so
+  `option forwardfor` would write that. The client's address is in
+  whatever header the provider sets: read that one in your actors. The
+  frontend deletes `X-Forwarded-For`, which may be the client's own
+  invention; keep it only if your provider replaces what the client
+  sent. An actor may trust the provider's header only while nothing but
+  the connectors can reach HAProxy and the nodes
+  ([Client addresses](#client-addresses)).
+- **WebSockets** need the provider to pass the upgrade and to keep an idle
+  connection open for more than 90 s, as for any proxy in front.
 
 ### Plain DNS round robin, no proxy at all
 
