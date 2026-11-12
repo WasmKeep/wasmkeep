@@ -124,6 +124,8 @@ server {
     location / {
         proxy_pass http://wasmkeep;
         proxy_http_version 1.1;
+        proxy_set_header Host $host;                       # the client's, not the upstream's name
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_set_header X-Forwarded-For $remote_addr;     # replace, never append

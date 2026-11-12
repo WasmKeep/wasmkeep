@@ -276,7 +276,8 @@ struct DevArgs {
 #[derive(Debug, Args)]
 struct ServeArgs {
     /// Stateless component (.wasm exporting wasi:http/incoming-handler) for
-    /// every path outside /actor/. Optional when --actor is given.
+    /// every path outside /actor/ and /_wasmkeep/. Optional when --actor is
+    /// given.
     component: Option<PathBuf>,
 
     /// Actor class served at /actor/<CLASS>/<name>/..., as CLASS=PATH to a
