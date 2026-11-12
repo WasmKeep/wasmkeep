@@ -30,6 +30,14 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # A pull request runs the fast jobs only (a minute or two): format, clippy,
+  # MSRV, the simulations, the examples, licences, the docs. The suites that
+  # take ten minutes (the tests on both Linux platforms and macOS, every
+  # language, the S3 suites) run on main after the merge and nightly, and
+  # `./scripts/check.sh --full` runs them before a merge, locally. A release
+  # needs a passing run on its commit. Their names stay required checks: a
+  # skipped job reports as passed.
+  #
   # Documentation, benchmark result files and the two release workflows
   # (which run on a tag or a published release) are read by no code job: a pull
   # request that changes nothing else runs this job, "benchmark publication
@@ -149,7 +157,7 @@ jobs:
     name: test (ubuntu-latest)
     timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -167,7 +175,7 @@ jobs:
     name: test (ubuntu-24.04-arm)
     timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -284,7 +292,7 @@ jobs:
     name: leases on an S3 API (moto)
     timeout-minutes: 25
     needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: test
@@ -353,7 +361,7 @@ jobs:
     name: every language passes the same tests
     timeout-minutes: 40
     needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-24.04
     env:
       WASMKEEP_REQUIRE_LANGS: "1"

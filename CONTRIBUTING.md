@@ -44,14 +44,20 @@ real-bucket durability validation. Run the relevant additional checks
 for changes in those areas. The light documentation check validates relative
 links and Markdown anchors, not remote links.
 
-Merges rely on `./scripts/check.sh --full` run locally; hosted CI (GitHub
-Actions) adds Linux on x86_64 and arm64, most of the checks listed
-above, and the publication backstop described below. A pull request that
-changes only documentation, benchmark result files or the two release
-workflows (the list is in `scripts/ci-changes.sh`) runs the docs site and the publication checks
-alone: nothing else reads those files. Every push to `main` runs
-everything, the suite on macOS included, which pull requests do not run;
-it also runs nightly.
+Merges rely on `./scripts/check.sh --full` run locally. Hosted CI (GitHub
+Actions) is split so that a pull request waits a minute or two, not ten:
+
+- **On a pull request**: format, clippy, MSRV, the simulations, the
+  examples, dependency and licence checks, the docs site and the
+  publication backstop described below. A pull request that changes only
+  documentation, benchmark result files or the two release workflows (the
+  list is in `scripts/ci-changes.sh`) runs the docs site and the
+  publication checks alone.
+- **On `main` after the merge, and nightly**: everything, which adds the
+  test suites on Linux x86_64, arm64 and macOS, every language, and the S3
+  suites. When several changes land together, only the last commit's run
+  is kept. A failure there is fixed forward.
+- **A release** needs a passing run on its commit.
 
 ## Code rules
 
