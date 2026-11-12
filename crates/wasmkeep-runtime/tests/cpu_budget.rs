@@ -234,45 +234,77 @@ fn calibrate(
 fn time_waiting_to_resume_after_a_yield_is_not_counted() {
     // An async guest yields on every tick. On a busy node the executor takes
     // a while to poll it again; that wait is other tasks' time, not this
-    // guest's. Here each resume is 45 ms late, longer than the whole 40 ms
-    // budget, so a single yield already puts the wall time past it while
-    // the guest's own work stays near 8 ms. How many yields there are
-    // depends on how often the ticker really wakes, which a loaded machine
-    // stretches (one loaded macOS run saw 2 for 8 ms of work), and the
-    // budget is only compared at an epoch check, so the claim is checked
-    // on the meter itself: what it charged stays under the budget.
-    let runtime = runtime(Duration::from_secs(10));
-    let component = runtime.compile(&wat::parse_str(WORK_WAT).unwrap()).unwrap();
-    let pre = runtime
-        .instantiate_pre(&Linker::<()>::new(runtime.engine()), &component)
-        .unwrap();
-    let n = calibrate(&pre, &runtime, Duration::from_millis(8));
+    // guest's. Here a resume is late by more than the whole budget, so a
+    // single yield already puts the wall time past it while the guest's own
+    // work stays near a fifth of it. The budget is only compared at an
+    // epoch check, so the claim is checked on the meter itself: what it
+    // charged stays under the budget.
+    //
+    // How many yields there are depends on how often the ticker really
+    // wakes, which a loaded machine stretches: one loaded macOS run saw 2
+    // for 8 ms of work, another none, and without a yield nothing waits
+    // and the run shows nothing. Such a run is repeated with twice the
+    // work, and the budget and the delay doubled with it, until the guest
+    // has yielded: 8 ms of work against 40 ms at first, 256 ms against
+    // 1.28 s at last.
+    const ATTEMPTS: u32 = 6;
+    // More late resumes show nothing more, and a guest that yields on every
+    // millisecond would wait for each: the ones after these are not delayed.
+    const LATE_RESUMES: usize = 8;
 
-    let runtime = self::runtime(Duration::from_millis(40));
-    let component = runtime.compile(&wat::parse_str(WORK_WAT).unwrap()).unwrap();
-    let pre = runtime
-        .instantiate_pre(&Linker::<()>::new(runtime.engine()), &component)
+    let calibration = runtime(Duration::from_secs(10));
+    let component = calibration
+        .compile(&wat::parse_str(WORK_WAT).unwrap())
         .unwrap();
-    let (mut store, meter) = runtime.new_metered_async_store(());
-    let started = Instant::now();
-    let (result, yields) = block_on_slowly(
-        async {
-            let instance = pre.instantiate_async(&mut store).await.unwrap();
-            let work = instance
-                .get_typed_func::<(i64,), ()>(&mut store, "work")
-                .unwrap();
-            work.call_async(&mut store, (n,)).await
-        },
-        Duration::from_millis(45),
-    );
-    let elapsed = started.elapsed();
-    assert!(yields >= 1, "no yield: the test proves nothing");
-    assert!(elapsed > Duration::from_millis(40), "{elapsed:?}");
-    result.unwrap_or_else(|e| panic!("trapped after {yields} yields, {elapsed:?}: {e:?}"));
-    let used = meter.used();
-    assert!(
-        used < Duration::from_millis(40),
-        "charged {used:?} for {elapsed:?} of wall time and {yields} delayed resumes"
+    let pre = calibration
+        .instantiate_pre(&Linker::<()>::new(calibration.engine()), &component)
+        .unwrap();
+    let mut n = calibrate(&pre, &calibration, Duration::from_millis(8));
+    let mut budget = Duration::from_millis(40);
+
+    for attempt in 1..=ATTEMPTS {
+        let runtime = runtime(budget);
+        let component = runtime.compile(&wat::parse_str(WORK_WAT).unwrap()).unwrap();
+        let pre = runtime
+            .instantiate_pre(&Linker::<()>::new(runtime.engine()), &component)
+            .unwrap();
+        let (mut store, meter) = runtime.new_metered_async_store(());
+        let started = Instant::now();
+        let (result, yields) = block_on_slowly(
+            async {
+                let instance = pre.instantiate_async(&mut store).await.unwrap();
+                let work = instance
+                    .get_typed_func::<(i64,), ()>(&mut store, "work")
+                    .unwrap();
+                work.call_async(&mut store, (n,)).await
+            },
+            budget + Duration::from_millis(5),
+            LATE_RESUMES,
+        );
+        let elapsed = started.elapsed();
+        if yields == 0 {
+            // Nothing waited: no trap either, whatever the meter charges.
+            result.unwrap_or_else(|e| panic!("trapped without a yield, {elapsed:?}: {e:?}"));
+            eprintln!(
+                "attempt {attempt}: no yield in {elapsed:?} ({n} iterations); twice the work next"
+            );
+            n *= 2;
+            budget *= 2;
+            continue;
+        }
+        assert!(elapsed > budget, "{elapsed:?} for a budget of {budget:?}");
+        result.unwrap_or_else(|e| {
+            panic!("trapped after {yields} yields, {elapsed:?}, budget {budget:?}: {e:?}")
+        });
+        let used = meter.used();
+        assert!(
+            used < budget,
+            "charged {used:?} of {budget:?} for {elapsed:?} of wall time and {yields} yields"
+        );
+        return;
+    }
+    panic!(
+        "no yield in {ATTEMPTS} attempts, the last with {n} iterations: the test proves nothing"
     );
 }
 
@@ -342,12 +374,16 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 /// Like `block_on`, also returning how many times the future was pending.
 fn block_on_counting<F: std::future::Future>(fut: F) -> (F::Output, usize) {
-    block_on_slowly(fut, Duration::ZERO)
+    block_on_slowly(fut, Duration::ZERO, 0)
 }
 
-/// Like `block_on_counting`, polling again only `delay` after each wake, as
-/// a busy executor would.
-fn block_on_slowly<F: std::future::Future>(fut: F, delay: Duration) -> (F::Output, usize) {
+/// Like `block_on_counting`, polling again only `delay` after each of the
+/// first `late` wakes, as a busy executor would.
+fn block_on_slowly<F: std::future::Future>(
+    fut: F,
+    delay: Duration,
+    late: usize,
+) -> (F::Output, usize) {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
 
@@ -368,7 +404,9 @@ fn block_on_slowly<F: std::future::Future>(fut: F, delay: Duration) -> (F::Outpu
             Poll::Pending => {
                 pending += 1;
                 std::thread::park();
-                std::thread::sleep(delay);
+                if pending <= late {
+                    std::thread::sleep(delay);
+                }
             }
         }
     }
