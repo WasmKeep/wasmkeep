@@ -62,6 +62,9 @@ else to run: no consensus cluster, no coordinator.
   waits a lease period plus a write timeout again before it fences
   anyone, so a node that regained the bucket at about the same time has
   renewed by then. One cut off for longer is fenced, and restarts.
+  Meanwhile a node that gets a request for one of the dead node's actors
+  answers 503, or keeps the request until the actor is free: see "When a
+  node dies: what a caller sees" below.
 - A deleted heartbeat frees nothing: the actors its node held stay held
   until a process starts with that id (its start check waits, then it
   takes them back) or the node is fenced: `wasmkeep cluster fence <node>`
@@ -69,6 +72,106 @@ else to run: no consensus cluster, no coordinator.
   later. Node leases, ownership records and markers are never collected;
   `wasmkeep cluster forget <node>` removes only a retired node's heartbeat
   in the format from before node leases, once it is older than 25 s.
+
+### When a node dies: what a caller sees
+
+Between a node's death and the takeover of its actors (15 to about 21 s
+after its last lease write, with the defaults), no node can run them. A
+surviving node that gets a request for one of them does one of two
+things.
+
+**It keeps the request and answers once it took the actor over**, for a
+`GET` or `HEAD` without a body and for a WebSocket upgrade that arrive
+from outside. The caller sees one slow answer (the actor's own, with
+`x-wasmkeep-node` naming the new owner, or the `101`) instead of a 503 to
+retry. The takeover is the ordinary one, at the moment it would succeed
+for a client that retried just then: nothing about leases changes, the
+wait only saves the caller the retries. A request is kept when the node
+has a reason to think the owner is gone or going:
+
+- the owner's heartbeat left this node's view (10 s after its last write)
+  and has not moved since;
+- the owner is still in view, but a connection to it could not be opened
+  from this node, and no lease write of it since then proves it alive;
+- the owner is fenced (by a node or by `wasmkeep cluster fence`), or
+  stopped and released, and its actors are not free yet.
+
+**It answers 503 with `Retry-After: 1` at once**, as before, for
+everything else: a request with a body, any other method (`POST`, `PUT`,
+`DELETE`, ...), an `actors.call` (the calling actor gets its error), a
+request another node forwarded, and any request over the caps below. Such
+a 503 still means the request was not run here; nothing with a body is
+ever kept, so a write is never run late for a caller that gave up. The
+same goes for an owner that is alive: a node that renews its lease is
+never waited for, however slow it is to answer, and nobody takes its
+actors.
+
+A kept request ends in one of these ways:
+
+- served by this node, which took the actor over;
+- sent, once, to another node that took it over first, and answered by it;
+- sent to the owner as usual, because the owner turned out to be alive (it
+  wrote its lease again, or restarted);
+- 503 "the actor's node is not reachable; retry" with `Retry-After: 1`
+  when the wait runs out, when this node begins to stop, or when its own
+  lease runs out. Never a 504 from the wait itself;
+- dropped, and never run, when its client closes the connection first.
+
+`--failover-wait-secs` sets how long a request is kept at most. The
+default comes from the lease timing: the ttl plus grace (15 s), the watch
+before a fence (6 s), one heartbeat period for a node that did not write
+the fence itself (3 s) and a second over which the kept requests are
+spread, 25 s in all. `--failover-wait-secs 0` turns the wait off: every
+request gets the answer it got before, at once. A node keeps at most a
+quarter of its `--max-connections` (2,500 with the default 10,000) and 64
+requests per actor; a request over either gets the 503 at once. A kept
+request holds its connection and its headers, nothing else: no actor is
+loaded for it and no bucket request is made for it while the owner's
+heartbeat is only stale. Each node decides by itself, nothing travels
+between nodes or into the bucket, so nodes with different settings, or
+of versions with and without the wait, work together.
+
+What the wait does not cover, with the defaults:
+
+- **The requests that find the death out.** A request already sent to the
+  node when it died gets the 503 ("did not answer"), or a 504 after 30 s
+  if the host went silent instead of refusing; it may have run. On each
+  surviving node, a request that arrives while the dead node is still in
+  view is sent to it, and gets that 503 when the connection is refused.
+  Only requests after it are kept. If the host is silent rather than
+  gone (a cut cable, a frozen machine), connections to it are not
+  refused but time out after 5 s: every request that arrives before the
+  first of them timed out waits those 5 s for its 503, and one written
+  into a connection that was already open gets a 504 after 30 s.
+- **A request that arrives in the first seconds can still get the 503.**
+  The takeover can come up to about 21 s after the node's last write,
+  the surviving node may learn of the fence a heartbeat period later, and
+  after a bucket outage the watch before a fence starts over: a request
+  kept from the very moment of the death can reach its 25 s and be
+  answered 503 after waiting that long. One that arrives once the node
+  left the view waits about 15 s at most.
+- **Another node took the actor first.** The kept request is then
+  forwarded to it, and waits for that node's restore of the actor under
+  the usual 30 s limit: about 55 s in the worst case, ending in the usual
+  504.
+- **The answer after the wait can still be an error**: the node is full,
+  the bucket fails during the takeover, or an access rule refuses the
+  request (a class open only to existing actors answers 404 for one that
+  does not exist, after the wait).
+- **A node that drains** takes no actor: a request it would hand to a
+  peer is handed over as before, not kept.
+- **A `GET` that writes.** A kept `GET` runs up to 25 s after it was sent,
+  and its client may have retried elsewhere meanwhile. An actor whose
+  `GET` handlers change state should not rely on the wait: turn it off,
+  or make those handlers safe to repeat.
+- **A load balancer that hides the client's departure.** A kept request
+  is dropped when its connection closes. A proxy that keeps its
+  connection to the node open after its own client gave up hides that,
+  and the request then runs for nobody: see [the front
+  door](deploy/front-door.md) for the settings that matter.
+
+`wasmkeep_failover_waits_total` counts the kept requests and how each
+wait ended ([monitoring](monitoring.md)).
 
 ## Replication
 
@@ -191,6 +294,7 @@ curl -i -X POST localhost:8082/actor/counter/alice   # 2, forwarded to a
 | `--cluster-listen` | Address of the cluster listener, e.g. `0.0.0.0:7443`: the port other nodes use, with mutual TLS (see below). Needed unless `--cluster-plaintext accept`; give it with `--cluster-advertise` |
 | `--cluster-advertise` | `https://HOST:PORT` the other nodes reach the cluster listener at |
 | `--cluster-plaintext` | `refuse` (default) or `accept`: whether plain HTTP between nodes is still used (see below). With `refuse`, a node needs `--cluster-listen` |
+| `--failover-wait-secs` | How long a `GET` or `HEAD` without a body, or a WebSocket upgrade, for an actor whose node died or is stopping is kept until another node took the actor over, instead of a 503 at once; default 25 (from the lease timing), 0 turns it off (see "When a node dies: what a caller sees") |
 | `--history-retention-secs` | How long old actor history stays in the bucket before garbage collection may delete it; default 3600, 0 allowed (see "History in the bucket") |
 | `--secrets-key FILE` | With `--app`: the key the app's secrets are sealed with (`wasmkeep secrets new-key`); given twice during a key change (see "Secrets in the bucket") |
 | `--no-secrets` | With `--app`: run without the app's secrets from the bucket (`--env` only); without it and without a key, a node refuses to start once the app has secrets |
