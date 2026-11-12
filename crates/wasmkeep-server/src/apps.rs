@@ -64,6 +64,51 @@ pub enum DeployError {
         /// The name given.
         name: String,
     },
+    /// Another app of the tenant is deployed on this bucket prefix: a new
+    /// one would share its actors (keyed tenant/class/name).
+    #[error("{}", other_apps_message(.app, .others, .prefix))]
+    OtherApp {
+        /// The app refused, `tenant/app`.
+        app: String,
+        /// The tenant's apps already there, `tenant/app`.
+        others: Vec<String>,
+        /// The bucket key prefix, empty or ending in `/`.
+        prefix: String,
+    },
+}
+
+/// What [`DeployError::OtherApp`] says: what is wrong, what to do, and the
+/// keys an abandoned app leaves.
+fn other_apps_message(app: &str, others: &[String], prefix: &str) -> String {
+    let (tenant, name) = app.split_once('/').unwrap_or((app, ""));
+    let keys = others
+        .iter()
+        .map(|o| format!("{prefix}apps/{o}/"))
+        .collect::<Vec<_>>();
+    let (listed, its, abandoned, keys) = match others {
+        [one] => (
+            format!("{one} is"),
+            "its",
+            format!("{one} is"),
+            keys.join(""),
+        ),
+        _ => (
+            format!("{} are", others.join(" and ")),
+            "their",
+            "one is".to_owned(),
+            format!("its folder ({})", keys.join(", ")),
+        ),
+    };
+    format!(
+        "{listed} already deployed on this bucket prefix: another app of tenant {tenant} \
+         would share {its} actors, which are keyed by tenant, class and name, until each \
+         app owns its state (planned for 0.4.0). Deploy {app} under another tenant \
+         (--app OTHER/{name}) or another bucket prefix (--bucket s3://BUCKET/{name}). \
+         If {abandoned} abandoned, stop its nodes and delete every key under {keys} (its \
+         versions, current and secrets). Actors' data stays under {prefix}actors/{tenant}/, \
+         {prefix}owners/{tenant}/, {prefix}leases/{tenant}/ and {prefix}alarms/{tenant}/: \
+         a new app of {tenant} with a class of the same name finds those actors"
+    )
 }
 
 fn bucket(e: impl std::fmt::Display) -> DeployError {
@@ -76,6 +121,8 @@ pub struct AppRef {
     store: Arc<dyn ObjectStore>,
     /// `<prefix>apps/<tenant>/<app>/`
     base: String,
+    /// The bucket key prefix, empty or ending in `/`.
+    prefix: String,
     tenant: String,
     app: String,
 }
@@ -96,14 +143,16 @@ impl AppRef {
             // Counted for the metrics page while `serve` follows the app.
             store: crate::counted_store::counted(store),
             base: format!("{prefix}apps/{tenant}/{app}/"),
+            prefix,
             tenant: tenant.to_owned(),
             app: app.to_owned(),
         }
     }
 
     /// What a first deploy checks before it creates the app: the names'
-    /// grammar (apps that exist keep theirs).
-    fn check_new(&self) -> Result<(), DeployError> {
+    /// grammar (apps that exist keep theirs), and that no other app of the
+    /// tenant is deployed on the prefix (a listing that fails refuses).
+    async fn check_new(&self) -> Result<(), DeployError> {
         for (what, name) in [("tenant", &self.tenant), ("app", &self.app)] {
             if !wasmkeep_runtime::is_identifier(name) {
                 return Err(DeployError::Name {
@@ -112,7 +161,55 @@ impl AppRef {
                 });
             }
         }
+        let others = self.other_apps().await?;
+        if !others.is_empty() {
+            return Err(DeployError::OtherApp {
+                app: format!("{}/{}", self.tenant, self.app),
+                others,
+                prefix: self.prefix.clone(),
+            });
+        }
         Ok(())
+    }
+
+    /// The other apps of this app's tenant deployed on the same bucket
+    /// prefix (`tenant/app`, sorted): each folder of `apps/<tenant>/` with
+    /// a `current`. Until apps own their state they share this one's
+    /// actors.
+    pub async fn other_apps(&self) -> Result<Vec<String>, DeployError> {
+        let folder = StorePath::from(format!("{}apps/{}", self.prefix, self.tenant));
+        let listed = self
+            .store
+            .list_with_delimiter(Some(&folder))
+            .await
+            .map_err(bucket)?;
+        // Listed as the bucket spells it (some characters escaped).
+        let me = object_store::path::PathPart::from(self.app.as_str());
+        let mut others = Vec::new();
+        for app in listed.common_prefixes {
+            let Some(name) = app.filename().map(str::to_owned) else {
+                continue;
+            };
+            if name == me.as_ref() {
+                continue;
+            }
+            match self.store.head(&app.clone().join("current")).await {
+                Ok(_) => others.push(format!("{}/{name}", self.tenant)),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(bucket(e)),
+            }
+        }
+        others.sort();
+        Ok(others)
+    }
+
+    /// [`Self::other_apps`] for a warning: a listing that fails is logged
+    /// and reads as none.
+    async fn other_apps_or_none(&self) -> Vec<String> {
+        self.other_apps().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not list the tenant's other apps");
+            Vec::new()
+        })
     }
 
     fn path(&self, key: &str) -> StorePath {
@@ -343,9 +440,13 @@ impl AppRef {
         }
 
         let read = self.read_current().await?;
-        if read.is_none() {
-            self.check_new()?;
-        }
+        let others = match &read {
+            None => {
+                self.check_new().await?;
+                Vec::new()
+            }
+            Some(_) => self.other_apps_or_none().await,
+        };
         let base = match &read {
             Some((current, _)) => {
                 let manifest = self.manifest(&current.version).await?;
@@ -505,6 +606,7 @@ impl AppRef {
                     current: current.clone(),
                     diff,
                     newly_marked: false,
+                    others,
                 });
             }
             manifest.previous = Some(current.version.clone());
@@ -554,6 +656,7 @@ impl AppRef {
             },
             diff,
             newly_marked: marked && !was_marked,
+            others,
         })
     }
 
@@ -583,6 +686,7 @@ impl AppRef {
         let seq = current.seq + 1;
         self.swap_current(Some(read), &previous, seq, marked)
             .await?;
+        let others = self.other_apps_or_none().await;
         Ok(Deployed {
             current: Current {
                 version: previous,
@@ -591,6 +695,7 @@ impl AppRef {
             },
             diff,
             newly_marked: marked && !current.marked,
+            others,
         })
     }
 
@@ -782,6 +887,10 @@ pub struct Deployed {
     /// This change set the marker: nodes take their rules from deploys
     /// from now on, and ignore `--access`.
     pub newly_marked: bool,
+    /// Other apps of the tenant deployed on the same prefix, which share
+    /// this app's actors: possible only for apps deployed before the
+    /// check that refuses a second one (see [`AppRef::other_apps`]).
+    pub others: Vec<String>,
 }
 
 /// What changes between two versions: classes, rules, and the names (never

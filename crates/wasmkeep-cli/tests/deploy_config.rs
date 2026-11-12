@@ -32,12 +32,16 @@ fn counter_wasm() -> PathBuf {
 }
 
 fn deploy(url: &str, args: &[&str]) -> (bool, String, String) {
+    deploy_app(url, "acme/shop", args)
+}
+
+fn deploy_app(url: &str, app: &str, args: &[&str]) -> (bool, String, String) {
     let Output {
         status,
         stdout,
         stderr,
     } = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
-        .args(["deploy", "--app", "acme/shop", "--bucket", url])
+        .args(["deploy", "--app", app, "--bucket", url])
         .args(args)
         .output()
         .unwrap();
@@ -200,4 +204,106 @@ fn rules_and_config_travel_with_deploys() {
     let (ok, out, err) = deploy(&url, &["--rollback", "--allow-reopen"]);
     assert!(ok, "{err}");
     assert!(out.contains("access counter: existing -> open"), "{out}");
+}
+
+/// Copies app `from`'s objects to app `to` under the bucket prefix: two
+/// apps of one tenant deployed before `deploy` refused the second.
+fn copy_app(bucket: &str, prefix: &str, from: &str, to: &str) {
+    use futures_util::TryStreamExt;
+    use object_store::path::Path as StorePath;
+    use object_store::{ObjectStore as _, ObjectStoreExt as _};
+    let store = object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .build()
+        .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let base = format!("{prefix}/apps/{from}");
+        let keys: Vec<String> = store
+            .list(Some(&StorePath::from(base.as_str())))
+            .map_ok(|m| m.location.to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(!keys.is_empty());
+        for key in keys {
+            let rest = key.strip_prefix(&format!("{base}/")).unwrap();
+            store
+                .copy(
+                    &StorePath::from(key.as_str()),
+                    &StorePath::from(format!("{prefix}/apps/{to}/{rest}")),
+                )
+                .await
+                .unwrap();
+        }
+    });
+}
+
+#[test]
+fn a_second_app_of_a_tenant_on_a_prefix_is_refused() {
+    let Ok(bucket) = std::env::var("WASMKEEP_TEST_S3_BUCKET") else {
+        eprintln!("WASMKEEP_TEST_S3_BUCKET not set; skipping");
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let prefix = format!("second-app-{}-{now}", std::process::id());
+    let url = format!("s3://{bucket}/{prefix}");
+    let actor = format!("counter={}", counter_wasm().display());
+
+    let (ok, _, err) = deploy(&url, &["--actor", &actor]);
+    assert!(ok, "{err}");
+    let (ok, _, err) = deploy_app(&url, "acme/admin", &["--actor", &actor]);
+    assert!(!ok, "a second app of acme was deployed");
+    assert!(err.contains("acme/shop is already deployed"), "{err}");
+    assert!(err.contains(&format!("{prefix}/apps/acme/shop/")), "{err}");
+    // Nothing deployed for it; another tenant is fine; a bad name is refused.
+    let (ok, _, err) = deploy_app(&url, "acme/admin", &["--rollback"]);
+    assert!(!ok && err.contains("nothing is deployed"), "{err}");
+    let (ok, _, err) = deploy_app(&url, "acme-2/admin", &["--actor", &actor]);
+    assert!(ok, "{err}");
+    let (ok, _, err) = deploy_app(&url, "acme-2/Admin", &["--actor", &actor]);
+    assert!(!ok && err.contains("[a-z][a-z0-9-]{0,63}"), "{err}");
+
+    // A pair from before the check: both keep deploying and serving, warned.
+    copy_app(&bucket, &prefix, "acme/shop", "acme/legacy");
+    let (ok, _, err) = deploy_app(&url, "acme/legacy", &["--access", "counter=existing"]);
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("acme/legacy and acme/shop are apps of one tenant"),
+        "{err}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let addr = free_port();
+    let log = dir.path().join("node.log");
+    let mut node = Command::new(env!("CARGO_BIN_EXE_wasmkeep"));
+    node.args(["serve", "--app", "acme/legacy", "--bucket", &url])
+        .arg("--data-dir")
+        .arg(dir.path().join("data"))
+        .args(["--listen", &addr.to_string()])
+        .env("RUST_LOG", "wasmkeep=info")
+        .stdout(std::fs::File::create(&log).unwrap());
+    let _node = Killed(node.spawn().unwrap());
+    let started = Instant::now();
+    while status(addr, "/actor/counter/x").is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the node never answered"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.contains("acme/legacy and acme/shop are apps of one tenant"),
+        "{logged}"
+    );
+    // A third is refused, naming both.
+    let (ok, _, err) = deploy_app(&url, "acme/blog", &["--actor", &actor]);
+    assert!(!ok, "a third app of acme was deployed");
+    assert!(err.contains("acme/legacy and acme/shop are"), "{err}");
 }

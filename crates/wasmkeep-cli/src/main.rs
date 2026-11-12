@@ -651,6 +651,22 @@ pub(crate) fn secret_looking(class: &str, vars: &wasmkeep_server::env::Vars) -> 
     out
 }
 
+/// The warning for an app that shares its bucket prefix with other apps of
+/// its tenant (`others`), deployed before `deploy` refused a second one:
+/// they share actors.
+pub(crate) fn shared_prefix_warning(app: &str, others: &[String]) -> Option<String> {
+    (!others.is_empty()).then(|| {
+        format!(
+            "{app} and {} are apps of one tenant on one bucket prefix: they share actors \
+             (keyed by tenant, class and name), and a class of the same name in both reaches \
+             the same actors. They keep working; a further app of the tenant is refused. \
+             To separate them, deploy one under another tenant or bucket prefix (it starts \
+             with no data) and stop the old one",
+            others.join(" and ")
+        )
+    })
+}
+
 /// Warnings about a deploy's changes: a class removed with a rule, and a
 /// class added without one at the same time (a rename leaves the new class
 /// open).
@@ -915,6 +931,18 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 let deployed = app_ref.version(&current.version).await?;
                 anyhow::Ok((current, deployed))
             })?;
+            // Apps of one tenant deployed on one prefix before `deploy`
+            // refused a second keep running, sharing actors: said loudly.
+            match rt.block_on(app_ref.other_apps()) {
+                Ok(others) => {
+                    if let Some(warning) =
+                        shared_prefix_warning(&format!("{tenant}/{name}"), &others)
+                    {
+                        tracing::warn!("{warning}");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "could not list the tenant's other apps"),
+            }
             deployed_rules = Some((current.marked, deployed.access));
             config.config = deployed.config;
             config.requires = deployed.requires;
@@ -1227,6 +1255,9 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         println!("  {line}");
     }
     for warning in deploy_warnings(&deployed.diff) {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(warning) = shared_prefix_warning(&format!("{tenant}/{name}"), &deployed.others) {
         eprintln!("warning: {warning}");
     }
     if deployed.newly_marked {
@@ -1694,6 +1725,17 @@ mod tests {
                 "a value leaked: {value}"
             );
         }
+    }
+
+    #[test]
+    fn apps_sharing_a_prefix_are_warned_about_by_name() {
+        assert_eq!(super::shared_prefix_warning("acme/shop", &[]), None);
+        let w = super::shared_prefix_warning("acme/shop", &["acme/admin".into()]).unwrap();
+        assert!(
+            w.starts_with("acme/shop and acme/admin are apps of one tenant"),
+            "{w}"
+        );
+        assert!(w.contains("share actors"), "{w}");
     }
 
     #[test]

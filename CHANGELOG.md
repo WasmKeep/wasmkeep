@@ -121,6 +121,17 @@ Since 0.2.0, in no release yet.
   a move depend on. Refusals because a record is full are counted in
   `wasmkeep_signatures_refused_full_total`, and logged as a full record
   rather than as a replay. The take and hand-off record holds 50,000.
+- **`deploy` refuses a second app of a tenant on a bucket prefix.** Its
+  actors are keyed by tenant, class and name, so it would share the first
+  app's actors without a word: until now only a node refused to start, and
+  only while a node of the other app was live. The first deploy of an app
+  now lists `apps/<tenant>/` and refuses when another app there has a
+  `current`, naming it and saying what to do: another tenant or another
+  prefix, or, for an abandoned app, the keys to delete. Two apps of one
+  tenant already deployed on one prefix keep working, and `deploy` and
+  `serve --app` warn about them by name; a third is refused. This lasts
+  until apps own their state (planned for 0.4.0,
+  [deploying](docs/cluster.md#deploying)).
 - **A new app's tenant and app names follow the class grammar**,
   `[a-z][a-z0-9-]{0,63}`: the first `wasmkeep deploy` of an app refuses
   others, and writes nothing. Actor addresses already required it of the
