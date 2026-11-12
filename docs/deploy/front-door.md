@@ -272,8 +272,10 @@ with it, and the provider stops using that connector.
 - **TLS** is the provider's: no certificate on the nodes, so no `ssl` on
   the `bind` line.
 - **The nodes still listen on the private network** (`--listen
-  10.0.0.11:8080`): the HAProxy of the other machines sends to them, and
-  nodes forward to each other there.
+  10.0.0.11:8080`): the HAProxy of the other machines sends to them
+  there. Nodes forward to each other on the cluster listener (port 7443
+  in the [three-node guide](three-nodes.md)), which must stay reachable
+  between the machines.
 - **Client addresses.** HAProxy sees the connector, at 127.0.0.1, so
   `option forwardfor` would write that. The client's address is in
   whatever header the provider sets: read that one in your actors. The
