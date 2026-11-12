@@ -828,8 +828,8 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   each runs, the app it serves, its advertised and cluster addresses, and
   whether it publishes a TLS pin. **State** is whether it takes actors:
   `serving`, or, while it is drained ([ADR 0014](adr/0014-draining-a-node-and-moving-an-actor.md)),
-  `draining`, `drained` (no actors left) or `stuck` (actors
-  left and no node of the same app to hand them to); `-` from a node that
+  `draining`, `drained` (no actors or WebSockets left) or `stuck` (actors
+  or WebSockets left and no node of the same app to hand them to); `-` from a node that
   predates draining. A node is **live** if its heartbeat was
   written within 10 s (three heartbeats plus the allowed clock skew), the
   rule the nodes themselves use with the default settings. Ages are

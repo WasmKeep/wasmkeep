@@ -198,7 +198,7 @@ impl ActorService {
             ));
             tokio::spawn(socket_owners::sweep_sockets(
                 Arc::downgrade(&service.inner),
-                cluster,
+                cluster.socket_sweep,
             ));
         }
 

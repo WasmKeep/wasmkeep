@@ -22,11 +22,15 @@ const SWEEP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// now runs, and miss every broadcast without a close. Skipped while this
 /// node's lease is not valid (the close at the lapse handles that); a read
 /// that fails closes nothing.
-pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, cluster: Arc<Cluster>) {
-    let every = cluster.socket_sweep;
+/// Holds neither the service nor the cluster while it waits, so a node
+/// dropped meanwhile stops at once (its lease is not kept renewing).
+pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every: Duration) {
     loop {
         tokio::time::sleep(every).await;
         let Some(inner) = service.upgrade() else {
+            return;
+        };
+        let Some(cluster) = inner.cluster.clone() else {
             return;
         };
         if inner.mailboxes.is_closed() {
@@ -68,7 +72,7 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, cluste
             },
         )
         .await;
-        drop(inner);
+        drop((inner, cluster));
     }
 }
 
