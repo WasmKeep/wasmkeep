@@ -17,13 +17,21 @@ leave running.**
    [`examples/watch`](examples/watch), on a three-node cluster on a
    released build, behind HTTPS, with dashboards, alerts and a nightly copy
    of the bucket. What that shows is missing goes on this page.
-2. **The known ways it stalls.** A snapshot upload gets a timeout and stops
-   failing silently; a restore gets one deadline for the whole of it (one
-   took 56 s in the soak,
+2. **The known ways it stalls.** A snapshot upload has a timeout and no
+   longer fails silently; a restore gets one deadline for the whole of it
+   (one took 56 s in the soak,
    [measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)); a
-   forwarded request is sent again when its connection had just closed.
-3. **Tests that depend on timing** wait on events instead of the clock.
-4. **A twelve-hour soak** of the release candidate.
+   request body the handler did not read no longer costs the answer.
+3. **A request waits for a takeover.** When an actor's node dies, a request
+   for that actor is held until another node may take it, 15 to about 21 s,
+   instead of being refused meanwhile. The wait before a takeover does not
+   change: one writer at a time is what it protects.
+4. **What running Watch showed is missing**: a guide to back up and restore
+   a cluster's bucket, alert rules as a file, updating a stateless
+   component across a cluster, and a page that says plainly what happens
+   when a node dies, what scales and what does not.
+5. **Tests that depend on timing** wait on events instead of the clock.
+6. **A twelve-hour soak** of the release candidate.
 
 ## Next
 
@@ -33,8 +41,26 @@ leave running.**
    together ([how](docs/cluster.md#upgrading-wasmkeep)).
 2. **The remaining operator commands**: inspect or export one actor,
    verify a bucket.
-3. **Traces.**
-4. Whatever running our own app shows is missing.
+3. **Load you can see**: actors and work per node, in the metrics and in
+   `wasmkeep cluster status`.
+4. **Traces.**
+5. Whatever running our own app shows is missing.
+
+## Then
+
+`0.5.0`: **several apps and tenants on the same nodes.**
+
+1. **Several tenants per process**, with limits per tenant.
+2. **Placement when an actor wakes**: on a node with room, not only where
+   its request arrived. Most actors sleep most of the time, so this spreads
+   load without moving anything that is running.
+3. **Automatic moves of running actors**, slowly and within limits, if
+   placement at wake-up is not enough. Until then an operator moves an
+   actor or drains a node
+   ([how](docs/cluster.md)).
+
+An actor runs on one node at a time, by design: a single actor that is too
+busy is split into more actors by its application, not by the platform.
 
 ## After that
 
@@ -51,8 +77,6 @@ Not before the releases above.
   ([tiers](docs/languages.md)). Java, Kotlin and PHP cannot produce an
   actor yet, and languages that need Wasm garbage collection wait on a
   decision of their own.
-- **Several tenants per process**, with limits per tenant, when a
-  multi-team user asks.
 - Ideas, each needing a design first: encrypting actor state in the
   bucket, exporting many actors' data for analytics, composing components
   at deploy time.
