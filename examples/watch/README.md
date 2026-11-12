@@ -38,6 +38,11 @@ curl -X DELETE $H/monitors/site
 Alerts are JSON with `text` and `content` fields, so Slack and Discord
 incoming webhooks accept them as they are.
 
+A check is a `GET` sent with `User-Agent: wasmkeep-watch/<version>`, and
+any status below 400 counts as up. A site that answers a client it does
+not know with an error (a 404, say) shows as down although browsers reach
+it: allow that agent on the site, or monitor a path that answers everyone.
+
 On a cluster, serve both classes on every node: a monitor whose node dies
 keeps checking on another node.
 
