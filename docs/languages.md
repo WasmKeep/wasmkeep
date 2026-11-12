@@ -38,6 +38,24 @@ different target, and does not make a language usable here.
 | **MoonBit** | Experimental | [MoonBit SDK](../sdks/moonbit) over `wit-bindgen moonbit`; `moon build --target wasm` (MoonBit 0.10.20 in CI), then `wasm-tools component embed --encoding utf16` and `component new` | Counter and [chat room](../examples/moonbit-chat-room) pass; 49 KB. The language is pre-1.0; no numbers from `bench/run.sh` yet, no outbound HTTP or key-value and queue clients (see [MoonBit](#moonbit)) |
 | **C# / .NET** | Experimental (spike) | [componentize-dotnet](https://github.com/bytecodealliance/componentize-dotnet) 0.8.0-preview with NativeAOT-LLVM, straight on its bindings | The [counter](../examples/csharp-counter) passes; 929 KB stripped. No SDK, chat room or numbers from `bench/run.sh`; every tool is preview (see [C#](#c-spike)) |
 
+### Getting an SDK
+
+Each SDK has the version of the server it is released with
+([versions](#versions)); here for `0.2.0`.
+
+| Language | Get it | Build an actor |
+| --- | --- | --- |
+| Rust | `cargo add wasmkeep-sdk` (crates.io) | `cargo build --release --target wasm32-wasip2` ([tutorial](tutorials/first-actor.md)) |
+| TypeScript / JavaScript | `npm install @wasmkeep/sdk` (npm) | `npx wasmkeep-ts build src/index.ts -o actor.wasm` ([README](../sdks/typescript/README.md)) |
+| Python | `pip install wasmkeep` (PyPI) | `python -m wasmkeep build app -o actor.wasm` ([README](../sdks/python/README.md)) |
+| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0` (a module of this repository) | `tinygo build -target=wasip2`, with the WIT the module ships ([README](../sdks/go/README.md#install)) |
+| C / C++ | `wasmkeep-c-sdk-0.2.0.tar.gz`, a file of the [release](https://github.com/WasmKeep/wasmkeep/releases) | The build command in the archive's README ([C SDK](../sdks/c/README.md)) |
+| Zig | `wasmkeep-zig-sdk-0.2.0.tar.gz`, a file of the release | The build command in the archive's README ([Zig SDK](../sdks/zig/README.md)) |
+| D, MoonBit, C#, standard Go | The repository's source at the release's tag | Each example's `build.sh` |
+
+The release's files are signed:
+[check a download](deploy/single-node.md#1-install-the-binary).
+
 ### Next, in order
 
 Each is experimental once a counter passes the shared tests; numbers
@@ -156,9 +174,9 @@ needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
 provides them inert (no directories).
 
 An app adds the module with `go get
-github.com/wasmkeep/wasmkeep/sdks/go@vX.Y.Z`, where `vX.Y.Z` is the
-release's tag: the module carries the server's version number. The
-`wasmkeep` package needs a release after `v0.1.0`; see the SDK's
+github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0`: the module carries the
+server's version number. The `wasmkeep` package starts at `v0.2.0`
+(`v0.1.0` has only the clients); see the SDK's
 [Install](../sdks/go/README.md#install).
 
 The [counter](../examples/go-counter), [chat room](../examples/go-chat-room)
@@ -309,7 +327,12 @@ tested.
 
 | SDK | Server | WIT package |
 | --- | --- | --- |
+| 0.2.0 | 0.2.0 | `wasmkeep:actor@0.2.0` |
 | 0.1.0 | 0.1.0 | `wasmkeep:actor@0.2.0` |
+
+`0.2.0` is the first version on the registries (crates.io, npm, PyPI);
+`0.1.0` was used from a clone of the repository. That the SDK and the WIT
+package both read `0.2.0` in the first row is a coincidence.
 
 The WIT package version is another number: it is the version of the
 interface between a component and the host

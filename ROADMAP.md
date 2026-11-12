@@ -5,27 +5,13 @@ Dates are not promised; the order is, and features come before speed.
 For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
-WasmKeep is **pre-alpha**. Its first release, `0.1.0`, is a pre-release for
-trying it, side projects and staging.
+WasmKeep is **pre-alpha**. Its releases so far, `0.1.0` and `0.2.0`, are
+pre-releases for trying it, side projects and staging.
 
 ## Now
 
-The next release, `0.2.0`: **installable.** Until now the SDKs were used
-from a clone of this repository. `0.2.0` brings:
-
-- the Rust, TypeScript, Python and Go SDKs from their registries
-  (crates.io, npm, PyPI, a Go module tag), published by the release itself
-  ([releasing](docs/releasing.md));
-- the C SDK as an archive in the release, and prebuilt example components,
-  so trying WasmKeep needs no toolchain;
-- a getting-started path that starts from a release, not a clone.
-
-Already in, and part of it: a durable write on a cluster node no longer
-syncs to the local disk as well as the bucket.
-
-## Next
-
-`0.3.0`: **our own app on it, and reliable enough to leave running.**
+The next release, `0.3.0`: **our own app on it, and reliable enough to
+leave running.**
 
 1. **Our own app.** Watch, the uptime monitor in
    [`examples/watch`](examples/watch), on a three-node cluster on a
@@ -38,6 +24,8 @@ syncs to the local disk as well as the bucket.
    forwarded request is sent again when its connection had just closed.
 3. **Tests that depend on timing** wait on events instead of the clock.
 4. **A twelve-hour soak** of the release candidate.
+
+## Next
 
 `0.4.0`: **operable by someone who did not write it.**
 
@@ -94,7 +82,7 @@ you, for standard Wasm components.
 ## Built
 
 By milestone, the names the [design decisions](docs/adr) use. In `0.1.0`
-unless marked "since".
+unless marked `0.2.0`.
 
 ### M0: Hello component
 
@@ -139,9 +127,17 @@ Languages, documentation, hardening, and `0.1.0`
 - Languages ([tiers and numbers](docs/languages.md)). Recommended: Rust.
   Supported: Zig, C/C++, TypeScript (QuickJS by default,
   [ADR 0018](docs/adr/0018-quickjs-the-default-typescript-engine.md)),
-  Python, and since `0.1.0` Go on TinyGo with a full [SDK](sdks/go).
-  Experimental, since `0.1.0`: D and MoonBit, each with an SDK, a counter
+  Python, and in `0.2.0` Go on TinyGo with a full [SDK](sdks/go).
+  Experimental, in `0.2.0`: D and MoonBit, each with an SDK, a counter
   and a chat room; a C# counter and a standard-Go counter.
+- **Installable, in `0.2.0`**: the Rust, TypeScript and Python SDKs from
+  their registries (crates.io, npm, PyPI) and the Go module by its tag,
+  published by the release itself ([releasing](docs/releasing.md)); the C
+  and Zig SDKs as archives in the release; prebuilt example components,
+  so trying WasmKeep needs no toolchain; a getting-started path from a
+  release, not a clone ([languages](docs/languages.md)).
+- In `0.2.0`: a durable write on a cluster node no longer syncs to the
+  local disk as well as the bucket.
 - Mutual TLS between nodes by default
   ([ADR 0011](docs/adr/0011-node-to-node-mtls.md)); alarms that survive
   their node ([ADR 0009](docs/adr/0009-alarms-in-a-cluster.md)); a clean
@@ -166,7 +162,7 @@ Languages, documentation, hardening, and `0.1.0`
   ([security](docs/security.md)); the [legal basics](docs/legal.md); CI on
   every pull request, with a benchmark regression check.
 - Watch, an uptime monitor built on WasmKeep
-  ([what it taught me](docs/dogfood.md)); and since `0.1.0` a comparison
+  ([what it taught me](docs/dogfood.md)); and in `0.2.0` a comparison
   with celld on one machine
   ([WasmKeep and celld](docs/compared-with-celld.md)).
 

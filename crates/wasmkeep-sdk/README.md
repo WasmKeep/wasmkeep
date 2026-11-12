@@ -35,18 +35,19 @@ wasmkeep_sdk::export!(Visits);
 ## Building an actor
 
 The actor is a library crate built for `wasm32-wasip2` with plain cargo; no
-other tool is needed. In its `Cargo.toml`:
+other tool is needed.
+
+```bash
+cargo new --lib visits && cd visits
+cargo add wasmkeep-sdk
+```
+
+In its `Cargo.toml`, the library is a `cdylib`:
 
 ```toml
 [lib]
 crate-type = ["cdylib"]
-
-[dependencies]
-wasmkeep-sdk = { path = "path/to/wasmkeep/crates/wasmkeep-sdk" }
 ```
-
-The crate is not on crates.io yet, so the dependency is a path into a clone
-of the repository.
 
 ```bash
 rustup target add wasm32-wasip2
@@ -55,7 +56,7 @@ cargo build --release --target wasm32-wasip2
 
 The result, `target/wasm32-wasip2/release/<name>.wasm`, is a component for
 the `wasmkeep:actor/actor` world; run it with `wasmkeep serve`. The
-[tutorial](https://github.com/WasmKeep/wasmkeep/blob/main/docs/tutorials/first-actor.md)
+[tutorial](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/tutorials/first-actor.md)
 goes from an empty directory to an actor whose state survives a restart.
 
 ## What is in the crate
@@ -68,17 +69,18 @@ goes from an empty directory to an actor whose state survives a restart.
 - `http`: the request handler, helpers to answer, and outbound requests.
 - `kv`, `queue`, `workflow`: a key-value store, queues and durable workflows,
   each built from actors
-  ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/main/docs/kv-and-queues.md),
-  [workflows](https://github.com/WasmKeep/wasmkeep/blob/main/docs/workflows.md)).
+  ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/kv-and-queues.md),
+  [workflows](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/workflows.md)).
 - `wasi`: the WASI 0.2 bindings (the `wasip2` crate).
 
-The [API reference](https://github.com/WasmKeep/wasmkeep/blob/main/docs/reference/api.md)
+The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/reference/api.md)
 lists every host function with its name in each SDK.
 
 ## Versions
 
-The crate has the version of the WasmKeep server it is released with. The
-interface it binds to, `wasmkeep:actor@0.2.0`, is versioned on its own: the
+The crate has the version of the WasmKeep server it is released with: use
+the two at the same version (`cargo add wasmkeep-sdk@0.2.0` for server
+0.2.0). It needs Rust 1.97 or later. The interface it binds to, `wasmkeep:actor@0.2.0`, is versioned on its own: the
 WIT files are in `wit/`, a copy of the ones the server is built from.
 
 ## License

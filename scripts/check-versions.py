@@ -35,6 +35,14 @@ MANIFESTS = [
 ]
 
 
+# The READMEs published with a package (crates.io, npm, PyPI).
+REGISTRY_READMES = [
+    'crates/wasmkeep-sdk/README.md',
+    'sdks/typescript/README.md',
+    'sdks/python/README.md',
+]
+
+
 def load(path, kind):
     if kind == 'json':
         return json.loads(path.read_text())
@@ -76,6 +84,15 @@ for file, kind, keys in MANIFESTS:
         errors.append(f'{file}: no version at {name(keys)}')
     elif found != expected:
         errors.append(f'{file}: {name(keys)} is {found}, the workspace version is {expected}')
+# A registry shows a package's README as that version's page, for good: its
+# links into the repository name the release's tag, not a branch that moves.
+for file in REGISTRY_READMES:
+    path = root / file
+    if not path.exists():
+        continue
+    for ref in re.findall(r'github\.com/WasmKeep/wasmkeep/(?:blob|tree)/([^/\s)]+)/', path.read_text()):
+        if ref != f'v{expected}':
+            errors.append(f'{file}: a link at {ref}, the release is v{expected}')
 if errors:
     print('\n'.join(errors), file=sys.stderr)
     print('Every SDK manifest carries the version in Cargo.toml: change them together.', file=sys.stderr)

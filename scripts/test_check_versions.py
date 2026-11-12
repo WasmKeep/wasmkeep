@@ -112,6 +112,14 @@ class Versions(unittest.TestCase):
         self.zig('1.2.4')
         self.fails('sdks/zig/wasmkeep.zig: version is 1.2.4')
 
+    def test_a_registry_readme_links_at_the_release_tag(self):
+        readme = self.root / 'sdks/python/README.md'
+        readme.write_text('[docs](https://github.com/WasmKeep/wasmkeep/blob/v1.2.3/docs/x.md)\n')
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        readme.write_text('[docs](https://github.com/WasmKeep/wasmkeep/blob/main/docs/x.md)\n')
+        self.fails('sdks/python/README.md: a link at main, the release is v1.2.3')
+
     def test_an_example_lockfile_with_another_sdk_version_fails(self):
         self.example('ts-jobs', '0.0.0')
         self.fails('examples/ts-jobs/package-lock.json: packages.../../sdks/typescript.version is 0.0.0')

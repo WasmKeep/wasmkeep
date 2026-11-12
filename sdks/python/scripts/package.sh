@@ -4,7 +4,9 @@
 # OUT is a new or empty directory outside the repository. It receives
 # dist/ (the sdist and the wheel), a virtual environment with the wheel
 # installed, and counter.wasm: examples/py-counter's app.py built from a
-# copy in OUT, with the SDK and the WIT taken from the installed wheel only.
+# copy in OUT with the installed package's own command,
+# `python -m wasmkeep build`, so the SDK, the WIT and componentize-py are
+# the environment's only.
 # Needs `build` and `twine` for ${PYTHON:-python3} (pip install build twine)
 # and network access: pip fetches the build backend and componentize-py.
 set -euo pipefail
@@ -31,7 +33,7 @@ bad = [n for n in names if "__pycache__" in n or n.endswith((".pyc", ".pyo"))
        or not (n.startswith("wasmkeep/") or n.split("/")[0].endswith(".dist-info"))]
 if bad:
     sys.exit("unexpected files in the wheel: " + ", ".join(bad))
-for needed in ("wasmkeep/__init__.py", "wasmkeep/wit/actor.wit", "wasmkeep/wit/deps/http.wit"):
+for needed in ("wasmkeep/__init__.py", "wasmkeep/__main__.py", "wasmkeep/wit/actor.wit", "wasmkeep/wit/deps/http.wit"):
     if needed not in names:
         sys.exit("missing from the wheel: " + needed)
 for suffix in (".dist-info/licenses/LICENSE", ".dist-info/licenses/NOTICE"):
@@ -44,13 +46,13 @@ PY
 # the wheel's requirement.
 "$python" -m venv "$out/venv"
 "$out/venv/bin/python" -m pip install --quiet --disable-pip-version-check "$wheel"
-# `import wasmkeep` needs the bindings componentize-py generates, so find the
-# installed package without importing it.
+# Where the package landed, without importing it.
 pkg=$(cd "$out" && "$out/venv/bin/python" -c 'import importlib.util as u; print(u.find_spec("wasmkeep").submodule_search_locations[0])')
 case "$pkg/" in "$out/venv"/*) ;; *) echo "wasmkeep resolved to $pkg, not the environment" >&2; exit 1 ;; esac
 diff -r "$sdk/wasmkeep/wit" "$pkg/wit"
 
 mkdir "$out/app"
 cp "$sdk/../../examples/py-counter/app.py" "$out/app/"
-(cd "$out/app" && "$out/venv/bin/componentize-py" -d "$pkg/wit" -w actor componentize app -p . -p "$(dirname "$pkg")" -o "$out/counter.wasm")
+# The environment is not activated: its python finds its own componentize-py.
+(cd "$out/app" && "$out/venv/bin/python" -m wasmkeep build app -o "$out/counter.wasm")
 echo "wrote $out/counter.wasm ($(wc -c < "$out/counter.wasm") bytes) from $(basename "$wheel")"

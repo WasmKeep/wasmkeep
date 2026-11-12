@@ -59,8 +59,13 @@ for i in range(len(dirs)):
         _, crates = licenses.setdefault((lic["id"], lic["text"]), (lic["name"], {}))
         for used in lic["used_by"]:
             c = used["crate"]
+            # The SDK of this project is published, so cargo-about no
+            # longer leaves it out as private: it is not a third party.
+            if c["name"] == "wasmkeep-sdk":
+                continue
             crates.setdefault((c["name"], c["version"]), c.get("repository"))
 counts = {}
+licenses = {key: value for key, value in licenses.items() if value[1]}
 for name, crates in licenses.values():
     counts[name] = counts.get(name, 0) + len(crates)
 lines = ["Third-party notices for the example components", "",
@@ -80,7 +85,8 @@ out.write_text("\n".join(lines) + "\n")
 packages = {}
 for i in range(len(dirs)):
     for pkg in json.loads((work / f"metadata-{i}.json").read_text())["packages"]:
-        packages[pkg["id"]] = pkg
+        if pkg["name"] != "wasmkeep-sdk":
+            packages[pkg["id"]] = pkg
 (work / "metadata.json").write_text(json.dumps({"packages": list(packages.values())}))
 ' "$work" "$out" "${components[@]}"
 fi

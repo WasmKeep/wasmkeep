@@ -24,6 +24,11 @@ class Versions(unittest.TestCase):
     def test_version_is_the_one_in_pyproject(self):
         self.assertEqual(wasmkeep.__version__, _find("pyproject.toml", r'^version = "([^"]+)"$'))
 
+    def test_the_build_names_the_componentize_py_pyproject_requires(self):
+        from wasmkeep.__main__ import COMPONENTIZE_PY
+
+        self.assertEqual(COMPONENTIZE_PY, _find("pyproject.toml", r'"componentize-py==([^"]+)"'))
+
     def test_wit_version_is_the_bundled_package(self):
         self.assertEqual(
             wasmkeep.WIT_VERSION,
