@@ -537,6 +537,9 @@ struct Flaky {
     /// The next this-many snapshot (`/snapshot/`) uploads fail at once,
     /// not applied.
     fail_snapshot_puts: Arc<std::sync::atomic::AtomicU32>,
+    /// The next this-many snapshot (`/snapshot/`) uploads never answer,
+    /// and are applied 8 s later: after their sender gave them up.
+    late_snapshot_puts: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Flaky {
@@ -552,6 +555,7 @@ impl Flaky {
             fail_released: Arc::default(),
             hang_snapshot_puts: Arc::default(),
             fail_snapshot_puts: Arc::default(),
+            late_snapshot_puts: Arc::default(),
             inner,
             down,
             fail_wal: Arc::default(),
@@ -652,6 +656,21 @@ impl ObjectStore for Flaky {
             std::future::pending::<()>().await;
         }
         if location.as_ref().contains("/snapshot/") {
+            if self
+                .late_snapshot_puts
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                // On a task of its own: the sender drops this call when
+                // it gives the upload up.
+                let (inner, location) = (Arc::clone(&self.inner), location.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    let _ = inner.put_opts(&location, payload, opts).await;
+                });
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
             if self
                 .hang_snapshot_puts
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

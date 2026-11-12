@@ -11,9 +11,10 @@
 //! Snapshots record the positions they hold, and are taken as the server
 //! takes them (every `SNAPSHOT_EVERY` segments, counted from the restore, so
 //! possibly right after a restore at the previous owner's head; one whose
-//! upload failed is tried again after the next segment, then after two
-//! more, four, so a snapshot can land late next to the one that retried
-//! it). With
+//! upload failed, a single attempt, is tried again once one more segment
+//! is there and a minimum time has passed, then after eight times as many
+//! segments, up to the interval, so a snapshot can land late before the
+//! one that retried it). With
 //! collection on, owners delete history by ADR 0012's rule
 //! (`collectable`) after their own acknowledged snapshots, through a client
 //! whose deletes can time out and land late.
@@ -53,6 +54,12 @@ const NODES: &str = "nodes/";
 const PREFIX: &str = "actors/t/c/a/";
 const EPOCH_MS: u64 = 1_000_000;
 const SNAPSHOT_EVERY: u64 = 5;
+/// Each failure in a row multiplies the segments a failed snapshot's next
+/// try waits for by this (the server's `SNAPSHOT_RETRY_GROWTH`).
+const SNAPSHOT_RETRY_GROWTH: u64 = 8;
+/// The least time between a snapshot that failed and its next try (the
+/// server's `SNAPSHOT_RETRY_MIN`, scaled as the interval is).
+const SNAPSHOT_RETRY_MIN: Duration = Duration::from_secs(1);
 /// How long a node waits for the bucket: longer than its slowest requests,
 /// so a slow upload can succeed after the grant ran out.
 const WAIT: Duration = Duration::from_secs(3);
@@ -199,6 +206,7 @@ struct Owner {
     since_snapshot: u64,
     snapshot_failures: u32,
     snapshot_retry_at: u64,
+    snapshot_retry_after: Instant,
 }
 
 type Node = LeaseNode<EpBucket, NodeClock>;
@@ -228,9 +236,13 @@ async fn snapshot_and_collect(
     rules: Rules,
     o: &mut Owner,
 ) {
-    if o.since_snapshot < SNAPSHOT_EVERY.max(o.snapshot_retry_at) || o.held_positions.is_empty() {
+    if o.since_snapshot < SNAPSHOT_EVERY.max(o.snapshot_retry_at)
+        || (o.snapshot_failures > 0 && Instant::now() < o.snapshot_retry_after)
+        || o.held_positions.is_empty()
+    {
         return;
     }
+    let started = Instant::now();
     let at = o.head;
     let key = format!("{PREFIX}{}", snapshot_key(at));
     // Created and acknowledged (ADR 0012, condition 1), or no collection.
@@ -238,25 +250,24 @@ async fn snapshot_and_collect(
         .create(&key, encode_positions(&o.held_positions))
         .await;
     match created {
-        // There (already, for a conflict: an earlier try landed late):
-        // the count starts again, as the server's does.
+        // There (already, for a conflict): the count starts again, as
+        // the server's does.
         Ok(_) | Err(wasmkeep_cluster::lease::BucketError::Conflict) => {
             o.since_snapshot = 0;
             o.snapshot_failures = 0;
             o.snapshot_retry_at = 0;
         }
         // Failed, or unanswered and perhaps landing later: the count
-        // stays, and the next try comes after the next segment, then
-        // after one more, two, four, up to the interval.
+        // stays, and the next try comes once one more segment is there,
+        // then eight times as many, up to the interval, and never before
+        // the minimum time since this try started.
         Err(_) => {
-            let wait = match o.snapshot_failures {
-                0 => 0,
-                n => 1u64
-                    .checked_shl(n - 1)
-                    .map_or(SNAPSHOT_EVERY, |w| w.min(SNAPSHOT_EVERY)),
-            };
+            let wait = SNAPSHOT_RETRY_GROWTH
+                .checked_pow(o.snapshot_failures)
+                .map_or(SNAPSHOT_EVERY, |w| w.min(SNAPSHOT_EVERY));
             o.snapshot_failures += 1;
             o.snapshot_retry_at = o.since_snapshot + wait;
+            o.snapshot_retry_after = started + SNAPSHOT_RETRY_MIN;
         }
     }
     let created = created.is_ok();
@@ -343,6 +354,7 @@ async fn run_node(
                         since_snapshot: u64::try_from(plan.segments.len()).unwrap(),
                         snapshot_failures: 0,
                         snapshot_retry_at: 0,
+                        snapshot_retry_after: Instant::now(),
                     };
                     // As after the server's first event: a snapshot is due
                     // if enough segments were restored, at the restored

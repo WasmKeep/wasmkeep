@@ -593,7 +593,11 @@ impl ActorState {
         .await
         .map_err(|e| e.to_string())??;
         if let Some(all) = snapshot {
-            let shipped = slot.lock().await.ship_snapshot(&all, true).await;
+            let shipped = slot
+                .lock()
+                .await
+                .ship_snapshot(&all, crate::replica::SnapshotKind::First)
+                .await;
             if let Err(e) = shipped {
                 self.abandon(&format!("first snapshot: {e}"));
                 return Err(format!("replication: {e}"));
@@ -626,7 +630,10 @@ impl ActorState {
         }
         if replica.failed().is_none() && replica.snapshot_due() {
             match with_db(&mut live.store, |db| db.snapshot()).await {
-                Ok(Ok(all)) => match replica.ship_snapshot(&all, false).await {
+                Ok(Ok(all)) => match replica
+                    .ship_snapshot(&all, crate::replica::SnapshotKind::Periodic)
+                    .await
+                {
                     // Created and acknowledged: collect what it makes
                     // unnecessary (ADR 0012), in the background.
                     Ok(true) => {
@@ -702,7 +709,10 @@ impl ActorState {
                         // then everything before it goes, whatever the
                         // retention window: erasing the data is the point
                         // of the delete (ADR 0012).
-                        match replica.ship_snapshot(&empty, false).await {
+                        match replica
+                            .ship_snapshot(&empty, crate::replica::SnapshotKind::AfterDelete)
+                            .await
+                        {
                             Ok(true) => {
                                 let request = CollectRequest {
                                     collector: replica.collector(),

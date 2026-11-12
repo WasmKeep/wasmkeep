@@ -180,8 +180,8 @@ pub(crate) struct Metrics {
     /// Garbage-collection passes that failed (a bucket error); the next
     /// snapshot tries again.
     pub(crate) history_collect_failures: AtomicU64,
-    /// Snapshot uploads that failed (every attempt of one, or its
-    /// deadline): a periodic one is tried again, see
+    /// Snapshot uploads that were not acknowledged (given up; one may
+    /// still land later): a periodic one is tried again, see
     /// `Replica::snapshot_due`.
     pub(crate) snapshot_upload_failures: AtomicU64,
 }
@@ -414,7 +414,7 @@ pub fn render(gauges: Gauges) -> String {
     counter(
         &mut out,
         "wasmkeep_snapshot_upload_failures_total",
-        "Snapshot uploads that failed; a periodic one is tried again.",
+        "Snapshot uploads not acknowledged; a periodic one is tried again.",
         m.snapshot_upload_failures.load(Ordering::Relaxed),
     );
     out

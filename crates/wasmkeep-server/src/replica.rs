@@ -86,13 +86,24 @@ const READ_ATTEMPTS: u32 = 3;
 /// started megabyte, is given up and sent again, the next attempt allowed
 /// twice as long, up to [`UPLOAD_ATTEMPTS`] times. Without it one hung PUT
 /// waited for the client's own 30 s timeout, the event was cut and the
-/// actor given up (seen in a smoke run against a real bucket). A snapshot
-/// (the whole database) is uploaded under the same bounds, the second per
-/// megabyte sizing them for it: its upload holds the actor's replica, and
-/// with it the actor, until it ends.
+/// actor given up (seen in a smoke run against a real bucket).
+///
+/// The bucket's client has a timeout of its own on every request, 30 s
+/// from connecting to the last byte of the answer (its default;
+/// `wasmkeep serve` builds the client without changing it), and it does
+/// not send a conditional create again once that has passed. So an
+/// attempt ends at the bound above or after 30 s, whichever comes first:
+/// the second per megabyte lengthens a first attempt up to 25 MB and no
+/// further, and an object the bucket cannot take within 30 s is never
+/// uploaded, whatever the deadline allows.
+///
+/// An actor's first snapshot and the one after a delete (the whole
+/// database) are uploaded under these bounds; a periodic snapshot under
+/// shorter ones, see [`periodic_snapshot_bound`]. An upload holds the
+/// actor's replica, and with it the actor, until it ends.
 const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
-/// Attempts per upload before it fails (a segment's stops replication, a
-/// periodic snapshot's is tried again later).
+/// Attempts per upload before it fails (a segment's stops replication;
+/// a periodic snapshot has one, and is tried again later).
 const UPLOAD_ATTEMPTS: u32 = 3;
 /// The whole upload (every attempt and any read-back) ends within this
 /// many [`UPLOAD_IDLE`]s, plus the same second per started megabyte: 21 s
@@ -102,6 +113,67 @@ const UPLOAD_ATTEMPTS: u32 = 3;
 /// limit even while moving, so a multi-megabyte upload slower than about
 /// a megabyte a second still fails, as it did under the client's 30 s.
 const UPLOAD_BUDGET_IDLES: u32 = 4;
+
+/// A periodic snapshot is an optimisation (the segments are the history),
+/// taken after an event while the actor is held: it must cost the events
+/// behind it little even when the bucket leaves every snapshot upload
+/// hanging. A caller queued behind the actor waits 30 s at most where its
+/// wait is bounded at all (`wall_per_event` for `actors.call`,
+/// `FORWARD_TIMEOUT` for a request another node forwards; a request the
+/// owner received itself waits unbounded). So a periodic snapshot gets one
+/// attempt, not sent again, given up after [`UPLOAD_IDLE`] plus a second
+/// per started megabyte and at most this many [`UPLOAD_IDLE`]s: 6 s under
+/// a megabyte, 10 s from 5 MB on, a third of that wait and under the
+/// bucket client's own 30 s.
+///
+/// After a failure the next try waits for one more segment, then
+/// [`SNAPSHOT_RETRY_GROWTH`] times as many each time up to
+/// [`SNAPSHOT_EVERY`] (1, 8, 64, 64...), and in any case for
+/// [`SNAPSHOT_RETRY_MIN`] from the start of the try that failed.
+///
+/// Worst case, the bucket hanging every snapshot upload: a try holds the
+/// actor for 10 s (6 s under a megabyte); the tries come at the segment
+/// the snapshot was due at, 1 later, 9 later, 73 later and then every 64,
+/// so at most three in any 64 segments, 30 s of hold (18 s), then one per
+/// 64 segments, 10 s (6 s); never two starting within 30 s. Before
+/// uploads had bounds, one hung snapshot per 64 segments held the actor
+/// for the client's 30 s.
+///
+/// The price: a database the bucket cannot take within 10 s (slower than
+/// a megabyte a second up to 5 MB, than its size in 10 s above) gets no
+/// periodic snapshot. Each try is one counted, bounded attempt, and a
+/// restore replays every segment since the last snapshot there is.
+const PERIODIC_SNAPSHOT_IDLES: u32 = 2;
+/// See [`PERIODIC_SNAPSHOT_IDLES`]: each failure in a row multiplies the
+/// segments the next try waits for by this.
+const SNAPSHOT_RETRY_GROWTH: u64 = 8;
+/// See [`PERIODIC_SNAPSHOT_IDLES`]: the least time between a periodic
+/// snapshot that failed and the next try, however fast segments follow:
+/// as long as the longest bounded wait of a queued caller.
+const SNAPSHOT_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a periodic snapshot's one attempt may take, for an idle bound
+/// of `idle` and a snapshot of `bytes`: see [`PERIODIC_SNAPSHOT_IDLES`].
+fn periodic_snapshot_bound(idle: std::time::Duration, bytes: usize) -> std::time::Duration {
+    let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    idle.saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
+        .min(idle.saturating_mul(PERIODIC_SNAPSHOT_IDLES))
+}
+
+/// Which snapshot an upload is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotKind {
+    /// An actor's first, at a new position: its history starts there, so
+    /// a failure stops replication. Sent again as a segment is.
+    First,
+    /// The periodic one, at the head: one short attempt, tried again
+    /// later ([`Replica::snapshot_due`]).
+    Periodic,
+    /// The one after a delete, at the head, so the history before it can
+    /// be erased: sent again as a segment is; a failure is not tried
+    /// again, and leaves the periodic snapshot's schedule as it was.
+    AfterDelete,
+}
 
 /// Why replication cannot continue. The actor must stop: the node gives up
 /// its lease, and the next event restores from the bucket.
@@ -136,11 +208,15 @@ pub(crate) struct Replica {
     /// Segments since the last snapshot. A periodic snapshot that fails
     /// leaves it as it is.
     since_snapshot: u64,
-    /// Periodic snapshots that failed since the last one that succeeded.
+    /// Periodic snapshots that failed since the last snapshot taken.
     snapshot_failures: u32,
-    /// No periodic snapshot is tried again before `since_snapshot` reaches
-    /// this: see [`Self::snapshot_due`].
+    /// After a periodic snapshot failed, none is tried again before
+    /// `since_snapshot` reaches this, nor before `snapshot_retry_after`:
+    /// see [`Self::snapshot_due`].
     snapshot_retry_at: u64,
+    snapshot_retry_after: tokio::time::Instant,
+    /// [`SNAPSHOT_RETRY_MIN`]; shorter in tests.
+    snapshot_retry_min: std::time::Duration,
     /// The local database file (for the `.replica` sidecar).
     db_path: PathBuf,
     /// Set when the bucket holds nothing yet: the first upload is a
@@ -261,6 +337,8 @@ impl Replica {
             since_snapshot: plan.segments.len() as u64,
             snapshot_failures: 0,
             snapshot_retry_at: 0,
+            snapshot_retry_after: tokio::time::Instant::now(),
+            snapshot_retry_min: SNAPSHOT_RETRY_MIN,
             db_path,
             needs_snapshot: plan.head() == EMPTY,
             checksum: DbChecksum::default(),
@@ -475,33 +553,36 @@ impl Replica {
         self.needs_snapshot
     }
 
-    /// Uploads a snapshot of the whole database at a new position (or at
-    /// the current one, for the periodic snapshot). The caller captures it
+    /// Uploads a snapshot of the whole database: an actor's first at a new
+    /// position, the others at the current one. The caller captures it
     /// right after `start_capture`, or with nothing pending.
     ///
     /// `Ok(true)`: this call created the snapshot, and it was acknowledged
     /// (completed while the lease was valid), as garbage collection
-    /// requires (ADR 0012); `Ok(false)`: a periodic snapshot that was
-    /// already there.
+    /// requires (ADR 0012); `Ok(false)`: one at the head that was already
+    /// there.
     ///
-    /// The upload is bounded as a segment's is ([`Self::put_bounded`]).
-    /// A periodic snapshot that fails stops nothing: the segments already
-    /// uploaded are the history, the count of segments since the last
-    /// snapshot stays, and [`Self::snapshot_due`] says when it is tried
-    /// again. Every failed upload is counted
-    /// (`wasmkeep_snapshot_upload_failures_total`).
+    /// The first one and the one after a delete are bounded and sent again
+    /// as a segment is ([`Self::put_bounded`]); a periodic one gets a
+    /// single short attempt ([`periodic_snapshot_bound`]). A snapshot at
+    /// the head that fails stops nothing: the segments already uploaded
+    /// are the history. For a periodic one the count of segments since the
+    /// last snapshot stays, and [`Self::snapshot_due`] says when it is
+    /// tried again; the one after a delete changes nothing of that. Every
+    /// upload not acknowledged is counted
+    /// (`wasmkeep_snapshot_upload_failures_total`), whether or not the
+    /// bucket ends up holding it: an attempt given up may still land.
     pub(crate) async fn ship_snapshot(
         &mut self,
         all: &Changes,
-        new_position: bool,
+        kind: SnapshotKind,
     ) -> Result<bool, ReplicaError> {
-        let position = if new_position {
-            SegmentId {
+        let position = match kind {
+            SnapshotKind::First => SegmentId {
                 generation: self.generation,
                 txid: self.next_txid()?,
-            }
-        } else {
-            self.head
+            },
+            SnapshotKind::Periodic | SnapshotKind::AfterDelete => self.head,
         };
         if let Some(reason) = &self.failed {
             return Err(ReplicaError::Local(format!(
@@ -512,11 +593,18 @@ impl Replica {
             .to_ltx(1, position.txid.max(1), crate::alarm::now_ms_i64())
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
         let key = snapshot_key(position);
-        if !new_position {
-            // Counted as failed until it is known to have succeeded, so an
-            // upload cancelled half-way waits like one that failed.
-            self.snapshot_failed();
-            return match self.put_bounded(&key, bytes, "snapshot").await {
+        if kind != SnapshotKind::First {
+            let sent = if kind == SnapshotKind::Periodic {
+                // Counted as failed until it is known to have succeeded,
+                // so an upload cancelled half-way waits like one that
+                // failed.
+                self.snapshot_failed();
+                let bound = periodic_snapshot_bound(self.upload_idle, bytes.len());
+                self.put_once(&key, bytes, bound).await
+            } else {
+                self.put_bounded(&key, bytes, "snapshot").await
+            };
+            return match sent {
                 Ok(()) => {
                     self.snapshot_taken();
                     Ok(true)
@@ -647,14 +735,17 @@ impl Replica {
     }
 
     /// Whether a periodic snapshot is due: [`SNAPSHOT_EVERY`] segments
-    /// since the last one. One that failed is tried again by the next
-    /// event; if that fails too, after one more segment, then two, four,
-    /// up to [`SNAPSHOT_EVERY`]. Each try captures the whole database and
-    /// holds the actor for its upload, so the tries thin out: seven in
-    /// the 63 segments after a first failure, then one per interval, the
-    /// rate a failure always waited for before.
+    /// since the last one. One that failed is tried again once the actor
+    /// has shipped one more segment and [`SNAPSHOT_RETRY_MIN`] has passed
+    /// since that try started; if that fails too, after
+    /// [`SNAPSHOT_RETRY_GROWTH`] times as many segments, up to
+    /// [`SNAPSHOT_EVERY`]. An actor that only reads, or is idle, does not
+    /// try again. Each try captures the whole database and holds the
+    /// actor for its upload: [`PERIODIC_SNAPSHOT_IDLES`] has the sums.
     pub(crate) fn snapshot_due(&self) -> bool {
         self.since_snapshot >= SNAPSHOT_EVERY.max(self.snapshot_retry_at)
+            && (self.snapshot_failures == 0
+                || tokio::time::Instant::now() >= self.snapshot_retry_after)
     }
 
     /// A snapshot holds the database at the head: the count starts again.
@@ -664,17 +755,53 @@ impl Replica {
         self.snapshot_retry_at = 0;
     }
 
-    /// A periodic snapshot failed: when the next try is allowed.
+    /// A periodic snapshot failed (or is starting): when the next try is
+    /// allowed.
     fn snapshot_failed(&mut self) {
-        // None after the first failure in a row, then 1, 2, 4...
-        let wait = match self.snapshot_failures {
-            0 => 0,
-            n => 1u64
-                .checked_shl(n - 1)
-                .map_or(SNAPSHOT_EVERY, |w| w.min(SNAPSHOT_EVERY)),
-        };
+        // 1 segment after the first failure in a row, then 8, then 64.
+        let wait = SNAPSHOT_RETRY_GROWTH
+            .checked_pow(self.snapshot_failures)
+            .map_or(SNAPSHOT_EVERY, |w| w.min(SNAPSHOT_EVERY));
         self.snapshot_failures = self.snapshot_failures.saturating_add(1);
         self.snapshot_retry_at = self.since_snapshot.saturating_add(wait);
+        self.snapshot_retry_after = tokio::time::Instant::now() + self.snapshot_retry_min;
+    }
+
+    /// A periodic snapshot's upload: one conditional create, given up
+    /// after `bound` and not sent again, then the acknowledgement rule as
+    /// in [`Self::put_bounded`]. What is given up may still land; nothing
+    /// depends on it. A create refused as existing counts as "already
+    /// there" only if the object is seen within the same bound.
+    async fn put_once(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        bound: std::time::Duration,
+    ) -> Result<(), ReplicaError> {
+        use tokio::time::timeout_at;
+        let location = StorePath::from(format!("{}{key}", self.prefix));
+        let until = tokio::time::Instant::now() + bound;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let sent = self
+            .store
+            .put_opts(&location, PutPayload::from(bytes), opts);
+        let reason = match timeout_at(until, sent).await {
+            Ok(Ok(_)) => return self.acknowledged(),
+            Ok(Err(object_store::Error::AlreadyExists { .. })) => {
+                match timeout_at(until, self.store.head(&location)).await {
+                    Ok(Ok(_)) => return Err(ReplicaError::Exists),
+                    Ok(Err(e)) => format!("refused as existing, then: {e}"),
+                    Err(_) => "refused as existing, then no answer in time".into(),
+                }
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no answer within {bound:?}"),
+        };
+        tracing::warn!(object = %location, what = "snapshot", %reason, "a periodic snapshot's upload was given up");
+        Err(ReplicaError::Bucket(format!("{location}: {reason}")))
     }
 
     async fn record(&mut self, sum: DbChecksum) -> Result<(), ReplicaError> {
@@ -685,7 +812,8 @@ impl Replica {
             .map_err(|e| ReplicaError::Local(e.to_string()))?
     }
 
-    /// A segment's or a snapshot's upload (`what`, for the log): a
+    /// A segment's upload, or a first or after-delete snapshot's (`what`,
+    /// for the log): a
     /// conditional create, each attempt bounded and sent again when the
     /// bucket does not answer, the whole upload within one deadline, then
     /// the acknowledgement rule: the upload counts only if it completed
@@ -1253,6 +1381,8 @@ mod tests {
             since_snapshot: 0,
             snapshot_failures: 0,
             snapshot_retry_at: 0,
+            snapshot_retry_after: tokio::time::Instant::now(),
+            snapshot_retry_min: SNAPSHOT_RETRY_MIN,
             db_path: dir.join("a.db"),
             needs_snapshot: false,
             checksum: DbChecksum::from_value(7),
@@ -1711,25 +1841,29 @@ mod tests {
         assert!(r.failed().is_some());
     }
 
-    /// A periodic snapshot's upload is bounded as a segment's is: when
-    /// every attempt hangs it fails within its deadline (it used to wait
-    /// for as long as the bucket's client would), replication goes on,
-    /// and the count of segments since the last snapshot is kept.
+    /// The process's count of snapshot uploads not acknowledged. Other
+    /// tests of this binary may add to it meanwhile: compare, never match.
+    fn snapshot_failures_counted() -> u64 {
+        crate::metrics::METRICS
+            .snapshot_upload_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A periodic snapshot gets one attempt, cut short: when the bucket
+    /// leaves it hanging it is given up within its bound and not sent
+    /// again (it used to get a segment's three attempts and whole
+    /// deadline), replication goes on, the count of segments since the
+    /// last snapshot is kept, and no next event tries at once.
     #[tokio::test]
-    async fn a_snapshot_upload_that_keeps_hanging_fails_within_its_deadline() {
+    async fn a_hung_periodic_snapshot_is_given_up_after_one_short_attempt() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut r, store) = faulty(dir.path(), 3, 0).await;
+        let (mut r, store) = faulty(dir.path(), u32::MAX, 0).await;
         r.since_snapshot = SNAPSHOT_EVERY;
-        let failures = || {
-            crate::metrics::METRICS
-                .snapshot_upload_failures
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
-        assert_eq!(failures(), 0);
+        let before = snapshot_failures_counted();
         let started = std::time::Instant::now();
         let shipped = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            r.ship_snapshot(&changes(DbChecksum::from_value(7)), false),
+            r.ship_snapshot(&changes(DbChecksum::from_value(7)), SnapshotKind::Periodic),
         )
         .await
         .expect("a snapshot upload is bounded");
@@ -1738,20 +1872,29 @@ mod tests {
             matches!(shipped, Err(ReplicaError::Bucket(_))),
             "{shipped:?}"
         );
-        // 4 x 200 ms and a second for its megabyte, as a segment's.
-        assert!(took >= std::time::Duration::from_millis(1_700), "{took:?}");
-        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+        // Twice the 200 ms the test's replica allows an idle bucket, not
+        // the 1.8 s of a segment's whole upload.
+        assert!(took >= std::time::Duration::from_millis(390), "{took:?}");
+        assert!(took < std::time::Duration::from_millis(1_200), "{took:?}");
+        assert_eq!(
+            store.hang_next.load(std::sync::atomic::Ordering::SeqCst),
+            u32::MAX - 1,
+            "one attempt, not sent again"
+        );
         assert_eq!(r.since_snapshot, SNAPSHOT_EVERY, "not reset by a failure");
-        assert!(r.snapshot_due(), "the next event tries again");
+        assert!(!r.snapshot_due(), "not tried again by the next event");
         assert!(r.failed().is_none(), "replication goes on");
-        assert_eq!(failures(), 1, "counted once, whatever its attempts");
-        // Segments still ship, and the next snapshot lands.
+        assert!(snapshot_failures_counted() > before, "counted");
+        // Segments still ship; once one has and the wait has passed, the
+        // next snapshot is due, and lands.
         store
             .hang_next
             .store(0, std::sync::atomic::Ordering::SeqCst);
         r.ship(&changes(DbChecksum::from_value(7))).await.unwrap();
+        r.snapshot_retry_after = tokio::time::Instant::now();
+        assert!(r.snapshot_due());
         let all = changes(r.checksum);
-        assert!(r.ship_snapshot(&all, false).await.unwrap());
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
         assert_eq!(r.since_snapshot, 0);
         assert!(!r.snapshot_due());
     }
@@ -1765,7 +1908,7 @@ mod tests {
         r.needs_snapshot = true;
         let shipped = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            r.ship_snapshot(&changes(DbChecksum::from_value(7)), true),
+            r.ship_snapshot(&changes(DbChecksum::from_value(7)), SnapshotKind::First),
         )
         .await
         .expect("a snapshot upload is bounded");
@@ -1775,29 +1918,14 @@ mod tests {
         assert!(r.failed().is_none());
     }
 
-    /// One hung attempt of a snapshot upload is given up and sent again.
-    #[tokio::test]
-    async fn a_hung_snapshot_upload_is_sent_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut r, _store) = faulty(dir.path(), 1, 0).await;
-        r.since_snapshot = SNAPSHOT_EVERY;
-        let shipped = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            r.ship_snapshot(&changes(DbChecksum::from_value(7)), false),
-        )
-        .await
-        .expect("a snapshot upload is bounded");
-        assert!(shipped.unwrap(), "created and acknowledged");
-        assert_eq!(r.since_snapshot, 0);
-    }
-
-    /// A snapshot that keeps failing is tried again by the next event,
-    /// then after one more segment, two, four: never more often than a
-    /// segment in two, and at least every [`SNAPSHOT_EVERY`] segments.
+    /// A periodic snapshot that keeps failing is tried again only after
+    /// one more segment, then eight, then every [`SNAPSHOT_EVERY`]: three
+    /// tries at most in any [`SNAPSHOT_EVERY`] segments.
     #[tokio::test]
     async fn a_snapshot_that_keeps_failing_is_tried_less_and_less_often() {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        r.snapshot_retry_min = std::time::Duration::ZERO;
         store
             .fail_next
             .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
@@ -1805,9 +1933,9 @@ mod tests {
         r.since_snapshot = SNAPSHOT_EVERY;
         // How many segments pass before each next attempt.
         let mut waits = Vec::new();
-        for _ in 0..10 {
+        for _ in 0..6 {
             assert!(r.snapshot_due());
-            assert!(r.ship_snapshot(&all, false).await.is_err());
+            assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
             let mut waited = 0;
             while !r.snapshot_due() {
                 r.since_snapshot += 1; // as a shipped segment does
@@ -1815,20 +1943,151 @@ mod tests {
             }
             waits.push(waited);
         }
-        assert_eq!(waits, [0, 1, 2, 4, 8, 16, 32, 64, 64, 64]);
+        assert_eq!(waits, [1, 8, 64, 64, 64, 64]);
         // A success starts over: the count, and the waits.
         store
             .fail_next
             .store(0, std::sync::atomic::Ordering::SeqCst);
-        assert!(r.ship_snapshot(&all, false).await.unwrap());
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
         assert_eq!(r.since_snapshot, 0);
         r.since_snapshot = SNAPSHOT_EVERY;
         store
             .fail_next
             .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
         r.head.txid += 1;
-        assert!(r.ship_snapshot(&all, false).await.is_err());
-        assert!(r.snapshot_due(), "the next event tries again");
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
+        assert!(!r.snapshot_due());
+        r.since_snapshot += 1;
+        assert!(r.snapshot_due(), "one segment later");
+    }
+
+    /// A failed periodic snapshot also waits a minimum time, however many
+    /// segments the actor ships meanwhile.
+    #[tokio::test]
+    async fn a_failed_periodic_snapshot_waits_a_minimum_time_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        r.snapshot_retry_min = std::time::Duration::from_millis(300);
+        store
+            .fail_next
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let all = changes(DbChecksum::from_value(7));
+        r.since_snapshot = SNAPSHOT_EVERY;
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
+        r.since_snapshot += 10; // a busy actor
+        assert!(!r.snapshot_due(), "the segments alone are not enough");
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(r.snapshot_due());
+        // And the time alone is not enough either.
+        store
+            .fail_next
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(!r.snapshot_due(), "no segment since: an idle actor waits");
+    }
+
+    /// The snapshot after a delete is not a periodic one: when it fails
+    /// (every attempt, as a segment's) it is counted, and the periodic
+    /// snapshot's schedule is as it was.
+    #[tokio::test]
+    async fn a_failed_snapshot_after_a_delete_leaves_the_periodic_schedule_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        store
+            .fail_next
+            .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        let all = changes(DbChecksum::from_value(7));
+        r.since_snapshot = 10;
+        let schedule = |r: &Replica| {
+            (
+                r.since_snapshot,
+                r.snapshot_failures,
+                r.snapshot_retry_at,
+                r.snapshot_retry_after,
+            )
+        };
+        let was = schedule(&r);
+        let before = snapshot_failures_counted();
+        let shipped = r.ship_snapshot(&all, SnapshotKind::AfterDelete).await;
+        assert!(
+            matches!(shipped, Err(ReplicaError::Bucket(_))),
+            "{shipped:?}"
+        );
+        assert_eq!(
+            store.fail_next.load(std::sync::atomic::Ordering::SeqCst),
+            u32::MAX - UPLOAD_ATTEMPTS,
+            "sent again, as a segment is"
+        );
+        assert!(snapshot_failures_counted() > before, "counted");
+        assert_eq!(schedule(&r), was);
+        assert!(r.failed().is_none(), "replication goes on");
+        // One that lands is a snapshot at the head: the count starts again.
+        store
+            .fail_next
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        r.head.txid += 1;
+        assert!(
+            r.ship_snapshot(&all, SnapshotKind::AfterDelete)
+                .await
+                .unwrap()
+        );
+        assert_eq!(r.since_snapshot, 0);
+    }
+
+    /// A periodic snapshot's create refused as existing with nothing
+    /// there is a failure, tried again later: "already there" is only
+    /// said of an object the bucket shows.
+    #[tokio::test]
+    async fn a_periodic_snapshot_refused_with_nothing_there_is_not_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, _store) = faulty_with(dir.path(), 0, 0, 1).await;
+        let all = changes(DbChecksum::from_value(7));
+        r.since_snapshot = SNAPSHOT_EVERY;
+        let shipped = r.ship_snapshot(&all, SnapshotKind::Periodic).await;
+        assert!(
+            matches!(shipped, Err(ReplicaError::Bucket(_))),
+            "{shipped:?}"
+        );
+        assert_eq!(r.since_snapshot, SNAPSHOT_EVERY);
+        assert_eq!(r.snapshot_failures, 1);
+        // One that is there: nothing created, and the count starts again.
+        r.snapshot_retry_after = tokio::time::Instant::now();
+        r.since_snapshot += 1;
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
+        r.since_snapshot = SNAPSHOT_EVERY;
+        assert!(!r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
+        assert_eq!(r.since_snapshot, 0);
+    }
+
+    /// A periodic snapshot's one attempt is allowed a second per megabyte
+    /// only up to twice the idle bound: a database too large to upload
+    /// within that costs one short attempt per try, never the client's
+    /// own timeout.
+    #[test]
+    fn a_periodic_snapshots_attempt_is_short_whatever_the_database() {
+        use std::time::Duration;
+        let idle = UPLOAD_IDLE;
+        assert_eq!(
+            periodic_snapshot_bound(idle, 100 << 10),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            periodic_snapshot_bound(idle, 3 << 20),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            periodic_snapshot_bound(idle, 5 << 20),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            periodic_snapshot_bound(idle, 100 << 20),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            periodic_snapshot_bound(idle, usize::MAX),
+            Duration::from_secs(10)
+        );
     }
 
     /// When every attempt hangs, the upload fails within its deadline
