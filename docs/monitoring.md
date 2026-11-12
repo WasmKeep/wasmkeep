@@ -202,6 +202,20 @@ dashboard queries a metric the page does not have.
 
 ### Alerts worth having
 
+These are in [`deploy/prometheus/alerts.yml`](../deploy/prometheus/alerts.yml)
+as Prometheus rules, with one more for a node Prometheus cannot scrape
+(`up == 0` for a minute): a node that is down exports nothing, so none of
+the rules below would say so. Load the file with `rule_files:` in
+`prometheus.yml` and check it with `promtool check rules` after editing.
+It assumes a scrape job named `wasmkeep`, and the rules on durable write
+latency and on failed events wait 5 minutes before they fire. Two of the
+rules below hold
+"when no node was lost": a rule cannot know that, so they fire on every
+fence and failover, a deliberate kill included, and their text says so.
+The [Compose example](../deploy/compose/README.md#with-prometheus-and-grafana)
+loads the file. A test (`the_alert_rules_use_only_metrics_that_exist`)
+fails if a rule names a metric the page does not have.
+
 - `wasmkeep_node_lease_failures_total` increasing on any node: two failures
   in a row and the node drops every actor it holds.
 - `increase(wasmkeep_node_fences_total[15m])` above 0 when no node was lost.

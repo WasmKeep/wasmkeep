@@ -106,6 +106,11 @@ ports), then kill a node: within about 15 s "Nodes ready" drops to 2,
 counters keep their values. Stop everything, monitoring included, with the
 same `-f` options and `down`.
 
+Prometheus also loads the alert rules of
+[`deploy/prometheus/alerts.yml`](../prometheus/alerts.yml): its Alerts
+page (<http://127.0.0.1:9090/alerts>) lists them with their state. The
+example runs no Alertmanager, so nothing is sent anywhere.
+
 ## What is in it
 
 | Service | Image | Role |

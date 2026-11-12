@@ -1,0 +1,118 @@
+# Prometheus alert rules for WasmKeep nodes: the alerts docs/monitoring.md
+# lists under "Alerts worth having", and one for a node Prometheus cannot
+# scrape.
+#
+#   rule_files:
+#     - alerts.yml
+#
+# The rules assume a scrape job named "wasmkeep" (the last rule) and the
+# "instance" label Prometheus adds to each node's series. Thresholds and
+# durations are starting points: adjust them to your traffic.
+#
+# Check the file after editing it: promtool check rules alerts.yml
+
+groups:
+  - name: wasmkeep
+    rules:
+      - alert: WasmKeepNodeLeaseWriteFailing
+        expr: increase(wasmkeep_node_lease_failures_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} failed to write its node lease"
+          description: >-
+            A write of the node's lease (its heartbeat) failed or timed out.
+            Two failures in a row and the lease runs out: the node reports
+            not ready and drops every actor it holds. Look at the bucket's
+            errors and latency from this node.
+
+      - alert: WasmKeepNodeFenced
+        expr: increase(wasmkeep_node_fences_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} fenced another node"
+          description: >-
+            This node fenced a node that had stopped renewing its lease: that
+            node crashed or was cut off from the bucket. Expected when a node
+            was lost or killed; otherwise find out which node stopped, and
+            why.
+
+      - alert: WasmKeepDurableWritesSlow
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (instance, le) (rate(wasmkeep_durable_write_seconds_bucket[5m]))
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable writes are slow on {{ $labels.instance }}"
+          description: >-
+            The 99th percentile of exec-durable, until the write is in the
+            bucket, has been above 1 s for 5 minutes: the bucket is slow as
+            actors feel it.
+
+      - alert: WasmKeepEventsFailing
+        expr: >-
+          sum by (class) (rate(wasmkeep_events_total{outcome="failed"}[5m]))
+            /
+          sum by (class) (rate(wasmkeep_events_total[5m]))
+            > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 1% of the events of class {{ $labels.class }} fail"
+          description: >-
+            Events of this class trapped, were stopped by the host or returned
+            an error, for more than 1% of all its events over 5 minutes. The
+            nodes' logs name the actors and the errors.
+
+      - alert: WasmKeepNodeNotReady
+        expr: wasmkeep_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} has not been ready for 2 minutes"
+          description: >-
+            /_wasmkeep/ready answers 503 on this node, so a load balancer
+            sends it no traffic. The wasmkeep_not_ready series of the same
+            instance carries the reason.
+
+      - alert: WasmKeepBucketErrors
+        expr: >-
+          sum by (instance) (rate(wasmkeep_bucket_requests_total{status="error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} gets errors from the bucket"
+          description: >-
+            Requests to the bucket have failed for 5 minutes: unreachable,
+            refused credentials, throttling or a server error. The statuses
+            not_found and precondition are routine and are not counted here.
+
+      - alert: WasmKeepFailover
+        expr: increase(wasmkeep_failovers_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} took over actors from another node"
+          description: >-
+            This node took actors whose node was fenced, or stopped without
+            releasing them. Expected when a node was lost or killed;
+            otherwise find out which node stopped, and why.
+
+      - alert: WasmKeepNodeDown
+        expr: up{job="wasmkeep"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.instance }}"
+          description: >-
+            The node's metrics page has not answered for 1 minute: the
+            process is down, or the metrics listener is unreachable. The
+            other alerts say nothing about a node that is not scraped.
