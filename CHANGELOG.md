@@ -39,9 +39,9 @@ Since 0.2.0, in no release yet.
   An upgrade relayed to the actor's node that the node provably never read
   (it refused the TLS handshake, or the upgrade came back unsent on a new
   TLS connection) is sent once more, the client waiting meanwhile; it
-  used to get a 503 asking the client to retry. The only other thing a
-  node sends a second time is an `actors.call` the peer provably never
-  read in the same way, once, as 0.2.0 already did after a refused
+  used to get a 503 asking the client to retry. Between nodes, the only
+  other thing sent a second time is an `actors.call` the peer provably
+  never read in the same way, once, as 0.2.0 already did after a refused
   handshake. A forwarded request is never sent again, whether its
   connection could not be opened or it was written into a connection
   that then failed: one that was written may have run on the owner, so
