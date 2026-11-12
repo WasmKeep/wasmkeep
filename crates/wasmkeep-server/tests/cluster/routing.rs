@@ -636,9 +636,23 @@ async fn an_expected_body_the_handler_does_not_read_is_not_asked_for() {
         let mut interim = [0u8; 25];
         stream.read_exact(&mut interim).await.unwrap();
         assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
-        stream.write_all(&vec![b'x'; len]).await.unwrap();
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw).await.unwrap();
+        // In two parts with a pause, as in `post_body`: the owner's answer
+        // is on its way while this node still streams the body to it. An
+        // owner told that the sender waits (an `Expect` passed on) would
+        // leave that body unread and close on the forwarding node.
+        let body = vec![b'x'; len];
+        let (first, rest) = body.split_at(64 << 10);
+        let wrote = async {
+            stream.write_all(first).await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream.write_all(rest).await
+        }
+        .await;
+        let mut raw = Vec::new();
+        let read = stream.read_to_end(&mut raw).await;
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(wrote.is_ok(), "the body was cut short ({wrote:?}): {raw:?}");
+        assert!(read.is_ok(), "the answer was cut short ({read:?}): {raw:?}");
         durable += 1;
         assert!(raw.starts_with("HTTP/1.1 200 "), "{raw:?}");
         assert!(raw.contains("x-wasmkeep-node: a\r\n"), "{raw:?}");
