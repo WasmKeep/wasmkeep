@@ -52,6 +52,7 @@ mod host;
 mod moving;
 mod requests;
 mod routing;
+mod socket_owners;
 mod sockets;
 mod start;
 mod state;

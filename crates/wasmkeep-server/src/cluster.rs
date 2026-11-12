@@ -103,6 +103,11 @@ pub struct ClusterConfig {
     /// How often this node looks in the bucket for alarms whose owner did
     /// not fire them (it died): those it delivers itself.
     pub alarm_sweep: Duration,
+    /// How often this node reads the ownership record of each actor that
+    /// has WebSockets here but no hold (it hibernated with them open), and
+    /// closes them with 1012 if another node holds it: 60 s. Tests shorten
+    /// it.
+    pub socket_sweep: Duration,
     /// The deployed app this node serves (`tenant/app`), or empty for
     /// classes given on the command line. Two apps of one tenant would
     /// share actor keys in the bucket, so nodes refuse to mix them.
@@ -190,6 +195,7 @@ impl ClusterConfig {
             lease: LeaseConfig::default_safe(),
             heartbeat: DEFAULT_HEARTBEAT,
             alarm_sweep: Duration::from_secs(10),
+            socket_sweep: Duration::from_secs(60),
             app: String::new(),
             cluster_tls: None,
             cluster_plaintext: ClusterPlaintext::Accept,
@@ -342,6 +348,9 @@ pub(crate) struct Cluster {
     /// period plus grace, by which its owner fired it or lost the actor.
     pub(crate) alarm_overdue: Duration,
     pub(crate) alarm_sweep: Duration,
+    /// How often sockets of actors this node does not hold are checked
+    /// against their ownership record ([`ClusterConfig::socket_sweep`]).
+    pub(crate) socket_sweep: Duration,
     /// ADR 0012's retention window ([`ClusterConfig::history_retention`]).
     pub(crate) history_retention: Duration,
     /// [`ClusterConfig::snapshot_retry_min`].
@@ -583,6 +592,7 @@ impl Cluster {
                     .saturating_add(config.lease.grace_ms()),
             ),
             alarm_sweep: config.alarm_sweep,
+            socket_sweep: config.socket_sweep,
             history_retention: config.history_retention,
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,

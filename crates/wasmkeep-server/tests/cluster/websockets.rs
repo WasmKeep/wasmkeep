@@ -248,6 +248,20 @@ async fn closed_within(ws: &mut Client, within: Duration) -> (u16, String) {
     closed
 }
 
+/// Whether `ws` stays open, with nothing but messages, for `for_`.
+async fn stays_open(ws: &mut Client, for_: Duration) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = tokio::time::Instant::now() + for_;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => return,
+            Ok(Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_)))) => {}
+            other => panic!("closed: {other:?}"),
+        }
+    }
+}
+
 /// The node `owners/default/chat/<name>` names, if any.
 async fn chat_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String> {
     use object_store::ObjectStoreExt as _;
@@ -295,8 +309,11 @@ async fn a_room_taken_by_another_node_closes_all_its_sockets_on_the_first_messag
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let wasm = chat_wasm();
     let wall = Duration::from_secs(30);
-    // a parks the room soon; b keeps what it takes.
-    let no_sweep = |_: &mut ActorConfig| {};
+    // a parks the room soon; b keeps what it takes. The sweep never runs
+    // here, so only the first message can close the listener.
+    let no_sweep = |c: &mut ActorConfig| {
+        c.cluster.as_mut().unwrap().socket_sweep = Duration::from_secs(600);
+    };
     let idle = Duration::from_millis(300);
     let a = node_configured(
         "a",
@@ -338,4 +355,43 @@ async fn a_room_taken_by_another_node_closes_all_its_sockets_on_the_first_messag
         1012,
         "the listening client stayed on a"
     );
+}
+
+/// A client that only listens never sends a frame, so no event finds its
+/// room gone: the owner sweep reads the record of each room with sockets
+/// and no hold here, and closes them with 1012 once another node holds
+/// it. A parked room that nobody took keeps its sockets.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_sweep_closes_a_listening_client_of_a_room_taken_elsewhere() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let wasm = chat_wasm();
+    let wall = Duration::from_secs(30);
+    let quick_sweep = |c: &mut ActorConfig| {
+        c.cluster.as_mut().unwrap().socket_sweep = Duration::from_millis(200);
+    };
+    let idle = Duration::from_millis(300);
+    let a = node_configured(
+        "a",
+        da.path(),
+        &store,
+        idle,
+        &["chat"],
+        wasm,
+        wall,
+        "",
+        quick_sweep,
+    )
+    .await;
+    let long = Duration::from_secs(30);
+    let b = node_with("b", db.path(), &store, long, "chat", wasm).await;
+    settle().await;
+    let mut listener = join_lobby(a.addr).await;
+    lobby_parked(&store, &a).await;
+    // Several sweeps over a parked room nobody took: it stays open.
+    stays_open(&mut listener, Duration::from_secs(1)).await;
+    b_takes_lobby(&store, &b).await;
+    let (code, reason) = closed_within(&mut listener, Duration::from_secs(5)).await;
+    assert_eq!(code, 1012, "{reason}");
+    eventually("a forgot the socket", async || a.service.websockets() == 0).await;
 }

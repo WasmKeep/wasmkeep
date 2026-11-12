@@ -267,6 +267,12 @@ impl Sockets {
         }
     }
 
+    /// The actors with at least one slot on this node, closing sockets
+    /// included.
+    pub(crate) fn owners(&self) -> Vec<ActorAddress> {
+        self.lock().by_owner.keys().cloned().collect()
+    }
+
     /// `owner`'s accepted connections (and `opening`, if it is one of its
     /// own), oldest first.
     pub(crate) fn of(&self, owner: &ActorAddress, opening: Option<u64>) -> Vec<u64> {
@@ -439,6 +445,7 @@ mod tests {
         let mut pending = sockets.open(a.clone()).unwrap();
         let mut other = sockets.open(b.clone()).unwrap();
         sockets.accept(other.id);
+        assert_eq!(sockets.owners().len(), 2);
         assert_eq!(sockets.close_owner(&a, 1012, "moved"), 2);
         assert_eq!(sockets.close_owner(&a, 1012, "moved"), 0, "closed once");
         for conn in [&mut first, &mut pending] {

@@ -537,6 +537,12 @@ impl Cluster {
             .await
     }
 
+    /// Whether this node holds `address` now, with its lease valid: a
+    /// resident actor that acquired it. One that hibernated released it.
+    pub(crate) fn holds_here(&self, address: &ActorAddress) -> bool {
+        self.node_lease_valid() && self.pending.holds(&self.owner_key(address))
+    }
+
     /// Whether no release or acquire of this node waits for its outcome.
     pub(crate) fn nothing_pending(&self) -> bool {
         self.pending.is_empty()

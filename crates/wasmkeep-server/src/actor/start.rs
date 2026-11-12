@@ -187,7 +187,15 @@ impl ActorService {
                 limits.retry_max,
             ));
             // While asked to drain, hand resident actors over (ADR 0014).
-            tokio::spawn(drain::drain_loop(Arc::downgrade(&service.inner), cluster));
+            tokio::spawn(drain::drain_loop(
+                Arc::downgrade(&service.inner),
+                Arc::clone(&cluster),
+            ));
+            // Close sockets whose actor another node took.
+            tokio::spawn(socket_owners::sweep_sockets(
+                Arc::downgrade(&service.inner),
+                cluster,
+            ));
         }
 
         // Re-arm alarms persisted before a restart or crash.
