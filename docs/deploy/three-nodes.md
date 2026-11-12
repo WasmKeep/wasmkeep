@@ -216,6 +216,10 @@ it exits with 1 if no node is live. See
   in-flight requests, then hands its actors over: the other nodes serve
   them on their next request. WebSockets to that node close and clients
   reconnect.
+- **Updating the stateless component** (the file given to `serve` for
+  paths outside `/actor/`): it is not part of a deploy. Copy the new file
+  to every node and restart them one at a time (see
+  [Updating the stateless component](../cluster.md#updating-the-stateless-component)).
 - **Adding a node**: start it with a new id. It serves new actors and any
   whose node is fenced; existing actors stay where they are.
 - **Secrets**: keep them in the bucket rather than in each node's `--env`

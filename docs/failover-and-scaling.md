@@ -162,6 +162,12 @@ so any node answers and the nodes do not coordinate. It scales with the
 nodes behind the load balancer, within each node's connection and instance
 limits and a 30 s wall clock per request.
 
+It is a file each node is started with, not part of a deploy:
+`wasmkeep deploy` does not change it. Updating it is a restart of each
+node in turn, with two versions answering side by side until the last one
+has restarted
+([how](cluster.md#updating-the-stateless-component)).
+
 ## Actors or a database?
 
 Actors are strong where state has an owner:

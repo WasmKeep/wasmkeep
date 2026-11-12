@@ -428,6 +428,50 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   versions a rollback stepped back from, and a version whose manifest
   this WasmKeep cannot read. Those stay in the bucket (they are small).
 
+### Updating the stateless component
+
+A deploy carries actor classes, with their access rules, configuration
+and required names. It does not carry the stateless component, the
+positional argument of `wasmkeep serve` that answers every path outside
+`/actor/`: that one is a file on each node, read once when the node
+starts, also with `--app`:
+
+```bash
+wasmkeep serve site.wasm --app acme/shop --bucket s3://wasmkeep-demo --node-id a ...
+```
+
+Nothing in the bucket names it, so `wasmkeep deploy` does not change it,
+`--rollback` does not bring an older one back, and `cluster status` does
+not show which one a node runs. To update it today:
+
+1. Copy the new file to every node, at the path its `serve` command names.
+2. Restart the nodes one at a time (`systemctl restart wasmkeep`), waiting
+   for each to be listed live by `wasmkeep cluster status` and to answer
+   `/_wasmkeep/ready` before the next.
+
+What happens meanwhile:
+
+- **The restarting node** makes a clean stop: requests under way get up
+  to 10 s to finish, its actors are given up and start on the other nodes
+  at their next request, and its WebSockets close with 1012. The load
+  balancer's check of `/_wasmkeep/ready` takes it out. At its start it
+  checks its node id first, which takes what is left of 15 s since it
+  stopped ([Flags](#flags)).
+- **The other nodes** keep answering, each with the file it was started
+  with. Until the last node has restarted, two versions of the component
+  answer side by side, and a client may get either one from one request to
+  the next. Keep two consecutive versions compatible with each other and
+  with the deployed actors.
+- **A file that does not compile or instantiate** makes `serve` exit at
+  start. Restarting one node first shows it while the others still run
+  the previous file.
+- **Going back** is the same procedure with the previous file.
+
+The stateless component has no `actors.call`: it is linked against WASI
+and `wasi:http` only. It reaches actors as any client does, over HTTP,
+under the same outbound rules as actors (public addresses only, unless
+the node allows a range with `--allow-outbound`).
+
 ### Access rules and configuration
 
 Access rules ([ADR 0010](adr/0010-who-may-create-an-actor.md)) and plain
