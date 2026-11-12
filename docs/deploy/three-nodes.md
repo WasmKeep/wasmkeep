@@ -220,8 +220,12 @@ it exits with 1 if no node is live. See
   paths outside `/actor/` and `/_wasmkeep/`): it is not part of a deploy.
   Copy the new file to every node and restart them one at a time (see
   [Updating the stateless component](../cluster.md#updating-the-stateless-component)).
-- **Adding a node**: start it with a new id. It serves new actors and any
-  whose node is fenced; existing actors stay where they are.
+- **Adding a node**: start it with a new id and add it to the load
+  balancer. An actor in memory on another node stays there, and the new
+  node forwards its requests; once it hibernates, its node gives it up,
+  and its next request starts it on whichever node that request reaches,
+  the new one included (see
+  [How it scales](../failover-and-scaling.md#how-it-scales)).
 - **Secrets**: keep them in the bucket rather than in each node's `--env`
   files. Create a key once (`wasmkeep secrets new-key --out secrets.key`),
   give it to every node (`--secrets-key /etc/wasmkeep/secrets.key`, mode

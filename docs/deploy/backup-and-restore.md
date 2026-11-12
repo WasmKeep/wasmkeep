@@ -177,7 +177,8 @@ also delete it. Start the nodes again when the check has passed.
    write the secrets again with `wasmkeep secrets reset`.
 3. **Move each node's data directory aside** (`--data-dir`), or decide to
    keep it knowingly. A node replaces a local database that is not at the
-   bucket's head, keeping the old file as `<name>.db.replaced`. But for
+   bucket's head, keeping the old file as `<name>.db.replaced` (one
+   generation only: a second replacement overwrites it). But for
    an actor the bucket knows nothing about, the local database becomes
    its first snapshot: with the old directories in place, actors created
    after the backup come back from disk, on whichever node has their
