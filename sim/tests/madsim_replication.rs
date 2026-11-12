@@ -16,7 +16,12 @@
 //! segments, up to the interval, so a snapshot can land late before the
 //! one that retried it). An owner here forgets that wait at every
 //! restore, where a server node keeps it for an actor it restores again
-//! itself: the simulation tries snapshots the server would hold back. With
+//! itself: the simulation tries snapshots the server would hold back.
+//! Two more differences: with an interval of 5 here, the wait after a
+//! failure is 1 segment, then 5, for any growth factor of 5 or more, so
+//! the simulation cannot tell the server's 8 from another such factor;
+//! and a create refused as existing counts as "already there" at once,
+//! where the server first looks for the object. With
 //! collection on, owners delete history by ADR 0012's rule
 //! (`collectable`) after their own acknowledged snapshots, through a client
 //! whose deletes can time out and land late.
@@ -57,7 +62,9 @@ const PREFIX: &str = "actors/t/c/a/";
 const EPOCH_MS: u64 = 1_000_000;
 const SNAPSHOT_EVERY: u64 = 5;
 /// Each failure in a row multiplies the segments a failed snapshot's next
-/// try waits for by this (the server's `SNAPSHOT_RETRY_GROWTH`).
+/// try waits for by this (the server's `SNAPSHOT_RETRY_GROWTH`). Capped
+/// at `SNAPSHOT_EVERY` (5), so any value of 5 or more gives the same
+/// waits here: 1, then 5.
 const SNAPSHOT_RETRY_GROWTH: u64 = 8;
 /// The least time between a snapshot that failed and its next try (the
 /// server's `SNAPSHOT_RETRY_MIN`, scaled as the interval is).

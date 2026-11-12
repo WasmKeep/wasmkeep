@@ -88,14 +88,19 @@ const READ_ATTEMPTS: u32 = 3;
 /// waited for the client's own 30 s timeout, the event was cut and the
 /// actor given up (seen in a smoke run against a real bucket).
 ///
-/// The bucket's client has a timeout of its own on every request, 30 s
-/// from connecting to the last byte of the answer (its default, which
-/// `wasmkeep serve` leaves as the environment has it), and it does
-/// not send a conditional create again once that has passed. So an
-/// attempt ends at the bound above or after 30 s, whichever comes first:
-/// the second per megabyte lengthens a first attempt up to 25 MB and no
-/// further, and an object the bucket cannot take within 30 s is never
-/// uploaded, whatever the deadline allows.
+/// An attempt here is one call to the bucket's client, which may send
+/// more than one request within it: after an error answer (a 5xx, 429 or
+/// 408) or a request it could not send, it pauses and sends again. It
+/// has a timeout of its own on each request, 30 s from connecting to the
+/// last byte of the answer (its default, which `wasmkeep serve` leaves
+/// as the environment has it), and a conditional create that times out,
+/// or whose connection breaks, it does not send again: the call fails.
+/// So the bound above is the only limit on an attempt (one answered with
+/// errors can hold several requests and last past 30 s where the bound
+/// allows), and 30 s is the limit on a request: the second per megabyte
+/// gives a first attempt's request more time up to 25 MB and no further,
+/// and an object the bucket cannot take within 30 s in one request is
+/// never uploaded, whatever the deadline allows.
 ///
 /// An actor's first snapshot and the one after a delete (the whole
 /// database) are uploaded under these bounds; a periodic snapshot under
@@ -121,10 +126,12 @@ const UPLOAD_BUDGET_IDLES: u32 = 4;
 /// wait is bounded at all (`wall_per_event` for `actors.call`,
 /// `FORWARD_TIMEOUT` for a request another node forwards; a request the
 /// owner received itself has no limit of its own). So a periodic snapshot
-/// gets one attempt, not sent again, given up after [`UPLOAD_IDLE`] plus a
+/// gets one attempt (one call to the client, see [`UPLOAD_IDLE`]), which
+/// this code does not send again, given up after [`UPLOAD_IDLE`] plus a
 /// second per started megabyte and at most this many [`UPLOAD_IDLE`]s: 6 s
 /// under a megabyte, 10 s from 5 MB on, a third of that wait and under
-/// the bucket client's own 30 s.
+/// the bucket client's own 30 s per request. Whatever the client sends
+/// again after an error answer, it sends within that bound.
 ///
 /// After a failure the next try waits for one more segment, then
 /// [`SNAPSHOT_RETRY_GROWTH`] times as many each time up to
@@ -885,8 +892,10 @@ impl Replica {
         );
     }
 
-    /// A periodic snapshot's upload: one conditional create, given up
-    /// after `bound` and not sent again, then the acknowledgement rule as
+    /// A periodic snapshot's upload: one conditional create (one call
+    /// to the client, which may send it again after an error answer),
+    /// given up after `bound` and not called again, then the
+    /// acknowledgement rule as
     /// in [`Self::put_bounded`]. What is given up may still land; nothing
     /// depends on it. A create refused as existing counts as "already
     /// there" only if the object is seen within the same bound.
