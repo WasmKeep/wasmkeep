@@ -37,6 +37,7 @@ impl ActorService {
         // one); a relayed upgrade is checked again on the owner, where the
         // actor is resident, so that check is immediate.
         if self.early_rule(class, address.name()) == crate::access::Access::Internal {
+            crate::metrics::refused(crate::metrics::Refusal::Access);
             return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
         }
         // An upgrade from outside can wait for a dead node's actor to be
@@ -83,13 +84,25 @@ impl ActorService {
             match probe {
                 Ok(Ok(Admitted::Yes)) => {}
                 Ok(Ok(Admitted::Missing)) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Access);
                     return text_response(StatusCode::NOT_FOUND, "no such actor\n");
                 }
                 Ok(Ok(Admitted::Forbidden)) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Access);
                     return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
                 }
-                Err(MailboxError::Capacity(_)) => return capacity_response(),
-                _ => return text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n"),
+                Err(MailboxError::Capacity(_)) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                    return capacity_response();
+                }
+                Err(MailboxError::Full(_)) => {
+                    crate::metrics::refused(crate::metrics::Refusal::Overloaded);
+                    return text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n");
+                }
+                _ => {
+                    crate::metrics::refused(crate::metrics::Refusal::Unavailable);
+                    return text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n");
+                }
             }
             // In a cluster the socket must live on the actor's owner: find out
             // (acquiring the lease if it is free), and relay to the owner if it
@@ -153,6 +166,7 @@ impl ActorService {
                         return response;
                     }
                     _ => {
+                        crate::metrics::refused(crate::metrics::Refusal::Unavailable);
                         let mut r =
                             text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n");
                         r.headers_mut().insert(
@@ -167,6 +181,7 @@ impl ActorService {
         }
         if let Err(e) = self.inner.sockets.can_open(&address) {
             tracing::debug!(actor = %address, error = ?e, "websocket refused");
+            crate::metrics::refused(crate::metrics::Refusal::Capacity);
             let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, "too many connections\n");
             r.headers_mut().insert(
                 hyper::header::RETRY_AFTER,
@@ -232,6 +247,7 @@ impl ActorService {
                 // Over a cap after all: others raced in since `can_open`.
                 // Nothing was registered.
                 tracing::debug!(actor = %address, error = ?e, "websocket refused");
+                crate::metrics::refused(crate::metrics::Refusal::Capacity);
                 let mut r =
                     text_response(StatusCode::SERVICE_UNAVAILABLE, "too many connections\n");
                 r.headers_mut().insert(

@@ -26,6 +26,21 @@ async fn start_with_wasm(
     max_resident: usize,
     wasm: &[u8],
 ) -> (SocketAddr, oneshot::Sender<()>) {
+    start_ruled(
+        data,
+        max_resident,
+        wasm,
+        wasmkeep_server::AccessRules::default(),
+    )
+    .await
+}
+
+async fn start_ruled(
+    data: &Path,
+    max_resident: usize,
+    wasm: &[u8],
+    access: wasmkeep_server::AccessRules,
+) -> (SocketAddr, oneshot::Sender<()>) {
     let runtime = Runtime::new(&RuntimeConfig {
         max_instances: 64,
         ..RuntimeConfig::default()
@@ -35,6 +50,7 @@ async fn start_with_wasm(
     let mut config = ActorConfig::new(data);
     config.mailbox.max_resident = max_resident;
     config.mailbox.idle_timeout = Duration::from_secs(600);
+    config.access = access;
     let service = ActorService::new(
         runtime,
         config,
@@ -233,4 +249,71 @@ async fn a_due_alarm_is_delivered_while_new_names_keep_the_node_at_capacity() {
         (200, "1"),
         "the alarm did not run within 3.5 s of being due"
     );
+}
+
+/// The status a WebSocket upgrade to `counter/<name>` gets.
+async fn upgrade_status(addr: SocketAddr, name: &str) -> u16 {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET /actor/counter/{name} HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !raw.windows(4).any(|part| part == b"\r\n\r\n") {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0, "closed before response headers");
+            raw.extend_from_slice(&chunk[..count]);
+        }
+    })
+    .await
+    .expect("WebSocket upgrade timed out");
+    let reply = String::from_utf8(raw).unwrap();
+    reply.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// `wasmkeep_admission_refused_total{reason="..."}` on the metrics page
+/// (this process's: nextest runs each test alone).
+fn refused(reason: &str) -> u64 {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    let series = format!("wasmkeep_admission_refused_total{{reason=\"{reason}\"}} ");
+    page.lines()
+        .find_map(|l| l.strip_prefix(&series))
+        .unwrap_or_else(|| panic!("no {series}in:\n{page}"))
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_refusals_are_counted_by_reason() {
+    // Every reason is on the page from the start, at 0.
+    for reason in ["access", "capacity", "overloaded", "unavailable"] {
+        assert_eq!(refused(reason), 0, "{reason}");
+    }
+    let data = tempfile::tempdir().unwrap();
+    let (full, _stop) = start(data.path(), 0).await;
+    assert_eq!(request(full, "POST", "a").await.status, 503);
+    assert_eq!(request(full, "GET", "b").await.status, 503);
+    assert_eq!(upgrade_status(full, "c").await, 503);
+    assert_eq!(refused("capacity"), 3);
+
+    // An internal class refuses outside requests; an `existing` one
+    // refuses to create a name from outside.
+    let wasm = guests::build_guest("../../examples/counter", "counter");
+    let mut rules = wasmkeep_server::AccessRules::default();
+    rules.set("counter", wasmkeep_server::Access::Internal);
+    let other = tempfile::tempdir().unwrap();
+    let (internal, _stop2) = start_ruled(other.path(), 8, &wasm, rules).await;
+    assert_eq!(request(internal, "POST", "a").await.status, 403);
+    let mut rules = wasmkeep_server::AccessRules::default();
+    rules.set("counter", wasmkeep_server::Access::Existing);
+    let third = tempfile::tempdir().unwrap();
+    let (existing, _stop3) = start_ruled(third.path(), 8, &wasm, rules).await;
+    assert_eq!(request(existing, "POST", "nobody").await.status, 404);
+    assert_eq!(upgrade_status(internal, "a").await, 403);
+    assert_eq!(upgrade_status(existing, "nobody").await, 404);
+    assert_eq!(refused("access"), 4);
+    assert_eq!(refused("capacity"), 3, "nothing else counted as capacity");
+    assert_eq!(refused("overloaded") + refused("unavailable"), 0);
 }

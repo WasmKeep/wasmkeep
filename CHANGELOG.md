@@ -121,6 +121,10 @@ Since 0.2.0, in no release yet.
   a move depend on. Refusals because a record is full are counted in
   `wasmkeep_signatures_refused_full_total`, and logged as a full record
   rather than as a replay. The take and hand-off record holds 50,000.
+- **`wasmkeep_admission_refused_total{reason}`** counts the requests,
+  WebSocket upgrades and actor calls a node refused before their event
+  ran: `access`, `capacity`, `overloaded` or `unavailable`
+  ([monitoring](docs/monitoring.md#metrics)).
 - **`deploy` refuses a second app of a tenant on a bucket prefix.** Its
   actors are keyed by tenant, class and name, so it would share the first
   app's actors without a word: until now only a node refused to start, and
