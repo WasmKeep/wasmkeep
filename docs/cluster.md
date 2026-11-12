@@ -442,7 +442,19 @@ with the same id.
 not own the actor relays the upgrade to the owner and joins the two
 connections, so everyone in a room shares one actor wherever they connected.
 If the actor later moves, its sockets close with code 1012; clients
-reconnect. If the owner does not answer the upgrade, the client gets a
+reconnect. A room that hibernates keeps its sockets open on its node but
+releases its ownership record, so a request that reaches it through
+another node wakes it there; its sockets on the first node then close with
+1012 when one of them next sends a message, or at the node's owner sweep
+(once a minute), so a client that only listens is closed too, a minute
+later at most. Sockets also close with 1012 when their node drains (see
+"Draining a node" below), and when its lease runs out (no write reached
+the bucket for ttl minus safety, 8 s with the defaults): before any other
+node can take its actors, and without waiting for the bucket to answer
+again. A socket closed because its node lost the actor gets no
+`on-websocket-close` there; a room keeping a list of who is in it should
+rebuild it from `connections()`. If the owner does not answer the
+upgrade, the client gets a
 503 and may open the socket again; over mutual TLS between nodes, that 503
 can take up to four heartbeat periods (12 s with the defaults) when the
 owner refuses the relaying node's certificate (see "A caller its peer
@@ -866,9 +878,14 @@ While it drains, the node ([ADR 0014](adr/0014-draining-a-node-and-moving-an-act
   - their queued events finish and are uploaded;
   - the lease is released, and each pending alarm moves to the new
     owner's timer, so it fires on time even after this node stops;
-- **reports `drained`** once it holds nothing, and keeps running and
-  forwarding until you stop it. You can then stop it with nothing left to
-  hand over.
+- **closes the WebSockets of rooms that hibernated with sockets open**
+  with 1012. Their clients reconnect through another node; their
+  `on-websocket-close` events do not run, since the draining node does not
+  take the room back to run them;
+- **reports `drained`** once it holds nothing, no WebSocket included, and
+  keeps running and forwarding until you stop it. You can then stop it
+  with nothing left to hand over. A WebSocket this node relays to another
+  node is not counted, and is cut when the node stops.
 
 A node with no other node to hand to (alone, or every other node draining
 or older than this feature) keeps serving its actors and reports `stuck`.

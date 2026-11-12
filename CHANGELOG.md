@@ -84,6 +84,35 @@ Since 0.2.0, in no release yet.
   restores that did not complete
   ([replication](docs/cluster.md#replication),
   [monitoring](docs/monitoring.md)).
+- **A client that only listens no longer misses a room's messages
+  without a close.** A room that hibernates keeps its WebSockets open on
+  its node and releases its ownership record. When a request then woke it
+  on another node, its sockets on the first node closed only one by one,
+  each when its client next sent a message: a client that only listens
+  stayed connected and silently missed everything the room said from then
+  on. Now every socket of the room on that node closes with 1012 as soon
+  as one of them sends, and an owner sweep, once a minute, closes the
+  sockets of rooms another node took even if none of them sends. A
+  node's sockets also close with 1012 when its lease runs out (8 s
+  without a write reaching the bucket, with the defaults), before any
+  other node can take its actors; nothing closed them before. A drain
+  closes the sockets of hibernated rooms, and reports `drained` only once
+  the node holds no socket. Each such close is counted in
+  `wasmkeep_websocket_owner_closes_total`
+  ([running a cluster](docs/cluster.md), [monitoring](docs/monitoring.md)).
+- **An idle WebSocket is pinged after 25 s** of silence from its client,
+  instead of 60 s, so a load balancer's usual idle timeout of 60 s no
+  longer cuts it first. The front door needs an idle timeout above 30 s
+  ([front door](docs/deploy/front-door.md)).
+- **A relayed WebSocket upgrade carries no `x-wasmkeep-*` header from the
+  client.** The relay to the actor's node removed a fixed list of node
+  headers; it now removes every header in that range, so a client cannot
+  pass a marker only nodes may set.
+- **Take and alarm hand-off calls between nodes keep their own record of
+  used signatures**, so a flood of other node calls that fills the record
+  (500,000 signatures at once) can no longer refuse the calls a drain and
+  a move depend on. Refusals because a record is full are counted in
+  `wasmkeep_signatures_refused_full_total`.
 - **Releases**: the npm job of the release workflow passed the tarball as
   a bare path, which npm read as a GitHub repository; it now publishes the
   file. See the correction under 0.2.0.
