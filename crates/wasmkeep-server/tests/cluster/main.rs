@@ -211,14 +211,27 @@ async fn node_behind_proxy(
     (node, proxy.unwrap())
 }
 
-/// What a [`PeerProxy`] does with the next bytes a peer sends on a
-/// connection (one request of a forwarding node, or part of one).
+/// What a [`PeerProxy`] does with the next bytes a peer sends: the first
+/// chunk it reads, after the mode is set, on any of its connections. Two
+/// assumptions the tests using a fault mode must meet, since the proxy
+/// cannot see where a request starts or ends (over TLS it cannot read it
+/// at all):
+/// - one chunk: the fault takes effect at that first read, taken to be
+///   the start of the request the test sends next. A request that arrives
+///   in several reads is still handled whole (see each mode); bytes of an
+///   earlier request still on their way would take the fault instead.
+/// - one peer: the mode is one value for every connection, whichever node
+///   opened it. With a second peer, or anything else a peer sends on its
+///   own (a call, an alarm handed over), the fault can land on another
+///   request than the one the test meant.
 const PROXY_PASS: u8 = 0;
-/// Closes the connection without passing them on: the node behind never
-/// sees the request.
+/// Closes the connection at that chunk without passing it on: the node
+/// behind never sees the request, nor whatever of it was still to come.
 const PROXY_SWALLOW: u8 = 1;
-/// Passes them on, then closes the peer's side: the node behind runs the
-/// request, and its answer is lost.
+/// Passes that chunk and all the peer sends after it on to the node, so a
+/// request split across reads still reaches it whole, and passes nothing
+/// back: the peer's side is closed at the first bytes of the answer. The
+/// node behind runs the request, and its answer is lost.
 const PROXY_CUT_ANSWER: u8 = 2;
 
 /// A TCP proxy in front of a node's port for its peers, which the test
@@ -291,35 +304,68 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
 /// drop the peer's next bytes or the answer to them.
 async fn proxy_pipe(mut inbound: TcpStream, mut outbound: TcpStream, mode: &AtomicU8) {
     let (mut from_peer, mut from_node) = (vec![0u8; 16 << 10], vec![0u8; 16 << 10]);
+    // Set by `PROXY_CUT_ANSWER`: nothing more goes back to the peer.
+    let mut cut_answer = false;
     loop {
         tokio::select! {
             n = inbound.read(&mut from_peer) => {
-                let Ok(n @ 1..) = n else { return };
-                match mode.swap(PROXY_PASS, Ordering::SeqCst) {
-                    PROXY_SWALLOW => return,
-                    PROXY_CUT_ANSWER => {
-                        let _ = outbound.write_all(&from_peer[..n]).await;
-                        drop(inbound);
-                        // The node behind still reads its request whole
-                        // and answers; nobody hears the answer.
-                        while matches!(outbound.read(&mut from_node).await, Ok(1..)) {}
-                        return;
+                let Ok(n @ 1..) = n else { break };
+                if !cut_answer {
+                    match mode.swap(PROXY_PASS, Ordering::SeqCst) {
+                        PROXY_SWALLOW => return,
+                        PROXY_CUT_ANSWER => cut_answer = true,
+                        _ => {}
                     }
-                    _ => {
-                        if outbound.write_all(&from_peer[..n]).await.is_err() {
-                            return;
-                        }
-                    }
+                }
+                if outbound.write_all(&from_peer[..n]).await.is_err() {
+                    return;
                 }
             }
             n = outbound.read(&mut from_node) => {
                 let Ok(n @ 1..) = n else { return };
+                if cut_answer {
+                    break;
+                }
                 if inbound.write_all(&from_node[..n]).await.is_err() {
                     return;
                 }
             }
         }
     }
+    if cut_answer {
+        // The node behind read its request whole and answers; the peer's
+        // side closes, and nobody hears the rest of the answer.
+        drop(inbound);
+        while matches!(outbound.read(&mut from_node).await, Ok(1..)) {}
+    }
+}
+
+/// [`PROXY_CUT_ANSWER`] on a request the proxy reads in two chunks: the
+/// node behind gets both, and the peer gets none of the answer.
+#[tokio::test]
+async fn the_proxy_cutting_an_answer_still_passes_a_split_request_whole() {
+    let node = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (addr, proxy) = peer_proxy(node.local_addr().unwrap()).await;
+    let node = tokio::spawn(async move {
+        let (mut stream, _) = node.accept().await.unwrap();
+        let mut request = [0u8; 8];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(b"answer").await.unwrap();
+        request
+    });
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    proxy.cut_next_answer();
+    peer.write_all(b"requ").await.unwrap();
+    // Long enough for the proxy to read the first half on its own.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    peer.write_all(b"est!").await.unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), node)
+        .await
+        .expect("the second half reaches the node");
+    assert_eq!(&request.unwrap(), b"request!");
+    let mut answer = Vec::new();
+    let _ = peer.read_to_end(&mut answer).await;
+    assert_eq!(answer, b"", "the answer was cut");
 }
 
 #[allow(clippy::too_many_arguments)]
