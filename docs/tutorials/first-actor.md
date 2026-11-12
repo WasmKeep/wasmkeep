@@ -54,7 +54,6 @@ codegen-units = 1
 ```
 
 Replace `src/lib.rs` with:
-Create `examples/visits/src/lib.rs`:
 
 ```rust
 use wasmkeep_sdk::http::{self, IncomingRequest, ResponseOutparam};

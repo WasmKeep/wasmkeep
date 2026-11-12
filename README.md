@@ -219,10 +219,10 @@ it from the bucket:
 
 ```bash
 git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep/deploy/compose
-docker compose up -d --build                                # the first build takes a few minutes
-curl -i -X POST http://127.0.0.1:8081/actor/counter/alice   # x-wasmkeep-node: the node that runs alice
-docker compose kill b                                       # that node (a, b or c)
-curl -i -X POST http://127.0.0.1:8081/actor/counter/alice   # about 20 s later, on a node still up (8081 a, 8082 b, 8083 c)
+docker compose up -d --build                                # the first build takes a few minutes; then wait a few seconds for the nodes
+curl -i -X POST http://127.0.0.1:8082/actor/counter/alice   # 1, x-wasmkeep-node: b (the node asked first takes a new actor)
+docker compose kill b                                       # kill the node that runs alice
+curl -i -X POST http://127.0.0.1:8081/actor/counter/alice   # through node a, 15 to about 21 s later: 2, from another node
 ```
 
 The actor is free 15 to about 21 s after the killed node's last heartbeat;

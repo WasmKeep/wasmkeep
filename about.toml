@@ -25,5 +25,7 @@ targets = [
 ]
 # Test and benchmark crates are never compiled into the binary.
 ignore-dev-dependencies = true
-# The workspace's own crates are covered by LICENSE and NOTICE.
+# The workspace's own crates are covered by LICENSE and NOTICE. The one
+# published crate, wasmkeep-sdk, is not private: scripts/notices.sh leaves
+# it out of the components' notices by name.
 private = { ignore = true }

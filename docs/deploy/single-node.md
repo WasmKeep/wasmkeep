@@ -54,7 +54,10 @@ sudo install -d -o wasmkeep -g wasmkeep /var/lib/wasmkeep/{classes,data,cache}
 ```
 
 Copy your components (built as in each SDK's README) into
-`/var/lib/wasmkeep/classes/`.
+`/var/lib/wasmkeep/classes/`. The unit below serves two: the counter, which
+a release carries prebuilt (`counter.wasm`, downloaded like the binary),
+and a chat room built from [`examples/chat-room`](../../examples/chat-room);
+leave the chat lines out to serve the counter alone.
 
 Configuration and secrets for a class (API keys, webhook URLs: see
 [Configuration and secrets](../concepts.md#configuration-and-secrets)) go in

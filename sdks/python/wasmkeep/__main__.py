@@ -20,6 +20,8 @@ import sys
 from wasmkeep import WIT_VERSION, __version__
 
 _PACKAGE = os.path.dirname(os.path.abspath(__file__))
+# The version pyproject.toml requires (test_package.py compares the two).
+COMPONENTIZE_PY = "0.25.1"
 
 
 def _componentize_py():
@@ -28,7 +30,14 @@ def _componentize_py():
         return [sys.executable, "-c", "import sys, componentize_py; sys.exit(componentize_py.script())"]
     found = shutil.which("componentize-py")
     if found is None:
-        sys.exit("wasmkeep: componentize-py is not installed: pip install wasmkeep (it comes with it)")
+        sys.exit(f"wasmkeep: componentize-py is not installed: pip install componentize-py=={COMPONENTIZE_PY}")
+    # Another version generates other bindings than the ones this SDK imports.
+    version = subprocess.run([found, "--version"], capture_output=True, text=True).stdout.split()
+    if COMPONENTIZE_PY not in version:
+        sys.exit(
+            f"wasmkeep: {found} is {' '.join(version) or 'an unknown version'}; "
+            f"this SDK needs componentize-py {COMPONENTIZE_PY}"
+        )
     return [found]
 
 
@@ -36,9 +45,18 @@ def _build(args):
     wit = os.path.join(_PACKAGE, "wit")
     if not os.path.isfile(os.path.join(wit, "actor.wit")):
         sys.exit(f"wasmkeep: no WIT files in {wit}: the package is incomplete")
+    if args.app.endswith(".py") or os.sep in args.app or "/" in args.app:
+        sys.exit(f"wasmkeep: APP is a module name, not a file: `app` for app.py (got {args.app})")
+    # The current directory first, then the other directories named, then
+    # the one this package is in.
+    paths = ["."] + (args.python_path or [])
+    top = args.app.split(".")[0]
+    if not any(
+        os.path.isfile(os.path.join(path, top + ".py")) or os.path.isdir(os.path.join(path, top)) for path in paths
+    ):
+        sys.exit(f"wasmkeep: no module {top} in {', '.join(os.path.abspath(path) for path in paths)}")
     command = _componentize_py() + ["-d", wit, "-w", "actor", "componentize", args.app]
-    # The app's own directories first, then the one this package is in.
-    for path in args.python_path or ["."]:
+    for path in paths:
         command += ["-p", path]
     command += ["-p", os.path.dirname(_PACKAGE), "-o", args.output]
     code = subprocess.call(command)
@@ -69,7 +87,7 @@ def main(argv=None):
         "--python-path",
         action="append",
         metavar="DIR",
-        help="a directory to find APP and what it imports in; repeatable (default: the current directory)",
+        help="another directory to find APP and what it imports in, besides the current one; repeatable",
     )
     build.set_defaults(run=_build)
     args = parser.parse_args(argv)

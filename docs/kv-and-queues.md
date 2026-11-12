@@ -23,7 +23,7 @@ libraries compiled into them in `THIRD_PARTY_NOTICES-components.txt`.
 a clone instead.
 
 ```bash
-# $v: the version of your wasmkeep binary
+# $v: the version of your wasmkeep binary, 0.2.0 or later
 curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/kv.wasm"
 curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/queue.wasm"
 wasmkeep serve --actor kv=kv.wasm --actor queue=queue.wasm --actor app=your-app.wasm \

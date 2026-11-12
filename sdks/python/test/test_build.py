@@ -27,6 +27,19 @@ class Outside(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn("APP", done.stderr)
 
+    def test_a_file_name_is_not_a_module(self):
+        done = _python("-m", "wasmkeep", "build", "app.py")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("APP is a module name, not a file", done.stderr)
+        self.assertNotIn("Traceback", done.stderr)
+
+    def test_a_missing_module_names_where_it_looked(self):
+        done = _python("-m", "wasmkeep", "build", "no_such_app", "-p", "test")
+        self.assertNotEqual(done.returncode, 0)
+        # The current directory is searched as well as the one named.
+        self.assertRegex(done.stderr, r"no module no_such_app in \S+, \S+test\n")
+        self.assertNotIn("Traceback", done.stderr)
+
     def test_a_host_function_says_where_it_runs(self):
         done = _python("-c", "import wasmkeep; wasmkeep.storage.exec('SELECT 1')")
         self.assertNotEqual(done.returncode, 0)

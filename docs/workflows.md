@@ -106,7 +106,7 @@ libraries compiled into them in `THIRD_PARTY_NOTICES-components.txt`.
 from a clone instead.
 
 ```bash
-# $v: the version of your wasmkeep binary
+# $v: the version of your wasmkeep binary, 0.2.0 or later
 for f in workflows-orders.wasm workflows-ledger.wasm; do
   curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/$f"
 done

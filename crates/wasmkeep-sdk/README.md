@@ -56,7 +56,7 @@ cargo build --release --target wasm32-wasip2
 
 The result, `target/wasm32-wasip2/release/<name>.wasm`, is a component for
 the `wasmkeep:actor/actor` world; run it with `wasmkeep serve`. The
-[tutorial](https://github.com/WasmKeep/wasmkeep/blob/main/docs/tutorials/first-actor.md)
+[tutorial](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/tutorials/first-actor.md)
 goes from an empty directory to an actor whose state survives a restart.
 
 ## What is in the crate
@@ -69,11 +69,11 @@ goes from an empty directory to an actor whose state survives a restart.
 - `http`: the request handler, helpers to answer, and outbound requests.
 - `kv`, `queue`, `workflow`: a key-value store, queues and durable workflows,
   each built from actors
-  ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/main/docs/kv-and-queues.md),
-  [workflows](https://github.com/WasmKeep/wasmkeep/blob/main/docs/workflows.md)).
+  ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/kv-and-queues.md),
+  [workflows](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/workflows.md)).
 - `wasi`: the WASI 0.2 bindings (the `wasip2` crate).
 
-The [API reference](https://github.com/WasmKeep/wasmkeep/blob/main/docs/reference/api.md)
+The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/reference/api.md)
 lists every host function with its name in each SDK.
 
 ## Versions

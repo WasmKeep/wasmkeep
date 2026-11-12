@@ -107,8 +107,8 @@ The limits listed for 0.1.0 still hold:
 ### Install and verify
 
 [Install](README.md#install) downloads a binary or runs the image.
-[Single node](docs/deploy/single-node.md#1-install-the-binary) checks the
-binaries, the components and the archives with cosign;
+[Single node](docs/deploy/single-node.md#1-install-the-binary) shows the
+cosign check, the same for every file of the release;
 [Compose](deploy/compose/README.md) checks the image.
 
 ## 0.1.0

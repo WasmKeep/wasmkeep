@@ -43,10 +43,14 @@ func init() {
 func main() {}
 ```
 
-Build it with TinyGo against the WIT this module ships (`wit/`), and serve
-it; see [`examples/go-counter/build.sh`](../../examples/go-counter/build.sh):
+Save it as `main.go` in a new directory, add the module, build it with
+TinyGo against the WIT the module ships (`wit/`), and serve it (see also
+[`examples/go-counter/build.sh`](../../examples/go-counter/build.sh)):
 
 ```bash
+go mod init hits
+go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0
+go mod tidy   # records the module's one dependency
 SDK=$(go list -m -f '{{.Dir}}' github.com/wasmkeep/wasmkeep/sdks/go)
 tinygo build -target=wasip2 -no-debug -opt=2 \
   --wit-package "$SDK/wit" --wit-world actor-tinygo -o actor.wasm .
@@ -63,12 +67,8 @@ program uses them (the host provides them inert: no directories).
 ## Install
 
 Add the module to an app at the version of the WasmKeep release it runs
-on:
-
-```bash
-go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0
-go mod tidy   # once the app imports a package: records the module's one dependency
-```
+on, as above (`go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0`, then
+`go mod tidy` once the app imports a package).
 
 The module carries the same version number as the server (in the
 repository, the module's own tag is `sdks/go/v0.2.0`). The `wasmkeep`
