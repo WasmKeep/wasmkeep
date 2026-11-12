@@ -126,6 +126,32 @@ Each actor's database follows it from node to node (ADR 0007):
   the bucket has.
 - If an upload fails, the node gives the actor up; the next request restores
   it from the bucket, possibly on another node.
+- A restore's reads are bounded together. The node lists the actor's history and
+  reads its last snapshot and the files after it, eight at a time; every
+  request waiting for the actor waits behind that. A read the bucket leaves
+  unanswered for 5 s, or that is slower than 5 s plus a second per
+  megabyte, is sent again, and so is one the bucket refuses with an error
+  a resend can get past (a 5xx or a broken connection, after the bucket
+  client's own retries), half a second later, then a second: three tries
+  per file. The reads of one restore have 30 s together, plus a second
+  per megabyte of what it reads and a second per eight files: 39 s for 63
+  small files and a snapshot under a megabyte, about 17 minutes more for a
+  database of 1 GiB. That counts the time the restore waits for the
+  bucket to give it the next file. It does not count the listing (given
+  up only when the bucket sends no key for 5 s, so a long history lists
+  for as long as its pages take), nor work on the local disk (never
+  interrupted), nor the time a read waits for its turn among the node's
+  other restores (they share 32 reads at once), so a node that takes many
+  actors over at once does not give them all up half-way: while that
+  queue lasts, a caller can wait longer than the deadline. A restore that fails or runs out of time changes nothing
+  on the node: the database is built beside the local file and put in its
+  place only when complete, so the next restore starts again from a fresh
+  listing. The request that waited gets a 503 with `Retry-After`, as for a
+  bucket that does not answer (a history that cannot be restored without
+  losing data stays an error, 500), the node gives the actor up so
+  another may try, and
+  `wasmkeep_restore_failures_total` counts it
+  ([monitoring](monitoring.md)).
 - `storage.delete-self` is recorded in the bucket, so a deleted actor stays
   deleted wherever it runs next. Like a plain `exec`, it is replicated when
   the event ends: if replication fails at that moment, the delete can be

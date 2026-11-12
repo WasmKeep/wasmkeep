@@ -5,7 +5,7 @@
 use super::*;
 
 /// The value of counter `name` on the node's metrics page.
-async fn counter(name: &str) -> u64 {
+pub(super) async fn counter(name: &str) -> u64 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let metrics = listener.local_addr().unwrap();
     tokio::spawn(wasmkeep_server::serve_metrics(

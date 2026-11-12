@@ -81,6 +81,74 @@ static RESTORE_READ_BYTES: tokio::sync::Semaphore =
 /// again, from a fresh listing).
 const READ_ATTEMPTS: u32 = 3;
 
+/// A read the bucket refuses with an error a resend may get past (a 5xx
+/// or a reset connection once the client's own retries are spent, a body
+/// cut half-way) is sent again after this pause, doubled each time, and
+/// counts among the read's [`READ_ATTEMPTS`]: a GET changes nothing, so
+/// sending it again is always safe. Without it one such answer among a
+/// chain's reads failed the whole restore and the event that woke the
+/// actor.
+const READ_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A restore's reads together (every object, every resend) end within
+/// one deadline, as an upload does: each read above is bounded, but a
+/// chain of reads that each stay under their limit added up without one
+/// (three tries of 5 s or more per object), while every caller of the
+/// actor waited behind it.
+///
+/// The deadline is sized from what is restored, and must never cut a
+/// restore that is going well:
+///
+/// - this much whatever is restored: six [`READ_IDLE`]s, 30 s, the wait
+///   of a caller whose wait is bounded at all (`wall_per_event`,
+///   `FORWARD_TIMEOUT`). Restores of up to 63 segments took 1 to 6 s next
+///   to a real bucket, and 17.5 s at worst with 19 of them sharing the
+///   node (`docs/benchmarks.md`), so a usual one has several times what
+///   it needs;
+/// - [`RESTORE_PER_MIB`] per started megabyte of the objects' listed
+///   sizes, the rate below which a single read is given up as too slow:
+///   a database of 1 GiB has 17 minutes more, and the reads of a large
+///   one are never the reason the deadline passes while each keeps that
+///   rate;
+/// - [`RESTORE_PER_AHEAD`] per [`READ_AHEAD`] objects, for a chain grown
+///   long because its periodic snapshots failed: eight reads side by
+///   side, each answered in 82 ms at the median and 1.7 s at worst next
+///   to the bucket.
+///
+/// The clock counts the time the restore waits for the bucket to give
+/// it the object it applies next, and nothing else, since nothing else
+/// is sized by the terms above:
+///
+/// - not the listing, whose length is not known before it ends: it keeps
+///   its own rule ([`list_with`]: given up when no key comes for
+///   [`READ_IDLE`], never while pages keep coming), so its time follows
+///   the pages listed;
+/// - not the time a read waits for the node's shared limit on reads
+///   ([`RESTORE_READS`], [`RESTORE_READ_MIB`]) before it is even asked
+///   for, as it is not in a read's own time: after a kill one node
+///   restores every actor it takes over at once, and a deadline counting
+///   that queue would end them all half-way, each to start again behind
+///   the others. The queue always moves, since every read holding a
+///   place in it is bounded; while it lasts, the deadline does not bound
+///   what a caller waits;
+/// - not checking the local file, applying an object to it or putting
+///   the finished database in place: local work, sized by the database
+///   and not by the compressed bytes read, and never cut, so what is on
+///   disk when a restore ends is the finished database or nothing. The
+///   reads ahead go on meanwhile.
+pub(crate) const RESTORE_BUDGET: std::time::Duration = READ_IDLE.saturating_mul(6);
+const RESTORE_PER_MIB: std::time::Duration = std::time::Duration::from_secs(1);
+const RESTORE_PER_AHEAD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A restore's deadline counted from `budget`: see [`RESTORE_BUDGET`].
+fn restore_time(budget: std::time::Duration, objects: usize, bytes: u64) -> std::time::Duration {
+    let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    let rounds = u32::try_from(objects.div_ceil(READ_AHEAD)).unwrap_or(u32::MAX);
+    budget
+        .saturating_add(RESTORE_PER_MIB.saturating_mul(megabytes))
+        .saturating_add(RESTORE_PER_AHEAD.saturating_mul(rounds))
+}
+
 /// A segment upload (one transaction, usually a few pages) is bounded too:
 /// an attempt the bucket has not answered within this, plus a second per
 /// started megabyte, is given up and sent again, the next attempt allowed
@@ -396,7 +464,30 @@ impl Replica {
     /// Prepares the actor's local database for generation `generation`:
     /// restores the bucket's current chain unless the local file is already
     /// at its head. The database must be closed.
+    ///
+    /// Its reads end within one deadline ([`RESTORE_BUDGET`]). A
+    /// restore that fails, for the bucket or anything else, leaves the
+    /// local file and its sidecar as they were (the database is built
+    /// beside it and renamed over it at the very end), so the next one
+    /// starts from a fresh listing and trusts nothing of this one; it is
+    /// counted in `wasmkeep_restore_failures_total`.
     pub(crate) async fn restore(
+        cluster: &Cluster,
+        address: &ActorAddress,
+        lease: LeaseView,
+        generation: u64,
+        db_path: PathBuf,
+        max_db_bytes: u64,
+    ) -> Result<Self, ReplicaError> {
+        let restored =
+            Self::restore_within(cluster, address, lease, generation, db_path, max_db_bytes).await;
+        if restored.is_err() {
+            crate::metrics::inc(&crate::metrics::METRICS.restore_failures);
+        }
+        restored
+    }
+
+    async fn restore_within(
         cluster: &Cluster,
         address: &ActorAddress,
         lease: LeaseView,
@@ -448,7 +539,9 @@ impl Replica {
             replica.checksum = sum;
             return Ok(replica);
         }
-        replica.checksum = replica.download(&plan, &keys, &sizes).await?;
+        replica.checksum = replica
+            .download(&plan, &keys, &sizes, cluster.restore_budget)
+            .await?;
         Ok(replica)
     }
 
@@ -492,6 +585,7 @@ impl Replica {
         plan: &Plan,
         listed: &[String],
         sizes: &std::collections::HashMap<String, u64>,
+        budget: std::time::Duration,
     ) -> Result<DbChecksum, ReplicaError> {
         let mut keys = Vec::with_capacity(plan.segments.len() + 1);
         if let Some(id) = plan.snapshot {
@@ -512,6 +606,18 @@ impl Replica {
                 keys.push((*key).clone());
             }
         }
+
+        // The time its reads have in all; moved back, below, by what is
+        // not a wait for the bucket ([`RESTORE_BUDGET`]).
+        let allowed = restore_time(
+            budget,
+            keys.len(),
+            keys.iter()
+                .map(|key| sizes.get(key).copied().unwrap_or(0))
+                .fold(0, u64::saturating_add),
+        );
+        let mut deadline = tokio::time::Instant::now() + allowed;
+        let objects = keys.len();
 
         let path = self.db_path.clone();
         let mut tmp = path.as_os_str().to_owned();
@@ -561,6 +667,7 @@ impl Replica {
                 let location = StorePath::from(format!("{}{key}", self.prefix));
                 // Its time counts every byte read alongside it.
                 let sharing = ahead;
+                let (turn, has_turn) = tokio::sync::oneshot::channel();
                 let task = tokio::spawn(async move {
                     // Never closed: a failed acquire would be a bug.
                     // One read takes at most a read-ahead's worth: a larger
@@ -575,6 +682,7 @@ impl Replica {
                     ) else {
                         return Err(ReplicaError::Local("restore read limit closed".into()));
                     };
+                    let _ = turn.send(());
                     // Its time counts every byte read alongside it on this
                     // node, other restores' included, as it is while the
                     // read lasts (reads that join later count too).
@@ -595,15 +703,31 @@ impl Replica {
                         .observe(read.elapsed());
                     got
                 });
-                reading.push_back((key, size, AbortOnDrop(task)));
+                reading.push_back((key, size, has_turn, AbortOnDrop(task)));
             }
-            let Some((key, size, mut task)) = reading.pop_front() else {
+            let Some((key, size, has_turn, mut task)) = reading.pop_front() else {
                 break;
             };
-            let bytes = (&mut task.0)
-                .await
-                .map_err(|e| ReplicaError::Local(e.to_string()))??;
+            // Waiting for the node's limit on reads is not the restore's
+            // time ([`RESTORE_BUDGET`]). An error means the task ended
+            // without its turn, which the wait below reports.
+            let queued = tokio::time::Instant::now();
+            let _ = has_turn.await;
+            deadline += queued.elapsed();
+            // Looked at here only, waiting for the bucket: never while an
+            // object is applied or the file put in place (whose time is
+            // not counted either, below). The reads still under way are
+            // aborted as `reading` is dropped.
+            let Ok(read) = tokio::time::timeout_at(deadline, &mut task.0).await else {
+                tracing::warn!(prefix = %self.prefix, object = %key, ?allowed, objects, "a restore ran out of time");
+                return Err(ReplicaError::Bucket(format!(
+                    "{}: the restore ran out of time ({allowed:?} for {objects} objects) reading {key}",
+                    self.prefix
+                )));
+            };
+            let bytes = read.map_err(|e| ReplicaError::Local(e.to_string()))??;
             ahead = ahead.saturating_sub(size);
+            let applying = tokio::time::Instant::now();
             let applied = tokio::task::spawn_blocking(move || {
                 restorer
                     .apply(&bytes)
@@ -613,6 +737,7 @@ impl Replica {
             .await
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
             restorer = applied?;
+            deadline += applying.elapsed();
         }
         let head = plan.head();
         let sum = tokio::task::spawn_blocking(move || {
@@ -1310,8 +1435,14 @@ impl Collector {
     }
 }
 
-/// A restore's read in flight: its key, its listed size, its task.
-type Reading = (String, u64, AbortOnDrop<Result<bytes::Bytes, ReplicaError>>);
+/// A restore's read in flight: its key, its listed size, the word that it
+/// has its turn under the node's limit on reads, its task.
+type Reading = (
+    String,
+    u64,
+    tokio::sync::oneshot::Receiver<()>,
+    AbortOnDrop<Result<bytes::Bytes, ReplicaError>>,
+);
 
 /// A task aborted when dropped (a restore that ends early, or is cut).
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -1325,7 +1456,11 @@ impl<T> Drop for AbortOnDrop<T> {
 /// Reads one object for a restore, giving up an attempt when the bucket
 /// is silent for [`READ_IDLE`] (no headers, or no next chunk), up to
 /// [`READ_ATTEMPTS`] times. An attempt given up is dropped whole: nothing
-/// of it is applied, and the next attempt reads the object again. Objects
+/// of it is applied, and the next attempt reads the object again. An
+/// attempt the bucket refuses, or whose body breaks, is sent again too,
+/// after a pause ([`READ_PAUSE`]), unless no resend would change the
+/// answer ([`definite`]: the object is gone, say, collected since the
+/// listing, and the next restore lists again). Objects
 /// larger than `max_object` are refused before their body is read.
 /// An attempt is also given up once it has taken [`READ_IDLE`] plus a
 /// second per started megabyte of the bytes read over the same link
@@ -1350,7 +1485,17 @@ async fn bounded_get(
     };
     let mut seen = sharing();
     let mut last = String::new();
-    'attempts: for _ in 0..READ_ATTEMPTS {
+    let mut pause = READ_PAUSE;
+    'attempts: for attempt in 1..=READ_ATTEMPTS {
+        // A failure a resend may get past: an attempt used, then a pause.
+        let refused = async |e: object_store::Error, pause: &mut std::time::Duration| {
+            if attempt < READ_ATTEMPTS {
+                tracing::info!(object = %location, reason = %e, "a restore's read failed; sending it again");
+                tokio::time::sleep(*pause).await;
+                *pause = pause.saturating_mul(2);
+            }
+            e.to_string()
+        };
         // The attempt's whole time, from its request, grown as reads join.
         let start = tokio::time::Instant::now();
         let mut limit = limit_for(seen);
@@ -1361,7 +1506,11 @@ async fn bounded_get(
         .await
         {
             Ok(Ok(got)) => got,
-            Ok(Err(e)) => return Err(ReplicaError::Bucket(e.to_string())),
+            Ok(Err(e)) if definite(&e) => return Err(ReplicaError::Bucket(e.to_string())),
+            Ok(Err(e)) => {
+                last = refused(e, &mut pause).await;
+                continue;
+            }
             Err(_) => {
                 last = format!("no answer within {READ_IDLE:?}");
                 tracing::info!(object = %location, reason = %last, "a restore's read stalled; sending it again");
@@ -1390,7 +1539,13 @@ async fn bounded_get(
             let until = start + limit;
             match tokio::time::timeout_at(until.min(now + READ_IDLE), body.next()).await {
                 Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
-                Ok(Some(Err(e))) => return Err(ReplicaError::Bucket(e.to_string())),
+                Ok(Some(Err(e))) if definite(&e) => {
+                    return Err(ReplicaError::Bucket(e.to_string()));
+                }
+                Ok(Some(Err(e))) => {
+                    last = refused(e, &mut pause).await;
+                    continue 'attempts;
+                }
                 Ok(None) => return Ok(bytes.into()),
                 Err(_) if tokio::time::Instant::now() >= start + limit => {
                     last = format!(
@@ -1408,7 +1563,7 @@ async fn bounded_get(
             }
         }
     }
-    tracing::warn!(object = %location, reason = %last, "a restore's read kept stalling");
+    tracing::warn!(object = %location, reason = %last, "a restore's read kept failing");
     Err(ReplicaError::Bucket(format!(
         "{location}: {last}, {READ_ATTEMPTS} times"
     )))
@@ -2312,6 +2467,24 @@ mod tests {
         assert_eq!(
             periodic_snapshot_bound(idle, usize::MAX),
             Duration::from_secs(10)
+        );
+    }
+
+    /// A restore's deadline is sized from what it reads: never under the
+    /// budget, a second more per started megabyte and per eight objects.
+    #[test]
+    fn a_restores_deadline_grows_with_what_it_reads() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(restore_time(RESTORE_BUDGET, 1, 1), s(32));
+        // A snapshot and 63 segments, a megabyte in all.
+        assert_eq!(restore_time(RESTORE_BUDGET, 64, 1 << 20), s(39));
+        // A database of 1 GiB in one snapshot.
+        assert_eq!(restore_time(RESTORE_BUDGET, 1, 1 << 30), s(30 + 1024 + 1));
+        assert_eq!(
+            restore_time(RESTORE_BUDGET, usize::MAX, u64::MAX),
+            RESTORE_BUDGET
+                .saturating_add(RESTORE_PER_MIB.saturating_mul(u32::MAX))
+                .saturating_add(RESTORE_PER_AHEAD.saturating_mul(u32::MAX))
         );
     }
 

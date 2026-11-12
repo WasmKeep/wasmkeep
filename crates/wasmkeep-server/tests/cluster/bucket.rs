@@ -225,6 +225,205 @@ async fn a_hung_read_does_not_stall_a_restore() {
     );
 }
 
+/// Two nodes and an actor at `path` that a wrote `writes` times before it
+/// was cut off from the bucket: b, which reads the bucket through the
+/// `Flaky` returned and gives a restore `budget` before sizes are counted
+/// (30 s on a real node), takes the actor at its next request.
+async fn cut_off_owner(
+    path: &str,
+    writes: u32,
+    budget: Duration,
+) -> (
+    Node,
+    Node,
+    Arc<Flaky>,
+    (tempfile::TempDir, tempfile::TempDir),
+) {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let down = Arc::new(AtomicBool::new(false));
+    let seen_by_a: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let flaky_b = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let seen_by_b: Arc<dyn ObjectStore> = flaky_b.clone();
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", dirs.0.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_configured(
+        "b",
+        dirs.1.path(),
+        &seen_by_b,
+        idle,
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        move |config: &mut ActorConfig| {
+            config.cluster.as_mut().unwrap().restore_budget = budget;
+        },
+    )
+    .await;
+    settle().await;
+    for expected in 1..=writes {
+        let r = send(a.addr, "POST", path, "").await;
+        assert_eq!(
+            (r.status, r.body.trim(), r.node.as_deref()),
+            (200, expected.to_string().as_str(), Some("a"))
+        );
+    }
+    down.store(true, Ordering::SeqCst);
+    (a, b, flaky_b, dirs)
+}
+
+/// The answer to the request that waited for b's first restore of
+/// `path`'s actor, and how long that request took. Requests are sent one
+/// at a time, so the one during which b first read the actor's history is
+/// the one that waited for the restore: its answer is the restore's, not
+/// that of a later request that found the work redone.
+async fn answer_behind_the_restore(b: &Node, path: &str, flaky_b: &Flaky) -> (Reply, Duration) {
+    let started = std::time::Instant::now();
+    loop {
+        let sent = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(40), send(b.addr, "GET", path, ""))
+            .await
+            .expect("a request behind a restore is answered");
+        if flaky_b.history_gets.load(Ordering::SeqCst) > 0 {
+            return (r, sent.elapsed());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "b never restored the actor"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Files a restore leaves while it builds a database (`<db>.restore`),
+/// anywhere under `dir`.
+fn restore_leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
+    walk(dir)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|e| e == "restore"))
+        .collect()
+}
+
+/// b serves `path`'s actor with `writes` writes, within 15 s.
+async fn restores_cleanly(b: &Node, path: &str, writes: u32) {
+    let started = std::time::Instant::now();
+    loop {
+        let r = send(b.addr, "GET", path, "").await;
+        if r.status == 200 {
+            assert_eq!(
+                (r.body.trim(), r.node.as_deref()),
+                (writes.to_string().as_str(), Some("b")),
+                "every acknowledged write restored"
+            );
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "b did not serve the actor: {} {}",
+            r.status,
+            r.body
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A read the bucket refuses once with an error a resend gets past (a
+/// 5xx, a reset connection) is sent again within the restore: the request
+/// that woke the actor is served, and nothing is read a second time but
+/// the object refused. It used to fail the whole restore, and the request
+/// with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_read_refused_once_is_sent_again() {
+    let path = "/actor/t/refused/durable";
+    let (_a, b, flaky_b, _dirs) = cut_off_owner(path, 5, Duration::from_secs(30)).await;
+    flaky_b.fail_wal_gets.store(1, Ordering::SeqCst);
+    let (r, _) = answer_behind_the_restore(&b, path, &flaky_b).await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "5", Some("b")),
+        "the request that woke the actor is served, every write restored"
+    );
+    assert_eq!(
+        flaky_b.fail_wal_gets.load(Ordering::SeqCst),
+        0,
+        "the refused read was made"
+    );
+    let mut reads: Vec<u32> = flaky_b.wal_gets.lock().unwrap().values().copied().collect();
+    reads.sort_unstable();
+    let twice = reads.iter().filter(|&&n| n == 2).count();
+    assert!(twice == 1 && reads.iter().all(|&n| n <= 2), "{reads:?}");
+    assert_eq!(
+        super::snapshots::counter("wasmkeep_restore_failures_total").await,
+        0
+    );
+}
+
+/// A bucket that leaves every read of the history hanging fails the
+/// restore within its reads' deadline (here 1 s, a second for the megabyte
+/// started and a second for the objects: 3 s; each read alone would be
+/// tried three times, 5 s each), with the answer of a bucket that does
+/// not answer: 503 with `Retry-After`. Nothing half-built stays on disk,
+/// and once the bucket answers the next request restores every write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_the_bucket_never_answers_ends_within_its_deadline() {
+    let path = "/actor/t/silent/durable";
+    let (_a, b, flaky_b, dirs) = cut_off_owner(path, 5, Duration::from_secs(1)).await;
+    flaky_b.hang_history_gets.store(true, Ordering::SeqCst);
+    let (r, took) = answer_behind_the_restore(&b, path, &flaky_b).await;
+    assert_eq!(
+        (r.status, r.retry_after.as_deref()),
+        (503, Some("1")),
+        "{}",
+        r.body
+    );
+    assert!(took < Duration::from_secs(8), "{took:?}");
+    assert_eq!(
+        restore_leftovers(dirs.1.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert!(super::snapshots::counter("wasmkeep_restore_failures_total").await >= 1);
+    flaky_b.hang_history_gets.store(false, Ordering::SeqCst);
+    restores_cleanly(&b, path, 5).await;
+    assert_eq!(
+        restore_leftovers(dirs.1.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// Reads that are each answered in time still add up: here every segment
+/// read takes 2 s, under any one read's limit, so the 30 segments, read
+/// eight at a time, take 8 s. The restore has 6 s (1 s, a second for the
+/// megabyte started, a second per eight objects) for its reads: it is given
+/// up then,
+/// answered as a bucket that does not answer is, and the next request
+/// restores every write once the bucket is fast again. Without a deadline
+/// for the reads together, the caller waited as long as the chain took.
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_reads_that_add_up_past_the_deadline_end_a_restore() {
+    let path = "/actor/t/slow/durable";
+    let (_a, b, flaky_b, dirs) = cut_off_owner(path, 30, Duration::from_secs(1)).await;
+    flaky_b.delay_wal_get_ms.store(2_000, Ordering::SeqCst);
+    let (r, took) = answer_behind_the_restore(&b, path, &flaky_b).await;
+    assert_eq!(
+        (r.status, r.retry_after.as_deref()),
+        (503, Some("1")),
+        "after {took:?}: {}",
+        r.body
+    );
+    assert_eq!(
+        restore_leftovers(dirs.1.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert!(super::snapshots::counter("wasmkeep_restore_failures_total").await >= 1);
+    flaky_b.delay_wal_get_ms.store(0, Ordering::SeqCst);
+    restores_cleanly(&b, path, 30).await;
+}
+
 /// A node cut off from the bucket cannot take an actor: it answers 503
 /// with `Retry-After`, as clients and load balancers expect for a
 /// temporary refusal, not a 500 counted as the guest's failure (review

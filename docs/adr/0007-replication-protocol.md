@@ -95,6 +95,25 @@ may not survive, which is what an unacknowledged write is allowed to do.
    are still applied one at a time, in the plan's order. In the 12-hour
    soak one restore of 55 objects took 56 s, each read about a second,
    none silent for 5 s.
+7. *(Added 2026-11-11.)* A read the bucket refuses with an error a resend
+   may get past is sent again after a pause (0.5 s, then 1 s), within the
+   same three tries: a GET changes nothing, so a resend is always safe. An
+   answer no resend changes (the object is gone, access is denied) still
+   fails the restore at once. A restore's reads together end within one
+   deadline: 30 s, plus a second per started megabyte of the objects it
+   reads (the rate below which one read is given up) and a second per
+   eight objects. Its clock runs while the restore waits for the bucket
+   to give it the object it applies next, and only then: not during the
+   listing (its length is not known before it ends; it keeps the rule of
+   step 5), not while an object is applied or the file is put in place
+   (local work, never cut), and not while a read waits for the node's
+   shared limit on reads before it is asked for (many restores start at
+   once after a kill, and a deadline counting their queue would end them
+   all half-way). A restore that fails, for any reason, leaves the local
+   file and its sidecar untouched (the database is built beside it),
+   writes nothing to the actor's history, and gives the lease up as a
+   failed restore did before: the next event restores from a fresh
+   listing, so it adds no ordering the protocol did not already have.
 
 Why every acknowledged write is on that chain: generation `h` acquires only
 after every earlier grant ran out *or was released*, and lists after
