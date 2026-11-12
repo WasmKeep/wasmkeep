@@ -1046,6 +1046,12 @@ fn a_relayed_upgrade_carries_no_node_or_framing_headers() {
         (CHAIN, "default/t/y"),
         (FORWARDED, "0"),
         ("x-wasmkeep-actor", "default/t/z"),
+        // Markers only a node may set, and any other name in the reserved
+        // range: a client must not choose any of them for the owner.
+        (TAKE, "1"),
+        (ALARM_HANDOFF, "1"),
+        (HOLDER, "a"),
+        ("X-WasmKeep-Something-New", "1"),
         ("content-length", "5"),
         ("transfer-encoding", "chunked"),
         ("connection", "keep-alive, upgrade, x-custom"),
@@ -1067,6 +1073,10 @@ fn a_relayed_upgrade_carries_no_node_or_framing_headers() {
         CHAIN,
         FORWARDED,
         "x-wasmkeep-actor",
+        TAKE,
+        ALARM_HANDOFF,
+        HOLDER,
+        "x-wasmkeep-something-new",
         "content-length",
         "transfer-encoding",
         "te",
@@ -1074,6 +1084,10 @@ fn a_relayed_upgrade_carries_no_node_or_framing_headers() {
     ] {
         assert!(!out.contains_key(gone), "{gone} relayed");
     }
+    assert!(
+        !out.keys().any(|k| k.as_str().starts_with("x-wasmkeep-")),
+        "a reserved header was relayed: {out:?}"
+    );
     assert_eq!(out["connection"], "upgrade");
     assert_eq!(out["upgrade"], "websocket");
     for kept in [
