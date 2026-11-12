@@ -239,6 +239,85 @@ async fn a_failed_periodic_snapshot_is_tried_again_later() {
     );
 }
 
+/// Waits until `p.a` holds no actor in memory, then for the release
+/// that follows.
+async fn hibernated(p: &Pair) {
+    eventually("the actor hibernates", async || p.a.service.resident() == 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// A failed periodic snapshot's wait outlives the actor's time in memory.
+/// The node drops an idle actor and restores it at its next event, with
+/// every segment since the last snapshot counted again: that restore used
+/// to forget the failure, so with a bucket failing snapshot uploads each
+/// wake of a long chain paid a try. A wake inside the wait tries nothing;
+/// one after it does; and the segments the try after that waits for (8)
+/// are still waited for after another hibernation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_snapshots_wait_outlives_hibernation() {
+    const WAIT: Duration = Duration::from_secs(8);
+    let p = pair_waiting(Duration::from_secs(1), WAIT).await;
+    let read = async || {
+        let r = send(p.a.addr, "GET", "/actor/t/x/durable", "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("a")),
+            "{}",
+            r.body
+        );
+        // The snapshot, if one is due, is taken once the event has ended.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    write(&p, "x", 1).await;
+    // Every snapshot upload fails: each try shows as one fault used.
+    let fault = &p.flaky.fail_snapshot_puts;
+    fault.store(u32::MAX, Ordering::SeqCst);
+    let tries = || u32::MAX - fault.load(Ordering::SeqCst);
+    let (mut written, not_before) = write_until_met(&p, "x", fault).await;
+    let not_after = std::time::Instant::now();
+    // One more write: the segment the next try waits for is there, so
+    // only the minimum wait holds it back.
+    written += 1;
+    write(&p, "x", written).await;
+    assert_eq!(tries(), 1);
+
+    hibernated(&p).await;
+    read().await;
+    assert!(
+        not_before.elapsed() < WAIT,
+        "too slow to tell: the wait had passed before the wake"
+    );
+    assert_eq!(tries(), 1, "a wake inside the wait tried again");
+
+    hibernated(&p).await;
+    tokio::time::sleep((WAIT + Duration::from_millis(200)).saturating_sub(not_after.elapsed()))
+        .await;
+    assert_eq!(tries(), 1, "no event, no try");
+    let second = std::time::Instant::now();
+    read().await;
+    eventually("a wake after the wait tries again", async || tries() == 2).await;
+
+    // The third try waits for 8 more segments, however long the actor
+    // sleeps and however often it wakes meanwhile.
+    hibernated(&p).await;
+    tokio::time::sleep((WAIT + Duration::from_millis(500)).saturating_sub(second.elapsed())).await;
+    read().await;
+    assert_eq!(tries(), 2, "tried again before 8 more segments");
+    for _ in 0..7 {
+        written += 1;
+        write(&p, "x", written).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(tries(), 2, "tried again after 7 segments");
+    written += 1;
+    write(&p, "x", written).await;
+    eventually("the eighth segment is followed by a try", async || {
+        tries() == 3
+    })
+    .await;
+    assert_eq!(snapshots_of(&p, "x").await.len(), 1, "every try failed");
+}
+
 /// A periodic snapshot's upload that was given up may still land: the
 /// counter says "not acknowledged", not "not there". Nothing is lost by
 /// it, the actor keeps answering, a later snapshot succeeds, and another

@@ -90,7 +90,11 @@ Each actor's database follows it from node to node (ADR 0007):
   every 64. With a bucket that leaves every snapshot upload hanging, the
   worst case is 10 s of hold per try and three tries in any 64 writes
   (30 s), never two within 30 s, then one try per 64 writes (10 s); an
-  actor that only reads does not try again. A
+  actor that only reads does not try again. The node remembers these waits
+  while an idle actor is out of its memory, so waking it does not try
+  again either; a node that takes the actor over from another, or one
+  that restarted, knows of no wait and tries at the actor's first event
+  there when 64 writes or more have no snapshot. A
   database the bucket cannot take within those 10 s gets no periodic
   snapshot: each try is one bounded attempt, and a restore replays every
   write since the last snapshot. Uploads not acknowledged are counted by

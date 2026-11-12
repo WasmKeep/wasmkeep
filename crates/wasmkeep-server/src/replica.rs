@@ -139,6 +139,15 @@ const UPLOAD_BUDGET_IDLES: u32 = 4;
 /// uploads had bounds, one hung snapshot per 64 segments held the actor
 /// for the client's 30 s.
 ///
+/// That holds on one node for as long as its process lives: the wait is
+/// the node's ([`SnapshotWaits`]), so an actor dropped from memory when
+/// idle and restored at its next event keeps it. A restore counts every
+/// segment since the last snapshot, so without a wait on record (another
+/// node took the actor over, this one restarted, or the record was full)
+/// a chain of [`SNAPSHOT_EVERY`] segments or more makes a snapshot due
+/// at the first event, as it always did: one more try, and the waits
+/// start from there.
+///
 /// The price: a database the bucket cannot take within 10 s (slower than
 /// a megabyte a second up to 5 MB, than its size in 10 s above) gets no
 /// periodic snapshot. Each try is one counted, bounded attempt, and a
@@ -151,6 +160,72 @@ const SNAPSHOT_RETRY_GROWTH: u64 = 8;
 /// snapshot that failed and the next try, however fast segments follow:
 /// as long as the longest bounded wait of a queued caller.
 pub(crate) const SNAPSHOT_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Each actor's wait after a periodic snapshot that failed, kept by the
+/// node ([`Cluster::snapshot_waits`]) so that it outlives the actor's
+/// [`Replica`]: an idle actor is dropped from memory and restored at its
+/// next event with every segment since the last snapshot counted again,
+/// and without this a snapshot would be due at that first event, wait or
+/// no wait. An entry is written when a try starts, removed when a
+/// snapshot is there, when the actor is deleted and when this node sees
+/// the actor go to another; a restore that finds a later snapshot drops
+/// it. Only this process knows it: another node that takes the actor
+/// over, or this one after a restart, starts with none.
+///
+/// At most [`SNAPSHOT_WAITS_MAX`] entries: one more pushes out the one
+/// whose time comes first, whose actor may then try again at its next
+/// restore, as it did before the wait was kept.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotWaits(
+    std::sync::Mutex<std::collections::HashMap<ActorAddress, SnapshotWait>>,
+);
+
+/// See [`SnapshotWaits`].
+const SNAPSHOT_WAITS_MAX: usize = 10_000;
+
+/// One actor's wait: no periodic snapshot is tried before `after`, nor
+/// before the actor's head has reached transaction `txid` (each segment
+/// is one transaction, whoever uploads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotWait {
+    /// Periodic snapshots that failed in a row.
+    failures: u32,
+    txid: u64,
+    after: tokio::time::Instant,
+}
+
+impl SnapshotWaits {
+    fn entries(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ActorAddress, SnapshotWait>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get(&self, address: &ActorAddress) -> Option<SnapshotWait> {
+        self.entries().get(address).copied()
+    }
+
+    fn set(&self, address: &ActorAddress, wait: SnapshotWait) {
+        let mut entries = self.entries();
+        if entries.len() >= SNAPSHOT_WAITS_MAX && !entries.contains_key(address) {
+            let first = entries
+                .iter()
+                .min_by_key(|(_, w)| w.after)
+                .map(|(a, _)| a.clone());
+            if let Some(first) = first {
+                entries.remove(&first);
+            }
+        }
+        entries.insert(address.clone(), wait);
+    }
+
+    /// The actor has a snapshot, was deleted, or is another node's now.
+    pub(crate) fn forget(&self, address: &ActorAddress) {
+        self.entries().remove(address);
+    }
+}
 
 /// How long a periodic snapshot's one attempt may take, for an idle bound
 /// of `idle` and a snapshot of `bytes`: see [`PERIODIC_SNAPSHOT_IDLES`].
@@ -208,6 +283,12 @@ pub(crate) struct Replica {
     /// Segments since the last snapshot. A periodic snapshot that fails
     /// leaves it as it is.
     since_snapshot: u64,
+    /// The actor, and the node's record of its wait after a periodic
+    /// snapshot that failed: what the three fields below hold is written
+    /// there too, and read back by the actor's next `Replica`
+    /// ([`SnapshotWaits`]).
+    address: ActorAddress,
+    snapshot_waits: Arc<SnapshotWaits>,
     /// Periodic snapshots that failed since the last snapshot taken.
     snapshot_failures: u32,
     /// After a periodic snapshot failed, none is tried again before
@@ -336,6 +417,8 @@ impl Replica {
             lease,
             head: plan.head(),
             since_snapshot: plan.segments.len() as u64,
+            address: address.clone(),
+            snapshot_waits: Arc::clone(&cluster.snapshot_waits),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
             snapshot_retry_after: tokio::time::Instant::now(),
@@ -347,6 +430,7 @@ impl Replica {
             failed: None,
             upload_idle: UPLOAD_IDLE,
         };
+        replica.resume_snapshot_wait();
         if plan.head() == EMPTY {
             // Nothing in the bucket yet: the local database (possibly from
             // before the node joined a cluster) becomes the first snapshot.
@@ -741,8 +825,11 @@ impl Replica {
     /// since that try started; if that fails too, after
     /// [`SNAPSHOT_RETRY_GROWTH`] times as many segments, up to
     /// [`SNAPSHOT_EVERY`]. An actor that only reads, or is idle, does not
-    /// try again. Each try captures the whole database and holds the
-    /// actor for its upload: [`PERIODIC_SNAPSHOT_IDLES`] has the sums.
+    /// try again, and neither does one restored on this node after a
+    /// hibernation: its wait is taken up again
+    /// ([`Self::resume_snapshot_wait`]). Each try captures the whole
+    /// database and holds the actor for its upload:
+    /// [`PERIODIC_SNAPSHOT_IDLES`] has the sums.
     pub(crate) fn snapshot_due(&self) -> bool {
         self.since_snapshot >= SNAPSHOT_EVERY.max(self.snapshot_retry_at)
             && (self.snapshot_failures == 0
@@ -754,6 +841,28 @@ impl Replica {
         self.since_snapshot = 0;
         self.snapshot_failures = 0;
         self.snapshot_retry_at = 0;
+        self.snapshot_waits.forget(&self.address);
+    }
+
+    /// After a restore: takes up the wait an earlier `Replica` of this
+    /// actor left on this node ([`SnapshotWaits`]), so a snapshot that
+    /// failed is not tried again by the first event after a hibernation.
+    /// Fewer than [`SNAPSHOT_EVERY`] segments restored means a snapshot
+    /// landed since (an upload given up, or another node's): nothing to
+    /// wait for.
+    fn resume_snapshot_wait(&mut self) {
+        let Some(wait) = self.snapshot_waits.get(&self.address) else {
+            return;
+        };
+        if self.since_snapshot < SNAPSHOT_EVERY {
+            self.snapshot_waits.forget(&self.address);
+            return;
+        }
+        self.snapshot_failures = wait.failures;
+        self.snapshot_retry_at = self
+            .since_snapshot
+            .saturating_add(wait.txid.saturating_sub(self.head.txid));
+        self.snapshot_retry_after = wait.after;
     }
 
     /// A periodic snapshot failed (or is starting): when the next try is
@@ -766,6 +875,14 @@ impl Replica {
         self.snapshot_failures = self.snapshot_failures.saturating_add(1);
         self.snapshot_retry_at = self.since_snapshot.saturating_add(wait);
         self.snapshot_retry_after = tokio::time::Instant::now() + self.snapshot_retry_min;
+        self.snapshot_waits.set(
+            &self.address,
+            SnapshotWait {
+                failures: self.snapshot_failures,
+                txid: self.head.txid.saturating_add(wait),
+                after: self.snapshot_retry_after,
+            },
+        );
     }
 
     /// A periodic snapshot's upload: one conditional create, given up
@@ -1380,6 +1497,8 @@ mod tests {
                 txid: 1,
             },
             since_snapshot: 0,
+            address: ActorAddress::new("t", "c", "a").unwrap(),
+            snapshot_waits: Arc::default(),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
             snapshot_retry_after: tokio::time::Instant::now(),
@@ -1960,6 +2079,102 @@ mod tests {
         assert!(!r.snapshot_due());
         r.since_snapshot += 1;
         assert!(r.snapshot_due(), "one segment later");
+    }
+
+    /// The wait after a failed periodic snapshot is the node's, not the
+    /// `Replica`'s: the actor's next one, restored after a hibernation
+    /// with every segment counted again, takes it up (it used to start
+    /// with a snapshot due at once), in time and in segments.
+    #[tokio::test]
+    async fn a_restored_replica_takes_up_the_wait_of_the_one_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        store
+            .fail_next
+            .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        let all = changes(DbChecksum::from_value(7));
+        r.since_snapshot = SNAPSHOT_EVERY;
+        r.head.txid = 100;
+        // Two failures in a row: the next try waits for 8 segments.
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
+        r.since_snapshot += 1;
+        r.head.txid += 1;
+        r.snapshot_retry_after = tokio::time::Instant::now();
+        assert!(r.snapshot_due());
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
+        let after = r.snapshot_retry_after;
+        // As a restore builds it: three segments further, all counted.
+        let waits = Arc::clone(&r.snapshot_waits);
+        let restored = async |txid: u64, since_snapshot: u64| {
+            let (mut next, _) = faulty(dir.path(), 0, 0).await;
+            next.snapshot_waits = Arc::clone(&waits);
+            next.head.txid = txid;
+            next.since_snapshot = since_snapshot;
+            next.resume_snapshot_wait();
+            next
+        };
+        let mut next = restored(104, SNAPSHOT_EVERY + 4).await;
+        assert_eq!(next.snapshot_failures, 2);
+        assert_eq!(next.snapshot_retry_after, after, "the time is kept");
+        next.snapshot_retry_after = tokio::time::Instant::now();
+        assert!(!next.snapshot_due(), "3 of the 8 segments");
+        next.since_snapshot += 4;
+        assert!(!next.snapshot_due(), "7 of the 8 segments");
+        next.since_snapshot += 1;
+        assert!(next.snapshot_due(), "8 segments after the failure");
+        // Every segment was there already, but not the time.
+        let next = restored(200, SNAPSHOT_EVERY + 99).await;
+        assert!(!next.snapshot_due(), "before the minimum time");
+        // A snapshot landed meanwhile: nothing left to wait for.
+        let next = restored(200, 3).await;
+        assert_eq!(next.snapshot_failures, 0);
+        assert!(r.snapshot_waits.get(&r.address).is_none());
+    }
+
+    /// A snapshot taken removes the node's record of the wait, and the
+    /// record holds a bounded number of actors: one more pushes out the
+    /// one whose time comes first.
+    #[tokio::test]
+    async fn the_nodes_record_of_waits_is_cleared_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        let all = changes(DbChecksum::from_value(7));
+        r.since_snapshot = SNAPSHOT_EVERY;
+        store
+            .fail_next
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
+        assert_eq!(
+            r.snapshot_waits.get(&r.address).map(|w| w.failures),
+            Some(1)
+        );
+        r.since_snapshot += 1;
+        r.snapshot_retry_after = tokio::time::Instant::now();
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
+        assert!(r.snapshot_waits.get(&r.address).is_none(), "cleared");
+
+        let waits = SnapshotWaits::default();
+        let now = tokio::time::Instant::now();
+        let actor = |i: usize| ActorAddress::new("t", "c", format!("a{i}")).unwrap();
+        let wait = |i: usize| SnapshotWait {
+            failures: 1,
+            txid: 1,
+            after: now + std::time::Duration::from_secs(i as u64),
+        };
+        for i in 0..SNAPSHOT_WAITS_MAX {
+            waits.set(&actor(i), wait(i + 1));
+        }
+        // One already there is replaced; nothing is pushed out.
+        waits.set(&actor(5), wait(6));
+        assert_eq!(waits.entries().len(), SNAPSHOT_WAITS_MAX);
+        assert!(waits.get(&actor(0)).is_some());
+        waits.set(&actor(SNAPSHOT_WAITS_MAX), wait(SNAPSHOT_WAITS_MAX + 1));
+        assert_eq!(waits.entries().len(), SNAPSHOT_WAITS_MAX);
+        assert!(waits.get(&actor(0)).is_none(), "the earliest went");
+        assert!(waits.get(&actor(1)).is_some());
+        assert!(waits.get(&actor(SNAPSHOT_WAITS_MAX)).is_some());
+        waits.forget(&actor(1));
+        assert!(waits.get(&actor(1)).is_none());
     }
 
     /// A failed periodic snapshot also waits a minimum time, however many

@@ -321,6 +321,9 @@ pub(crate) struct Cluster {
     pub(crate) history_retention: Duration,
     /// [`ClusterConfig::snapshot_retry_min`].
     pub(crate) snapshot_retry_min: Duration,
+    /// Actors' waits after a periodic snapshot that failed: here, so they
+    /// outlive an actor's time in memory.
+    pub(crate) snapshot_waits: Arc<crate::replica::SnapshotWaits>,
     /// When a heartbeat last reached the bucket (ms since the epoch; 0:
     /// never), and how often one is sent: for readiness.
     heartbeat_ok_ms: std::sync::atomic::AtomicU64,
@@ -547,6 +550,7 @@ impl Cluster {
             alarm_sweep: config.alarm_sweep,
             history_retention: config.history_retention,
             snapshot_retry_min: config.snapshot_retry_min,
+            snapshot_waits: Arc::default(),
             heartbeat_ok_ms: std::sync::atomic::AtomicU64::new(0),
             heartbeat_every: config.heartbeat,
             heartbeat_landed: tokio::sync::Notify::new(),

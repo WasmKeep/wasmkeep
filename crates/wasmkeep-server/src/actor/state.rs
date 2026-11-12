@@ -417,6 +417,9 @@ impl ActorState {
                 if let OwnershipError::NotOwner { owner, until_ms } = &e {
                     let until = (*until_ms).min(now_ms().saturating_add(HINT_MS));
                     self.owner_hint = Some((owner.clone(), until));
+                    // Another node's actor now: its periodic snapshots
+                    // are that node's to schedule.
+                    cluster.snapshot_waits.forget(&self.address);
                 }
                 Err(e)
             }
@@ -751,6 +754,11 @@ impl ActorState {
             }
             Err(e) => Err(e),
         };
+        // A deleted actor leaves no wait behind on this node; the replica
+        // in memory keeps its own for as long as it lives.
+        if let Some(cluster) = &self.cluster {
+            cluster.snapshot_waits.forget(&self.address);
+        }
         if let Err(e) = result {
             self.abandon(&format!("recording the delete: {e}"));
         }

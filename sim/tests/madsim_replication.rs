@@ -14,7 +14,9 @@
 //! upload failed, a single attempt, is tried again once one more segment
 //! is there and a minimum time has passed, then after eight times as many
 //! segments, up to the interval, so a snapshot can land late before the
-//! one that retried it). With
+//! one that retried it). An owner here forgets that wait at every
+//! restore, where a server node keeps it for an actor it restores again
+//! itself: the simulation tries snapshots the server would hold back. With
 //! collection on, owners delete history by ADR 0012's rule
 //! (`collectable`) after their own acknowledged snapshots, through a client
 //! whose deletes can time out and land late.
