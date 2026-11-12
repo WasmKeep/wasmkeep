@@ -38,9 +38,11 @@ else to run: no consensus cluster, no coordinator.
   and the 503 does not say which it was. Only a connection kept open
   that the node had already closed costs nothing: it is replaced before
   the request is written. (One exception: a WebSocket upgrade that node
-  refused at the TLS handshake is sent once more; see "A caller its peer
-  briefly stopped trusting" below.) A release that fails is retried in the
-  background; until it lands, the record keeps naming the node.
+  provably never read, because it refused the TLS handshake or the
+  upgrade came back unsent on a new TLS connection, is sent once more,
+  the client waiting meanwhile; see "A caller its peer briefly stopped
+  trusting" below.) A release that fails is retried in the background;
+  until it lands, the record keeps naming the node.
 - A node that stops cleanly (`SIGTERM` or Ctrl-C) finishes its in-flight
   events, then releases its actors: the next request for one of them
   starts it on another node at once. Last, it writes its heartbeat
@@ -209,7 +211,11 @@ with the same id.
 not own the actor relays the upgrade to the owner and joins the two
 connections, so everyone in a room shares one actor wherever they connected.
 If the actor later moves, its sockets close with code 1012; clients
-reconnect.
+reconnect. If the owner does not answer the upgrade, the client gets a
+503 and may open the socket again; over mutual TLS between nodes, that 503
+can take up to four heartbeat periods (12 s with the defaults) when the
+owner refuses the relaying node's certificate (see "A caller its peer
+briefly stopped trusting" below).
 
 **Calls between nodes.** `actors.call` reaches an actor wherever it runs.
 Nodes prove to each other that a call comes from the cluster with a
@@ -319,7 +325,26 @@ bucket controls the cluster, as with the call secret.
   relayed WebSocket upgrade, which has no body, is sent once more the
   same way, the client waiting meanwhile; if it is refused again, or the
   heartbeat does not land, the client gets a 503 asking it to retry. A
-  forwarded request gets that 503 at once: its body is not kept.
+  forwarded request gets that 503 at once: its body is not kept. A call
+  or an upgrade that came back unsent on a new TLS connection to the
+  peer is treated as one refused at the handshake (a refusal can close
+  the connection before the request is written; whatever closed it, the
+  peer read nothing). Nothing else is sent again: not a request whose
+  connection could not be opened, and not one written into a connection
+  that then failed, which the peer may have read.
+
+  The price is the client's wait when the peer keeps refusing. The
+  upgrade's 503 then comes after up to four heartbeat periods if the
+  heartbeat lands and the second try is refused too (12 s at most with
+  the default 3 s period, 9 s or less when the next heartbeat lands on
+  time: up to one period for it, then two), and after two periods (6 s)
+  if the heartbeat does not land; a call waits as long for its failure.
+  Answering at once would be faster in that case only: a peer that
+  refuses a live node does so for a moment, and then the wait ends in
+  the open socket or the call's answer, where a 503 at once would leave
+  the client to open the socket again and fail the call. A client that
+  gives up on a WebSocket handshake sooner than that sees its own
+  timeout instead.
 
 An upgrade of WasmKeep itself, including one that changes the format of
 signed calls, upgrades every node together ([below](#upgrading-wasmkeep)).

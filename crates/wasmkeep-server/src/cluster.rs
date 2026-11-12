@@ -318,8 +318,9 @@ pub(crate) struct Cluster {
     /// never), and how often one is sent: for readiness.
     heartbeat_ok_ms: std::sync::atomic::AtomicU64,
     heartbeat_every: Duration,
-    /// Woken each time a heartbeat reaches the bucket: a call a peer
-    /// refused at the handshake waits for one (see [`Cluster::call`]).
+    /// Woken each time a heartbeat reaches the bucket: a call or a
+    /// WebSocket upgrade the peer never read waits for one before it is
+    /// sent again (see [`Cluster::call`]).
     heartbeat_landed: tokio::sync::Notify,
     /// Whether this process may use its node id: checked once at start,
     /// before its first heartbeat and before any lease (see
@@ -767,13 +768,20 @@ impl Cluster {
     /// it answers 101, joins the client's connection to it. The owner holds
     /// the socket; this node only relays bytes.
     ///
-    /// If the owner refuses this node's certificate at the handshake, the
-    /// upgrade is sent once more as [`Cluster::call`] sends a call again:
-    /// after this node's next heartbeat reached the bucket and two more
-    /// periods passed, the client waiting meanwhile; a 503 if that
-    /// heartbeat does not land within two periods, or if the second try
-    /// fails. Any other failure is a 503 at once: the owner may have read
-    /// the upgrade.
+    /// If the owner provably never read the upgrade
+    /// ([`never_read_by_peer`]: it refused this node's certificate at the
+    /// TLS handshake, or the HTTP client handed the upgrade back unsent on
+    /// a new TLS connection), the upgrade is sent once more as
+    /// [`Cluster::call`] sends a call again: after this node's next
+    /// heartbeat reached the bucket and two more periods passed, the
+    /// client waiting meanwhile; a 503 if that heartbeat does not land
+    /// within two periods, or if the second try fails. So a client whose
+    /// upgrade the owner keeps refusing waits up to four periods for its
+    /// 503 (two when the heartbeat does not land): `docs/cluster.md` says
+    /// why that is accepted. After any other failure the upgrade is not
+    /// sent again, and the 503 comes at once: no connection could be
+    /// opened, or the connection failed after the upgrade was written,
+    /// when the owner may have read it.
     pub(crate) async fn forward_upgrade(
         &self,
         owner: &str,
@@ -818,16 +826,19 @@ impl Cluster {
             let upgrade = self.clients().upgrade.clone();
             match tokio::time::timeout(FORWARD_TIMEOUT, upgrade.request(out)).await {
                 Ok(Ok(r)) => break (base, revocation, r),
-                // As for `actors.call` (`Cluster::call`): refused at the
-                // handshake, so never read by the owner. Sent once more
-                // when this node's heartbeat is live there again; a 503
-                // at once if that heartbeat does not land.
+                // As for `actors.call` (`Cluster::call`): never read by
+                // the owner, which refused the handshake, or whose new TLS
+                // connection gave the upgrade back unsent. Sent once more
+                // when this node's heartbeat is live there again; a 503,
+                // without a second try, if that heartbeat does not land
+                // within two periods.
                 Ok(Err(e)) if first && never_read_by_peer(&base, &e) => {
                     first = false;
                     tracing::info!(
                         owner,
-                        "an upgrade's handshake was refused (this node's heartbeat is not live \
-                         there); sending it again after the next heartbeat"
+                        "the owner did not read an upgrade (it refused the handshake, or the \
+                         new connection closed before the upgrade was written); sending it \
+                         again after this node's next heartbeat"
                     );
                     if !self.heartbeat_lands_then_two_periods().await {
                         return unavailable("the actor's node did not answer; retry\n");
@@ -1092,15 +1103,17 @@ impl Cluster {
     /// callee sees who called and cycles across nodes are still refused.
     ///
     /// If `owner` refuses this node's certificate at the handshake (its
-    /// view of this node's heartbeat lapsed), the call is sent once more,
+    /// view of this node's heartbeat lapsed), or the HTTP client hands the
+    /// call back unsent on a new TLS connection (the refusal can close it
+    /// before the call is written), the call is sent once more,
     /// newly signed, once this node's next heartbeat reached the bucket
     /// and two more periods passed (`owner` lists the heartbeats once a
     /// period, plus its listing's own latency). If that heartbeat does not
     /// land within two periods, the call fails without being sent again.
-    /// Safe: a refused handshake means `owner` never read the
-    /// request. Over TLS 1.3 the refusal usually arrives after the request
-    /// was written (this side's handshake was already done), so hyper
-    /// reports a send error and does not retry.
+    /// Safe: either way `owner` never read the request
+    /// ([`never_read_by_peer`]). Over TLS 1.3 the refusal usually arrives
+    /// after the request was written (this side's handshake was already
+    /// done), so hyper reports a send error and does not retry.
     pub(crate) async fn call(
         &self,
         owner: &str,
@@ -1119,8 +1132,9 @@ impl Cluster {
             Err(CallFailure::HandshakeRefused) => {
                 tracing::info!(
                     owner,
-                    "a call's handshake was refused (this node's heartbeat is not live there); \
-                     sending it again after the next heartbeat"
+                    "the owner did not read a call (it refused the handshake, or the new \
+                     connection closed before the call was written); sending it again after \
+                     this node's next heartbeat"
                 );
                 if !self.heartbeat_lands_then_two_periods().await {
                     return Err(CallFailure::HandshakeRefused.message(owner));
@@ -1534,9 +1548,10 @@ impl Cluster {
             // again here either. Of the three users of the peer clients,
             // `actors.call` (`Cluster::call`) and a WebSocket upgrade
             // (`Cluster::forward_upgrade`, which has no body) send again,
-            // once, a request the owner refused at the handshake
-            // (`never_read_by_peer`), and nothing else; this path answers
-            // 503 for all of them.
+            // once, a request the owner provably never read
+            // (`never_read_by_peer`: refused at the TLS handshake, or
+            // handed back unsent on a new TLS connection), and nothing
+            // else; this path answers 503 for all of them.
             Ok(Err(e)) => {
                 tracing::warn!(owner, error = %e, "forwarding failed");
                 unavailable("the actor's node did not answer; retry\n")
@@ -1553,12 +1568,28 @@ impl Cluster {
 }
 
 /// Whether a request to the peer at `base` failed in a way that proves the
-/// peer never read it, so that sending it again cannot run it twice: the
-/// peer refused the TLS handshake (the request may have been written, TLS
-/// 1.3 letting this side write before the refusal arrives, but a peer
-/// whose handshake failed decrypts nothing), or, over TLS, the client
-/// handed the request back before writing any of it, as it does when the
-/// refusal closes a new connection first.
+/// peer never read it, so that sending it again cannot run it twice. Two
+/// cases:
+///
+/// - The peer refused the TLS handshake
+///   ([`crate::cluster_tls::handshake_refused`]: one of a fixed list of
+///   fatal alerts arrived). The request may have been written, TLS 1.3
+///   letting this side write before the refusal arrives, but the peer did
+///   not read it: a rustls server sends those alerts only while it handles
+///   the ClientHello, the client's certificate or its CertificateVerify,
+///   states in which it passes no application data on. (It reads
+///   application data before its handshake is done only as early data,
+///   which the cluster listener leaves off, with resumption.) Once its
+///   handshake is done, it sends none of them. Checked in the source of
+///   rustls 0.23.46, the server's side of TLS 1.3, the only version
+///   between nodes; to check again when that dependency changes.
+/// - Over TLS, the HTTP client handed the request back before writing any
+///   of it ([`crate::cluster_tls::request_unsent`]) on a new connection
+///   (a request it gets back on a connection reused from the pool, it
+///   sends on another connection itself). A refusal that closes the
+///   connection before the write looks like this; so does any other close
+///   of a new connection before the write, which is as safe to send
+///   again.
 fn never_read_by_peer(base: &str, error: &hyper_util::client::legacy::Error) -> bool {
     crate::cluster_tls::handshake_refused(error)
         || (base.starts_with("https://") && crate::cluster_tls::request_unsent(error))
@@ -1567,8 +1598,9 @@ fn never_read_by_peer(base: &str, error: &hyper_util::client::legacy::Error) -> 
 /// Why a call to another node failed.
 #[derive(Debug)]
 enum CallFailure {
-    /// The node refused this node's certificate at the handshake: it never
-    /// read the request.
+    /// The node never read the request ([`never_read_by_peer`]): it
+    /// refused this node's certificate at the handshake, or its new TLS
+    /// connection gave the request back unsent, as a refusal can.
     HandshakeRefused,
     Other(String),
 }

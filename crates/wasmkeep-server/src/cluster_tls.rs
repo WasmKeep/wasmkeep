@@ -411,7 +411,9 @@ pub(crate) struct PeerPin(pub(crate) Pin32);
 /// Whether the peer refused the TLS handshake (a fatal alert it sends only
 /// while its handshake runs, as when it does not trust this node's
 /// certificate): then it never read a request sent on that connection,
-/// even though TLS 1.3 let this side write one first.
+/// even though TLS 1.3 let this side write one first. Why these alerts
+/// mean the handshake, and for which version of rustls that was checked:
+/// `never_read_by_peer` in `cluster.rs`.
 pub(crate) fn handshake_refused(error: &(dyn std::error::Error + 'static)) -> bool {
     use rustls::AlertDescription as A;
     let mut source = Some(error);
