@@ -328,12 +328,16 @@ Each actor's database follows it from node to node (ADR 0007):
   overdue by more than a lease period plus grace, so an alarm whose node
   died still fires ([ADR 0009](adr/0009-alarms-in-a-cluster.md)).
 - When a node rebuilds a database from the bucket, the local file it
-  replaces is kept as `<name>.db.replaced` (one generation), never deleted.
+  replaces is kept as `<name>.db.replaced` rather than deleted. Only
+  one generation is kept: a second replacement of the same actor's file
+  overwrites the first `.replaced` copy.
 
 **Joining a cluster with existing data:** the first node to touch an actor
 decides its history when the bucket is empty. Start the node that holds the
 existing databases first, and let it serve each actor once, before adding
-nodes. A database replaced by mistake can be recovered from `.replaced`.
+nodes. A database replaced by mistake can be recovered from `.replaced`,
+until a later replacement of that actor's file overwrites it, so copy it
+elsewhere before then.
 
 ## Try it locally
 
