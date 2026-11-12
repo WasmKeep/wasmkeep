@@ -6,6 +6,7 @@
 - Amended by [ADR 0020](0020-one-lease-per-node.md) (2026-11-07): node
   leases, ownership records and the `leases/` markers are lease state,
   never collected (see "Not collected here").
+- Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): history collection walks the app's root, `state/<tenant>/<app>/`.
 - Date: 2026-11-05
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 

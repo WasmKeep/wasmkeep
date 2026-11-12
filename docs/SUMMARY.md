@@ -60,3 +60,4 @@
 - [0019 Workflows as an SDK pattern](adr/0019-workflows-as-an-sdk-pattern.md)
 - [0020 One lease per node](adr/0020-one-lease-per-node.md)
 - [0021 The app model](adr/0021-the-app-model.md)
+- [0022 App-owned state and the one-time migration](adr/0022-app-owned-state-and-the-one-time-migration.md)

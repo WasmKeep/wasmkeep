@@ -10,6 +10,7 @@
   - no node-local floor;
   - three value layers, and a follower of its own;
   - recovery from a lost key.
+- Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): an app's actor state is a second prefix, `state/<tenant>/<app>/`; secrets do not move.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster)
 
