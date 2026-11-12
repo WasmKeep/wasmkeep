@@ -31,8 +31,8 @@ x-node: &node
   depends_on:
     - minio
   restart: unless-stopped
-  # A clean stop can take about 25 s (in-flight requests, queued events,
-  # handover); the default 10 s would turn it into a crash.
+  # A clean stop can take about 29 s (in-flight requests, queued events,
+  # handover, the node's lease); the default 10 s would turn it into a crash.
   stop_grace_period: 30s
   # Three open files per resident actor (docs/deploy/where-to-run.md).
   ulimits:

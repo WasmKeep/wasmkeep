@@ -30,10 +30,12 @@ On `SIGTERM` or Ctrl-C a node:
 2. lets requests under way finish, for up to 10 s;
 3. closes its WebSockets with code 1012;
 4. lets each actor finish its queued events, for up to 10 s, and gives
-   each actor up;
-5. writes its own lease `released`.
+   each actor up, waiting up to 3 s for those releases to reach the
+   bucket;
+5. writes its own lease `released`, within about 6 s.
 
-The whole stop takes up to about 25 s. An actor is free as soon as it is
+Each wait ends as soon as its work is done. Together they bound the
+whole stop at about 29 s. An actor is free as soon as it is
 given up: its next request starts it on another node at once, after that
 node has rebuilt the database from the bucket (unless its local copy is
 already current). Clients whose socket closed with 1012 open it again and

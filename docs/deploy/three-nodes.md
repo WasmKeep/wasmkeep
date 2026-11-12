@@ -245,9 +245,10 @@ it exits with 1 if no node is live. See
   a peer fences its heartbeat (15 to about 21 s after its last write) and
   a restore, and their alarms arrive
   later still ([measured](../benchmarks.md#three-nodes-against-a-real-bucket)).
-- **Stop timeouts**: a clean stop can take up to about 25 s (10 s for
-  in-flight requests, 10 s for actors to finish their queued events, a few
-  seconds for the handover). Allow 30 s: `TimeoutStopSec=30` in systemd,
+- **Stop timeouts**: a clean stop can take up to about 29 s (10 s for
+  in-flight requests, 10 s for actors to finish their queued events, 3 s
+  for the handover to reach the bucket, about 6 s for the node to release
+  its own lease). Allow 30 s: `TimeoutStopSec=30` in systemd,
   `--stop-timeout 30` for Docker (its default is 10 s),
   `terminationGracePeriodSeconds: 30` in Kubernetes. A node killed earlier
   is treated as a crash, which is safe, only slower.

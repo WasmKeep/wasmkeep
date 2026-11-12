@@ -745,7 +745,7 @@ the last stop and the first start, so plan a short window.
 1. `wasmkeep cluster status --bucket ...`: note the nodes it lists as live.
 2. Stop every node cleanly (`systemctl stop wasmkeep`, `SIGTERM`). Each
    finishes its requests and releases its actors; a clean stop takes up to
-   about 25 s.
+   about 29 s.
 3. Wait until `cluster status` exits with 1 (no live node), about 10 s after
    the last stop. A node still listed as live is still running the old
    binary: stop it first. This check does not depend on version strings.
