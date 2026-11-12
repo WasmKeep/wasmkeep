@@ -147,8 +147,12 @@ async fn a_hung_periodic_snapshot_holds_the_actor_for_one_short_attempt() {
     // The write the snapshot was due after, and the one behind it.
     write(&p, "hung", written + 1).await;
     let held = started.elapsed();
-    assert!(held < Duration::from_secs(10), "held for {held:?}");
-    // No event tries again at once, write or read.
+    // One attempt of 6 s and two writes: well under the 21 s it used to
+    // be sent again for (which no write here waits out: 15 s each), with
+    // room for a machine that takes seconds over the writes.
+    assert!(held < Duration::from_secs(15), "held for {held:?}");
+    // No event tries again at once, write or read: one that did would be
+    // held for the 6 s of an attempt.
     let started = std::time::Instant::now();
     for i in 2..=4 {
         write(&p, "hung", written + i).await;
@@ -156,7 +160,7 @@ async fn a_hung_periodic_snapshot_holds_the_actor_for_one_short_attempt() {
     let r = send(p.a.addr, "GET", "/actor/t/hung/durable", "").await;
     assert_eq!(r.status, 200, "{}", r.body);
     let free = started.elapsed();
-    assert!(free < Duration::from_secs(3), "held again: {free:?}");
+    assert!(free < Duration::from_secs(5), "held again: {free:?}");
     assert_eq!(
         hung.load(Ordering::SeqCst),
         u32::MAX - 1,
@@ -176,13 +180,16 @@ async fn a_hung_periodic_snapshot_holds_the_actor_for_one_short_attempt() {
 /// second snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_periodic_snapshot_is_tried_again_later() {
-    const WAIT: Duration = Duration::from_secs(5);
+    // Long next to the five writes and 300 ms that must fit inside it
+    // (a third of a second on an idle machine).
+    const WAIT: Duration = Duration::from_secs(10);
     let p = pair_waiting(NO_HIBERNATION, WAIT).await;
     write(&p, "x", 1).await;
     let failures = snapshot_upload_failures().await;
     // One upload fails; a try after it would succeed, and show.
     p.flaky.fail_snapshot_puts.store(1, Ordering::SeqCst);
     let (mut written, not_before) = write_until_met(&p, "x", &p.flaky.fail_snapshot_puts).await;
+    // The wait runs from the start of the try, which has started.
     let not_after = std::time::Instant::now();
     // More writes: whichever write the snapshot failed after, events
     // have ended since and a segment was uploaded, so only the minimum
@@ -255,7 +262,10 @@ async fn hibernated(p: &Pair) {
 /// are still waited for after another hibernation.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_snapshots_wait_outlives_hibernation() {
-    const WAIT: Duration = Duration::from_secs(8);
+    // Long next to what must fit inside it: a write, the second of idle
+    // time before the actor is dropped, and a wake (1.6 s on an idle
+    // machine, most of it those fixed waits).
+    const WAIT: Duration = Duration::from_secs(16);
     let p = pair_waiting(Duration::from_secs(1), WAIT).await;
     let read = async || {
         let r = send(p.a.addr, "GET", "/actor/t/x/durable", "").await;
@@ -293,12 +303,14 @@ async fn a_failed_snapshots_wait_outlives_hibernation() {
     tokio::time::sleep((WAIT + Duration::from_millis(200)).saturating_sub(not_after.elapsed()))
         .await;
     assert_eq!(tries(), 1, "no event, no try");
-    let second = std::time::Instant::now();
     read().await;
     eventually("a wake after the wait tries again", async || tries() == 2).await;
+    // The second wait runs from the start of that try: no later than now.
+    let second = std::time::Instant::now();
 
     // The third try waits for 8 more segments, however long the actor
-    // sleeps and however often it wakes meanwhile.
+    // sleeps and however often it wakes meanwhile: its minimum time has
+    // passed before the next wake, so only the segments hold it back.
     hibernated(&p).await;
     tokio::time::sleep((WAIT + Duration::from_millis(500)).saturating_sub(second.elapsed())).await;
     read().await;
@@ -324,14 +336,15 @@ async fn a_failed_snapshots_wait_outlives_hibernation() {
 /// node restores every acknowledged write.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_upload_given_up_that_lands_later_loses_nothing() {
-    // Longer than the 8 s the upload takes to land, so the late snapshot
-    // is there before the next try; the actor never hibernates.
-    const WAIT: Duration = Duration::from_secs(12);
+    // Much longer than the 8 s the upload takes to land, so the late
+    // snapshot is there, and three more writes are answered, well before
+    // the next try (12 s to spare); the actor never hibernates.
+    const WAIT: Duration = Duration::from_secs(20);
     let p = pair_waiting(NO_HIBERNATION, WAIT).await;
     write(&p, "x", 1).await;
     let failures = snapshot_upload_failures().await;
     p.flaky.late_snapshot_puts.store(1, Ordering::SeqCst);
-    let (mut written, _) = write_until_met(&p, "x", &p.flaky.late_snapshot_puts).await;
+    let (mut written, not_before) = write_until_met(&p, "x", &p.flaky.late_snapshot_puts).await;
     // Answered once the attempt is given up (6 s), before it lands (8 s).
     written += 1;
     write(&p, "x", written).await;
@@ -352,7 +365,12 @@ async fn a_snapshot_upload_given_up_that_lands_later_loses_nothing() {
         written += 1;
         write(&p, "x", written).await;
     }
-    assert_eq!(snapshots_of(&p, "x").await.len(), 2, "not tried yet");
+    let snapshots = snapshots_of(&p, "x").await.len();
+    assert!(
+        not_before.elapsed() < WAIT,
+        "too slow to tell: the wait had passed before the check"
+    );
+    assert_eq!(snapshots, 2, "not tried yet");
     // The try started before it was given up: the wait has passed by then.
     tokio::time::sleep(WAIT.saturating_sub(given_up.elapsed())).await;
     written += 1;

@@ -2347,23 +2347,35 @@ mod tests {
     async fn a_failed_periodic_snapshot_waits_a_minimum_time_too() {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, store) = faulty(dir.path(), 0, 0).await;
-        r.snapshot_retry_min = std::time::Duration::from_millis(300);
+        // An hour: no machine is slow enough for it to pass between the
+        // try and the check after it. The test does not wait for it: it
+        // moves the end of the wait instead.
+        let min = std::time::Duration::from_secs(3600);
+        let soon = std::time::Duration::from_millis(50);
+        r.snapshot_retry_min = min;
         store
             .fail_next
             .store(1, std::sync::atomic::Ordering::SeqCst);
         let all = changes(DbChecksum::from_value(7));
         r.since_snapshot = SNAPSHOT_EVERY;
+        let before = tokio::time::Instant::now();
         assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
         r.since_snapshot += 10; // a busy actor
         assert!(!r.snapshot_due(), "the segments alone are not enough");
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(
+            r.snapshot_retry_after >= before + min,
+            "the whole minimum, from the try"
+        );
+        // Due once the clock is past the end of the wait.
+        r.snapshot_retry_after = tokio::time::Instant::now() + soon;
+        tokio::time::sleep(soon).await;
         assert!(r.snapshot_due());
         // And the time alone is not enough either.
         store
             .fail_next
             .store(1, std::sync::atomic::Ordering::SeqCst);
         assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        r.snapshot_retry_after = tokio::time::Instant::now();
         assert!(!r.snapshot_due(), "no segment since: an idle actor waits");
     }
 
