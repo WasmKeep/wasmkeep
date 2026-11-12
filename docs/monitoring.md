@@ -131,6 +131,7 @@ class names, event kinds and fixed reasons, never actor names.
 | `wasmkeep_failovers_total` | counter | Actors this node took over whose ownership record still named another node, freed because that node was fenced, released or replaced by a new process. See below. |
 | `wasmkeep_history_collected_total` | counter | Objects of actors' history deleted from the bucket by garbage collection ([ADR 0012](adr/0012-bucket-garbage-collection.md)). |
 | `wasmkeep_history_collect_failures_total` | counter | Garbage-collection passes that failed (a bucket error); the next snapshot tries again. Steadily rising: the bucket refuses deletes. |
+| `wasmkeep_snapshot_upload_failures_total` | counter | Snapshot uploads that failed: every attempt of one, or its deadline (an attempt is given up after 5 s plus a second per megabyte of the database and sent again, the next one after twice that, three at most, the whole upload within 20 s plus that second per megabyte). A periodic snapshot that fails loses nothing and fails no event: the writes already uploaded are the history, and it is tried again by the actor's next event, then after one more write, two, four, up to 64 while it keeps failing. Until one succeeds, a restore of that actor replays more writes. The snapshot after a delete counts here and in `wasmkeep_history_collect_failures_total`; an actor's first snapshot counts here, and its event fails. Steadily rising: the bucket refuses or stalls large uploads. |
 
 Not there yet: per-tenant labels (one tenant per process until
 multi-tenancy), traps by reason (`wasmkeep_events_total{outcome="failed"}`
@@ -176,7 +177,8 @@ should stay near zero.
 every metric above except `wasmkeep_classes`, the guest log counters
 (`wasmkeep_guest_log_lines_total`, `wasmkeep_guest_log_dropped_total`),
 the history collection counters (`wasmkeep_history_collected_total`,
-`wasmkeep_history_collect_failures_total`), the listing and restore-read
+`wasmkeep_history_collect_failures_total`),
+`wasmkeep_snapshot_upload_failures_total`, the listing and restore-read
 histograms (`wasmkeep_listing_seconds`, `wasmkeep_restore_read_seconds`),
 the node lease write and fence counters (`wasmkeep_node_lease_writes_total`,
 `wasmkeep_node_fences_total`) and `wasmkeep_requests_abandoned_total`. To

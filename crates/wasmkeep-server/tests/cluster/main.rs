@@ -45,6 +45,8 @@ mod node_leases;
 mod routing;
 #[path = "signed_calls.rs"]
 mod signed_calls;
+#[path = "snapshots.rs"]
+mod snapshots;
 #[path = "websockets.rs"]
 mod websockets;
 
@@ -529,6 +531,12 @@ struct Flaky {
     hang_wal_puts: Arc<std::sync::atomic::AtomicU32>,
     /// The next this-many `released` writes of a node lease fail.
     fail_released: Arc<std::sync::atomic::AtomicU32>,
+    /// The next this-many snapshot (`/snapshot/`) uploads never answer and
+    /// are not applied.
+    hang_snapshot_puts: Arc<std::sync::atomic::AtomicU32>,
+    /// The next this-many snapshot (`/snapshot/`) uploads fail at once,
+    /// not applied.
+    fail_snapshot_puts: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Flaky {
@@ -542,6 +550,8 @@ impl Flaky {
             fail_owner_puts: Arc::default(),
             hang_wal_puts: Arc::default(),
             fail_released: Arc::default(),
+            hang_snapshot_puts: Arc::default(),
+            fail_snapshot_puts: Arc::default(),
             inner,
             down,
             fail_wal: Arc::default(),
@@ -640,6 +650,25 @@ impl ObjectStore for Flaky {
                 .is_ok()
         {
             std::future::pending::<()>().await;
+        }
+        if location.as_ref().contains("/snapshot/") {
+            if self
+                .hang_snapshot_puts
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                std::future::pending::<()>().await;
+            }
+            if self
+                .fail_snapshot_puts
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(object_store::Error::Generic {
+                    store: "flaky",
+                    source: "snapshot upload failed".into(),
+                });
+            }
         }
         if location.as_ref().contains("/wal/") {
             let delay = self.delay_wal_ms.load(Ordering::SeqCst);

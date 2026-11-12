@@ -10,7 +10,10 @@
 //!
 //! Snapshots record the positions they hold, and are taken as the server
 //! takes them (every `SNAPSHOT_EVERY` segments, counted from the restore, so
-//! possibly right after a restore at the previous owner's head). With
+//! possibly right after a restore at the previous owner's head; one whose
+//! upload failed is tried again after the next segment, then after two
+//! more, four, so a snapshot can land late next to the one that retried
+//! it). With
 //! collection on, owners delete history by ADR 0012's rule
 //! (`collectable`) after their own acknowledged snapshots, through a client
 //! whose deletes can time out and land late.
@@ -186,13 +189,16 @@ fn trace(msg: &str) {
 }
 
 /// What one owner knows: its hold, the database head it has, every
-/// position its database holds, and the segments since its last snapshot
-/// (counted from the restore, as the server does).
+/// position its database holds, the segments since its last snapshot
+/// (counted from the restore, as the server does), and when a snapshot
+/// that failed is tried again (the server's `Replica::snapshot_due`).
 struct Owner {
     held: Held,
     head: SegmentId,
     held_positions: BTreeSet<SegmentId>,
     since_snapshot: u64,
+    snapshot_failures: u32,
+    snapshot_retry_at: u64,
 }
 
 type Node = LeaseNode<EpBucket, NodeClock>;
@@ -222,19 +228,38 @@ async fn snapshot_and_collect(
     rules: Rules,
     o: &mut Owner,
 ) {
-    if o.since_snapshot < SNAPSHOT_EVERY || o.held_positions.is_empty() {
+    if o.since_snapshot < SNAPSHOT_EVERY.max(o.snapshot_retry_at) || o.held_positions.is_empty() {
         return;
     }
-    // Reset before trying, as the server does: a failed snapshot is
-    // retried only after another full interval.
-    o.since_snapshot = 0;
     let at = o.head;
     let key = format!("{PREFIX}{}", snapshot_key(at));
     // Created and acknowledged (ADR 0012, condition 1), or no collection.
     let created = bucket
         .create(&key, encode_positions(&o.held_positions))
-        .await
-        .is_ok();
+        .await;
+    match created {
+        // There (already, for a conflict: an earlier try landed late):
+        // the count starts again, as the server's does.
+        Ok(_) | Err(wasmkeep_cluster::lease::BucketError::Conflict) => {
+            o.since_snapshot = 0;
+            o.snapshot_failures = 0;
+            o.snapshot_retry_at = 0;
+        }
+        // Failed, or unanswered and perhaps landing later: the count
+        // stays, and the next try comes after the next segment, then
+        // after one more, two, four, up to the interval.
+        Err(_) => {
+            let wait = match o.snapshot_failures {
+                0 => 0,
+                n => 1u64
+                    .checked_shl(n - 1)
+                    .map_or(SNAPSHOT_EVERY, |w| w.min(SNAPSHOT_EVERY)),
+            };
+            o.snapshot_failures += 1;
+            o.snapshot_retry_at = o.since_snapshot + wait;
+        }
+    }
+    let created = created.is_ok();
     if !created || !node.may_act(&o.held) || rules.collect == Collect::Off {
         return;
     }
@@ -316,6 +341,8 @@ async fn run_node(
                         head: plan.head(),
                         held_positions: positions,
                         since_snapshot: u64::try_from(plan.segments.len()).unwrap(),
+                        snapshot_failures: 0,
+                        snapshot_retry_at: 0,
                     };
                     // As after the server's first event: a snapshot is due
                     // if enough segments were restored, at the restored

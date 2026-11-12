@@ -567,8 +567,9 @@ of the same history:
   the prefix keeps every segment and snapshot.
 - **Without periodic snapshots** (removed from the copy, the first kept):
   every segment is replayed. This is what an actor whose periodic
-  snapshots kept failing would leave (a failed one is logged and retried
-  64 segments later).
+  snapshots kept failing would leave (a failed one is counted and tried
+  again by the next event, then less and less often, down to once every
+  64 segments).
 - **After garbage collection** ([ADR 0012](adr/0012-bucket-garbage-collection.md)):
   what the server's rule (`collectable`) leaves after the last periodic
   snapshot once the retention window has passed: that snapshot, the
