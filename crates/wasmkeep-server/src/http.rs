@@ -167,7 +167,7 @@ impl HttpComponent {
         let req = store
             .data_mut()
             .http()
-            .new_incoming_request(Scheme::Http, req.map(CappedBody::new))?;
+            .new_incoming_request(Scheme::Http, CappedBody::of(req))?;
         let out = store.data_mut().http().new_response_outparam(sender)?;
         let pre = self.pre.clone();
 
@@ -393,9 +393,16 @@ const UNREAD_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// So what is left is read and discarded once the body is dropped: up to
 /// the same cap, for at most [`UNREAD_BODY_TIMEOUT`]. A body that failed
 /// or went over the cap is not read further.
+///
+/// Nor is one whose sender waits for `100 Continue` and was never asked
+/// for it: hyper sends the 100 when the body is first read, so reading it
+/// here would make a client send a body nobody wants. Left alone, that
+/// client gets the answer without the 100 and sends nothing.
 pub(crate) struct CappedBody {
     inner: Option<UnsyncBoxBody<Bytes, wasmtime_wasi_http::Error>>,
     left: u64,
+    /// The sender waits for `100 Continue`, and nothing has read the body.
+    awaits_continue: bool,
 }
 
 impl CappedBody {
@@ -407,7 +414,28 @@ impl CappedBody {
         Self {
             inner: Some(inner.map_err(Into::into).boxed_unsync()),
             left: MAX_BODY_BYTES,
+            awaits_continue: false,
         }
+    }
+
+    /// `req` with its body capped.
+    pub(crate) fn of<B>(req: Request<B>) -> Request<Self>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<wasmtime_wasi_http::Error>,
+    {
+        // When hyper holds the body back until it is read (it does not
+        // for HTTP/1.0).
+        let awaits_continue = req.version() > hyper::Version::HTTP_10
+            && req
+                .headers()
+                .get(hyper::header::EXPECT)
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+        req.map(|body| {
+            let mut body = Self::new(body);
+            body.awaits_continue = awaits_continue;
+            body
+        })
     }
 }
 
@@ -420,6 +448,7 @@ impl hyper::body::Body for CappedBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         use std::task::Poll;
+        self.awaits_continue = false;
         let Some(inner) = self.inner.as_mut() else {
             return Poll::Ready(None);
         };
@@ -466,7 +495,7 @@ impl Drop for CappedBody {
         let Some(mut inner) = self.inner.take() else {
             return;
         };
-        if hyper::body::Body::is_end_stream(&inner) {
+        if self.awaits_continue || hyper::body::Body::is_end_stream(&inner) {
             return;
         }
         // Outside a runtime nothing can read on: the connection closes as
@@ -1063,6 +1092,47 @@ mod tests {
         assert!(body.frame().await.unwrap().is_ok());
         drop(body);
         assert_eq!(read_in_the_end(read).await, 3 * 1024);
+    }
+
+    /// A request (`expect`: its `Expect` header), its body capped, and the bytes read
+    /// from that body so far.
+    fn capped_request(
+        version: hyper::Version,
+        expect: Option<&str>,
+    ) -> (CappedBody, Arc<std::sync::atomic::AtomicU64>) {
+        let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut req = Request::new(Frames {
+            frames: [Ok(1024), Ok(1024)].into(),
+            read: Arc::clone(&read),
+        });
+        *req.version_mut() = version;
+        if let Some(expect) = expect {
+            req.headers_mut()
+                .insert(hyper::header::EXPECT, expect.parse().unwrap());
+        }
+        (CappedBody::of(req).into_body(), read)
+    }
+
+    #[tokio::test]
+    async fn a_body_waiting_for_100_continue_is_not_asked_for_when_dropped() {
+        let v11 = hyper::Version::HTTP_11;
+        let (body, read) = capped_request(v11, Some("100-Continue"));
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 0);
+
+        // Once the handler read from it, the sender was told to go on.
+        let (mut body, read) = capped_request(v11, Some("100-continue"));
+        assert!(body.frame().await.unwrap().is_ok());
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 2 * 1024);
+
+        // Nobody waits without the header, or in HTTP/1.0.
+        let (body, read) = capped_request(v11, None);
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 2 * 1024);
+        let (body, read) = capped_request(hyper::Version::HTTP_10, Some("100-continue"));
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 2 * 1024);
     }
 
     #[tokio::test]

@@ -197,7 +197,9 @@ actor of the same tenant and waits for the answer.
   read past it otherwise). Calls between actors cap both ways. A handler
   may answer without reading the body: the server reads and discards what
   is left (up to the cap, for at most 30 s), so the client can finish
-  sending it and read the answer.
+  sending it and read the answer. A client that sent
+  `Expect: 100-continue` to the actor's own node gets the answer without
+  the 100, and sends nothing.
 
 ## WebSockets
 

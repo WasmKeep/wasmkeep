@@ -599,3 +599,51 @@ async fn a_large_body_the_handler_reads_arrives_whole() {
         }
     }
 }
+
+/// A client that sent `Expect: 100-continue` is waiting to be told whether
+/// to send its body. A handler that answers without reading the body must
+/// not have the server ask for it: the answer comes alone. Through the
+/// other node, which asks for the body as it forwards the request, the
+/// client sends it and still gets the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expected_body_the_handler_does_not_read_is_not_asked_for() {
+    let p = x_on_a_y_on_b().await;
+    let len = 4 << 20;
+    let head = format!(
+        "POST /actor/t/x/durable HTTP/1.1\r\nHost: t\r\nContent-Length: {len}\r\n\
+         Expect: 100-continue\r\nConnection: close\r\n\r\n"
+    );
+    let mut durable: u64 = send(p.a.addr, "GET", "/actor/t/x/durable", "")
+        .await
+        .body
+        .trim()
+        .parse()
+        .unwrap();
+
+    for _ in 0..5 {
+        let mut stream = TcpStream::connect(p.a.addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        durable += 1;
+        assert!(raw.starts_with("HTTP/1.1 200 "), "{raw:?}");
+        assert!(raw.contains(&format!("\r\n{durable}\n\r\n")), "{raw:?}");
+    }
+
+    for _ in 0..5 {
+        let mut stream = TcpStream::connect(p.b.addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut interim = [0u8; 25];
+        stream.read_exact(&mut interim).await.unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        stream.write_all(&vec![b'x'; len]).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        durable += 1;
+        assert!(raw.starts_with("HTTP/1.1 200 "), "{raw:?}");
+        assert!(raw.contains("x-wasmkeep-node: a\r\n"), "{raw:?}");
+        assert!(raw.contains(&format!("\r\n{durable}\n\r\n")), "{raw:?}");
+    }
+    let r = send(p.a.addr, "GET", "/actor/t/x/durable", "").await;
+    assert_eq!(r.body.trim(), durable.to_string());
+}
