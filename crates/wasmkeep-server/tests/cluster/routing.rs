@@ -498,3 +498,118 @@ async fn a_request_abandoned_while_queued_is_not_run() {
         "{page}"
     );
 }
+
+/// Node a behind a proxy the test controls, owning actor `x`, and node b
+/// holding one pooled connection to it for forwarded requests.
+async fn b_with_a_pooled_connection_to_a() -> (Node, Node, PeerProxy, [tempfile::TempDir; 2]) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let (a, proxy) = node_behind_proxy("a", dirs[0].path(), &store, "t", test_actor_wasm()).await;
+    let b = node_with(
+        "b",
+        dirs[1].path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    settle().await;
+    assert_eq!(
+        send(a.addr, "GET", "/actor/t/x/slept", "").await.status,
+        200
+    );
+    let r = send_reachable(b.addr, "GET", "/actor/t/x/slept", "").await;
+    assert_eq!((r.status, r.node.as_deref()), (200, Some("a")));
+    pooled().await;
+    (a, b, proxy, dirs)
+}
+
+/// The owner closes a connection it kept idle (its own idle limit, or a
+/// restart) while the forwarding node still has it in its pool. The
+/// forwarding node's client sees the close before it writes anything, so
+/// the next request goes out on a new connection and the client never
+/// notices: no 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_after_the_owner_closed_the_idle_connection_goes_on_a_new_one() {
+    let (_a, b, proxy, _dirs) = b_with_a_pooled_connection_to_a().await;
+    for round in 1..=3 {
+        let before = proxy.accepted.load(Ordering::SeqCst);
+        proxy.close_connections();
+        // The close reaches b before the request does.
+        pooled().await;
+        let r = send(b.addr, "GET", "/actor/t/x/slept", "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref(), r.body.trim()),
+            (200, Some("a"), "0"),
+            "round {round}"
+        );
+        assert_eq!(
+            proxy.accepted.load(Ordering::SeqCst),
+            before + 1,
+            "round {round}: one new connection"
+        );
+        pooled().await;
+    }
+}
+
+/// A request written into a connection that then closes without an answer
+/// is not sent again: the forwarding node cannot tell an owner that never
+/// read it from one that ran it and lost the connection (its client
+/// reports the same error for both), and an event must not run twice. The
+/// client gets a 503 with `Retry-After` and decides. Here the request is
+/// first lost on the way (the event does not run), then delivered with its
+/// answer lost (the event runs exactly once); the same for `actors.call`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_written_before_its_connection_closed_is_not_sent_again() {
+    let (a, b, proxy, _dirs) = b_with_a_pooled_connection_to_a().await;
+    let slept = async || {
+        // Longer than the event, which outlives its lost answer.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let r = send(a.addr, "GET", "/actor/t/x/slept", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.body.trim().to_owned()
+    };
+    let unanswered = |r: &Reply| {
+        assert_eq!(
+            (r.status, r.body.trim(), r.retry_after.as_deref()),
+            (503, "the actor's node did not answer; retry", Some("1"))
+        );
+    };
+
+    // Lost before the owner read it.
+    let before = proxy.accepted.load(Ordering::SeqCst);
+    proxy.swallow_next_request();
+    let r = send(b.addr, "POST", "/actor/t/x/sleep?ms=100", "").await;
+    unanswered(&r);
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), before, "sent once");
+    assert_eq!(slept().await, "0");
+
+    // Read by the owner, the answer lost.
+    let r = send(b.addr, "POST", "/actor/t/x/sleep?ms=100", "").await;
+    assert_eq!(
+        (r.status, r.body.trim()),
+        (200, "slept"),
+        "a new connection"
+    );
+    pooled().await;
+    let before = proxy.accepted.load(Ordering::SeqCst);
+    proxy.cut_next_answer();
+    let r = send(b.addr, "POST", "/actor/t/x/sleep?ms=100", "").await;
+    unanswered(&r);
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), before, "sent once");
+    assert_eq!(slept().await, "2", "the event ran once, not twice");
+
+    // `actors.call` from an actor on b: the same rule.
+    let call = "/actor/t/local/call?to=t/x&path=%2Fsleep%3Fms%3D100";
+    let r = send_reachable(b.addr, "POST", call, "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "200:slept"));
+    pooled().await;
+    let before = proxy.accepted.load(Ordering::SeqCst);
+    proxy.cut_next_answer();
+    let r = send(b.addr, "POST", call, "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.starts_with("failed:node a: "), "{}", r.body);
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), before, "sent once");
+    assert_eq!(slept().await, "4", "the callee ran once, not twice");
+}

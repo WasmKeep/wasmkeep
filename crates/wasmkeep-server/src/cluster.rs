@@ -410,8 +410,12 @@ struct Clients {
 /// How long a connection to a peer may wait idle in a client's pool. Below
 /// the port's own idle limit ([`crate::http::ServeLimits`]'s
 /// `header_read_timeout`, 30 s), so the pool drops a connection before the
-/// peer closes it: a request written into a connection the peer is closing
-/// fails with `SendRequest`, and is not retried.
+/// peer closes it. A connection the peer closed while it waited in the
+/// pool costs nothing: the client sees the close before it writes, and
+/// sends on another connection. A request written just as the peer closes
+/// fails with `SendRequest`, exactly as one the peer read before the
+/// connection was lost: the client cannot tell the two apart, so neither
+/// is sent again (the second could run an event twice).
 pub(crate) const PEER_POOL_IDLE: Duration = Duration::from_secs(20);
 
 /// The builder of every client a node uses to reach its peers.
@@ -1494,6 +1498,10 @@ impl Cluster {
                 tracing::warn!(owner, "forwarding: the node is no longer trusted");
                 unavailable("the actor's node is no longer trusted; retry\n")
             }),
+            // Not sent again: the owner may have read the request before
+            // the connection failed. What it provably never read (a
+            // pooled connection found closed), the client already sent on
+            // another connection.
             Ok(Err(e)) => {
                 tracing::warn!(owner, error = %e, "forwarding failed");
                 unavailable("the actor's node did not answer; retry\n")

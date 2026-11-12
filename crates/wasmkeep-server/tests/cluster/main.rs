@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -183,7 +183,19 @@ async fn node_counting_peers(
     class: &str,
     wasm: &[u8],
 ) -> (Node, Arc<AtomicUsize>) {
-    let (node, accepted) = start_node(
+    let (node, proxy) = node_behind_proxy(id, data, store, class, wasm).await;
+    (node, proxy.accepted)
+}
+
+/// Like `node_with`, with other nodes reaching it through a [`PeerProxy`].
+async fn node_behind_proxy(
+    id: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    class: &str,
+    wasm: &[u8],
+) -> (Node, PeerProxy) {
+    let (node, proxy) = start_node(
         id,
         data,
         store,
@@ -196,27 +208,118 @@ async fn node_counting_peers(
         true,
     )
     .await;
-    (node, accepted.unwrap())
+    (node, proxy.unwrap())
 }
 
-/// Listens on a fresh port and pipes every connection to `target`;
-/// returns the port and how many connections it accepted.
-async fn counting_proxy(target: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+/// What a [`PeerProxy`] does with the next bytes a peer sends on a
+/// connection (one request of a forwarding node, or part of one).
+const PROXY_PASS: u8 = 0;
+/// Closes the connection without passing them on: the node behind never
+/// sees the request.
+const PROXY_SWALLOW: u8 = 1;
+/// Passes them on, then closes the peer's side: the node behind runs the
+/// request, and its answer is lost.
+const PROXY_CUT_ANSWER: u8 = 2;
+
+/// A TCP proxy in front of a node's port for its peers, which the test
+/// controls. It never reads what it carries, so it works over TLS too.
+struct PeerProxy {
+    /// How many connections it accepted (over TLS, each one a handshake).
+    accepted: Arc<AtomicUsize>,
+    /// What happens to the next bytes a peer sends: one of the `PROXY_`
+    /// constants, back to [`PROXY_PASS`] once it happened.
+    next: Arc<AtomicU8>,
+    /// Bumped to close every connection open now.
+    close: tokio::sync::watch::Sender<u64>,
+}
+
+impl PeerProxy {
+    /// Closes every connection open now, both sides, as the node behind
+    /// does to one it kept idle too long.
+    fn close_connections(&self) {
+        self.close.send_modify(|n| *n += 1);
+    }
+
+    /// The next bytes a peer sends are dropped and their connection closed.
+    fn swallow_next_request(&self) {
+        self.next.store(PROXY_SWALLOW, Ordering::SeqCst);
+    }
+
+    /// The next bytes a peer sends reach the node; the peer's side of the
+    /// connection is closed before the answer.
+    fn cut_next_answer(&self) {
+        self.next.store(PROXY_CUT_ANSWER, Ordering::SeqCst);
+    }
+}
+
+/// Listens on a fresh port and pipes every connection to `target`.
+async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
-    let count = Arc::clone(&accepted);
+    let next = Arc::new(AtomicU8::new(PROXY_PASS));
+    let (close, closed) = tokio::sync::watch::channel(0u64);
+    let (count, mode) = (Arc::clone(&accepted), Arc::clone(&next));
     tokio::spawn(async move {
-        while let Ok((mut inbound, _)) = listener.accept().await {
+        while let Ok((inbound, _)) = listener.accept().await {
             count.fetch_add(1, Ordering::SeqCst);
+            let (mode, mut closed) = (Arc::clone(&mode), closed.clone());
+            closed.mark_unchanged();
             tokio::spawn(async move {
-                if let Ok(mut outbound) = TcpStream::connect(target).await {
-                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                let Ok(outbound) = TcpStream::connect(target).await else {
+                    return;
+                };
+                tokio::select! {
+                    () = proxy_pipe(inbound, outbound, &mode) => {}
+                    // A proxy nobody controls any more keeps carrying.
+                    Ok(()) = closed.changed() => {}
                 }
             });
         }
     });
-    (addr, accepted)
+    (
+        addr,
+        PeerProxy {
+            accepted,
+            next,
+            close,
+        },
+    )
+}
+
+/// Carries bytes both ways until either side closes, or `mode` says to
+/// drop the peer's next bytes or the answer to them.
+async fn proxy_pipe(mut inbound: TcpStream, mut outbound: TcpStream, mode: &AtomicU8) {
+    let (mut from_peer, mut from_node) = (vec![0u8; 16 << 10], vec![0u8; 16 << 10]);
+    loop {
+        tokio::select! {
+            n = inbound.read(&mut from_peer) => {
+                let Ok(n @ 1..) = n else { return };
+                match mode.swap(PROXY_PASS, Ordering::SeqCst) {
+                    PROXY_SWALLOW => return,
+                    PROXY_CUT_ANSWER => {
+                        let _ = outbound.write_all(&from_peer[..n]).await;
+                        drop(inbound);
+                        // The node behind still reads its request whole
+                        // and answers; nobody hears the answer.
+                        while matches!(outbound.read(&mut from_node).await, Ok(1..)) {}
+                        return;
+                    }
+                    _ => {
+                        if outbound.write_all(&from_peer[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            n = outbound.read(&mut from_node) => {
+                let Ok(n @ 1..) = n else { return };
+                if inbound.write_all(&from_node[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,7 +334,7 @@ async fn start_node(
     prefix: &str,
     adjust: impl FnOnce(&mut ActorConfig),
     count_peers: bool,
-) -> (Node, Option<Arc<AtomicUsize>>) {
+) -> (Node, Option<PeerProxy>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -257,7 +360,7 @@ async fn start_node(
         let target = cluster_port
             .as_ref()
             .map_or(addr, |l| l.local_addr().unwrap());
-        let (proxy, accepted) = counting_proxy(target).await;
+        let (proxy, accepted) = peer_proxy(target).await;
         let cluster = config.cluster.as_mut().unwrap();
         match cluster.cluster_tls.as_mut() {
             Some(tls) => tls.advertise = format!("https://{proxy}"),
