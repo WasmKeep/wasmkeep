@@ -39,10 +39,14 @@ Since 0.2.0, in no release yet.
   An upgrade relayed to the actor's node that the node provably never read
   (it refused the TLS handshake, or the upgrade came back unsent on a new
   TLS connection) is sent once more, the client waiting meanwhile; it
-  used to get a 503 asking the client to retry. Nothing else is sent
-  again: a request written into a connection that then failed may have
-  run on the owner, so the client gets a 503, which does not say whether
-  it ran ([running a cluster](docs/cluster.md)).
+  used to get a 503 asking the client to retry. The only other thing a
+  node sends a second time is an `actors.call` the peer provably never
+  read in the same way, once, as 0.2.0 already did after a refused
+  handshake. A forwarded request is never sent again, whether its
+  connection could not be opened or it was written into a connection
+  that then failed: one that was written may have run on the owner, so
+  the client gets a 503, which does not say whether it ran
+  ([running a cluster](docs/cluster.md)).
 - **A restore's reads have one deadline, a refused read is sent again,
   and failed restores are counted.** Restoring an actor from the bucket
   bounded each read but not the reads together, so reads that each stayed
@@ -175,7 +179,7 @@ Added after the release; the text above is as it was published.
   the release's tag by the release workflow; for npm that did not happen:
   the workflow's npm job failed before it reached the registry, and the
   package was published from a maintainer's account instead. Later
-  versions are published by the workflow and carry a provenance
+  versions will be published by the workflow, with a provenance
   statement.
 
 ### Install and verify
