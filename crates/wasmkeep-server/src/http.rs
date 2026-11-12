@@ -403,6 +403,8 @@ pub(crate) struct CappedBody {
     left: u64,
     /// The sender waits for `100 Continue`, and nothing has read the body.
     awaits_continue: bool,
+    /// How long what is left is still read once the body is dropped.
+    unread_timeout: Duration,
 }
 
 impl CappedBody {
@@ -415,6 +417,7 @@ impl CappedBody {
             inner: Some(inner.map_err(Into::into).boxed_unsync()),
             left: MAX_BODY_BYTES,
             awaits_continue: false,
+            unread_timeout: UNREAD_BODY_TIMEOUT,
         }
     }
 
@@ -507,6 +510,7 @@ impl Drop for CappedBody {
             return;
         };
         let mut left = self.left;
+        let unread_timeout = self.unread_timeout;
         runtime.spawn(async move {
             let rest = async {
                 while let Some(Ok(frame)) = inner.frame().await {
@@ -517,7 +521,7 @@ impl Drop for CappedBody {
                     left -= len;
                 }
             };
-            let _ = tokio::time::timeout(UNREAD_BODY_TIMEOUT, rest).await;
+            let _ = tokio::time::timeout(unread_timeout, rest).await;
         });
     }
 }
@@ -1155,6 +1159,53 @@ mod tests {
             let unread = if waits { 0 } else { 2 * 1024 };
             assert_eq!(read_in_the_end(read).await, unread, "{expect:?}");
         }
+    }
+
+    /// A body whose sender sent a part and then nothing more.
+    struct Stalled {
+        first: Option<usize>,
+        read: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl hyper::body::Body for Stalled {
+        type Data = Bytes;
+        type Error = wasmtime_wasi_http::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            match self.first.take() {
+                Some(len) => {
+                    self.read
+                        .fetch_add(len as u64, std::sync::atomic::Ordering::SeqCst);
+                    let data = Bytes::from(vec![0; len]);
+                    std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))))
+                }
+                // Nothing wakes the reader: only its time limit ends this.
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_body_that_stalls_is_let_go_after_the_time_limit() {
+        // The limit a server runs with is one this test cannot wait for.
+        assert_eq!(UNREAD_BODY_TIMEOUT, Duration::from_secs(30));
+        let limit = Duration::from_millis(300);
+        let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut body = CappedBody::new(Stalled {
+            first: Some(1024),
+            read: Arc::clone(&read),
+        });
+        assert_eq!(body.unread_timeout, UNREAD_BODY_TIMEOUT);
+        body.unread_timeout = limit;
+        let dropped = std::time::Instant::now();
+        drop(body);
+        // The body is held (and with it the connection) until the limit,
+        // and no longer.
+        assert_eq!(read_in_the_end(read).await, 1024);
+        assert!(dropped.elapsed() >= limit, "{:?}", dropped.elapsed());
     }
 
     #[tokio::test]
