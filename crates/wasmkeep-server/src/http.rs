@@ -424,12 +424,15 @@ impl CappedBody {
         B: hyper::body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
     {
-        // When hyper holds the body back until it is read (it does not
-        // for HTTP/1.0).
+        // When hyper holds the body back until it is read: it does not
+        // for HTTP/1.0, and of several `Expect` headers its last one
+        // decides, compared whole.
         let awaits_continue = req.version() > hyper::Version::HTTP_10
             && req
                 .headers()
-                .get(hyper::header::EXPECT)
+                .get_all(hyper::header::EXPECT)
+                .iter()
+                .next_back()
                 .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
         req.map(|body| {
             let mut body = Self::new(body);
@@ -1094,11 +1097,11 @@ mod tests {
         assert_eq!(read_in_the_end(read).await, 3 * 1024);
     }
 
-    /// A request (`expect`: its `Expect` header), its body capped, and the bytes read
-    /// from that body so far.
-    fn capped_request(
+    /// A request (`expect`: its `Expect` headers, in order), its body
+    /// capped, and the bytes read from that body so far.
+    fn capped_request<'a>(
         version: hyper::Version,
-        expect: Option<&str>,
+        expect: impl IntoIterator<Item = &'a str>,
     ) -> (CappedBody, Arc<std::sync::atomic::AtomicU64>) {
         let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut req = Request::new(Frames {
@@ -1106,9 +1109,9 @@ mod tests {
             read: Arc::clone(&read),
         });
         *req.version_mut() = version;
-        if let Some(expect) = expect {
+        for expect in expect {
             req.headers_mut()
-                .insert(hyper::header::EXPECT, expect.parse().unwrap());
+                .append(hyper::header::EXPECT, expect.parse().unwrap());
         }
         (CappedBody::of(req).into_body(), read)
     }
@@ -1133,6 +1136,25 @@ mod tests {
         let (body, read) = capped_request(hyper::Version::HTTP_10, Some("100-continue"));
         drop(body);
         assert_eq!(read_in_the_end(read).await, 2 * 1024);
+    }
+
+    /// hyper decides whether to hold a body back: with several `Expect`
+    /// headers its last one counts, compared whole.
+    #[tokio::test]
+    async fn the_last_expect_header_says_whether_the_sender_waits() {
+        let v11 = hyper::Version::HTTP_11;
+        for (expect, waits) in [
+            (&["100-continue", "other"][..], false),
+            (&["other", "100-continue"], true),
+            (&["100-continue", "100-CONTINUE"], true),
+            (&["100-continue, other"], false),
+            (&["other"], false),
+        ] {
+            let (body, read) = capped_request(v11, expect.iter().copied());
+            drop(body);
+            let unread = if waits { 0 } else { 2 * 1024 };
+            assert_eq!(read_in_the_end(read).await, unread, "{expect:?}");
+        }
     }
 
     #[tokio::test]
