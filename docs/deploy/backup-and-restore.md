@@ -197,8 +197,7 @@ What a restored cluster is:
   of that time. A node started under the same id replaces its lease after
   the start check (15 s when the copy's lease says `live`), which frees
   the records naming its old process. An id nobody starts again is fenced
-  by the other nodes, or
-  with `wasmkeep cluster fence <node>`.
+  by the other nodes, or with `wasmkeep cluster fence <node>`.
 - **Alarms that came due since the backup fire** soon after the start,
   and anything the actors did outside between the backup and the restore
   (a webhook sent, an email, a call to your API) is unknown to the
@@ -206,7 +205,10 @@ What a restored cluster is:
   restore makes that visible.
 - **Drain requests of the backup apply again**: a node that was draining
   when the copy was made drains again. `wasmkeep cluster undrain <node>`
-  withdraws it.
+  withdraws it. A move request in the copy may apply again too, for up
+  to 5 minutes after the restore copy: a node counts a move request's age
+  from the object's date in the bucket, which a copy normally sets anew
+  (not tested). It expires by itself.
 
 One actor cannot be restored alone today: there is no command for it,
 and copying one actor's old objects under a running cluster changes
