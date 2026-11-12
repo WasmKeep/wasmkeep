@@ -466,14 +466,14 @@ async fn a_restore_that_fails_putting_its_file_in_place_is_redone_from_the_bucke
     assert_ne!(std::fs::read(file(".replaced")).unwrap(), b"what was there");
 }
 
-/// `actors` actors that a wrote about 1.4 MiB of incompressible data to,
-/// each in one segment after a small snapshot, before a was cut off from
-/// the bucket. b reads the bucket through the `Flaky` returned, every
-/// segment answered after 4 s (under the 5 s of silence that gives a read
-/// up), and gives a restore half a second before sizes are counted: with
-/// the two megabytes started and the second for its objects, 3.5 s for
-/// its reads when nothing else is read on the node. The actors' paths
-/// come with it.
+/// `actors` actors that a wrote about 0.86 MiB of incompressible data
+/// to, each in one segment after a small snapshot, before a was cut off
+/// from the bucket: under a megabyte of history each. b reads the bucket
+/// through the `Flaky` returned, every segment answered after 4 s (under
+/// the 5 s of silence that gives a read up), and gives a restore half a
+/// second before sizes are counted: with the megabyte started and the
+/// second for its objects, 2.5 s for its reads when nothing else is read
+/// on the node. The actors' paths come with it.
 async fn large_actors_cut_off(
     name: &str,
     actors: usize,
@@ -523,7 +523,7 @@ async fn large_actors_cut_off(
         let sql_path = path.replace("/durable", "/sql");
         for sql in [
             "CREATE TABLE big (x)",
-            "INSERT INTO big VALUES (randomblob(1500000))",
+            "INSERT INTO big VALUES (randomblob(900000))",
         ] {
             let mut stream = TcpStream::connect(a.addr).await.unwrap();
             let req = format!(
@@ -547,7 +547,7 @@ async fn large_actors_cut_off(
             .try_collect()
             .await
             .unwrap();
-        if sizes.iter().filter(|&&n| n > 1_000_000).count() == actors {
+        if sizes.iter().filter(|&&n| n > 800_000).count() == actors {
             break;
         }
         assert!(
@@ -565,17 +565,17 @@ async fn large_actors_cut_off(
 /// A read's own limit counts every megabyte read alongside it on the
 /// node, other restores' included, so the deadline of a restore's reads
 /// together has to count them too: after a kill one node restores many
-/// actors at once over one link. Here five actors of about 1.4 MiB each
+/// actors at once over one link. Here eight actors of about 0.86 MiB each
 /// are taken over together and every segment read takes 4 s, inside each
-/// read's limit. A restore alone has 3.5 s (the test below: it is ended),
-/// but with the others' megabytes in flight each has several seconds
-/// more: every one completes at its first try, each segment read once.
-/// Sized from its own bytes only, the deadline ended all five at 3.5 s,
-/// every read inside its limit, and the callers that tried again met the
-/// same end together.
+/// read's limit. A restore alone has 2.5 s (the test below: it is ended),
+/// but with the others' megabytes in flight, seven started where its own
+/// are one, each has 6 s more: every one completes at its first try, each
+/// segment read once. Sized from its own bytes only, the deadline ended
+/// all eight at 2.5 s, every read inside its limit, and the callers that
+/// tried again met the same end together.
 #[tokio::test(flavor = "multi_thread")]
 async fn restores_side_by_side_are_not_ended_for_each_others_bytes() {
-    let (_a, b, flaky_b, paths, _dirs) = large_actors_cut_off("beside", 5).await;
+    let (_a, b, flaky_b, paths, _dirs) = large_actors_cut_off("beside", 8).await;
     let started = std::time::Instant::now();
     let tasks: Vec<_> = paths
         .iter()
@@ -615,7 +615,7 @@ async fn restores_side_by_side_are_not_ended_for_each_others_bytes() {
 }
 
 /// The same actor restored alone is ended by its deadline: no megabyte
-/// of another restore is in flight, so its reads have the 3.5 s its own
+/// of another restore is in flight, so its reads have the 2.5 s its own
 /// size gives and the 4 s read does not fit. What the test above shows is
 /// the other restores' bytes, not a deadline that lets slow reads through.
 #[tokio::test(flavor = "multi_thread")]
