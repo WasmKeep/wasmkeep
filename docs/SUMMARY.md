@@ -24,6 +24,7 @@
 - [One server (VPS)](deploy/single-node.md)
 - [Three nodes](deploy/three-nodes.md)
 - [Load balancer, WAF and routing](deploy/front-door.md)
+- [Back up and restore the bucket](deploy/backup-and-restore.md)
 - [Monitoring](monitoring.md)
 
 # Reference

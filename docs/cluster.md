@@ -558,7 +558,9 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   secrets.
 - **Restoring the bucket from a backup** can put `current` below what the
   running nodes opened; they refuse it (and block after 30 s) until
-  restarted: restart the nodes after a restore. Deleting `current` by hand
+  restarted: restart the nodes after a restore
+  ([Back up and restore a cluster's bucket](deploy/backup-and-restore.md)
+  has the whole procedure). Deleting `current` by hand
   leaves running nodes with the set they have and restarted ones with
   none.
 - **Older nodes.** `set`, `unset` and `reset` refuse, without `--force`,

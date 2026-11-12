@@ -243,7 +243,7 @@ deploy, and Prometheus and Grafana on the same cluster;
 - [Languages](docs/languages.md): which languages work today and how
 - [Concepts](docs/concepts.md): addresses, events, life cycle, storage, alarms, calls, WebSockets
 - [API reference](docs/reference/api.md): every host function and hook, with its name in the Rust, TypeScript, Python, C and Zig SDKs
-- Deploying: [one server (VPS)](docs/deploy/single-node.md), [three nodes](docs/deploy/three-nodes.md)
+- Deploying: [one server (VPS)](docs/deploy/single-node.md), [three nodes](docs/deploy/three-nodes.md), [back up and restore the bucket](docs/deploy/backup-and-restore.md)
 - Examples: [counter](examples/counter), [chat room](examples/chat-room) (WebSockets),
   [rate limiter](examples/rate-limiter) (alarms), [AI agent](examples/agent) (a model over
   HTTP, a reminder tool on an alarm), [jobs](examples/jobs) (the SDK's

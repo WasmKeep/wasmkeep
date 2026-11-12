@@ -256,6 +256,9 @@ it exits with 1 if no node is live. See
   last event may be lost (see [Running a cluster](../cluster.md#replication)).
 - **Logs**: each node logs to the journal; `RUST_LOG=wasmkeep_server=debug`
   shows leases, forwarding and replication decisions.
+- **Backups**: the bucket is the only durable copy. Copy it somewhere the
+  nodes cannot write, and restore that copy once before you need it (see
+  [Back up and restore a cluster's bucket](backup-and-restore.md)).
 - **Bucket growth**: each actor's history older than an hour
   (`--history-retention-secs`) is collected after its periodic snapshot,
   a deleted actor's at once, and `wasmkeep deploy` keeps the current
