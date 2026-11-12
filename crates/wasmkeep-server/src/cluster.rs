@@ -124,7 +124,8 @@ pub struct ClusterConfig {
     /// The time the reads of a restore from the bucket have together,
     /// whatever it restores: 30 s.
     /// A second per megabyte and a second per eight objects of the
-    /// history it reads come on top. Tests shorten it.
+    /// history it reads come on top, and what other restores' bytes in
+    /// flight add to its reads' limits is not counted. Tests shorten it.
     pub restore_budget: Duration,
     /// This node reads the app's secrets from the bucket (heartbeat line
     /// 10, ADR 0016); `false` with `--no-secrets`.

@@ -424,6 +424,173 @@ async fn slow_reads_that_add_up_past_the_deadline_end_a_restore() {
     restores_cleanly(&b, path, 30).await;
 }
 
+/// `actors` actors that a wrote about 1.4 MiB of incompressible data to,
+/// each in one segment after a small snapshot, before a was cut off from
+/// the bucket. b reads the bucket through the `Flaky` returned, every
+/// segment answered after 4 s (under the 5 s of silence that gives a read
+/// up), and gives a restore half a second before sizes are counted: with
+/// the two megabytes started and the second for its objects, 3.5 s for
+/// its reads when nothing else is read on the node. The actors' paths
+/// come with it.
+async fn large_actors_cut_off(
+    name: &str,
+    actors: usize,
+) -> (
+    Node,
+    Node,
+    Arc<Flaky>,
+    Vec<String>,
+    (tempfile::TempDir, tempfile::TempDir),
+) {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let down = Arc::new(AtomicBool::new(false));
+    let seen_by_a: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let flaky_b = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let seen_by_b: Arc<dyn ObjectStore> = flaky_b.clone();
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", dirs.0.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_configured(
+        "b",
+        dirs.1.path(),
+        &seen_by_b,
+        idle,
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |config: &mut ActorConfig| {
+            config.cluster.as_mut().unwrap().restore_budget = Duration::from_millis(500);
+        },
+    )
+    .await;
+    settle().await;
+    let paths: Vec<String> = (0..actors)
+        .map(|i| format!("/actor/t/{name}{i}/durable"))
+        .collect();
+    for path in &paths {
+        let r = send(a.addr, "POST", path, "").await;
+        assert_eq!(
+            (r.status, r.body.trim(), r.node.as_deref()),
+            (200, "1", Some("a"))
+        );
+        let sql_path = path.replace("/durable", "/sql");
+        for sql in [
+            "CREATE TABLE big (x)",
+            "INSERT INTO big VALUES (randomblob(1500000))",
+        ] {
+            let mut stream = TcpStream::connect(a.addr).await.unwrap();
+            let req = format!(
+                "POST {sql_path} HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sql}",
+                sql.len()
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut raw = String::new();
+            stream.read_to_string(&mut raw).await.unwrap();
+            assert!(raw.contains("ok:"), "{raw}");
+        }
+    }
+    // A plain query answers before its segment is uploaded: wait until
+    // every actor's large segment is in the bucket.
+    let started = std::time::Instant::now();
+    loop {
+        use futures_util::TryStreamExt;
+        let sizes: Vec<u64> = shared
+            .list(None)
+            .map_ok(|m| m.size)
+            .try_collect()
+            .await
+            .unwrap();
+        if sizes.iter().filter(|&&n| n > 1_000_000).count() == actors {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the large segments never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    flaky_b.delay_wal_get_ms.store(4_000, Ordering::SeqCst);
+    down.store(true, Ordering::SeqCst);
+    (a, b, flaky_b, paths, dirs)
+}
+
+/// Restores that read side by side are not ended for each other's bytes.
+/// A read's own limit counts every megabyte read alongside it on the
+/// node, other restores' included, so the deadline of a restore's reads
+/// together has to count them too: after a kill one node restores many
+/// actors at once over one link. Here five actors of about 1.4 MiB each
+/// are taken over together and every segment read takes 4 s, inside each
+/// read's limit. A restore alone has 3.5 s (the test below: it is ended),
+/// but with the others' megabytes in flight each has several seconds
+/// more: every one completes at its first try, each segment read once.
+/// Sized from its own bytes only, the deadline ended all five at 3.5 s,
+/// every read inside its limit, and the callers that tried again met the
+/// same end together.
+#[tokio::test(flavor = "multi_thread")]
+async fn restores_side_by_side_are_not_ended_for_each_others_bytes() {
+    let (_a, b, flaky_b, paths, _dirs) = large_actors_cut_off("beside", 5).await;
+    let started = std::time::Instant::now();
+    let tasks: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let (addr, path) = (b.addr, path.clone());
+            tokio::spawn(async move {
+                loop {
+                    let r = send(addr, "GET", &path, "").await;
+                    if r.status == 200 && r.node.as_deref() == Some("b") {
+                        assert_eq!(r.body.trim(), "1");
+                        return;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(40),
+                        "{path} never served: {} {}",
+                        r.status,
+                        r.body
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(
+        super::snapshots::counter("wasmkeep_restore_failures_total").await,
+        0,
+        "no restore was ended"
+    );
+    let reads = flaky_b.wal_gets.lock().unwrap().clone();
+    assert!(
+        reads.len() >= paths.len() && reads.values().all(|&n| n == 1),
+        "every segment read once: {reads:?}"
+    );
+}
+
+/// The same actor restored alone is ended by its deadline: no megabyte
+/// of another restore is in flight, so its reads have the 3.5 s its own
+/// size gives and the 4 s read does not fit. What the test above shows is
+/// the other restores' bytes, not a deadline that lets slow reads through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_alone_has_no_more_than_its_own_deadline() {
+    let (_a, b, flaky_b, paths, _dirs) = large_actors_cut_off("alone", 1).await;
+    let (r, took) = answer_behind_the_restore(&b, &paths[0], &flaky_b).await;
+    assert_eq!(
+        (r.status, r.retry_after.as_deref()),
+        (503, Some("1")),
+        "after {took:?}: {}",
+        r.body
+    );
+    assert!(super::snapshots::counter("wasmkeep_restore_failures_total").await >= 1);
+    flaky_b.delay_wal_get_ms.store(0, Ordering::SeqCst);
+    restores_cleanly(&b, &paths[0], 1).await;
+}
+
 /// A node cut off from the bucket cannot take an actor: it answers 503
 /// with `Retry-After`, as clients and load balancers expect for a
 /// temporary refusal, not a 500 counted as the guest's failure (review

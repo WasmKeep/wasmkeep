@@ -109,7 +109,23 @@ may not survive, which is what an unacknowledged write is allowed to do.
    (local work, never cut), and not while a read waits for the node's
    shared limit on reads before it is asked for (many restores start at
    once after a kill, and a deadline counting their queue would end them
-   all half-way). A restore that fails, for any reason, leaves the local
+   all half-way). *(Corrected 2026-11-12.)* The deadline is sized from the
+   restore's own bytes, but a read's limit (step 6) counts every megabyte
+   in flight on the node, so restores reading side by side were each
+   ended by their own deadline with every read inside its limit (32
+   actors of 8 MiB taken over at once: 261 s per read, 39 s per restore),
+   and tried again together. For each object, the seconds that other
+   restores' bytes in flight added to the limits of its read's tries (the
+   limit as it is, less the limit with this restore's bytes alone, most
+   seen during the try) are therefore not counted, up to the time the
+   restore waited for that object. What is counted for an object is then
+   at most what its tries are allowed with no other restore on the node,
+   so other restores' reads never end a restore; one alone on the node
+   has exactly the deadline above. Worst case: the deadline above plus
+   768 s per object (three tries, at most 256 s each from the node's
+   256 MiB in flight), which the reads' own limits already allowed; a
+   bucket that never answers still ends a read, and the restore, after
+   three silences of 5 s. A restore that fails, for any reason, leaves the local
    file and its sidecar untouched (the database is built beside it),
    writes nothing to the actor's history, and gives the lease up as a
    failed restore did before: the next event restores from a fresh

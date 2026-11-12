@@ -141,9 +141,27 @@ Each actor's database follows it from node to node (ADR 0007):
   up only when the bucket sends no key for 5 s, so a long history lists
   for as long as its pages take), nor work on the local disk (never
   interrupted), nor the time a read waits for its turn among the node's
-  other restores (they share 32 reads at once), so a node that takes many
-  actors over at once does not give them all up half-way: while that
-  queue lasts, a caller can wait longer than the deadline. A restore that fails or runs out of time changes nothing
+  other restores (they share 32 reads and 256 MiB at once): while that
+  queue lasts, a caller can wait longer than the deadline. Nor does it
+  count what other restores add to a read's time. A read's own limit
+  counts every megabyte being read on the node at that moment, other
+  restores' included, since they share one link: after a node dies, the
+  node that takes over 32 actors of 8 MiB each gives every read 261 s
+  (5 s plus 256), while each restore, by its own size, has 39 s. So for
+  each file, the seconds that other restores' megabytes added to the
+  limits of its read's tries are left out of the count, up to the time
+  the restore waited for that file. A restore is therefore never ended
+  because of what other restores are reading: what is counted for a file
+  is at most what its read is allowed with nothing else read on the node.
+  A restore alone on the node gets nothing more than its 30 s and its own
+  seconds, and slow reads that add up end it. At worst a restore's waits
+  for the bucket last its own time plus 768 s per file (three tries, each
+  given at most 256 s by the 256 MiB the node reads at once): only while
+  other restores keep the node at that limit and each of its reads is
+  tried three times to the end of its time, which is what each read's
+  own limit allows. A bucket that never answers ends a restore sooner,
+  whatever else is read: a read is given up after three silences of 5 s.
+  A restore that fails or runs out of time changes nothing
   on the node: the database is built beside the local file and put in its
   place only when complete, so the next restore starts again from a fresh
   listing. The request that waited gets a 503 with `Retry-After`, as for a

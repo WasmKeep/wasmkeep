@@ -52,7 +52,11 @@ Since 0.2.0, in no release yet.
   eight objects; the clock runs only while the restore waits for the
   bucket to give it the object it applies next, so the listing, work on
   the local disk and the wait for a turn among the node's other restores
-  are not counted. Running out of time is answered like a bucket that
+  are not counted. Neither are the seconds that other restores' reads on
+  the node add to the limit of a read (a second per megabyte in flight,
+  256 at most), so restores that read side by side after a takeover are
+  not ended for each other's bytes; a restore alone on the node has no
+  more than its own time. Running out of time is answered like a bucket that
   does not answer, a 503 with `Retry-After`, and leaves the local file as
   it was. A read the bucket refuses with an error a resend can get past
   (a 5xx or a broken connection, after the bucket client's own retries)
