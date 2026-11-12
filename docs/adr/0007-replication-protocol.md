@@ -6,6 +6,7 @@
   ownership is a node lease plus an ownership record per actor; where this
   record says lease, read the actor's hold (`LeaseView`: the hold exists and
   the node lease is valid).
+- Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): history keys move under the app's root, `state/<tenant>/<app>/`.
 - Date: 2026-11-02
 - Milestone: [M2](../../ROADMAP.md#m2-cluster-and-durability)
 

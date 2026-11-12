@@ -6,7 +6,8 @@
   (`crates/wasmkeep-server/src/apps.rs`,
   `crates/wasmkeep-server/tests/cluster/deploys.rs`,
   `crates/wasmkeep-cli/tests/deploy_config.rs`). Planned for 0.4.0, each
-  with its own ADR: the front, app-owned actor state, the project file.
+  with its own ADR: the front, app-owned actor state
+  ([ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)), the project file.
   Later: several apps on the same nodes.
 - Date: 2026-11-12
 - Release: 0.3.0 and [0.4.0](../../ROADMAP.md#next)
@@ -65,10 +66,10 @@ is checked by the first deploy, while the app has no `current`.
 
 Two apps never share actors, whatever bucket prefix they use: each app's
 actor state is kept apart from other apps', in the bucket and on disk
-(the layout is fixed by its own ADR). Existing
+(the layout is fixed by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)). Existing
 data moves there once, by a migration, rather than keeping today's layout
 beside the new one for good. The layout and the migration are fixed by
-their own ADR.
+[ADR 0022](0022-app-owned-state-and-the-one-time-migration.md).
 
 Until then, **one app per tenant per bucket prefix**, enforced by
 `deploy`: the first deploy of an app lists `apps/<tenant>/` and refuses

@@ -10,6 +10,7 @@
   actor's hold (`LeaseView`: the hold exists and the node lease is valid).
   `sim/tests/madsim_drain.rs` models the node leases of
   [ADR 0020](0020-one-lease-per-node.md).
+- Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): move keys move under the app's root, and `actor move` gains `--app`.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster) (the part [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) left open)
 

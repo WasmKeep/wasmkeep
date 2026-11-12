@@ -18,6 +18,7 @@
   ended hands the alarm off with its release still pending; a peer that
   had not listed the drain yet left the alarm to it, and nobody fired it
   until the sweep (`a_handed_alarm_waits_for_the_senders_release`).
+- Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): move keys move under the app's root, and node-to-node calls carry the app.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster)
 
