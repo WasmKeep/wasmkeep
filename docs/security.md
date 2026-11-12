@@ -132,8 +132,13 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   this node), and TLS peers are never reached in plaintext. The forwarded
   header gives no privilege on any port: it only stops a request being
   forwarded again.
-- One app per bucket prefix: a node refuses to start next to another app of
-  its tenant.
+- One app per bucket prefix. A node refuses to start while a node of
+  another app of its tenant is live on the prefix; nothing else checks it
+  (`wasmkeep deploy` does not), and actors are keyed by tenant, class and
+  name, so a second app of the tenant on the same prefix shares the first
+  one's actors. Give each app its own prefix.
+- One bucket prefix is one trust domain: every node on it signs calls with
+  the same cluster secret, whatever app or tenant it serves.
 
 **The bucket** (`crates/wasmkeep-server/src/replica.rs`)
 - Restore streams one object and one page at a time; chains that would

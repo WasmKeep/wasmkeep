@@ -49,7 +49,7 @@ servers, Postgres and Valkey, and walks through each pattern):
 | Shopping carts, sessions, workflows | user or order | durable state, alarms for reminders |
 | Per-user AI agents | user or conversation | durable memory, outbound HTTP |
 | Device twins (IoT) | device | latest state, alarms for missed heartbeats |
-| Customer plugins in a SaaS | tenant or plugin | sandboxing, per-tenant limits |
+| Customer plugins in a SaaS | customer or plugin | sandboxing, limits per actor |
 
 ## When not to use it
 
