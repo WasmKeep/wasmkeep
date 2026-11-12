@@ -285,7 +285,9 @@ jobs:
             const ok = a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1)));
             if (!ok) { console.error(`::error::npm ${process.argv[1]} cannot publish without a token (11.5.1 or later)`); process.exit(1); }
           ' "$(npm --version)"
-          npm publish "dist/wasmkeep-sdk-$VERSION.tgz"
+          # "./": npm reads a bare "dist/x.tgz" as the GitHub repository
+          # dist/x.tgz and tries to clone it.
+          npm publish "./dist/wasmkeep-sdk-$VERSION.tgz"
 
   # The Go module has no registry: its version is a tag of this repository,
   # sdks/go/vX.Y.Z, pushed signed with the release's tag. This checks it is
