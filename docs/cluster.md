@@ -126,6 +126,56 @@ Each actor's database follows it from node to node (ADR 0007):
   the bucket has.
 - If an upload fails, the node gives the actor up; the next request restores
   it from the bucket, possibly on another node.
+- A restore's reads are bounded together. The node lists the actor's history and
+  reads its last snapshot and the files after it, eight at a time; every
+  request waiting for the actor waits behind that. A read the bucket leaves
+  unanswered for 5 s, or that is slower than 5 s plus a second per
+  megabyte, is sent again, and so is one the bucket refuses with an error
+  a resend can get past (a 5xx or a broken connection, after the bucket
+  client's own retries), half a second later, then a second: three tries
+  per file. While it pauses, a read gives up its place among the node's
+  reads, and waits for one again before it is resent. The reads of one restore have 30 s together, plus a second
+  per megabyte of what it reads and a second per eight files: 39 s for 63
+  small files and a snapshot under a megabyte, about 17 minutes more for a
+  database of 1 GiB. That counts the time the restore waits for the
+  bucket to give it the next file. It does not count the listing (given
+  up only when the bucket sends no key for 5 s, so a long history lists
+  for as long as its pages take), nor work on the local disk (never
+  interrupted), nor the time a read waits for its turn among the node's
+  other restores (they share 32 reads and 256 MiB at once): while that
+  queue lasts, a caller can wait longer than the deadline. Nor does it
+  count what other restores add to a read's time. A read's own limit
+  counts every megabyte being read on the node at that moment, other
+  restores' included, since they share one link: after a node dies, the
+  node that takes over 32 actors of 8 MiB each gives every read 261 s
+  (5 s plus 256), while each restore, by its own size, has 39 s. So for
+  each file, the seconds that other restores' megabytes added to the
+  limits of its read's tries are left out of the count, up to the time
+  the restore waited for that file. A restore is therefore never ended
+  because of what other restores are reading: what is counted for a file
+  is at most what its read is allowed with nothing else read on the node.
+  A restore alone on the node gets nothing more than its 30 s and its own
+  seconds, and slow reads that add up end it. At worst a restore's waits
+  for the bucket last its own time plus 768 s per file (three tries, each
+  given at most 256 s by the 256 MiB the node reads at once): only while
+  other restores keep the node at that limit and each of its reads is
+  tried three times to the end of its time, which is what each read's
+  own limit allows. A bucket that never answers ends a restore sooner,
+  whatever else is read: a read is given up after three silences of 5 s.
+  A restore that fails or runs out of time before its
+  database is complete changes nothing on the node: the database is built
+  beside the local file and put in its place only when complete. If
+  putting it in place fails (an error of the local disk), the file that
+  was there has already been moved to `<name>.db.replaced`, and the node
+  is left with no file for the actor or with the new one unmarked. Either
+  way the next restore starts again from a fresh listing and reads the
+  bucket: a node uses a local file as it is only after checking it
+  against the bucket's history. The request that waited gets a 503 with `Retry-After`, as for a
+  bucket that does not answer (a history that cannot be restored without
+  losing data stays an error, 500), the node gives the actor up so
+  another may try, and
+  `wasmkeep_restore_failures_total` counts it
+  ([monitoring](monitoring.md)).
 - `storage.delete-self` is recorded in the bucket, so a deleted actor stays
   deleted wherever it runs next. Like a plain `exec`, it is replicated when
   the event ends: if replication fails at that moment, the delete can be

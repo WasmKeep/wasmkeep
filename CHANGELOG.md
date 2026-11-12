@@ -7,6 +7,72 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
+## Unreleased
+
+Since 0.2.0, in no release yet.
+
+### What changed
+
+- **A snapshot upload is bounded, tried again after a failure, and
+  counted.** The snapshot an actor's owner adds every 64 writes holds the
+  actor while it uploads. It now gets one attempt, given up after 5 s plus
+  a second per megabyte and 10 s at most; the upload had no bound of its
+  own, so a bucket that left it unanswered held the actor until the bucket
+  client ended the request (30 s by default). One that fails costs no
+  write and fails no event, and is tried again
+  once the actor has made one more write and 30 s have passed, then 8
+  writes later, then every 64; a failure used to put the next snapshot 64
+  more writes away. The node keeps these waits while an idle actor is out
+  of its memory. `wasmkeep_snapshot_upload_failures_total` counts the
+  snapshot uploads that were not acknowledged
+  ([replication](docs/cluster.md#replication),
+  [monitoring](docs/monitoring.md)).
+- **A request body the handler left unread no longer costs the upload or
+  the answer.** A handler may answer without reading the body. The server
+  now reads and discards what is left, up to the body cap and for at most
+  30 s, so a large upload is no longer cut off and, when the request came
+  through another node, its answer is no longer lost. A body held back
+  with `Expect: 100-continue` is not asked for, and a node that forwards a
+  request does not pass `Expect` on ([concepts](docs/concepts.md)).
+- **Between nodes, a WebSocket upgrade the owner never read is sent once
+  more, and a forwarded request that was written is never sent twice.**
+  An upgrade relayed to the actor's node that the node provably never read
+  (it refused the TLS handshake, or the upgrade came back unsent on a new
+  TLS connection) is sent once more, the client waiting meanwhile; it
+  used to get a 503 asking the client to retry. Between nodes, the only
+  other thing sent a second time is an `actors.call` the peer provably
+  never read in the same way, once, as 0.2.0 already did after a refused
+  handshake. A forwarded request is never sent again, whether its
+  connection could not be opened or it was written into a connection
+  that then failed: one that was written may have run on the owner, so
+  the client gets a 503, which does not say whether it ran
+  ([running a cluster](docs/cluster.md)).
+- **A restore's reads have one deadline, a refused read is sent again,
+  and failed restores are counted.** Restoring an actor from the bucket
+  bounded each read but not the reads together, so reads that each stayed
+  under their limit added up with the length of the history while every
+  caller of the actor waited. The reads of one restore now end within
+  30 s, plus a second per megabyte of what it reads and a second per
+  eight objects; the clock runs only while the restore waits for the
+  bucket to give it the object it applies next, so the listing, work on
+  the local disk and the wait for a turn among the node's other restores
+  are not counted. Neither are the seconds that other restores' reads on
+  the node add to the limit of a read (a second per megabyte in flight,
+  256 at most), so restores that read side by side after a takeover are
+  not ended for each other's bytes; a restore alone on the node has no
+  more than its own time. Running out of time is answered like a bucket that
+  does not answer, a 503 with `Retry-After`, and leaves the local file as
+  it was. A read the bucket refuses with an error a resend can get past
+  (a 5xx or a broken connection, after the bucket client's own retries)
+  used to fail the whole restore; it is sent again after 0.5 s, then 1 s,
+  three tries per object. `wasmkeep_restore_failures_total` counts the
+  restores that did not complete
+  ([replication](docs/cluster.md#replication),
+  [monitoring](docs/monitoring.md)).
+- **Releases**: the npm job of the release workflow passed the tarball as
+  a bare path, which npm read as a GitHub repository; it now publishes the
+  file. See the correction under 0.2.0.
+
 ## 0.2.0
 
 **The installable release.** With 0.1.0 the SDKs were used from a clone of
@@ -103,6 +169,18 @@ The limits listed for 0.1.0 still hold:
 - Binaries are for Linux; on macOS and Windows, use the image or build
   from source. The Zig SDK is an archive, not yet a package `zig fetch`
   resolves; D and MoonBit are used from the source.
+
+### Correction
+
+Added after the release; the text above is as it was published.
+
+- The npm package `@wasmkeep/sdk@0.2.0` was published without a
+  provenance statement. The text above says the SDKs are published from
+  the release's tag by the release workflow; for npm that did not happen:
+  the workflow's npm job failed before it reached the registry, and the
+  package was published from a maintainer's account instead. Later
+  versions will be published by the workflow, with a provenance
+  statement.
 
 ### Install and verify
 

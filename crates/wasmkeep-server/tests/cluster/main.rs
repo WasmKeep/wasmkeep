@@ -642,6 +642,15 @@ struct Flaky {
     /// The next this-many segment (`/wal/`) reads never answer: a request
     /// the bucket accepted and then left hanging.
     hang_wal_gets: Arc<std::sync::atomic::AtomicU32>,
+    /// The next this-many segment (`/wal/`) reads are refused at once with
+    /// an error a resend gets past (a 5xx, a reset connection).
+    fail_wal_gets: Arc<std::sync::atomic::AtomicU32>,
+    /// While set, no read of an actor's history (`/wal/` or `/snapshot/`)
+    /// answers.
+    hang_history_gets: Arc<AtomicBool>,
+    /// Reads of actors' history (`/wal/` and `/snapshot/`) asked for,
+    /// answered or not.
+    history_gets: Arc<std::sync::atomic::AtomicU32>,
     /// Every segment (`/wal/`) read waits this many ms before answering: a
     /// slow bucket, each request answered in time but late.
     delay_wal_get_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -710,6 +719,9 @@ impl Flaky {
             fail_wal: Arc::default(),
             delay_wal_ms: Arc::default(),
             hang_wal_gets: Arc::default(),
+            fail_wal_gets: Arc::default(),
+            hang_history_gets: Arc::default(),
+            history_gets: Arc::default(),
             delay_wal_get_ms: Arc::default(),
             trickle_wal_gets: Arc::default(),
             wal_gets: Arc::default(),
@@ -871,6 +883,12 @@ impl ObjectStore for Flaky {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         self.check()?;
+        if location.as_ref().contains("/wal/") || location.as_ref().contains("/snapshot/") {
+            self.history_gets.fetch_add(1, Ordering::SeqCst);
+            if self.hang_history_gets.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+        }
         if location.as_ref().contains("/wal/")
             && self
                 .hang_wal_gets
@@ -886,6 +904,16 @@ impl ObjectStore for Flaky {
                 .unwrap()
                 .entry(location.to_string())
                 .or_default() += 1;
+            if self
+                .fail_wal_gets
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(object_store::Error::Generic {
+                    store: "flaky",
+                    source: "read failed".into(),
+                });
+            }
             let delay = self.delay_wal_get_ms.load(Ordering::SeqCst);
             if delay > 0 {
                 let now = self.wal_gets_now.fetch_add(1, Ordering::SeqCst) + 1;

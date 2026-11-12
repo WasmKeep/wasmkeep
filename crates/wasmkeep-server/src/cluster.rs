@@ -121,6 +121,12 @@ pub struct ClusterConfig {
     /// the next try: 30 s, the longest bounded wait of a caller queued
     /// behind the actor. Tests shorten it.
     pub snapshot_retry_min: Duration,
+    /// The time the reads of a restore from the bucket have together,
+    /// whatever it restores: 30 s.
+    /// A second per megabyte and a second per eight objects of the
+    /// history it reads come on top, and what other restores' bytes in
+    /// flight add to its reads' limits is not counted. Tests shorten it.
+    pub restore_budget: Duration,
     /// This node reads the app's secrets from the bucket (heartbeat line
     /// 10, ADR 0016); `false` with `--no-secrets`.
     pub reads_secrets: bool,
@@ -177,6 +183,7 @@ impl ClusterConfig {
             cluster_plaintext: ClusterPlaintext::Accept,
             history_retention: Duration::from_secs(3600),
             snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
+            restore_budget: crate::replica::RESTORE_BUDGET,
             reads_secrets: true,
         }
     }
@@ -321,6 +328,8 @@ pub(crate) struct Cluster {
     pub(crate) history_retention: Duration,
     /// [`ClusterConfig::snapshot_retry_min`].
     pub(crate) snapshot_retry_min: Duration,
+    /// [`ClusterConfig::restore_budget`].
+    pub(crate) restore_budget: Duration,
     /// Actors' waits after a periodic snapshot that failed: here, so they
     /// outlive an actor's time in memory.
     pub(crate) snapshot_waits: Arc<crate::replica::SnapshotWaits>,
@@ -555,6 +564,7 @@ impl Cluster {
             alarm_sweep: config.alarm_sweep,
             history_retention: config.history_retention,
             snapshot_retry_min: config.snapshot_retry_min,
+            restore_budget: config.restore_budget,
             snapshot_waits: Arc::default(),
             heartbeat_ok_ms: std::sync::atomic::AtomicU64::new(0),
             heartbeat_every: config.heartbeat,
