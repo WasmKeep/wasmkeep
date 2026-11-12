@@ -130,11 +130,20 @@ may not survive, which is what an unacknowledged write is allowed to do.
    768 s per object (three tries, at most 256 s each from the node's
    256 MiB in flight), which the reads' own limits already allowed; a
    bucket that never answers still ends a read, and the restore, after
-   three silences of 5 s. A restore that fails, for any reason, leaves the local
-   file and its sidecar untouched (the database is built beside it),
-   writes nothing to the actor's history, and gives the lease up as a
-   failed restore did before: the next event restores from a fresh
-   listing, so it adds no ordering the protocol did not already have.
+   three silences of 5 s. A restore that fails before its database is
+   complete leaves the local file and its sidecar untouched (the database
+   is built beside it). One that fails while putting the complete
+   database in place (a local disk error: the old file is set aside and
+   its sidecar removed, the new file renamed in, its sidecar written) has
+   set the old file aside, and leaves no file in place or the new one
+   without a sidecar. Neither is used as it is: a local file spares the
+   reads only when a sidecar names the chain's head and the file's
+   checksum is the one the sidecar records, so the next restore reads the
+   bucket again (and, if the new file was in place, sets it aside over
+   the file set aside before: one generation is kept). In every case a failed restore writes nothing to the actor's history and
+   gives the lease up as a failed restore did before: the next event
+   restores from a fresh listing, so it adds no ordering the protocol did
+   not already have.
 
 Why every acknowledged write is on that chain: generation `h` acquires only
 after every earlier grant ran out *or was released*, and lists after

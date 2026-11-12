@@ -657,12 +657,26 @@ impl Replica {
     /// restores the bucket's current chain unless the local file is already
     /// at its head. The database must be closed.
     ///
-    /// Its reads end within one deadline ([`RESTORE_BUDGET`]). A
-    /// restore that fails, for the bucket or anything else, leaves the
-    /// local file and its sidecar as they were (the database is built
-    /// beside it and renamed over it at the very end), so the next one
-    /// starts from a fresh listing and trusts nothing of this one; it is
-    /// counted in `wasmkeep_restore_failures_total`.
+    /// Its reads end within one deadline ([`RESTORE_BUDGET`]). The
+    /// database is built beside the local file, so a restore that fails
+    /// before it is complete (a read, the deadline, a history that cannot
+    /// be restored, an error writing the file being built) leaves the
+    /// local file and its sidecar as they were, and removes what it was
+    /// building. A complete one is put in place in three local steps: the
+    /// file that was there is set aside and its sidecar removed
+    /// ([`set_aside`]), the new file is renamed in, its sidecar is
+    /// written. A restore that fails in one of these (a local disk
+    /// error) has changed the local files: the old file is at
+    /// `<db>.replaced`, and either no file is in place or the new one is,
+    /// without a sidecar. Neither is used as it is: a local file spares
+    /// the reads only when a sidecar names the chain's head and the
+    /// file's checksum is the one the sidecar records
+    /// ([`Self::local_is_at`]). So the next restore reads the bucket
+    /// again, as after any failure: it starts from a fresh listing and
+    /// trusts nothing of this one. If the new file was in place, that
+    /// next restore sets it aside in turn, over the file set aside
+    /// before (one generation is kept). A failed restore is counted in
+    /// `wasmkeep_restore_failures_total`.
     pub(crate) async fn restore(
         cluster: &Cluster,
         address: &ActorAddress,

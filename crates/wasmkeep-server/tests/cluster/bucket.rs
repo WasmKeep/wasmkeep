@@ -424,6 +424,48 @@ async fn slow_reads_that_add_up_past_the_deadline_end_a_restore() {
     restores_cleanly(&b, path, 30).await;
 }
 
+/// A restore that fails once its database is complete, while putting it
+/// in place, is the one failure that changes the node's files: the file
+/// that was there has been set aside (`<db>.replaced`) and its sidecar
+/// removed. Here the sidecar of the new file cannot be written. Nothing
+/// then says the file in place is the bucket's, so the next restore
+/// trusts nothing local, reads the history again and serves every write;
+/// the file set aside by the first is replaced by the copy the first
+/// left in place (one generation is kept).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_that_fails_putting_its_file_in_place_is_redone_from_the_bucket() {
+    let path = "/actor/t/aside/durable";
+    let (_a, b, flaky_b, dirs) = cut_off_owner(path, 5, Duration::from_secs(30)).await;
+    // b has an older file for the actor, and cannot write a sidecar.
+    let dir = dirs.1.path().join("actors/default/t");
+    let file = |suffix: &str| dir.join(format!("aside.db{suffix}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(file(""), b"what was there").unwrap();
+    std::fs::create_dir(file(".replica.tmp")).unwrap();
+
+    let (r, _) = answer_behind_the_restore(&b, path, &flaky_b).await;
+    assert_ne!(r.status, 200, "{}", r.body);
+    assert!(super::snapshots::counter("wasmkeep_restore_failures_total").await >= 1);
+    assert_eq!(
+        std::fs::read(file(".replaced")).unwrap(),
+        b"what was there",
+        "the file that was there is set aside"
+    );
+    assert!(
+        !file(".replica").exists(),
+        "nothing vouches for a local file"
+    );
+    assert_eq!(
+        restore_leftovers(dirs.1.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+
+    std::fs::remove_dir(file(".replica.tmp")).unwrap();
+    restores_cleanly(&b, path, 5).await;
+    assert!(file(".replica").exists());
+    assert_ne!(std::fs::read(file(".replaced")).unwrap(), b"what was there");
+}
+
 /// `actors` actors that a wrote about 1.4 MiB of incompressible data to,
 /// each in one segment after a small snapshot, before a was cut off from
 /// the bucket. b reads the bucket through the `Flaky` returned, every
