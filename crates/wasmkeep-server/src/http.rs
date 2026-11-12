@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -378,27 +379,39 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
 /// forwarded requests alike); a larger one fails the guest's read.
 pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
+/// How long the rest of a request body is still read after its reader let
+/// go of it (see [`CappedBody`]).
+const UNREAD_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A request body that stops at `left` bytes, failing like an oversized
 /// body in wasi-http.
-pub(crate) struct CappedBody<B> {
-    inner: std::pin::Pin<Box<B>>,
+///
+/// A handler may answer without reading the body, or after reading part
+/// of it. hyper closes a connection whose request body nobody reads any
+/// more, and a sender still writing that body (a client, or the node
+/// forwarding the request) gets a reset, which can cost it the answer.
+/// So what is left is read and discarded once the body is dropped: up to
+/// the same cap, for at most [`UNREAD_BODY_TIMEOUT`]. A body that failed
+/// or went over the cap is not read further.
+pub(crate) struct CappedBody {
+    inner: Option<UnsyncBoxBody<Bytes, wasmtime_wasi_http::Error>>,
     left: u64,
 }
 
-impl<B> CappedBody<B> {
-    pub(crate) fn new(inner: B) -> Self {
+impl CappedBody {
+    pub(crate) fn new<B>(inner: B) -> Self
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<wasmtime_wasi_http::Error>,
+    {
         Self {
-            inner: Box::pin(inner),
+            inner: Some(inner.map_err(Into::into).boxed_unsync()),
             left: MAX_BODY_BYTES,
         }
     }
 }
 
-impl<B> hyper::body::Body for CappedBody<B>
-where
-    B: hyper::body::Body<Data = Bytes>,
-    B::Error: Into<wasmtime_wasi_http::Error>,
-{
+impl hyper::body::Body for CappedBody {
     type Data = Bytes;
     type Error = wasmtime_wasi_http::Error;
 
@@ -407,11 +420,15 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         use std::task::Poll;
-        match self.inner.as_mut().poll_frame(cx) {
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match std::pin::Pin::new(inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 let len = frame.data_ref().map_or(0, |d| d.len() as u64);
                 if len > self.left {
                     self.left = 0;
+                    self.inner = None;
                     return Poll::Ready(Some(Err(wasmtime_wasi_http::Error::HttpRequestBodySize(
                         Some(MAX_BODY_BYTES),
                     ))));
@@ -419,18 +436,57 @@ where
                 self.left -= len;
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => {
+                self.inner = None;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.inner = None;
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.inner
+            .as_ref()
+            .is_none_or(hyper::body::Body::is_end_stream)
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
+        self.inner
+            .as_ref()
+            .map_or_else(|| hyper::body::SizeHint::with_exact(0), |b| b.size_hint())
+    }
+}
+
+impl Drop for CappedBody {
+    fn drop(&mut self) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        if hyper::body::Body::is_end_stream(&inner) {
+            return;
+        }
+        // Outside a runtime nothing can read on: the connection closes as
+        // it would have.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut left = self.left;
+        runtime.spawn(async move {
+            let rest = async {
+                while let Some(Ok(frame)) = inner.frame().await {
+                    let len = frame.data_ref().map_or(0, |d| d.len() as u64);
+                    if len > left {
+                        break;
+                    }
+                    left -= len;
+                }
+            };
+            let _ = tokio::time::timeout(UNREAD_BODY_TIMEOUT, rest).await;
+        });
     }
 }
 
@@ -946,6 +1002,105 @@ mod tests {
         assert!(matches!(target("/actor/counter/"), Some(None)));
         assert!(matches!(target("/actor/counter/bad%zz"), Some(None)));
         assert!(matches!(target("/actor/counter/%FF"), Some(None)));
+    }
+
+    /// A body of `frames` (a frame's size, or a failure), counting the
+    /// bytes read from it.
+    struct Frames {
+        frames: std::collections::VecDeque<Result<usize, ()>>,
+        read: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl hyper::body::Body for Frames {
+        type Data = Bytes;
+        type Error = wasmtime_wasi_http::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Ready(self.frames.pop_front().map(|frame| match frame {
+                Ok(len) => {
+                    self.read
+                        .fetch_add(len as u64, std::sync::atomic::Ordering::SeqCst);
+                    Ok(hyper::body::Frame::data(Bytes::from(vec![0; len])))
+                }
+                Err(()) => Err(wasmtime_wasi_http::Error::ConnectionTerminated),
+            }))
+        }
+    }
+
+    /// A capped body of `frames`, and the bytes read from it so far.
+    fn capped(frames: &[Result<usize, ()>]) -> (CappedBody, Arc<std::sync::atomic::AtomicU64>) {
+        let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body = CappedBody::new(Frames {
+            frames: frames.iter().copied().collect(),
+            read: Arc::clone(&read),
+        });
+        (body, read)
+    }
+
+    /// The bytes read once nothing reads the body any more (it is dropped).
+    async fn read_in_the_end(read: Arc<std::sync::atomic::AtomicU64>) -> u64 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&read) > 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        read.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_body_is_read_to_its_end() {
+        let (body, read) = capped(&[Ok(1024), Ok(1024), Ok(1024)]);
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 3 * 1024);
+
+        // Also one its reader left half-way.
+        let (mut body, read) = capped(&[Ok(1024), Ok(1024), Ok(1024)]);
+        assert!(body.frame().await.unwrap().is_ok());
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 3 * 1024);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_body_is_not_read_past_the_cap() {
+        let frame = 1 << 20;
+        let frames = vec![Ok(frame); 20];
+        let (body, read) = capped(&frames);
+        drop(body);
+        // The frame that crosses the cap is the last one read.
+        assert_eq!(read_in_the_end(read).await, MAX_BODY_BYTES + frame as u64);
+
+        // What the reader took counts against the same cap.
+        let (mut body, read) = capped(&frames);
+        for _ in 0..10 {
+            assert!(body.frame().await.unwrap().is_ok());
+        }
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, MAX_BODY_BYTES + frame as u64);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_failed_or_went_over_the_cap_is_not_read_on() {
+        let (mut body, read) = capped(&[Ok(1024), Err(()), Ok(1024)]);
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_err());
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 1024);
+
+        // Failing while what is left is discarded stops that too.
+        let (body, read) = capped(&[Ok(1024), Err(()), Ok(1024)]);
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, 1024);
+
+        let frame = 1 << 20;
+        let (mut body, read) = capped(&vec![Ok(frame); 20]);
+        while let Some(Ok(_)) = body.frame().await {}
+        drop(body);
+        assert_eq!(read_in_the_end(read).await, MAX_BODY_BYTES + frame as u64);
     }
 }
 

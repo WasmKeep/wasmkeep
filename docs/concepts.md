@@ -194,7 +194,10 @@ actor of the same tenant and waits for the answer.
 - A call that would come back to an actor already waiting in the chain (A
   calls B calls A) is refused with `reentrant` instead of deadlocking.
 - Request bodies are capped at 16 MB (413 when declared larger; a failed
-  read past it otherwise). Calls between actors cap both ways.
+  read past it otherwise). Calls between actors cap both ways. A handler
+  may answer without reading the body: the server reads and discards what
+  is left (up to the cap, for at most 30 s), so the client can finish
+  sending it and read the answer.
 
 ## WebSockets
 
