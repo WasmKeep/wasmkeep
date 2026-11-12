@@ -292,11 +292,11 @@ impl ActorState {
                 let opened = tokio::task::spawn_blocking(move || {
                     // Restored from the bucket by `ensure_owner`: no file,
                     // nothing in the bucket either.
-                    if !storage.db_path(a.tenant(), a.class(), a.name()).exists() {
+                    if !storage.db_path(a.class(), a.name()).exists() {
                         return Ok(None);
                     }
                     storage
-                        .open(a.tenant(), a.class(), a.name())
+                        .open(a.class(), a.name())
                         .map(|db| Some(residency.retain(db)))
                 })
                 .await;
@@ -721,7 +721,7 @@ pub(super) async fn sweep_alarms(
             now.saturating_sub(overdue.saturating_mul(3)),
         );
         match cluster
-            .alarms_due_before(&inner.tenant, before, cursor.as_ref(), SWEEP_SCAN)
+            .alarms_due_before(before, cursor.as_ref(), SWEEP_SCAN)
             .await
         {
             Ok((due, next)) => {

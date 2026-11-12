@@ -202,9 +202,12 @@ async fn on_init_runs_again_for_a_new_component_version() {
     v2.extend_from_slice(payload);
 
     let init_version = |data: &Path| {
-        let storage = wasmkeep_storage::Storage::new(wasmkeep_storage::StorageConfig::new(data));
+        let storage = wasmkeep_storage::Storage::new(
+            wasmkeep_storage::StorageConfig::new(data),
+            wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+        );
         storage
-            .open("default", "counter", "a")
+            .open("counter", "a")
             .unwrap()
             .meta("init_version")
             .unwrap()

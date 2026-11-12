@@ -47,14 +47,17 @@ fn config(data: &std::path::Path) -> ActorConfig {
 
 /// Sets every actor's alarm to `at`, the node being down.
 fn set_alarms(data: &std::path::Path, n: usize, at: u64) {
-    let storage = Storage::new(StorageConfig::new(data));
+    let storage = Storage::new(
+        StorageConfig::new(data),
+        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+    );
     std::thread::scope(|s| {
         let threads = 16;
         for t in 0..threads {
             let storage = &storage;
             s.spawn(move || {
                 for i in (t..n).step_by(threads) {
-                    let mut db = storage.open("default", "t", &format!("a{i}")).unwrap();
+                    let mut db = storage.open("t", &format!("a{i}")).unwrap();
                     db.set_alarm(at).unwrap();
                 }
             });
@@ -128,7 +131,10 @@ fn benches(c: &mut Criterion) {
             bytes / n as u64
         );
 
-        let storage = Storage::new(StorageConfig::new(data));
+        let storage = Storage::new(
+            StorageConfig::new(data),
+            wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+        );
         let pending = storage.pending_alarms().unwrap();
         assert_eq!(pending.found.len(), n, "alarms found");
         assert!(pending.skipped.is_empty());

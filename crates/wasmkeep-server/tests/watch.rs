@@ -235,9 +235,12 @@ async fn a_monitor_alerts_once_per_change_through_the_webhook() {
     // again with a new timestamp; the hub must keep just one transition.
     // The GET waits for the first monitor event to finish before the reset.
     let _ = request(addr, "GET", "/actor/monitor/api/", "").await;
-    let storage = wasmkeep_storage::Storage::new(wasmkeep_storage::StorageConfig::new(data.path()));
+    let storage = wasmkeep_storage::Storage::new(
+        wasmkeep_storage::StorageConfig::new(data.path()),
+        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+    );
     {
-        let mut monitor = storage.open("default", "monitor", "api").unwrap();
+        let mut monitor = storage.open("monitor", "api").unwrap();
         monitor
             .exec("UPDATE state SET v = 'up' WHERE k = 'state'", &[])
             .unwrap();

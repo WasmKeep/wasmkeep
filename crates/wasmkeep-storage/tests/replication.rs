@@ -7,7 +7,7 @@ use std::path::Path;
 
 use wasmkeep_storage::ltx::{self, DbChecksum};
 use wasmkeep_storage::wal::{CaptureError, Changes, restore};
-use wasmkeep_storage::{ActorDb, SqlValue, Storage, StorageConfig};
+use wasmkeep_storage::{ActorDb, SqlValue, StateDir, Storage, StorageConfig};
 
 /// The LTX files an owner would upload: a snapshot, then one segment per
 /// capture.
@@ -84,8 +84,8 @@ fn dump(path: &Path) -> Vec<String> {
 }
 
 fn open(dir: &Path) -> ActorDb {
-    let storage = Storage::new(StorageConfig::new(dir));
-    let mut db = storage.open("t", "c", "a").unwrap();
+    let storage = rooted(StorageConfig::new(dir));
+    let mut db = storage.open("c", "a").unwrap();
     db.start_capture().unwrap();
     db
 }
@@ -249,8 +249,8 @@ fn a_segment_out_of_order_is_refused() {
 
 /// A snapshot and two segments of a small database.
 fn small_chain(dir: &tempfile::TempDir) -> Shipped {
-    let storage = Storage::new(StorageConfig::new(dir.path()));
-    let mut db = storage.open("t", "c", "a").unwrap();
+    let storage = rooted(StorageConfig::new(dir.path()));
+    let mut db = storage.open("c", "a").unwrap();
     db.start_capture().unwrap();
     let mut shipped = Shipped::start(&mut db);
     exec(&mut db, "CREATE TABLE t (x)", &[]);
@@ -365,4 +365,15 @@ fn a_chain_that_shrinks_the_database_restores_exactly() {
     let mut r = wasmkeep_storage::wal::Restorer::create(&path, 1 << 30).unwrap();
     assert!(r.apply(&seg).is_err(), "a segment with nothing before it");
     assert!(r.apply(&snap).is_err(), "applied after a failure");
+}
+
+/// A storage of tenant `t`, its databases at `<data_dir>/actors/t/` (where
+/// the server's state root puts them; this crate does not know it).
+fn rooted(config: StorageConfig) -> Storage {
+    let state = StateDir {
+        dir: "actors/t".into(),
+        scratch: ".deleting".into(),
+        tenant: "t".into(),
+    };
+    Storage::new(config, state)
 }

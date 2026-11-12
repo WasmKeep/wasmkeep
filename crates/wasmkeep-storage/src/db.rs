@@ -62,10 +62,26 @@ pub struct PendingAlarms {
     pub skipped: Vec<StorageError>,
 }
 
+/// Where one root's actor databases live under the data directory, and
+/// the tenant every one records as part of its address. Given by the
+/// server, which knows the layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateDir {
+    /// The folder of the databases, each at `<class>/<name>.db` in it,
+    /// relative to the data directory.
+    pub dir: PathBuf,
+    /// Scratch space, relative to the data directory.
+    pub scratch: PathBuf,
+    /// The tenant of every actor in it.
+    pub tenant: String,
+}
+
 /// Opens and deletes actor databases.
 #[derive(Debug, Clone)]
 pub struct Storage {
     config: StorageConfig,
+    /// Where this root's databases live.
+    state: StateDir,
     /// Open connections per database file.
     open: Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>>,
 }
@@ -96,12 +112,20 @@ impl Storage {
         &self.config
     }
 
-    /// Uses `config.data_dir` (created on first open).
-    pub fn new(config: StorageConfig) -> Self {
+    /// Opens databases in `state.dir` under `config.data_dir` (created on
+    /// first open).
+    pub fn new(config: StorageConfig, state: StateDir) -> Self {
         Self {
             config,
+            state,
             open: Arc::default(),
         }
+    }
+
+    /// Where this root's databases live.
+    #[must_use]
+    pub fn state(&self) -> &StateDir {
+        &self.state
     }
 
     /// Whether any connection to this database file is still open (a
@@ -114,21 +138,26 @@ impl Storage {
             .contains_key(path)
     }
 
+    /// Scratch space under the data directory.
+    #[must_use]
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.config.data_dir.join(&self.state.scratch)
+    }
+
     /// The database file for an actor.
-    pub fn db_path(&self, tenant: &str, class: &str, name: &str) -> PathBuf {
+    pub fn db_path(&self, class: &str, name: &str) -> PathBuf {
         self.config
             .data_dir
-            .join("actors")
-            .join(encode_segment(tenant))
+            .join(&self.state.dir)
             .join(encode_segment(class))
             .join(format!("{}.db", encode_segment(name)))
     }
 
     /// Opens (creating if needed) an actor's database.
-    pub fn open(&self, tenant: &str, class: &str, name: &str) -> Result<ActorDb, StorageError> {
+    pub fn open(&self, class: &str, name: &str) -> Result<ActorDb, StorageError> {
         #[cfg(feature = "fault-injection")]
         crate::faults::pause("open");
-        let path = self.db_path(tenant, class, name);
+        let path = self.db_path(class, name);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|source| StorageError::Io {
                 path: dir.to_owned(),
@@ -148,7 +177,7 @@ impl Storage {
         });
         // Record the address inside the database: file names of long names
         // are hashed, so scans need it to know which actor a file belongs to.
-        let address = format!("{tenant}/{class}/{name}");
+        let address = format!("{}/{class}/{name}", self.state.tenant);
         let recorded = db.meta(ADDRESS_KEY).map_err(|e| StorageError::Meta {
             path: path.clone(),
             source: e,
@@ -204,8 +233,8 @@ impl Storage {
     }
 
     /// Removes an actor's database files. The database must not be open.
-    pub fn delete(&self, tenant: &str, class: &str, name: &str) -> Result<(), StorageError> {
-        let path = self.db_path(tenant, class, name);
+    pub fn delete(&self, class: &str, name: &str) -> Result<(), StorageError> {
+        let path = self.db_path(class, name);
         #[cfg(feature = "fault-injection")]
         if crate::faults::take("delete") {
             return Err(StorageError::Io {
@@ -1106,8 +1135,13 @@ mod tests {
     #[test]
     fn a_refused_durable_begin_leaves_synchronous_normal() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = crate::Storage::new(crate::StorageConfig::new(dir.path()))
-            .open("t", "c", "a")
+        let state = crate::StateDir {
+            dir: "actors/t".into(),
+            scratch: ".deleting".into(),
+            tenant: "t".into(),
+        };
+        let mut db = crate::Storage::new(crate::StorageConfig::new(dir.path()), state)
+            .open("c", "a")
             .unwrap();
         // Read as the host does (the guest's sandbox refuses pragmas).
         let level = |db: &mut ActorDb| -> i64 {

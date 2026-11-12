@@ -143,11 +143,11 @@ impl ActorState {
                 let a = self.address.clone();
                 let residency = self.residency.clone();
                 let opened = tokio::task::spawn_blocking(move || {
-                    if !storage.db_path(a.tenant(), a.class(), a.name()).exists() {
+                    if !storage.db_path(a.class(), a.name()).exists() {
                         return Ok(None);
                     }
                     storage
-                        .open(a.tenant(), a.class(), a.name())
+                        .open(a.class(), a.name())
                         .map(|db| Some(residency.retain(db)))
                         .map_err(|e| e.to_string())
                 })

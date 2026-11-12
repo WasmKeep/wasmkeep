@@ -14,10 +14,13 @@ use std::collections::BTreeSet;
 
 use crate::lease::BucketError;
 use crate::membership::validate_node_id;
+use crate::state_root::{Family, StateRoot};
 
 /// Key prefix of every intent.
 pub const CONTROL_PREFIX: &str = "control/";
 const DRAIN: &str = "control/drain/";
+/// Every tenant's moves, as listed (built per tenant by
+/// [`StateRoot::key`] with [`Family::Moves`]).
 const MOVE: &str = "control/move/";
 
 /// A move key older than this, by the bucket's clock, is ignored and
@@ -52,9 +55,16 @@ pub struct MoveIntent {
 }
 
 impl MoveIntent {
-    /// Its key under `control/move/`.
+    /// Its key under `control/move/`: the key it was listed under, so
+    /// under the root of the tenant the listing gave (the prefix plays no
+    /// part in a key relative to it).
     pub fn key(&self) -> String {
-        move_key(&self.tenant, &self.class, &self.name, &self.target)
+        move_key(
+            &StateRoot::new("", self.tenant.as_str()),
+            &self.class,
+            &self.name,
+            &self.target,
+        )
     }
 }
 
@@ -78,17 +88,17 @@ pub fn drain_key(node: &str) -> Result<String, InvalidIntent> {
     Ok(format!("{DRAIN}{node}"))
 }
 
-/// The key that asks for actor `tenant/class/name` to move to `target`.
-/// Tenant and class must be single key segments; the name is hex-encoded,
-/// so any name fits.
+/// The key that asks for actor `class/name` of `root` to move to
+/// `target`. The root's tenant and the class must be single key segments;
+/// the name is hex-encoded, so any name fits.
 pub fn checked_move_key(
-    tenant: &str,
+    root: &StateRoot,
     class: &str,
     name: &str,
     target: &str,
 ) -> Result<String, InvalidIntent> {
     validate_node_id(target).map_err(|e| InvalidIntent(e.to_string()))?;
-    for (what, part) in [("tenant", tenant), ("class", class)] {
+    for (what, part) in [("tenant", root.tenant()), ("class", class)] {
         if !segment(part) {
             return Err(InvalidIntent(format!(
                 "invalid {what} {part:?}: one non-empty path segment"
@@ -98,11 +108,14 @@ pub fn checked_move_key(
     if name.is_empty() {
         return Err(InvalidIntent("empty actor name".into()));
     }
-    Ok(move_key(tenant, class, name, target))
+    Ok(move_key(root, class, name, target))
 }
 
-fn move_key(tenant: &str, class: &str, name: &str, target: &str) -> String {
-    format!("{MOVE}{tenant}/{class}/{}/{target}", hex(name.as_bytes()))
+fn move_key(root: &StateRoot, class: &str, name: &str, target: &str) -> String {
+    root.key(
+        Family::Moves,
+        &format!("{class}/{}/{target}", hex(name.as_bytes())),
+    )
 }
 
 fn segment(s: &str) -> bool {
@@ -195,7 +208,8 @@ mod tests {
     #[test]
     fn drain_and_move_keys_read_back() {
         let drain = drain_key("node-b").unwrap();
-        let mv = checked_move_key("acme", "room", "lobby/1 ünï", "node-c").unwrap();
+        let mv =
+            checked_move_key(&StateRoot::new("", "acme"), "room", "lobby/1 ünï", "node-c").unwrap();
         assert_eq!(drain, "control/drain/node-b");
         assert!(mv.starts_with("control/move/acme/room/"), "{mv}");
         let (control, expired) = parse(&[(drain, 10), (mv.clone(), 1_000)], 2_000);
@@ -216,7 +230,7 @@ mod tests {
 
     #[test]
     fn moves_expire_by_the_buckets_clock() {
-        let mv = checked_move_key("acme", "room", "x", "node-c").unwrap();
+        let mv = checked_move_key(&StateRoot::new("", "acme"), "room", "x", "node-c").unwrap();
         let (control, expired) = parse(&[(mv.clone(), 1_000)], 1_000 + MOVE_TTL_MS);
         assert_eq!(control.moves.len(), 1);
         assert!(expired.is_empty());
@@ -245,10 +259,10 @@ mod tests {
     #[test]
     fn bad_intents_are_refused_before_writing() {
         assert!(drain_key("Node B").is_err());
-        assert!(checked_move_key("acme", "room", "x", "Node C").is_err());
-        assert!(checked_move_key("ac/me", "room", "x", "c").is_err());
-        assert!(checked_move_key("acme", "", "x", "c").is_err());
-        assert!(checked_move_key("acme", "..", "x", "c").is_err());
-        assert!(checked_move_key("acme", "room", "", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme"), "room", "x", "Node C").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "ac/me"), "room", "x", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme"), "", "x", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme"), "..", "x", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme"), "room", "", "c").is_err());
     }
 }

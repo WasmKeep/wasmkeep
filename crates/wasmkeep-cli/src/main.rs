@@ -1482,7 +1482,12 @@ fn cluster_forget(args: &NodeArgs) -> anyhow::Result<()> {
 fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
     use wasmkeep_cluster::control::{self, Keys as _};
     let (tenant, class, name) = &args.actor;
-    let key = control::checked_move_key(tenant, class, name, &args.to)?;
+    let key = control::checked_move_key(
+        &wasmkeep_cluster::state_root::StateRoot::new("", tenant.as_str()),
+        class,
+        name,
+        &args.to,
+    )?;
     let (store, prefix) = open_bucket(&args.bucket)?;
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()

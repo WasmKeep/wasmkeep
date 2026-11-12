@@ -712,13 +712,7 @@ impl Replica {
         max_db_bytes: u64,
     ) -> Result<Self, ReplicaError> {
         let store = Arc::clone(&cluster.store);
-        let prefix = format!(
-            "{}actors/{}/{}/{}/",
-            cluster.store_prefix(),
-            address.tenant(),
-            address.class(),
-            wasmkeep_storage::encode_segment(address.name())
-        );
+        let prefix = format!("{}/", cluster.history_key(address));
         let sized = list_sized(&store, &prefix, Some(READ_IDLE)).await?;
         let keys: Vec<String> = sized.iter().map(|(k, _)| k.clone()).collect();
         let sizes: std::collections::HashMap<String, u64> = sized.into_iter().collect();
@@ -1552,13 +1546,7 @@ pub(crate) async fn exists_in_bucket(
     address: &ActorAddress,
 ) -> Result<bool, ReplicaError> {
     use futures_util::TryStreamExt;
-    let prefix = format!(
-        "{}actors/{}/{}/{}",
-        cluster.store_prefix(),
-        address.tenant(),
-        address.class(),
-        wasmkeep_storage::encode_segment(address.name())
-    );
+    let prefix = cluster.history_key(address);
     let base = StorePath::from(prefix);
     let mut listing = cluster.store.list(Some(&base));
     listing
@@ -1575,13 +1563,7 @@ pub(crate) async fn highest_generation_in_bucket(
     cluster: &Cluster,
     address: &ActorAddress,
 ) -> Result<u64, ReplicaError> {
-    let prefix = format!(
-        "{}actors/{}/{}/{}/",
-        cluster.store_prefix(),
-        address.tenant(),
-        address.class(),
-        wasmkeep_storage::encode_segment(address.name())
-    );
+    let prefix = format!("{}/", cluster.history_key(address));
     let keys = list_with(&cluster.store, &prefix, Some(READ_IDLE)).await?;
     Ok(Listing::from_keys(keys.iter().map(String::as_str)).highest_generation())
 }

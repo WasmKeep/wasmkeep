@@ -273,11 +273,9 @@ impl ActorState {
         {
             return Ok(true);
         }
-        let path = self.storage.db_path(
-            self.address.tenant(),
-            self.address.class(),
-            self.address.name(),
-        );
+        let path = self
+            .storage
+            .db_path(self.address.class(), self.address.name());
         let local = tokio::task::spawn_blocking(move || path.exists())
             .await
             .map_err(|e| e.to_string())?;
@@ -362,11 +360,9 @@ impl ActorState {
                 self.owner_hint = None;
                 let (view, generation) = (hold.view(), hold.generation().unwrap_or(0));
                 self.lease = Some(hold);
-                let path = self.storage.db_path(
-                    self.address.tenant(),
-                    self.address.class(),
-                    self.address.name(),
-                );
+                let path = self
+                    .storage
+                    .db_path(self.address.class(), self.address.name());
                 // A call cut short may still be closing the old connection
                 // on a blocking thread; never replace the file under it.
                 let deadline = std::time::Instant::now() + self.limits.wall;
@@ -691,7 +687,7 @@ impl ActorState {
             }
             let mut db = residency.retain(
                 storage
-                    .open(a.tenant(), a.class(), a.name())
+                    .open(a.class(), a.name())
                     .map_err(|e| format!("{e:#}"))?,
             );
             db.start_capture().map_err(|e| e.to_string())?;
@@ -858,11 +854,9 @@ impl ActorState {
                     // A host panic can retire the old mailbox while its
                     // blocking worker still owns this actor's connection.
                     // A fresh reservation must not overlap that SQL work.
-                    let path = self.storage.db_path(
-                        self.address.tenant(),
-                        self.address.class(),
-                        self.address.name(),
-                    );
+                    let path = self
+                        .storage
+                        .db_path(self.address.class(), self.address.name());
                     let deadline = tokio::time::Instant::now() + self.limits.wall;
                     while self.storage.is_open(&path) {
                         if tokio::time::Instant::now() >= deadline {
@@ -877,7 +871,7 @@ impl ActorState {
                     let residency = self.residency.clone();
                     tokio::task::spawn_blocking(move || {
                         storage
-                            .open(a.tenant(), a.class(), a.name())
+                            .open(a.class(), a.name())
                             .map(|db| residency.retain(db))
                     })
                     .await
@@ -1065,10 +1059,8 @@ impl ActorState {
             self.db = None; // close before removing the files
             let storage = self.storage.clone();
             let a = self.address.clone();
-            let removed = tokio::task::spawn_blocking(move || {
-                storage.delete(a.tenant(), a.class(), a.name())
-            })
-            .await;
+            let removed =
+                tokio::task::spawn_blocking(move || storage.delete(a.class(), a.name())).await;
             let files_removed = matches!(removed, Ok(Ok(())));
             if !files_removed {
                 if self.replica.is_some() {

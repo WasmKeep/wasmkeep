@@ -23,7 +23,10 @@ fn address(name: &str) -> ActorAddress {
 
 fn fixture(idle_timeout: Duration) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Storage::new(StorageConfig::new(directory.path()));
+    let storage = Storage::new(
+        StorageConfig::new(directory.path()),
+        crate::state_dir(&crate::StateRoot::new("", "tenant")),
+    );
     let factory_storage = storage.clone();
     let mailboxes = Mailboxes::new_with_residency(
         MailboxConfig {
@@ -34,7 +37,7 @@ fn fixture(idle_timeout: Duration) -> Fixture {
         move |address: ActorAddress, residency| {
             let storage = factory_storage.clone();
             async move {
-                let db = storage.open(address.tenant(), address.class(), address.name())?;
+                let db = storage.open(address.class(), address.name())?;
                 Ok::<_, BoxError>(ActorHost::new(
                     residency.retain(db),
                     Arc::<Sockets>::default(),
@@ -106,17 +109,14 @@ async fn cancelled_db_work_and_cancelled_drain_preserve_the_connection() {
     );
     f.mailboxes.close();
     assert!(f.mailboxes.drained(Duration::from_secs(5)).await);
-    assert!(
-        !f.storage
-            .is_open(&f.storage.db_path("tenant", "class", "recover"))
-    );
+    assert!(!f.storage.is_open(&f.storage.db_path("class", "recover")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_detached_db_worker_keeps_capacity_until_the_connection_closes() {
     let f = fixture(Duration::from_millis(10));
     let actor = address("retiring");
-    let path = f.storage.db_path("tenant", "class", "retiring");
+    let path = f.storage.db_path("class", "retiring");
     let (started, ready) = oneshot::channel();
     let (release, held) = mpsc::channel();
     let interrupted = f.mailboxes.submit(&actor, move |host| {
@@ -150,7 +150,7 @@ async fn a_detached_db_worker_keeps_capacity_until_the_connection_closes() {
         .submit(&address("new"), |_host| Box::pin(async {}))
         .await;
     assert!(matches!(refused, Err(MailboxError::Capacity(_))));
-    assert!(!f.storage.db_path("tenant", "class", "new").exists());
+    assert!(!f.storage.db_path("class", "new").exists());
     f.mailboxes.close();
     assert!(!f.mailboxes.drained(Duration::from_millis(30)).await);
 
@@ -280,10 +280,13 @@ async fn an_alarm_refused_for_capacity_retries_after_a_gated_blocker() {
 
     // Receiving the outbound request proves the blocker is running in the
     // sole slot. Keep it there with the channel, not a guessed sleep interval.
-    let storage = Storage::new(StorageConfig::new(data.path()));
-    let path = actor_storage.db_path("default", "test", "alarm");
+    let storage = Storage::new(
+        StorageConfig::new(data.path()),
+        crate::state_dir(&crate::StateRoot::new("", "default")),
+    );
+    let path = actor_storage.db_path("test", "alarm");
     assert!(!actor_storage.is_open(&path));
-    let mut observed = storage.open("default", "test", "alarm").unwrap();
+    let mut observed = storage.open("test", "alarm").unwrap();
     assert_eq!(stored_count(&mut observed, "attempts"), 0);
     assert_eq!(stored_count(&mut observed, "fired"), 0);
     let due = crate::alarm::now_ms();

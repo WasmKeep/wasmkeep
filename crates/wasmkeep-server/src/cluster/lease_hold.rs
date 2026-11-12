@@ -449,11 +449,14 @@ impl Cluster {
     /// The ownership record of an actor (ADR 0020). The name is encoded
     /// like the database file name, so any actor name is a safe key.
     pub(crate) fn owner_key(&self, address: &ActorAddress) -> String {
-        format!(
-            "owners/{}/{}/{}",
-            address.tenant(),
-            address.class(),
-            wasmkeep_storage::encode_segment(address.name())
+        self.debug_assert_mine(address);
+        self.root.key(
+            Family::Owners,
+            &format!(
+                "{}/{}",
+                address.class(),
+                wasmkeep_storage::encode_segment(address.name())
+            ),
         )
     }
 
@@ -470,7 +473,7 @@ impl Cluster {
             &self.control_keys,
             &SystemClock,
             &self.lease_config,
-            &Cluster::lease_key(address),
+            &self.lease_key(address),
             keys,
         )
         .await?;

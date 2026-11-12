@@ -1202,7 +1202,13 @@ async fn request_move(
     target: &str,
 ) -> object_store::path::Path {
     use object_store::ObjectStoreExt as _;
-    let key = wasmkeep_cluster::control::checked_move_key("default", "t", name, target).unwrap();
+    let key = wasmkeep_cluster::control::checked_move_key(
+        &wasmkeep_cluster::state_root::StateRoot::new("", "default"),
+        "t",
+        name,
+        target,
+    )
+    .unwrap();
     let path = object_store::path::Path::from(key);
     store.put(&path, Vec::new().into()).await.unwrap();
     path

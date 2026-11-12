@@ -18,7 +18,7 @@ mod path;
 mod value;
 pub mod wal;
 
-pub use db::{ActorDb, PendingAlarms, Storage, StorageConfig};
+pub use db::{ActorDb, PendingAlarms, StateDir, Storage, StorageConfig};
 pub use error::{SqlError, SqlErrorKind, StorageError};
 pub use path::encode_segment;
 pub use value::{Rows, SqlValue};

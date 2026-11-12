@@ -4,6 +4,7 @@
 //! must be one on purpose.
 
 use super::*;
+use wasmkeep_cluster::state_root::StateRoot;
 use wasmkeep_storage::{Storage, StorageConfig};
 
 /// Names that cover the encodings: plain, escaped, and one long enough to
@@ -19,7 +20,7 @@ fn node_on(prefix: &str) -> Arc<Cluster> {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let mut config = ClusterConfig::new("n1", "http://n1", store);
     config.prefix = prefix.into();
-    Cluster::new(&config, "acme/").unwrap()
+    Cluster::new(&config, "acme/", "acme").unwrap()
 }
 
 fn actor(name: &str) -> ActorAddress {
@@ -39,13 +40,13 @@ async fn owner_and_lease_keys_are_relative_to_the_prefix() {
             c.owner_key(&actor(&long())),
             format!("owners/acme/chat/{}", long_encoded())
         );
-        assert_eq!(Cluster::lease_key(&actor(PLAIN)), "leases/acme/chat/room-1");
+        assert_eq!(c.lease_key(&actor(PLAIN)), "leases/acme/chat/room-1");
         assert_eq!(
-            Cluster::lease_key(&actor(ESCAPED)),
+            c.lease_key(&actor(ESCAPED)),
             "leases/acme/chat/%52oom%201%20%C3%A9"
         );
         assert_eq!(
-            Cluster::lease_key(&actor(&long())),
+            c.lease_key(&actor(&long())),
             format!("leases/acme/chat/{}", long_encoded())
         );
     }
@@ -60,7 +61,7 @@ fn long_encoded() -> String {
 async fn alarm_keys_carry_the_prefix() {
     for (prefix, p) in [("", ""), ("p", "p/"), ("p/", "p/")] {
         let c = node_on(prefix);
-        assert_eq!(c.alarm_base("acme").as_ref(), format!("{p}alarms/acme"));
+        assert_eq!(c.alarm_base().as_ref(), format!("{p}alarms/acme"));
         let tagged = Entry::owned(1_700_000_000_000, 7, "ab12").unwrap();
         assert_eq!(
             c.alarm_key(&actor(PLAIN), &tagged).as_ref(),
@@ -80,24 +81,75 @@ async fn alarm_keys_carry_the_prefix() {
 #[test]
 fn move_keys_are_relative_to_the_prefix() {
     assert_eq!(
-        wasmkeep_cluster::control::checked_move_key("acme", "chat", ESCAPED, "node-b").unwrap(),
+        wasmkeep_cluster::control::checked_move_key(
+            &StateRoot::new("", "acme"),
+            "chat",
+            ESCAPED,
+            "node-b"
+        )
+        .unwrap(),
         "control/move/acme/chat/526f6f6d203120c3a9/node-b"
     );
 }
 
 #[test]
 fn database_files_are_per_tenant_and_class() {
-    let storage = Storage::new(StorageConfig::new("/data"));
+    let at = |tenant: &str| {
+        Storage::new(
+            StorageConfig::new("/data"),
+            crate::state_dir(&StateRoot::new("p/", tenant)),
+        )
+    };
+    let storage = at("acme");
     assert_eq!(
-        storage.db_path("acme", "chat", PLAIN),
+        storage.db_path("chat", PLAIN),
         std::path::Path::new("/data/actors/acme/chat/room-1.db")
     );
     assert_eq!(
-        storage.db_path("Acme", "chat", ESCAPED),
+        at("Acme").db_path("chat", ESCAPED),
         std::path::Path::new("/data/actors/%41cme/chat/%52oom%201%20%C3%A9.db")
     );
     assert_eq!(
-        storage.db_path("acme", "chat", &long()),
+        storage.db_path("chat", &long()),
         std::path::Path::new(&format!("/data/actors/acme/chat/{}.db", long_encoded()))
     );
+    assert_eq!(
+        storage.scratch_dir(),
+        std::path::Path::new("/data/.deleting")
+    );
+}
+
+#[tokio::test]
+async fn history_keys_carry_the_prefix() {
+    use wasmkeep_cluster::replication::{SegmentId, snapshot_key};
+    for (prefix, p) in [("", ""), ("p", "p/"), ("p/", "p/")] {
+        let c = node_on(prefix);
+        assert_eq!(
+            c.history_key(&actor(PLAIN)),
+            format!("{p}actors/acme/chat/room-1")
+        );
+        assert_eq!(
+            c.history_key(&actor(ESCAPED)),
+            format!("{p}actors/acme/chat/%52oom%201%20%C3%A9")
+        );
+        assert_eq!(
+            c.history_key(&actor(&long())),
+            format!("{p}actors/acme/chat/{}", long_encoded())
+        );
+        let snapshot = snapshot_key(SegmentId {
+            txid: 9,
+            generation: 2,
+        });
+        assert_eq!(
+            format!("{}/{snapshot}", c.history_key(&actor(PLAIN))),
+            format!("{p}actors/acme/chat/room-1/snapshot/0000000000000009-0000000000000002.ltx")
+        );
+    }
+}
+
+#[test]
+fn a_listed_move_is_deleted_under_the_key_it_was_listed_at() {
+    let listed = "control/move/other/chat/526f6f6d203120c3a9/node-b".to_owned();
+    let (control, _) = wasmkeep_cluster::control::parse(&[(listed.clone(), 5)], 5);
+    assert_eq!(control.moves[0].key(), listed);
 }
