@@ -526,10 +526,18 @@ async fn b_with_a_pooled_connection_to_a() -> (Node, Node, PeerProxy, [tempfile:
 }
 
 /// The owner closes a connection it kept idle (its own idle limit, or a
-/// restart) while the forwarding node still has it in its pool. The
-/// forwarding node's client sees the close before it writes anything, so
-/// the next request goes out on a new connection and the client never
-/// notices: no 503.
+/// restart) while the forwarding node still has it in its pool. The next
+/// request goes out on a new connection and the client never notices: no
+/// 503.
+///
+/// A characterization test of the HTTP client's pool, not of anything
+/// this crate does: the test waits until the close reached the forwarding
+/// node, so the pooled connection's task has ended and the pool drops the
+/// entry when the next request takes a connection (its checkout skips
+/// connections that are no longer open). The client's other mechanism,
+/// sending again a request it got back unsent from a reused connection
+/// (a close that arrives between the checkout and the write), is not what
+/// passes here, and no test in this suite reaches it on purpose.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_after_the_owner_closed_the_idle_connection_goes_on_a_new_one() {
     let (_a, b, proxy, _dirs) = b_with_a_pooled_connection_to_a().await;
