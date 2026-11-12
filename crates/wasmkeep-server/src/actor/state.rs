@@ -417,6 +417,9 @@ impl ActorState {
                 if let OwnershipError::NotOwner { owner, until_ms } = &e {
                     let until = (*until_ms).min(now_ms().saturating_add(HINT_MS));
                     self.owner_hint = Some((owner.clone(), until));
+                    // Another node's actor now: its periodic snapshots
+                    // are that node's to schedule.
+                    cluster.snapshot_waits.forget(&self.address);
                 }
                 Err(e)
             }
@@ -593,7 +596,11 @@ impl ActorState {
         .await
         .map_err(|e| e.to_string())??;
         if let Some(all) = snapshot {
-            let shipped = slot.lock().await.ship_snapshot(&all, true).await;
+            let shipped = slot
+                .lock()
+                .await
+                .ship_snapshot(&all, crate::replica::SnapshotKind::First)
+                .await;
             if let Err(e) = shipped {
                 self.abandon(&format!("first snapshot: {e}"));
                 return Err(format!("replication: {e}"));
@@ -626,7 +633,10 @@ impl ActorState {
         }
         if replica.failed().is_none() && replica.snapshot_due() {
             match with_db(&mut live.store, |db| db.snapshot()).await {
-                Ok(Ok(all)) => match replica.ship_snapshot(&all, false).await {
+                Ok(Ok(all)) => match replica
+                    .ship_snapshot(&all, crate::replica::SnapshotKind::Periodic)
+                    .await
+                {
                     // Created and acknowledged: collect what it makes
                     // unnecessary (ADR 0012), in the background.
                     Ok(true) => {
@@ -702,7 +712,10 @@ impl ActorState {
                         // then everything before it goes, whatever the
                         // retention window: erasing the data is the point
                         // of the delete (ADR 0012).
-                        match replica.ship_snapshot(&empty, false).await {
+                        match replica
+                            .ship_snapshot(&empty, crate::replica::SnapshotKind::AfterDelete)
+                            .await
+                        {
                             Ok(true) => {
                                 let request = CollectRequest {
                                     collector: replica.collector(),
@@ -741,6 +754,11 @@ impl ActorState {
             }
             Err(e) => Err(e),
         };
+        // A deleted actor leaves no wait behind on this node; the replica
+        // in memory keeps its own for as long as it lives.
+        if let Some(cluster) = &self.cluster {
+            cluster.snapshot_waits.forget(&self.address);
+        }
         if let Err(e) = result {
             self.abandon(&format!("recording the delete: {e}"));
         }

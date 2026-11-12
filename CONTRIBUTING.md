@@ -47,8 +47,8 @@ links and Markdown anchors, not remote links.
 Merges rely on `./scripts/check.sh --full` run locally; hosted CI (GitHub
 Actions) adds Linux on x86_64 and arm64, most of the checks listed
 above, and the publication backstop described below. A pull request that
-changes only documentation or benchmark result files (the list is in
-`scripts/ci-changes.sh`) runs the docs site and the publication checks
+changes only documentation, benchmark result files or the two release
+workflows (the list is in `scripts/ci-changes.sh`) runs the docs site and the publication checks
 alone: nothing else reads those files. Every push to `main` runs
 everything, the suite on macOS included, which pull requests do not run;
 it also runs nightly.

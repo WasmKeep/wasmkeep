@@ -31,7 +31,7 @@ void wk_ws_message(uint64_t conn, wk_bytes data, bool binary) {
 }
 ```
 
-Starting with the release after 0.1.0, a release carries this SDK as
+A release carries this SDK (from 0.2.0 on) as
 `wasmkeep-c-sdk-<version>.tar.gz`, signed like its other files: the
 sources with the bindings already generated, the WIT and the componentize
 script, so building needs no clone and no wit-bindgen. Its README has the

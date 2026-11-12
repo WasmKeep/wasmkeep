@@ -117,6 +117,10 @@ pub struct ClusterConfig {
     /// collection could delete it (ADR 0012): objects younger than this
     /// are kept for a later pass. Not applied after a delete.
     pub history_retention: Duration,
+    /// The least time between a periodic snapshot whose upload failed and
+    /// the next try: 30 s, the longest bounded wait of a caller queued
+    /// behind the actor. Tests shorten it.
+    pub snapshot_retry_min: Duration,
     /// This node reads the app's secrets from the bucket (heartbeat line
     /// 10, ADR 0016); `false` with `--no-secrets`.
     pub reads_secrets: bool,
@@ -172,6 +176,7 @@ impl ClusterConfig {
             cluster_tls: None,
             cluster_plaintext: ClusterPlaintext::Accept,
             history_retention: Duration::from_secs(3600),
+            snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
             reads_secrets: true,
         }
     }
@@ -314,6 +319,11 @@ pub(crate) struct Cluster {
     pub(crate) alarm_sweep: Duration,
     /// ADR 0012's retention window ([`ClusterConfig::history_retention`]).
     pub(crate) history_retention: Duration,
+    /// [`ClusterConfig::snapshot_retry_min`].
+    pub(crate) snapshot_retry_min: Duration,
+    /// Actors' waits after a periodic snapshot that failed: here, so they
+    /// outlive an actor's time in memory.
+    pub(crate) snapshot_waits: Arc<crate::replica::SnapshotWaits>,
     /// When a heartbeat last reached the bucket (ms since the epoch; 0:
     /// never), and how often one is sent: for readiness.
     heartbeat_ok_ms: std::sync::atomic::AtomicU64,
@@ -544,6 +554,8 @@ impl Cluster {
             ),
             alarm_sweep: config.alarm_sweep,
             history_retention: config.history_retention,
+            snapshot_retry_min: config.snapshot_retry_min,
+            snapshot_waits: Arc::default(),
             heartbeat_ok_ms: std::sync::atomic::AtomicU64::new(0),
             heartbeat_every: config.heartbeat,
             heartbeat_landed: tokio::sync::Notify::new(),

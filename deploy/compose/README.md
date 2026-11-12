@@ -149,11 +149,11 @@ LICENSE, NOTICE and, in released images, the third-party notices are in
 For each release, CI publishes the image for linux/amd64 and
 linux/arm64 as `ghcr.io/wasmkeep/wasmkeep:<version>`, signed with keyless
 cosign like the release binaries. To check it before running it (cosign 3),
-here for `v0.1.0`:
+here for `v0.2.0`:
 
 ```bash
-cosign verify ghcr.io/wasmkeep/wasmkeep:0.1.0 \
-  --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.1.0 \
+cosign verify ghcr.io/wasmkeep/wasmkeep:0.2.0 \
+  --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -161,13 +161,14 @@ It prints the verified digest; pin that digest (`ghcr.io/wasmkeep/wasmkeep@sha25
 in your deployment rather than the tag. The `dev` tag is a test build of
 the release process, overwritten without notice: do not deploy it.
 
-To serve one component with it, mount the component and a volume for the
-data, and listen on every address of the container:
+To serve one component with it (the release's `counter.wasm`, for
+instance), mount the component and a volume for the data, and listen on
+every address of the container:
 
 ```bash
 docker run --rm -p 8080:8080 \
   -v "$PWD/counter.wasm:/counter.wasm:ro" -v wasmkeep-data:/var/lib/wasmkeep \
-  ghcr.io/wasmkeep/wasmkeep:0.1.0 serve --listen 0.0.0.0:8080 --actor counter=/counter.wasm
+  ghcr.io/wasmkeep/wasmkeep:0.2.0 serve --listen 0.0.0.0:8080 --actor counter=/counter.wasm
 ```
 
 The component must be readable by user 65532 (on SELinux hosts, add `,Z`

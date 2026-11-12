@@ -454,6 +454,9 @@ async fn move_resident(
     // The stub goes either way. After a success the lease names the
     // target, so this node forwards to it.
     inner.mailboxes.hibernate(address);
+    if done {
+        cluster.snapshot_waits.forget(address);
+    }
     match answer {
         TakeAnswer::Held => {}
         TakeAnswer::HeldBy(holder) if holder == intent.target => {}

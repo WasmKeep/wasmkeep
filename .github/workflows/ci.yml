@@ -30,7 +30,8 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Documentation and benchmark result files are read by no code job: a pull
+  # Documentation, benchmark result files and the two release workflows
+  # (which run on a tag or a published release) are read by no code job: a pull
   # request that changes nothing else runs this job, "benchmark publication
   # paths" and "docs site" only. scripts/ci-changes.sh holds the list.
   #

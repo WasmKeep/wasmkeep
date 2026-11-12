@@ -262,6 +262,7 @@ async fn hand_over_one(inner: Arc<ServiceInner>, cluster: Arc<Cluster>, address:
     match outcome {
         HandOver::Done { alarm } => {
             inner.mailboxes.hibernate(&address);
+            cluster.snapshot_waits.forget(&address);
             tracing::info!(actor = %address, "handed over (draining)");
             if let Some(at) = alarm {
                 hand_off(&inner, &cluster, &address, at).await;

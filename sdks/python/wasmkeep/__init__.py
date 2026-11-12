@@ -15,9 +15,10 @@ class Hits(Actor):
 WitWorld, IncomingHandler = Hits.exports()
 ```
 
-Build with componentize-py, adding this directory to the module path:
+Build `app.py` into a component (componentize-py, with the WIT world this
+package carries):
 
-    componentize-py -d WIT -w actor componentize app -p path/to/sdks/python -o actor.wasm
+    python -m wasmkeep build app -o actor.wasm
 
 Every hook runs one event at a time per actor: no locks needed. One
 instance of the class handles events until the actor hibernates; keep state
@@ -27,28 +28,56 @@ that must survive in `storage`, not on `self`.
 import json as _json
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from componentize_py_types import Err, Ok
-from wit_world import exports as _exports
-from wit_world.imports import actors as _actors
-from wit_world.imports import alarms as _alarms
-from wit_world.imports import env as _env
-from wit_world.imports import storage as _storage
-from wit_world.imports import websockets as _ws
-from wit_world.imports.streams import StreamError_Closed
-from wit_world.imports.wasi_http_types import (
-    Fields,
-    Method_Other,
-    OutgoingBody,
-    OutgoingResponse,
-    ResponseOutparam,
-)
-from wit_world.imports.wasmkeep_actor_types import (
-    Value_Blob,
-    Value_Integer,
-    Value_Null,
-    Value_Real,
-    Value_Text,
-)
+# componentize-py generates these two modules into the component: they exist
+# there and nowhere else. Under plain CPython (`python -m wasmkeep build`, an
+# editor, a test runner) the package still imports, and whatever needs the
+# host says so when it is used.
+try:
+    from componentize_py_types import Err, Ok
+    from wit_world import exports as _exports
+    from wit_world.imports import actors as _actors
+    from wit_world.imports import alarms as _alarms
+    from wit_world.imports import env as _env
+    from wit_world.imports import storage as _storage
+    from wit_world.imports import websockets as _ws
+    from wit_world.imports.streams import StreamError_Closed
+    from wit_world.imports.wasi_http_types import (
+        Fields,
+        Method_Other,
+        OutgoingBody,
+        OutgoingResponse,
+        ResponseOutparam,
+    )
+    from wit_world.imports.wasmkeep_actor_types import (
+        Value_Blob,
+        Value_Integer,
+        Value_Null,
+        Value_Real,
+        Value_Text,
+    )
+except ModuleNotFoundError as _missing:
+    if _missing.name not in ("componentize_py_types", "wit_world"):
+        raise
+
+    class _Outside:
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError(
+                "wasmkeep: the host's functions exist only inside a component; "
+                "build one with `python -m wasmkeep build` and serve it with wasmkeep"
+            )
+
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            self()
+
+    class Err(Exception):  # type: ignore[no-redef]
+        """Never raised out here: only the host fails a call."""
+
+    Ok = _exports = _actors = _alarms = _env = _storage = _ws = _Outside()
+    StreamError_Closed = Fields = Method_Other = OutgoingBody = _Outside()
+    OutgoingResponse = ResponseOutparam = _Outside()
+    Value_Blob = Value_Integer = Value_Null = Value_Real = Value_Text = _Outside()
 
 __all__ = [
     "Actor",
@@ -70,7 +99,7 @@ __all__ = [
 ]
 
 # The package's version, as in pyproject.toml (test/test_package.py checks it).
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 # The version of the `wasmkeep:actor` WIT package in wasmkeep/wit: the
 # interface the SDK is written against, which changes less often.
 WIT_VERSION = "0.2.0"
