@@ -223,23 +223,47 @@ impl Sockets {
         if let Some(conn) = registry.conns.get_mut(&id)
             && &conn.owner == owner
         {
-            conn.accepted = false;
-            // If the queue is full the socket is dropped instead: still closed.
-            if let Some(tx) = conn.tx.take() {
-                let _ = tx.try_send(Outgoing::Close(code, reason));
-            }
+            Self::close_conn(conn, code, &reason);
         }
     }
 
-    /// Closes every connection on the node (shutdown). Each task releases
-    /// its own slot after finishing cleanup.
-    pub(crate) fn close_all(&self, code: u16, reason: &str) {
+    /// Closes every connection on the node (shutdown, a lapsed node
+    /// lease). Each task releases its own slot after finishing cleanup.
+    /// Returns how many were open (not closing already).
+    pub(crate) fn close_all(&self, code: u16, reason: &str) -> usize {
         let mut registry = self.lock();
+        let mut closed = 0;
         for conn in registry.conns.values_mut() {
-            conn.accepted = false;
-            if let Some(tx) = conn.tx.take() {
-                let _ = tx.try_send(Outgoing::Close(code, reason.to_owned()));
+            closed += usize::from(Self::close_conn(conn, code, reason));
+        }
+        closed
+    }
+
+    /// Closes every connection of `owner`, pending ones included (this
+    /// node no longer owns the actor). Returns how many were open.
+    pub(crate) fn close_owner(&self, owner: &ActorAddress, code: u16, reason: &str) -> usize {
+        let mut registry = self.lock();
+        let Registry { conns, by_owner } = &mut *registry;
+        let mut closed = 0;
+        for id in by_owner.get(owner).into_iter().flatten() {
+            if let Some(conn) = conns.get_mut(id) {
+                closed += usize::from(Self::close_conn(conn, code, reason));
             }
+        }
+        closed
+    }
+
+    /// Asks the writer to close `conn` and hides it; false if it was
+    /// closing already.
+    fn close_conn(conn: &mut Conn, code: u16, reason: &str) -> bool {
+        conn.accepted = false;
+        // If the queue is full the socket is dropped instead: still closed.
+        match conn.tx.take() {
+            Some(tx) => {
+                let _ = tx.try_send(Outgoing::Close(code, reason.to_owned()));
+                true
+            }
+            None => false,
         }
     }
 
@@ -403,6 +427,33 @@ mod tests {
         ));
         sockets.remove(opened.id);
         assert_eq!(sockets.len(), 0);
+    }
+
+    #[test]
+    fn closing_an_actors_sockets_leaves_other_actors_alone() {
+        let sockets = Sockets::default();
+        let (a, b) = (actor("a"), actor("b"));
+        let mut first = sockets.open(a.clone()).unwrap();
+        sockets.accept(first.id);
+        // Pending: its open event has not run yet. Closed too.
+        let mut pending = sockets.open(a.clone()).unwrap();
+        let mut other = sockets.open(b.clone()).unwrap();
+        sockets.accept(other.id);
+        assert_eq!(sockets.close_owner(&a, 1012, "moved"), 2);
+        assert_eq!(sockets.close_owner(&a, 1012, "moved"), 0, "closed once");
+        for conn in [&mut first, &mut pending] {
+            assert!(matches!(
+                conn.outgoing.try_recv(),
+                Ok(Outgoing::Close(1012, _))
+            ));
+        }
+        assert!(matches!(
+            other.outgoing.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(sockets.of(&b, None), vec![other.id]);
+        // Slots stay until each close event ran.
+        assert_eq!(sockets.reserved_by(&a), 2);
     }
 
     #[test]

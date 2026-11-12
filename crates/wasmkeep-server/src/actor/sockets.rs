@@ -164,11 +164,28 @@ impl ActorState {
         // hibernated with the socket open): on a draining node that closes
         // it, and the client's reconnect goes to the peer (ADR 0014).
         if let Err(e) = self.ensure_owner().await {
-            // The lease moved while the socket was open: the socket is on the
-            // wrong node now. Close it so the client reconnects.
             tracing::warn!(actor = %self.address, error = ?e, "websocket event: no longer the owner");
-            self.sockets
-                .close(&self.address, conn, 1012, "actor moved; reconnect".into());
+            match e {
+                // Another node owns the actor, or this draining node sends
+                // it to a peer: every socket of the actor here is on the
+                // wrong node, not only this one. Close them all, so a
+                // client that only listens reconnects too instead of
+                // missing every broadcast.
+                OwnershipError::NotOwner { .. } | OwnershipError::Elsewhere { .. } => {
+                    let closed =
+                        self.sockets
+                            .close_owner(&self.address, 1012, "actor moved; reconnect");
+                    crate::metrics::owner_closes("event", closed);
+                }
+                // Not now (the bucket, a write without an answer): this
+                // socket reconnects; the others try on their next frame.
+                OwnershipError::Unavailable(_)
+                | OwnershipError::Refused(_)
+                | OwnershipError::Broken(_) => {
+                    self.sockets
+                        .close(&self.address, conn, 1012, "actor moved; reconnect".into());
+                }
+            }
             return false;
         }
         if let Err(e) = self.ensure_ready().await {

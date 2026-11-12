@@ -193,6 +193,20 @@ pub(crate) struct Metrics {
     /// Node calls refused because the record of used signatures was full,
     /// by record (`calls`; `control`, takes and alarm hand-offs).
     pub(crate) signatures_refused_full: Family<AtomicU64>,
+    /// WebSockets this node closed with 1012 because it no longer owned
+    /// their actor, by how it found out (`event`, `sweep`, `lease_lapse`,
+    /// `drain`).
+    pub(crate) websocket_owner_closes: Family<AtomicU64>,
+}
+
+/// Counts `n` WebSockets closed for `reason` ([`Metrics::websocket_owner_closes`]).
+pub(crate) fn owner_closes(reason: &str, n: usize) {
+    if n > 0 {
+        METRICS
+            .websocket_owner_closes
+            .get(&[("reason", reason)])
+            .fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
 }
 
 /// The process's metrics.
@@ -443,6 +457,12 @@ pub fn render(gauges: Gauges) -> String {
         "wasmkeep_signatures_refused_full_total",
         "Node calls refused because the record of used signatures was full, by record.",
         &m.signatures_refused_full,
+    );
+    family(
+        &mut out,
+        "wasmkeep_websocket_owner_closes_total",
+        "WebSockets closed with 1012 because this node no longer owned their actor, by how it found out.",
+        &m.websocket_owner_closes,
     );
     out
 }

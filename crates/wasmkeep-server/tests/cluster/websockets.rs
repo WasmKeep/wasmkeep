@@ -202,3 +202,140 @@ async fn awkward_names_reach_their_room_from_any_node() {
         }
     }
 }
+
+type Client =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A chat client of room `lobby` on the node at `addr`, past its join
+/// message.
+async fn join_lobby(addr: SocketAddr) -> Client {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/actor/chat/lobby"))
+        .await
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) if t.contains("joined") => return ws,
+            Ok(Some(Ok(_))) => {}
+            other => panic!("no join message: {other:?}"),
+        }
+    }
+}
+
+/// The close code and reason `ws` gets within `within`, reading past any
+/// message; panics if it gets none. Reads on until the connection ends, so
+/// the client's answer to the close goes out, as a browser's does.
+async fn closed_within(ws: &mut Client, within: Duration) -> (u16, String) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = tokio::time::Instant::now() + within;
+    let closed = loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(Message::Close(Some(f))))) => {
+                break (u16::from(f.code), f.reason.to_string());
+            }
+            Ok(Some(Ok(Message::Close(None)))) => break (1005, String::new()),
+            Ok(Some(Ok(_))) => {}
+            Ok(other) => panic!("the socket ended without a close frame: {other:?}"),
+            Err(_) => panic!("not closed within {within:?}"),
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(_)) = ws.next().await {}
+    })
+    .await;
+    closed
+}
+
+/// The node `owners/default/chat/<name>` names, if any.
+async fn chat_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String> {
+    use object_store::ObjectStoreExt as _;
+    let key = object_store::path::Path::from(format!("owners/default/chat/{name}"));
+    let body = match store.get(&key).await {
+        Ok(r) => String::from_utf8(r.bytes().await.unwrap().to_vec()).unwrap(),
+        Err(object_store::Error::NotFound { .. }) => return None,
+        Err(e) => panic!("{e}"),
+    };
+    let node = body.lines().nth(1)?.split(' ').next()?.to_owned();
+    (node != "-").then_some(node)
+}
+
+/// Room `lobby` hibernated on `a` with its sockets open: its record
+/// released, no instance left.
+async fn lobby_parked(store: &Arc<dyn ObjectStore>, a: &Node) {
+    eventually("the lobby hibernated on a", async || {
+        a.service.resident() == 0 && chat_holder(store, "lobby").await.is_none()
+    })
+    .await;
+}
+
+/// b takes the lobby with a plain request, and holds it.
+async fn b_takes_lobby(store: &Arc<dyn ObjectStore>, b: &Node) {
+    let r = send_reachable(b.addr, "GET", "/actor/chat/lobby/", "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("b")),
+        "{}",
+        r.body
+    );
+    assert_eq!(chat_holder(store, "lobby").await.as_deref(), Some("b"));
+}
+
+/// A room that hibernated with sockets open on a, then taken by b, has
+/// sockets on the wrong node. The first one to send finds a no longer
+/// owns the room, and every socket of the room on a closes with 1012, not
+/// only that one: a client that only listens would otherwise stay
+/// connected to a room that no longer broadcasts to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_taken_by_another_node_closes_all_its_sockets_on_the_first_message() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let wasm = chat_wasm();
+    let wall = Duration::from_secs(30);
+    // a parks the room soon; b keeps what it takes.
+    let no_sweep = |_: &mut ActorConfig| {};
+    let idle = Duration::from_millis(300);
+    let a = node_configured(
+        "a",
+        da.path(),
+        &store,
+        idle,
+        &["chat"],
+        wasm,
+        wall,
+        "",
+        no_sweep,
+    )
+    .await;
+    let long = Duration::from_secs(30);
+    let b = node_configured(
+        "b",
+        db.path(),
+        &store,
+        long,
+        &["chat"],
+        wasm,
+        wall,
+        "",
+        no_sweep,
+    )
+    .await;
+    settle().await;
+    let mut talker = join_lobby(a.addr).await;
+    let mut listener = join_lobby(a.addr).await;
+    lobby_parked(&store, &a).await;
+    b_takes_lobby(&store, &b).await;
+    talker.send(Message::text("anyone?")).await.unwrap();
+    assert_eq!(
+        closed_within(&mut talker, Duration::from_secs(5)).await.0,
+        1012
+    );
+    assert_eq!(
+        closed_within(&mut listener, Duration::from_secs(5)).await.0,
+        1012,
+        "the listening client stayed on a"
+    );
+}
