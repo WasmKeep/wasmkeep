@@ -410,3 +410,28 @@ async fn oversized_client_messages_close_the_socket() {
     .expect("the socket stayed open after an oversized message");
     assert!(matches!(ended, Some(1009) | None), "{ended:?}");
 }
+
+/// A silent client is pinged after 25 s, so the socket carries traffic
+/// before a load balancer's usual idle timeout (60 s for nginx and AWS
+/// ALB) cuts it. It used to wait 60 s, exactly that timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_client_is_pinged_after_25_seconds() {
+    let (addr, _dir, _service) = start_with_limits(7, 256).await;
+    ready_actor(addr, "quiet").await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/actor/t/quiet"))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let frame = tokio::time::timeout(Duration::from_secs(35), ws.next())
+        .await
+        .expect("no ping within 35 s");
+    let waited = started.elapsed();
+    assert!(
+        matches!(frame, Some(Ok(Message::Ping(_)))),
+        "first frame: {frame:?}"
+    );
+    assert!(
+        waited >= Duration::from_secs(24) && waited <= Duration::from_secs(30),
+        "pinged after {waited:?}"
+    );
+}

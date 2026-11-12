@@ -28,8 +28,9 @@ node a     node b     node c       any node takes any request;
   ([monitoring](../monitoring.md)). `/_wasmkeep/health` only says the
   process answers.
 - **WebSockets** need the upgrade passed through and a tunnel or idle
-  timeout above 90 s (WasmKeep pings an idle socket after 60 s and closes
-  it 30 s later if there is no answer).
+  timeout above 30 s; the usual default of 60 s works (WasmKeep pings a
+  socket whose client has been silent for 25 s, and closes it 30 s later
+  if there is no answer).
 - **A server timeout above the failover wait.** When a node dies, the
   others keep a `GET`, a `HEAD` or a WebSocket upgrade for one of its
   actors until they took the actor over, up to 25 s by default

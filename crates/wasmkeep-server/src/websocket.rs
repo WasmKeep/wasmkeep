@@ -26,7 +26,9 @@ pub(crate) const MAX_SOCKETS_PER_ACTOR: usize = 1_000;
 pub(crate) const MAX_SOCKETS_PER_NODE: usize = 50_000;
 /// A silent client is pinged after this long, and closed if still silent
 /// after [`PONG_WAIT`] more (half-open connections otherwise never end).
-pub(crate) const PING_AFTER: Duration = Duration::from_secs(60);
+/// Under a load balancer's usual idle timeout (60 s for nginx and AWS
+/// ALB), so an idle socket carries a frame before the balancer cuts it.
+pub(crate) const PING_AFTER: Duration = Duration::from_secs(25);
 pub(crate) const PONG_WAIT: Duration = Duration::from_secs(30);
 
 /// The protocol limits for every socket the host accepts.
