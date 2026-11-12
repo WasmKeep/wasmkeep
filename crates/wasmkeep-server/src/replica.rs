@@ -52,22 +52,184 @@ const READ_AHEAD_BYTES: u64 = 32 << 20;
 const RESTORE_READS: usize = 32;
 const RESTORE_READ_MIB: u32 = 256;
 /// The listed bytes of the restore reads under way on this node (permits
-/// count whole megabytes; a read's time counts bytes).
-static RESTORE_READ_IN_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// count whole megabytes; a read's time counts bytes). Each restore's own
+/// part ([`OwnInFlight`]) changes under the same lock, so the two are
+/// always read as one: a restore alone on the node sees exactly its own
+/// bytes here.
+static RESTORE_READ_IN_FLIGHT: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 
-/// Counts a read's bytes in [`RESTORE_READ_IN_FLIGHT`] while it lives.
-struct InFlightBytes(u64);
+/// One restore's part of [`RESTORE_READ_IN_FLIGHT`].
+type OwnInFlight = Arc<std::sync::atomic::AtomicU64>;
+
+/// The bytes in flight on the node, and those of them that are `restore`'s.
+fn in_flight(restore: &OwnInFlight) -> (u64, u64) {
+    let node = RESTORE_READ_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (*node, restore.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Counts a read's bytes in [`RESTORE_READ_IN_FLIGHT`], and in its
+/// restore's part of it, while it lives.
+struct InFlightBytes(u64, OwnInFlight);
 
 impl InFlightBytes {
-    fn new(bytes: u64) -> Self {
-        RESTORE_READ_IN_FLIGHT.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        Self(bytes)
+    fn new(bytes: u64, restore: &OwnInFlight) -> Self {
+        let mut node = RESTORE_READ_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *node = node.saturating_add(bytes);
+        restore.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        Self(bytes, Arc::clone(restore))
     }
 }
 
 impl Drop for InFlightBytes {
     fn drop(&mut self) {
-        RESTORE_READ_IN_FLIGHT.fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+        let mut node = RESTORE_READ_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *node = node.saturating_sub(self.0);
+        self.1
+            .fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The limit of one try of a read: [`READ_IDLE`] plus a second per
+/// started megabyte of `bytes`, the bytes read over the same link
+/// alongside it, its own included.
+fn read_limit(bytes: u64) -> std::time::Duration {
+    let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    READ_IDLE.saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
+}
+
+/// The time one read has, shared by the read ([`bounded_get`]) and by the
+/// restore that waits for it, so the two never disagree.
+///
+/// A try's limit is [`read_limit`] of the most bytes seen in flight
+/// alongside it: what its restore had ahead when it was asked for, or the
+/// node's bytes in flight if more, looked at when the read starts, at
+/// every wait for the body, and when its restore looks at its deadline.
+/// Those bytes are either its own restore's or other restores'. The limit
+/// the same try would have with no other restore on the node is
+/// [`read_limit`] of the most of its own restore's bytes seen; the
+/// difference, whole seconds, is what the other restores' bytes added:
+/// the read's *lift*. It is exactly zero for a restore alone on the node.
+struct ReadTime {
+    /// Its restore's bytes in flight; `None` for a read outside a restore,
+    /// whose time counts `ahead` alone.
+    restore: Option<OwnInFlight>,
+    /// The most bytes seen in flight alongside it, and the most of its own
+    /// restore's: never under `ahead`, the listed bytes its restore was
+    /// reading ahead when it was asked for, its own included.
+    all: std::sync::atomic::AtomicU64,
+    own: std::sync::atomic::AtomicU64,
+    /// The lifts of the tries that ended, in ms.
+    ended: std::sync::atomic::AtomicU64,
+}
+
+impl ReadTime {
+    fn new(ahead: u64, restore: Option<OwnInFlight>) -> Self {
+        Self {
+            restore,
+            all: ahead.into(),
+            own: ahead.into(),
+            ended: 0.into(),
+        }
+    }
+
+    /// Looks at the bytes in flight now: the current try's limit, and its
+    /// lift.
+    fn look(&self) -> (std::time::Duration, std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (node, own) = self.restore.as_ref().map_or((0, 0), in_flight);
+        let all = self.all.fetch_max(node, Relaxed).max(node);
+        let own = self.own.fetch_max(own, Relaxed).max(own);
+        let limit = read_limit(all);
+        (limit, limit.saturating_sub(read_limit(own)))
+    }
+
+    /// A try ended and another follows: its lift stays counted.
+    fn next_try(&self) {
+        let lift = u64::try_from(self.look().1.as_millis()).unwrap_or(u64::MAX);
+        self.ended
+            .fetch_add(lift, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The lifts of its tries so far, the current one included.
+    fn lifted(&self) -> std::time::Duration {
+        let ended = self.ended.load(std::sync::atomic::Ordering::Relaxed);
+        std::time::Duration::from_millis(ended).saturating_add(self.look().1)
+    }
+}
+
+/// A read's place under the node's limits on reads: one of
+/// [`RESTORE_READS`], its megabytes of [`RESTORE_READ_MIB`], and its
+/// bytes counted in flight. Held while the bucket is asked and answers,
+/// and given up for the pause before a resend ([`READ_PAUSE`]): a read
+/// that only waits keeps no other restore's read waiting, and its bytes,
+/// which nobody is reading, add nothing to the other reads' limits. A
+/// read keeps nothing of a failed try's answer while it is without its
+/// megabytes, which are what bounds the memory of the node's reads.
+struct Turn {
+    megabytes: u32,
+    counted: u64,
+    restore: OwnInFlight,
+    /// Whether the read has its place, for the restore that waits for
+    /// it: waiting for a place is not the restore's time.
+    has: tokio::sync::watch::Sender<bool>,
+    held: Option<(
+        tokio::sync::SemaphorePermit<'static>,
+        tokio::sync::SemaphorePermit<'static>,
+        InFlightBytes,
+    )>,
+}
+
+impl Turn {
+    /// The place of a read of `size` listed bytes, not taken yet.
+    fn new(size: u64, restore: OwnInFlight, has: tokio::sync::watch::Sender<bool>) -> Self {
+        // One read takes at most a read-ahead's worth: a larger object
+        // would take the whole budget, and the fair semaphore would hold
+        // every other restore behind it. Its bytes are counted as its
+        // permits are, or one large object would lift every read's limit
+        // past any bound.
+        Self {
+            megabytes: u32::try_from(size.div_ceil(1 << 20))
+                .unwrap_or(u32::MAX)
+                .clamp(1, RESTORE_READ_ONE_MIB),
+            counted: size.min(u64::from(RESTORE_READ_ONE_MIB) << 20),
+            restore,
+            has,
+            held: None,
+        }
+    }
+
+    /// Waits for its place: a slot, then its megabytes.
+    async fn take(&mut self) -> Result<(), ReplicaError> {
+        self.has.send_replace(false);
+        // Never closed: a failed acquire would be a bug.
+        let (Ok(slot), Ok(bytes)) = (
+            RESTORE_READ_SLOTS.acquire().await,
+            RESTORE_READ_BYTES.acquire_many(self.megabytes).await,
+        ) else {
+            return Err(ReplicaError::Local("restore read limit closed".into()));
+        };
+        // Its time counts every byte read alongside it on this node,
+        // other restores' included, as it is while the read lasts (reads
+        // that join later count too).
+        let counted = InFlightBytes::new(self.counted, &self.restore);
+        self.held = Some((slot, bytes, counted));
+        self.has.send_replace(true);
+        Ok(())
+    }
+
+    /// Pauses for `pause` without its place, then waits for one again.
+    /// The pause is the restore's time, as the failed try was; the wait
+    /// for a place after it is not, as the first was not.
+    async fn pause(&mut self, pause: std::time::Duration) -> Result<(), ReplicaError> {
+        self.held = None;
+        tokio::time::sleep(pause).await;
+        self.take().await
     }
 }
 
@@ -80,6 +242,106 @@ static RESTORE_READ_BYTES: tokio::sync::Semaphore =
 /// Attempts per read before the restore fails (the next event restores
 /// again, from a fresh listing).
 const READ_ATTEMPTS: u32 = 3;
+
+/// A read the bucket refuses with an error a resend may get past (a 5xx
+/// or a reset connection once the client's own retries are spent, a body
+/// cut half-way) is sent again after this pause, doubled each time, and
+/// counts among the read's [`READ_ATTEMPTS`]: a GET changes nothing, so
+/// sending it again is always safe. The read gives up its place under
+/// the node's limits on reads while it pauses ([`Turn`]). Without a
+/// resend one such answer among a chain's reads failed the whole restore
+/// and the event that woke the actor.
+const READ_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A restore's reads together (every object, every resend) end within
+/// one deadline, as an upload does: each read above is bounded, but a
+/// chain of reads that each stay under their limit added up without one
+/// (three tries of 5 s or more per object), while every caller of the
+/// actor waited behind it.
+///
+/// The rule. A restore has a time *allowed*, sized from what it restores
+/// ([`restore_time`]):
+///
+/// - this much whatever is restored: six [`READ_IDLE`]s, 30 s, the wait
+///   of a caller whose wait is bounded at all (`wall_per_event`,
+///   `FORWARD_TIMEOUT`). Restores of up to 63 segments took 1 to 6 s next
+///   to a real bucket, and 17.5 s at worst with 19 of them sharing the
+///   node (`docs/benchmarks.md`);
+/// - [`RESTORE_PER_MIB`] per started megabyte of the objects' listed
+///   sizes, the rate below which a single read is given up as too slow
+///   when nothing is read alongside it: a database of 1 GiB has 17
+///   minutes more;
+/// - [`RESTORE_PER_AHEAD`] per [`READ_AHEAD`] objects, for a chain grown
+///   long because its periodic snapshots failed: eight reads side by
+///   side, each answered in 82 ms at the median and 1.7 s at worst next
+///   to the bucket.
+///
+/// Against it counts the time the restore waits for the bucket to give
+/// it the object it applies next, less, for each object, that read's
+/// lift ([`ReadTime`]): the seconds the bytes of *other* restores in
+/// flight on the node added to the limits of its tries, and never more
+/// than the restore waited for that object. The restore is ended when
+/// what counts passes what is allowed.
+///
+/// The lift is why the allowed time can be sized from the restore's own
+/// bytes while a read's limit counts every byte in flight on the node
+/// (a second per megabyte, up to [`RESTORE_READ_MIB`]): after a kill one
+/// node restores every actor it takes over at once over one link, and 32
+/// actors of 8 MiB each then give every read 261 s where each restore is
+/// allowed 39 s. Without the lift every one of them was ended at 39 s
+/// with each read inside its limit, nothing was kept, and the callers
+/// that tried again met the same end together. With it, what a read
+/// takes past the limit it would have with no other restore on the node
+/// is never counted: the time counted for an object is at most what its
+/// tries are allowed alone (three of [`READ_IDLE`] plus a second per
+/// megabyte of the restore's own bytes ahead, and the pauses), so other
+/// restores' bytes never end a restore. A restore alone on the node has
+/// no lift at all, and slow reads that add up end it as before.
+///
+/// The worst case. Bytes in flight on the node never pass
+/// [`RESTORE_READ_MIB`] megabytes (a read counts for at most
+/// [`RESTORE_READ_ONE_MIB`], as its permits do), so a try's lift is at
+/// most 256 s and an object's, three tries, 768 s. The waits that count
+/// (for the bucket to give the next object, the read having its place)
+/// therefore end within the allowed time plus 768 s per object read:
+/// reached only while other restores keep 256 MiB in flight and every
+/// one of its reads uses three tries to the end of their lifted limits.
+/// That is no more than the reads' own bounds give, which is what bounded
+/// such a restore before there was a deadline; on a node restoring
+/// nothing else it is the allowed time exactly. A bucket that never
+/// answers ends a restore sooner than either: a read is given up after
+/// three silences of [`READ_IDLE`], 15 s, whatever is in flight.
+///
+/// Not counted at all, since nothing above sizes it:
+///
+/// - the listing, whose length is not known before it ends: it keeps
+///   its own rule ([`list_with`]: given up when no key comes for
+///   [`READ_IDLE`], never while pages keep coming), so its time follows
+///   the pages listed;
+/// - the time a read waits for the node's shared limit on reads
+///   ([`RESTORE_READS`], [`RESTORE_READ_MIB`]) before it is even asked
+///   for, as it is not in a read's own time, or waits for it again after
+///   the pause before a resend ([`Turn`]; the pause itself counts). The
+///   queue always moves, since every read holding a place in it is
+///   bounded; while it lasts, the deadline does not bound what a caller
+///   waits;
+/// - checking the local file, creating the file the database is built
+///   in, applying an object to it or putting the finished database in
+///   place: local work, sized by the database and not by the compressed
+///   bytes read, and never cut. The reads ahead go on meanwhile.
+pub(crate) const RESTORE_BUDGET: std::time::Duration = READ_IDLE.saturating_mul(6);
+const RESTORE_PER_MIB: std::time::Duration = std::time::Duration::from_secs(1);
+const RESTORE_PER_AHEAD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The time a restore's reads are allowed, counted from `budget`: see
+/// [`RESTORE_BUDGET`].
+fn restore_time(budget: std::time::Duration, objects: usize, bytes: u64) -> std::time::Duration {
+    let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    let rounds = u32::try_from(objects.div_ceil(READ_AHEAD)).unwrap_or(u32::MAX);
+    budget
+        .saturating_add(RESTORE_PER_MIB.saturating_mul(megabytes))
+        .saturating_add(RESTORE_PER_AHEAD.saturating_mul(rounds))
+}
 
 /// A segment upload (one transaction, usually a few pages) is bounded too:
 /// an attempt the bucket has not answered within this, plus a second per
@@ -396,7 +658,44 @@ impl Replica {
     /// Prepares the actor's local database for generation `generation`:
     /// restores the bucket's current chain unless the local file is already
     /// at its head. The database must be closed.
+    ///
+    /// Its reads end within one deadline ([`RESTORE_BUDGET`]). The
+    /// database is built beside the local file, so a restore that fails
+    /// before it is complete (a read, the deadline, a history that cannot
+    /// be restored, an error writing the file being built) leaves the
+    /// local file and its sidecar as they were, and removes what it was
+    /// building. A complete one is put in place in three local steps: the
+    /// file that was there is set aside and its sidecar removed
+    /// ([`set_aside`]), the new file is renamed in, its sidecar is
+    /// written. A restore that fails in one of these (a local disk
+    /// error) has changed the local files: the old file is at
+    /// `<db>.replaced`, and either no file is in place or the new one is,
+    /// without a sidecar. Neither is used as it is: a local file spares
+    /// the reads only when a sidecar names the chain's head and the
+    /// file's checksum is the one the sidecar records
+    /// ([`Self::local_is_at`]). So the next restore reads the bucket
+    /// again, as after any failure: it starts from a fresh listing and
+    /// trusts nothing of this one. If the new file was in place, that
+    /// next restore sets it aside in turn, over the file set aside
+    /// before (one generation is kept). A failed restore is counted in
+    /// `wasmkeep_restore_failures_total`.
     pub(crate) async fn restore(
+        cluster: &Cluster,
+        address: &ActorAddress,
+        lease: LeaseView,
+        generation: u64,
+        db_path: PathBuf,
+        max_db_bytes: u64,
+    ) -> Result<Self, ReplicaError> {
+        let restored =
+            Self::restore_within(cluster, address, lease, generation, db_path, max_db_bytes).await;
+        if restored.is_err() {
+            crate::metrics::inc(&crate::metrics::METRICS.restore_failures);
+        }
+        restored
+    }
+
+    async fn restore_within(
         cluster: &Cluster,
         address: &ActorAddress,
         lease: LeaseView,
@@ -448,7 +747,9 @@ impl Replica {
             replica.checksum = sum;
             return Ok(replica);
         }
-        replica.checksum = replica.download(&plan, &keys, &sizes).await?;
+        replica.checksum = replica
+            .download(&plan, &keys, &sizes, cluster.restore_budget)
+            .await?;
         Ok(replica)
     }
 
@@ -492,6 +793,7 @@ impl Replica {
         plan: &Plan,
         listed: &[String],
         sizes: &std::collections::HashMap<String, u64>,
+        budget: std::time::Duration,
     ) -> Result<DbChecksum, ReplicaError> {
         let mut keys = Vec::with_capacity(plan.segments.len() + 1);
         if let Some(id) = plan.snapshot {
@@ -512,6 +814,20 @@ impl Replica {
                 keys.push((*key).clone());
             }
         }
+
+        // The time its reads are allowed; the deadline is moved back,
+        // below, by what does not count against it ([`RESTORE_BUDGET`]).
+        let allowed = restore_time(
+            budget,
+            keys.len(),
+            keys.iter()
+                .map(|key| sizes.get(key).copied().unwrap_or(0))
+                .fold(0, u64::saturating_add),
+        );
+        let objects = keys.len();
+        // What other restores' bytes added to its reads' limits, so far.
+        let mut lifted = std::time::Duration::ZERO;
+        let in_flight: OwnInFlight = Arc::default();
 
         let path = self.db_path.clone();
         let mut tmp = path.as_os_str().to_owned();
@@ -540,6 +856,9 @@ impl Replica {
             .await
             .map_err(|e| ReplicaError::Local(e.to_string()))??
         };
+        // Its clock starts here, with its first read: creating the file
+        // above is local work, not a wait for the bucket.
+        let mut deadline = tokio::time::Instant::now() + allowed;
         // Reads on tasks of their own, so they go on while an object is
         // applied; aborted if the restore ends early.
         let mut pending = keys.into_iter().peekable();
@@ -560,50 +879,100 @@ impl Replica {
                 let store = Arc::clone(&self.store);
                 let location = StorePath::from(format!("{}{key}", self.prefix));
                 // Its time counts every byte read alongside it.
-                let sharing = ahead;
+                let time = Arc::new(ReadTime::new(ahead, Some(Arc::clone(&in_flight))));
+                let (has, has_turn) = tokio::sync::watch::channel(false);
+                let its_time = Arc::clone(&time);
+                let mut turn = Turn::new(size, Arc::clone(&in_flight), has);
                 let task = tokio::spawn(async move {
-                    // Never closed: a failed acquire would be a bug.
-                    // One read takes at most a read-ahead's worth: a larger
-                    // object would take the whole budget, and the fair
-                    // semaphore would hold every other restore behind it.
-                    let mib = u32::try_from(size.div_ceil(1 << 20))
-                        .unwrap_or(u32::MAX)
-                        .clamp(1, RESTORE_READ_ONE_MIB);
-                    let (Ok(_slot), Ok(_bytes)) = (
-                        RESTORE_READ_SLOTS.acquire().await,
-                        RESTORE_READ_BYTES.acquire_many(mib).await,
-                    ) else {
-                        return Err(ReplicaError::Local("restore read limit closed".into()));
-                    };
-                    // Its time counts every byte read alongside it on this
-                    // node, other restores' included, as it is while the
-                    // read lasts (reads that join later count too).
-                    // Counted as its permits are: at most a read-ahead's
-                    // worth, or one large object would lift every read's
-                    // limit past any bound.
-                    let _counted =
-                        InFlightBytes::new(size.min(u64::from(RESTORE_READ_ONE_MIB) << 20));
-                    let alongside = move || {
-                        sharing
-                            .max(RESTORE_READ_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed))
-                    };
+                    turn.take().await?;
                     let read = std::time::Instant::now();
-                    let got =
-                        bounded_get(&store, &location, max_object, max, listed, &alongside).await;
+                    let got = bounded_get(
+                        &store,
+                        &location,
+                        max_object,
+                        max,
+                        listed,
+                        &its_time,
+                        Some(&mut turn),
+                    )
+                    .await;
                     crate::metrics::METRICS
                         .restore_read_seconds
                         .observe(read.elapsed());
                     got
                 });
-                reading.push_back((key, size, AbortOnDrop(task)));
+                reading.push_back(Reading {
+                    key,
+                    size,
+                    has_turn,
+                    time,
+                    task: AbortOnDrop(task),
+                });
             }
-            let Some((key, size, mut task)) = reading.pop_front() else {
+            let Some(Reading {
+                key,
+                size,
+                mut has_turn,
+                time,
+                mut task,
+            }) = reading.pop_front()
+            else {
                 break;
             };
-            let bytes = (&mut task.0)
-                .await
-                .map_err(|e| ReplicaError::Local(e.to_string()))??;
+            // What it waits for this object, its read having its place.
+            let mut waited = std::time::Duration::ZERO;
+            // The read ended, or is about to: its place says no more.
+            let mut ended = false;
+            let read = loop {
+                // Waiting for the node's limit on reads is not the
+                // restore's time ([`RESTORE_BUDGET`]): before the read is
+                // asked for, or again after the pause before a resend
+                // ([`Turn`]). An error means the task ended, which the
+                // wait below reports.
+                if !ended {
+                    let queued = tokio::time::Instant::now();
+                    ended = has_turn.wait_for(|has| *has).await.is_err();
+                    deadline += queued.elapsed();
+                }
+                // The deadline is looked at here only, waiting for the
+                // bucket: never while an object is applied or the file
+                // put in place (whose time is not counted either, below).
+                // What other restores' bytes have added to this read's
+                // limits does not count: looked at again when the time is
+                // up, as it grows while the read lasts. The reads still
+                // under way are aborted as `reading` is dropped.
+                let since = tokio::time::Instant::now();
+                let until = deadline + time.lifted();
+                let read = tokio::select! {
+                    biased;
+                    read = &mut task.0 => Some(read),
+                    lost = has_turn.wait_for(|has| !*has), if !ended => {
+                        ended = lost.is_err();
+                        None
+                    }
+                    () = tokio::time::sleep_until(until) => None,
+                };
+                waited = waited.saturating_add(since.elapsed());
+                if let Some(read) = read {
+                    break read;
+                }
+                if deadline + time.lifted() <= tokio::time::Instant::now() {
+                    let lifted = lifted.saturating_add(time.lifted());
+                    tracing::warn!(prefix = %self.prefix, object = %key, ?allowed, ?lifted, objects, "a restore ran out of time");
+                    return Err(ReplicaError::Bucket(format!(
+                        "{}: the restore ran out of time ({allowed:?} for {objects} objects, {lifted:?} for other restores' reads) reading {key}",
+                        self.prefix
+                    )));
+                }
+            };
+            // Never more than it waited for this object: a read that
+            // was quick leaves nothing for the next ones.
+            let lift = time.lifted().min(waited);
+            deadline += lift;
+            lifted = lifted.saturating_add(lift);
+            let bytes = read.map_err(|e| ReplicaError::Local(e.to_string()))??;
             ahead = ahead.saturating_sub(size);
+            let applying = tokio::time::Instant::now();
             let applied = tokio::task::spawn_blocking(move || {
                 restorer
                     .apply(&bytes)
@@ -613,6 +982,7 @@ impl Replica {
             .await
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
             restorer = applied?;
+            deadline += applying.elapsed();
         }
         let head = plan.head();
         let sum = tokio::task::spawn_blocking(move || {
@@ -1118,7 +1488,15 @@ impl Replica {
         let max = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         match timeout_at(
             deadline,
-            bounded_get(&self.store, location, max, max, Some(max), &|| max),
+            bounded_get(
+                &self.store,
+                location,
+                max,
+                max,
+                Some(max),
+                &ReadTime::new(max, None),
+                None,
+            ),
         )
         .await
         {
@@ -1310,8 +1688,18 @@ impl Collector {
     }
 }
 
-/// A restore's read in flight: its key, its listed size, its task.
-type Reading = (String, u64, AbortOnDrop<Result<bytes::Bytes, ReplicaError>>);
+/// A restore's read in flight.
+struct Reading {
+    key: String,
+    /// Its listed size.
+    size: u64,
+    /// Whether it has its place under the node's limits on reads
+    /// ([`Turn`]).
+    has_turn: tokio::sync::watch::Receiver<bool>,
+    /// Its time, as the read counts it.
+    time: Arc<ReadTime>,
+    task: AbortOnDrop<Result<bytes::Bytes, ReplicaError>>,
+}
 
 /// A task aborted when dropped (a restore that ends early, or is cut).
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -1325,13 +1713,18 @@ impl<T> Drop for AbortOnDrop<T> {
 /// Reads one object for a restore, giving up an attempt when the bucket
 /// is silent for [`READ_IDLE`] (no headers, or no next chunk), up to
 /// [`READ_ATTEMPTS`] times. An attempt given up is dropped whole: nothing
-/// of it is applied, and the next attempt reads the object again. Objects
+/// of it is applied, and the next attempt reads the object again. An
+/// attempt the bucket refuses, or whose body breaks, is sent again too,
+/// after a pause ([`READ_PAUSE`]) during which `turn`, the read's place
+/// under the node's limits, is given up, unless no resend would change the
+/// answer ([`definite`]: the object is gone, say, collected since the
+/// listing, and the next restore lists again). Objects
 /// larger than `max_object` are refused before their body is read.
 /// An attempt is also given up once it has taken [`READ_IDLE`] plus a
 /// second per started megabyte of the bytes read over the same link
-/// alongside it, this object's included: the most `sharing` has answered
-/// during the attempt, asked again at every wait, so a read served last
-/// among them still has its time. `listed` is the size
+/// alongside it, this object's included: the most `time` has seen,
+/// looked at again at every wait, so a read served last among them still
+/// has its time ([`ReadTime`]). `listed` is the size
 /// the listing gave: an object of another size is not the one the plan
 /// names, and is refused before its body is read (the read-ahead's memory
 /// bound counts listed sizes).
@@ -1341,19 +1734,33 @@ async fn bounded_get(
     max_object: u64,
     cap: u64,
     listed: Option<u64>,
-    sharing: &(dyn Fn() -> u64 + Sync),
+    time: &ReadTime,
+    mut turn: Option<&mut Turn>,
 ) -> Result<bytes::Bytes, ReplicaError> {
     use futures_util::StreamExt;
-    let limit_for = |bytes: u64| {
-        let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
-        READ_IDLE.saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
-    };
-    let mut seen = sharing();
     let mut last = String::new();
-    'attempts: for _ in 0..READ_ATTEMPTS {
+    let mut pause = READ_PAUSE;
+    'attempts: for attempt in 1..=READ_ATTEMPTS {
+        if attempt > 1 {
+            time.next_try();
+        }
+        // A failure a resend may get past: an attempt used, then a pause,
+        // without its place under the node's limits on reads if it has
+        // one ([`Turn`]).
+        let mut refused = async |e: object_store::Error| {
+            if attempt < READ_ATTEMPTS {
+                tracing::info!(object = %location, reason = %e, "a restore's read failed; sending it again");
+                match turn.as_deref_mut() {
+                    Some(turn) => turn.pause(pause).await?,
+                    None => tokio::time::sleep(pause).await,
+                }
+                pause = pause.saturating_mul(2);
+            }
+            Ok::<_, ReplicaError>(e.to_string())
+        };
         // The attempt's whole time, from its request, grown as reads join.
         let start = tokio::time::Instant::now();
-        let mut limit = limit_for(seen);
+        let mut limit = time.look().0;
         let got = match tokio::time::timeout_at(
             (start + limit).min(start + READ_IDLE),
             store.get(location),
@@ -1361,7 +1768,11 @@ async fn bounded_get(
         .await
         {
             Ok(Ok(got)) => got,
-            Ok(Err(e)) => return Err(ReplicaError::Bucket(e.to_string())),
+            Ok(Err(e)) if definite(&e) => return Err(ReplicaError::Bucket(e.to_string())),
+            Ok(Err(e)) => {
+                last = refused(e).await?;
+                continue;
+            }
             Err(_) => {
                 last = format!("no answer within {READ_IDLE:?}");
                 tracing::info!(object = %location, reason = %last, "a restore's read stalled; sending it again");
@@ -1385,12 +1796,20 @@ async fn bounded_get(
         let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
         loop {
             let now = tokio::time::Instant::now();
-            seen = seen.max(sharing());
-            limit = limit_for(seen);
+            limit = time.look().0;
             let until = start + limit;
             match tokio::time::timeout_at(until.min(now + READ_IDLE), body.next()).await {
                 Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
-                Ok(Some(Err(e))) => return Err(ReplicaError::Bucket(e.to_string())),
+                Ok(Some(Err(e))) if definite(&e) => {
+                    return Err(ReplicaError::Bucket(e.to_string()));
+                }
+                Ok(Some(Err(e))) => {
+                    // Nothing of this answer is kept through the pause:
+                    // the read has no megabytes then to count it by.
+                    drop((body, bytes));
+                    last = refused(e).await?;
+                    continue 'attempts;
+                }
                 Ok(None) => return Ok(bytes.into()),
                 Err(_) if tokio::time::Instant::now() >= start + limit => {
                     last = format!(
@@ -1408,7 +1827,7 @@ async fn bounded_get(
             }
         }
     }
-    tracing::warn!(object = %location, reason = %last, "a restore's read kept stalling");
+    tracing::warn!(object = %location, reason = %last, "a restore's read kept failing");
     Err(ReplicaError::Bucket(format!(
         "{location}: {last}, {READ_ATTEMPTS} times"
     )))
@@ -1643,6 +2062,11 @@ mod tests {
         fail_next: std::sync::atomic::AtomicU32,
         /// The next segment reads (a read-back's HEAD or GET) fail.
         fail_get_next: std::sync::atomic::AtomicU32,
+        /// The next segment reads are answered, then their body breaks
+        /// half-way; `cut_bodies` is held by each such body while it
+        /// lives.
+        cut_get_next: std::sync::atomic::AtomicU32,
+        cut_bodies: Arc<()>,
         /// Runs `on_put` right before the segment upload of this number
         /// (1 is the first; 0: never): the lease lapsing as a resend goes.
         call_at_put: std::sync::atomic::AtomicU32,
@@ -1726,6 +2150,33 @@ mod tests {
                     source: "connection reset".into(),
                 });
             }
+            if location.as_ref().contains("/wal/") && take(&self.cut_get_next) {
+                use futures_util::StreamExt;
+                let got = self.inner.get_opts(location, options).await?;
+                let (meta, range, attributes) =
+                    (got.meta.clone(), got.range.clone(), got.attributes.clone());
+                let extensions = got.extensions.clone();
+                let half = usize::try_from(meta.size / 2).unwrap();
+                let half = got.bytes().await?.slice(..half);
+                let alive = Arc::clone(&self.cut_bodies);
+                let pieces = [
+                    Ok(half),
+                    Err(object_store::Error::Generic {
+                        store: "PutFaults",
+                        source: "connection reset".into(),
+                    }),
+                ];
+                let stream = futures_util::stream::iter(pieces).inspect(move |_| {
+                    let _ = &alive;
+                });
+                return Ok(object_store::GetResult {
+                    payload: object_store::GetResultPayload::Stream(Box::pin(stream)),
+                    meta,
+                    range,
+                    attributes,
+                    extensions,
+                });
+            }
             self.inner.get_opts(location, options).await
         }
 
@@ -1779,6 +2230,8 @@ mod tests {
             refuse_next: std::sync::atomic::AtomicU32::new(refuse),
             fail_next: std::sync::atomic::AtomicU32::new(0),
             fail_get_next: std::sync::atomic::AtomicU32::new(0),
+            cut_get_next: std::sync::atomic::AtomicU32::new(0),
+            cut_bodies: Arc::default(),
             call_at_put: std::sync::atomic::AtomicU32::new(0),
             puts: std::sync::atomic::AtomicU32::new(0),
             on_put: std::sync::Mutex::new(None),
@@ -2192,23 +2645,35 @@ mod tests {
     async fn a_failed_periodic_snapshot_waits_a_minimum_time_too() {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, store) = faulty(dir.path(), 0, 0).await;
-        r.snapshot_retry_min = std::time::Duration::from_millis(300);
+        // An hour: no machine is slow enough for it to pass between the
+        // try and the check after it. The test does not wait for it: it
+        // moves the end of the wait instead.
+        let min = std::time::Duration::from_secs(3600);
+        let soon = std::time::Duration::from_millis(50);
+        r.snapshot_retry_min = min;
         store
             .fail_next
             .store(1, std::sync::atomic::Ordering::SeqCst);
         let all = changes(DbChecksum::from_value(7));
         r.since_snapshot = SNAPSHOT_EVERY;
+        let before = tokio::time::Instant::now();
         assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
         r.since_snapshot += 10; // a busy actor
         assert!(!r.snapshot_due(), "the segments alone are not enough");
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(
+            r.snapshot_retry_after >= before + min,
+            "the whole minimum, from the try"
+        );
+        // Due once the clock is past the end of the wait.
+        r.snapshot_retry_after = tokio::time::Instant::now() + soon;
+        tokio::time::sleep(soon).await;
         assert!(r.snapshot_due());
         // And the time alone is not enough either.
         store
             .fail_next
             .store(1, std::sync::atomic::Ordering::SeqCst);
         assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        r.snapshot_retry_after = tokio::time::Instant::now();
         assert!(!r.snapshot_due(), "no segment since: an idle actor waits");
     }
 
@@ -2312,6 +2777,142 @@ mod tests {
         assert_eq!(
             periodic_snapshot_bound(idle, usize::MAX),
             Duration::from_secs(10)
+        );
+    }
+
+    /// Reads one object of 3 MiB whose first try fails as `fail_get_next`
+    /// and `cut_get_next` say, and looks at what the read holds half-way
+    /// through the pause before its resend.
+    async fn pauses_without_its_place(fail_get_next: u32, cut_get_next: u32) {
+        let store = Arc::new(PutFaults {
+            inner: InMemory::new(),
+            hang_next: 0.into(),
+            land_then_hang_next: 0.into(),
+            refuse_next: 0.into(),
+            fail_next: 0.into(),
+            fail_get_next: fail_get_next.into(),
+            cut_get_next: cut_get_next.into(),
+            cut_bodies: Arc::default(),
+            call_at_put: 0.into(),
+            puts: 0.into(),
+            on_put: std::sync::Mutex::new(None),
+        });
+        let location = StorePath::from("a/wal/object");
+        let body = vec![7u8; 3 << 20];
+        store
+            .inner
+            .put(&location, body.clone().into())
+            .await
+            .unwrap();
+        let size = body.len() as u64;
+        let places = || {
+            (
+                RESTORE_READ_SLOTS.available_permits(),
+                RESTORE_READ_BYTES.available_permits(),
+                *RESTORE_READ_IN_FLIGHT.lock().unwrap(),
+            )
+        };
+        let free = (RESTORE_READS, RESTORE_READ_MIB as usize, 0);
+        assert_eq!(places(), free);
+        let own = OwnInFlight::default();
+        let (has, has_turn) = tokio::sync::watch::channel(false);
+        let mut turn = Turn::new(size, Arc::clone(&own), has);
+        turn.take().await.unwrap();
+        assert_eq!(places(), (RESTORE_READS - 1, 256 - 3, size));
+        let read = {
+            let store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+            tokio::spawn(async move {
+                let time = ReadTime::new(size, Some(own));
+                bounded_get(
+                    &store,
+                    &location,
+                    size,
+                    size,
+                    Some(size),
+                    &time,
+                    Some(&mut turn),
+                )
+                .await
+            })
+        };
+        // The failure comes at once; the pause lasts half a second.
+        tokio::time::sleep(READ_PAUSE / 2).await;
+        let left = |n: &std::sync::atomic::AtomicU32| n.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            (left(&store.fail_get_next), left(&store.cut_get_next)),
+            (0, 0),
+            "the first try failed"
+        );
+        assert_eq!(places(), free, "nothing held during the pause");
+        assert_eq!(
+            Arc::strong_count(&store.cut_bodies),
+            1,
+            "the answer that broke is dropped before the pause"
+        );
+        assert!(*has_turn.borrow(), "the pause is not a wait for a place");
+        assert_eq!(read.await.unwrap().unwrap().len(), body.len());
+        assert_eq!(places(), free, "and gave it back when the read ended");
+    }
+
+    /// A read the bucket refused pauses before it is sent again without
+    /// its place under the node's limits on reads: no slot, no megabytes,
+    /// no bytes counted in flight. It held all three through the pause,
+    /// keeping other restores' reads waiting for a read that only waited.
+    #[tokio::test]
+    async fn a_read_that_pauses_before_a_resend_gives_up_its_place() {
+        pauses_without_its_place(1, 0).await;
+    }
+
+    /// So does a read whose body broke half-way, and it keeps nothing of
+    /// that answer through the pause, neither its stream nor the part
+    /// read: without its megabytes, nothing counts that memory, and the
+    /// wait for a place after the pause can be long.
+    #[tokio::test]
+    async fn a_read_whose_body_broke_keeps_nothing_of_it_while_it_pauses() {
+        pauses_without_its_place(0, 1).await;
+    }
+
+    /// A read's limit counts every byte in flight on the node; its lift is
+    /// the part of it other restores' bytes account for, exactly zero for
+    /// a restore alone, and kept for each try that ended.
+    #[test]
+    fn a_reads_lift_is_what_other_restores_bytes_add_to_its_limit() {
+        let s = std::time::Duration::from_secs;
+        let (mine, theirs) = (OwnInFlight::default(), OwnInFlight::default());
+        let _own = InFlightBytes::new(3 << 20, &mine);
+        let time = ReadTime::new(3 << 20, Some(Arc::clone(&mine)));
+        assert_eq!(time.look(), (s(8), s(0)), "alone on the node");
+        {
+            let _other = InFlightBytes::new(10 << 20, &theirs);
+            assert_eq!(time.look(), (s(18), s(10)));
+        }
+        // The most seen stays, as for the limit itself.
+        assert_eq!(time.look(), (s(18), s(10)));
+        assert_eq!(time.lifted(), s(10));
+        time.next_try();
+        assert_eq!(time.lifted(), s(20), "a second try has its own");
+        // Its own restore's later reads lift the limit, never the lift.
+        let _more = InFlightBytes::new(20 << 20, &mine);
+        assert_eq!(time.look(), (s(28), s(0)));
+        // A read outside a restore counts what it is given, alone.
+        assert_eq!(ReadTime::new(1, None).look(), (s(6), s(0)));
+    }
+
+    /// A restore's deadline is sized from what it reads: never under the
+    /// budget, a second more per started megabyte and per eight objects.
+    #[test]
+    fn a_restores_deadline_grows_with_what_it_reads() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(restore_time(RESTORE_BUDGET, 1, 1), s(32));
+        // A snapshot and 63 segments, a megabyte in all.
+        assert_eq!(restore_time(RESTORE_BUDGET, 64, 1 << 20), s(39));
+        // A database of 1 GiB in one snapshot.
+        assert_eq!(restore_time(RESTORE_BUDGET, 1, 1 << 30), s(30 + 1024 + 1));
+        assert_eq!(
+            restore_time(RESTORE_BUDGET, usize::MAX, u64::MAX),
+            RESTORE_BUDGET
+                .saturating_add(RESTORE_PER_MIB.saturating_mul(u32::MAX))
+                .saturating_add(RESTORE_PER_AHEAD.saturating_mul(u32::MAX))
         );
     }
 

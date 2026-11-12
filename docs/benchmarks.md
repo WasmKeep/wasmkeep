@@ -889,7 +889,9 @@ From [`…-0f2986f-soak-r2.csv`](../bench/results/2026-11-07-0f2986f-soak-r2.csv
   worst**, once: that actor's restore (a listing and 55 reads, one after
   another) took 56 s, each read slow but never silent for 5 s, so none was
   cut; the 11 requests whose clients had given up meanwhile then ran,
-  16 s more. Nothing bounds a restore's total time yet. Alarms after their
+  16 s more. Nothing bounded a restore's total time then; reads have
+  since been made eight at a time, and a restore's reads have one deadline
+  ([cluster](cluster.md)), not measured here. Alarms after their
   node died: 24.0 s at the median, 35.9 s at worst; a restarted node was
   ready within 10.4 s. Durable write 57 ms at the median, 674 ms at p99,
   29.4 s at worst. The writers wait for each answer, so the 27 % fewer
