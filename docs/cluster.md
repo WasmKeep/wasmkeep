@@ -84,9 +84,13 @@ things.
 `GET` or `HEAD` without a body and for a WebSocket upgrade that arrive
 from outside. The caller sees one slow answer (the actor's own, with
 `x-wasmkeep-node` naming the new owner, or the `101`) instead of a 503 to
-retry. The takeover is the ordinary one, at the moment it would succeed
-for a client that retried just then: nothing about leases changes, the
-wait only saves the caller the retries. A request is kept when the node
+retry. The takeover is the ordinary one, and the actor is free at the
+same moment as without the wait: nothing about leases changes, the wait
+only saves the caller the retries. A kept request asks for the actor up
+to a second after this node learns it is free (the requests kept for
+different actors are spread over that second), which is at its own fence
+of the dead node or, when another node wrote the fence, at its next
+heartbeat listing (up to 3 s later). A request is kept when the node
 has a reason to think the owner is gone or going:
 
 - the owner's heartbeat left this node's view (10 s after its last write)
@@ -101,10 +105,13 @@ everything else: a request with a body, any other method (`POST`, `PUT`,
 `DELETE`, ...), an `actors.call` (the calling actor gets its error), a
 request another node forwarded, and any request over the caps below. Such
 a 503 still means the request was not run here; nothing with a body is
-ever kept, so a write is never run late for a caller that gave up. The
-same goes for an owner that is alive: a node that renews its lease is
-never waited for, however slow it is to answer, and nobody takes its
-actors.
+ever kept, so a write is never run late for a caller that gave up. An
+owner that is alive keeps its actors: a node that renews its lease is
+never taken from, however slow it is to answer, and a request for one of
+its actors is sent to it as before. The one exception is a node that is
+alive but to which this node could not open a connection: requests for
+its actors are kept for a few seconds, until its next lease write shows
+it alive (see "An owner that is alive but refuses connections" below).
 
 A kept request ends in one of these ways:
 
@@ -123,11 +130,22 @@ before a fence (6 s), one heartbeat period for a node that did not write
 the fence itself (3 s) and a second over which the kept requests are
 spread, 25 s in all. `--failover-wait-secs 0` turns the wait off: every
 request gets the answer it got before, at once. A node keeps at most a
-quarter of its `--max-connections` (2,500 with the default 10,000) and 64
-requests per actor; a request over either gets the 503 at once. A kept
-request holds its connection and its headers, nothing else: no actor is
-loaded for it and no bucket request is made for it while the owner's
-heartbeat is only stale. Each node decides by itself, nothing travels
+quarter of its connection limit and 64 requests per actor; a request over
+either gets the 503 at once. The connection limit is `--max-connections`
+(10,000 by default, so 2,500 kept requests) after `serve` lowered it to
+fit the open-file limit: a node left at a limit of 1,024 files keeps far
+fewer, and one whose quarter comes to zero keeps none (counted as
+`over_cap`). The cap counts requests, not connections: over HTTP/2,
+several kept requests can share one connection. Nothing identifies the
+caller before a request is kept, so anyone who can reach the node can
+fill the places for a dead node's actors; later callers then get the 503
+at once, as without the wait. A kept request holds its connection and its
+headers, nothing else: no actor is loaded for it, and no bucket request
+is made for it while the owner's heartbeat is only stale. While the owner
+is suspected after a failed connection, or stopped and released, each
+kept request reads the actor's ownership record about once a second, as
+a client retrying every second would; once the actor looks free it asks
+for it, about once a second until it has it. Each node decides by itself, nothing travels
 between nodes or into the bucket, so nodes with different settings, or
 of versions with and without the wait, work together.
 
@@ -154,10 +172,25 @@ What the wait does not cover, with the defaults:
   forwarded to it, and waits for that node's restore of the actor under
   the usual 30 s limit: about 55 s in the worst case, ending in the usual
   504.
+- **An owner that is alive but refuses connections.** When this node
+  cannot open a connection to a node that is alive (its listener
+  restarts, a firewall or a one-way network fault, the 5 s connection
+  timeout, or this node running out of sockets), the request that finds
+  it out gets the 503 as before, and the `GET`s and upgrades that follow
+  for that node's actors are kept instead of sent, even over connections
+  to it that still work. They are released when a heartbeat listing shows
+  a lease write of that node more than 2 s (twice the allowed clock skew)
+  after the failure: about 2 to 8 s later, since a node writes its lease
+  every 3 s and this node lists every 3 s. They are then sent to the
+  owner as usual, and get its answer or the 503 they would have got at
+  once. Nobody takes the actors. The node is then not suspected again for
+  10 s; while the fault lasts, the next failed connection after that
+  starts the same again.
 - **The answer after the wait can still be an error**: the node is full,
   the bucket fails during the takeover, or an access rule refuses the
   request (a class open only to existing actors answers 404 for one that
-  does not exist, after the wait).
+  does not exist, after the wait; a class not reachable from outside is
+  refused 403 at once, before any wait).
 - **A node that drains** takes no actor: a request it would hand to a
   peer is handed over as before, not kept.
 - **A `GET` that writes.** A kept `GET` runs up to 25 s after it was sent,

@@ -92,9 +92,15 @@ node still holds the request. `option redispatch` with `retries` sends a
 request whose connection a node refused (it just died, and its health
 check has not failed yet) to another node, where it can be kept, instead
 of failing it; it applies to connections that could not be opened, so no
-request is sent twice. `option abortonclose` makes HAProxy close its
-connection to the node when the client closes its own before an answer:
-that is what lets a node drop a kept request nobody waits for.
+request is sent twice. `option abortonclose` asks HAProxy to give up a
+request whose client closed its connection before an answer, and so to
+close its connection to the node: that is what lets a node drop a kept
+request nobody waits for. This example was not run against HAProxy with a
+kept request: check with your version that a client's departure closes
+the node's side while HAProxy waits for the answer (the node then counts
+`outcome="left"` in `wasmkeep_failover_waits_total`). Another proxy needs
+its own equivalent; without one, a kept `GET` runs after the takeover for
+a client that has left.
 
 **nginx**: hash a variable holding the actor's path:
 
