@@ -27,7 +27,8 @@ Everything under the prefix given to `--bucket s3://BUCKET/PREFIX`:
 | `apps/<tenant>/<app>/secrets/` | The app's secrets, sealed, and their own `current` | As above |
 | `cluster/secret` | The secret nodes sign their calls to each other with | Created once |
 | `control/` | Drain and move requests | By the operator's commands |
-| `leases/`, `probe/` | Markers left by earlier versions, and the object the start check writes | Small |
+| `leases/<tenant>/<class>/<name>` | One small marker per actor, written by the node that first takes it. It carries the generation the actor's first ownership record starts from, and keeps a binary from before node leases from taking the actor ([ADR 0020](../adr/0020-one-lease-per-node.md)) | Created once, never collected |
+| `probe/` | The object a node's start check writes to test conditional writes | Deleted right after the check |
 
 History objects are deleted only by garbage collection, by the node that
 holds the actor, after a newer snapshot of its own was acknowledged, and
