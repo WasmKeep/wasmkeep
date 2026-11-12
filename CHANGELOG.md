@@ -13,6 +13,21 @@ Since 0.2.0, in no release yet.
 
 ### What changed
 
+- **A request waits for a takeover.** When an actor's node dies, a GET or
+  HEAD without a body, or a WebSocket upgrade, for one of its actors is
+  kept by the node that received it until the actor can be taken over (15
+  to about 21 s after the dead node's last write, unchanged), then served,
+  instead of being answered 503 meanwhile. A request with a body, an
+  actor-to-actor call and a forwarded request still get the 503 at once,
+  which still means it did not run. A client that leaves while its
+  request is kept is dropped and its request never runs. At most a
+  quarter of the node's connection limit, and 64 per actor, are kept;
+  beyond that, the 503 at once. `--failover-wait-secs` sets the wait
+  (about 25 s by default, from the lease timing); 0 turns it off. Set the
+  load balancer's server timeout above it.
+  `wasmkeep_failover_waits_total` counts how each wait ended
+  ([what a caller sees](docs/cluster.md#when-a-node-dies-what-a-caller-sees),
+  [front door](docs/deploy/front-door.md)).
 - **A snapshot upload is bounded, tried again after a failure, and
   counted.** The snapshot an actor's owner adds every 64 writes holds the
   actor while it uploads. It now gets one attempt, given up after 5 s plus

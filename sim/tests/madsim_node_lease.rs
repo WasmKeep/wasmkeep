@@ -20,6 +20,18 @@
 //! nobody, from a fenced node, from a node's older instance), and the twin
 //! must hold the actor now and then.
 //!
+//! With waiters (`a_waiter_follows_the_owner_watch`), a process refused
+//! because another node holds the actor may keep asking as the server
+//! keeps a request for a dead node's actor: it feeds an
+//! `OwnerWatch` (`wasmkeep_cluster::failover`) from its own listings of
+//! the node leases and asks again only when its `Waiter` says so, until a
+//! deadline. The same checks hold with those acquisitions; a waiter never
+//! asks while the holder is only stale, nor more often than its retry
+//! period; and after a crash with one request per survivor and no retry
+//! (`a_waiter_takes_over_after_a_crash`), a survivor holds the actor
+//! within the wait. This models acquisitions, not requests: what a kept
+//! request's caller sees is the cluster tests' to show.
+//!
 //! Ignoring the node's epoch rule is never caught here, and a test says
 //! why (`ignoring_the_epoch_is_never_caught_here`).
 //!
@@ -35,6 +47,7 @@ use std::time::Duration;
 use madsim::net::NetSim;
 use madsim::runtime::{Handle, Runtime};
 use madsim::time::{Instant, sleep};
+use wasmkeep_cluster::failover::{OwnerWatch, Seen, Step, Verdict, Waiter};
 use wasmkeep_cluster::lease::{Bucket, Clock, LeaseConfig};
 use wasmkeep_cluster::node_lease::{
     AcquireError, Hold, NodeLeaseObject, NodeState, OwnerRecord, frees, operator_fence, tail,
@@ -68,6 +81,18 @@ impl SimEnv {
     }
 }
 
+/// How long a node's lease counts as live in a waiter's view: three lease
+/// periods plus the skew allowed, as the server's heartbeat horizon.
+const HORIZON_MS: u64 = 1_300;
+/// How often a waiting process lists the node leases.
+const LISTING_MS: u64 = 300;
+/// The least time between two tries of one waiter.
+const RETRY_MS: u64 = 300;
+/// How long a waiter keeps asking: ttl plus grace, the fence watch (a
+/// lease period plus an attempt), a lease period until the fencer looks,
+/// a listing, the jitter and a retry, and the skew allowed.
+const WAIT_MS: u64 = 3_500;
+
 /// ttl 1 s, grace 500 ms, safety 200 ms: tolerates 350 ms of skew.
 fn config() -> LeaseConfig {
     LeaseConfig::new(1_000, 500, 200, 300).unwrap()
@@ -91,6 +116,49 @@ enum Variant {
     /// A lapse ends no hold: a hold acquired before it acts again once the
     /// lease is renewed (the node's epoch rule ignored).
     EpochIgnored,
+    /// The correct rules, with waiters: a refused process may keep asking
+    /// as its `OwnerWatch` and `Waiter` say.
+    Waiters,
+    /// Waiters that take the watch's `Free` for a grant: the record is
+    /// written without asking whether its holder's node frees it.
+    HintAsGrant,
+    /// Waiters that never wait: a refusal is final, as without the wait.
+    GiveUp,
+}
+
+impl Variant {
+    fn waiters(self) -> bool {
+        matches!(self, Self::Waiters | Self::HintAsGrant | Self::GiveUp)
+    }
+}
+
+/// One process's wait for the actor another node holds.
+struct Wait {
+    owner: String,
+    waiter: Waiter,
+    /// When it began (this node's clock), and the tries made since.
+    began_ms: u64,
+    tries: u64,
+}
+
+/// What the waiters of a simulation did.
+#[derive(Clone, Debug, Default)]
+struct Waits {
+    /// Waits begun, by the verdict that admitted them.
+    suspect: u64,
+    stale: u64,
+    stopping: u64,
+    /// How they ended: holding the actor, another node holding it, the
+    /// holder shown alive, the deadline.
+    took: u64,
+    saw_other: u64,
+    left: u64,
+    expired: u64,
+    /// Tries made while the holder was only stale, or fenced with its
+    /// date not passed: none may be.
+    tried_unfree: u64,
+    /// Waits that tried more often than once per retry period.
+    spun: u64,
 }
 
 /// One hold, as the checks see it.
@@ -131,6 +199,11 @@ struct Shared {
     running: HashMap<usize, (u32, u64)>,
     /// Acquisitions by the twin's processes.
     twin_acquired: u64,
+    waits: Waits,
+    /// The crash scenario: when the holder was killed (global ms). From
+    /// then on each surviving process asks once, and waits or not.
+    killed_at: Option<u64>,
+    killed_node: u32,
 }
 
 /// What node `i` writes after its lease lines: the heartbeat's fields,
@@ -205,6 +278,7 @@ async fn acquire_broken<B: Bucket, C: Clock>(
                     .and_then(|(b, _)| NodeLeaseObject::decode(&b));
                 let free = match (variant, &obj) {
                     (Variant::FreeOnFenceAtOnce, Some(o)) if o.state != NodeState::Live => true,
+                    (Variant::HintAsGrant, _) => true,
                     _ => frees(i, obj.as_ref(), clock.now_ms(), &cfg),
                 };
                 if !free {
@@ -252,6 +326,7 @@ async fn run_node(
     skew_ms: i64,
     seed: u64,
     variant: Variant,
+    scenario: bool,
     shared: Arc<Mutex<Shared>>,
 ) {
     let cfg = config();
@@ -307,7 +382,41 @@ async fn run_node(
             stop_process(&mut shared.lock().unwrap().claims, i, process, env.now());
         };
         let mut hold: Option<Held> = None;
+        // With waiters: what this process knows of the others' leases, its
+        // wait if it has one, and (the crash scenario) whether it asked
+        // since the holder was killed.
+        let mut watch = OwnerWatch::new(id.clone(), &cfg, HORIZON_MS);
+        let mut listed_ms = 0;
+        let mut wait: Option<Wait> = None;
+        let mut asked_since_kill = false;
+        let ask_after_kill_ms = rng.below(1_500);
         loop {
+            if variant.waiters() && clock.now_ms() >= listed_ms + LISTING_MS {
+                // One listing: every other node's lease, or nothing learnt.
+                let mut bodies = Vec::new();
+                let mut failed = false;
+                for p in (1..=3u32).filter(|&p| p != i) {
+                    match bucket.get(&format!("{NODES}n{p}")).await {
+                        Ok(Some((body, _))) => bodies.push((format!("n{p}"), body)),
+                        Ok(None) => {}
+                        Err(_) => failed = true,
+                    }
+                }
+                if !failed {
+                    let objects: Vec<(String, Option<NodeLeaseObject>)> = bodies
+                        .into_iter()
+                        .map(|(id, body)| (id, NodeLeaseObject::decode(&body)))
+                        .collect();
+                    let seen = objects.iter().map(|(id, o)| Seen {
+                        id,
+                        state: o.as_ref().map(|o| o.state),
+                        instance: o.as_ref().and_then(|o| o.instance.as_deref()),
+                        written_at_ms: o.as_ref().map_or(0, |o| o.written_at_ms),
+                    });
+                    listed_ms = clock.now_ms();
+                    watch.observe(seen, listed_ms);
+                }
+            }
             if node.lost() {
                 // Exit at once: no releases. The claims end now.
                 end(&shared);
@@ -324,14 +433,14 @@ async fn run_node(
             }
             // A clean stop now and then: stop acting, release the hold,
             // then the node lease (`released`), and exit.
-            if rng.below(300) == 0 {
+            if !scenario && rng.below(300) == 0 {
                 end(&shared);
                 node.clean_stop(&env).await;
                 shared.lock().unwrap().clean_stops += 1;
                 break;
             }
             match hold.take() {
-                Some(h) if rng.chance(8) => {
+                Some(h) if !scenario && rng.chance(8) => {
                     end(&shared);
                     node.release(&h).await;
                 }
@@ -351,48 +460,165 @@ async fn run_node(
                     hold = Some(h);
                 }
                 None => {
-                    let reason = takeover_reason(&bucket, &id, &instance).await;
-                    let got = match variant {
-                        Variant::ReuseGeneration | Variant::FreeOnFenceAtOnce => {
+                    // Without waiters a process asks whenever it holds
+                    // nothing. With them, a waiter asks when its `Waiter`
+                    // says so, and a process without one now and then (a
+                    // request arriving); in the crash scenario, once the
+                    // holder was killed, once only.
+                    let now = clock.now_ms();
+                    let mut tried_as = None;
+                    let ask = if !variant.waiters() {
+                        true
+                    } else if let Some(w) = &mut wait {
+                        let verdict = watch.verdict(&w.owner, now, Some(w.waiter.held_since_ms()));
+                        let step = w.waiter.step(verdict, now);
+                        let mut s = shared.lock().unwrap();
+                        match step {
+                            Step::Try => {
+                                w.tries += 1;
+                                if matches!(
+                                    verdict,
+                                    Verdict::Stale { .. }
+                                        | Verdict::Forward
+                                        | Verdict::Stopping {
+                                            released: false,
+                                            ..
+                                        }
+                                ) {
+                                    s.waits.tried_unfree += 1;
+                                }
+                                tried_as = Some(verdict);
+                            }
+                            Step::Leave => s.waits.left += 1,
+                            Step::Expire => s.waits.expired += 1,
+                            Step::Wait { .. } => {}
+                        }
+                        if matches!(step, Step::Leave | Step::Expire) {
+                            if w.tries > 1 + (now - w.began_ms) / RETRY_MS {
+                                s.waits.spun += 1;
+                            }
+                            drop(s);
+                            wait = None;
+                        }
+                        step == Step::Try
+                    } else {
+                        let killed = shared.lock().unwrap().killed_at;
+                        match killed {
+                            Some(_) if asked_since_kill => false,
+                            Some(at) if env.now() >= at + ask_after_kill_ms => {
+                                asked_since_kill = true;
+                                true
+                            }
+                            Some(_) => false,
+                            None => rng.chance(30),
+                        }
+                    };
+                    if ask {
+                        let reason = takeover_reason(&bucket, &id, &instance).await;
+                        let broken = match variant {
+                            Variant::ReuseGeneration | Variant::FreeOnFenceAtOnce => true,
+                            Variant::HintAsGrant => tried_as == Some(Verdict::Free),
+                            _ => false,
+                        };
+                        let got = if broken {
                             let b = &bucket;
                             let (id, instance) = (&id, &instance);
                             node.acquire_via(ACTOR, async |valid: &dyn Fn() -> bool| {
                                 acquire_broken(b, &clock, id, instance, variant, valid).await
                             })
                             .await
+                        } else {
+                            node.acquire(ACTOR, 1).await
+                        };
+                        if variant.waiters() {
+                            let now = clock.now_ms();
+                            let mut s = shared.lock().unwrap();
+                            let mut ended = false;
+                            match (&got, &mut wait) {
+                                (Ok(_), Some(_)) => {
+                                    s.waits.took += 1;
+                                    ended = true;
+                                }
+                                (Err(AcquireError::Held { node: owner, .. }), Some(w)) => {
+                                    if &w.owner == owner {
+                                        w.waiter.refused(now);
+                                    } else {
+                                        s.waits.saw_other += 1;
+                                        ended = true;
+                                    }
+                                }
+                                // The bucket did not answer: asked again later.
+                                (Err(_), Some(w)) => w.waiter.refused(now),
+                                (Err(AcquireError::Held { node: owner, .. }), None)
+                                    if variant != Variant::GiveUp =>
+                                {
+                                    // As a connection to the holder that
+                                    // failed: always once it was killed; now
+                                    // and then under the random faults, where
+                                    // it may be alive (in the crash scenario
+                                    // nothing fails before the kill).
+                                    if s.killed_at.is_some() || (!scenario && rng.chance(50)) {
+                                        watch.connect_failed(owner, now);
+                                    }
+                                    let verdict = watch.verdict(owner, now, None);
+                                    let jitter = u64::from(i) * 67;
+                                    if let Some(waiter) =
+                                        Waiter::admit(verdict, now, now + WAIT_MS, RETRY_MS, jitter)
+                                    {
+                                        match verdict {
+                                            Verdict::Suspect => s.waits.suspect += 1,
+                                            Verdict::Stale { .. } => s.waits.stale += 1,
+                                            _ => s.waits.stopping += 1,
+                                        }
+                                        wait = Some(Wait {
+                                            owner: owner.clone(),
+                                            waiter,
+                                            began_ms: now,
+                                            tries: 0,
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if ended {
+                                if let Some(w) = wait.take()
+                                    && w.tries > 1 + (now - w.began_ms) / RETRY_MS
+                                {
+                                    s.waits.spun += 1;
+                                }
+                            }
                         }
-                        _ => node.acquire(ACTOR, 1).await,
-                    };
-                    if let Ok(h) = got
-                        && node.may_act(&h)
-                    {
-                        // The node acts as owner from now on.
-                        let until = node
-                            .valid_until_ms()
-                            .unwrap_or(0)
-                            .saturating_add_signed(-skew_ms);
-                        serial += 1;
-                        let mut s = shared.lock().unwrap();
-                        s.acquired += 1;
-                        if slot == TWIN {
-                            s.twin_acquired += 1;
+                        if let Ok(h) = got
+                            && node.may_act(&h)
+                        {
+                            // The node acts as owner from now on.
+                            let until = node
+                                .valid_until_ms()
+                                .unwrap_or(0)
+                                .saturating_add_signed(-skew_ms);
+                            serial += 1;
+                            let mut s = shared.lock().unwrap();
+                            s.acquired += 1;
+                            if slot == TWIN {
+                                s.twin_acquired += 1;
+                            }
+                            *s.reasons.entry(reason).or_default() += 1;
+                            s.holds.push(HoldSeen {
+                                node: i,
+                                instance: instance.clone(),
+                                generation: h.generation,
+                                serial,
+                            });
+                            s.claims.push(Claim {
+                                node: i,
+                                instance: process,
+                                generation: h.generation,
+                                from_ms: env.now(),
+                                until_ms: until,
+                            });
+                            drop(s);
+                            hold = Some(h);
                         }
-                        *s.reasons.entry(reason).or_default() += 1;
-                        s.holds.push(HoldSeen {
-                            node: i,
-                            instance: instance.clone(),
-                            generation: h.generation,
-                            serial,
-                        });
-                        s.claims.push(Claim {
-                            node: i,
-                            instance: process,
-                            generation: h.generation,
-                            from_ms: env.now(),
-                            until_ms: until,
-                        });
-                        drop(s);
-                        hold = Some(h);
                     }
                 }
             }
@@ -412,9 +638,20 @@ struct Outcome {
     lost_payloads: u64,
     deletions: u64,
     reasons: HashMap<&'static str, u64>,
+    waits: Waits,
+    /// The crash scenario: when the holder was killed, and which node it
+    /// was.
+    killed: Option<(u64, u32)>,
 }
 
 fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
+    simulate_with(seed, variant, duration, false)
+}
+
+/// `scenario`: no random fault, no twin, no operator, no slow bucket and
+/// no hold given up; halfway, the node holding the actor is killed for
+/// good, and each survivor asks for the actor once.
+fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool) -> Outcome {
     let rt = Runtime::with_seed_and_config(seed, madsim::Config::default());
     let shared = Arc::new(Mutex::new(Shared::default()));
     let out = Arc::clone(&shared);
@@ -428,7 +665,8 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
             .ip("10.0.0.1".parse().unwrap())
             .init({
                 let store = Store::default();
-                move || bucket_node_with(Arc::clone(&store), bucket::Faults { slow_one_in: 25 })
+                let slow_one_in = if scenario { 0 } else { 25 };
+                move || bucket_node_with(Arc::clone(&store), bucket::Faults { slow_one_in })
             })
             .build();
         let max_skew = config().max_skew_ms();
@@ -436,6 +674,9 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
         take_fences();
         // Slots 0 to 2 run n1 to n3; slot 3 runs n1's twin.
         for slot in 0..=TWIN {
+            if scenario && slot == TWIN {
+                continue;
+            }
             let i = if slot == TWIN {
                 1
             } else {
@@ -457,6 +698,7 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
                         skew_ms,
                         node_seed,
                         variant,
+                        scenario,
                         Arc::clone(&shared),
                     )
                 })
@@ -485,7 +727,7 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
                         skew_ms: op_skew,
                     };
                     let mut rng = Rng::new(seed ^ 0x0FE7_CE00);
-                    loop {
+                    while !scenario {
                         sleep(Duration::from_millis(2_000 + rng.below(6_000))).await;
                         let n = 1 + rng.below(3);
                         let key = format!("{NODES}n{n}");
@@ -516,6 +758,28 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
         for step in 1..=steps {
             sleep(Duration::from_millis(50)).await;
             let at = step * 50;
+            if scenario {
+                // Halfway: the holder dies, and stays dead.
+                let mut s = shared.lock().unwrap();
+                let now = env.now();
+                let holder = s
+                    .claims
+                    .iter()
+                    .rev()
+                    .find(|c| c.from_ms <= now && now < c.until_ms)
+                    .map(|c| (c.node, c.instance));
+                if step >= steps / 2
+                    && s.killed_at.is_none()
+                    && let Some((node, process)) = holder
+                {
+                    stop_process(&mut s.claims, node, process, now);
+                    s.killed_at = Some(now);
+                    s.killed_node = node;
+                    drop(s);
+                    handle.kill(nodes[usize::try_from(node).unwrap() - 1]);
+                }
+                continue;
+            }
             let n = usize::try_from(rng.below(4)).unwrap();
             // Over four slots at the three-slot schedule's rate per process
             // (one in 40 steps a clog, one in 120 a crash, for each).
@@ -568,6 +832,8 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
         lost_payloads: s.lost_payloads,
         deletions: s.deletions,
         reasons: s.reasons.clone(),
+        waits: s.waits.clone(),
+        killed: s.killed_at.map(|at| (at, s.killed_node)),
     }
 }
 
@@ -651,6 +917,7 @@ fn each_broken_variant_is_caught() {
         Variant::ReuseGeneration,
         Variant::FreeOnFenceAtOnce,
         Variant::ResolveWhileHeld,
+        Variant::HintAsGrant,
     ] {
         // At least 200 seeds: the rarest variant shows within that, so a
         // quick run with fewer seeds still finds it.
@@ -703,5 +970,92 @@ fn ignoring_the_epoch_is_never_caught_here() {
     assert!(
         acts >= seeds() / 2,
         "old holds acted {acts} times: the variant missed its case"
+    );
+}
+
+/// The single-owner checks hold when waiters drive acquisitions, under
+/// the same faults; a waiter asks only when its rule says so; and the runs
+/// reach every way a wait begins and ends.
+#[test]
+fn a_waiter_follows_the_owner_watch() {
+    let mut waits = Waits::default();
+    let (mut acquired, mut fences) = (0, 0);
+    for seed in 0..seeds() {
+        let o = simulate(seed, Variant::Waiters, Duration::from_secs(30));
+        if let Some(d) = double_ownership(&o.claims) {
+            panic!("seed {seed}: two owners: {d:?}");
+        }
+        if let Some(pair) = shared_generation(&o.holds) {
+            panic!("seed {seed}: one generation, two holds: {pair:?}");
+        }
+        assert_eq!(
+            o.waits.tried_unfree, 0,
+            "seed {seed}: a waiter asked for an actor whose holder was only stale"
+        );
+        assert_eq!(
+            o.waits.spun, 0,
+            "seed {seed}: a waiter asked more than once per retry period"
+        );
+        acquired += o.acquired;
+        fences += o.fences;
+        waits.suspect += o.waits.suspect;
+        waits.stale += o.waits.stale;
+        waits.stopping += o.waits.stopping;
+        waits.took += o.waits.took;
+        waits.saw_other += o.waits.saw_other;
+        waits.left += o.waits.left;
+        waits.expired += o.waits.expired;
+    }
+    eprintln!(
+        "{} seeds with waiters: {acquired} acquisitions, {fences} fences, {waits:?}",
+        seeds()
+    );
+    let floor = (seeds() / 20).max(1);
+    for (what, n) in [
+        ("begun on a suspected holder", waits.suspect),
+        ("begun on a stale holder", waits.stale),
+        ("begun on a fenced or released holder", waits.stopping),
+        ("ended holding the actor", waits.took),
+        ("ended by another node holding it", waits.saw_other),
+        ("ended by the holder shown alive", waits.left),
+    ] {
+        assert!(n >= floor, "{n} waits {what}, want {floor}");
+    }
+}
+
+/// The holder is killed and each survivor asks once, with no retry: a
+/// waiter takes the actor over within the wait, never before the dead
+/// node's lease allows (the checks above), and none gives up at its
+/// deadline. Without the wait (a refusal is final) nobody ever holds the
+/// actor again: the check has teeth.
+#[test]
+fn a_waiter_takes_over_after_a_crash() {
+    let taken_over = |o: &Outcome| {
+        let (killed_at, dead) = o.killed.expect("the holder was never killed");
+        o.claims
+            .iter()
+            .filter(|c| c.node != dead && c.until_ms > c.from_ms && c.from_ms >= killed_at)
+            .map(|c| c.from_ms - killed_at)
+            .min()
+    };
+    for seed in 0..seeds() {
+        let o = simulate_with(seed, Variant::Waiters, Duration::from_secs(16), true);
+        assert!(double_ownership(&o.claims).is_none(), "seed {seed}");
+        assert!(shared_generation(&o.holds).is_none(), "seed {seed}");
+        let after = taken_over(&o)
+            .unwrap_or_else(|| panic!("seed {seed}: nobody took over: {:?}", o.waits));
+        // Each survivor asks within 1.5 s of the kill and waits `WAIT_MS`.
+        assert!(
+            after <= 1_500 + WAIT_MS,
+            "seed {seed}: taken over {after} ms after the kill"
+        );
+        assert_eq!(o.waits.expired, 0, "seed {seed}: {:?}", o.waits);
+        assert_eq!(o.waits.tried_unfree + o.waits.spun, 0, "seed {seed}");
+    }
+    let o = simulate_with(0, Variant::GiveUp, Duration::from_secs(16), true);
+    assert_eq!(
+        taken_over(&o),
+        None,
+        "taken over though no survivor waited: the scenario shows nothing"
     );
 }

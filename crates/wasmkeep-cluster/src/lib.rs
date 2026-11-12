@@ -11,6 +11,7 @@
 pub mod alarm_index;
 pub mod bucket_check;
 pub mod control;
+pub mod failover;
 pub mod holds;
 pub mod lease;
 pub mod membership;

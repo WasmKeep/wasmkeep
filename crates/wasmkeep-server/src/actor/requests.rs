@@ -3,6 +3,16 @@
 
 use super::*;
 
+/// What to do with a request another node holds ([`ActorService::hold`]).
+pub(super) enum Held {
+    /// Kept, and time to ask for the actor again.
+    Retry,
+    /// Not kept, or no longer: sent to the node as without the wait.
+    Forward,
+    /// Kept in vain: this answer.
+    Answer(Response<HyperOutgoingBody>),
+}
+
 impl ActorService {
     /// Handles `/actor/<class>/<name><rest>`: `rest` (with the query) is the
     /// path the guest sees. Never fails; errors become HTTP statuses.
@@ -86,15 +96,67 @@ impl ActorService {
         req.headers_mut().remove(CHAIN);
 
         let Some(signed) = signed_body else {
-            return match self.dispatch(address.clone(), req, chain, outside).await {
-                Ok(response) => response,
-                Err(handback) => match &self.inner.cluster {
+            // A request from outside that can wait for a dead node's actor
+            // to be taken over: a GET or HEAD whose body is known to be
+            // empty, so nothing is buffered and nothing of it was sent
+            // anywhere. Its deadline counts from now.
+            let deadline = self
+                .inner
+                .cluster
+                .as_ref()
+                .and_then(|cluster| cluster.failover.deadline_ms())
+                .filter(|_| {
+                    matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
+                        && hyper::body::Body::is_end_stream(req.body())
+                        && !crate::cluster::never_forward(&req)
+                });
+            let mut ticket = None;
+            let mut req = req;
+            loop {
+                let handback = match self
+                    .dispatch(address.clone(), req, Arc::clone(&chain), outside)
+                    .await
+                {
+                    Ok(response) => {
+                        if let Some(ticket) = ticket.take() {
+                            Self::kept_request_answered(ticket, &response);
+                        }
+                        return response;
+                    }
+                    Err(handback) => handback,
+                };
+                return match &self.inner.cluster {
                     Some(cluster) => {
                         let Handback {
                             node,
-                            req,
+                            req: back,
                             elsewhere,
                         } = *handback;
+                        let held = if elsewhere {
+                            Held::Forward
+                        } else {
+                            self.hold(
+                                cluster,
+                                &mut ticket,
+                                &node,
+                                &address,
+                                deadline,
+                                crate::cluster::Kept::Request,
+                            )
+                            .await
+                        };
+                        match held {
+                            Held::Retry => {
+                                req = back;
+                                continue;
+                            }
+                            Held::Answer(response) => return response,
+                            Held::Forward => {}
+                        }
+                        if let Some(ticket) = ticket.take() {
+                            ticket.end("forwarded");
+                        }
+                        let req = back;
                         // Already forwarded: answered 503 here, the peer
                         // never asked, so no reason to suspect it.
                         let sent = !crate::cluster::never_forward(&req);
@@ -111,8 +173,8 @@ impl ActorService {
                         response
                     }
                     None => text_response(StatusCode::INTERNAL_SERVER_ERROR, "actor error\n"),
-                },
-            };
+                };
+            }
         };
         // A node's call: its body must be the one it signed. Only a valid
         // signature gets this far, so only nodes make us buffer a body.
@@ -160,6 +222,68 @@ impl ActorService {
             // the owner it saw); the calling actor gets the 503.
             Err(_) => crate::cluster::unavailable("actor ownership is changing; retry\n"),
         }
+    }
+
+    /// A request (or an upgrade) for `address` came back naming `owner`,
+    /// another node. Keeps it if waiting for a takeover can serve it
+    /// (`Cluster::keep`), and says what to do once the wait ends. `ticket`
+    /// is the request's place while it is kept: `None` at first, and set
+    /// on [`Held::Retry`]. `deadline`: `None` for a request that is never
+    /// kept.
+    pub(super) async fn hold<'a>(
+        &self,
+        cluster: &'a crate::cluster::Cluster,
+        ticket: &mut Option<crate::cluster::Ticket<'a>>,
+        owner: &str,
+        address: &ActorAddress,
+        deadline: Option<u64>,
+        kind: crate::cluster::Kept,
+    ) -> Held {
+        use crate::cluster::Waited;
+        let Some(deadline) = deadline else {
+            return Held::Forward;
+        };
+        let mut kept = match ticket.take() {
+            Some(mut kept) if kept.owner() == owner => {
+                kept.refused();
+                kept
+            }
+            // Another node took the actor: sent there, once.
+            Some(kept) => {
+                kept.end("forwarded");
+                return Held::Forward;
+            }
+            None => match cluster.keep(owner, address, deadline, kind) {
+                Some(kept) => kept,
+                None => return Held::Forward,
+            },
+        };
+        match kept.wait().await {
+            Waited::Try => {
+                // Asked afresh: not answered from what this node remembers.
+                self.inner.forget_owner(address);
+                *ticket = Some(kept);
+                Held::Retry
+            }
+            Waited::Leave => Held::Forward,
+            // What a request for an owner out of this node's view gets.
+            Waited::GiveUp => Held::Answer(crate::cluster::unavailable(
+                "the actor's node is not reachable; retry\n",
+            )),
+        }
+    }
+
+    /// A kept request was answered here: by its actor, or otherwise (the
+    /// node full, the actor refused, a restore that failed).
+    fn kept_request_answered(
+        ticket: crate::cluster::Ticket<'_>,
+        response: &Response<HyperOutgoingBody>,
+    ) {
+        ticket.end(if response.headers().contains_key(SERVED_BY) {
+            "served"
+        } else {
+            "answered_other"
+        });
     }
 
     /// Runs a request on the actor's mailbox. Hands the request back with

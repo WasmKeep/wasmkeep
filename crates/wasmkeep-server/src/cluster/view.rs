@@ -323,6 +323,9 @@ impl Cluster {
                     .filter_map(|n| Some((n.id.clone(), Peer::of(n)?)))
                     .collect();
                 *self.peers.write().unwrap_or_else(|p| p.into_inner()) = peers;
+                // The same bodies, for the requests kept until a dead
+                // node's actors are free: no bucket request.
+                self.failover.observe(&all, now);
                 // Last, and handed to the fence task: a fence awaits the
                 // bucket, and neither this view nor the next listing may
                 // wait for it.
@@ -439,8 +442,12 @@ impl Cluster {
                     written_at_ms = written_at,
                     "fenced a node that stopped renewing its lease (ADR 0020)"
                 );
+                self.failover.nudge(&node);
             }
-            Fence::Alive | Fence::NotLive => {}
+            // Fenced or released by another: requests kept for its actors
+            // need not wait for the next listing to ask.
+            Fence::NotLive => self.failover.nudge(&node),
+            Fence::Alive => {}
             Fence::Unavailable => {
                 tracing::warn!(node = %node, "fencing a stale node failed; watching it again");
             }

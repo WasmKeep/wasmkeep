@@ -1,6 +1,7 @@
 //! WebSocket upgrades: `GET /actor/<class>/<name>/...` with an upgrade
 //! header, accepted by the actor's `on-websocket-open` before 101.
 
+use super::requests::Held;
 use super::*;
 
 impl ActorService {
@@ -38,91 +39,131 @@ impl ActorService {
         if self.early_rule(class, address.name()) == crate::access::Access::Internal {
             return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
         }
-        if let Some(owner) = self.inner.remote_owner(&address).await
-            && let Some(cluster) = &self.inner.cluster
-        {
-            let response = cluster.forward_upgrade(&owner, req).await;
-            if response.status().is_server_error() {
-                self.inner.forget_owner(&address);
-            }
-            return response;
-        }
-        // Check admission before sending 101, including open classes. A
-        // later eviction race is reported as WebSocket try-again (1013).
-        let probe = self
+        // An upgrade from outside can wait for a dead node's actor to be
+        // taken over (`ActorService::hold`): nothing of it was sent on, and
+        // nothing of a body is read or buffered while it is kept. Its
+        // deadline counts from now.
+        let deadline = self
             .inner
-            .mailboxes
-            .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
-                Box::pin(async move { state.admit(true).await })
-            })
-            .await;
-        match probe {
-            Ok(Ok(Admitted::Yes)) => {}
-            Ok(Ok(Admitted::Missing)) => {
-                return text_response(StatusCode::NOT_FOUND, "no such actor\n");
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.failover.deadline_ms())
+            .filter(|_| !crate::cluster::never_forward(&req));
+        let kind = crate::cluster::Kept::WebSocket;
+        let mut ticket = None;
+        // Once, unless the upgrade is kept: then again from here each time
+        // it asks for the actor.
+        loop {
+            if let Some(owner) = self.inner.remote_owner(&address).await
+                && let Some(cluster) = &self.inner.cluster
+            {
+                match self
+                    .hold(cluster, &mut ticket, &owner, &address, deadline, kind)
+                    .await
+                {
+                    Held::Retry => continue,
+                    Held::Answer(response) => return response,
+                    Held::Forward => {}
+                }
+                let response = cluster.forward_upgrade(&owner, req).await;
+                if response.status().is_server_error() {
+                    self.inner.forget_owner(&address);
+                }
+                return response;
             }
-            Ok(Ok(Admitted::Forbidden)) => {
-                return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
-            }
-            Err(MailboxError::Capacity(_)) => return capacity_response(),
-            _ => return text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n"),
-        }
-        // In a cluster the socket must live on the actor's owner: find out
-        // (acquiring the lease if it is free), and relay to the owner if it
-        // is another node.
-        if let Some(cluster) = self.inner.cluster.clone() {
+            // Check admission before sending 101, including open classes. A
+            // later eviction race is reported as WebSocket try-again (1013).
             let probe = self
                 .inner
                 .mailboxes
-                .submit_wait(&address, ADMISSION_WAIT, |state: &mut ActorState| {
-                    Box::pin(async move {
-                        match state.ensure_owner().await {
-                            Ok(()) => {
-                                // The socket may never open (the client
-                                // gone, the node full): no event would arm
-                                // the actor's alarm here.
-                                state.arm_committed_alarm().await;
-                                Ok(())
-                            }
-                            Err(OwnershipError::NotOwner { owner, .. }) => {
-                                Err(Some((owner, false)))
-                            }
-                            Err(OwnershipError::Elsewhere { peer }) => Err(Some((peer, true))),
-                            Err(
-                                OwnershipError::Unavailable(_)
-                                | OwnershipError::Refused(_)
-                                | OwnershipError::Broken(_),
-                            ) => Err(None),
-                        }
-                    })
+                .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
+                    Box::pin(async move { state.admit(true).await })
                 })
                 .await;
             match probe {
-                Ok(Ok(())) => {}
-                Ok(Err(Some((owner, false)))) => {
-                    self.inner.mailboxes.hibernate(&address);
-                    self.inner.remember_owner(&address, &owner);
-                    return cluster.forward_upgrade(&owner, req).await;
+                Ok(Ok(Admitted::Yes)) => {}
+                Ok(Ok(Admitted::Missing)) => {
+                    return text_response(StatusCode::NOT_FOUND, "no such actor\n");
                 }
-                Ok(Err(Some((peer, true)))) => {
-                    self.inner.mailboxes.hibernate(&address);
-                    let sent = !crate::cluster::never_forward(&req);
-                    let response = cluster.forward_upgrade(&peer, req).await;
-                    if sent && response.status().is_server_error() {
-                        cluster.suspect(&peer);
+                Ok(Ok(Admitted::Forbidden)) => {
+                    return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
+                }
+                Err(MailboxError::Capacity(_)) => return capacity_response(),
+                _ => return text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n"),
+            }
+            // In a cluster the socket must live on the actor's owner: find out
+            // (acquiring the lease if it is free), and relay to the owner if it
+            // is another node.
+            if let Some(cluster) = &self.inner.cluster {
+                let probe = self
+                    .inner
+                    .mailboxes
+                    .submit_wait(&address, ADMISSION_WAIT, |state: &mut ActorState| {
+                        Box::pin(async move {
+                            match state.ensure_owner().await {
+                                Ok(()) => {
+                                    // The socket may never open (the client
+                                    // gone, the node full): no event would arm
+                                    // the actor's alarm here.
+                                    state.arm_committed_alarm().await;
+                                    Ok(())
+                                }
+                                Err(OwnershipError::NotOwner { owner, .. }) => {
+                                    Err(Some((owner, false)))
+                                }
+                                Err(OwnershipError::Elsewhere { peer }) => Err(Some((peer, true))),
+                                Err(
+                                    OwnershipError::Unavailable(_)
+                                    | OwnershipError::Refused(_)
+                                    | OwnershipError::Broken(_),
+                                ) => Err(None),
+                            }
+                        })
+                    })
+                    .await;
+                match probe {
+                    Ok(Ok(())) => {
+                        if let Some(ticket) = ticket.take() {
+                            ticket.end("served");
+                        }
                     }
-                    return response;
-                }
-                _ => {
-                    let mut r =
-                        text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n");
-                    r.headers_mut().insert(
-                        hyper::header::RETRY_AFTER,
-                        hyper::header::HeaderValue::from_static("1"),
-                    );
-                    return r;
+                    Ok(Err(Some((owner, false)))) => {
+                        self.inner.mailboxes.hibernate(&address);
+                        self.inner.remember_owner(&address, &owner);
+                        match self
+                            .hold(cluster, &mut ticket, &owner, &address, deadline, kind)
+                            .await
+                        {
+                            Held::Retry => continue,
+                            Held::Answer(response) => return response,
+                            Held::Forward => {}
+                        }
+                        return cluster.forward_upgrade(&owner, req).await;
+                    }
+                    Ok(Err(Some((peer, true)))) => {
+                        self.inner.mailboxes.hibernate(&address);
+                        if let Some(ticket) = ticket.take() {
+                            ticket.end("forwarded");
+                        }
+                        let sent = !crate::cluster::never_forward(&req);
+                        let response = cluster.forward_upgrade(&peer, req).await;
+                        if sent && response.status().is_server_error() {
+                            cluster.suspect(&peer);
+                        }
+                        return response;
+                    }
+                    _ => {
+                        let mut r =
+                            text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n");
+                        r.headers_mut().insert(
+                            hyper::header::RETRY_AFTER,
+                            hyper::header::HeaderValue::from_static("1"),
+                        );
+                        return r;
+                    }
                 }
             }
+            break;
         }
         if let Err(e) = self.inner.sockets.can_open(&address) {
             tracing::debug!(actor = %address, error = ?e, "websocket refused");

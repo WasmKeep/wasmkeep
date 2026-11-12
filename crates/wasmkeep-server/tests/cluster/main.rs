@@ -39,6 +39,8 @@ mod draining;
 mod durable_writes;
 #[path = "failover.rs"]
 mod failover;
+#[path = "failover_wait.rs"]
+mod failover_wait;
 #[path = "node_leases.rs"]
 mod node_leases;
 #[path = "routing.rs"]
@@ -246,6 +248,10 @@ struct PeerProxy {
     next: Arc<AtomicU8>,
     /// Bumped to close every connection open now.
     close: tokio::sync::watch::Sender<u64>,
+    /// Where it listens.
+    addr: SocketAddr,
+    /// Set to stop listening: connections to it are refused from then on.
+    refuse: tokio::sync::watch::Sender<bool>,
 }
 
 impl PeerProxy {
@@ -253,6 +259,23 @@ impl PeerProxy {
     /// does to one it kept idle too long.
     fn close_connections(&self) {
         self.close.send_modify(|n| *n += 1);
+    }
+
+    /// Stops listening and closes every connection: from now on a peer's
+    /// connection to the node behind is refused, as by a firewall or a
+    /// listener that is gone, while the node itself runs on.
+    async fn refuse_connections(&self) {
+        self.refuse.send_replace(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(self.addr).await.is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the proxy at {} still accepts connections",
+                self.addr
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.close_connections();
     }
 
     /// The next bytes a peer sends are dropped and their connection closed.
@@ -274,9 +297,18 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
     let accepted = Arc::new(AtomicUsize::new(0));
     let next = Arc::new(AtomicU8::new(PROXY_PASS));
     let (close, closed) = tokio::sync::watch::channel(0u64);
+    let (refuse, mut refused) = tokio::sync::watch::channel(false);
     let (count, mode) = (Arc::clone(&accepted), Arc::clone(&next));
     tokio::spawn(async move {
-        while let Ok((inbound, _)) = listener.accept().await {
+        loop {
+            let inbound = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((inbound, _)) => inbound,
+                    Err(_) => break,
+                },
+                // Dropping the listener is what refuses connections.
+                Ok(()) = refused.changed() => break,
+            };
             count.fetch_add(1, Ordering::SeqCst);
             let (mode, mut closed) = (Arc::clone(&mode), closed.clone());
             closed.mark_unchanged();
@@ -298,6 +330,8 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
             accepted,
             next,
             close,
+            addr,
+            refuse,
         },
     )
 }
@@ -401,6 +435,9 @@ async fn start_node(
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     cluster.heartbeat = Duration::from_millis(100);
     cluster.alarm_sweep = Duration::from_millis(200);
+    // Off unless a test asks (`failover_wait.rs`): every other test sees
+    // the answer a node gives at once.
+    cluster.failover_wait = Some(Duration::ZERO);
     config.cluster = Some(cluster);
     adjust(&mut config);
     let cluster_port = cluster_listener(&mut config).await;
@@ -689,6 +726,9 @@ struct Flaky {
     hang_wal_puts: Arc<std::sync::atomic::AtomicU32>,
     /// The next this-many `released` writes of a node lease fail.
     fail_released: Arc<std::sync::atomic::AtomicU32>,
+    /// Writes of this key fail while set (`nodes/a`: this node cannot
+    /// fence a).
+    fail_puts_of: Arc<std::sync::Mutex<Option<String>>>,
     /// The next this-many snapshot (`/snapshot/`) uploads never answer and
     /// are not applied.
     hang_snapshot_puts: Arc<std::sync::atomic::AtomicU32>,
@@ -711,6 +751,7 @@ impl Flaky {
             fail_owner_puts: Arc::default(),
             hang_wal_puts: Arc::default(),
             fail_released: Arc::default(),
+            fail_puts_of: Arc::default(),
             hang_snapshot_puts: Arc::default(),
             fail_snapshot_puts: Arc::default(),
             late_snapshot_puts: Arc::default(),
@@ -797,6 +838,12 @@ impl ObjectStore for Flaky {
             return Err(object_store::Error::Generic {
                 store: "flaky",
                 source: "release refused".into(),
+            });
+        }
+        if self.fail_puts_of.lock().unwrap().as_deref() == Some(location.as_ref()) {
+            return Err(object_store::Error::Generic {
+                store: "flaky",
+                source: "write refused".into(),
             });
         }
         if location.as_ref().starts_with("owners/") && self.fail_owner_puts.load(Ordering::SeqCst) {
@@ -1324,6 +1371,7 @@ async fn node_app(
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     cluster.heartbeat = Duration::from_millis(100);
+    cluster.failover_wait = Some(Duration::ZERO);
     config.cluster = Some(cluster);
     let cluster_port = cluster_listener(&mut config).await;
     let service = ActorService::new(runtime, config, classes).unwrap();
@@ -1474,6 +1522,7 @@ async fn long_lease_node(
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
     cluster.lease = LeaseConfig::new(10_000, 1_000, 200, 100).unwrap();
     cluster.heartbeat = Duration::from_millis(100);
+    cluster.failover_wait = Some(Duration::ZERO);
     config.cluster = Some(cluster);
     let cluster_port = cluster_listener(&mut config).await;
     let service = ActorService::new(

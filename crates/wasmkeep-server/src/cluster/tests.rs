@@ -2522,3 +2522,252 @@ async fn an_acquisition_whose_epoch_moved_writes_nothing() {
         "a record was written for a hold dead from the start"
     );
 }
+
+#[test]
+fn the_default_failover_wait_follows_the_lease_timing() {
+    // ttl 10 s + grace 5 s, the fence watch (3.3 s + 2.7 s), one listing
+    // (3 s) and a second of spread.
+    assert_eq!(
+        failover_wait_default(&LeaseConfig::default_safe(), DEFAULT_HEARTBEAT),
+        Duration::from_millis(24_999)
+    );
+    let config = ClusterConfig::new(
+        "a",
+        "http://a",
+        Arc::new(object_store::memory::InMemory::new()),
+    );
+    assert_eq!(config.failover_wait, None, "on by default, derived");
+    assert_eq!(config.failover_wait_max, 2_500);
+}
+
+/// Node `id`'s lease as a listing shows it, written `age` ago.
+fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duration) -> NodeInfo {
+    NodeInfo {
+        id: id.to_owned(),
+        address: format!("http://{id}"),
+        version: String::new(),
+        written_at_ms: now_ms() - u64::try_from(age.as_millis()).unwrap(),
+        app: "t/".to_owned(),
+        cluster_address: None,
+        tls_pins: Vec::new(),
+        drain: None,
+        reads_secrets: false,
+        can_take: false,
+        instance: Some("0011223344556677".to_owned()),
+        lease: Some(state),
+    }
+}
+
+/// How old node a's lease is in [`waiting_node`]'s listing: past the
+/// horizon (61 s), its actors free 600 ms from now.
+const STALE: Duration = Duration::from_millis(64_400);
+
+/// Node b keeping at most `max` requests, having listed node a's lease
+/// `live` and [`STALE`]. Its timing is long (ttl 60 s, grace 5 s), so its
+/// own start check outlasts the test: it lists and fences nothing, and
+/// the test alone says what it knows. Its lease is set valid by hand.
+fn waiting_node(max: usize, wait: Duration) -> Arc<Cluster> {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let mut config = ClusterConfig::new("b", "http://b", store);
+    config.heartbeat = Duration::from_secs(20);
+    config.lease = LeaseConfig::new(60_000, 5_000, 2_000, 1_000).unwrap();
+    config.failover_wait = Some(wait);
+    config.failover_wait_max = max;
+    let b = Cluster::new(&config, "t/").unwrap();
+    b.validity.set_until(Some(now_ms() + 60_000));
+    let stale = listed("a", wasmkeep_cluster::node_lease::NodeState::Live, STALE);
+    b.failover.observe(&[stale], now_ms());
+    b
+}
+
+#[tokio::test]
+async fn kept_requests_are_capped_and_a_dropped_one_frees_its_place() {
+    use wasmkeep_cluster::failover::Verdict;
+    let b = waiting_node(2, Duration::from_secs(30));
+    assert!(matches!(b.failover.verdict("a"), Verdict::Stale { .. }));
+    let actor = |name: &str| ActorAddress::new("t", "c", name).unwrap();
+    let deadline = b.failover.deadline_ms().unwrap();
+    let keep = |name: &str| b.keep("a", &actor(name), deadline, Kept::Request);
+    let (x, y) = (keep("x").unwrap(), keep("y").unwrap());
+    assert_eq!(b.failover.kept(), 2);
+    assert!(keep("z").is_none(), "over the node's cap");
+    // A client that leaves drops its request, and the place with it.
+    drop(x);
+    assert_eq!(b.failover.kept(), 1);
+    let z = keep("z").unwrap();
+    drop((y, z));
+    assert_eq!(b.failover.kept(), 0);
+
+    // Per actor too, whatever the node's cap leaves.
+    let b = waiting_node(1_000, Duration::from_secs(30));
+    let deadline = b.failover.deadline_ms().unwrap();
+    let kept: Vec<_> = (0..64)
+        .map(|_| b.keep("a", &actor("x"), deadline, Kept::WebSocket).unwrap())
+        .collect();
+    assert!(
+        b.keep("a", &actor("x"), deadline, Kept::WebSocket)
+            .is_none()
+    );
+    assert!(
+        b.keep("a", &actor("y"), deadline, Kept::WebSocket)
+            .is_some()
+    );
+    drop(kept);
+    assert_eq!(b.failover.kept(), 0);
+}
+
+#[tokio::test]
+async fn nothing_is_kept_with_the_wait_off_for_a_live_owner_or_past_the_deadline() {
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let off = waiting_node(10, Duration::ZERO);
+    assert_eq!(off.failover.deadline_ms(), None);
+    assert!(
+        off.keep("a", &x, now_ms() + 30_000, Kept::Request)
+            .is_none()
+    );
+
+    let b = waiting_node(10, Duration::from_secs(30));
+    let deadline = b.failover.deadline_ms().unwrap();
+    // A node that renews, one never listed, this node itself.
+    let live = listed(
+        "c",
+        wasmkeep_cluster::node_lease::NodeState::Live,
+        Duration::ZERO,
+    );
+    let stale = listed("a", wasmkeep_cluster::node_lease::NodeState::Live, STALE);
+    // Twice: a later `written_at` than the listing before would show a
+    // writing.
+    b.failover.observe(&[stale.clone(), live.clone()], now_ms());
+    b.failover.observe(&[stale, live], now_ms());
+    for owner in ["c", "nobody", "b"] {
+        assert!(
+            b.keep(owner, &x, deadline, Kept::Request).is_none(),
+            "{owner}"
+        );
+    }
+    // a's actors are free 600 ms from now: a deadline before that cannot
+    // be met by waiting.
+    assert!(b.keep("a", &x, now_ms() + 300, Kept::Request).is_none());
+    assert!(b.keep("a", &x, now_ms() + 900, Kept::Request).is_some());
+    // Not while this node's own lease is not valid.
+    b.validity.set_until(None);
+    assert!(b.keep("a", &x, deadline, Kept::Request).is_none());
+}
+
+#[tokio::test]
+async fn a_kept_request_gives_up_at_its_deadline_at_shutdown_and_when_the_lease_lapses() {
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let b = waiting_node(10, Duration::from_secs(30));
+    // The deadline: nobody fences a, so nothing changes until then.
+    let started = std::time::Instant::now();
+    let mut kept = b.keep("a", &x, now_ms() + 900, Kept::Request).unwrap();
+    assert_eq!(kept.wait().await, Waited::GiveUp);
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(850) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    drop(kept);
+
+    let deadline = b.failover.deadline_ms().unwrap();
+    let mut kept = b.keep("a", &x, deadline, Kept::Request).unwrap();
+    let wait = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(kept.wait(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.validity.set_until(None);
+        })
+        .0
+    });
+    assert_eq!(wait.await.unwrap(), Waited::GiveUp, "the lease ran out");
+    drop(kept);
+
+    let b = waiting_node(10, Duration::from_secs(30));
+    let deadline = b.failover.deadline_ms().unwrap();
+    let mut kept = b.keep("a", &x, deadline, Kept::Request).unwrap();
+    let wait = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(kept.wait(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.failover.close();
+        })
+        .0
+    });
+    assert_eq!(wait.await.unwrap(), Waited::GiveUp, "the node stops");
+    drop(kept);
+    assert!(
+        b.keep("a", &x, deadline, Kept::Request).is_none(),
+        "stopping"
+    );
+}
+
+#[tokio::test]
+async fn a_fence_or_a_listing_wakes_a_kept_request_and_a_renewal_releases_it() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let b = waiting_node(10, Duration::from_secs(30));
+    let deadline = b.failover.deadline_ms().unwrap();
+
+    // This node's own fence: asked again, without waiting for a listing.
+    let mut kept = b.keep("a", &x, deadline, Kept::Request).unwrap();
+    let wait = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(kept.wait(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.failover.nudge("a");
+        })
+        .0
+    });
+    assert_eq!(wait.await.unwrap(), Waited::Try);
+    // Still held there: it waits again, and a listing showing a writing
+    // again releases it to the ordinary answer.
+    kept.refused();
+    let wait = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(kept.wait(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.failover
+                .observe(&[listed("a", NodeState::Live, Duration::ZERO)], now_ms());
+        })
+        .0
+    });
+    assert_eq!(wait.await.unwrap(), Waited::Leave);
+    drop(kept);
+    assert_eq!(b.failover.kept(), 0);
+}
+
+/// The mark behind a suspected peer relies on the HTTP client saying
+/// `is_connect` only before a request was handed to a connection: for a
+/// connection it could not open (checked here), and for a pooled one it
+/// could not hand out (rare, not checked). To check again when hyper-util
+/// moves.
+#[tokio::test]
+async fn only_a_connection_that_could_not_be_opened_counts_as_a_failed_connect() {
+    let client = peer_client_builder(Duration::from_secs(1))
+        .build::<_, http_body_util::Empty<bytes::Bytes>>(
+            hyper_util::client::legacy::connect::HttpConnector::new(),
+        );
+    let get = |addr: std::net::SocketAddr| {
+        client.request(
+            Request::get(format!("http://{addr}/"))
+                .body(http_body_util::Empty::new())
+                .unwrap(),
+        )
+    };
+    // Nothing listens: refused.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let refusing = listener.local_addr().unwrap();
+    drop(listener);
+    let error = get(refusing).await.unwrap_err();
+    assert!(error.is_connect(), "{error:?}");
+    // Accepted, then closed without an answer: the request may have been
+    // read.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closing = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+        }
+    });
+    let error = get(closing).await.unwrap_err();
+    assert!(!error.is_connect(), "{error:?}");
+}

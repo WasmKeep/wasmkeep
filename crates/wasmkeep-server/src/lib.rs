@@ -29,7 +29,8 @@ mod websocket;
 pub use access::{Access, AccessRules};
 pub use actor::{ActorConfig, ActorService};
 pub use cluster::{
-    ClusterConfig, ClusterPlaintext, ClusterTlsConfig, DEFAULT_HEARTBEAT, heartbeat_horizon_ms,
+    ClusterConfig, ClusterPlaintext, ClusterTlsConfig, DEFAULT_HEARTBEAT, failover_wait_default,
+    heartbeat_horizon_ms,
 };
 pub use egress::{EgressPolicy, IpRange};
 pub use env::ActorEnv;

@@ -196,6 +196,8 @@ async fn node(id: &str, data: &Path, shared: &Arc<dyn ObjectStore>) -> Node {
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     cluster.heartbeat = PERIOD;
     cluster.alarm_sweep = Duration::from_millis(200);
+    // These tests are about what a node answers at once.
+    cluster.failover_wait = Some(Duration::ZERO);
     cluster.cluster_tls = Some(ClusterTlsConfig::new(format!(
         "https://{}",
         cluster_listener.local_addr().unwrap()

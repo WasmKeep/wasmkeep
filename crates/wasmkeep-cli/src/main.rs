@@ -344,6 +344,15 @@ struct ServeArgs {
     #[arg(long, value_name = "SECS", default_value_t = 3600)]
     history_retention_secs: u64,
 
+    /// Seconds a request for an actor whose node died or is stopping is
+    /// kept until another node can take the actor over, instead of a 503
+    /// at once: a GET or HEAD without a body, or a WebSocket upgrade,
+    /// arriving from outside. By default what a takeover can take, from
+    /// the lease timing (25 s); 0 answers at once, as before. A load
+    /// balancer's server timeout must be longer (see docs/cluster.md).
+    #[arg(long, value_name = "SECS")]
+    failover_wait_secs: Option<u64>,
+
     /// Bucket shared by the cluster: s3://BUCKET[/PREFIX]. Credentials,
     /// region and endpoint come from the AWS_* environment variables
     /// (AWS_ENDPOINT for MinIO or R2, AWS_ALLOW_HTTP=true for plain http).
@@ -983,6 +992,9 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             let mut cluster = ClusterConfig::new(node_id, advertise, store);
             cluster.prefix = prefix;
             cluster.history_retention = std::time::Duration::from_secs(args.history_retention_secs);
+            cluster.failover_wait = args.failover_wait_secs.map(std::time::Duration::from_secs);
+            // Three quarters of the connections stay for everything else.
+            cluster.failover_wait_max = max_connections / 4;
             cluster.reads_secrets = !args.no_secrets;
             if let Some((tenant, name)) = &args.app {
                 cluster.app = format!("{tenant}/{name}");

@@ -91,6 +91,8 @@ async fn node_with(
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     cluster.heartbeat = Duration::from_millis(100);
     cluster.alarm_sweep = Duration::from_millis(200);
+    // These tests are about what a node answers at once.
+    cluster.failover_wait = Some(Duration::ZERO);
     cluster.cluster_plaintext = plaintext;
     let cluster_listener = if mode == Mode::Plain {
         None

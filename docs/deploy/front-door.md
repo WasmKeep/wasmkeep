@@ -30,6 +30,20 @@ node a     node b     node c       any node takes any request;
 - **WebSockets** need the upgrade passed through and a tunnel or idle
   timeout above 90 s (WasmKeep pings an idle socket after 60 s and closes
   it 30 s later if there is no answer).
+- **A server timeout above the failover wait.** When a node dies, the
+  others keep a `GET`, a `HEAD` or a WebSocket upgrade for one of its
+  actors until they took the actor over, up to 25 s by default
+  (`--failover-wait-secs`, see [what a caller sees when a node
+  dies](../cluster.md#when-a-node-dies-what-a-caller-sees)), and a kept
+  request sent on to the node that took the actor can wait 30 s more
+  there. A load balancer that gives up on the node sooner turns that wait
+  into its own 504: give it 60 s or more for the node's answer, or lower
+  the wait on the nodes to fit.
+- **Tell the node when the client is gone.** A kept request is dropped,
+  and never run, when its connection closes. If the load balancer keeps
+  its connection to the node open after its own client left, the node
+  cannot know, and runs the request for nobody once the actor is taken
+  over.
 - **Never expose** the metrics listener (`--metrics-listen`) or the
   node-to-node traffic to the internet.
 
@@ -58,12 +72,35 @@ backend wasmkeep
     hash-type consistent
     option httpchk GET /_wasmkeep/ready
     http-check expect status 200
+    # Above the failover wait (25 s) plus a forward to the new owner.
+    timeout server 60s
     timeout tunnel 1h
+    # A node that refuses the connection: try another one.
+    retries 2
+    option redispatch
+    # The client left while its request waited: close the node's side too.
+    option abortonclose
     default-server inter 2s fall 2 rise 2
     server a 10.0.0.11:8080 check
     server b 10.0.0.12:8080 check
     server c 10.0.0.13:8080 check
 ```
+
+`timeout server` is how long HAProxy waits for a node's answer: it must
+be longer than the nodes' failover wait, or HAProxy answers 504 while the
+node still holds the request. `option redispatch` with `retries` sends a
+request whose connection a node refused (it just died, and its health
+check has not failed yet) to another node, where it can be kept, instead
+of failing it; it applies to connections that could not be opened, so no
+request is sent twice. `option abortonclose` asks HAProxy to give up a
+request whose client closed its connection before an answer, and so to
+close its connection to the node: that is what lets a node drop a kept
+request nobody waits for. This example was not run against HAProxy with a
+kept request: check with your version that a client's departure closes
+the node's side while HAProxy waits for the answer (the node then counts
+`outcome="left"` in `wasmkeep_failover_waits_total`). Another proxy needs
+its own equivalent; without one, a kept `GET` runs after the takeover for
+a client that has left.
 
 **nginx**: hash a variable holding the actor's path:
 
