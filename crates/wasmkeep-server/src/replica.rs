@@ -150,7 +150,7 @@ const SNAPSHOT_RETRY_GROWTH: u64 = 8;
 /// See [`PERIODIC_SNAPSHOT_IDLES`]: the least time between a periodic
 /// snapshot that failed and the next try, however fast segments follow:
 /// as long as the longest bounded wait of a queued caller.
-const SNAPSHOT_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const SNAPSHOT_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a periodic snapshot's one attempt may take, for an idle bound
 /// of `idle` and a snapshot of `bytes`: see [`PERIODIC_SNAPSHOT_IDLES`].
@@ -215,7 +215,8 @@ pub(crate) struct Replica {
     /// see [`Self::snapshot_due`].
     snapshot_retry_at: u64,
     snapshot_retry_after: tokio::time::Instant,
-    /// [`SNAPSHOT_RETRY_MIN`]; shorter in tests.
+    /// [`SNAPSHOT_RETRY_MIN`] unless the node's configuration says
+    /// otherwise (tests shorten it).
     snapshot_retry_min: std::time::Duration,
     /// The local database file (for the `.replica` sidecar).
     db_path: PathBuf,
@@ -338,7 +339,7 @@ impl Replica {
             snapshot_failures: 0,
             snapshot_retry_at: 0,
             snapshot_retry_after: tokio::time::Instant::now(),
-            snapshot_retry_min: SNAPSHOT_RETRY_MIN,
+            snapshot_retry_min: cluster.snapshot_retry_min,
             db_path,
             needs_snapshot: plan.head() == EMPTY,
             checksum: DbChecksum::default(),
