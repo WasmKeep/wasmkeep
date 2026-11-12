@@ -472,7 +472,7 @@ impl ActorState {
                 .store
                 .data_mut()
                 .http()
-                .new_incoming_request(Scheme::Http, req.map(crate::http::CappedBody::new))?;
+                .new_incoming_request(Scheme::Http, crate::http::CappedBody::of(req))?;
             let (out_tx, out_rx) = oneshot::channel();
             let out = live.store.data_mut().http().new_response_outparam(out_tx)?;
             let forward = async move {

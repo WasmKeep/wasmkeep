@@ -621,3 +621,166 @@ async fn a_request_written_before_its_connection_closed_is_not_sent_again() {
     assert_eq!(proxy.accepted.load(Ordering::SeqCst), before, "sent once");
     assert_eq!(slept().await, "4", "the callee ran once, not twice");
 }
+
+/// Sends a POST with `len` bytes of body, all of it whatever the node
+/// answers meanwhile, and reads the reply. A write or a read the node cut
+/// short is the failure these tests look for, so it is reported, not
+/// unwrapped.
+async fn post_body(addr: SocketAddr, path: &str, len: usize) -> Result<Reply, String> {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    // In two parts with a pause, so the answer of a handler that does not
+    // read the body is on its way while most of the body is still to
+    // send, whatever the socket buffers hold.
+    let body = vec![b'x'; len];
+    let (first, rest) = body.split_at(len.min(64 << 10));
+    let wrote = async {
+        stream.write_all(first).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stream.write_all(rest).await
+    }
+    .await;
+    let mut raw = Vec::new();
+    let read = stream.read_to_end(&mut raw).await;
+    let raw = String::from_utf8_lossy(&raw);
+    if let Err(e) = wrote {
+        return Err(format!("the body was cut short ({e}); answer: {raw:?}"));
+    }
+    let Some((head, body)) = raw.split_once("\r\n\r\n") else {
+        return Err(format!("no answer ({read:?}): {raw:?}"));
+    };
+    let header = |name: &str| {
+        head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+        })
+    };
+    Ok(Reply {
+        status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        node: header("x-wasmkeep-node"),
+        retry_after: header("retry-after"),
+        body: if header("transfer-encoding").as_deref() == Some("chunked") {
+            dechunk(body)
+        } else {
+            body.to_owned()
+        },
+    })
+}
+
+/// A handler may answer without reading the request body. The client
+/// (and, for a forwarded request, the forwarding node) is then still
+/// sending it: the owner must let it finish, or the sender sees its
+/// connection reset and can lose the answer. Each request runs once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_body_the_handler_does_not_read_still_gets_its_answer() {
+    let p = x_on_a_y_on_b().await;
+    let mut durable: u64 = send(p.a.addr, "GET", "/actor/t/x/durable", "")
+        .await
+        .body
+        .trim()
+        .parse()
+        .unwrap();
+    for (via, addr) in [("the other node", p.b.addr), ("the owner", p.a.addr)] {
+        for len in [256 << 10, 4 << 20, 8 << 20] {
+            for attempt in 0..3 {
+                let what = format!("{len} bytes sent to {via}, attempt {attempt}");
+                // `/durable` counts its runs and never reads the body.
+                let reply = post_body(addr, "/actor/t/x/durable", len)
+                    .await
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                durable += 1;
+                assert_eq!(
+                    (reply.status, reply.node.as_deref(), reply.body.trim()),
+                    (200, Some("a"), durable.to_string().as_str()),
+                    "{what}"
+                );
+            }
+        }
+    }
+    // Nothing ran a second time behind an answer.
+    let r = send(p.a.addr, "GET", "/actor/t/x/durable", "").await;
+    assert_eq!(r.body.trim(), durable.to_string());
+}
+
+/// The same bodies to a handler that reads them whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_body_the_handler_reads_arrives_whole() {
+    let p = x_on_a_y_on_b().await;
+    for (via, addr) in [("the other node", p.b.addr), ("the owner", p.a.addr)] {
+        for len in [256 << 10, 4 << 20, 8 << 20] {
+            let reply = post_body(addr, "/actor/t/x/body-len", len)
+                .await
+                .unwrap_or_else(|e| panic!("{len} bytes sent to {via}: {e}"));
+            assert_eq!(
+                (reply.status, reply.node.as_deref(), reply.body.trim()),
+                (200, Some("a"), len.to_string().as_str()),
+                "{len} bytes sent to {via}"
+            );
+        }
+    }
+}
+
+/// A client that sent `Expect: 100-continue` is waiting to be told whether
+/// to send its body. A handler that answers without reading the body must
+/// not have the server ask for it: the answer comes alone. Through the
+/// other node, which asks for the body as it forwards the request, the
+/// client sends it and still gets the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expected_body_the_handler_does_not_read_is_not_asked_for() {
+    let p = x_on_a_y_on_b().await;
+    let len = 4 << 20;
+    let head = format!(
+        "POST /actor/t/x/durable HTTP/1.1\r\nHost: t\r\nContent-Length: {len}\r\n\
+         Expect: 100-continue\r\nConnection: close\r\n\r\n"
+    );
+    let mut durable: u64 = send(p.a.addr, "GET", "/actor/t/x/durable", "")
+        .await
+        .body
+        .trim()
+        .parse()
+        .unwrap();
+
+    for _ in 0..5 {
+        let mut stream = TcpStream::connect(p.a.addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        durable += 1;
+        assert!(raw.starts_with("HTTP/1.1 200 "), "{raw:?}");
+        assert!(raw.contains(&format!("\r\n{durable}\n\r\n")), "{raw:?}");
+    }
+
+    for _ in 0..5 {
+        let mut stream = TcpStream::connect(p.b.addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut interim = [0u8; 25];
+        stream.read_exact(&mut interim).await.unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        // In two parts with a pause, as in `post_body`: the owner's answer
+        // is on its way while this node still streams the body to it. An
+        // owner told that the sender waits (an `Expect` passed on) would
+        // leave that body unread and close on the forwarding node.
+        let body = vec![b'x'; len];
+        let (first, rest) = body.split_at(64 << 10);
+        let wrote = async {
+            stream.write_all(first).await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream.write_all(rest).await
+        }
+        .await;
+        let mut raw = Vec::new();
+        let read = stream.read_to_end(&mut raw).await;
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(wrote.is_ok(), "the body was cut short ({wrote:?}): {raw:?}");
+        assert!(read.is_ok(), "the answer was cut short ({read:?}): {raw:?}");
+        durable += 1;
+        assert!(raw.starts_with("HTTP/1.1 200 "), "{raw:?}");
+        assert!(raw.contains("x-wasmkeep-node: a\r\n"), "{raw:?}");
+        assert!(raw.contains(&format!("\r\n{durable}\n\r\n")), "{raw:?}");
+    }
+    let r = send(p.a.addr, "GET", "/actor/t/x/durable", "").await;
+    assert_eq!(r.body.trim(), durable.to_string());
+}

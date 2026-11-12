@@ -226,3 +226,82 @@ async fn guest_panic_returns_500_and_server_keeps_serving() {
     let (status, _) = request(addr, "GET", "/").await;
     assert_eq!(status, 200);
 }
+
+/// Sends a POST (`framing`: the header that frames its body) and its body
+/// in two parts with a pause, so the component's answer is on its way
+/// while most of the body is still to send, and reads the reply. A write
+/// or a read the server cut short is the failure looked for, so it is
+/// reported, not unwrapped.
+async fn post_in_two_parts(
+    addr: SocketAddr,
+    framing: &str,
+    first: &[u8],
+    rest: &[u8],
+) -> Result<String, String> {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let head =
+        format!("POST /upload HTTP/1.1\r\nHost: test\r\n{framing}\r\nConnection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let wrote = async {
+        stream.write_all(first).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stream.write_all(rest).await
+    }
+    .await;
+    let mut raw = Vec::new();
+    let read = stream.read_to_end(&mut raw).await;
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    if let Err(e) = wrote {
+        return Err(format!("the body was cut short ({e}); answer: {raw:?}"));
+    }
+    if let Err(e) = read {
+        return Err(format!("the answer was cut short ({e}): {raw:?}"));
+    }
+    Ok(raw)
+}
+
+/// examples/hello answers without reading the request body. A client
+/// still sending a large one must be able to finish and read the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_body_the_component_does_not_read_still_gets_its_answer() {
+    let (addr, _stop) = start(hello_component()).await;
+    for len in [256 << 10, 4 << 20, 8 << 20] {
+        for attempt in 0..3 {
+            let what = format!("{len} bytes, attempt {attempt}");
+            let body = vec![b'x'; len];
+            let (first, rest) = body.split_at(64 << 10);
+            let framing = format!("Content-Length: {len}");
+            let text = post_in_two_parts(addr, &framing, first, rest)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(text.starts_with("HTTP/1.1 200 "), "{what}: {text}");
+            assert!(text.contains("You sent POST /upload\n"), "{what}: {text}");
+        }
+    }
+}
+
+/// The same for a body sent in chunks, whose length the server does not
+/// know beforehand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_chunked_body_the_component_does_not_read_still_gets_its_answer() {
+    let (addr, _stop) = start(hello_component()).await;
+    // 64 chunks of 64 KiB (4 MiB), then the last, empty one.
+    let mut chunk = format!("{:x}\r\n", 64 << 10).into_bytes();
+    chunk.extend(std::iter::repeat_n(b'x', 64 << 10));
+    chunk.extend(b"\r\n");
+    let mut rest = chunk.repeat(63);
+    rest.extend(b"0\r\n\r\n");
+    for attempt in 0..3 {
+        let text = post_in_two_parts(addr, "Transfer-Encoding: chunked", &chunk, &rest)
+            .await
+            .unwrap_or_else(|e| panic!("attempt {attempt}: {e}"));
+        assert!(
+            text.starts_with("HTTP/1.1 200 "),
+            "attempt {attempt}: {text}"
+        );
+        assert!(
+            text.contains("You sent POST /upload\n"),
+            "attempt {attempt}: {text}"
+        );
+    }
+}
