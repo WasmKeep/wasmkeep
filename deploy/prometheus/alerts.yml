@@ -90,9 +90,11 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} gets errors from the bucket"
           description: >-
-            Requests to the bucket have failed for 5 minutes: unreachable,
-            refused credentials, throttling or a server error. The statuses
-            not_found and precondition are routine and are not counted here.
+            At least one request to the bucket failed in every 5-minute
+            window for 5 minutes (two errors a few minutes apart are
+            enough): unreachable, refused credentials, throttling or a
+            server error. The statuses not_found and precondition are
+            routine and are not counted here.
 
       - alert: WasmKeepFailover
         expr: increase(wasmkeep_failovers_total[15m]) > 0
