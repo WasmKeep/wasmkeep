@@ -83,7 +83,7 @@ jobs:
           for try in 1 2 3; do
             now=$(gh api "repos/$REPO/pulls/$NUMBER" --jq .draft) && break
             now=
-            sleep "$((try * 2))"
+            if [ "$try" -lt 3 ]; then sleep "$((try * 2))"; fi
           done
           case "$now" in
             true) echo "still a draft: nothing else runs" ;;
