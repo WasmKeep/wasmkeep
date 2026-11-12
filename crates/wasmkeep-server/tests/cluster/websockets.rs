@@ -427,3 +427,40 @@ async fn a_lapsed_node_lease_closes_its_sockets() {
         "the bucket is still out of reach"
     );
 }
+
+/// A draining node hands over its resident actors; a room that hibernated
+/// with its sockets open is not resident, so its sockets used to stay
+/// open, and the node reported `drained` while it still held them. Now
+/// the drain closes them with 1012 and counts them until they are gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_closes_the_sockets_of_a_hibernated_room() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let wasm = chat_wasm();
+    let a = node_with(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_millis(300),
+        "chat",
+        wasm,
+    )
+    .await;
+    let _b = node_with(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        "chat",
+        wasm,
+    )
+    .await;
+    settle().await;
+    let mut client = join_lobby(a.addr).await;
+    lobby_parked(&store, &a).await;
+    drain(&store, "a").await;
+    let (code, reason) = closed_within(&mut client, Duration::from_secs(5)).await;
+    assert_eq!(code, 1012, "{reason}");
+    wait_drain_line(&store, "a", "drained").await;
+    assert_eq!(a.service.websockets(), 0, "drained with a socket");
+}
