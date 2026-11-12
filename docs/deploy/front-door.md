@@ -266,8 +266,9 @@ frontend tunnel
 Point each connector at `http://127.0.0.1:8081`. A request now reaches a
 node that is ready whichever connector received it, and the same node for
 the same actor from all three, as long as every HAProxy lists the same
-servers in the same order (the consistent hash depends on it). A machine that is down takes its connector down
-with it, and the provider stops using that connector.
+servers in the same order (the consistent hash depends on it; not
+exercised here). A machine that is down takes its connector down with
+it, and the provider stops using that connector.
 
 - **TLS** is the provider's: no certificate on the nodes, so no `ssl` on
   the `bind` line.
