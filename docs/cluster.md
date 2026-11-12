@@ -133,7 +133,8 @@ Each actor's database follows it from node to node (ADR 0007):
   megabyte, is sent again, and so is one the bucket refuses with an error
   a resend can get past (a 5xx or a broken connection, after the bucket
   client's own retries), half a second later, then a second: three tries
-  per file. The reads of one restore have 30 s together, plus a second
+  per file. While it pauses, a read gives up its place among the node's
+  reads, and waits for one again before it is resent. The reads of one restore have 30 s together, plus a second
   per megabyte of what it reads and a second per eight files: 39 s for 63
   small files and a snapshot under a megabyte, about 17 minutes more for a
   database of 1 GiB. That counts the time the restore waits for the

@@ -97,7 +97,12 @@ may not survive, which is what an unacknowledged write is allowed to do.
    none silent for 5 s.
 7. *(Added 2026-11-11.)* A read the bucket refuses with an error a resend
    may get past is sent again after a pause (0.5 s, then 1 s), within the
-   same three tries: a GET changes nothing, so a resend is always safe. An
+   same three tries: a GET changes nothing, so a resend is always safe.
+   *(Corrected 2026-11-12.)* During the pause the read gives up its place
+   under the node's limits of step 6 (its slot, its megabytes, its bytes
+   counted in flight), which it used to hold while it only waited, and
+   waits for one again before the resend; that second wait is not in the
+   deadline below, as the first is not. An
    answer no resend changes (the object is gone, access is denied) still
    fails the restore at once. A restore's reads together end within one
    deadline: 30 s, plus a second per started megabyte of the objects it
