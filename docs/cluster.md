@@ -31,12 +31,14 @@ else to run: no consensus cluster, no coordinator.
   are no renewals while the actor stays in memory. A request that reaches
   a node not holding the actor is forwarded **once** to the node the
   record names, if that node is live. Responses carry `x-wasmkeep-node:
-  <id>`. If the connection to that node closes after the request was
-  written to it and before an answer, the client gets a 503 ("the
-  actor's node did not answer; retry") and the request is not sent
-  again: that node may have run it. A kept connection that node closed
-  earlier is simply replaced. A release that fails is retried in the background; until it
-  lands, the record keeps naming the node.
+  <id>`. If no connection to that node can be opened, or the connection
+  fails before an answer, the client gets a 503 ("the actor's node did
+  not answer; retry") and the request is not sent again: whether or not
+  it was written, since a request that was written may have run there,
+  and the 503 does not say which it was. Only a connection kept open
+  that the node had already closed costs nothing: it is replaced before
+  the request is written. A release that fails is retried in the
+  background; until it lands, the record keeps naming the node.
 - A node that stops cleanly (`SIGTERM` or Ctrl-C) finishes its in-flight
   events, then releases its actors: the next request for one of them
   starts it on another node at once. Last, it writes its heartbeat

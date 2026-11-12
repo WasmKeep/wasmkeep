@@ -1498,10 +1498,18 @@ impl Cluster {
                 tracing::warn!(owner, "forwarding: the node is no longer trusted");
                 unavailable("the actor's node is no longer trusted; retry\n")
             }),
-            // Not sent again: the owner may have read the request before
-            // the connection failed. What it provably never read (a
-            // pooled connection found closed), the client already sent on
-            // another connection.
+            // Every failure before an answer, none sent again from here:
+            // a connection that could not be opened, a request the client
+            // handed back unsent on a new connection, and a request
+            // written into a connection that then failed, which the owner
+            // may have read. (hyper-util itself sends an unsent request
+            // again only on a reused pooled connection, and drops one it
+            // finds closed when it takes it from the pool.) The body
+            // streams from the client, so the first two cannot be sent
+            // again here either. Of the three users of the peer clients,
+            // only `actors.call` (`Cluster::call`) sends again, and only
+            // a request the owner refused at the handshake; this path and
+            // `Cluster::forward_upgrade` answer 503 for all of them.
             Ok(Err(e)) => {
                 tracing::warn!(owner, error = %e, "forwarding failed");
                 unavailable("the actor's node did not answer; retry\n")
