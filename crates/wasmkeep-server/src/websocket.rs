@@ -30,6 +30,10 @@ pub(crate) const MAX_SOCKETS_PER_NODE: usize = 50_000;
 /// ALB), so an idle socket carries a frame before the balancer cuts it.
 pub(crate) const PING_AFTER: Duration = Duration::from_secs(25);
 pub(crate) const PONG_WAIT: Duration = Duration::from_secs(30);
+/// How long a socket the server closed waits for the client's close frame
+/// before it is dropped. A client that never answers (and keeps sending
+/// pings, say) cannot keep it, and its slot, any longer.
+pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// The protocol limits for every socket the host accepts.
 pub(crate) fn config() -> WebSocketConfig {
@@ -60,6 +64,9 @@ struct Conn {
     /// `on-websocket-open` accepted it: until then it is invisible to the
     /// actor's other events (no broadcast reaches a socket it may refuse).
     accepted: bool,
+    /// Notified when the server closes it, so its reader stops delivering
+    /// frames and waits for the client's close for a bounded time only.
+    closing: Arc<tokio::sync::Notify>,
 }
 
 /// Why `send` failed.
@@ -106,6 +113,8 @@ pub(crate) struct Opened {
     pub(crate) id: u64,
     pub(crate) outgoing: mpsc::Receiver<Outgoing>,
     pub(crate) queued: Arc<AtomicUsize>,
+    /// Notified once the server closes it ([`Self::close_all`] and the like).
+    pub(crate) closing: Arc<tokio::sync::Notify>,
 }
 
 impl Sockets {
@@ -141,6 +150,7 @@ impl Sockets {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, outgoing) = mpsc::channel(SEND_QUEUE);
         let queued = Arc::new(AtomicUsize::new(0));
+        let closing = Arc::new(tokio::sync::Notify::new());
         registry
             .by_owner
             .entry(owner.clone())
@@ -153,12 +163,14 @@ impl Sockets {
                 tx: Some(tx),
                 queued: Arc::clone(&queued),
                 accepted: false,
+                closing: Arc::clone(&closing),
             },
         );
         Ok(Opened {
             id,
             outgoing,
             queued,
+            closing,
         })
     }
 
@@ -261,10 +273,36 @@ impl Sockets {
         match conn.tx.take() {
             Some(tx) => {
                 let _ = tx.try_send(Outgoing::Close(code, reason.to_owned()));
+                // Kept as a permit if the reader is not waiting yet.
+                conn.closing.notify_one();
                 true
             }
             None => false,
         }
+    }
+
+    /// Whether `id` is one of `owner`'s accepted connections, not closing:
+    /// a frame read from it may still be delivered.
+    pub(crate) fn is_open(&self, owner: &ActorAddress, id: u64) -> bool {
+        self.lock()
+            .conns
+            .get(&id)
+            .is_some_and(|c| &c.owner == owner && c.accepted && c.tx.is_some())
+    }
+
+    /// The actors with at least one connection on this node that is not
+    /// closing.
+    pub(crate) fn open_owners(&self) -> Vec<ActorAddress> {
+        let registry = self.lock();
+        registry
+            .by_owner
+            .iter()
+            .filter(|(_, ids)| {
+                ids.iter()
+                    .any(|id| registry.conns.get(id).is_some_and(|c| c.tx.is_some()))
+            })
+            .map(|(owner, _)| owner.clone())
+            .collect()
     }
 
     /// The actors with at least one slot on this node, closing sockets

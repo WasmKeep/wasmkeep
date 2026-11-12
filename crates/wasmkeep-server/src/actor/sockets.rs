@@ -75,6 +75,11 @@ impl ActorState {
 
     /// `on-websocket-message`.
     pub(super) async fn ws_message(&mut self, conn: u64, msg: WsMessageWit) {
+        // Closed by the server since the frame was read: not delivered (nor
+        // may it wake the actor or claim it).
+        if !self.sockets.is_open(&self.address, conn) {
+            return;
+        }
         if !self.ws_prepare(conn).await {
             return;
         }
@@ -237,6 +242,7 @@ pub(super) struct Accepted {
     id: u64,
     outgoing: tokio::sync::mpsc::Receiver<crate::websocket::Outgoing>,
     queued: Arc<std::sync::atomic::AtomicUsize>,
+    closing: Arc<tokio::sync::Notify>,
     /// The close to send instead of serving it: the guest refused it, or
     /// the open event failed.
     refusal: Option<(u16, String)>,
@@ -281,6 +287,7 @@ impl ServiceInner {
             id,
             outgoing: opened.outgoing,
             queued: opened.queued,
+            closing: opened.closing,
             refusal,
         })
     }
@@ -320,6 +327,7 @@ impl ServiceInner {
             id,
             mut outgoing,
             queued,
+            closing,
             refusal,
         } = accepted;
         let (mut sink, mut stream) = ws.split();
@@ -355,15 +363,34 @@ impl ServiceInner {
 
         let (mut code, mut reason) = (1006_u16, String::new());
         let mut pinged = false;
+        // Set once the server closed the socket: from then on no frame is
+        // delivered, and the client's close is awaited until then only, so
+        // a client that ignores the close (pinging on, say) cannot keep
+        // the socket and its slot, or drive its actor.
+        let mut closed_by_us: Option<tokio::time::Instant> = None;
         loop {
             // A silent client is pinged, then closed if it stays silent:
             // half-open connections would otherwise live forever.
             let wait = if pinged {
                 crate::websocket::PONG_WAIT
             } else {
-                crate::websocket::PING_AFTER
+                self.ping_after
             };
-            let frame = match tokio::time::timeout(wait, stream.next()).await {
+            let next = match closed_by_us {
+                Some(deadline) => match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(next) => Ok(next),
+                    Err(_) => break, // no close from the client: 1006
+                },
+                None => tokio::select! {
+                    biased;
+                    () = closing.notified() => {
+                        closed_by_us = Some(tokio::time::Instant::now() + self.close_wait);
+                        continue;
+                    }
+                    next = tokio::time::timeout(wait, stream.next()) => next,
+                },
+            };
+            let frame = match next {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(_) if pinged => {
@@ -379,6 +406,19 @@ impl ServiceInner {
                     continue;
                 }
             };
+            if closed_by_us.is_some() {
+                match frame {
+                    Ok(WsMessage::Close(frame)) => {
+                        (code, reason) = match frame {
+                            Some(f) => (u16::from(f.code), f.reason.to_string()),
+                            None => (1005, String::new()),
+                        };
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
             pinged = false;
             let msg = match frame {
                 Ok(WsMessage::Text(t)) => WsMessageWit::Text(t.to_string()),

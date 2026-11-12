@@ -197,6 +197,8 @@ pub(crate) struct Metrics {
     /// their actor, by how it found out (`event`, `sweep`, `lease_lapse`,
     /// `drain`).
     pub(crate) websocket_owner_closes: Family<AtomicU64>,
+    /// Ownership records the WebSocket owner sweep read.
+    pub(crate) websocket_sweep_reads: AtomicU64,
 }
 
 /// Counts `n` WebSockets closed for `reason` ([`Metrics::websocket_owner_closes`]).
@@ -463,6 +465,12 @@ pub fn render(gauges: Gauges) -> String {
         "wasmkeep_websocket_owner_closes_total",
         "WebSockets closed with 1012 because this node no longer owned their actor, by how it found out.",
         &m.websocket_owner_closes,
+    );
+    counter(
+        &mut out,
+        "wasmkeep_websocket_sweep_reads_total",
+        "Ownership records the WebSocket owner sweep read.",
+        m.websocket_sweep_reads.load(Ordering::Relaxed),
     );
     out
 }

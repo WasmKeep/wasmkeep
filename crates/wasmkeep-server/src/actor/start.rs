@@ -153,6 +153,8 @@ impl ActorService {
                 tenant: config.tenant,
                 wall: config.wall_per_event,
                 sockets: Arc::clone(&sockets),
+                ping_after: config.websocket_ping_after,
+                close_wait: config.websocket_close_wait,
                 classes,
                 mailboxes,
                 alarms: alarms.clone(),
@@ -193,9 +195,15 @@ impl ActorService {
             ));
             // Close sockets whose actor this node no longer owns.
             tokio::spawn(socket_owners::close_sockets_at_lapse(
-                Arc::downgrade(&service.inner),
+                Arc::downgrade(&sockets),
                 cluster.validity.subscribe(),
             ));
+            let lapsed = Arc::downgrade(&sockets);
+            cluster.on_lease_lapse(Box::new(move || {
+                if let Some(sockets) = lapsed.upgrade() {
+                    socket_owners::close_for_lapse(&sockets);
+                }
+            }));
             tokio::spawn(socket_owners::sweep_sockets(
                 Arc::downgrade(&service.inner),
                 cluster.socket_sweep,

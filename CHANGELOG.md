@@ -100,6 +100,13 @@ Since 0.2.0, in no release yet.
   the node holds no socket. Each such close is counted in
   `wasmkeep_websocket_owner_closes_total`
   ([running a cluster](docs/cluster.md), [monitoring](docs/monitoring.md)).
+  The sweep reads at most 5,000 records a pass, counted in
+  `wasmkeep_websocket_sweep_reads_total`.
+- **A WebSocket the server closed stops at the close.** Its client used to
+  keep it open by not answering the close, and its messages still ran
+  events; a node draining waited on it forever. Now nothing it sends after
+  the close is delivered, and it is dropped if its client has not answered
+  within 5 s.
 - **An idle WebSocket is pinged after 25 s** of silence from its client,
   instead of 60 s, so a load balancer's usual idle timeout of 60 s no
   longer cuts it first. The front door needs an idle timeout above 30 s
@@ -112,7 +119,8 @@ Since 0.2.0, in no release yet.
   used signatures**, so a flood of other node calls that fills the record
   (500,000 signatures at once) can no longer refuse the calls a drain and
   a move depend on. Refusals because a record is full are counted in
-  `wasmkeep_signatures_refused_full_total`.
+  `wasmkeep_signatures_refused_full_total`, and logged as a full record
+  rather than as a replay. The take and hand-off record holds 50,000.
 - **Releases**: the npm job of the release workflow passed the tarball as
   a bare path, which npm read as a GitHub repository; it now publishes the
   file. See the correction under 0.2.0.

@@ -287,6 +287,17 @@ fn identical_calls_in_one_millisecond_get_distinct_signatures() {
     assert_ne!(sign("01"), sign("02"));
 }
 
+/// A full record refuses fresh signatures as full, not as replays, so
+/// the log tells exhaustion from a replay.
+#[test]
+fn a_full_record_tells_full_from_used() {
+    let seen = SeenSignatures::with_cap("control", 2);
+    assert_eq!(seen.spend([1; 32], 1_000, 1_000), Spent::Fresh);
+    assert_eq!(seen.spend([2; 32], 1_000, 1_000), Spent::Fresh);
+    assert_eq!(seen.spend([3; 32], 1_000, 1_000), Spent::Full);
+    assert_eq!(seen.spend([1; 32], 1_000, 1_000), Spent::Used);
+}
+
 #[test]
 fn a_signature_is_accepted_once() {
     let seen = SeenSignatures::default();
@@ -2816,4 +2827,18 @@ async fn a_full_signature_record_still_accepts_control_calls() {
     );
     // Still used once only, in its own record.
     assert!(!cluster.first_use(&signed(next + 1), true), "replayed");
+}
+
+/// A lease write that finds the lease ran out runs the lapse hook (the
+/// service closes its WebSockets there) before ending every hold.
+#[tokio::test]
+async fn a_lapse_runs_its_hook_before_ending_the_holds() {
+    let cluster = node("a");
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&ran);
+    cluster.on_lease_lapse(Box::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    cluster.end_holds_after_lapse();
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

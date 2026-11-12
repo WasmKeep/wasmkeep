@@ -99,6 +99,19 @@ pub(crate) struct SeenSignatures {
     seen: Mutex<Seen>,
     /// Which record this is, for the metric of refusals when full.
     name: &'static str,
+    /// Most signatures it holds at once.
+    cap: usize,
+}
+
+/// What [`SeenSignatures::spend`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Spent {
+    /// First use: recorded.
+    Fresh,
+    /// Used already, or too old to tell: a replay.
+    Used,
+    /// The record is full: refused, though it may be fresh.
+    Full,
 }
 
 impl Default for SeenSignatures {
@@ -122,19 +135,34 @@ pub(crate) struct Seen {
 /// are refused until old ones expire. Each lives at most two windows, so
 /// this allows several thousand calls a second into one node.
 pub(super) const MAX_SEEN: usize = 500_000;
+/// The same for take and alarm hand-off calls, which are rare: a drain or
+/// a move sends one per actor.
+pub(super) const MAX_SEEN_CONTROL: usize = 50_000;
 
 impl SeenSignatures {
-    /// An empty record, `name` in the metric of refusals when full.
+    /// An empty record of up to [`MAX_SEEN`], `name` in the metric of
+    /// refusals when full.
     pub(super) fn named(name: &'static str) -> Self {
+        Self::with_cap(name, MAX_SEEN)
+    }
+
+    /// An empty record of up to `cap` signatures.
+    pub(super) fn with_cap(name: &'static str, cap: usize) -> Self {
         Self {
             seen: Mutex::default(),
             name,
+            cap,
         }
     }
 
     /// Records `mac`, signed at `ts`; false if it was already used (or the
     /// record is full).
     pub(super) fn first_use(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {
+        self.spend(mac, ts, now) == Spent::Fresh
+    }
+
+    /// Records `mac`, signed at `ts`, and says whether it was fresh.
+    pub(super) fn spend(&self, mac: [u8; 32], ts: u64, now: u64) -> Spent {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         seen.horizon = seen.horizon.max(now);
         let horizon = seen.horizon;
@@ -149,23 +177,23 @@ impl SeenSignatures {
         // against a clock that may have stepped back: check it again against
         // the horizon, past which records are gone.
         if ts.saturating_add(SIGNATURE_WINDOW_MS) < horizon {
-            return false;
+            return Spent::Used;
         }
         if seen.macs.contains(&mac) {
-            return false;
+            return Spent::Used;
         }
-        if seen.macs.len() >= MAX_SEEN {
+        if seen.macs.len() >= self.cap {
             crate::metrics::inc(
                 &crate::metrics::METRICS
                     .signatures_refused_full
                     .get(&[("record", self.name)]),
             );
-            return false;
+            return Spent::Full;
         }
         seen.macs.insert(mac);
         seen.by_expiry
             .insert((ts.saturating_add(SIGNATURE_WINDOW_MS), mac));
-        true
+        Spent::Fresh
     }
 
     #[cfg(test)]

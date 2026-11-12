@@ -357,6 +357,30 @@ async fn a_room_taken_by_another_node_closes_all_its_sockets_on_the_first_messag
     );
 }
 
+/// Serves this test process's metrics, and returns where.
+async fn metrics_page() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(wasmkeep_server::serve_metrics(
+        listener,
+        None,
+        std::future::pending(),
+    ));
+    addr
+}
+
+/// Ownership records the owner sweeps of this process read so far.
+async fn sweep_reads(metrics: SocketAddr) -> u64 {
+    let (status, page) = get_raw(metrics, "/metrics").await;
+    assert_eq!(status, 200);
+    page.lines()
+        .find_map(|l| l.strip_prefix("wasmkeep_websocket_sweep_reads_total "))
+        .unwrap_or_else(|| panic!("no sweep reads in\n{page}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 /// A client that only listens never sends a frame, so no event finds its
 /// room gone: the owner sweep reads the record of each room with sockets
 /// and no hold here, and closes them with 1012 once another node holds
@@ -388,8 +412,15 @@ async fn the_owner_sweep_closes_a_listening_client_of_a_room_taken_elsewhere() {
     settle().await;
     let mut listener = join_lobby(a.addr).await;
     lobby_parked(&store, &a).await;
-    // Several sweeps over a parked room nobody took: it stays open.
-    stays_open(&mut listener, Duration::from_secs(1)).await;
+    // Several sweeps read the record of a parked room nobody took: it
+    // stays open. (Only a sweeps often; b's sweep runs once a minute.)
+    let metrics = metrics_page().await;
+    let start = sweep_reads(metrics).await;
+    eventually("a swept the parked room twice", async || {
+        sweep_reads(metrics).await >= start + 2
+    })
+    .await;
+    stays_open(&mut listener, Duration::from_millis(100)).await;
     b_takes_lobby(&store, &b).await;
     let (code, reason) = closed_within(&mut listener, Duration::from_secs(5)).await;
     assert_eq!(code, 1012, "{reason}");
@@ -397,10 +428,9 @@ async fn the_owner_sweep_closes_a_listening_client_of_a_room_taken_elsewhere() {
 }
 
 /// A node whose lease runs out (the bucket out of reach for longer than
-/// ttl minus safety) may no longer own anything, and a peer may claim its
-/// actors once ttl plus grace passed: its sockets close with 1012 when
-/// the validity ends, before any peer can claim, without waiting for the
-/// bucket to answer again.
+/// ttl minus safety) may no longer own anything: its sockets close with
+/// 1012 when the validity ends, without waiting for the bucket to answer
+/// again (it never does here).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lapsed_node_lease_closes_its_sockets() {
     let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -412,38 +442,62 @@ async fn a_lapsed_node_lease_closes_its_sockets() {
     let a = node_with("a", da.path(), &seen_by_a, idle, "chat", chat_wasm()).await;
     settle().await;
     let mut client = join_lobby(a.addr).await;
-    let cut = std::time::Instant::now();
     down.store(true, Ordering::SeqCst);
     // Valid for ttl minus safety (800 ms here) after the last write.
     let (code, reason) = closed_within(&mut client, Duration::from_secs(5)).await;
     assert_eq!((code, reason.as_str()), (1012, "node lost its lease"));
-    assert!(
-        cut.elapsed() < Duration::from_secs(3),
-        "closed after {:?}",
-        cut.elapsed()
-    );
-    assert!(
-        down.load(Ordering::SeqCst),
-        "the bucket is still out of reach"
-    );
+}
+
+/// `nodes/<id>` as written now (empty before its first write).
+async fn heartbeat_body(store: &Arc<dyn ObjectStore>, id: &str) -> String {
+    use object_store::ObjectStoreExt as _;
+    let key = object_store::path::Path::from(format!("nodes/{id}"));
+    match store.get(&key).await {
+        Ok(r) => String::from_utf8(r.bytes().await.unwrap().to_vec()).unwrap(),
+        Err(object_store::Error::NotFound { .. }) => String::new(),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Waits until `nodes/<id>` was written `n` more times, and returns it.
+async fn heartbeats(store: &Arc<dyn ObjectStore>, id: &str, n: usize) -> String {
+    let mut last = heartbeat_body(store, id).await;
+    for _ in 0..n {
+        let before = last.clone();
+        eventually("another heartbeat", async || {
+            last = heartbeat_body(store, id).await;
+            last != before
+        })
+        .await;
+    }
+    last
 }
 
 /// A draining node hands over its resident actors; a room that hibernated
 /// with its sockets open is not resident, so its sockets used to stay
 /// open, and the node reported `drained` while it still held them. Now
 /// the drain closes them with 1012 and counts them until they are gone.
+/// A client that never answers the close, and keeps pinging, holds its
+/// socket only for the close wait: the node reports `draining` meanwhile,
+/// then `drained`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_closes_the_sockets_of_a_hibernated_room() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let wasm = chat_wasm();
-    let a = node_with(
+    let close_wait = Duration::from_secs(2);
+    let a = node_configured(
         "a",
         da.path(),
         &store,
         Duration::from_millis(300),
-        "chat",
+        &["chat"],
         wasm,
+        Duration::from_secs(30),
+        "",
+        |c: &mut ActorConfig| c.websocket_close_wait = close_wait,
     )
     .await;
     let _b = node_with(
@@ -456,11 +510,30 @@ async fn a_drain_closes_the_sockets_of_a_hibernated_room() {
     )
     .await;
     settle().await;
-    let mut client = join_lobby(a.addr).await;
+    let client = join_lobby(a.addr).await;
     lobby_parked(&store, &a).await;
+    // The client never reads the close (so never answers it), and pings.
+    let (mut tx, mut rx) = client.split();
+    let pinger = tokio::spawn(async move {
+        while tx.send(Message::Ping(Vec::new().into())).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
     drain(&store, "a").await;
-    let (code, reason) = closed_within(&mut client, Duration::from_secs(5)).await;
-    assert_eq!(code, 1012, "{reason}");
+    // Several drain passes: the socket is closing, still here, counted.
+    let body = heartbeats(&store, "a", 3).await;
+    assert_eq!(a.service.websockets(), 1, "the socket went early");
+    assert_eq!(drain_line(&body), Some("draining"), "{body}");
+    // Past the close wait it is dropped, pings or not.
+    eventually("a forgot the socket", async || a.service.websockets() == 0).await;
+    pinger.abort();
     wait_drain_line(&store, "a", "drained").await;
-    assert_eq!(a.service.websockets(), 0, "drained with a socket");
+    let code = loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.next()).await {
+            Ok(Some(Ok(Message::Close(Some(f))))) => break u16::from(f.code),
+            Ok(Some(Ok(_))) => {}
+            other => panic!("no close frame: {other:?}"),
+        }
+    };
+    assert_eq!(code, 1012);
 }

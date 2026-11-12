@@ -326,7 +326,7 @@ it, and the provider stops using that connector.
   the connectors can reach HAProxy and the nodes
   ([Client addresses](#client-addresses)).
 - **WebSockets** need the provider to pass the upgrade and to keep an idle
-  connection open for more than 90 s, as for any proxy in front.
+  connection open for more than 30 s, as for any proxy in front.
 
 ### Plain DNS round robin, no proxy at all
 

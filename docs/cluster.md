@@ -447,13 +447,18 @@ releases its ownership record, so a request that reaches it through
 another node wakes it there; its sockets on the first node then close with
 1012 when one of them next sends a message, or at the node's owner sweep
 (once a minute), so a client that only listens is closed too, a minute
-later at most. Sockets also close with 1012 when their node drains (see
-"Draining a node" below), and when its lease runs out (no write reached
+later at most. Sockets also close with 1012 when their node drains and
+another node can take its actors (see "Draining a node" below), and when
+its lease runs out (no write reached
 the bucket for ttl minus safety, 8 s with the defaults): before any other
 node can take its actors, and without waiting for the bucket to answer
 again. A socket closed because its node lost the actor gets no
 `on-websocket-close` there; a room keeping a list of who is in it should
-rebuild it from `connections()`. If the owner does not answer the
+rebuild it from `connections()`. Such a close can reach every client of
+a node at once (a lease that runs out closes them all): clients should
+reconnect after a random delay on 1012, backing off on each failure, so
+they do not all reconnect in the same instant. A client that does not
+answer a close within 5 s is dropped. If the owner does not answer the
 upgrade, the client gets a
 503 and may open the socket again; over mutual TLS between nodes, that 503
 can take up to four heartbeat periods (12 s with the defaults) when the

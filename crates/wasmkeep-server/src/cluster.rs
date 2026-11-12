@@ -394,6 +394,10 @@ pub(crate) struct Cluster {
     lease_attempt: Duration,
     /// This node's lease validity, shared with every hold.
     pub(crate) validity: Arc<NodeValidity>,
+    /// Run when a lease write finds the lease had run out, before every
+    /// hold ends: the service closes its WebSockets there, so none is
+    /// still open once the holds' releases are queued.
+    lapse_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Set by a clean stop: the lease task writes `released` and ends.
     lease_stop: tokio::sync::watch::Sender<bool>,
     /// Set once the lease task has ended, whatever the way.
@@ -496,6 +500,12 @@ impl std::fmt::Debug for Cluster {
 }
 
 impl Cluster {
+    /// Sets the hook a lapsed lease runs before ending every hold (once;
+    /// a later call is ignored).
+    pub(crate) fn on_lease_lapse(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.lapse_hook.set(hook);
+    }
+
     /// `serves`: what this node serves (see [`NodeInfo::app`]).
     pub(crate) fn new(config: &ClusterConfig, serves: &str) -> Result<Arc<Self>, crate::Error> {
         let invalid_id =
@@ -555,7 +565,7 @@ impl Cluster {
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
             seen: SeenSignatures::named("calls"),
-            seen_control: SeenSignatures::named("control"),
+            seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(
@@ -611,6 +621,7 @@ impl Cluster {
             lease_every: lease_every(config.heartbeat, &config.lease),
             lease_attempt: lease_attempt(&config.lease),
             validity: Arc::new(NodeValidity::new()),
+            lapse_hook: std::sync::OnceLock::new(),
             lease_stop: tokio::sync::watch::Sender::new(false),
             lease_done: tokio::sync::watch::Sender::new(false),
             old_heartbeats: Mutex::new(HashMap::new()),
@@ -1055,13 +1066,24 @@ impl Cluster {
     /// refused without using up the real call's signature. `control`: a
     /// take or an alarm hand-off, recorded apart from other calls.
     pub(crate) fn first_use(&self, signed: &Signed, control: bool) -> bool {
-        let fresh = self
-            .record(control)
-            .first_use(signed.mac, signed.ts, now_ms());
-        if !fresh {
-            self.note_refused("signature already used");
+        match self.record(control).spend(signed.mac, signed.ts, now_ms()) {
+            signing::Spent::Fresh => true,
+            signing::Spent::Used => {
+                self.note_refused("signature already used");
+                false
+            }
+            // Not a replay: more node calls than the record holds.
+            signing::Spent::Full if control => {
+                self.note_refused(
+                    "record of used signatures full (control: takes and alarm hand-offs)",
+                );
+                false
+            }
+            signing::Spent::Full => {
+                self.note_refused("record of used signatures full (calls)");
+                false
+            }
         }
-        fresh
     }
 
     /// The record of used signatures for control calls, or for the rest.
