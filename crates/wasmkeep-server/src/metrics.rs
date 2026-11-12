@@ -155,6 +155,9 @@ pub(crate) struct Metrics {
     /// One object a restore read from the bucket (a segment or a
     /// snapshot), from its request to its last byte, resends included.
     pub(crate) restore_read_seconds: Histogram,
+    /// Restores from the bucket that failed or ran out of time: the event
+    /// that woke the actor was refused, and the next one restores again.
+    pub(crate) restore_failures: AtomicU64,
     /// Node lease writes that reached the bucket (ADR 0020): the heartbeat,
     /// one bucket write each.
     pub(crate) node_lease_writes: AtomicU64,
@@ -360,6 +363,12 @@ pub fn render(gauges: Gauges) -> String {
     );
     m.restore_read_seconds
         .render(&mut out, "wasmkeep_restore_read_seconds", "");
+    counter(
+        &mut out,
+        "wasmkeep_restore_failures_total",
+        "Restores from the bucket that failed or ran out of time; the next event restores again.",
+        m.restore_failures.load(Ordering::Relaxed),
+    );
     counter(
         &mut out,
         "wasmkeep_guest_log_lines_total",

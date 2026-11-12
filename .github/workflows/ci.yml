@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    # A draft starts nothing (see the jobs' conditions): marking it ready
+    # A draft starts nothing but the job "draft", which asks whether it is
+    # still one (see that job and the jobs' conditions): marking it ready
     # for review starts the run.
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -47,9 +48,54 @@ jobs:
   # "false". `!cancelled()` is what makes them run when this job fails:
   # without a status function they would be skipped, and a skipped job
   # counts as passed. A push to main always runs everything.
+  #
+  # A run started for a draft runs the job "draft" first and nothing else,
+  # unless the pull request is no longer a draft by then: this job, "docs
+  # site" and "benchmark publication paths" need "draft" and are skipped
+  # only when it answered the literal "true", and the others follow this
+  # job. In every other run "draft" is skipped and they run.
+  draft:
+    # The event's payload says what the pull request was when the event was
+    # made. A push to a draft and "ready for review" in the same second
+    # make two runs of one concurrency group, and the push's can be the one
+    # that stays: it would skip every job as a draft's, which reports every
+    # required check as passed, on a pull request that is ready, with no
+    # other run to come. So a run started for a draft asks what the pull
+    # request is now, and runs everything if it is ready. One short job
+    # without a checkout; it never fails a draft: an answer it cannot get
+    # counts as "ready", so that nothing passes without having run.
+    name: draft
+    if: ${{ github.event.pull_request.draft == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      now: ${{ steps.ask.outputs.now }}
+    steps:
+      - id: ask
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          now=
+          for try in 1 2 3; do
+            now=$(gh api "repos/$REPO/pulls/$NUMBER" --jq .draft) && break
+            now=
+            if [ "$try" -lt 3 ]; then sleep "$((try * 2))"; fi
+          done
+          case "$now" in
+            true) echo "still a draft: nothing else runs" ;;
+            false) echo "::notice::started for a draft that is ready for review now: every job runs" ;;
+            *) echo "::warning::could not ask whether the pull request is still a draft: every job runs"; now=unknown ;;
+          esac
+          echo "now=$now" >> "$GITHUB_OUTPUT"
+
   changes:
     name: changes
-    if: ${{ github.event.pull_request.draft != true }}
+    needs: draft
+    if: ${{ !cancelled() && (github.event.pull_request.draft != true || needs.draft.outputs.now != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -77,7 +123,8 @@ jobs:
 
   benchmark-publication:
     name: benchmark publication paths
-    if: ${{ github.event.pull_request.draft != true }}
+    needs: draft
+    if: ${{ !cancelled() && (github.event.pull_request.draft != true || needs.draft.outputs.now != 'true') }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
@@ -493,7 +540,8 @@ jobs:
 
   docs:
     name: docs site
-    if: ${{ github.event.pull_request.draft != true }}
+    needs: draft
+    if: ${{ !cancelled() && (github.event.pull_request.draft != true || needs.draft.outputs.now != 'true') }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
