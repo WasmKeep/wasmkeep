@@ -62,8 +62,11 @@ repaired, and the other actors are not affected.
 ### With the cluster stopped: restorable
 
 Stop every node cleanly and wait until `wasmkeep cluster status` exits
-with 1 (no live node). A clean stop lets each actor finish its events and
-their uploads before the node gives it up. After it nothing writes or
+with 1 (no live node). A clean stop gives each actor up to 10 s to finish
+its queued events and their uploads before the node gives it up. A node
+that logs `shutdown: some actors did not finish in time` cut some events
+short: a plain `exec` among them may not be in the bucket, and is then
+not in the copy either. Once every process has exited nothing writes or
 deletes any more, as long as nobody runs `wasmkeep deploy` or
 `wasmkeep secrets` meanwhile, and the copy is the bucket at one moment.
 This is the one way I can show to be restorable from the code. Its cost
