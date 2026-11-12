@@ -135,8 +135,7 @@ either gets the 503 at once. The connection limit is `--max-connections`
 (10,000 by default, so 2,500 kept requests) after `serve` lowered it to
 fit the open-file limit: a node left at a limit of 1,024 files keeps far
 fewer, and one whose quarter comes to zero keeps none (counted as
-`over_cap`). The cap counts requests, not connections: over HTTP/2,
-several kept requests can share one connection. Nothing identifies the
+`over_cap`). Nothing identifies the
 caller before a request is kept, so anyone who can reach the node can
 fill the places for a dead node's actors; later callers then get the 503
 at once, as without the wait. A kept request holds its connection and its
