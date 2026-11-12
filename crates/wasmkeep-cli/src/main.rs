@@ -1618,7 +1618,80 @@ fn open_bucket(
         .with_bucket_name(bucket)
         .build()
         .with_context(|| format!("opening bucket {url}"))?;
-    Ok((std::sync::Arc::new(store), prefix.to_owned()))
+    let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(store);
+    refuse_migrated(url, &store, prefix)?;
+    Ok((store, prefix.to_owned()))
+}
+
+/// The objects a later version writes while it moves a bucket's actor
+/// state to a layout this version cannot read, under the key prefix.
+const MIGRATION_MARKERS: [&str; 2] = ["cluster/migration", "cluster/migrated/"];
+
+/// Refuses a bucket that a later version is migrating or has migrated:
+/// this version would read and write actor state where it no longer is.
+/// Only reads; a bucket that cannot be read is left to the command, which
+/// reports it in its own words.
+fn refuse_migrated(
+    url: &str,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    // On a thread of its own: callers may hold a runtime of their own.
+    let found = std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            // Bounded: an unreachable bucket is the command's to report.
+            rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    migration_marker(store.as_ref(), prefix),
+                )
+                .await
+                .ok()
+                .flatten()
+            })
+        })
+        .join()
+        .ok()
+        .flatten()
+    });
+    if let Some(marker) = found {
+        anyhow::bail!(
+            "bucket {url} is being migrated, or was migrated, to the layout of a later \
+             WasmKeep version ({marker} exists): this version ({}) cannot use it. \
+             Use the version that migrated it.",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    Ok(())
+}
+
+/// The first migration marker found under `prefix`, if any.
+async fn migration_marker(store: &dyn object_store::ObjectStore, prefix: &str) -> Option<String> {
+    use object_store::ObjectStoreExt as _;
+    let key = |k: &str| {
+        if prefix.is_empty() {
+            k.to_owned()
+        } else {
+            format!("{prefix}/{k}")
+        }
+    };
+    let lock = key(MIGRATION_MARKERS[0]);
+    if store
+        .head(&object_store::path::Path::from(lock.as_str()))
+        .await
+        .is_ok()
+    {
+        return Some(lock);
+    }
+    let done = key(MIGRATION_MARKERS[1]);
+    let folder = object_store::path::Path::from(done.trim_end_matches('/'));
+    let listed = store.list_with_delimiter(Some(&folder)).await.ok()?;
+    let first = listed.objects.first().map(|m| m.location.to_string());
+    first.or_else(|| listed.common_prefixes.first().map(ToString::to_string))
 }
 
 /// Splits `s3://BUCKET[/PREFIX]` into the bucket and the key prefix.
@@ -1635,7 +1708,49 @@ fn parse_bucket(url: &str) -> anyhow::Result<(&str, &str)> {
 mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
-    use super::{load_env, move_warnings, parse_bucket};
+    use super::{load_env, migration_marker, move_warnings, parse_bucket};
+
+    #[tokio::test]
+    async fn a_migrated_or_migrating_bucket_is_found() {
+        use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path};
+        let store = InMemory::new();
+        assert_eq!(migration_marker(&store, "wk").await, None);
+        // Keys that only look alike are not markers.
+        store
+            .put(
+                &Path::from("wk/cluster/migrations-notes"),
+                PutPayload::from("x"),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &Path::from("other/cluster/migration"),
+                PutPayload::from("x"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(migration_marker(&store, "wk").await, None);
+        store
+            .put(
+                &Path::from("wk/cluster/migrated/acme"),
+                PutPayload::from("x"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            migration_marker(&store, "wk").await.as_deref(),
+            Some("wk/cluster/migrated/acme")
+        );
+        let root = InMemory::new();
+        root.put(&Path::from("cluster/migration"), PutPayload::from("x"))
+            .await
+            .unwrap();
+        assert_eq!(
+            migration_marker(&root, "").await.as_deref(),
+            Some("cluster/migration")
+        );
+    }
 
     /// A move target that cannot take the actor gets a warning saying why.
     #[test]
