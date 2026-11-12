@@ -85,7 +85,10 @@ settings matter.
   exists, except PyPI. Reserve the crate and the npm package once, by
   hand, with a placeholder version `0.0.0` that says so in its
   description: `cargo publish` of a crate named `wasmkeep-sdk`, and
-  `npm publish` of `@wasmkeep/sdk`. Every real version then goes out
+  `npm publish` of `@wasmkeep/sdk`. Reserve the unscoped npm name
+  `wasmkeep-ts` the same way, as a placeholder that points to
+  `@wasmkeep/sdk`: it is the name of the SDK's build command, and `npx`
+  looks a command up as a package when it is not installed. Every real version then goes out
   through `publish.yml`, with a provenance statement.
 - **crates.io**: in the crate's settings, a trusted publisher: owner
   `WasmKeep`, repository `wasmkeep`, workflow `publish.yml`, environment
