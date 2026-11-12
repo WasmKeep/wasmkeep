@@ -1479,6 +1479,12 @@ impl Cluster {
         // chunked, so its framing still holds).
         strip_hop_by_hop(req.headers_mut(), Framing::Keep);
         *req.version_mut() = hyper::Version::HTTP_11;
+        // This node answers a client's `Expect: 100-continue` itself, as
+        // soon as the body starts streaming to the owner, which is at
+        // once. Passed on, it would tell the owner that the sender waits
+        // before sending, and to leave an unread body unread (see
+        // `CappedBody`).
+        req.headers_mut().remove(hyper::header::EXPECT);
         req.headers_mut()
             .insert(FORWARDED, hyper::header::HeaderValue::from_static("1"));
         crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "request")]));

@@ -194,7 +194,19 @@ actor of the same tenant and waits for the answer.
 - A call that would come back to an actor already waiting in the chain (A
   calls B calls A) is refused with `reentrant` instead of deadlocking.
 - Request bodies are capped at 16 MB (413 when declared larger; a failed
-  read past it otherwise). Calls between actors cap both ways.
+  read past it otherwise). Calls between actors cap both ways. A handler
+  may answer without reading the body: the server reads and discards what
+  is left (up to the cap, for at most 30 s), so the client can finish
+  sending it and read the answer. The exception is a client that sent
+  `Expect: 100-continue` straight to the actor's node, when the handler
+  read nothing of the body: the answer comes without the 100, and the
+  connection closes after it. A client that waited for the 100 has sent
+  nothing and loses nothing. One that sends the body anyway, without
+  waiting, is not read out: its upload is cut off (a broken pipe or a
+  reset), which can cost it the answer, unless the body was small enough
+  to have arrived whole already. Through another node there is no such
+  case: the node that forwards the request sends the 100 itself, and the
+  body is read and discarded like any other.
 
 ## WebSockets
 
