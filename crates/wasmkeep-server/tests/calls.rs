@@ -84,7 +84,11 @@ async fn an_actor_can_call_another() {
     assert_eq!(status, 200);
     assert_eq!(body, "200:0");
     // The callee is a real, persistent actor.
-    assert!(data.path().join("actors/default/t/b.db").exists());
+    assert!(
+        data.path()
+            .join("state/default/default/actors/t/b.db")
+            .exists()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -94,7 +98,12 @@ async fn a_capacity_refusal_is_an_http_response_and_keeps_the_caller_usable() {
     // The caller occupies the only slot while waiting for this fresh callee.
     let response = post(addr, "/actor/t/a/call?to=t/b&path=/fired").await;
     assert_eq!(response, (200, "503:actor capacity unavailable".into()));
-    assert!(!data.path().join("actors/default/t/b.db").exists());
+    assert!(
+        !data
+            .path()
+            .join("state/default/default/actors/t/b.db")
+            .exists()
+    );
     assert_eq!(post(addr, "/actor/t/a/caller").await, (200, "none".into()));
 }
 

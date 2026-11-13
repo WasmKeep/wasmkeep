@@ -237,7 +237,7 @@ async fn a_monitor_alerts_once_per_change_through_the_webhook() {
     let _ = request(addr, "GET", "/actor/monitor/api/", "").await;
     let storage = wasmkeep_storage::Storage::new(
         wasmkeep_storage::StorageConfig::new(data.path()),
-        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default", "default")),
     );
     {
         let mut monitor = storage.open("monitor", "api").unwrap();

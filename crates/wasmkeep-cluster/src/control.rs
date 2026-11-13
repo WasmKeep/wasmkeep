@@ -7,21 +7,22 @@
 //!
 //! ```text
 //! control/drain/<node-id>
-//! control/move/<tenant>/<class>/<name hex>/<target node-id>
+//! state/<tenant>/<app>/moves/<class>/<name hex>/<target node-id>
 //! ```
+//!
+//! A drain names a node, shared by the bucket prefix; a move is an app's,
+//! under its state root (ADR 0022). Moves written under the layout before
+//! 0.4.0 (`control/move/<tenant>/...`) are not read.
 
 use std::collections::BTreeSet;
 
 use crate::lease::BucketError;
 use crate::membership::validate_node_id;
-use crate::state_root::{Family, StateRoot};
+use crate::state_root::{Family, STATE_PREFIX, StateRoot};
 
 /// Key prefix of every intent.
 pub const CONTROL_PREFIX: &str = "control/";
 const DRAIN: &str = "control/drain/";
-/// Every tenant's moves, as listed (built per tenant by
-/// [`StateRoot::key`] with [`Family::Moves`]).
-const MOVE: &str = "control/move/";
 
 /// A move key older than this, by the bucket's clock, is ignored and
 /// deleted by the next node that lists it.
@@ -44,6 +45,8 @@ pub trait Keys {
 pub struct MoveIntent {
     /// The actor's tenant.
     pub tenant: String,
+    /// The actor's app, within the tenant.
+    pub app: String,
     /// The actor's class.
     pub class: String,
     /// The actor's name, as given.
@@ -55,12 +58,12 @@ pub struct MoveIntent {
 }
 
 impl MoveIntent {
-    /// Its key under `control/move/`: the key it was listed under, so
-    /// under the root of the tenant the listing gave (the prefix plays no
-    /// part in a key relative to it).
+    /// Its key: the key it was listed under, under the root of the app
+    /// the listing gave (the prefix plays no part in a key relative to
+    /// it).
     pub fn key(&self) -> String {
         move_key(
-            &StateRoot::new("", self.tenant.as_str()),
+            &StateRoot::new("", self.tenant.as_str(), self.app.as_str()),
             &self.class,
             &self.name,
             &self.target,
@@ -89,7 +92,8 @@ pub fn drain_key(node: &str) -> Result<String, InvalidIntent> {
 }
 
 /// The key that asks for actor `class/name` of `root` to move to
-/// `target`. The root's tenant and the class must be single key segments;
+/// `target`. The root's tenant and app and the class must be single key
+/// segments;
 /// the name is hex-encoded, so any name fits.
 pub fn checked_move_key(
     root: &StateRoot,
@@ -98,7 +102,11 @@ pub fn checked_move_key(
     target: &str,
 ) -> Result<String, InvalidIntent> {
     validate_node_id(target).map_err(|e| InvalidIntent(e.to_string()))?;
-    for (what, part) in [("tenant", root.tenant()), ("class", class)] {
+    for (what, part) in [
+        ("tenant", root.tenant()),
+        ("app", root.app()),
+        ("class", class),
+    ] {
         if !segment(part) {
             return Err(InvalidIntent(format!(
                 "invalid {what} {part:?}: one non-empty path segment"
@@ -126,12 +134,23 @@ fn segment(s: &str) -> bool {
         && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Reads the intents: drain markers, and moves written within
-/// [`MOVE_TTL_MS`] of `now_ms`. Moves older than that are deleted, best
-/// effort. Keys that do not parse are ignored. A failed listing is an
-/// error: callers keep what they read last (ADR 0014).
-pub async fn read<K: Keys>(keys: &K, now_ms: u64) -> Result<Control, BucketError> {
-    let listed = keys.list_keys(CONTROL_PREFIX).await?;
+/// Reads the intents: drain markers, and the moves of `moves_of`'s app
+/// (none without it) written within [`MOVE_TTL_MS`] of `now_ms`. Moves
+/// older than that are deleted, best effort. Keys that do not parse are
+/// ignored. A failed listing is an error: callers keep what they read
+/// last (ADR 0014).
+pub async fn read<K: Keys>(
+    keys: &K,
+    moves_of: Option<&StateRoot>,
+    now_ms: u64,
+) -> Result<Control, BucketError> {
+    let mut listed = keys.list_keys(DRAIN).await?;
+    if let Some(root) = moves_of {
+        listed.extend(
+            keys.list_keys(&format!("{}/", root.base(Family::Moves)))
+                .await?,
+        );
+    }
     let (control, expired) = parse(&listed, now_ms);
     for key in expired {
         // Best effort: a key left behind is still expired, and the next
@@ -150,7 +169,7 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
             if validate_node_id(node).is_ok() {
                 control.draining.insert(node.to_owned());
             }
-        } else if let Some(rest) = key.strip_prefix(MOVE) {
+        } else if let Some(rest) = key.strip_prefix(STATE_PREFIX) {
             let Some(intent) = parse_move(rest, *modified) else {
                 continue;
             };
@@ -164,17 +183,24 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
     (control, expired)
 }
 
+/// `<tenant>/<app>/moves/<class>/<name hex>/<target>`, after `state/`.
 fn parse_move(rest: &str, written_at_ms: u64) -> Option<MoveIntent> {
     let parts: Vec<&str> = rest.split('/').collect();
-    let [tenant, class, name, target] = parts.as_slice() else {
+    let [tenant, app, family, class, name, target] = parts.as_slice() else {
         return None;
     };
-    if !segment(tenant) || !segment(class) || validate_node_id(target).is_err() {
+    if *family != Family::Moves.folder()
+        || !segment(tenant)
+        || !segment(app)
+        || !segment(class)
+        || validate_node_id(target).is_err()
+    {
         return None;
     }
     let name = String::from_utf8(unhex(name)?).ok()?;
     (!name.is_empty()).then(|| MoveIntent {
         tenant: (*tenant).to_owned(),
+        app: (*app).to_owned(),
         class: (*class).to_owned(),
         name,
         target: (*target).to_owned(),
@@ -208,10 +234,15 @@ mod tests {
     #[test]
     fn drain_and_move_keys_read_back() {
         let drain = drain_key("node-b").unwrap();
-        let mv =
-            checked_move_key(&StateRoot::new("", "acme"), "room", "lobby/1 ünï", "node-c").unwrap();
+        let mv = checked_move_key(
+            &StateRoot::new("", "acme", "blog"),
+            "room",
+            "lobby/1 ünï",
+            "node-c",
+        )
+        .unwrap();
         assert_eq!(drain, "control/drain/node-b");
-        assert!(mv.starts_with("control/move/acme/room/"), "{mv}");
+        assert!(mv.starts_with("state/acme/blog/moves/room/"), "{mv}");
         let (control, expired) = parse(&[(drain, 10), (mv.clone(), 1_000)], 2_000);
         assert!(expired.is_empty());
         assert_eq!(control.draining, BTreeSet::from(["node-b".to_owned()]));
@@ -219,6 +250,7 @@ mod tests {
             control.moves,
             [MoveIntent {
                 tenant: "acme".into(),
+                app: "blog".into(),
                 class: "room".into(),
                 name: "lobby/1 ünï".into(),
                 target: "node-c".into(),
@@ -230,7 +262,8 @@ mod tests {
 
     #[test]
     fn moves_expire_by_the_buckets_clock() {
-        let mv = checked_move_key(&StateRoot::new("", "acme"), "room", "x", "node-c").unwrap();
+        let mv =
+            checked_move_key(&StateRoot::new("", "acme", "blog"), "room", "x", "node-c").unwrap();
         let (control, expired) = parse(&[(mv.clone(), 1_000)], 1_000 + MOVE_TTL_MS);
         assert_eq!(control.moves.len(), 1);
         assert!(expired.is_empty());
@@ -244,12 +277,16 @@ mod tests {
         let listed = [
             "control/drain/Not Valid",
             "control/drain/",
-            "control/move/acme/room/78",
-            "control/move/acme/room/zz/node-c",
-            "control/move/acme/room/787/node-c",
-            "control/move/acme/room//node-c",
-            "control/move/acme/room/78/node-c/extra",
-            "control/move/../room/78/node-c",
+            "state/acme/blog/moves/room/78",
+            "state/acme/blog/moves/room/zz/node-c",
+            "state/acme/blog/moves/room/787/node-c",
+            "state/acme/blog/moves/room//node-c",
+            "state/acme/blog/moves/room/78/node-c/extra",
+            "state/../blog/moves/room/78/node-c",
+            "state/acme/../moves/room/78/node-c",
+            "state/acme/blog/owners/room/78/node-c",
+            // The layout before 0.4.0: no longer read.
+            "control/move/acme/room/78/node-c",
             "control/other/thing",
         ]
         .map(|k| (k.to_owned(), 0));
@@ -259,10 +296,13 @@ mod tests {
     #[test]
     fn bad_intents_are_refused_before_writing() {
         assert!(drain_key("Node B").is_err());
-        assert!(checked_move_key(&StateRoot::new("", "acme"), "room", "x", "Node C").is_err());
-        assert!(checked_move_key(&StateRoot::new("", "ac/me"), "room", "x", "c").is_err());
-        assert!(checked_move_key(&StateRoot::new("", "acme"), "", "x", "c").is_err());
-        assert!(checked_move_key(&StateRoot::new("", "acme"), "..", "x", "c").is_err());
-        assert!(checked_move_key(&StateRoot::new("", "acme"), "room", "", "c").is_err());
+        assert!(
+            checked_move_key(&StateRoot::new("", "acme", "blog"), "room", "x", "Node C").is_err()
+        );
+        assert!(checked_move_key(&StateRoot::new("", "ac/me", "blog"), "room", "x", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme", "b/g"), "room", "x", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme", "blog"), "", "x", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme", "blog"), "..", "x", "c").is_err());
+        assert!(checked_move_key(&StateRoot::new("", "acme", "blog"), "room", "", "c").is_err());
     }
 }

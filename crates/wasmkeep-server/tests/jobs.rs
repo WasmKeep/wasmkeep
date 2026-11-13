@@ -179,7 +179,7 @@ async fn kv_keys_expire_and_list_across_shards() {
     let expected: String = (0..12).map(|i| format!("item:{i:02}\n")).collect();
     assert_eq!(listed.body, expected, "sorted, all shards, prefix only");
     // The 13 keys spread over more than one shard database.
-    let shards = std::fs::read_dir(data.path().join("actors/default/kv"))
+    let shards = std::fs::read_dir(data.path().join("state/default/default/actors/kv"))
         .unwrap()
         .filter(|e| {
             e.as_ref()

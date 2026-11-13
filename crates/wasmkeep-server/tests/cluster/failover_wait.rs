@@ -290,7 +290,7 @@ async fn an_upgrade_for_a_dead_nodes_actor_waits_and_opens_on_the_new_owner() {
 /// The node an actor's ownership record names.
 async fn lease_holder_of(store: &Arc<dyn ObjectStore>, class: &str, name: &str) -> Option<String> {
     use object_store::ObjectStoreExt as _;
-    let key = object_store::path::Path::from(format!("owners/default/{class}/{name}"));
+    let key = object_store::path::Path::from(test_key(Family::Owners, &format!("{class}/{name}")));
     let body = store.get(&key).await.ok()?.bytes().await.ok()?;
     wasmkeep_cluster::node_lease::OwnerRecord::decode(&body)?
         .holder

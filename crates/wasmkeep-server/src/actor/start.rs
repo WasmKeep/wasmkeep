@@ -40,27 +40,23 @@ impl ActorService {
         }
         let classes: Classes = Arc::new(std::sync::RwLock::new(map));
 
+        // The root of this node's actor state (ADR 0022): every key and
+        // database path of an actor starts from it. Its app is the one the
+        // node serves: deployed (`--app`), or the implicit app for classes
+        // given on the command line (`default/default` for `serve --actor`).
+        let root = state_root(&config)?;
+        // The local databases of the layout before 0.4.0, moved once
+        // before anything else touches the data directory.
+        crate::local_layout::prepare(
+            &config.storage.data_dir,
+            &root,
+            config.cluster.as_ref().is_some_and(|c| c.migrated),
+        )?;
         let cluster = match &config.cluster {
-            Some(c) => Some(Cluster::new(
-                c,
-                // Classes given on the command line run as the implicit
-                // app (ADR 0022): `default/default` for `serve --actor`.
-                &if c.app.is_empty() {
-                    format!("{}/{}", config.tenant, crate::cluster::IMPLICIT_APP_NAME)
-                } else {
-                    c.app.clone()
-                },
-                &config.tenant,
-            )?),
+            Some(c) => Some(Cluster::new(c, &root)?),
             None => None,
         };
-        // The root of this node's actor state (ADR 0022): every key and
-        // database path of an actor starts from it. Built once, by the
-        // cluster when there is one.
-        let root = cluster.as_ref().map_or_else(
-            || wasmkeep_cluster::state_root::StateRoot::new("", config.tenant.as_str()),
-            |c| c.state_root().clone(),
-        );
+        let root = cluster.as_ref().map_or(root, |c| c.state_root().clone());
         let factory_cluster = cluster.clone();
         // A guest statement runs on a blocking thread, which does not stop
         // when its event is cut: stop the statement no later than that.
@@ -227,18 +223,16 @@ impl ActorService {
         }
 
         // Re-arm alarms persisted before a restart or crash.
-        let (tenant, known) = (
-            service.inner.tenant.clone(),
-            Arc::clone(&service.inner.classes),
-        );
+        let known = Arc::clone(&service.inner.classes);
         tokio::spawn(async move {
             match tokio::task::spawn_blocking(move || storage.pending_alarms()).await {
                 Ok(Ok(pending)) => {
                     for e in &pending.skipped {
                         tracing::warn!(error = %e, "an actor database could not be read; its alarm, if any, is not armed");
                     }
+                    // Only this app's databases are scanned (ADR 0022).
                     for (t, class, name, at) in pending.found {
-                        if t != tenant || !read(&known).contains_key(&class) {
+                        if !read(&known).contains_key(&class) {
                             continue;
                         }
                         if let Ok(address) = ActorAddress::new(t, class, name) {
@@ -303,4 +297,29 @@ impl ActorService {
             }
         });
     }
+}
+
+/// The root of the actor state of the node `config` describes (ADR 0022):
+/// the app a cluster names (`tenant/app`), else `config.app`, both under
+/// `config.tenant`.
+fn state_root(config: &ActorConfig) -> Result<StateRoot, Error> {
+    let mut app = config.app.clone();
+    let mut prefix = "";
+    if let Some(c) = &config.cluster {
+        prefix = c.prefix.as_str();
+        if !c.app.is_empty() {
+            let (tenant, named) = c.app.split_once('/').unwrap_or(("", ""));
+            if tenant != config.tenant || named.is_empty() || named.contains('/') {
+                return Err(Error::Config(format!(
+                    "the cluster serves {:?}, not an app of tenant {:?}",
+                    c.app, config.tenant
+                )));
+            }
+            app = named.to_owned();
+        }
+    }
+    if app.is_empty() {
+        app = crate::cluster::IMPLICIT_APP_NAME.to_owned();
+    }
+    Ok(StateRoot::new(prefix, config.tenant.as_str(), app))
 }
