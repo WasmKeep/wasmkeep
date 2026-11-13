@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod dev;
+mod migrate_cmd;
 mod secrets_cmd;
 mod status;
 mod usage;
@@ -145,6 +146,16 @@ enum ClusterCommand {
     /// and grace). Refuses a recent one (that node may still run) and a
     /// node lease (never deleted: fence it instead).
     Forget(NodeArgs),
+    /// Move the actor state of a bucket prefix written by a version before
+    /// 0.4.0 into each app's own root, once, while every node is stopped
+    /// (ADR 0022). Without --apply, a dry run: prints the plan (the app
+    /// each class goes to, the nodes it sees, object counts, an estimate)
+    /// and writes nothing. --apply copies, verifies, puts barriers in front
+    /// of older binaries, proves no node ran, then commits; it can be run
+    /// again after a crash. --rollback undoes it until a node starts.
+    /// Exits with 0 when done, 1 when refused or aborted (nothing new
+    /// committed), 2 when some tenants were committed and others not.
+    Migrate(migrate_cmd::MigrateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -656,25 +667,6 @@ pub(crate) fn secret_looking(class: &str, vars: &wasmkeep_server::env::Vars) -> 
     out
 }
 
-/// The warning for an app that shares its bucket prefix with other apps of
-/// its tenant (`others`), deployed before `deploy` refused a second one:
-/// they share actors.
-pub(crate) fn shared_prefix_warning(app: &str, others: &[String]) -> Option<String> {
-    (!others.is_empty()).then(|| {
-        format!(
-            "{app} and {} are apps of one tenant on one bucket prefix: they share actors \
-             (keyed by tenant, class and name), and a class of the same name in both reaches \
-             the same actors. Nothing else changes for them (in a cluster, a node still refuses to \
-             start while a node of the other app is live); a further app of the tenant is refused. \
-             To separate them, deploy one on another bucket prefix, or under another tenant if \
-             another owner runs it: it starts with no data and its secrets are set again, and an \
-             app cannot move between prefixes later (its secrets are sealed to its prefix). Then \
-             stop the old one",
-            others.join(" and ")
-        )
-    })
-}
-
 /// Warnings about a deploy's changes: a class removed with a rule, and a
 /// class added without one at the same time (a rename leaves the new class
 /// open).
@@ -788,6 +780,15 @@ fn main() -> anyhow::Result<()> {
         Command::Cluster(ClusterCommand::Undrain(args)) => cluster_drain(&args, false),
         Command::Cluster(ClusterCommand::Fence(args)) => cluster_fence(&args),
         Command::Cluster(ClusterCommand::Forget(args)) => cluster_forget(&args),
+        Command::Cluster(ClusterCommand::Migrate(args)) => {
+            let code = migrate_cmd::run(&args)?;
+            if code != 0 {
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
         Command::Dev(args) => dev::run(dev::DevOptions {
@@ -930,6 +931,8 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             std::time::Duration::from_millis(args.sql_cpu_budget_ms);
         if let (Some((tenant, name)), Some(bucket)) = (&args.app, &args.bucket) {
             let (store, prefix) = open_bucket(bucket)?;
+            // Before anything reads or writes the app's state (ADR 0022).
+            check_layout(bucket, &store, &prefix, tenant)?;
             let app_store = std::sync::Arc::clone(&store);
             let app_ref = AppRef::new(store, &prefix, tenant, name);
             let (current, deployed) = rt.block_on(async {
@@ -939,18 +942,15 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 let deployed = app_ref.version(&current.version).await?;
                 anyhow::Ok((current, deployed))
             })?;
-            // Apps of one tenant deployed on one prefix before `deploy`
-            // refused a second keep running, sharing actors: said loudly.
-            match rt.block_on(app_ref.other_apps()) {
-                Ok(others) => {
-                    if let Some(warning) =
-                        shared_prefix_warning(&format!("{tenant}/{name}"), &others)
-                    {
-                        tracing::warn!("{warning}");
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "could not list the tenant's other apps"),
-            }
+            // A `current` from before 0.4.0 (no token 3): its rules may still
+            // be `--access` ones, which a deploy of this version would drop
+            // at run time. Refuse it at start instead (ADR 0022).
+            anyhow::ensure!(
+                current.rooted,
+                "{tenant}/{name} was last deployed by a version before 0.4.0: run `wasmkeep \
+                 cluster migrate --bucket {bucket}` (with --apply), or deploy it once with this \
+                 version, then start this node"
+            );
             deployed_rules = Some((current.marked, deployed.access));
             config.config = deployed.config;
             config.requires = deployed.requires;
@@ -1068,20 +1068,27 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         if let Some((_, seq)) = &follow {
             config.deploy_seq = *seq;
         }
+        // A cluster node checks the bucket's layout before it writes
+        // anything there, even its heartbeat (ADR 0022).
+        if let (Some(bucket), Some(_)) = (&args.bucket, &config.cluster) {
+            let (store, prefix) = open_bucket(bucket)?;
+            check_layout(bucket, &store, &prefix, &config.tenant)?;
+        }
         let service = ActorService::new(runtime.clone(), config, classes)?;
         // Leases name their holder by node id: a second process with this
         // id could run the same actors as the first.
         rt.block_on(service.node_id_checked())
             .map_err(|why| anyhow::anyhow!("{why}"))?;
-        // Two apps of one tenant on one bucket prefix would share actors:
-        // refuse to join such a cluster rather than mix their data.
-        let mixed = rt
-            .block_on(service.app_conflicts())
+        // Nodes of the version before keep actor state in the old layout:
+        // refuse to run beside them (upgrades stop every node). Two apps
+        // of one tenant share a prefix safely (ADR 0022).
+        let older = rt
+            .block_on(service.older_nodes())
             .map_err(|e| anyhow::anyhow!("reading the cluster's heartbeats: {e}"))?;
         anyhow::ensure!(
-            mixed.is_empty(),
+            older.is_empty(),
             "{}.",
-            wasmkeep_server::conflict_advice(&mixed)
+            wasmkeep_server::older_nodes_advice(&older)
         );
         if let Some((app_ref, _)) = follow.take() {
             rt.spawn(app_ref.follow(service.clone(), std::time::Duration::from_secs(3)));
@@ -1262,9 +1269,6 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         println!("  {line}");
     }
     for warning in deploy_warnings(&deployed.diff) {
-        eprintln!("warning: {warning}");
-    }
-    if let Some(warning) = shared_prefix_warning(&format!("{tenant}/{name}"), &deployed.others) {
         eprintln!("warning: {warning}");
     }
     if deployed.newly_marked {
@@ -1608,7 +1612,7 @@ fn parse_actor_address(s: &str) -> Result<(String, String, String), String> {
 }
 
 fn cluster_status(args: StatusArgs) -> anyhow::Result<()> {
-    let (store, prefix) = open_bucket(&args.bucket)?;
+    let (store, prefix) = open_bucket_unchecked(&args.bucket)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1659,7 +1663,7 @@ fn parse_requires(s: &str) -> Result<(String, std::collections::BTreeSet<String>
 }
 
 /// Parses `TENANT/APP`.
-fn parse_app(s: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_app(s: &str) -> Result<(String, String), String> {
     let (tenant, app) = s
         .split_once('/')
         .filter(|(t, a)| !t.is_empty() && !a.is_empty() && !a.contains('/'))
@@ -1667,8 +1671,20 @@ fn parse_app(s: &str) -> Result<(String, String), String> {
     Ok((tenant.to_owned(), app.to_owned()))
 }
 
-/// Opens `s3://BUCKET[/PREFIX]`, configured from the AWS_* environment.
-fn open_bucket(
+/// Opens `s3://BUCKET[/PREFIX]`, configured from the AWS_* environment,
+/// for a command that writes: refused while `cluster migrate` holds the
+/// prefix (ADR 0022). Only reads.
+pub(crate) fn open_bucket(
+    url: &str,
+) -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)> {
+    let (store, prefix) = open_bucket_unchecked(url)?;
+    refuse_locked(url, &store, &prefix)?;
+    Ok((store, prefix))
+}
+
+/// [`open_bucket`] without the check: `cluster status` and `cluster
+/// migrate`.
+pub(crate) fn open_bucket_unchecked(
     url: &str,
 ) -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)> {
     let (bucket, prefix) = parse_bucket(url)?;
@@ -1677,79 +1693,72 @@ fn open_bucket(
         .build()
         .with_context(|| format!("opening bucket {url}"))?;
     let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(store);
-    refuse_migrated(url, &store, prefix)?;
     Ok((store, prefix.to_owned()))
 }
 
-/// The objects a later version writes while it moves a bucket's actor
-/// state to a layout this version cannot read, under the key prefix.
-const MIGRATION_MARKERS: [&str; 2] = ["cluster/migration", "cluster/migrated/"];
-
-/// Refuses a bucket that a later version is migrating or has migrated:
-/// this version would read and write actor state where it no longer is.
-/// Only reads; a bucket that cannot be read is left to the command, which
-/// reports it in its own words.
-fn refuse_migrated(
-    url: &str,
-    store: &std::sync::Arc<dyn object_store::ObjectStore>,
-    prefix: &str,
-) -> anyhow::Result<()> {
-    // On a thread of its own: callers may hold a runtime of their own.
-    let found = std::thread::scope(|s| {
+/// Runs `check` on a thread of its own (callers may hold a runtime of
+/// their own), bounded: an unreachable bucket is the command's to report.
+fn on_own_thread<T: Send>(check: impl std::future::Future<Output = T> + Send) -> Option<T> {
+    std::thread::scope(|s| {
         s.spawn(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .ok()?;
-            // Bounded: an unreachable bucket is the command's to report.
             rt.block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    migration_marker(store.as_ref(), prefix),
-                )
-                .await
-                .ok()
-                .flatten()
+                tokio::time::timeout(std::time::Duration::from_secs(10), check)
+                    .await
+                    .ok()
             })
         })
         .join()
         .ok()
         .flatten()
-    });
-    if let Some(marker) = found {
+    })
+}
+
+/// Refuses a bucket prefix that `cluster migrate` holds.
+fn refuse_locked(
+    url: &str,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    use wasmkeep_cluster::lease::Bucket as _;
+    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+        std::sync::Arc::clone(store),
+        prefix,
+    );
+    let found = on_own_thread(async { bucket.get(wasmkeep_cluster::migrate::LOCK_KEY).await });
+    if let Some(Ok(Some(_))) = found {
         anyhow::bail!(
-            "bucket {url} is being migrated, or was migrated, to the layout of a later \
-             WasmKeep version ({marker} exists): this version ({}) cannot use it. \
-             Use the version that migrated it.",
-            env!("CARGO_PKG_VERSION")
+            "bucket {url}: {}",
+            wasmkeep_cluster::migrate::StartRefusal::InProgress
         );
     }
     Ok(())
 }
 
-/// The first migration marker found under `prefix`, if any.
-async fn migration_marker(store: &dyn object_store::ObjectStore, prefix: &str) -> Option<String> {
-    use object_store::ObjectStoreExt as _;
-    let key = |k: &str| {
-        if prefix.is_empty() {
-            k.to_owned()
-        } else {
-            format!("{prefix}/{k}")
-        }
-    };
-    let lock = key(MIGRATION_MARKERS[0]);
-    if store
-        .head(&object_store::path::Path::from(lock.as_str()))
-        .await
-        .is_ok()
-    {
-        return Some(lock);
+/// What `serve` and `dev` check on a bucket before anything writes to it
+/// (ADR 0022): no migration in progress, and `tenant`'s actor state not
+/// left in the layout before 0.4.0.
+pub(crate) fn check_layout(
+    url: &str,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+) -> anyhow::Result<()> {
+    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+        std::sync::Arc::clone(store),
+        prefix,
+    );
+    match on_own_thread(wasmkeep_cluster::migrate::start_check(&bucket, tenant)) {
+        None => anyhow::bail!("bucket {url}: no answer while checking its layout"),
+        Some(Err(e)) => Err(anyhow::anyhow!(
+            "bucket {url}: {}",
+            e.to_string().replace("<this bucket>", url)
+        )),
+        Some(Ok(())) => Ok(()),
     }
-    let done = key(MIGRATION_MARKERS[1]);
-    let folder = object_store::path::Path::from(done.trim_end_matches('/'));
-    let listed = store.list_with_delimiter(Some(&folder)).await.ok()?;
-    let first = listed.objects.first().map(|m| m.location.to_string());
-    first.or_else(|| listed.common_prefixes.first().map(ToString::to_string))
 }
 
 /// Splits `s3://BUCKET[/PREFIX]` into the bucket and the key prefix.
@@ -1767,49 +1776,45 @@ mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
     use super::{
-        load_env, migration_marker, move_target, move_target_warning, move_warnings, parse_bucket,
+        check_layout, load_env, move_target, move_target_warning, move_warnings, parse_bucket,
     };
 
-    #[tokio::test]
-    async fn a_migrated_or_migrating_bucket_is_found() {
-        use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path};
-        let store = InMemory::new();
-        assert_eq!(migration_marker(&store, "wk").await, None);
-        // Keys that only look alike are not markers.
-        store
-            .put(
-                &Path::from("wk/cluster/migrations-notes"),
-                PutPayload::from("x"),
-            )
-            .await
+    /// A command of this version refuses a prefix being migrated, and a
+    /// tenant whose actor state is still in the layout before 0.4.0;
+    /// a migrated tenant and a fresh one start (ADR 0022).
+    #[test]
+    fn the_layout_check_refuses_an_unmigrated_tenant_and_a_running_migration() {
+        use object_store::{
+            ObjectStore, ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path,
+        };
+        let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+        let put = |k: &str| {
+            let store = std::sync::Arc::clone(&store);
+            let k = k.to_owned();
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(store.put(&Path::from(k.as_str()), PutPayload::from("x")))
+                    .unwrap();
+            })
+            .join()
             .unwrap();
-        store
-            .put(
-                &Path::from("other/cluster/migration"),
-                PutPayload::from("x"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(migration_marker(&store, "wk").await, None);
-        store
-            .put(
-                &Path::from("wk/cluster/migrated/acme"),
-                PutPayload::from("x"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            migration_marker(&store, "wk").await.as_deref(),
-            Some("wk/cluster/migrated/acme")
-        );
-        let root = InMemory::new();
-        root.put(&Path::from("cluster/migration"), PutPayload::from("x"))
-            .await
-            .unwrap();
-        assert_eq!(
-            migration_marker(&root, "").await.as_deref(),
-            Some("cluster/migration")
-        );
+        };
+        let check = |tenant: &str| check_layout("s3://b/wk", &store, "wk", tenant);
+        check("acme").unwrap();
+        // Keys of another prefix, or a move, do not count.
+        put("other/owners/acme/c/n");
+        put("wk/control/move/acme/c/6e/node-b");
+        check("acme").unwrap();
+        put("wk/owners/acme/c/n");
+        let e = check("acme").unwrap_err().to_string();
+        assert!(e.contains("cluster migrate --bucket s3://b/wk"), "{e}");
+        check("other").unwrap();
+        put("wk/cluster/migrated/acme");
+        check("acme").unwrap();
+        put("wk/cluster/migration");
+        let e = check("other").unwrap_err().to_string();
+        assert!(e.contains("in progress"), "{e}");
     }
 
     /// `actor move` names the actor's app with `--app`, or the implicit
@@ -1940,17 +1945,6 @@ mod tests {
                 "a value leaked: {value}"
             );
         }
-    }
-
-    #[test]
-    fn apps_sharing_a_prefix_are_warned_about_by_name() {
-        assert_eq!(super::shared_prefix_warning("acme/shop", &[]), None);
-        let w = super::shared_prefix_warning("acme/shop", &["acme/admin".into()]).unwrap();
-        assert!(
-            w.starts_with("acme/shop and acme/admin are apps of one tenant"),
-            "{w}"
-        );
-        assert!(w.contains("share actors"), "{w}");
     }
 
     #[test]

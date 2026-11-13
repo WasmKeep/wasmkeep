@@ -423,14 +423,15 @@ impl ActorService {
         tracing::info!(actors = resident, took = ?started.elapsed(), "actors stopped");
     }
 
-    /// Live nodes on the same bucket prefix serving the same tenant but
-    /// another app: their actors would share keys. Empty outside a cluster.
+    /// Live nodes on the same bucket prefix of the version before the
+    /// implicit app (ADR 0022), which keep actor state in the layout before
+    /// 0.4.0. Empty outside a cluster.
     ///
     /// # Errors
     /// The heartbeats could not be read.
-    pub async fn app_conflicts(&self) -> Result<Vec<String>, String> {
+    pub async fn older_nodes(&self) -> Result<Vec<String>, String> {
         match &self.inner.cluster {
-            Some(c) => c.app_conflicts().await,
+            Some(c) => c.older_nodes().await,
             None => Ok(Vec::new()),
         }
     }

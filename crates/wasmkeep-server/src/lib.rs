@@ -31,7 +31,7 @@ pub use access::{Access, AccessRules};
 pub use actor::{ActorConfig, ActorService};
 pub use cluster::{
     ClusterConfig, ClusterPlaintext, ClusterTlsConfig, DEFAULT_HEARTBEAT, IMPLICIT_APP_NAME,
-    conflict_advice, failover_wait_default, heartbeat_horizon_ms,
+    failover_wait_default, heartbeat_horizon_ms, older_nodes_advice,
 };
 pub use egress::{EgressPolicy, IpRange};
 pub use env::ActorEnv;

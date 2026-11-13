@@ -48,7 +48,7 @@ pub(crate) use lease_hold::*;
 pub(crate) use node_lease_task::lease_attempt;
 use node_lease_task::{lease_every, node_lease_loop};
 pub(crate) use signing::*;
-pub use view::conflict_advice;
+pub use view::older_nodes_advice;
 pub(crate) use view::*;
 
 /// On a signed node call: the body is an alarm handed off by a draining

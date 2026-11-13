@@ -69,8 +69,10 @@ async fn an_idle_peer_connection_is_not_reused() {
     );
 }
 
+/// Only nodes of the version before the implicit app are refused: two
+/// apps of one tenant share a prefix safely (ADR 0022).
 #[test]
-fn only_another_app_of_the_same_tenant_conflicts() {
+fn only_nodes_of_the_version_before_are_refused() {
     let n = |id: &str, app: &str| NodeInfo {
         id: id.into(),
         address: "http://x".into(),
@@ -87,42 +89,17 @@ fn only_another_app_of_the_same_tenant_conflicts() {
     };
     let nodes = [
         n("me", "acme/shop"),
-        n("b", "acme/shop"),  // same app: fine
-        n("c", "other/shop"), // another tenant: separate keys
-        n("d", "acme/admin"), // same tenant, another app: conflict
-        n("e", "acme/"),      // command-line classes of an older version: conflict
-        n("f", ""),           // an older node: not judged
+        n("b", "acme/shop"),  // same app
+        n("c", "other/shop"), // another tenant
+        n("d", "acme/admin"), // same tenant, another app: its own root
+        n("e", "acme/"),      // command-line classes of an older version
+        n("f", ""),           // predates the app line: the start guard's
     ];
-    assert_eq!(
-        conflicts("me", "acme/shop", &nodes),
-        vec![
-            "d (acme/admin)".to_owned(),
-            "e (acme/, an older version)".to_owned()
-        ]
-    );
-    assert!(conflicts("me", "other/x", &nodes[..1]).is_empty());
-}
-
-/// A conflict with nodes of the version before the implicit app only
-/// (ADR 0022) is an upgrade that did not stop every node: the advice says
-/// so, instead of sending the operator to another bucket prefix.
-#[test]
-fn a_conflict_with_older_nodes_only_asks_for_a_stop_all_upgrade() {
-    let older = vec!["e (default/, an older version)".to_owned()];
-    let advice = conflict_advice(&older);
+    assert_eq!(older_nodes("me", &nodes), vec!["e (acme/)".to_owned()]);
+    assert!(older_nodes("e", &nodes[4..5]).is_empty());
+    let advice = older_nodes_advice(&["e (default/)".to_owned()]);
     assert!(advice.contains("stop every node"), "{advice}");
-    assert!(
-        advice.contains("e (default/, an older version)"),
-        "{advice}"
-    );
-    assert!(!advice.contains("--bucket prefix"), "{advice}");
-    let mixed = vec![
-        "d (acme/admin)".to_owned(),
-        "e (acme/, an older version)".to_owned(),
-    ];
-    let advice = conflict_advice(&mixed);
-    assert!(advice.contains("another --bucket prefix"), "{advice}");
-    assert!(!advice.contains("stop every node"), "{advice}");
+    assert!(advice.contains("e (default/)"), "{advice}");
 }
 
 #[test]
