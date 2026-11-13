@@ -1847,3 +1847,90 @@ fn a_rollback_racing_an_acknowledged_remove_old_never_loses_state() {
         });
     }
 }
+
+/// `--remove-old` with the rollback given up, while a rollback runs to the
+/// end between its listing and its lock read (`k`: the request, counted
+/// from the end of the listing, before which the rollback is done): it
+/// stops, deleting nothing, and a later `--apply` makes the rollback work
+/// again.
+fn a_rollback_done_before_the_lock_read(seed: u64, k: u64) {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        apply(&sim).await.unwrap();
+        // The dry run makes the same reads, and writes nothing.
+        let ops = *sim.ops.lock().unwrap();
+        Migrator::new(&sim, &SimClock, apps(), options())
+            .removal(remove_options(true))
+            .await
+            .unwrap();
+        let now = *sim.ops.lock().unwrap();
+        let reads = now - ops;
+        sim.hooks.lock().unwrap().insert(
+            now + reads + k,
+            vec![Box::new(|m: &mut Map, _| *m = fixture_after_rollback())],
+        );
+        let r = remove_old(&sim, true).await;
+        assert!(
+            matches!(r, Err(MigrateError::Aborted(_))),
+            "seed {seed}, k {k}: {r:?}"
+        );
+        let bare = |m: &Map| -> BTreeMap<String, Vec<u8>> {
+            canonical(m)
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with("cluster/"))
+                .collect()
+        };
+        assert_eq!(
+            bare(&sim.snapshot()),
+            bare(&fixture()),
+            "seed {seed}, k {k}: deleted the only copy"
+        );
+        // Nothing was deleted: migrated again, the rollback still works.
+        apply(&sim).await.unwrap();
+        rollback(&sim)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}, k {k}: {e}"));
+        assert_eq!(
+            canonical(&sim.snapshot()),
+            canonical(&fixture()),
+            "seed {seed}, k {k}"
+        );
+    });
+}
+
+#[test]
+fn a_rollback_done_before_the_lock_read_stops_the_removal() {
+    // Two tenants: their two marks, then the lock read.
+    for k in 1..=3 {
+        a_rollback_done_before_the_lock_read(4, k);
+    }
+    for seed in 0..seeds() {
+        a_rollback_done_before_the_lock_read(seed, 1 + seed % 3);
+    }
+}
+
+#[test]
+fn a_remove_old_with_nothing_to_delete_writes_no_mark() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Sim::new(seed, fixture());
+            migrated(&sim).await;
+            remove_old(&sim, false).await.unwrap();
+            for t in ["acme", "default"] {
+                sim.objects
+                    .lock()
+                    .unwrap()
+                    .remove(&format!("{REMOVED_PREFIX}{t}"));
+            }
+            let again = remove_old(&sim, false).await.unwrap();
+            assert_eq!(again.deletes(), 0, "seed {seed}");
+            let m = sim.snapshot();
+            assert!(
+                !m.keys().any(|k| k.starts_with(REMOVED_PREFIX)),
+                "seed {seed}: wrote a mark for nothing"
+            );
+        });
+    }
+}

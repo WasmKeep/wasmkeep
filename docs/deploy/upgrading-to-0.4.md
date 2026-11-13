@@ -33,17 +33,19 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
 
 ## The steps
 
-1. **Back up the bucket** with the cluster stopped
-   ([how](backup-and-restore.md#with-the-cluster-stopped-restorable)), or
-   right after step 3. Keep that copy until step 11 is done.
+1. **Freeze deploys, secret changes, `actor move` and drains**, CI
+   included. A deploy by an older `wasmkeep` during the migration stops
+   it before it commits. An `actor move` after `--apply` writes under the
+   migrated roots, and from then on the rollback refuses.
 
-2. **Freeze deploys and secret changes**, CI included. A deploy by an
-   older `wasmkeep` during the migration stops it before it commits.
-
-3. **Stop every node**: the service units, not just the processes. A
+2. **Stop every node**: the service units, not just the processes. A
    process its service manager restarts writes its lease again, and the
    migration refuses, or aborts before committing. `wasmkeep cluster
    status --bucket s3://BUCKET/PREFIX` exits with 1 once no node is live.
+
+3. **Back up the bucket**, now that the cluster is stopped
+   ([how](backup-and-restore.md#with-the-cluster-stopped-restorable)).
+   Keep that copy until step 11 is done.
 
 4. **Install 0.4.0** on every machine, without starting it.
 
@@ -66,7 +68,8 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
      the tenant, or `default/default`;
    - the node leases it sees, and whether each may still run (a node
      stopped cleanly is quiet at once; a crashed or fenced one once its
-     lease is 16 s old, with the default timings);
+     lease is 16 s old with the default timings, or a heartbeat in the
+     format from before node leases once it is 25 s old);
    - the objects per family, and an estimate of the time;
    - what refuses the run, if anything.
 
@@ -79,7 +82,9 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
    ```
 
    It takes the lock (`cluster/migration`), waits one node-lease window
-   (16 s with the default timings: a node the dry run judged stopped,
+   (16 s with the default timings, 25 s when `nodes/` still holds a
+   heartbeat in the format from before node leases, as a prefix last run
+   by 0.2.0 does: a node the dry run judged stopped,
    because its clock and the migrator's disagree, renews its lease in
    that time and the run aborts), copies inside the bucket (no download),
    checks every copy, writes the barriers that stop older binaries (token
@@ -95,8 +100,8 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
    nothing new committed, 2 some tenants committed and others not (run it
    again).
 
-7. **Verify**: run the dry run again. Every tenant reads `migrated`, and
-   nothing is refused. `wasmkeep cluster status` still shows no live node.
+7. **Verify**: run the dry run again. Every tenant reads `migrated`,
+   nothing is refused, and it ends with "Nothing to migrate". `wasmkeep cluster status` still shows no live node.
 
 8. **Start** every node of 0.4.0. At its first start a node puts its old
    local databases aside (`<data_dir>/actors.pre-0.4/`), and restores
@@ -106,7 +111,7 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
 
 9. **Check the app**: `wasmkeep cluster status` shows every node live,
    and requests to a few known actors return their data. Then unfreeze
-   deploys and secret changes.
+   deploys, secret changes, `actor move` and drains.
 
 10. **Remove the old keys, dry run**, once the app answers (the same day
     is the intent):
@@ -155,11 +160,13 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
     deleting. After a crash, run it again: it goes on. Exit codes: 0
     done, 1 refused or stopped. Storage is back to one copy of the state
     (on a versioned bucket, once the noncurrent versions expire). The
-    backup from step 1 can go.
+    backup from step 3 can go. A run with nothing to delete writes no
+    mark and leaves the rollback as it was.
 
 ## Rolling back
 
-**Before the first start** (step 8), and while no app was deployed:
+**Before the first start** (step 8), while no app was deployed and no
+`actor move` was requested:
 
 ```sh
 wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX --rollback
@@ -176,7 +183,7 @@ starting the older binary.
 **After the first start**, the rollback refuses: a node of any version
 ran, an app was deployed, or a key under a migrated root is newer than
 the tenant's commit. The state stays where 0.4.0 reads it. Going back to
-the older version then means restoring the backup from step 1 into an
+the older version then means restoring the backup from step 3 into an
 empty prefix, which loses every write since the migration. After
 `--remove-old --apply` has started, the rollback refuses whatever else
 is true.

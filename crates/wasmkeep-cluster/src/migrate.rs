@@ -1432,6 +1432,12 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 outcome.failed.push((tenant.clone(), lost.to_string()));
                 break;
             }
+            // A mark with no commit is from a `--remove-old` that stopped
+            // before deleting (the commit it planned against was rolled
+            // back): it would refuse this commit's rollback for nothing.
+            // A `--remove-old` still running sees this run's commit, not
+            // its own, and stops too.
+            self.clear_stale_mark(tenant, &key).await?;
             match self.store.create(&key, commit.encode(COMMIT_HEADER)).await {
                 Ok(_) => outcome.committed.push(tenant.clone()),
                 // A re-run after a crash between the write and its answer.
@@ -1992,6 +1998,25 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         Ok(tenants.into_iter().collect())
     }
 
+    /// Deletes tenant `tenant`'s `--remove-old` mark if it has no commit
+    /// at `key` (read, not listed: a commit a listing left out keeps it).
+    async fn clear_stale_mark(&self, tenant: &str, key: &str) -> Result<(), MigrateError> {
+        if self
+            .store
+            .get(key)
+            .await
+            .map_err(bucket(format!("reading {key}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mark = format!("{REMOVED_PREFIX}{tenant}");
+        self.store
+            .delete(&mark)
+            .await
+            .map_err(bucket(format!("deleting {mark}")))
+    }
+
     /// Why a rollback is now one-way, if it is: a `nodes/` change since
     /// the run (a node of any version ran), a deploy since a commit, or a
     /// key under a migrated root written after its commit.
@@ -2117,12 +2142,24 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
     /// `--remove-old` as a dry run: what it would delete, and what refuses
     /// it. Reads only.
     pub async fn removal(&self, options: RemoveOptions) -> Result<Removal, MigrateError> {
+        Ok(self.planned_removal(options).await?.0)
+    }
+
+    /// [`Self::removal`], with the commit of each tenant it plans for.
+    async fn planned_removal(
+        &self,
+        options: RemoveOptions,
+    ) -> Result<(Removal, BTreeMap<String, Record>), MigrateError> {
         let mut out = Removal::default();
+        let mut planned = BTreeMap::new();
         if let Some((lock, _)) = self.read_record(LOCK_KEY, LOCK_HEADER).await? {
+            let flag = match lock.mode {
+                LockMode::Apply => "--apply",
+                LockMode::Rollback => "--rollback",
+            };
             out.refusals.push(format!(
-                "{LOCK_KEY} exists: a run of migrate ({:?}) is unfinished; run it again to the \
-                 end first",
-                lock.mode
+                "{LOCK_KEY} exists: a `wasmkeep cluster migrate {flag}` is unfinished; run it \
+                 again to the end first"
             ));
         }
         let commits = self.commits().await?;
@@ -2144,9 +2181,10 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 .tenant_removal(&tenant, commit, &single, now, options)
                 .await?;
             out.refusals.extend(refusals);
+            planned.insert(tenant.clone(), commit.0.clone());
             out.tenants.insert(tenant, t);
         }
-        Ok(out)
+        Ok((out, planned))
     }
 
     /// [`Self::removal`] for one migrated tenant.
@@ -2304,11 +2342,19 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
     /// `--rollback` refuses; then, if a run took the lock meanwhile, it
     /// stops. Run again after a crash, it goes on.
     pub async fn remove_old(&self, options: RemoveOptions) -> Result<Removal, MigrateError> {
-        let removal = self.removal(options).await?;
+        let (removal, planned) = self.planned_removal(options).await?;
         if !removal.refusals.is_empty() {
             return Err(MigrateError::Refused(removal.refusals));
         }
-        for tenant in removal.tenants.keys() {
+        // A tenant with nothing to delete is not marked: its rollback is
+        // not given up for nothing.
+        let deleting: Vec<&String> = removal
+            .tenants
+            .iter()
+            .filter(|(_, t)| !t.delete.is_empty())
+            .map(|(tenant, _)| tenant)
+            .collect();
+        for tenant in &deleting {
             let mark = format!("{REMOVED_PREFIX}{tenant}");
             match self.store.create(&mark, Vec::new()).await {
                 Ok(_) | Err(BucketError::Conflict) => {}
@@ -2320,8 +2366,8 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 }
             }
         }
-        // A rollback checks for the marks under its lock: one of the two
-        // sees the other.
+        // A rollback checks for the marks under its lock: one that takes
+        // it from here on sees them and refuses.
         if self
             .store
             .get(LOCK_KEY)
@@ -2333,6 +2379,20 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 "{LOCK_KEY} was taken by a run of migrate meanwhile: nothing was deleted; let \
                  it finish and run this again"
             )));
+        }
+        // One that took it and let it go since the listing deleted the
+        // commit under it (and put the old layout back as the only copy):
+        // each commit must still be the one planned against. The record,
+        // not the version, is compared: versions of two reads are opaque.
+        for tenant in &deleting {
+            let key = format!("{COMMIT_PREFIX}{tenant}");
+            let now = self.read_record(&key, COMMIT_HEADER).await?;
+            if now.as_ref().map(|(r, _)| r) != planned.get(*tenant) {
+                return Err(MigrateError::Aborted(format!(
+                    "{key} changed since the listing (a --rollback or --apply ran meanwhile): \
+                     nothing was deleted; run this again"
+                )));
+            }
         }
         for t in removal.tenants.values() {
             each(&t.delete, self.options.concurrency, |key| async move {

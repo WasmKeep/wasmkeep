@@ -171,12 +171,18 @@ starts, the migration is one-way.** The bare keys stay until
   of an actor with no tombstone (a new actor created in the window between
   the final proof and the commit). The refusal names each key.
 - **One-way for good**: before its first delete it creates
-  `cluster/removed/<tenant>`, which `--rollback` counts as one-way, then
-  reads the lock again and stops if a run took it meanwhile. A rollback
-  checks under its lock; so one of the two always sees the other, and a
-  rollback never restores records over deleted history. A rollback that
-  finishes deletes the mark with the commit (only a removal that saw its
-  lock, and so deleted nothing, can have written it).
+  `cluster/removed/<tenant>` for each tenant it deletes from (none for a
+  tenant with nothing to delete), which `--rollback` counts as one-way,
+  then reads the lock again and stops if a run took it meanwhile, then
+  reads each such tenant's commit again and stops if it is gone or is not
+  the one it listed (a rollback that took the lock and let it go in
+  between). A rollback checks under its lock, and deletes the commit
+  under it: so a rollback that ends before the lock read leaves no
+  commit, one that starts after the marks refuses, and a rollback never
+  restores records over deleted history. A rollback that finishes
+  deletes the mark with the commit, and `--apply`, under its lock,
+  deletes the mark of a tenant it is about to commit that has no commit:
+  only a removal that stopped before deleting can have left it.
 - It is a dry run without `--apply`, and resumes after a crash: it
   recomputes everything from listings, and deletes are idempotent. It
   takes no lock: nodes run while it does, and a held lock would refuse a

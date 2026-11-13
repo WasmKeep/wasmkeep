@@ -66,6 +66,7 @@ on a bucket that holds actor state.
   TENANT/APP`, which must name an app of the tenant (or
   `default/default`); the other apps start a shared class empty.
   `--apply` waits one node-lease window (16 s with the default timings,
+  25 s when `nodes/` still holds a heartbeat from before node leases,
   so that a node whose clock disagrees with the migrator's shows itself),
   copies server-side, verifies, then puts barriers in front of older
   binaries (token `3` in every app's `current`, a tombstone over every old
@@ -91,8 +92,10 @@ on a bucket that holds actor state.
   key written after the commit, an old record that is not a tombstone or
   history with no tombstone (a binary before 0.4.0 ran on the prefix),
   naming each key. Before its first delete it writes
-  `cluster/removed/<tenant>`, after which `--rollback` refuses for good.
-  It can be run again after a crash.
+  `cluster/removed/<tenant>`, after which `--rollback` refuses for good;
+  a tenant with nothing to delete gets none. It stops, deleting nothing,
+  if a `--rollback` or `--apply` ran meanwhile. It can be run again after
+  a crash.
 - **`actor move` runs the start check `serve` runs**: it refuses a tenant
   whose state is still in the layout before 0.4.0, printing the migrate
   command, instead of writing a request no node reads.
@@ -131,13 +134,16 @@ on a bucket that holds actor state.
 
 From 0.2.0 or 0.3.0, on a bucket prefix that holds actor state:
 
-1. Back up the bucket; freeze deploys and secret changes (CI included).
-2. Stop every node: the service units, not just the processes.
-3. `wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX`: read the plan;
+1. Freeze deploys, secret changes, `actor move` and drains (CI
+   included).
+2. Stop every node: the service units, not just the processes. Then back
+   up the bucket.
+3. Install 0.4.0 on every node, without starting it.
+4. `wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX`: read the plan;
    give `--heir` where it asks.
-4. Run it again with `--apply` (and the same `--heir`).
-5. Upgrade every node, start them all, and check the app.
-6. The same day: `cluster migrate --remove-old`, then `--remove-old
+5. Run it again with `--apply` (and the same `--heir`).
+6. Start every node, and check the app.
+7. The same day: `cluster migrate --remove-old`, then `--remove-old
    --apply`.
 
 The whole procedure is in [upgrading to
