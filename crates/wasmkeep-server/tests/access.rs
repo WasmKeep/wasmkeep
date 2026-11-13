@@ -64,7 +64,7 @@ async fn send(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
 
 /// Databases on disk for `class`.
 fn databases(data: &Path, class: &str) -> Vec<String> {
-    let dir = data.join("state/default/default/actors").join(class);
+    let dir = data.join("actors/default").join(class);
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map(|d| {
             d.filter_map(|e| e.ok())

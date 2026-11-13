@@ -99,7 +99,7 @@ __all__ = [
 ]
 
 # The package's version, as in pyproject.toml (test/test_package.py checks it).
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 # The version of the `wasmkeep:actor` WIT package in wasmkeep/wit: the
 # interface the SDK is written against, which changes less often.
 WIT_VERSION = "0.2.0"

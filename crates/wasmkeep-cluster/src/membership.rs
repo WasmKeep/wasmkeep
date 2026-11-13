@@ -46,9 +46,8 @@ pub struct NodeInfo {
     pub version: String,
     /// When it wrote this heartbeat, on its own clock (ms).
     pub written_at_ms: u64,
-    /// What it serves: `tenant/app`, `default/default` for classes given
-    /// on the command line (the implicit app, ADR 0022); `tenant/` from
-    /// nodes of the version before it, empty from nodes that predate both.
+    /// What it serves: `tenant/app` for a deployed app, `tenant/` for
+    /// classes given on the command line; empty from nodes that predate it.
     pub app: String,
     /// Its cluster listener (`https://host:port`), when it has one
     /// ([ADR 0011](../../../docs/adr/0011-node-to-node-mtls.md)).

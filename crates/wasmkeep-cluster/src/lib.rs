@@ -15,7 +15,6 @@ pub mod failover;
 pub mod holds;
 pub mod lease;
 pub mod membership;
-pub mod migrate;
 pub mod node_lease;
 #[cfg(feature = "object-store")]
 pub mod object_store;

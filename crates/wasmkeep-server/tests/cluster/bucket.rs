@@ -437,7 +437,7 @@ async fn a_restore_that_fails_putting_its_file_in_place_is_redone_from_the_bucke
     let path = "/actor/t/aside/durable";
     let (_a, b, flaky_b, dirs) = cut_off_owner(path, 5, Duration::from_secs(30)).await;
     // b has an older file for the actor, and cannot write a sidecar.
-    let dir = dirs.1.path().join(test_dir("t"));
+    let dir = dirs.1.path().join("actors/default/t");
     let file = |suffix: &str| dir.join(format!("aside.db{suffix}"));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(file(""), b"what was there").unwrap();

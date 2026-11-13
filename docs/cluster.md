@@ -28,9 +28,7 @@ of what adding nodes does, read
   clock skew between nodes (see `wasmkeep_cluster::node_lease`, proven in
   simulation).
 - Each actor has an **ownership record** in the bucket at
-  `state/<tenant>/<app>/owners/<class>/<name>`, under its app's state root
-  ([ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md);
-  `default/default` for `serve --actor`), naming the node (and its process)
+  `owners/<tenant>/<class>/<name>`, naming the node (and its process)
   that holds it, with a generation of its own for every hold. A node
   writes it when it takes the actor (its first event after waking) and
   when it gives it up (hibernation, a drain, a move, a clean stop): there
@@ -216,7 +214,7 @@ wait ended ([monitoring](monitoring.md)).
 Each actor's database follows it from node to node (ADR 0007):
 
 - After every event, the owner uploads what the event committed as an LTX
-  file under `state/<tenant>/<app>/actors/<class>/<name>/wal/`, and a snapshot every 64
+  file under `actors/<tenant>/<class>/<name>/wal/`, and a snapshot every 64
   uploads. A node that takes an actor over rebuilds its database from the
   bucket first, unless its local copy is already current.
 - An upload the bucket leaves unanswered is given up and sent again: an
@@ -471,23 +469,12 @@ briefly stopped trusting" below).
 Nodes prove to each other that a call comes from the cluster with a
 signature: HMAC-SHA256, keyed with a random secret the first node stores at
 `cluster/secret` in the bucket, over the node the call is for, the method,
-path, body, calling actor, chain of waiting actors, the calling node's app,
-a timestamp and a nonce
+path, body, calling actor, chain of waiting actors, a timestamp and a nonce
 unique to each send (valid for a minute, and accepted once). Only a signed call's
 caller (`x-wasmkeep-caller`) and chain are believed, so a client cannot pass
 for an actor or reach an `internal` class, and a call cycle across nodes is
 refused instead of deadlocking. The secret itself never travels; a malformed
 one in the bucket stops calls between nodes rather than weakening them.
-
-**The app on every hop.** A forwarded request, a relayed WebSocket upgrade
-and a call between nodes name the sending node's app in
-`x-wasmkeep-app: tenant/app` (signed on calls). A node refuses a hop for
-an app it does not serve before reading it: 503, `Retry-After: 1`, "not
-this app's node"; the actor does not run. Nodes started without `--app`
-run as the implicit app `default/default`. A client's header is never
-believed or passed on: it is removed from what clients send to actors and
-from what actors send, and never reaches an actor
-([ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md)).
 
 Credentials, region and endpoint come from the standard `AWS_*` environment
 variables.
@@ -622,26 +609,36 @@ wasmkeep serve --app acme/shop --bucket s3://wasmkeep-demo --node-id a ...
 wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
 ```
 
-- **Each app owns its actors** ([ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md)):
-  their state lives under `state/<tenant>/<app>/`, beside
-  `apps/<tenant>/<app>/`, so several apps of one tenant can share a bucket
-  prefix, and the same class and actor name in two apps are two actors.
-  An app is those two prefixes, for deleting, exporting and access
-  policies alike. Nodes started with `--actor` run as the implicit app
-  `default/default`; `deploy --app default/default` moves such a cluster
-  to deploys and keeps its actors. There is no `app delete` yet: to remove
-  an app nobody runs, stop its nodes and delete both prefixes:
+- **One app per tenant per bucket prefix**, until each app owns its
+  actors' state (planned for 0.4.0, [ADR 0021](adr/0021-the-app-model.md)).
+  Actors are keyed by tenant, class and name, so two apps of one tenant on
+  the same prefix would share actors. The first `deploy` of an app refuses
+  when another app of its tenant is deployed on the prefix (it has
+  `apps/<tenant>/<app>/current`), naming that app: deploy the new one on
+  another prefix (`s3://bucket/admin`), or under another tenant if
+  another owner runs it (`--app globex/admin`). Another prefix is a
+  separate cluster with its own cluster secret: the app starts there with
+  no data, its secrets are set again, and it cannot be moved to another
+  prefix later (its secrets are sealed to the prefix). A node also refuses
+  to start when a live node on its prefix serves another app of its
+  tenant. Two apps of one tenant deployed on one prefix before this check
+  are left as they were (in a cluster, still not running at the same
+  time), and `deploy` and `serve` warn about them by name; a further one
+  is refused while any of them has a `current`. The first deploy needs
+  list access to `<prefix>apps/<tenant>/` (a listing that fails refuses);
+  two first deploys at the same moment can both pass it. There is no `app
+  delete` yet. To free the tenant from an app nobody runs, stop its nodes
+  and delete its `current`, which keeps its versions and secrets:
 
   ```bash
+  aws s3 rm s3://wasmkeep-demo/apps/acme/legacy/current
+  # or remove the app entirely (its versions, current and secrets):
   aws s3 rm --recursive s3://wasmkeep-demo/apps/acme/legacy/
-  aws s3 rm --recursive s3://wasmkeep-demo/state/acme/legacy/
   ```
 
-- A bucket prefix that holds actor state written by a version before
-  0.4.0 is migrated once with `wasmkeep cluster migrate` while every node
-  is stopped ([Migrating to 0.4.0](deploy/backup-and-restore.md#migrating-to-040)).
-  Until then, nodes and `deploy` of this version refuse that tenant and
-  print the command to run.
+  Its actors' data stays under `actors/<tenant>/`, `owners/<tenant>/`,
+  `leases/<tenant>/` and `alarms/<tenant>/`, and the next app of the
+  tenant finds the actors of any class with the same name.
 - The tenant and app names of a new app match `[a-z][a-z0-9-]{0,63}`; an
   app deployed earlier keeps its name.
 - `deploy` compiles and checks every component before uploading anything;
@@ -744,15 +741,17 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo \
   made `internal` closes its open sockets (1008) at their next message.
 - A node that reads a version it cannot apply keeps the previous one and
   reports not ready (`/_wasmkeep/ready`) until it can.
-- **`--access` with `--app`** is refused: rules come with deploys. Every
-  deploy of 0.4.0 marks the app (its `current` carries token `3`, [ADR
-  0022](adr/0022-app-owned-state-and-the-one-time-migration.md)), and a
-  node refuses to follow a `current` from an earlier version. A cluster
-  that still passes `--access` to its nodes deploys those rules once
-  (`wasmkeep deploy --app acme/shop --bucket ... --access
-  monitor=existing`), then removes `--access` from their command lines;
-  the start-up error gives the `deploy` command. A node following an app
-  that never deployed rules logs that every class is open.
+- **`--access` with `--app`** is refused once rules have been deployed
+  (the start-up error gives the `wasmkeep deploy` command). Before that it
+  still works, so a cluster started with `--access` moves in three steps:
+  1. upgrade every node, flags unchanged;
+  2. deploy the rules once:
+     `wasmkeep deploy --app acme/shop --bucket ... --access monitor=existing`
+     (nodes switch to them and log that `--access` is now ignored);
+  3. remove `--access` from the nodes' command lines.
+
+  A node following an app that never deployed rules, started without
+  `--access`, logs that every class is open.
 
 ### Secrets in the bucket
 
@@ -846,14 +845,14 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE    STATE    VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
-a     yes   979ms  serving  0.2.0    acme/shop  http://a:8080  https://a:7443   pinned
-b     yes   2.2s   serving  0.2.0    acme/shop  http://b:8080  -                plain
-c     no    14m    serving  0.2.0    acme/shop  http://c:8080  https://c:7443   pinned
+a     yes   979ms  serving  0.3.0    acme/shop  http://a:8080  https://a:7443   pinned
+b     yes   2.2s   serving  0.3.0    acme/shop  http://b:8080  -                plain
+c     no    14m    serving  0.3.0    acme/shop  http://c:8080  https://c:7443   pinned
 
 APP        DEPLOYED VERSION  SEQ
 acme/shop  9cf4de9152d8dd29  1
 
-2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.2.0
+2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.3.0
 warning: mixed plain and TLS nodes: b still plain while a use the cluster listener; give every node a cluster listener, then drop --cluster-plaintext accept (ADR 0011)
 ```
 
@@ -941,18 +940,13 @@ its one error.
 ## Moving one actor
 
 ```bash
-wasmkeep actor move --app acme/shop room/lobby --to node-c --bucket s3://acme-wasmkeep/prod
+wasmkeep actor move acme/room/lobby --to node-c --bucket s3://acme-wasmkeep/prod
 ```
-
-The actor is `CLASS/NAME` of the app `--app` names. Without `--app`, it is
-written `default/CLASS/NAME`, of the implicit app `default/default` (nodes
-started without `--app`); another tenant in front is refused, asking for
-`--app`.
 
 The target must be a live node: an id no live node has is refused without
 `--force`, and a target that is draining, or too old to take moved actors,
 gets a warning (the request is written; the owner keeps the actor), as
-does one that serves another app.
+does one that serves another tenant.
 
 Within a few seconds the actor's owner hands it to `node-c`
 ([ADR 0017](adr/0017-moving-one-actor.md)):
@@ -998,39 +992,14 @@ the last stop and the first start, so plan a short window.
 5. Start every node, then run `cluster status` again: every node live, one
    version in the summary, no warning.
 
-Going back to the previous binary is the same procedure, except across
-the 0.4.0 layout change: `cluster migrate --rollback` works only until
-the first node starts after the migration. Builds made from
-source report the version of the release they follow (`0.2.0` for any
+Going back to the previous binary is the same procedure. Builds made from
+source report the version of the release they follow (`0.3.0` for any
 build since it), so the version column cannot tell two of them apart:
 step 3 is what proves no old node is left.
 
 **What goes wrong if old and new nodes run together** (each is a reason
 for the rule; there may be others nobody has listed):
 
-- **Every hop, from 0.2 to a later version**: nodes after 0.2.0 name their
-  app on every hop to another node, and refuse a hop that names none: a
-  request forwarded, an upgrade relayed or a call made by a 0.2 node gets
-  503, "refused: sent by a node of an older version". The other way, the
-  0.2 node fails the newer node's signatures: calls to `internal` classes,
-  moves and alarm hand-offs fail, and other calls run there as requests
-  from outside, with no calling actor.
-- **Starting next to the other version**: a node started without `--app`
-  names its app `default/default` after 0.2.0 and `default/` in 0.2. A
-  newer node refuses to start while a 0.2 one is live on the bucket prefix,
-  asking to stop every node and upgrade them together; a 0.2 node started
-  next to a newer one refuses too, saying another app of the tenant runs
-  there.
-- **The layout of actor state** (0.4.0, [ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md)):
-  0.4.0 keys every app's actors under `state/<tenant>/<app>/`, and a
-  bucket written by an earlier version is migrated once, with every node
-  stopped, by `wasmkeep cluster migrate`. A 0.3 binary refuses a bucket
-  being migrated or migrated; 0.2's `serve --app` and `deploy` cannot read
-  the `current` token `3` and stop; a 0.2 `serve --actor` node finds a
-  tombstone over each migrated actor's old record and answers 503 for it
-  (an actor it creates under the old keys is not seen by 0.4.0: running
-  0.2 on a migrated bucket is unsupported). Going back after the first
-  0.4.0 start is not supported ([Migrating to 0.4.0](deploy/backup-and-restore.md#migrating-to-040)).
 - **Calls between nodes**: the format of signed calls can change between
   versions.
   Old and new nodes refuse each other's calls (logged as "bad, expired or

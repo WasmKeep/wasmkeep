@@ -22,6 +22,21 @@ impl ActorService {
         name: &str,
         mut req: Request<Incoming>,
     ) -> Response<HyperOutgoingBody> {
+        if !read(&self.inner.classes).contains_key(class) {
+            return text_response(StatusCode::NOT_FOUND, "no such actor class\n");
+        }
+        let address = match ActorAddress::new(&self.inner.tenant, class, name) {
+            Ok(a) => a,
+            Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
+        };
+        // Set by the host, never by the client: the same encoding as calls
+        // (the name percent-encoded), so it is plain ASCII and unambiguous.
+        req.headers_mut().remove("x-wasmkeep-actor");
+        if let Ok(value) =
+            hyper::header::HeaderValue::from_str(&crate::cluster::encode_address(&address))
+        {
+            req.headers_mut().insert("x-wasmkeep-actor", value);
+        }
         // Only `actors.call` says which actor is calling: locally, or from
         // another node of the cluster proving it with the cluster secret
         // (in refuse mode, only on the cluster port: ADR 0011, phase B).
@@ -49,33 +64,6 @@ impl ActorService {
             None => None,
         };
         let internal = signed_body.is_some();
-        // A hop from a node of another app (or of an older version) is
-        // refused before anything else, its body unread (ADR 0022). The
-        // header never reaches a guest.
-        if let Some(refused) = self
-            .inner
-            .cluster
-            .as_ref()
-            .and_then(|cluster| cluster.wrong_app(&req, internal))
-        {
-            return refused;
-        }
-        req.headers_mut().remove(crate::cluster::APP);
-        if !read(&self.inner.classes).contains_key(class) {
-            return text_response(StatusCode::NOT_FOUND, "no such actor class\n");
-        }
-        let address = match ActorAddress::new(&self.inner.tenant, class, name) {
-            Ok(a) => a,
-            Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
-        };
-        // Set by the host, never by the client: the same encoding as calls
-        // (the name percent-encoded), so it is plain ASCII and unambiguous.
-        req.headers_mut().remove("x-wasmkeep-actor");
-        if let Ok(value) =
-            hyper::header::HeaderValue::from_str(&crate::cluster::encode_address(&address))
-        {
-            req.headers_mut().insert("x-wasmkeep-actor", value);
-        }
         // ADR 0010: outside requests may be refused, or kept from creating
         // actors. A request another node forwarded is checked again here
         // (it does not carry the cluster secret); the actor is resident on

@@ -118,7 +118,7 @@ plain values.
 | `storage.query(sql, *params)` | Rows as dicts, by column name |
 | `storage.delete_self()` | Deletes this actor when the event ends |
 | `alarms.set(at_ms)`, `alarms.get()`, `alarms.clear()` | The actor's single alarm, in ms since the Unix epoch |
-| `env.get(name, default=None)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/reference/api.md#interface-env)), or `default` |
+| `env.get(name, default=None)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/reference/api.md#interface-env)), or `default` |
 | `actors.self_address()` | This actor's `ActorAddress` (`tenant`, `class_name`, `name`) |
 | `actors.call("class/name", method=, path=, headers=, body=)` | Calls another actor; returns a `CallResponse` (`status`, `headers`, `body`, `text()`, `json()`) |
 | `sockets.send(conn, data)`, `broadcast(data, except_conn=)`, `close(conn, code, reason)`, `connections()` | The actor's WebSockets (str is text, bytes binary) |
@@ -136,9 +136,9 @@ anything that must survive in `storage`, not on `self`.
 ## Key-value and queues
 
 `wasmkeep.kv` and `wasmkeep.queue` are clients for key-value shards and
-queues built from actors ([ADR 0015](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/adr/0015-kv-and-queues-as-sdk-patterns.md)).
+queues built from actors ([ADR 0015](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0015-kv-and-queues-as-sdk-patterns.md)).
 The shard and queue classes are the Rust SDK's: deploy the components of
-[`examples/jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/jobs)
+[`examples/jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/jobs)
 as classes `kv` and `queue` (a release carries them already built, `kv.wasm`
 and `queue.wasm`). These clients speak their protocol over `actors.call`, byte for byte like the
 Rust and TypeScript clients, so all of them share the same data.
@@ -180,15 +180,15 @@ WitWorld, IncomingHandler = App.exports()
 Failures raise `kv.KvError` (`.kind`: conflict, key-too-long, storage, call,
 refused with `.status`) and `queue.QueueError` (storage, call, refused);
 numbers outside Rust's `u32`/`u64` raise `ValueError`. The
-[guide](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/kv-and-queues.md#python) covers the semantics and
-limits; [`examples/py-jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/py-jobs) is a working app.
+[guide](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/kv-and-queues.md#python) covers the semantics and
+limits; [`examples/py-jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/py-jobs) is a working app.
 
 ## Workflows
 
 `wasmkeep.workflow` starts and follows durable workflows
-([ADR 0019](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/adr/0019-workflows-as-an-sdk-pattern.md)): the
+([ADR 0019](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0019-workflows-as-an-sdk-pattern.md)): the
 workflow class is written with the Rust SDK's runner (as
-[`examples/workflows/orders`](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/workflows/orders),
+[`examples/workflows/orders`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/workflows/orders),
 which a release carries already built, `workflows-orders.wasm`), one actor
 per instance, and this client speaks its protocol over `actors.call`, like
 the Rust `workflow::Client`. Only the client side is in Python.
@@ -212,16 +212,16 @@ orders.cancel("order-42")
 | `Status` | `state` (`"running"`, `"waiting"`, `"completed"`, `"failed"`, `"cancelled"`), `wake_at`, `waiting_for`, `output`, `error`, `positions`, `is_finished` |
 
 Failures raise `workflow.WorkflowError` (`.kind`: unknown, finished, call,
-refused with `.status`). The [guide](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/workflows.md#python) covers
+refused with `.status`). The [guide](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/workflows.md#python) covers
 the semantics.
 
 ## From a clone
 
-The [examples](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples) build
+The [examples](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples) build
 against the SDK in the repository, with the same command
-(`examples/py-counter/build.sh`): [counter](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/py-counter),
-[chat room](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/py-chat-room),
-[jobs](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/py-jobs)
+(`examples/py-counter/build.sh`): [counter](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/py-counter),
+[chat room](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/py-chat-room),
+[jobs](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/py-jobs)
 (key-value, queues and workflow orders). The protocol code
 (`wasmkeep/wire.py`) imports no host bindings, so the SDK's unit tests run
 under plain CPython, without componentize-py:
@@ -231,7 +231,7 @@ sdks/python/test/run.sh          # python3 -m unittest discover -s test
 ```
 
 Python components are large (about 19 MB, CPython included) and slower than
-Rust: see [languages](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/languages.md).
+Rust: see [languages](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/languages.md).
 
 ## License
 

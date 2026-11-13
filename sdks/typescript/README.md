@@ -57,7 +57,7 @@ interface it binds to, `wasmkeep:actor@0.2.0`, is versioned on its own.
 WasmKeep is pre-alpha.
 
 In a clone of the repository, the
-[TypeScript examples](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/ts-counter)
+[TypeScript examples](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/ts-counter)
 depend on the SDK by path instead (`"@wasmkeep/sdk": "file:../../sdks/typescript"`,
 after `npm ci` in `sdks/typescript`).
 
@@ -70,7 +70,7 @@ after `npm ci` in `sdks/typescript`).
 | `storage.query(sql, ...params)` | rows as objects; integers beyond 2^53 come back as `bigint` |
 | `storage.deleteSelf()` | delete this actor when the event ends |
 | `alarms.set(at)`, `alarms.get()`, `alarms.clear()` | the actor's alarm (ms since epoch or a `Date`) |
-| `env.get(name)` | the class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/reference/api.md#interface-env)), or `undefined` |
+| `env.get(name)` | the class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/reference/api.md#interface-env)), or `undefined` |
 | `actors.self()` | this actor's address: `{ tenant, class, name }` |
 | `actors.call("class/name", { method, path, headers, body })` | call another actor, wherever it runs |
 | `sockets.send(conn, data)`, `sockets.broadcast(data, except?)`, `sockets.close(conn)`, `sockets.connections()` | WebSockets held by the host, open across hibernation |
@@ -79,7 +79,7 @@ after `npm ci` in `sdks/typescript`).
 | `new queue.Client("class/name")` | a Rust queue actor: `send`, `sendDelayed`, `sendBatch`, `lease`, `ack`, `retry`, `settle`, `stats`, `deadLetters` |
 | `queue.isDelivery(req)`, `queue.handleDelivery(req, handle)` | answer a queue's push delivery, one outcome per message |
 | `http.fetch(url, { method, headers, body, timeoutMs, limit })` | outbound HTTP, synchronously: `{ status, headers, body, text(), json() }`; throws `http.FetchError` when there is no response, or when its body breaks before its end (`incomplete body`; a body longer than `limit`, 16 MiB by default, is cut to it without an error). Works on both engines (QuickJS has no `fetch`, and StarlingMonkey's is asynchronous) |
-| `workflow.define(fn, config)`, `new workflow.Client(class)` | durable workflows: `wf.step`, `wf.sleep`, `wf.waitForEvent` ([guide](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/workflows.md#typescript)) |
+| `workflow.define(fn, config)`, `new workflow.Client(class)` | durable workflows: `wf.step`, `wf.sleep`, `wf.waitForEvent` ([guide](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/workflows.md#typescript)) |
 
 SQL errors throw `SqlError` (with `kind`), failed calls throw `CallError`.
 A `fetch` handler returns a string, bytes, or `{ status, headers, body }`;
@@ -88,10 +88,10 @@ an exception becomes a 500.
 ## Key-value and queues
 
 `kv` and `queue` are the clients of the Rust SDK's key-value and queue
-patterns ([guide](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/kv-and-queues.md#typescript),
-[ADR 0015](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/adr/0015-kv-and-queues-as-sdk-patterns.md)). Only
+patterns ([guide](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/kv-and-queues.md#typescript),
+[ADR 0015](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0015-kv-and-queues-as-sdk-patterns.md)). Only
 the client side is in TypeScript: the shard and queue classes are deployed
-as the Rust components from [`examples/jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/jobs)
+as the Rust components from [`examples/jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/jobs)
 (`examples/jobs/kv` as class `kv`, `examples/jobs/queue` as class `queue`,
 which a release carries already built as `kv.wasm` and `queue.wasm`, or a
 Rust queue class of your own for other settings). The protocol and
@@ -125,9 +125,9 @@ export default defineActor({
 
 Versions, ids and times are `number`s; failures throw `kv.KvError` or
 `queue.QueueError` with a `kind` (`conflict`, `key-too-long`, `call`,
-`refused`, ...). [`examples/ts-jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.2.0/examples/ts-jobs) runs against
+`refused`, ...). [`examples/ts-jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/ts-jobs) runs against
 the Rust classes; the differences from the Rust API are listed in the
-[guide](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/kv-and-queues.md#typescript).
+[guide](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/kv-and-queues.md#typescript).
 
 ## How it works
 
@@ -141,20 +141,20 @@ engines, pre-initialized with your bundle:
   APIs: no `URL`, `crypto`, `fetch`, timers or streams. The SDK supplies
   UTF-8 `TextEncoder`/`TextDecoder` and a `console` writing to stdout and
   stderr, as on the other engine; the node logs both
-  ([what actors print](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/monitoring.md#what-actors-print)).
+  ([what actors print](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/monitoring.md#what-actors-print)).
 - **StarlingMonkey**, with `--engine starlingmonkey`
   ([ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS)):
   those Web APIs, and faster on JavaScript-heavy code, for components of
   about 13 MB and about 4.6× the memory per resident actor. Its engine,
   SpiderMonkey, is MPL-2.0: a component built this way contains it, so
   distributing the component requires making SpiderMonkey's source
-  available ([legal](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/legal.md)).
+  available ([legal](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/legal.md)).
 
 Code that uses a global QuickJS lacks fails with an error that says to
 build with `--engine starlingmonkey`: at build time if module code uses
 it, otherwise from the handler that does. The first load of a component
 on a node compiles it (cached afterwards). See
-[TypeScript engines](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/docs/languages.md#typescript-on-quickjs) for the
+[TypeScript engines](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/languages.md#typescript-on-quickjs) for the
 measurements and the full list.
 
 ## Type-checking your actor
@@ -162,7 +162,7 @@ measurements and the full list.
 The package ships its TypeScript sources and the declarations of the host
 interfaces, with no compiled `.d.ts`: `tsc` checks the SDK's sources with
 your project's options. The options the SDK is written for are in
-[`examples/ts-counter/tsconfig.json`](https://github.com/WasmKeep/wasmkeep/blob/v0.2.0/examples/ts-counter/tsconfig.json):
+[`examples/ts-counter/tsconfig.json`](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/examples/ts-counter/tsconfig.json):
 `"moduleResolution": "Bundler"`, the `ES2022` and `ESNext.Disposable`
 libraries, and `"types": []`. Copy that file, add `typescript` to your
 devDependencies (the SDK is checked with 5.9.3), and run

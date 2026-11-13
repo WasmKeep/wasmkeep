@@ -190,7 +190,6 @@ mod tests {
             version: format!("v{}", n - 1),
             seq: u64::try_from(n).unwrap(),
             marked: false,
-            rooted: false,
         };
         put("apps/acme/shop/current".into(), current.format()).await;
         (store, app)

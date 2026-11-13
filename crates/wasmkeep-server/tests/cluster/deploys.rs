@@ -1,6 +1,7 @@
 //! Deploys, versions, access rules and apps as every node sees them.
 
 use super::*;
+use object_store::ObjectStoreExt as _;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn existing_access_checks_the_bucket_and_leaves_nothing_for_unknown_names() {
@@ -95,7 +96,7 @@ async fn existing_access_checks_the_bucket_and_leaves_nothing_for_unknown_names(
     assert_eq!((r.status, r.body.trim()), (200, "200:2"));
     // From outside, through either node, even posing as a node or an actor.
     for node in [a.addr, b.addr] {
-        let forged = "x-wasmkeep-internal: guess\r\nx-wasmkeep-caller: default/v/m1\r\nx-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n";
+        let forged = "x-wasmkeep-internal: guess\r\nx-wasmkeep-caller: default/v/m1\r\nx-wasmkeep-forwarded: 1\r\n";
         for extra in ["", forged] {
             let r = send(node, "GET", "/actor/u/x/durable", extra).await;
             assert_eq!(r.status, 403, "{extra:?}: {}", r.body);
@@ -105,10 +106,9 @@ async fn existing_access_checks_the_bucket_and_leaves_nothing_for_unknown_names(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn two_apps_of_one_tenant_on_one_prefix_run_side_by_side() {
-    // acme/shop and acme/admin on the same bucket prefix: each app's actor
-    // state has its own root (ADR 0022), so neither is refused; only a
-    // node of the version before the implicit app is.
+async fn two_apps_of_one_tenant_on_one_prefix_are_detected() {
+    // acme/shop and acme/admin on the same bucket prefix would share actor
+    // keys; `serve` refuses to start the second when this reports it.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let service = |id: &str, app: &str, dir: &Path| {
@@ -138,12 +138,16 @@ async fn two_apps_of_one_tenant_on_one_prefix_run_side_by_side() {
     shop.node_id_checked().await.unwrap();
     // Another node of the same app: fine.
     let shop2 = service("shop-2", "acme/shop", dirs.1.path());
-    assert_eq!(shop2.older_nodes().await.unwrap(), Vec::<String>::new());
+    assert_eq!(shop2.app_conflicts().await.unwrap(), Vec::<String>::new());
     drop(shop2);
-    // Another app of the tenant: fine too.
     let admin = service("admin-1", "acme/admin", dirs.1.path());
-    admin.node_id_checked().await.unwrap();
-    assert_eq!(admin.older_nodes().await.unwrap(), Vec::<String>::new());
+    // shop-2's heartbeat is still fresh: it may be listed too.
+    let mixed = admin.app_conflicts().await.unwrap();
+    assert!(
+        mixed.contains(&"shop-1 (acme/shop)".to_owned()),
+        "{mixed:?}"
+    );
+    assert!(mixed.iter().all(|m| m.contains("acme/shop")), "{mixed:?}");
     drop((shop, admin));
 }
 
@@ -467,9 +471,7 @@ async fn a_version_carries_its_access_rules_and_configuration() {
         }
     };
     let plain = app.deploy(&rt, classes()).await.unwrap();
-    // Every `current` of this version is rooted (token 3, ADR 0022), which
-    // marks the app (ADR 0013) from its first deploy.
-    assert!(plain.marked && plain.rooted);
+    assert!(!plain.marked, "nothing new: written as before ADR 0013");
     let mut rules = wasmkeep_server::AccessRules::default();
     rules.apply("c", "existing:main,room 1").unwrap();
     let config = BTreeMap::from([(
@@ -561,8 +563,7 @@ async fn a_version_carries_its_access_rules_and_configuration() {
         .unwrap();
     assert!(v3.marked);
     let raw = String::from_utf8(read("apps/default/shop/current".into()).await).unwrap();
-    // Token 3 (ADR 0022): marked and rooted.
-    assert_eq!(raw, format!("{} {} 3\n", v3.version, v3.seq));
+    assert_eq!(raw, format!("{} {} 2\n", v3.version, v3.seq));
 }
 
 /// ADR 0016: the names a class requires travel with its version, are kept
@@ -598,9 +599,9 @@ async fn required_names_travel_with_deploys() {
         "{:?}",
         v1.diff.lines()
     );
-    // Every deploy of this version marks the app (token 3 implies it, ADR
-    // 0022): its nodes take their rules from deploys.
-    assert!(v1.current.marked && v1.current.rooted);
+    // Required names alone do not mark the app (ADR 0013): nodes still on
+    // `--access` keep their rules.
+    assert!(!v1.newly_marked && !v1.current.marked);
     let read = |v: &str| {
         let (app, v) = (app.clone(), v.to_owned());
         async move { app.version(&v).await.unwrap().requires }
@@ -1088,6 +1089,8 @@ async fn new_apps_need_tenant_and_app_names_of_the_class_grammar() {
         .await
         .unwrap();
     assert_eq!(v2.current.seq, 2);
+    // Its own folder, however the bucket spells it, is not another app.
+    assert_eq!(v2.others, Vec::<String>::new());
     assert_eq!(old.rollback(false).await.unwrap().current.seq, 3);
 
     // The longest valid names are fine.
@@ -1099,30 +1102,120 @@ async fn new_apps_need_tenant_and_app_names_of_the_class_grammar() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn apps_of_one_tenant_on_one_prefix_all_deploy() {
-    // Each app's actor state has its own root (ADR 0022): a second and a
-    // third app of a tenant deploy next to the first, and every `current`
-    // is rooted (token 3).
+async fn a_second_app_of_a_tenant_on_a_prefix_is_refused_and_an_existing_pair_keeps_working() {
+    // Actors are keyed tenant/class/name: two apps of one tenant on one
+    // prefix would share them.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let rt = deploy_runtime();
     let code = || vec![("c".into(), counter_wasm().to_vec())];
-    for name in ["shop", "admin", "blog"] {
-        let d = AppRef::new(Arc::clone(&store), "", "acme", name)
-            .deploy_changes(&rt, changes(code()))
-            .await
-            .unwrap();
-        assert!(d.current.rooted && d.current.marked, "{name}");
+    let app = |prefix: &str, tenant: &str, name: &str| {
+        AppRef::new(Arc::clone(&store), prefix, tenant, name)
+    };
+    let first = app("", "acme", "shop")
+        .deploy_changes(&rt, changes(code()))
+        .await;
+    assert_eq!(first.unwrap().others, Vec::<String>::new());
+
+    // A second app of acme: refused, naming the first, what to do, and
+    // the keys to delete if it is abandoned. Nothing written.
+    let e = app("", "acme", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap_err()
+        .to_string();
+    for part in [
+        "acme/shop",
+        "another tenant",
+        "a bucket prefix other than",
+        "apps/acme/shop/",
+        "actors/acme/",
+    ] {
+        assert!(e.contains(part), "{part:?} missing from: {e}");
     }
-    let shop = AppRef::new(Arc::clone(&store), "", "acme", "shop");
-    let again = shop
+    assert_eq!(app("", "acme", "admin").current().await.unwrap(), None);
+    assert!(
+        !bucket_keys(&store)
+            .await
+            .iter()
+            .any(|k| k.starts_with("apps/acme/admin/")),
+        "nothing written for the refused app"
+    );
+
+    // Another tenant (even one whose name starts the same), and another
+    // prefix, are fine. The app itself redeploys.
+    app("", "acme-2", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    app("other", "acme", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    let again = app("", "acme", "shop")
         .deploy_changes(&rt, changes(vec![("c".into(), test_actor_wasm().to_vec())]))
         .await
         .unwrap();
-    assert_eq!(again.current.seq, 2);
-    let back = shop.rollback(false).await.unwrap();
-    assert!(back.current.rooted, "a rollback writes token 3 too");
-    let current = shop.current().await.unwrap().unwrap();
-    assert!(current.rooted);
+    assert_eq!((again.current.seq, again.others), (2, Vec::new()));
+
+    // Secrets set for an app never deployed do not make it an app.
+    store
+        .put(
+            &object_store::path::Path::from("apps/acme/draft/secrets/current"),
+            object_store::PutPayload::from_static(b"0000000000000001\n"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        app("", "acme", "shop").other_apps().await.unwrap(),
+        Vec::<String>::new()
+    );
+
+    // Two apps of acme deployed before this check: both keep deploying
+    // and rolling back, each told about the other.
+    copy_app(&store, "acme/shop", "acme/legacy").await;
+    let shop = app("", "acme", "shop").rollback(false).await.unwrap();
+    assert_eq!(shop.others, ["acme/legacy"]);
+    let legacy = app("", "acme", "legacy")
+        .deploy_changes(&rt, changes(code()))
+        .await
+        .unwrap();
+    assert_eq!(legacy.others, ["acme/shop"]);
+    // A third is refused, naming both.
+    let e = app("", "acme", "blog")
+        .deploy(&rt, code())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("acme/legacy") && e.contains("acme/shop"), "{e}");
+
+    // An abandoned app removed as the error says: the name is free.
+    for key in bucket_keys(&store).await {
+        if key.starts_with("apps/acme/legacy/") || key.starts_with("apps/acme/shop/") {
+            store
+                .delete(&object_store::path::Path::from(key.as_str()))
+                .await
+                .unwrap();
+        }
+    }
+    app("", "acme", "blog").deploy(&rt, code()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_second_app_check_names_the_keys_under_the_bucket_prefix() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = deploy_runtime();
+    let code = || vec![("c".into(), counter_wasm().to_vec())];
+    AppRef::new(Arc::clone(&store), "team/prod", "acme", "shop")
+        .deploy(&rt, code())
+        .await
+        .unwrap();
+    let e = AppRef::new(Arc::clone(&store), "team/prod/", "acme", "admin")
+        .deploy(&rt, code())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("team/prod/apps/acme/shop/"), "{e}");
+    assert!(e.contains("team/prod/actors/acme/"), "{e}");
 }
 
 fn changes(classes: Vec<(String, Vec<u8>)>) -> wasmkeep_server::apps::Changes {

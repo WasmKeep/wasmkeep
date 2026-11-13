@@ -331,8 +331,7 @@ jobs:
           cargo test -p wasmkeep-sim --locked --target-dir target/madsim
           --lib --test madsim_admission --test madsim_alarm_index
           --test madsim_alarm_sweep --test madsim_drain
-          --test madsim_migrate --test madsim_node_lease
-          --test madsim_replication --test madsim_two_apps
+          --test madsim_node_lease --test madsim_replication
 
   s3:
     # MinIO no longer publishes container images, so this runs against

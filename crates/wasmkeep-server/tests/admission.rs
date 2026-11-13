@@ -128,7 +128,7 @@ async fn zero_resident_capacity_returns_retryable_503_without_creating_a_databas
     assert!(
         !data
             .path()
-            .join("state/default/default/actors/counter/rejected.db")
+            .join("actors/default/counter/rejected.db")
             .exists(),
         "a rejected admission created an actor database"
     );
@@ -207,7 +207,7 @@ async fn zero_resident_capacity_refuses_websocket_upgrade_before_switching_proto
     assert!(
         !data
             .path()
-            .join("state/default/default/actors/counter/rejected.db")
+            .join("actors/default/counter/rejected.db")
             .exists()
     );
 }

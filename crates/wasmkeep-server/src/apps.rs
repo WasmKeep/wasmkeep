@@ -44,10 +44,6 @@ pub enum DeployError {
     /// Someone else changed `current` at the same moment; nothing changed.
     #[error("another deploy changed the app at the same time; retry")]
     Conflict,
-    /// The bucket prefix is being migrated, or holds the tenant's actor
-    /// state in the layout before 0.4.0 (ADR 0022): run `cluster migrate`.
-    #[error("{0}")]
-    Layout(String),
     /// Nothing is deployed yet, or there is nothing to roll back to.
     #[error("{0}")]
     Nothing(&'static str),
@@ -68,6 +64,69 @@ pub enum DeployError {
         /// The name given.
         name: String,
     },
+    /// Another app of the tenant is deployed on this bucket prefix: a new
+    /// one would share its actors (keyed tenant/class/name).
+    #[error("{}", other_apps_message(.app, .others, .prefix))]
+    OtherApp {
+        /// The app refused, `tenant/app`.
+        app: String,
+        /// The tenant's apps already there, `tenant/app`.
+        others: Vec<String>,
+        /// The bucket key prefix, empty or ending in `/`.
+        prefix: String,
+    },
+}
+
+/// What [`DeployError::OtherApp`] says: what is wrong, what to do, and the
+/// keys an abandoned app leaves.
+fn other_apps_message(app: &str, others: &[String], prefix: &str) -> String {
+    let (tenant, name) = app.split_once('/').unwrap_or((app, ""));
+    let folder = |o: &String| format!("{prefix}apps/{o}/");
+    let here = if prefix.is_empty() {
+        "the bucket root".to_owned()
+    } else {
+        prefix.to_owned()
+    };
+    let (listed, its, free) = match others {
+        [one] => (
+            format!("{one} is"),
+            "its",
+            format!(
+                "If {one} is abandoned, stop its nodes and delete {f}current: that alone frees \
+                 the tenant and keeps its versions and secrets; to remove the app, delete every \
+                 key under {f}.",
+                f = folder(one)
+            ),
+        ),
+        _ => (
+            format!("{} are", others.join(" and ")),
+            "their",
+            format!(
+                "The new app is refused while any of them has a current, so this frees the \
+                 tenant only if every one of them is abandoned: stop their nodes and delete \
+                 each one's current ({}), which keeps their versions and secrets; to remove \
+                 them, delete every key under each folder ({}).",
+                others
+                    .iter()
+                    .map(|o| format!("{}current", folder(o)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                others.iter().map(folder).collect::<Vec<_>>().join(", ")
+            ),
+        ),
+    };
+    format!(
+        "{listed} already deployed on this bucket prefix: another app of tenant {tenant} \
+         would share {its} actors, which are keyed by tenant, class and name, until each \
+         app owns its state (planned for 0.4.0). Deploy {app} on a bucket prefix other than \
+         {here} (--bucket s3://BUCKET/OTHER), or under another tenant if another owner runs \
+         it (--app OTHER/{name}); either way it starts with no data and no secrets. Another \
+         prefix is a separate cluster, and an app cannot move between prefixes later (its \
+         secrets are sealed to its prefix). {free} Actors' data stays under \
+         {prefix}actors/{tenant}/, {prefix}owners/{tenant}/, {prefix}leases/{tenant}/ and \
+         {prefix}alarms/{tenant}/: a new app of {tenant} with a class of the same name finds \
+         those actors"
+    )
 }
 
 fn bucket(e: impl std::fmt::Display) -> DeployError {
@@ -109,9 +168,8 @@ impl AppRef {
     }
 
     /// What a first deploy checks before it creates the app: the names'
-    /// grammar (apps that exist keep theirs). Other apps of the tenant on
-    /// the prefix are fine: each app's actors live under its own state
-    /// root (ADR 0022).
+    /// grammar (apps that exist keep theirs), and that no other app of the
+    /// tenant is deployed on the prefix (a listing that fails refuses).
     async fn check_new(&self) -> Result<(), DeployError> {
         for (what, name) in [("tenant", &self.tenant), ("app", &self.app)] {
             if !wasmkeep_runtime::is_identifier(name) {
@@ -121,24 +179,55 @@ impl AppRef {
                 });
             }
         }
+        let others = self.other_apps().await?;
+        if !others.is_empty() {
+            return Err(DeployError::OtherApp {
+                app: format!("{}/{}", self.tenant, self.app),
+                others,
+                prefix: self.prefix.clone(),
+            });
+        }
         Ok(())
     }
 
-    /// What a deploy checks before it writes (ADR 0022): no migration in
-    /// progress, and the tenant's actor state not left in the layout
-    /// before 0.4.0 (a `current` written now is rooted, token 3).
-    async fn check_layout(&self) -> Result<(), DeployError> {
-        let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
-            Arc::clone(&self.store),
-            self.prefix.clone(),
-        );
-        wasmkeep_cluster::migrate::start_check(&keys, &self.tenant)
+    /// The other apps of this app's tenant deployed on the same bucket
+    /// prefix (`tenant/app`, sorted): each folder of `apps/<tenant>/` with
+    /// a `current`. Until apps own their state they share this one's
+    /// actors.
+    pub async fn other_apps(&self) -> Result<Vec<String>, DeployError> {
+        let folder = StorePath::from(format!("{}apps/{}", self.prefix, self.tenant));
+        let listed = self
+            .store
+            .list_with_delimiter(Some(&folder))
             .await
-            .map(drop)
-            .map_err(|e| match e {
-                wasmkeep_cluster::migrate::StartRefusal::Bucket(e) => bucket(e),
-                e => DeployError::Layout(e.to_string()),
-            })
+            .map_err(bucket)?;
+        // Listed as the bucket spells it (some characters escaped).
+        let me = object_store::path::PathPart::from(self.app.as_str());
+        let mut others = Vec::new();
+        for app in listed.common_prefixes {
+            let Some(name) = app.filename().map(str::to_owned) else {
+                continue;
+            };
+            if name == me.as_ref() {
+                continue;
+            }
+            match self.store.head(&app.clone().join("current")).await {
+                Ok(_) => others.push(format!("{}/{name}", self.tenant)),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(bucket(e)),
+            }
+        }
+        others.sort();
+        Ok(others)
+    }
+
+    /// [`Self::other_apps`] for a warning: a listing that fails is logged
+    /// and reads as none.
+    async fn other_apps_or_none(&self) -> Vec<String> {
+        self.other_apps().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not list the tenant's other apps");
+            Vec::new()
+        })
     }
 
     fn path(&self, key: &str) -> StorePath {
@@ -207,14 +296,10 @@ impl AppRef {
             mode,
             ..PutOptions::default()
         };
-        // Every `current` this version writes is rooted (ADR 0022), which
-        // implies marked.
-        debug_assert!(marked, "a rooted current is marked");
         let body = Current {
             version: version.to_owned(),
             seq,
-            marked: true,
-            rooted: true,
+            marked,
         }
         .format();
         let body = PutPayload::from(body.into_bytes());
@@ -360,7 +445,6 @@ impl AppRef {
         changes: Changes,
         exact: Option<Settings>,
     ) -> Result<Deployed, DeployError> {
-        self.check_layout().await?;
         if let Some(classes) = &changes.classes {
             let mut compiled = Vec::new();
             for (name, bytes) in classes {
@@ -374,9 +458,13 @@ impl AppRef {
         }
 
         let read = self.read_current().await?;
-        if read.is_none() {
-            self.check_new().await?;
-        }
+        let others = match &read {
+            None => {
+                self.check_new().await?;
+                Vec::new()
+            }
+            Some(_) => self.other_apps_or_none().await,
+        };
         let base = match &read {
             Some((current, _)) => {
                 let manifest = self.manifest(&current.version).await?;
@@ -536,16 +624,16 @@ impl AppRef {
                     current: current.clone(),
                     diff,
                     newly_marked: false,
+                    others,
                 });
             }
             manifest.previous = Some(current.version.clone());
         }
         let version = manifest.version_id();
         let was_marked = read.as_ref().is_some_and(|(c, _)| c.marked);
-        // Every deploy of this version writes token 3 (ADR 0022), which
-        // marks the app (ADR 0013): its nodes take their rules from
-        // deploys, and refuse `--access`.
-        let marked = true;
+        // Rules or configuration mark the app (ADR 0013); required names
+        // alone do not: nodes still on `--access` keep their rules.
+        let marked = was_marked || manifest.marks();
         for (key, bytes) in uploads {
             self.put_once(&format!("{version}/{key}"), bytes).await?;
         }
@@ -583,10 +671,10 @@ impl AppRef {
                 version,
                 seq,
                 marked,
-                rooted: true,
             },
             diff,
             newly_marked: marked && !was_marked,
+            others,
         })
     }
 
@@ -594,7 +682,6 @@ impl AppRef {
     /// a new, higher `seq`, and its rules and configuration. Refused if that
     /// makes a class more open, unless `allow_reopen` (ADR 0013).
     pub async fn rollback(&self, allow_reopen: bool) -> Result<Deployed, DeployError> {
-        self.check_layout().await?;
         let (current, read) = self
             .read_current()
             .await?
@@ -613,20 +700,20 @@ impl AppRef {
         if !allow_reopen && !diff.reopened.is_empty() {
             return Err(DeployError::Reopens(diff.reopened.join(", ")));
         }
-        // Rooted, so marked (ADR 0022).
-        let marked = true;
+        let marked = current.marked || back.marks();
         let seq = current.seq + 1;
         self.swap_current(Some(read), &previous, seq, marked)
             .await?;
+        let others = self.other_apps_or_none().await;
         Ok(Deployed {
             current: Current {
                 version: previous,
                 seq,
                 marked,
-                rooted: true,
             },
             diff,
             newly_marked: marked && !current.marked,
+            others,
         })
     }
 
@@ -708,10 +795,6 @@ impl AppRef {
     }
 }
 
-/// The third token of `current` once the app's state is under its root
-/// (ADR 0022); `wasmkeep_cluster::migrate` writes it too.
-pub const ROOTED_TOKEN: &str = wasmkeep_cluster::migrate::ROOTED_TOKEN;
-
 /// What `current` points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Current {
@@ -723,18 +806,12 @@ pub struct Current {
     /// (ADR 0013): written as a third field, which tools and nodes from
     /// before refuse, and kept by every later deploy and rollback.
     pub marked: bool,
-    /// The app's actor state lives under its own root (ADR 0022): token
-    /// `3`, which implies `marked` and which versions before 0.4.0 cannot
-    /// read, so their `serve --app` and `deploy` stop. Written by every
-    /// deploy and rollback of this version, and by `cluster migrate`.
-    pub rooted: bool,
 }
 
 impl Current {
     /// Reads the body of `apps/<tenant>/<app>/current`:
-    /// `"<version> <seq>"`, `"<version> <seq> 2"` once marked, or
-    /// `"<version> <seq> 3"` once rooted (and so marked). `None` if it is
-    /// anything else.
+    /// `"<version> <seq>"`, or `"<version> <seq> 2"` once marked. `None` if
+    /// it is anything else.
     pub fn parse(body: &[u8]) -> Option<Self> {
         let text = String::from_utf8_lossy(body);
         let mut parts = text.split_whitespace();
@@ -746,31 +823,25 @@ impl Current {
         ) else {
             return None;
         };
-        let (marked, rooted) = match marked {
-            None => (false, false),
-            Some("2") => (true, false),
-            Some(ROOTED_TOKEN) => (true, true),
+        let marked = match marked {
+            None => false,
+            Some("2") => true,
             Some(_) => return None,
         };
         Some(Self {
             version: version.to_owned(),
             seq,
             marked,
-            rooted,
         })
     }
 
-    /// The stored form.
-    pub fn format(&self) -> String {
+    fn format(&self) -> String {
         let Self {
             version,
             seq,
             marked,
-            rooted,
         } = self;
-        if *rooted {
-            format!("{version} {seq} {ROOTED_TOKEN}\n")
-        } else if *marked {
+        if *marked {
             format!("{version} {seq} 2\n")
         } else {
             format!("{version} {seq}\n")
@@ -834,6 +905,10 @@ pub struct Deployed {
     /// This change set the marker: nodes take their rules from deploys
     /// from now on, and ignore `--access`.
     pub newly_marked: bool,
+    /// Other apps of the tenant deployed on the same prefix, which share
+    /// this app's actors: possible only for apps deployed before the
+    /// check that refuses a second one (see [`AppRef::other_apps`]).
+    pub others: Vec<String>,
 }
 
 /// What changes between two versions: classes, rules, and the names (never
@@ -1101,6 +1176,13 @@ impl Manifest {
         }
     }
 
+    /// Whether this version brings access rules or configuration: the
+    /// first such version marks the app (ADR 0013). Required names make it
+    /// format 2 (older nodes refuse it) but do not mark it.
+    fn marks(&self) -> bool {
+        !self.access.is_empty() || !self.config.is_empty()
+    }
+
     fn format(&self) -> String {
         let mut out = format!("wasmkeep-manifest {}\n", self.format_number());
         if let Some(p) = &self.previous {
@@ -1179,6 +1261,25 @@ mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
     use super::*;
+
+    #[test]
+    fn the_second_app_error_says_every_other_app_must_go_and_keeps_the_prefix() {
+        let two = vec!["acme/legacy".to_owned(), "acme/shop".to_owned()];
+        let e = other_apps_message("acme/blog", &two, "team/prod/");
+        // Deleting one of two still leaves the other: both must go.
+        assert!(e.contains("every one of them"), "{e}");
+        assert!(!e.contains("If one is abandoned"), "{e}");
+        assert!(e.contains("team/prod/apps/acme/legacy/current"), "{e}");
+        assert!(e.contains("team/prod/apps/acme/shop/current"), "{e}");
+        // The other-prefix hint names a prefix other than the one in use.
+        assert!(e.contains("other than team/prod/"), "{e}");
+        assert!(e.contains("sealed to its prefix"), "{e}");
+        let one = other_apps_message("acme/blog", &two[..1], "");
+        assert!(e.contains("acme/legacy and acme/shop are"), "{e}");
+        assert!(one.contains("If acme/legacy is abandoned"), "{one}");
+        assert!(one.contains("apps/acme/legacy/current"), "{one}");
+        assert!(one.contains("other than the bucket root"), "{one}");
+    }
 
     fn two_classes() -> Manifest {
         Manifest {
@@ -1271,23 +1372,11 @@ mod tests {
         let marked = Current::parse(b"abc 8 2\n").unwrap();
         assert!(marked.marked);
         assert_eq!(marked.format(), "abc 8 2\n");
-        assert!(!marked.rooted && !plain.rooted);
-        // Token 3 (ADR 0022): marked, and the app's state under its root.
-        let rooted = Current::parse(b"abc 9 3\n").unwrap();
-        assert!(rooted.marked && rooted.rooted);
-        assert_eq!(rooted.format(), "abc 9 3\n");
-        assert_eq!(Current::parse(b"abc 8 4"), None);
+        assert_eq!(Current::parse(b"abc 8 3"), None);
         assert_eq!(Current::parse(b"abc 8 2 x"), None);
-        assert_eq!(Current::parse(b"abc 8 3 x"), None);
         // What `current` was read with before ADR 0013: exactly two fields.
         let old = |t: &str| t.split_whitespace().count() == 2;
         assert!(old(&plain.format()) && !old(&marked.format()));
-        // And before 0.4.0: two fields, or a third that is `2` only.
-        let before_0_4 = |t: &str| {
-            let parts: Vec<&str> = t.split_whitespace().collect();
-            parts.len() == 2 || (parts.len() == 3 && parts[2] == "2")
-        };
-        assert!(before_0_4(&marked.format()) && !before_0_4(&rooted.format()));
     }
 
     #[test]
