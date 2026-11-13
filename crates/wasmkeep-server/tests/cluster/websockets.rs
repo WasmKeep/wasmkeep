@@ -262,10 +262,10 @@ async fn stays_open(ws: &mut Client, for_: Duration) {
     }
 }
 
-/// The node `owners/default/chat/<name>` names, if any.
+/// The node the ownership record of `chat/<name>` names, if any.
 async fn chat_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String> {
     use object_store::ObjectStoreExt as _;
-    let key = object_store::path::Path::from(format!("owners/default/chat/{name}"));
+    let key = object_store::path::Path::from(test_key(Family::Owners, &format!("chat/{name}")));
     let body = match store.get(&key).await {
         Ok(r) => String::from_utf8(r.bytes().await.unwrap().to_vec()).unwrap(),
         Err(object_store::Error::NotFound { .. }) => return None,

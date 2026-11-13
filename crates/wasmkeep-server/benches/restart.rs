@@ -49,7 +49,7 @@ fn config(data: &std::path::Path) -> ActorConfig {
 fn set_alarms(data: &std::path::Path, n: usize, at: u64) {
     let storage = Storage::new(
         StorageConfig::new(data),
-        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default", "default")),
     );
     std::thread::scope(|s| {
         let threads = 16;
@@ -110,7 +110,7 @@ fn benches(c: &mut Criterion) {
             created = n;
             node.stop_and_drain();
         }
-        let files = std::fs::read_dir(data.join("actors/default/t"))
+        let files = std::fs::read_dir(data.join("state/default/default/actors/t"))
             .unwrap()
             .filter(|e| {
                 e.as_ref()
@@ -121,7 +121,7 @@ fn benches(c: &mut Criterion) {
             })
             .count();
         assert_eq!(files, n, "databases on disk");
-        let bytes: u64 = std::fs::read_dir(data.join("actors/default/t"))
+        let bytes: u64 = std::fs::read_dir(data.join("state/default/default/actors/t"))
             .unwrap()
             .map(|e| e.unwrap().metadata().unwrap().len())
             .sum();
@@ -133,7 +133,7 @@ fn benches(c: &mut Criterion) {
 
         let storage = Storage::new(
             StorageConfig::new(data),
-            wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+            wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default", "default")),
         );
         let pending = storage.pending_alarms().unwrap();
         assert_eq!(pending.found.len(), n, "alarms found");

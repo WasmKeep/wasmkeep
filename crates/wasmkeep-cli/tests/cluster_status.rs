@@ -225,7 +225,9 @@ fn drain_and_move_requests_reach_the_bucket() {
         let mut args = vec![
             "actor",
             "move",
-            "acme/room/lobby/1",
+            "--app",
+            "acme/shop",
+            "room/lobby/1",
             "--to",
             target,
             "--bucket",
@@ -275,13 +277,16 @@ fn drain_and_move_requests_reach_the_bucket() {
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "{err}");
     assert!(!err.contains("warning"), "{err}");
-    let read = rt.block_on(control::read(&keys, now_ms())).unwrap();
+    let shop = wasmkeep_cluster::state_root::StateRoot::new("", "acme", "shop");
+    let read = rt
+        .block_on(control::read(&keys, Some(&shop), now_ms()))
+        .unwrap();
     assert_eq!(read.draining.iter().collect::<Vec<_>>(), ["node-b"]);
     assert_eq!(read.moves.len(), 1);
     let mv = &read.moves[0];
     assert_eq!(
-        (&*mv.tenant, &*mv.class, &*mv.name, &*mv.target),
-        ("acme", "room", "lobby/1", "node-c")
+        (&*mv.tenant, &*mv.app, &*mv.class, &*mv.name, &*mv.target),
+        ("acme", "shop", "room", "lobby/1", "node-c")
     );
     // Written by the bucket's clock, within the last minute.
     assert!(now_ms().abs_diff(mv.written_at_ms) < 60_000);
@@ -289,7 +294,7 @@ fn drain_and_move_requests_reach_the_bucket() {
     ok(wasmkeep(&[
         "cluster", "undrain", "node-b", "--bucket", &url,
     ]));
-    let read = rt.block_on(control::read(&keys, now_ms())).unwrap();
+    let read = rt.block_on(control::read(&keys, None, now_ms())).unwrap();
     assert!(read.draining.is_empty());
 
     // Leave the bucket as it was.
@@ -326,7 +331,9 @@ fn bad_drain_and_move_requests_are_refused_before_the_bucket() {
     let out = wasmkeep(&[
         "actor",
         "move",
-        "ac me/room/x",
+        "--app",
+        "ac me/shop",
+        "room/x",
         "--to",
         "c",
         "--bucket",

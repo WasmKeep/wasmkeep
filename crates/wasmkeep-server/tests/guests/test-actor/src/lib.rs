@@ -25,6 +25,7 @@
 //! - `POST /durable-commit`: BEGIN, adds 1 to `durable` with `exec`, then
 //!   `exec-durable("COMMIT")`; answers the new value (503 with the error)
 //! - `POST /caller`: the `x-wasmkeep-caller` header, or `none`
+//! - `GET /header?name=N`: the request's header N, or `none`
 //! - WebSockets: accepted (refused with "go away" when the path contains
 //!   `refuse`); text is echoed; `POST /ws-closed` counts close callbacks
 //! - `POST /broadcast?text=T`: sends T to every connection it sees
@@ -348,6 +349,14 @@ impl http::Guest for TestActor {
                 .get("x-wasmkeep-caller")
                 .first()
                 .map_or("none".to_owned(), |v| String::from_utf8_lossy(v).into_owned()),
+            (Method::Get, "/header") => {
+                let name = query_param(&full, "name").unwrap_or_default();
+                request
+                    .headers()
+                    .get(&name)
+                    .first()
+                    .map_or("none".to_owned(), |v| String::from_utf8_lossy(v).into_owned())
+            }
             (Method::Get, "/fetch") => {
                 let url = query_param(&full, "url").map(|u| percent_decode(&u)).unwrap_or_default();
                 let send: usize = query_param(&full, "send").and_then(|n| n.parse().ok()).unwrap_or(0);

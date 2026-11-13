@@ -40,7 +40,7 @@ async fn send(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
 fn recorded_seq(data: &std::path::Path, name: &str) -> Option<String> {
     let storage = wasmkeep_storage::Storage::new(
         wasmkeep_storage::StorageConfig::new(data),
-        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default", "default")),
     );
     storage.open("c", name).unwrap().meta("deploy_seq").unwrap()
 }

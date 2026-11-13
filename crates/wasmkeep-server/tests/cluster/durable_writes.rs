@@ -224,7 +224,7 @@ async fn acknowledged_durable_writes_survive_losing(lost: Lost) {
     let a = start(&seen_by_old).await;
     settle().await;
 
-    let db = da.path().join("actors/default/t/x.db");
+    let db = da.path().join(test_dir("t").join("x.db"));
     let beside = |suffix: &str| {
         let mut p = db.clone().into_os_string();
         p.push(suffix);
@@ -421,13 +421,13 @@ async fn a_database_restored_under_the_alarm_scan_keeps_replicating() {
     stop_listening(a).await;
     // As after a crash, the local file is not known to be current (here:
     // no sidecar), so the next owner restores it from the bucket.
-    let wal = da.path().join("actors/default/t/x.db-wal");
+    let wal = da.path().join(test_dir("t").join("x.db-wal"));
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while wal.exists() {
         assert!(std::time::Instant::now() < deadline, "still open");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    std::fs::remove_file(da.path().join("actors/default/t/x.db.replica")).unwrap();
+    std::fs::remove_file(da.path().join(test_dir("t").join("x.db.replica"))).unwrap();
 
     // The restarted node's scan holds x's database open for a while.
     wasmkeep_storage::faults::delay_next("alarm_scan", Duration::from_millis(2_500));
@@ -447,7 +447,7 @@ async fn a_database_restored_under_the_alarm_scan_keeps_replicating() {
         "the restore ran while the scan had the database open"
     );
     assert!(
-        da.path().join("actors/default/t/x.db.replaced").exists(),
+        da.path().join(test_dir("t").join("x.db.replaced")).exists(),
         "the database was replaced from the bucket"
     );
     while wasmkeep_storage::faults::held("alarm_scan") {

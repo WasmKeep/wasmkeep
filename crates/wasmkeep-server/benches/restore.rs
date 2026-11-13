@@ -55,7 +55,7 @@ const SIZES: [u64; 4] = [10, 100, 1_000, 10_000];
 
 /// Where the counter `name`'s objects live in the bucket.
 fn prefix(name: &str) -> String {
-    format!("actors/default/counter/{name}")
+    format!("state/default/default/actors/counter/{name}")
 }
 
 /// Keep-alive HTTP/1.1 client over a blocking socket.
