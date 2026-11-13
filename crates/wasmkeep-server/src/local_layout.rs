@@ -78,8 +78,7 @@ pub(crate) fn prepare(data_dir: &Path, root: &StateRoot, put_aside: bool) -> Res
                 return refuse(format!(
                     "both {} (databases of a version before 0.4.0) and {} exist: they are \
                      never merged. Keep the one to serve, move the other out of the data \
-                     directory, and start again (docs/deploy/backup-and-restore.md, Migrating to \
-                     0.4.0)",
+                     directory, and start again (docs/deploy/upgrading-to-0.4.md)",
                     old.display(),
                     taken.display()
                 ));
