@@ -29,6 +29,8 @@ mod guests;
 // The tests, by theme; this file keeps what they share.
 #[path = "alarms.rs"]
 mod alarms;
+#[path = "apps.rs"]
+mod apps;
 #[path = "bucket.rs"]
 mod bucket;
 #[path = "deploys.rs"]

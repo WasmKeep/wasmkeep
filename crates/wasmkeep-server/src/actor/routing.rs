@@ -221,10 +221,11 @@ pub(super) fn build_request(
         if HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h)) {
             continue;
         }
-        // Only the host hands alarms off or asks a node to take an actor
-        // (ADR 0014, ADR 0017).
+        // Only the host hands alarms off, asks a node to take an actor, or
+        // names the app between nodes (ADR 0014, ADR 0017, ADR 0022).
         if name.eq_ignore_ascii_case(crate::cluster::ALARM_HANDOFF)
             || name.eq_ignore_ascii_case(crate::cluster::TAKE)
+            || name.eq_ignore_ascii_case(crate::cluster::APP)
         {
             continue;
         }

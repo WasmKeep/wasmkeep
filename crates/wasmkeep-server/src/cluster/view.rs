@@ -298,11 +298,7 @@ impl Cluster {
                 if !mixed.is_empty() && now.saturating_sub(logged) >= period {
                     self.conflict_logged_ms
                         .store(now, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!(
-                        serves = %self.serves,
-                        others = %mixed.join(", "),
-                        "another app of this tenant runs on the same bucket prefix: they share actor keys; deploy one on another --bucket prefix, or under another tenant if another owner runs it"
-                    );
+                    tracing::error!(serves = %self.serves, "{}", conflict_advice(&mixed));
                 }
                 if let Some(tls) = &self.tls
                     && tls.refresh(&nodes, self.heartbeat_horizon_ms)
@@ -567,17 +563,48 @@ impl Cluster {
     }
 }
 
-/// Live nodes serving the same tenant as `serves` but another app (or
-/// command-line classes): `node (app)` each. Their actors would share keys
-/// in the bucket. Nodes that predate the app line are not judged.
+/// Live nodes serving the same tenant as `serves` but another app: `node
+/// (app)` each. Their actors would share keys in the bucket. Nodes that
+/// predate the app line are not judged; a node of the version before the
+/// implicit app (ADR 0022) names its tenant alone (`tenant/`), and is
+/// listed as an older version.
 pub(crate) fn conflicts(me: &str, serves: &str, nodes: &[NodeInfo]) -> Vec<String> {
     let tenant = |app: &str| app.split('/').next().unwrap_or_default().to_owned();
     nodes
         .iter()
         .filter(|n| n.id != me && !n.app.is_empty())
         .filter(|n| tenant(&n.app) == tenant(serves) && n.app != serves)
-        .map(|n| format!("{} ({})", n.id, n.app))
+        .map(|n| {
+            if n.app.ends_with('/') {
+                format!("{} ({}{OLDER}", n.id, n.app)
+            } else {
+                format!("{} ({})", n.id, n.app)
+            }
+        })
         .collect()
+}
+
+/// How [`conflicts`] marks a node of the version before the implicit app.
+const OLDER: &str = ", an older version)";
+
+/// What an operator reads about `mixed` ([`conflicts`]): when every entry
+/// is a node of the version before the implicit app (ADR 0022), WasmKeep
+/// itself was upgraded without stopping every node, and the advice is to
+/// do so; otherwise two apps of one tenant share a bucket prefix.
+pub fn conflict_advice(mixed: &[String]) -> String {
+    if !mixed.is_empty() && mixed.iter().all(|m| m.ends_with(OLDER)) {
+        return format!(
+            "a node of an earlier WasmKeep version is live on this bucket prefix ({}): stop \
+             every node and upgrade them together (docs/cluster.md, Upgrading WasmKeep)",
+            mixed.join(", ")
+        );
+    }
+    format!(
+        "another app of this tenant already runs on this bucket prefix ({}): their actors \
+         would share data. Deploy one on another --bucket prefix, or under another tenant if \
+         another owner runs it (docs/cluster.md, Deploying)",
+        mixed.join(", ")
+    )
 }
 
 impl Cluster {

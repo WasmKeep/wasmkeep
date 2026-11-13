@@ -225,7 +225,9 @@ fn drain_and_move_requests_reach_the_bucket() {
         let mut args = vec![
             "actor",
             "move",
-            "acme/room/lobby/1",
+            "--app",
+            "acme/shop",
+            "room/lobby/1",
             "--to",
             target,
             "--bucket",
@@ -326,7 +328,9 @@ fn bad_drain_and_move_requests_are_refused_before_the_bucket() {
     let out = wasmkeep(&[
         "actor",
         "move",
-        "ac me/room/x",
+        "--app",
+        "ac me/shop",
+        "room/x",
         "--to",
         "c",
         "--bucket",
