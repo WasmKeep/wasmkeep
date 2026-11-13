@@ -205,9 +205,14 @@ async fn a_signed_call_whose_body_was_changed_is_refused() {
     let path = "/actor/u/x/durable";
     let signed_with = |body: &[u8], ts: u128, nonce: &str| {
         let hash = sha256_hex(body);
-        let msg = format!("wasmkeep-call v4\n{ts}\n{nonce}\na\nPOST\n{path}\n{hash}\n");
+        let msg = format!(
+            "wasmkeep-call v4\n{ts}\n{nonce}\na\nPOST\n{path}\n{hash}\nx-wasmkeep-app:default/default\n"
+        );
         let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
-        format!("x-wasmkeep-internal: v4 {ts} {nonce} {hash} {mac}\r\nx-wasmkeep-forwarded: 1\r\n")
+        format!(
+            "x-wasmkeep-internal: v4 {ts} {nonce} {hash} {mac}\r\nx-wasmkeep-forwarded: 1\r\n\
+             x-wasmkeep-app: default/default\r\n"
+        )
     };
     let signed = |body: &[u8], ts: u128| signed_with(body, ts, &format!("{ts:x}"));
     let post = |headers: String, body: &'static str| async move {
