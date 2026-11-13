@@ -11,7 +11,7 @@ The text under a version's heading is its GitHub release text
 
 Since 0.3.0, in no release yet.
 
-## 0.3.0 — 2026-11-13
+## 0.3.0
 
 **Reliable enough to leave running.** This release fixes the known ways
 a cluster stalled or lost an answer when a node or the bucket misbehaved,
@@ -22,6 +22,13 @@ side projects and staging, not production. The interface between an actor
 and the host is unchanged (`wasmkeep:actor@0.2.0`), and so are the SDKs'
 APIs: a component built for 0.1.0 or 0.2.0 runs as it is. See the
 [roadmap](ROADMAP.md) for what comes next.
+
+Soaked on three nodes against a real bucket, a node killed every three
+minutes: twelve hours on a release candidate (239 kills, failover p99
+22.43 s, no acknowledged write lost or duplicated, no alarm missed;
+`bench/results/2026-11-12-b849bfe-soak-ovh-bhs-3vps-12h.csv`), then three
+hours on this release's code (59 kills, failover p99 20.9 s, the same
+result; `bench/results/2026-11-13-648c2d1-soak-ovh-bhs-3vps-3h.csv`).
 
 ### What changed
 
