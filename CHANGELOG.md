@@ -11,11 +11,32 @@ The text under a version's heading is its GitHub release text
 
 Since 0.3.0, in no release yet.
 
+### What changed
+
+- **Every hop between nodes names its app, and a node refuses another
+  app's.** A forwarded request, a relayed WebSocket upgrade and a call
+  between nodes carry `x-wasmkeep-app: tenant/app`, the sending node's
+  app, covered by the signature on signed calls. A node answers a hop for
+  an app it does not serve with 503, `Retry-After: 1`, "not this app's
+  node", before reading its body, and the actor does not run. A client's
+  header is never believed or passed on: it is removed from what clients
+  send to actors and from what guests send, and never reaches an actor. `serve` without `--app` (classes given on
+  the command line) runs as the implicit app `default/default`, and says
+  so in its heartbeat (it said `default/` before); its keys are unchanged
+  ([ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md)).
+  Nodes of earlier versions send no app: see Upgrading below.
+- **`actor move` names the actor's app**: `wasmkeep actor move --app
+  acme/shop room/lobby --to node-c`. Without `--app`, the actor is written
+  `default/CLASS/NAME`, of the implicit app; another tenant in front
+  (`acme/room/lobby`) is refused with a message asking for `--app`. A
+  target serving another app gets a warning
+  ([moving one actor](docs/cluster.md#moving-one-actor)).
+
 ### App-owned state (for 0.4.0)
 
 These change the layout in the bucket and on disk; they supersede the
-second-app refusal and the migration guard listed under "What changed"
-below. See "Upgrading to 0.4.0" before starting a node of this version
+second-app refusal and the migration guard listed under 0.3.0. See
+"Upgrading to 0.4.0" before starting a node of this version
 on a bucket that holds actor state.
 
 - **Each app's actor state lives under its own root,
@@ -106,28 +127,7 @@ scripts written for `actors/<tenant>/` must move to `state/<t>/<a>/`.
 Nodes that followed an app with `--access` and no deployed rules must
 deploy those rules (`deploy --access`) and start without `--access`.
 
-### What changed
-
-- **Every hop between nodes names its app, and a node refuses another
-  app's.** A forwarded request, a relayed WebSocket upgrade and a call
-  between nodes carry `x-wasmkeep-app: tenant/app`, the sending node's
-  app, covered by the signature on signed calls. A node answers a hop for
-  an app it does not serve with 503, `Retry-After: 1`, "not this app's
-  node", before reading its body, and the actor does not run. A client's
-  header is never believed or passed on: it is removed from what clients
-  send to actors and from what guests send, and never reaches an actor. `serve` without `--app` (classes given on
-  the command line) runs as the implicit app `default/default`, and says
-  so in its heartbeat (it said `default/` before); its keys are unchanged
-  ([ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md)).
-  Nodes of earlier versions send no app: see Upgrading below.
-- **`actor move` names the actor's app**: `wasmkeep actor move --app
-  acme/shop room/lobby --to node-c`. Without `--app`, the actor is written
-  `default/CLASS/NAME`, of the implicit app; another tenant in front
-  (`acme/room/lobby`) is refused with a message asking for `--app`. A
-  target serving another app gets a warning
-  ([moving one actor](docs/cluster.md#moving-one-actor)).
-
-### Upgrading from 0.3.0
+Also when upgrading from 0.3.0, with or without actor state:
 
 - Stop every node of a cluster, upgrade them all, start them all
   ([upgrading](docs/cluster.md#upgrading-wasmkeep)): nodes of this
