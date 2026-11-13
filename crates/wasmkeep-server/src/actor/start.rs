@@ -48,9 +48,17 @@ impl ActorService {
                 } else {
                     c.app.clone()
                 },
+                &config.tenant,
             )?),
             None => None,
         };
+        // The root of this node's actor state (ADR 0022): every key and
+        // database path of an actor starts from it. Built once, by the
+        // cluster when there is one.
+        let root = cluster.as_ref().map_or_else(
+            || wasmkeep_cluster::state_root::StateRoot::new("", config.tenant.as_str()),
+            |c| c.state_root().clone(),
+        );
         let factory_cluster = cluster.clone();
         // A guest statement runs on a blocking thread, which does not stop
         // when its event is cut: stop the statement no later than that.
@@ -58,7 +66,7 @@ impl ActorService {
         storage_config.max_statement_time =
             storage_config.max_statement_time.min(config.wall_per_event);
         let data_dir = storage_config.data_dir.clone();
-        let storage = Storage::new(storage_config);
+        let storage = Storage::new(storage_config, crate::state_dir(&root));
         let factory_classes = Arc::clone(&classes);
         let factory_runtime = runtime.clone();
         let limits = EventLimits {
@@ -120,6 +128,12 @@ impl ActorService {
                     let class = class.ok_or_else(|| -> BoxError {
                         format!("unknown class {}", address.class()).into()
                     })?;
+                    // The database path and the address recorded in it come
+                    // from the root's tenant, not the address's (ADR 0022):
+                    // an actor of another tenant never starts here.
+                    if address.tenant() != storage.state().tenant {
+                        return Err(format!("{address} is not of this node's tenant").into());
+                    }
                     Ok(ActorState {
                         address,
                         class,

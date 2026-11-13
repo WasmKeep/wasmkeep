@@ -2,16 +2,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
-use wasmkeep_storage::{SqlErrorKind, SqlValue as V, Storage, StorageConfig};
+use wasmkeep_storage::{SqlErrorKind, SqlValue as V, StateDir, Storage, StorageConfig};
 
 fn storage(dir: &tempfile::TempDir) -> Storage {
-    Storage::new(StorageConfig::new(dir.path()))
+    rooted(StorageConfig::new(dir.path()))
 }
 
 #[test]
 fn values_round_trip_through_params_and_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.exec("CREATE TABLE t (i INTEGER, r REAL, s TEXT, b BLOB, n)", &[])
         .unwrap();
     let row = [
@@ -35,13 +35,13 @@ fn values_round_trip_through_params_and_rows() {
 fn data_survives_closing_and_reopening() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = storage(&dir).open("t", "c", "a").unwrap();
+        let mut db = storage(&dir).open("c", "a").unwrap();
         db.exec("CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)", &[])
             .unwrap();
         db.exec("INSERT INTO kv VALUES ('x', 41)", &[]).unwrap();
         db.exec("UPDATE kv SET v = v + 1", &[]).unwrap();
     } // dropped, as on a process restart
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     let rows = db.query("SELECT v FROM kv WHERE k = 'x'", &[]).unwrap();
     assert_eq!(rows.values, vec![vec![V::Integer(42)]]);
 }
@@ -50,8 +50,8 @@ fn data_survives_closing_and_reopening() {
 fn each_address_has_its_own_database() {
     let dir = tempfile::tempdir().unwrap();
     let s = storage(&dir);
-    let mut a = s.open("t", "c", "Room").unwrap();
-    let mut b = s.open("t", "c", "room").unwrap();
+    let mut a = s.open("c", "Room").unwrap();
+    let mut b = s.open("c", "room").unwrap();
     a.exec("CREATE TABLE only_in_a (x)", &[]).unwrap();
     let err = b.query("SELECT * FROM only_in_a", &[]).unwrap_err();
     assert_eq!(err.kind, SqlErrorKind::Syntax);
@@ -65,7 +65,7 @@ fn each_address_has_its_own_database() {
 #[test]
 fn statement_errors_have_the_right_kind() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.exec(
         "CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT NOT NULL UNIQUE)",
         &[],
@@ -111,7 +111,7 @@ fn statement_errors_have_the_right_kind() {
 #[test]
 fn sandbox_blocks_attach_pragmas_and_file_escapes() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     let outside = dir.path().join("escape.db");
     let outside_sql = outside.display().to_string().replace('\'', "''");
 
@@ -150,11 +150,11 @@ fn sandbox_blocks_attach_pragmas_and_file_escapes() {
 #[test]
 fn quota_stops_writes_but_not_reads() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Storage::new(StorageConfig {
+    let s = rooted(StorageConfig {
         max_db_bytes: 256 * 1024,
         ..StorageConfig::new(dir.path())
     });
-    let mut db = s.open("t", "c", "a").unwrap();
+    let mut db = s.open("c", "a").unwrap();
     db.exec("CREATE TABLE big (b BLOB)", &[]).unwrap();
     let blob = V::Blob(vec![7; 16 * 1024]);
     let mut inserted = 0;
@@ -173,7 +173,7 @@ fn quota_stops_writes_but_not_reads() {
 #[test]
 fn an_open_transaction_is_rolled_back_at_the_end_of_the_event() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.exec("CREATE TABLE t (x)", &[]).unwrap();
 
     db.exec("BEGIN", &[]).unwrap();
@@ -196,7 +196,7 @@ fn an_open_transaction_is_rolled_back_at_the_end_of_the_event() {
 #[test]
 fn exec_durable_refuses_transaction_control() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.exec("CREATE TABLE t (x)", &[]).unwrap();
     for sql in [
         "BEGIN",
@@ -224,7 +224,7 @@ fn an_interrupted_write_aborts_the_events_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = StorageConfig::new(dir.path());
     config.max_statement_time = std::time::Duration::from_millis(300);
-    let mut db = Storage::new(config).open("t", "c", "a").unwrap();
+    let mut db = rooted(config).open("c", "a").unwrap();
     db.exec("CREATE TABLE t (x)", &[]).unwrap();
     db.exec("BEGIN", &[]).unwrap();
     db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
@@ -264,7 +264,7 @@ fn an_interrupted_write_aborts_the_events_transaction() {
 fn durable_writes_commit_and_persist() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = storage(&dir).open("t", "c", "a").unwrap();
+        let mut db = storage(&dir).open("c", "a").unwrap();
         db.exec("CREATE TABLE t (x)", &[]).unwrap();
         assert_eq!(db.exec_durable("INSERT INTO t VALUES (1)", &[]).unwrap(), 1);
         // Still sandboxed after the internal pragma toggle.
@@ -273,7 +273,7 @@ fn durable_writes_commit_and_persist() {
             SqlErrorKind::NotAllowed
         );
     }
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     assert_eq!(db.query("SELECT x FROM t", &[]).unwrap().values.len(), 1);
 }
 
@@ -281,7 +281,7 @@ fn durable_writes_commit_and_persist() {
 fn a_transaction_can_end_in_a_durable_commit() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = storage(&dir).open("t", "c", "a").unwrap();
+        let mut db = storage(&dir).open("c", "a").unwrap();
         db.exec("CREATE TABLE t (x)", &[]).unwrap();
         db.exec("BEGIN", &[]).unwrap();
         db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
@@ -298,7 +298,7 @@ fn a_transaction_can_end_in_a_durable_commit() {
             SqlErrorKind::NotAllowed
         );
     }
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     assert_eq!(db.query("SELECT x FROM t", &[]).unwrap().values.len(), 3);
 }
 
@@ -307,7 +307,7 @@ fn a_transaction_can_end_in_a_durable_commit() {
 fn a_durable_commit_fsyncs_the_wal() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.exec("CREATE TABLE t (x)", &[]).unwrap();
     db.exec("BEGIN", &[]).unwrap();
     db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
@@ -331,7 +331,7 @@ fn a_durable_commit_fsyncs_the_wal() {
 #[test]
 fn inside_a_transaction_only_a_commit_can_be_durable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.exec("CREATE TABLE t (x)", &[]).unwrap();
     db.exec("BEGIN", &[]).unwrap();
     // Refused before it runs: nothing in a transaction is durable before
@@ -352,15 +352,15 @@ fn delete_removes_the_database() {
     let dir = tempfile::tempdir().unwrap();
     let s = storage(&dir);
     let path = {
-        let mut db = s.open("t", "c", "a").unwrap();
+        let mut db = s.open("c", "a").unwrap();
         db.exec("CREATE TABLE t (x)", &[]).unwrap();
         db.path().to_owned()
     };
     assert!(path.exists());
-    s.delete("t", "c", "a").unwrap();
+    s.delete("c", "a").unwrap();
     assert!(!path.exists());
-    s.delete("t", "c", "a").unwrap(); // idempotent
-    let mut db = s.open("t", "c", "a").unwrap();
+    s.delete("c", "a").unwrap(); // idempotent
+    let mut db = s.open("c", "a").unwrap();
     assert_eq!(
         db.query("SELECT * FROM t", &[]).unwrap_err().kind,
         SqlErrorKind::Syntax
@@ -370,7 +370,7 @@ fn delete_removes_the_database() {
 #[test]
 fn host_tables_are_hidden_from_guests() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.set_alarm(1_000).unwrap();
     db.set_meta("component", "abc").unwrap();
 
@@ -408,7 +408,7 @@ fn host_tables_are_hidden_from_guests() {
 fn alarms_and_meta_persist_and_follow_guest_transactions() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = storage(&dir).open("t", "c", "a").unwrap();
+        let mut db = storage(&dir).open("c", "a").unwrap();
         assert_eq!(db.alarm().unwrap(), None);
         db.set_alarm(5).unwrap();
         db.set_alarm(7).unwrap(); // replaces
@@ -423,7 +423,7 @@ fn alarms_and_meta_persist_and_follow_guest_transactions() {
         assert!(db.end_event().unwrap());
         assert_eq!(db.alarm().unwrap(), Some(7));
     }
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     assert_eq!(db.alarm().unwrap(), Some(7));
     assert_eq!(db.meta("component").unwrap().as_deref(), Some("v2"));
     db.clear_alarm().unwrap();
@@ -435,10 +435,10 @@ fn pending_alarms_are_found_by_scanning_the_data_dir() {
     let dir = tempfile::tempdir().unwrap();
     let s = storage(&dir);
     let long = "n".repeat(250); // hashed file name; address comes from meta
-    s.open("t", "c", "quiet").unwrap();
-    s.open("t", "c", "soon").unwrap().set_alarm(10).unwrap();
-    s.open("t", "other", &long).unwrap().set_alarm(20).unwrap();
-    let mut cleared = s.open("t", "c", "cleared").unwrap();
+    s.open("c", "quiet").unwrap();
+    s.open("c", "soon").unwrap().set_alarm(10).unwrap();
+    s.open("other", &long).unwrap().set_alarm(20).unwrap();
+    let mut cleared = s.open("c", "cleared").unwrap();
     cleared.set_alarm(30).unwrap();
     cleared.clear_alarm().unwrap();
 
@@ -454,7 +454,7 @@ fn pending_alarms_are_found_by_scanning_the_data_dir() {
         ]
     );
     assert!(
-        Storage::new(StorageConfig::new(dir.path().join("empty")))
+        rooted(StorageConfig::new(dir.path().join("empty")))
             .pending_alarms()
             .unwrap()
             .found
@@ -466,7 +466,7 @@ fn pending_alarms_are_found_by_scanning_the_data_dir() {
 fn one_unreadable_database_does_not_hide_the_other_alarms() {
     let dir = tempfile::tempdir().unwrap();
     let s = storage(&dir);
-    s.open("t", "c", "soon").unwrap().set_alarm(10).unwrap();
+    s.open("c", "soon").unwrap().set_alarm(10).unwrap();
     // A file that is not a database, where a database would be.
     let bad = dir.path().join("actors/t/c/broken.db");
     std::fs::write(&bad, b"this is not a SQLite database, not even close").unwrap();
@@ -491,7 +491,7 @@ fn fts3_tokenizer_cannot_leak_or_install_a_function_pointer() {
     // returns a host pointer, two install one, and a virtual table using
     // it then calls the guest-chosen address (a segfault, or worse).
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     let leak = db.query("SELECT fts3_tokenizer(?1)", &[V::Text("simple".into())]);
     let leak = leak.unwrap_err();
     assert_eq!(leak.kind, SqlErrorKind::NotAllowed, "{leak:?}");
@@ -526,7 +526,7 @@ fn a_temp_table_cannot_shadow_or_reach_host_tables() {
     // shadows it (temp is searched first), and its trigger then runs host
     // writes with the sandbox off. Temp objects are refused outright.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     db.set_meta("deploy_seq", "3").unwrap();
     for sql in [
         "CREATE TEMP TABLE x(key TEXT PRIMARY KEY, value TEXT)",
@@ -554,7 +554,7 @@ fn a_runaway_statement_is_stopped_at_its_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = StorageConfig::new(dir.path());
     config.max_statement_time = std::time::Duration::from_millis(300);
-    let mut db = Storage::new(config).open("t", "c", "a").unwrap();
+    let mut db = rooted(config).open("c", "a").unwrap();
     let started = std::time::Instant::now();
     let err = db
         .query(
@@ -584,7 +584,7 @@ fn values_and_results_are_capped() {
     let mut config = StorageConfig::new(dir.path());
     config.max_value_bytes = 1 << 20;
     config.max_result_bytes = 4 << 20;
-    let mut db = Storage::new(config).open("t", "c", "a").unwrap();
+    let mut db = rooted(config).open("c", "a").unwrap();
     // One value over the cap.
     let err = db.query("SELECT zeroblob(2000000)", &[]).unwrap_err();
     assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
@@ -609,11 +609,11 @@ fn writes_stop_when_one_event_fills_the_wal() {
     // them between events; one event rewriting the same rows must not grow it
     // without bound.
     let dir = tempfile::tempdir().unwrap();
-    let s = Storage::new(StorageConfig {
+    let s = rooted(StorageConfig {
         max_wal_bytes: 1024 * 1024,
         ..StorageConfig::new(dir.path())
     });
-    let mut db = s.open("t", "c", "a").unwrap();
+    let mut db = s.open("c", "a").unwrap();
     db.start_capture().unwrap();
     db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)", &[])
         .unwrap();
@@ -646,11 +646,11 @@ fn a_rolled_back_transaction_that_filled_the_wal_does_not_wedge_the_actor() {
     // back, its frames stay in the file. The next capture must still empty
     // the WAL, or every later write would be refused.
     let dir = tempfile::tempdir().unwrap();
-    let s = Storage::new(StorageConfig {
+    let s = rooted(StorageConfig {
         max_wal_bytes: 1024 * 1024,
         ..StorageConfig::new(dir.path())
     });
-    let mut db = s.open("t", "c", "a").unwrap();
+    let mut db = s.open("c", "a").unwrap();
     db.start_capture().unwrap();
     db.exec("CREATE TABLE t (b BLOB)", &[]).unwrap();
     db.take_changes().unwrap();
@@ -677,11 +677,11 @@ fn sql_cpu_per_event_is_bounded() {
     // The guest's own CPU budget does not see time spent in SQLite; one
     // event's statements share their own CPU budget.
     let dir = tempfile::tempdir().unwrap();
-    let s = Storage::new(StorageConfig {
+    let s = rooted(StorageConfig {
         max_sql_cpu_per_event: std::time::Duration::from_millis(50),
         ..StorageConfig::new(dir.path())
     });
-    let mut db = s.open("t", "c", "a").unwrap();
+    let mut db = s.open("c", "a").unwrap();
     // One long statement is stopped at the budget, well before its own
     // (wall-clock) deadline.
     let started = std::time::Instant::now();
@@ -729,7 +729,7 @@ fn sql_cpu_per_event_is_bounded() {
 fn opening_waits_for_a_lock_held_for_a_moment() {
     let dir = tempfile::tempdir().unwrap();
     let store = storage(&dir);
-    drop(store.open("t", "c", "a").unwrap()); // created, in WAL mode
+    drop(store.open("c", "a").unwrap()); // created, in WAL mode
     let path = dir.path().join("actors/t/c/a.db");
     let other = rusqlite::Connection::open(&path).unwrap();
     other.execute_batch("BEGIN EXCLUSIVE").unwrap();
@@ -737,7 +737,7 @@ fn opening_waits_for_a_lock_held_for_a_moment() {
         std::thread::sleep(std::time::Duration::from_millis(300));
         other.execute_batch("COMMIT").unwrap();
     });
-    let opened = store.open("t", "c", "a");
+    let opened = store.open("c", "a");
     holder.join().unwrap();
     let mut db = opened.unwrap();
     db.exec("CREATE TABLE ok (x)", &[]).unwrap();
@@ -750,14 +750,14 @@ fn opening_waits_for_a_lock_held_for_a_moment() {
 fn overlapping_opens_and_closes_of_one_database_all_succeed() {
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(storage(&dir));
-    drop(store.open("t", "c", "a").unwrap());
+    drop(store.open("c", "a").unwrap());
     let workers: Vec<_> = (0..4)
         .map(|w| {
             let store = std::sync::Arc::clone(&store);
             std::thread::spawn(move || {
                 for i in 0..200 {
                     let mut db = store
-                        .open("t", "c", "a")
+                        .open("c", "a")
                         .unwrap_or_else(|e| panic!("worker {w}, round {i}: {e}"));
                     db.exec("CREATE TABLE IF NOT EXISTS n (x)", &[])
                         .unwrap_or_else(|e| panic!("worker {w}, round {i}: {e:?}"));
@@ -783,15 +783,13 @@ fn a_busy_open_is_tried_again_then_given_up() {
     for _ in 0..4 {
         wasmkeep_storage::faults::fail_next("open_busy");
     }
-    let mut db = store
-        .open("t", "c", "a")
-        .expect("opened at the fifth attempt");
+    let mut db = store.open("c", "a").expect("opened at the fifth attempt");
     db.exec("CREATE TABLE ok (x)", &[]).unwrap();
     drop(db);
     for _ in 0..5 {
         wasmkeep_storage::faults::fail_next("open_busy");
     }
-    let err = store.open("t", "c", "b").unwrap_err().to_string();
+    let err = store.open("c", "b").unwrap_err().to_string();
     assert!(err.contains("database is locked"), "{err}");
     assert!(err.contains("(SQLite code 5)"), "{err}");
 }
@@ -806,7 +804,7 @@ fn a_commit_without_a_local_sync_keeps_the_rules_and_skips_the_fsync() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = storage(&dir).open("t", "c", "a").unwrap();
+        let mut db = storage(&dir).open("c", "a").unwrap();
         db.exec("CREATE TABLE t (x)", &[]).unwrap();
         for sql in ["BEGIN", "SAVEPOINT s", "RELEASE s", "ROLLBACK", "COMMIT"] {
             let err = db.exec_commit(sql, &[]).unwrap_err();
@@ -829,6 +827,17 @@ fn a_commit_without_a_local_sync_keeps_the_rules_and_skips_the_fsync() {
         assert!(!db.in_transaction());
         assert!(!db.end_event().unwrap(), "nothing left to roll back");
     }
-    let mut db = storage(&dir).open("t", "c", "a").unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
     assert_eq!(db.query("SELECT x FROM t", &[]).unwrap().values.len(), 2);
+}
+
+/// A storage of tenant `t`, its databases at `<data_dir>/actors/t/` (where
+/// the server's state root puts them; this crate does not know it).
+fn rooted(config: StorageConfig) -> Storage {
+    let state = StateDir {
+        dir: "actors/t".into(),
+        scratch: ".deleting".into(),
+        tenant: "t".into(),
+    };
+    Storage::new(config, state)
 }

@@ -41,3 +41,15 @@ pub use http::{
     serve_with, serve_with_cluster_listener,
 };
 pub use wasmkeep_cluster::lease::LeaseConfig;
+pub use wasmkeep_cluster::state_root::StateRoot;
+
+/// Where `root`'s actor databases live under the data directory (ADR 0022):
+/// the one place the local layout is spelled.
+#[must_use]
+pub fn state_dir(root: &StateRoot) -> wasmkeep_storage::StateDir {
+    wasmkeep_storage::StateDir {
+        dir: root.local(wasmkeep_storage::encode_segment),
+        scratch: root.scratch(),
+        tenant: root.tenant().to_owned(),
+    }
+}

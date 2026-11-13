@@ -132,17 +132,18 @@ pub(super) fn empty_database_snapshot(
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = storage
-        .config()
-        .data_dir
-        .join(".deleting")
+        .scratch_dir()
         .join(format!("{}-{n}", std::process::id()));
     let result = (|| {
-        let fresh = Storage::new(wasmkeep_storage::StorageConfig {
-            data_dir: scratch.clone(),
-            ..storage.config().clone()
-        });
+        let fresh = Storage::new(
+            wasmkeep_storage::StorageConfig {
+                data_dir: scratch.clone(),
+                ..storage.config().clone()
+            },
+            storage.state().clone(),
+        );
         let mut db = fresh
-            .open(address.tenant(), address.class(), address.name())
+            .open(address.class(), address.name())
             .map_err(|e| format!("{e:#}"))?;
         db.start_capture().map_err(|e| e.to_string())?;
         db.snapshot().map_err(|e| e.to_string())

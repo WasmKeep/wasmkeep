@@ -19,3 +19,4 @@ pub mod node_lease;
 #[cfg(feature = "object-store")]
 pub mod object_store;
 pub mod replication;
+pub mod state_root;

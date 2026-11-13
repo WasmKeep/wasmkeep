@@ -24,6 +24,7 @@ use wasmkeep_cluster::lease::{Clock, LeaseConfig};
 use wasmkeep_cluster::membership::{DrainState, InvalidNodeId, Membership, NODES_PREFIX, NodeInfo};
 use wasmkeep_cluster::node_lease::Owners;
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
+use wasmkeep_cluster::state_root::{Family, StateRoot};
 use wasmkeep_runtime::ActorAddress;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -342,8 +343,9 @@ pub(crate) struct Cluster {
     pub(crate) ttl: Duration,
     /// The shared bucket, for replication.
     pub(crate) store: Arc<dyn ObjectStore>,
-    /// Key prefix in the bucket, ending in `/` (or empty).
-    prefix: String,
+    /// The root of every actor-state key (ADR 0022), and the one copy of
+    /// the bucket prefix.
+    root: StateRoot,
     /// How long after its due time an alarm counts as abandoned: a lease
     /// period plus grace, by which its owner fired it or lost the actor.
     pub(crate) alarm_overdue: Duration,
@@ -506,8 +508,13 @@ impl Cluster {
         let _ = self.lapse_hook.set(hook);
     }
 
-    /// `serves`: what this node serves (see [`NodeInfo::app`]).
-    pub(crate) fn new(config: &ClusterConfig, serves: &str) -> Result<Arc<Self>, crate::Error> {
+    /// `serves`: what this node serves (see [`NodeInfo::app`]); `tenant`:
+    /// whose actors, the tenant of its [`StateRoot`].
+    pub(crate) fn new(
+        config: &ClusterConfig,
+        serves: &str,
+        tenant: &str,
+    ) -> Result<Arc<Self>, crate::Error> {
         let invalid_id =
             |e: InvalidNodeId| crate::Error::InvalidNodeId(config.node_id.clone(), e.to_string());
         // Every bucket request this node makes goes through here (leases,
@@ -590,11 +597,7 @@ impl Cluster {
             secret: tokio::sync::OnceCell::new(),
             ttl: Duration::from_millis(config.lease.ttl_ms()),
             store,
-            prefix: if config.prefix.is_empty() || config.prefix.ends_with('/') {
-                config.prefix.clone()
-            } else {
-                format!("{}/", config.prefix)
-            },
+            root: StateRoot::new(&config.prefix, tenant),
             alarm_overdue: Duration::from_millis(
                 config
                     .lease
@@ -644,9 +647,9 @@ impl Cluster {
         Ok(cluster)
     }
 
-    /// `alarms/<tenant>/`: the alarm index (ADR 0009) of `tenant`.
-    fn alarm_base(&self, tenant: &str) -> StorePath {
-        StorePath::from(format!("{}alarms/{tenant}", self.prefix))
+    /// `alarms/<tenant>/`: the alarm index (ADR 0009) of this node's root.
+    fn alarm_base(&self) -> StorePath {
+        StorePath::from(self.root.bucket_base(Family::Alarms))
     }
 
     /// The key of `address`'s index entry `entry`:
@@ -658,12 +661,30 @@ impl Cluster {
     /// stops at "now"; the name as hex, so nothing in the key is escaped by
     /// the object store.
     fn alarm_key(&self, address: &ActorAddress, entry: &Entry) -> StorePath {
-        StorePath::from(format!(
-            "{}alarms/{}/{}",
-            self.prefix,
-            address.tenant(),
-            alarm_index::key_tail(address.class(), address.name(), entry)
+        self.assert_mine(address);
+        StorePath::from(self.root.bucket_key(
+            Family::Alarms,
+            &alarm_index::key_tail(address.class(), address.name(), entry),
         ))
+    }
+
+    /// The root of this node's actor state (ADR 0022).
+    pub(crate) fn state_root(&self) -> &StateRoot {
+        &self.root
+    }
+
+    /// Every address whose keys this node builds is of its root's tenant:
+    /// addresses are made with the service's tenant, and a node call
+    /// naming another is refused before any key is built. Checked in
+    /// every build: a key is built from the root's tenant, never the
+    /// address's, so an address of another tenant reaching here would
+    /// otherwise read or write that tenant's actor under this one's keys.
+    pub(crate) fn assert_mine(&self, address: &ActorAddress) {
+        assert_eq!(
+            address.tenant(),
+            self.root.tenant(),
+            "{address} is not of this node's tenant"
+        );
     }
 
     /// Lists an alarm of `address` due at `at` in the bucket's index, as
@@ -713,6 +734,16 @@ impl Cluster {
         }
     }
 
+    /// The folder of `address`'s tagged entries due at `at`:
+    /// `alarms/<tenant>/<at, 15 digits>/<class>.t/<name as hex>`.
+    fn alarm_entries_base(&self, address: &ActorAddress, at: u64) -> StorePath {
+        self.assert_mine(address);
+        StorePath::from(self.root.bucket_key(
+            Family::Alarms,
+            &alarm_index::tagged_prefix(address.class(), address.name(), at),
+        ))
+    }
+
     /// `address`'s tagged entries due at `at`, as listed now (the legacy
     /// entry is elsewhere: [`alarm_index::entries_to_clear`] adds it).
     pub(crate) async fn alarm_entries_at(
@@ -721,12 +752,7 @@ impl Cluster {
         at: u64,
     ) -> Result<Vec<Entry>, object_store::Error> {
         use futures_util::TryStreamExt as _;
-        let base = StorePath::from(format!(
-            "{}alarms/{}/{}",
-            self.prefix,
-            address.tenant(),
-            alarm_index::tagged_prefix(address.class(), address.name(), at)
-        ));
+        let base = self.alarm_entries_base(address, at);
         let strip = format!("{}/", base.as_ref());
         let listed: Vec<_> = self.store.list(Some(&base)).try_collect().await?;
         Ok(listed
@@ -737,7 +763,7 @@ impl Cluster {
             .collect())
     }
 
-    /// Reads `tenant`'s index entries in key (so due time) order, after
+    /// Reads this node's index entries in key (so due time) order, after
     /// `after` (a key from an earlier page) if given: entries due before
     /// `before_ms`, at most `scan` of them. Returns them with the key to
     /// resume from, or `None` once the listing reached entries not yet due
@@ -745,13 +771,13 @@ impl Cluster {
     /// entries alike; an actor listed under both is returned for each.
     pub(crate) async fn alarms_due_before(
         &self,
-        tenant: &str,
         before_ms: u64,
         after: Option<&StorePath>,
         scan: usize,
     ) -> Result<(Vec<(ActorAddress, u64, StorePath)>, Option<StorePath>), object_store::Error> {
         use futures_util::TryStreamExt as _;
-        let base = self.alarm_base(tenant);
+        let base = self.alarm_base();
+        let tenant = self.root.tenant();
         let strip = format!("{}/", base.as_ref());
         // `after` is a listed location, already in the store's encoding:
         // passed through as is (never rebuilt from a string, which would
@@ -963,7 +989,7 @@ impl Cluster {
             .get_or_try_init(|| async {
                 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
                 let location =
-                    object_store::path::Path::from(format!("{}{SECRET_KEY}", self.prefix));
+                    object_store::path::Path::from(format!("{}{SECRET_KEY}", self.root.prefix()));
                 let fresh = random_hex(32).map_err(|e| e.to_string())?;
                 let opts = PutOptions {
                     mode: PutMode::Create,
@@ -1483,19 +1509,36 @@ impl Cluster {
 
     /// Key prefix in the bucket, ending in `/` (or empty).
     pub(crate) fn store_prefix(&self) -> &str {
-        &self.prefix
+        self.root.prefix()
     }
 
     /// An actor's per-actor lease from before ADR 0020, replaced by a
     /// marker at its first acquisition under node leases (its generation
     /// seeds the first ownership record). The name is encoded like the
     /// database file name, so any actor name is a safe key.
-    pub(crate) fn lease_key(address: &ActorAddress) -> String {
-        format!(
-            "leases/{}/{}/{}",
-            address.tenant(),
-            address.class(),
-            wasmkeep_storage::encode_segment(address.name())
+    pub(crate) fn lease_key(&self, address: &ActorAddress) -> String {
+        self.assert_mine(address);
+        self.root.key(
+            Family::Leases,
+            &format!(
+                "{}/{}",
+                address.class(),
+                wasmkeep_storage::encode_segment(address.name())
+            ),
+        )
+    }
+
+    /// The folder of `address`'s history in the bucket (ADR 0007), with
+    /// the prefix and without a trailing `/`.
+    pub(crate) fn history_key(&self, address: &ActorAddress) -> String {
+        self.assert_mine(address);
+        self.root.bucket_key(
+            Family::History,
+            &format!(
+                "{}/{}",
+                address.class(),
+                wasmkeep_storage::encode_segment(address.name())
+            ),
         )
     }
 
@@ -1743,3 +1786,6 @@ fn random_hex(n: usize) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod state_keys_tests;
