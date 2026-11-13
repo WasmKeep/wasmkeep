@@ -68,8 +68,7 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
      the tenant, or `default/default`;
    - the node leases it sees, and whether each may still run (a node
      stopped cleanly is quiet at once; a crashed or fenced one once its
-     lease is 16 s old with the default timings, or a heartbeat in the
-     format from before node leases once it is 25 s old);
+     lease is 16 s old, with the default timings);
    - the objects per family, and an estimate of the time;
    - what refuses the run, if anything.
 
@@ -82,11 +81,11 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
    ```
 
    It takes the lock (`cluster/migration`), waits one node-lease window
-   (16 s with the default timings, 25 s when `nodes/` still holds a
-   heartbeat in the format from before node leases, as a prefix last run
-   by 0.2.0 does: a node the dry run judged stopped,
+   (16 s with the default timings: a node the dry run judged stopped,
    because its clock and the migrator's disagree, renews its lease in
-   that time and the run aborts), copies inside the bucket (no download),
+   that time and the run aborts; every release writes node leases, so
+   the longer wait for an older heartbeat format, 25 s, applies only to a
+   prefix that a build from before 0.1.0 ran on), copies inside the bucket (no download),
    checks every copy, writes the barriers that stop older binaries (token
    `3` in every app's `current`, and a tombstone over every old ownership
    record, or where an actor has history and no record), proves that no
@@ -101,7 +100,8 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
    again).
 
 7. **Verify**: run the dry run again. Every tenant reads `migrated`,
-   nothing is refused, and it ends with "Nothing to migrate". `wasmkeep cluster status` still shows no live node.
+   nothing is refused, and it ends with "Nothing to migrate". `wasmkeep
+   cluster status` still shows no live node.
 
 8. **Start** every node of 0.4.0. At its first start a node puts its old
    local databases aside (`<data_dir>/actors.pre-0.4/`), and restores

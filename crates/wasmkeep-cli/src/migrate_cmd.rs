@@ -256,8 +256,9 @@ fn plan_hint(plan: &Plan) -> &'static str {
         "Nothing to migrate: start the nodes of this version (from the first start the \
          migration is one-way)."
     } else {
-        "Dry run: nothing was written. Stop every node (the service units), freeze deploys, \
-         then run this again with --apply."
+        "Dry run: nothing was written. Freeze deploys, secret changes, actor move and \
+         drains, stop every node (the service units), back up the bucket, then run this \
+         again with --apply."
     }
 }
 
@@ -265,8 +266,8 @@ fn plan_hint(plan: &Plan) -> &'static str {
 /// is decided inside the run.
 fn apply_line(lease_window_ms: u64, old_window_ms: u64) -> String {
     format!(
-        "Taking the lock, then waiting {} s (one node-lease window; {} s when nodes/ still \
-         holds a heartbeat from before node leases) before copying. Run one --apply or \
+        "Taking the lock, then waiting {} s (one node-lease window; {} s if nodes/ holds a \
+         heartbeat in a format from before 0.1.0) before copying. Run one --apply or \
          --rollback at a time: another run takes the lock over and this one stops.",
         lease_window_ms.div_ceil(1000),
         old_window_ms.max(lease_window_ms).div_ceil(1000)

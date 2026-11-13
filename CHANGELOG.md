@@ -66,7 +66,6 @@ on a bucket that holds actor state.
   TENANT/APP`, which must name an app of the tenant (or
   `default/default`); the other apps start a shared class empty.
   `--apply` waits one node-lease window (16 s with the default timings,
-  25 s when `nodes/` still holds a heartbeat from before node leases,
   so that a node whose clock disagrees with the migrator's shows itself),
   copies server-side, verifies, then puts barriers in front of older
   binaries (token `3` in every app's `current`, a tombstone over every old
@@ -132,7 +131,9 @@ on a bucket that holds actor state.
 
 ### Upgrading to 0.4.0
 
-From 0.2.0 or 0.3.0, on a bucket prefix that holds actor state:
+From 0.3.0, on a bucket prefix that holds actor state (a prefix last run
+by 0.2.0 has the same layout and takes the same steps; read the notes
+under 0.3.0 for the rest of that upgrade):
 
 1. Freeze deploys, secret changes, `actor move` and drains (CI
    included).
@@ -157,7 +158,7 @@ scripts written for `actors/<tenant>/` must move to `state/<t>/<a>/`.
 Nodes that followed an app with `--access` and no deployed rules must
 deploy those rules (`deploy --access`) and start without `--access`.
 
-Also when upgrading from 0.3.0, with or without actor state:
+With or without actor state:
 
 - Stop every node of a cluster, upgrade them all, start them all
   ([upgrading](docs/cluster.md#upgrading-wasmkeep)): nodes of this

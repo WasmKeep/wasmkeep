@@ -1436,8 +1436,12 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             // before deleting (the commit it planned against was rolled
             // back): it would refuse this commit's rollback for nothing.
             // A `--remove-old` still running sees this run's commit, not
-            // its own, and stops too.
-            self.clear_stale_mark(tenant, &key).await?;
+            // its own, and stops too. A failure leaves the tenant for the
+            // next run, as a failed commit does.
+            if let Err(e) = self.clear_stale_mark(tenant, &key).await {
+                outcome.failed.push((tenant.clone(), e.to_string()));
+                continue;
+            }
             match self.store.create(&key, commit.encode(COMMIT_HEADER)).await {
                 Ok(_) => outcome.committed.push(tenant.clone()),
                 // A re-run after a crash between the write and its answer.
