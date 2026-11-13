@@ -90,39 +90,14 @@ fn only_another_app_of_the_same_tenant_conflicts() {
         n("b", "acme/shop"),  // same app: fine
         n("c", "other/shop"), // another tenant: separate keys
         n("d", "acme/admin"), // same tenant, another app: conflict
-        n("e", "acme/"),      // command-line classes of an older version: conflict
+        n("e", "acme/"),      // command-line classes of acme: conflict
         n("f", ""),           // an older node: not judged
     ];
     assert_eq!(
         conflicts("me", "acme/shop", &nodes),
-        vec![
-            "d (acme/admin)".to_owned(),
-            "e (acme/, an older version)".to_owned()
-        ]
+        vec!["d (acme/admin)".to_owned(), "e (acme/)".to_owned()]
     );
     assert!(conflicts("me", "other/x", &nodes[..1]).is_empty());
-}
-
-/// A conflict with nodes of the version before the implicit app only
-/// (ADR 0022) is an upgrade that did not stop every node: the advice says
-/// so, instead of sending the operator to another bucket prefix.
-#[test]
-fn a_conflict_with_older_nodes_only_asks_for_a_stop_all_upgrade() {
-    let older = vec!["e (default/, an older version)".to_owned()];
-    let advice = conflict_advice(&older);
-    assert!(advice.contains("stop every node"), "{advice}");
-    assert!(
-        advice.contains("e (default/, an older version)"),
-        "{advice}"
-    );
-    assert!(!advice.contains("--bucket prefix"), "{advice}");
-    let mixed = vec![
-        "d (acme/admin)".to_owned(),
-        "e (acme/, an older version)".to_owned(),
-    ];
-    let advice = conflict_advice(&mixed);
-    assert!(advice.contains("another --bucket prefix"), "{advice}");
-    assert!(!advice.contains("stop every node"), "{advice}");
 }
 
 #[test]
@@ -522,7 +497,7 @@ fn node(id: &str) -> Arc<Cluster> {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     Cluster::new(
         &ClusterConfig::new(id, format!("http://{id}"), store),
-        "t/default",
+        "t/",
         "t",
     )
     .unwrap()
@@ -705,7 +680,7 @@ fn rendezvous_is_stable_and_spreads_actors() {
 
 #[tokio::test]
 async fn only_serving_peers_of_the_same_app_that_are_not_draining_are_chosen() {
-    let me = node("me"); // serves `t/default`
+    let me = node("me"); // serves `t/`
     let peer = |app: &str, drain: Option<DrainState>| Peer {
         plain: Some("http://x".into()),
         tls: None,
@@ -716,23 +691,23 @@ async fn only_serving_peers_of_the_same_app_that_are_not_draining_are_chosen() {
     };
     let serving = Some(DrainState::Serving);
     *me.peers.write().unwrap() = HashMap::from([
-        ("me".to_owned(), peer("t/default", serving)),
-        ("other-tenant".to_owned(), peer("u/default", serving)),
-        ("too-old".to_owned(), peer("t/default", None)),
+        ("me".to_owned(), peer("t/", serving)),
+        ("other-tenant".to_owned(), peer("u/", serving)),
+        ("too-old".to_owned(), peer("t/", None)),
         (
             "draining".to_owned(),
-            peer("t/default", Some(DrainState::Draining)),
+            peer("t/", Some(DrainState::Draining)),
         ),
-        ("marked".to_owned(), peer("t/default", serving)),
+        ("marked".to_owned(), peer("t/", serving)),
         (
             "unreachable".to_owned(),
             Peer {
                 plain: None,
                 tls: Some("https://y:7443".into()),
-                ..peer("t/default", serving)
+                ..peer("t/", serving)
             },
         ),
-        ("good".to_owned(), peer("t/default", serving)),
+        ("good".to_owned(), peer("t/", serving)),
     ]);
     // `marked` is asked to drain, though its heartbeat still says serving.
     me.control
@@ -774,18 +749,15 @@ async fn only_nodes_that_deliver_this_apps_alarms_share_the_sweep() {
     };
     let serving = Some(DrainState::Serving);
     *me.peers.write().unwrap() = HashMap::from([
-        ("me".to_owned(), peer("t/default", serving)),
-        ("same".to_owned(), peer("t/default", serving)),
-        ("other-app".to_owned(), peer("t/admin", serving)),
-        ("other-tenant".to_owned(), peer("u/default", serving)),
-        // A node of an older version, which names no app (ADR 0022):
-        // refused on every hop, so it is given no share.
+        ("me".to_owned(), peer("t/", serving)),
+        ("same".to_owned(), peer("t/", serving)),
+        ("other-tenant".to_owned(), peer("u/", serving)),
         ("older".to_owned(), peer("", None)),
         (
             "draining".to_owned(),
-            peer("t/default", Some(DrainState::Draining)),
+            peer("t/", Some(DrainState::Draining)),
         ),
-        ("marked".to_owned(), peer("t/default", serving)),
+        ("marked".to_owned(), peer("t/", serving)),
     ]);
     me.control
         .write()
@@ -793,13 +765,13 @@ async fn only_nodes_that_deliver_this_apps_alarms_share_the_sweep() {
         .draining
         .insert("marked".to_owned());
     let shards = me.alarm_shards();
-    assert_eq!(shards.nodes, ["me", "same"]);
+    assert_eq!(shards.nodes, ["me", "older", "same"]);
     assert_eq!(shards.me, Some(0));
 
     // Draining itself: its share goes to the others.
     me.control.write().unwrap().draining.insert("me".to_owned());
     let shards = me.alarm_shards();
-    assert_eq!(shards.nodes, ["same"]);
+    assert_eq!(shards.nodes, ["older", "same"]);
     assert_eq!(shards.me, None);
     let a = ActorAddress::new("t", "c", "x").unwrap();
     assert!(!shards.is_mine(&a));
@@ -818,7 +790,7 @@ async fn live_nodes_split_the_alarm_sweep_between_them() {
         let peer = |a: &str| Peer {
             plain: Some(a.to_owned()),
             tls: None,
-            app: "t/default".to_owned(),
+            app: String::new(),
             drain: None,
             can_take: false,
             instance: None,

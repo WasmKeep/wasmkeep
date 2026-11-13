@@ -96,7 +96,7 @@ async fn existing_access_checks_the_bucket_and_leaves_nothing_for_unknown_names(
     assert_eq!((r.status, r.body.trim()), (200, "200:2"));
     // From outside, through either node, even posing as a node or an actor.
     for node in [a.addr, b.addr] {
-        let forged = "x-wasmkeep-internal: guess\r\nx-wasmkeep-caller: default/v/m1\r\nx-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n";
+        let forged = "x-wasmkeep-internal: guess\r\nx-wasmkeep-caller: default/v/m1\r\nx-wasmkeep-forwarded: 1\r\n";
         for extra in ["", forged] {
             let r = send(node, "GET", "/actor/u/x/durable", extra).await;
             assert_eq!(r.status, 403, "{extra:?}: {}", r.body);

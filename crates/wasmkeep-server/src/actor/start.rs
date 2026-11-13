@@ -43,10 +43,8 @@ impl ActorService {
         let cluster = match &config.cluster {
             Some(c) => Some(Cluster::new(
                 c,
-                // Classes given on the command line run as the implicit
-                // app (ADR 0022): `default/default` for `serve --actor`.
                 &if c.app.is_empty() {
-                    format!("{}/{}", config.tenant, crate::cluster::IMPLICIT_APP_NAME)
+                    format!("{}/", config.tenant)
                 } else {
                     c.app.clone()
                 },

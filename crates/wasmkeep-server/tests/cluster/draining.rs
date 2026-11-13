@@ -66,7 +66,7 @@ async fn a_draining_node_sends_new_actors_to_a_peer() {
         a.addr,
         "GET",
         "/actor/t/fwd/fired",
-        "x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n",
+        "x-wasmkeep-forwarded: 1\r\n",
     )
     .await;
     assert_eq!(

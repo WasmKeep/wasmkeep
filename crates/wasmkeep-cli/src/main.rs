@@ -65,14 +65,9 @@ enum ActorCommand {
 
 #[derive(Debug, Args)]
 struct MoveArgs {
-    /// The actor: CLASS/NAME with `--app`, or `default/CLASS/NAME` for
-    /// the implicit app `default/default` (the name may contain `/`).
-    actor: String,
-
-    /// The actor's app, TENANT/APP; `default/default` (classes given on
-    /// the command line) when the actor is written `default/CLASS/NAME`.
-    #[arg(long, value_parser = parse_app)]
-    app: Option<(String, String)>,
+    /// The actor, as TENANT/CLASS/NAME (the name may contain `/`).
+    #[arg(value_parser = parse_actor_address)]
+    actor: (String, String, String),
 
     /// The node to move it to.
     #[arg(long)]
@@ -1079,8 +1074,10 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("reading the cluster's heartbeats: {e}"))?;
         anyhow::ensure!(
             mixed.is_empty(),
-            "{}.",
-            wasmkeep_server::conflict_advice(&mixed)
+            "another app of this tenant already runs on this bucket prefix ({}): \
+             their actors would share data. Deploy one on another --bucket prefix, or under \
+             another tenant if another owner runs it (docs/cluster.md, Deploying).",
+            mixed.join(", ")
         );
         if let Some((app_ref, _)) = follow.take() {
             rt.spawn(app_ref.follow(service.clone(), std::time::Duration::from_secs(3)));
@@ -1484,11 +1481,7 @@ fn cluster_forget(args: &NodeArgs) -> anyhow::Result<()> {
 /// Writes `control/move/...` (ADR 0014).
 fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
     use wasmkeep_cluster::control::{self, Keys as _};
-    let ((tenant, app), class, name) = move_target(&args.actor, args.app.as_ref())?;
-    if let Some(warning) = move_target_warning(&args.actor, args.app.as_ref()) {
-        eprintln!("warning: {warning}");
-    }
-    let (tenant, class, name) = (&tenant, &class, &name);
+    let (tenant, class, name) = &args.actor;
     let key = control::checked_move_key(
         &wasmkeep_cluster::state_root::StateRoot::new("", tenant.as_str()),
         class,
@@ -1508,7 +1501,7 @@ fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
         ),
         None => {}
         Some(node) => {
-            for warning in move_warnings(&node, &format!("{tenant}/{app}")) {
+            for warning in move_warnings(&node, tenant) {
                 eprintln!("warning: {warning}");
             }
         }
@@ -1521,61 +1514,16 @@ fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The app (`tenant`, `app`), class and name of `actor move`'s actor:
-/// `CLASS/NAME` of `app`, or, without `--app`, `default/CLASS/NAME` of the
-/// implicit app `default/default` (ADR 0022). Another tenant written in
-/// front is refused: its app must be named.
-fn move_target(
-    actor: &str,
-    app: Option<&(String, String)>,
-) -> anyhow::Result<((String, String), String, String)> {
-    if let Some(app) = app {
-        let (class, name) = actor
-            .split_once('/')
-            .filter(|(c, n)| !c.is_empty() && !n.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("expected CLASS/NAME with --app, got {actor:?}"))?;
-        return Ok((app.clone(), class.to_owned(), name.to_owned()));
-    }
-    let (tenant, class, name) = parse_actor_address(actor).map_err(|e| anyhow::anyhow!(e))?;
-    anyhow::ensure!(
-        tenant == wasmkeep_server::IMPLICIT_APP_NAME,
-        "{actor} is of tenant {tenant}: name its app, as `--app {tenant}/APP {class}/{name}` \
-         (without --app, the actor is of the implicit app default/default)"
-    );
-    Ok((
-        (tenant, wasmkeep_server::IMPLICIT_APP_NAME.to_owned()),
-        class,
-        name,
-    ))
-}
-
-/// A warning for `actor move --app TENANT/APP TENANT/CLASS/NAME`, the
-/// syntax before `--app` with the tenant kept in front: it names class
-/// `TENANT`, which is allowed (a class may share its tenant's name) but
-/// most likely a mistake.
-fn move_target_warning(actor: &str, app: Option<&(String, String)>) -> Option<String> {
-    let (tenant, _) = app?;
-    let rest = actor.strip_prefix(tenant.as_str())?.strip_prefix('/')?;
-    rest.contains('/').then(|| {
-        format!(
-            "{actor} names class {tenant} of the app: with --app, the actor is CLASS/NAME. \
-             Did you mean {rest}?"
-        )
-    })
-}
-
-/// Why a live move target may not take the actor of `app` (`tenant/app`):
-/// the request is written anyway (the owner keeps the actor, or another
-/// node takes it).
-fn move_warnings(node: &wasmkeep_cluster::membership::NodeInfo, app: &str) -> Vec<String> {
+/// Why a live move target may not take the actor: the request is written
+/// anyway (the owner keeps the actor, or another node takes it).
+fn move_warnings(node: &wasmkeep_cluster::membership::NodeInfo, tenant: &str) -> Vec<String> {
     use wasmkeep_cluster::membership::DrainState;
     let mut warnings = Vec::new();
-    // A node serves one app (`tenant/app`; `default/default` for classes
-    // given on the command line); `tenant/` from the version before, empty
-    // from nodes that predate both.
-    if !node.app.is_empty() && node.app != app {
+    // A node serves one app (`tenant/app`) or a tenant's classes
+    // (`tenant/`); empty from nodes that predate it.
+    if !node.app.is_empty() && !node.app.starts_with(&format!("{tenant}/")) {
         warnings.push(format!(
-            "{} serves {}, not {app}: it refuses to take the actor",
+            "{} serves {}, not tenant {tenant}: it refuses to take the actor",
             node.id, node.app
         ));
     }
@@ -1765,9 +1713,7 @@ fn parse_bucket(url: &str) -> anyhow::Result<(&str, &str)> {
 mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
-    use super::{
-        load_env, migration_marker, move_target, move_target_warning, move_warnings, parse_bucket,
-    };
+    use super::{load_env, migration_marker, move_warnings, parse_bucket};
 
     #[tokio::test]
     async fn a_migrated_or_migrating_bucket_is_found() {
@@ -1811,40 +1757,6 @@ mod tests {
         );
     }
 
-    /// `actor move` names the actor's app with `--app`, or the implicit
-    /// app with `default/` in front (ADR 0022).
-    #[test]
-    fn a_moved_actor_is_named_within_its_app() {
-        let shop = ("acme".to_owned(), "shop".to_owned());
-        let owned = |t: &str, a: &str, c: &str, n: &str| {
-            ((t.to_owned(), a.to_owned()), c.to_owned(), n.to_owned())
-        };
-        assert_eq!(
-            move_target("room/lobby/1", Some(&shop)).unwrap(),
-            owned("acme", "shop", "room", "lobby/1")
-        );
-        assert_eq!(
-            move_target("default/room/x", None).unwrap(),
-            owned("default", "default", "room", "x")
-        );
-        let e = move_target("acme/room/x", None).unwrap_err().to_string();
-        assert!(e.contains("--app acme/APP room/x"), "{e}");
-        assert!(move_target("room", Some(&shop)).is_err());
-        assert!(move_target("room/", Some(&shop)).is_err());
-        assert!(move_target("default/room", None).is_err());
-    }
-
-    /// The tenant kept in front with `--app` (the syntax before it) parses
-    /// as a class named like the tenant: allowed, with a warning.
-    #[test]
-    fn a_tenant_kept_in_front_with_app_gets_a_warning() {
-        let shop = ("acme".to_owned(), "shop".to_owned());
-        let w = move_target_warning("acme/room/lobby", Some(&shop)).expect("a warning");
-        assert!(w.contains("room/lobby"), "{w}");
-        assert!(move_target_warning("room/lobby", Some(&shop)).is_none());
-        assert!(move_target_warning("default/room/x", None).is_none());
-    }
-
     /// A move target that cannot take the actor gets a warning saying why.
     #[test]
     fn a_move_target_that_cannot_take_it_gets_a_warning() {
@@ -1863,24 +1775,21 @@ mod tests {
             instance: None,
             lease: None,
         };
-        assert!(move_warnings(&node(true, Some(DrainState::Serving)), "acme/shop").is_empty());
-        assert!(move_warnings(&node(true, None), "acme/shop").is_empty());
-        // Another app's node, of the same tenant or not: it refuses the
-        // hop (ADR 0022).
-        for app in ["globex/shop", "acme/admin"] {
-            let other = move_warnings(&node(true, None), app);
-            assert!(
-                other.len() == 1 && other[0].contains(&format!("not {app}")),
-                "{other:?}"
-            );
-        }
-        let old = move_warnings(&node(false, None), "acme/shop");
+        assert!(move_warnings(&node(true, Some(DrainState::Serving)), "acme").is_empty());
+        assert!(move_warnings(&node(true, None), "acme").is_empty());
+        // Another tenant's node: warned about, since a move there crosses tenants.
+        let other = move_warnings(&node(true, None), "globex");
+        assert!(
+            other.len() == 1 && other[0].contains("not tenant globex"),
+            "{other:?}"
+        );
+        let old = move_warnings(&node(false, None), "acme");
         assert!(
             old.len() == 1 && old[0].contains("does not take moved actors"),
             "{old:?}"
         );
         for state in [DrainState::Draining, DrainState::Drained] {
-            let w = move_warnings(&node(true, Some(state)), "acme/shop");
+            let w = move_warnings(&node(true, Some(state)), "acme");
             assert!(w.len() == 1 && w[0].contains("is draining"), "{w:?}");
         }
     }
