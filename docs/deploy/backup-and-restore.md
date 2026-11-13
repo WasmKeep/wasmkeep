@@ -14,20 +14,25 @@ restored, how to restore it, and how to check that it works.
 
 ## What is in the bucket
 
-Everything under the prefix given to `--bucket s3://BUCKET/PREFIX`:
+Everything under the prefix given to `--bucket s3://BUCKET/PREFIX`. Each
+app's actor state is under its own root, `state/<tenant>/<app>/` (written
+`R` below; `default/default` for nodes started with `--actor`), from
+0.4.0 ([ADR 0022](../adr/0022-app-owned-state-and-the-one-time-migration.md)):
 
 | Keys | What | Written |
 | --- | --- | --- |
-| `actors/<tenant>/<class>/<name>/wal/` | One object for every write an actor committed (a segment) | Created once, never changed |
-| `actors/<tenant>/<class>/<name>/snapshot/` | The whole database, every 64 writes | Created once, never changed |
-| `owners/<tenant>/<class>/<name>` | Which node holds the actor, with a generation that grows by one at every hold | Replaced when the actor changes hands |
+| `R actors/<class>/<name>/wal/` | One object for every write an actor committed (a segment) | Created once, never changed |
+| `R actors/<class>/<name>/snapshot/` | The whole database, every 64 writes | Created once, never changed |
+| `R owners/<class>/<name>` | Which node holds the actor, with a generation that grows by one at every hold | Replaced when the actor changes hands |
 | `nodes/<id>` | Each node's heartbeat, which is its lease | Replaced every 3 s |
-| `alarms/<tenant>/...` | The index of pending alarms, by due time | Created and deleted as alarms change |
+| `R alarms/...` | The index of pending alarms, by due time | Created and deleted as alarms change |
+| `R moves/...` | Requests to move one actor (`actor move`) | By the operator; deleted when done or 5 minutes old |
 | `apps/<tenant>/<app>/<version>/` and `apps/<tenant>/<app>/current` | Deployed versions (components, access rules, configuration) and the pointer to the current one | Versions created once; `current` replaced by a deploy |
 | `apps/<tenant>/<app>/secrets/` | The app's secrets, sealed, and their own `current` | As above |
 | `cluster/secret` | The secret nodes sign their calls to each other with | Created once |
-| `control/` | Drain and move requests | By the operator's commands |
-| `leases/<tenant>/<class>/<name>` | One small marker per actor, written by the node that first takes it. It carries the generation the actor's first ownership record starts from, and keeps a binary from before node leases from taking the actor ([ADR 0020](../adr/0020-one-lease-per-node.md)) | Created once, never collected |
+| `control/drain/` | Drain requests | By the operator's commands |
+| `cluster/migration`, `cluster/migrated/<tenant>` | The lock of a running `cluster migrate`, and each migrated tenant's commit ([below](#migrating-to-040)) | By `cluster migrate` |
+| `R leases/<class>/<name>` | One small marker per actor, written by the node that first takes it. It carries the generation the actor's first ownership record starts from, and keeps a binary from before node leases from taking the actor ([ADR 0020](../adr/0020-one-lease-per-node.md)) | Created once, never collected |
 | `probe/` | The object a node's start check writes to test conditional writes | Deleted right after the check |
 
 History objects are deleted only by garbage collection, by the node that
@@ -245,3 +250,70 @@ it, and again after every WasmKeep upgrade:
 
 The drill reads every object only for the actors it requests. Until a
 verify command exists, the sample is the measure of the copy.
+
+## Migrating to 0.4.0
+
+0.4.0 keys each app's actor state under its own root,
+`state/<tenant>/<app>/`, where 0.2 and 0.3 keyed it by tenant alone
+(`actors/<tenant>/`, `owners/<tenant>/`, `leases/<tenant>/`,
+`alarms/<tenant>/` and `control/move/<tenant>/`)
+([ADR 0022](../adr/0022-app-owned-state-and-the-one-time-migration.md)).
+A bucket prefix that holds actor state is migrated once, offline, by
+`wasmkeep cluster migrate`; a node or `deploy` of 0.4.0 refuses an
+unmigrated tenant and prints the command.
+
+1. **Back up the bucket** ([above](#with-the-cluster-stopped-restorable)),
+   and keep that copy until the old keys are removed.
+2. **Freeze deploys and secret changes**, CI included.
+3. **Stop every node**: the service units, not just the processes. A
+   process its service manager restarts writes its lease again, and the
+   migration refuses, or aborts before committing.
+4. **Dry run**: `wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX`.
+   It writes nothing, and prints:
+   - the app each class goes to: the one app whose current version
+     deploys it; else the tenant's only app (`default/default` for the
+     tenant `default` with no app). A class two apps deploy, or one in no
+     app's current version when the tenant has several apps, needs
+     `--heir TENANT/APP`, with no default; the other apps start that class
+     empty;
+   - the node leases it sees, and whether each may still run (a node
+     stopped cleanly is quiet at once; a crashed or fenced one once its
+     lease is 16 s old, with the default timings);
+   - the objects per family, and an estimate of the time.
+5. **Apply**: the same command with `--apply` (and the same `--heir`). It
+   copies inside the bucket (no download), checks every copy, writes the
+   barriers that stop older binaries (token `3` in every app's `current`,
+   and a tombstone over every old ownership record), proves that no node
+   ran meanwhile, and commits each tenant. After a crash or an abort, run
+   it again: it resumes. Exit codes: 0 done, 1 refused or aborted with
+   nothing new committed, 2 some tenants committed and others not (run it
+   again).
+6. **Upgrade** every node to 0.4.0, **start** them all, and **check the
+   app**. At its first start a node puts its old local databases aside
+   (`<data_dir>/actors.pre-0.4/`), and restores each actor from the bucket
+   on its first wake; a node with no bucket (`dev`, `serve` alone) moves
+   them into its app's folder instead.
+
+**Rollback.** Until a node of any version starts on the migrated prefix,
+`wasmkeep cluster migrate --bucket ... --rollback` puts the old layout and
+the `current` tokens back, for the older binaries. **After the first
+start, the migration is one-way**: the rollback refuses, and the state
+stays where 0.4.0 reads it. The old keys stay in the bucket until a later
+release's `--remove-old` deletes them (the tombstones excepted).
+
+Notes:
+
+- Copies get a new last-modified time, so copied history is kept one more
+  `--history-retention-secs` before collection.
+- Lifecycle rules, access policies and backup scripts written for
+  `actors/<tenant>/` must move to `state/<tenant>/<app>/`.
+- A backup from before 0.4.0 restores into an empty prefix, then is
+  migrated. A backup synced without deleting over a migrated prefix leaves
+  both layouts: 0.4.0 reads only `state/`, and `cluster migrate` refuses a
+  tenant that has both with no migration in progress. Restore into an
+  empty prefix.
+- On a versioned bucket, the old keys keep their noncurrent versions until
+  the lifecycle rules expire them.
+- A node of 0.2 started on a migrated prefix with `--actor` answers 503 for
+  every migrated actor (its old record is a tombstone); an actor it
+  creates under the old keys is not seen by 0.4.0. Do not run it there.

@@ -11,6 +11,89 @@ The text under a version's heading is its GitHub release text
 
 Since 0.2.0, in no release yet.
 
+### App-owned state (for 0.4.0)
+
+These change the layout in the bucket and on disk; they supersede the
+second-app refusal and the migration guard listed under "What changed"
+below. See "Upgrading to 0.4.0" before starting a node of this version
+on a bucket that holds actor state.
+
+- **Each app's actor state lives under its own root,
+  `state/<tenant>/<app>/`**, beside `apps/<tenant>/<app>/`: history,
+  ownership records, old-lease markers, the alarm index and move requests
+  (`state/<t>/<a>/{actors,owners,leases,alarms,moves}/`). Each key keeps
+  its tail, byte for byte; only its front changes. On disk the databases
+  move to `<data_dir>/state/<t>/<a>/actors/`. Nodes given classes on the
+  command line (`serve --actor`, `dev`) keep theirs under the implicit app
+  `default/default`
+  ([ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md)).
+- **Two apps of one tenant share a bucket prefix safely.** The same class
+  and actor name in two apps are two actors. `deploy` no longer refuses a
+  second app of a tenant, `deploy` and `serve` no longer warn about apps
+  sharing a prefix, and a node no longer refuses to start next to a node
+  of another app. A node still refuses to start next to a live node of
+  the version before (its heartbeat names `tenant/`).
+- **`wasmkeep cluster migrate`** moves a bucket prefix written by 0.2 or
+  0.3 into the new layout, once, while every node is stopped. Without
+  `--apply` it is a dry run that writes nothing: it prints the app each
+  class goes to, the nodes it sees and whether they may still run, object
+  counts and an estimate. A class goes to the one app whose current
+  version deploys it; a class in no manifest goes to the tenant's only
+  app, or to `default/default` for the tenant `default` with no app; a
+  class two apps deploy, or a tenant with several apps, needs `--heir
+  TENANT/APP` (the other apps start that class empty). `--apply` copies
+  server-side, verifies, then puts barriers in front of older binaries
+  (token `3` in every app's `current`, a tombstone over every old
+  ownership record), proves that no node ran, and commits each tenant
+  (`cluster/migrated/<tenant>`). It refuses while a node may still run
+  and fences nothing; after a crash, run it again. `--rollback` undoes it
+  while no node of any version has started since; after that, it is
+  one-way. Nothing of the old layout is deleted yet (the next release
+  adds `--remove-old`). Exit codes: 0 done, 1 refused or aborted, 2
+  partly committed ([backup and restore](docs/deploy/backup-and-restore.md#migrating-to-040)).
+- **A node or command of this version checks the bucket before it writes
+  there**: it refuses while `cluster/migration` exists, and refuses a
+  tenant whose state is still in the layout before 0.4.0, printing the
+  command to run. `cluster status` reads on.
+- **Token `3` in `current`.** Every deploy and rollback of this version
+  writes it, as does `cluster migrate`; it means the app is marked (ADR
+  0013: rules come with deploys, nodes refuse `--access` with `--app`)
+  and its state is rooted. `serve --app` refuses a `current` without it:
+  run `cluster migrate --apply`, or deploy once with this version.
+  Versions before 0.4.0 cannot read it: their `serve --app` and `deploy`
+  stop.
+- **A node moves its local databases once, at start.** In a cluster the
+  bucket is the truth: `<data_dir>/actors/<tenant>` goes aside to
+  `<data_dir>/actors.pre-0.4/<tenant>`, and each actor restores from its
+  new root on its first wake. Alone (`dev`, `serve` without a cluster) the
+  local copy is the only one: it becomes the app's, if no app of the
+  tenant has local state yet; otherwise the start is refused. One rename,
+  never a copy; a file is left at the old path so an older binary fails
+  instead of starting empty. Both folders present is refused, never
+  merged.
+- **Moves** are listed under the node's own root; a move written by an
+  older `actor move` (`control/move/...`) is not read.
+
+### Upgrading to 0.4.0
+
+From 0.2.0 or 0.3.0, on a bucket prefix that holds actor state:
+
+1. Freeze deploys and secret changes (CI included).
+2. Stop every node: the service units, not just the processes.
+3. `wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX`: read the plan;
+   give `--heir` where it asks.
+4. Run it again with `--apply` (and the same `--heir`).
+5. Upgrade every node, start them all, and check the app.
+
+**One-way after the first start.** Until a node of any version starts,
+`cluster migrate --rollback` puts the old layout back for the older
+binaries. Once one has started, the migration is one-way; the old keys
+stay until `--remove-old` (next release). Keep a backup from before the
+migration until then. Lifecycle rules, access policies and backup
+scripts written for `actors/<tenant>/` must move to `state/<t>/<a>/`.
+Nodes that followed an app with `--access` and no deployed rules must
+deploy those rules (`deploy --access`) and start without `--access`.
+
 ### What changed
 
 - **Every hop between nodes names its app, and a node refuses another
