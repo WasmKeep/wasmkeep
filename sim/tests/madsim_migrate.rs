@@ -30,6 +30,13 @@
 //!   tombstone's condition fails, the run aborts, and the next run copies
 //!   the new generation.
 //! - **`--rollback` after a node ran** is refused, and changes nothing.
+//! - **`--remove-old`**: crashed after any request, then run again, it
+//!   ends with only the tombstones left of the old layout and nothing else
+//!   changed; it refuses while the rollback still works unless
+//!   acknowledged, and a rollback after its first delete is refused; it
+//!   refuses a key written after the commit, and an unfinished migration;
+//!   it never touches a tenant with no commit; it keeps history younger
+//!   than the retention window and moves not yet expired for a later run.
 //!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --test madsim_migrate --target-dir target/madsim`
 
@@ -42,9 +49,11 @@ use std::time::Duration;
 
 use madsim::runtime::Runtime;
 use wasmkeep_cluster::alarm_index::{self, Entry};
+use wasmkeep_cluster::control::MOVE_TTL_MS;
 use wasmkeep_cluster::lease::{Bucket, BucketError, Clock, Version};
 use wasmkeep_cluster::migrate::{
     self, AppInfo, COMMIT_PREFIX, LOCK_KEY, MigrateError, Migrator, ObjectMeta, Options, Pause,
+    REMOVED_PREFIX, Removal, RemoveOptions,
 };
 use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState, OwnerRecord, encode_marker};
 use wasmkeep_cluster::replication::{
@@ -1396,6 +1405,532 @@ fn a_started_rollback_finishes_whatever_ran_since() {
                 .await
                 .unwrap_or_else(|e| panic!("seed {seed}, crash at {i}: {e}"));
             assert_eq!(canonical(&sim.snapshot()), before, "seed {seed}");
+        });
+    }
+}
+
+// `--remove-old` (ADR 0022): deletes the old-layout keys of committed
+// tenants once rollback is over, and never anything else.
+
+/// History older than this may go (the fixture's is ten minutes old).
+const RETENTION_MS: u64 = 60_000;
+
+fn remove_options(forgo_rollback: bool) -> RemoveOptions {
+    RemoveOptions {
+        forgo_rollback,
+        history_retention_ms: RETENTION_MS,
+    }
+}
+
+async fn remove_old(sim: &Sim, forgo_rollback: bool) -> Result<Removal, MigrateError> {
+    Migrator::new(sim, &SimClock, apps(), options())
+        .remove_old(remove_options(forgo_rollback))
+        .await
+}
+
+/// A node of this version ran on the migrated prefix and stopped: the
+/// rollback is one-way from here.
+fn a_node_ran(sim: &Sim) {
+    sim.write(
+        "nodes/node-new",
+        NodeLeaseObject {
+            state: NodeState::Released,
+            instance: Some("nn".into()),
+            written_at_ms: Sim::now(),
+        }
+        .encode(),
+    );
+}
+
+/// What `--remove-old` never touches: everything but the old layout's
+/// actor state, and the tombstones in it.
+fn untouchable(m: &Map) -> BTreeMap<String, Vec<u8>> {
+    m.iter()
+        .filter(|(k, _)| {
+            !["actors/", "leases/", "alarms/", "control/move/"]
+                .iter()
+                .any(|p| k.starts_with(p))
+        })
+        .map(|(k, o)| (k.clone(), o.body.clone()))
+        .collect()
+}
+
+/// The end state of a finished `--remove-old` over `before` (a migrated
+/// bucket): no old-layout key of the migrated tenants is left but the
+/// tombstones, and nothing else changed (the commits aside, the marks
+/// added).
+fn check_removed(seed: u64, m: &Map, before: &Map) {
+    for family in [
+        Family::History,
+        Family::Leases,
+        Family::Alarms,
+        Family::Moves,
+    ] {
+        for t in ["acme", "default"] {
+            let base = format!("{}/{t}/", family.bare());
+            assert!(
+                !m.keys().any(|k| k.starts_with(&base)),
+                "seed {seed}: {base} left"
+            );
+        }
+    }
+    for a in actors() {
+        let body = &m.get(&a.bare(Family::Owners)).expect("tombstone").body;
+        assert_eq!(
+            migrate::tombstone_target(body),
+            Some(a.rooted(Family::Owners).as_str()),
+            "seed {seed}: {}",
+            a.name
+        );
+    }
+    let mut want = untouchable(before);
+    for t in ["acme", "default"] {
+        want.insert(format!("{REMOVED_PREFIX}{t}"), Vec::new());
+    }
+    let got: BTreeMap<String, Vec<u8>> = untouchable(m)
+        .into_iter()
+        .map(|(k, b)| {
+            if k.starts_with(REMOVED_PREFIX) {
+                (k, Vec::new())
+            } else {
+                (k, b)
+            }
+        })
+        .collect();
+    assert_eq!(got, want, "seed {seed}: something else changed");
+}
+
+/// A migrated bucket on which a node then ran.
+async fn migrated(sim: &Sim) {
+    apply(sim).await.unwrap();
+    madsim::time::sleep(Duration::from_secs(1)).await;
+    a_node_ran(sim);
+}
+
+/// `--remove-old` crashed after request `i` (`None`: no crash), then run
+/// again: the clean end state. Gives the clean run's requests.
+fn remove_with_crash(seed: u64, i: Option<u64>) -> u64 {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        migrated(&sim).await;
+        let before = sim.snapshot();
+        let ops = *sim.ops.lock().unwrap();
+        *sim.crash_after.lock().unwrap() = i.map(|i| ops + i);
+        let first = remove_old(&sim, false).await;
+        let used = *sim.ops.lock().unwrap() - ops;
+        *sim.crash_after.lock().unwrap() = None;
+        if let Err(e) = &first {
+            assert!(i.is_some(), "seed {seed}: {e}");
+            // Whatever it deleted, nothing else changed meanwhile.
+            let m = sim.snapshot();
+            let kept: BTreeMap<String, Vec<u8>> = untouchable(&m)
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with(REMOVED_PREFIX))
+                .collect();
+            assert_eq!(kept, untouchable(&before), "seed {seed}, crash at {i:?}");
+            remove_old(&sim, false)
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}, crash at {i:?}: {e}"));
+        }
+        check_removed(seed, &sim.snapshot(), &before);
+        // A third run: nothing left to delete.
+        let again = remove_old(&sim, false).await.unwrap();
+        assert!(
+            again.tenants.values().all(|t| t.delete.is_empty()),
+            "seed {seed}: {again:?}"
+        );
+        // And the rollback is refused, changing nothing.
+        let m = sim.snapshot();
+        assert!(
+            matches!(rollback(&sim).await, Err(MigrateError::Refused(_))),
+            "seed {seed}"
+        );
+        assert_eq!(canonical(&sim.snapshot()), canonical(&m), "seed {seed}");
+        used
+    })
+}
+
+#[test]
+fn a_remove_old_crashed_anywhere_then_run_again_ends_in_the_clean_state() {
+    let ops = remove_with_crash(4, None);
+    for i in 0..=ops {
+        remove_with_crash(4, Some(i));
+    }
+    for seed in 0..seeds() {
+        let ops = remove_with_crash(seed, None);
+        remove_with_crash(seed, Some(Rng::new(seed ^ 0x0dd).below(ops + 1)));
+    }
+}
+
+#[test]
+fn a_remove_old_while_the_rollback_is_open_needs_the_acknowledgement() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Sim::new(seed, fixture());
+            apply(&sim).await.unwrap();
+            let before = sim.snapshot();
+            // No node ran: the rollback still works, so it refuses.
+            match remove_old(&sim, false).await {
+                Err(MigrateError::Refused(why)) => {
+                    assert!(why.concat().contains("--forgo-rollback"), "{why:?}");
+                }
+                other => panic!("seed {seed}: {other:?}"),
+            }
+            assert_eq!(canonical(&sim.snapshot()), canonical(&before));
+            // Acknowledged, crashed somewhere or not: from its first
+            // delete, the rollback is refused and changes nothing.
+            let ops = *sim.ops.lock().unwrap();
+            let crash = Rng::new(seed ^ 0xac).below(60);
+            *sim.crash_after.lock().unwrap() = Some(ops + crash);
+            let first = remove_old(&sim, true).await;
+            *sim.crash_after.lock().unwrap() = None;
+            let m = sim.snapshot();
+            let deleted = before.keys().any(|k| !m.contains_key(k));
+            match rollback(&sim).await {
+                Err(MigrateError::Refused(why)) => {
+                    assert!(why.concat().contains("one-way"), "seed {seed}: {why:?}");
+                    assert_eq!(canonical(&sim.snapshot()), canonical(&m), "seed {seed}");
+                }
+                Ok(_) => {
+                    // Only before its mark, and so before any delete.
+                    assert!(
+                        !deleted,
+                        "seed {seed}: rolled back after deletes ({first:?})"
+                    );
+                    assert_eq!(
+                        canonical(&sim.snapshot()),
+                        canonical(&fixture_after_rollback()),
+                        "seed {seed}"
+                    );
+                    return;
+                }
+                Err(e) => panic!("seed {seed}: {e}"),
+            }
+            remove_old(&sim, true)
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            check_removed(seed, &sim.snapshot(), &before);
+        });
+    }
+}
+
+/// The fixture as a rollback leaves it: byte for byte the bare layout.
+fn fixture_after_rollback() -> Map {
+    fixture()
+}
+
+#[test]
+fn a_key_written_after_the_commit_refuses_the_removal() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let mut rng = Rng::new(seed ^ 0x1a7e);
+            let sim = Sim::new(seed, fixture());
+            migrated(&sim).await;
+            madsim::time::sleep(Duration::from_secs(1)).await;
+            // An old binary ran after the migration: a brand-new actor
+            // under the old keys (a record, not a tombstone), or a late
+            // segment of a migrated one, or a late alarm entry.
+            let a = actors()[usize::try_from(rng.below(6)).unwrap()].clone();
+            let late = match rng.below(3) {
+                0 => {
+                    let mut new = a.clone();
+                    new.name = format!("new-{seed}");
+                    new.segment = new.name.clone();
+                    sim.write(&new.bare(Family::Owners), new.record());
+                    sim.write(&new.bare(Family::Leases), encode_marker(1));
+                    new.bare(Family::Owners)
+                }
+                1 => {
+                    let key = format!("{}/wal/late-{seed}.ltx", a.bare(Family::History));
+                    sim.write(&key, b"late".to_vec());
+                    key
+                }
+                _ => {
+                    let key = format!("{}x", a.bare(Family::Alarms));
+                    sim.write(&key, Vec::new());
+                    key
+                }
+            };
+            let before = sim.snapshot();
+            match remove_old(&sim, false).await {
+                Err(MigrateError::Refused(why)) => {
+                    assert!(why.concat().contains(&late), "seed {seed}: {why:?}");
+                }
+                other => panic!("seed {seed}: {other:?}"),
+            }
+            assert_eq!(
+                canonical(&sim.snapshot()),
+                canonical(&before),
+                "seed {seed}: deleted although refused"
+            );
+            // The dry run names it too, and writes nothing.
+            let dry = Migrator::new(&sim, &SimClock, apps(), options())
+                .removal(remove_options(false))
+                .await
+                .unwrap();
+            assert!(dry.refusals.concat().contains(&late), "seed {seed}");
+            assert_eq!(canonical(&sim.snapshot()), canonical(&before));
+        });
+    }
+}
+
+#[test]
+fn a_tenant_not_migrated_is_never_touched() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Sim::new(seed, fixture());
+            migrated(&sim).await;
+            // A tenant with old-layout state and no commit (an old binary
+            // created it after the migration): listed, left alone.
+            let mut stray = actors()[0].clone();
+            stray.tenant = "stray";
+            for (key, body) in history(&stray) {
+                sim.write(&format!("{}/{key}", stray.bare(Family::History)), body);
+            }
+            sim.write(&stray.bare(Family::Owners), stray.record());
+            sim.write(&stray.bare(Family::Leases), encode_marker(1));
+            sim.write(&stray.bare(Family::Moves), Vec::new());
+            let before = sim.snapshot();
+            let done = remove_old(&sim, false)
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            assert_eq!(done.skipped, ["stray"], "seed {seed}");
+            let m = sim.snapshot();
+            for (k, o) in before.iter().filter(|(k, _)| k.contains("/stray/")) {
+                assert_eq!(m.get(k).map(|o| &o.body), Some(&o.body), "seed {seed}: {k}");
+            }
+            check_removed(seed, &m, &before);
+        });
+    }
+}
+
+/// `--apply` crashed after request `i`; `--remove-old` then. `true` if
+/// that left one tenant committed and the other not (the lock held), and
+/// the removal was refused, changing nothing.
+fn remove_after_half_a_migration(seed: u64, i: u64) -> bool {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        *sim.crash_after.lock().unwrap() = Some(i);
+        let _ = apply(&sim).await;
+        *sim.crash_after.lock().unwrap() = None;
+        let m = sim.snapshot();
+        let commits = m.keys().filter(|k| k.starts_with(COMMIT_PREFIX)).count();
+        if commits != 1 || !m.contains_key(LOCK_KEY) {
+            return false;
+        }
+        a_node_ran(&sim);
+        let before = sim.snapshot();
+        match remove_old(&sim, true).await {
+            Err(MigrateError::Refused(why)) => {
+                assert!(why.concat().contains(LOCK_KEY), "seed {seed}: {why:?}");
+            }
+            other => panic!("seed {seed}, crash at {i}: {other:?}"),
+        }
+        assert_eq!(
+            canonical(&sim.snapshot()),
+            canonical(&before),
+            "seed {seed}"
+        );
+        true
+    })
+}
+
+#[test]
+fn an_unfinished_migration_refuses_the_removal() {
+    for seed in 0..seeds() {
+        let (ops, _) = clean(seed);
+        let hits = (ops.saturating_sub(12)..=ops)
+            .filter(|i| remove_after_half_a_migration(seed, *i))
+            .count();
+        assert!(
+            hits > 0,
+            "seed {seed}: no crash point between the two commits"
+        );
+    }
+}
+
+#[test]
+fn young_history_and_live_moves_are_kept_for_a_later_run() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let mut m = fixture();
+            // One actor's last writes and its move are recent.
+            let recent = actors()[usize::try_from(seed % 6).unwrap()].clone();
+            for (k, o) in &mut m {
+                if k.starts_with(&format!("{}/", recent.bare(Family::History)))
+                    || *k == recent.bare(Family::Moves)
+                {
+                    o.written = EPOCH_MS - 10_000;
+                }
+            }
+            let sim = Sim::new(seed, m);
+            migrated(&sim).await;
+            let before = sim.snapshot();
+            let done = remove_old(&sim, false).await.unwrap();
+            let t = &done.tenants[recent.tenant];
+            assert!(
+                t.young_history > 0 && t.live_moves == 1,
+                "seed {seed}: {t:?}"
+            );
+            let m = sim.snapshot();
+            assert!(m.contains_key(&recent.bare(Family::Moves)), "seed {seed}");
+            assert!(
+                m.keys()
+                    .any(|k| k.starts_with(&format!("{}/", recent.bare(Family::History)))),
+                "seed {seed}"
+            );
+            // Later, a second run deletes the rest.
+            madsim::time::sleep(Duration::from_millis(RETENTION_MS.max(MOVE_TTL_MS))).await;
+            remove_old(&sim, false).await.unwrap();
+            check_removed(seed, &sim.snapshot(), &before);
+        });
+    }
+}
+
+#[test]
+fn a_rollback_racing_an_acknowledged_remove_old_never_loses_state() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Arc::new(Sim::new(seed, fixture()));
+            apply(&sim).await.unwrap();
+            let migrated = sim.snapshot();
+            let delay = Rng::new(seed ^ 0x7ace).below(200);
+            let remove = {
+                let sim = Arc::clone(&sim);
+                madsim::task::spawn(async move { remove_old(&sim, true).await.map(drop) })
+            };
+            let back = {
+                let sim = Arc::clone(&sim);
+                madsim::task::spawn(async move {
+                    madsim::time::sleep(Duration::from_millis(delay)).await;
+                    rollback(&sim).await.map(drop)
+                })
+            };
+            let (r, b) = (remove.await.unwrap(), back.await.unwrap());
+            let m = sim.snapshot();
+            let deleted = migrated
+                .keys()
+                .any(|k| !k.starts_with("cluster/") && !m.contains_key(k));
+            if b.is_ok() {
+                // Rolled back: then nothing of the old layout went.
+                assert_eq!(
+                    canonical(&m),
+                    canonical(&fixture()),
+                    "seed {seed} (at {delay}): rolled back over deletes ({r:?})"
+                );
+            } else {
+                // Not rolled back: the roots are whole, and deletes, if
+                // any, only of the old layout.
+                let roots = |m: &Map| -> BTreeMap<String, Vec<u8>> {
+                    m.iter()
+                        .filter(|(k, _)| k.starts_with("state/"))
+                        .map(|(k, o)| (k.clone(), o.body.clone()))
+                        .collect()
+                };
+                assert_eq!(
+                    roots(&m),
+                    roots(&migrated),
+                    "seed {seed} (at {delay}): {b:?}"
+                );
+                assert!(
+                    m.keys().any(|k| k.starts_with(COMMIT_PREFIX)) || !deleted,
+                    "seed {seed} (at {delay}): {r:?} {b:?}"
+                );
+            }
+        });
+    }
+}
+
+/// `--remove-old` with the rollback given up, while a rollback runs to the
+/// end between its listing and its lock read (`k`: the request, counted
+/// from the end of the listing, before which the rollback is done): it
+/// stops, deleting nothing, and a later `--apply` makes the rollback work
+/// again.
+fn a_rollback_done_before_the_lock_read(seed: u64, k: u64) {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        apply(&sim).await.unwrap();
+        // The dry run makes the same reads, and writes nothing.
+        let ops = *sim.ops.lock().unwrap();
+        Migrator::new(&sim, &SimClock, apps(), options())
+            .removal(remove_options(true))
+            .await
+            .unwrap();
+        let now = *sim.ops.lock().unwrap();
+        let reads = now - ops;
+        sim.hooks.lock().unwrap().insert(
+            now + reads + k,
+            vec![Box::new(|m: &mut Map, _| *m = fixture_after_rollback())],
+        );
+        let r = remove_old(&sim, true).await;
+        assert!(
+            matches!(r, Err(MigrateError::Aborted(_))),
+            "seed {seed}, k {k}: {r:?}"
+        );
+        let bare = |m: &Map| -> BTreeMap<String, Vec<u8>> {
+            canonical(m)
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with("cluster/"))
+                .collect()
+        };
+        assert_eq!(
+            bare(&sim.snapshot()),
+            bare(&fixture()),
+            "seed {seed}, k {k}: deleted the only copy"
+        );
+        // Nothing was deleted: migrated again, the rollback still works.
+        apply(&sim).await.unwrap();
+        rollback(&sim)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}, k {k}: {e}"));
+        assert_eq!(
+            canonical(&sim.snapshot()),
+            canonical(&fixture()),
+            "seed {seed}, k {k}"
+        );
+    });
+}
+
+#[test]
+fn a_rollback_done_before_the_lock_read_stops_the_removal() {
+    // Two tenants: their two marks, then the lock read.
+    for k in 1..=3 {
+        a_rollback_done_before_the_lock_read(4, k);
+    }
+    for seed in 0..seeds() {
+        a_rollback_done_before_the_lock_read(seed, 1 + seed % 3);
+    }
+}
+
+#[test]
+fn a_remove_old_with_nothing_to_delete_writes_no_mark() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Sim::new(seed, fixture());
+            migrated(&sim).await;
+            remove_old(&sim, false).await.unwrap();
+            for t in ["acme", "default"] {
+                sim.objects
+                    .lock()
+                    .unwrap()
+                    .remove(&format!("{REMOVED_PREFIX}{t}"));
+            }
+            let again = remove_old(&sim, false).await.unwrap();
+            assert_eq!(again.deletes(), 0, "seed {seed}");
+            let m = sim.snapshot();
+            assert!(
+                !m.keys().any(|k| k.starts_with(REMOVED_PREFIX)),
+                "seed {seed}: wrote a mark for nothing"
+            );
         });
     }
 }

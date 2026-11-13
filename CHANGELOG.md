@@ -76,9 +76,32 @@ on a bucket that holds actor state.
   nothing; after a crash, run it again. Two runs at once stop each other
   before either commits a state the other undid. `--rollback` undoes it
   while no node of any version has started and no app was deployed
-  since; after that, it is one-way. Nothing of the old layout is deleted:
-  `--remove-old` is not built yet. Exit codes: 0 done, 1 refused or aborted, 2
-  partly committed ([backup and restore](docs/deploy/backup-and-restore.md#migrating-to-040)).
+  since; after that, it is one-way. Nothing of the old layout is deleted
+  by it. Exit codes: 0 done, 1 refused or aborted, 2
+  partly committed ([upgrading to 0.4.0](docs/deploy/upgrading-to-0.4.md)).
+- **`wasmkeep cluster migrate --remove-old`** deletes what a migration left
+  in the layout before 0.4.0, for every migrated tenant: a dry run that
+  lists it, then `--remove-old --apply`. It keeps the tombstones over the
+  old ownership records for good, history younger than
+  `--history-retention-secs` (3600 by default) and move requests not yet
+  expired (5 minutes) for a later run, and never touches `state/`,
+  `apps/`, `nodes/` or a tenant with no commit. It refuses while a run of
+  migrate is unfinished, while the rollback would still work (no node
+  started since; `--forgo-rollback` gives it up), and on any old-layout
+  key written after the commit, an old record that is not a tombstone or
+  history with no tombstone (a binary before 0.4.0 ran on the prefix),
+  naming each key. Before its first delete it writes
+  `cluster/removed/<tenant>`, after which `--rollback` refuses for good;
+  a tenant with nothing to delete gets none. It stops, deleting nothing,
+  if a `--rollback` or `--apply` ran meanwhile. It can be run again after
+  a crash.
+- **`actor move` runs the start check `serve` runs**: it refuses a tenant
+  whose state is still in the layout before 0.4.0, printing the migrate
+  command, instead of writing a request no node reads.
+- **`wasmkeep_admission_refused_total` counts wrong-app hops** under their
+  own reason, `wrong_app`: a hop from another node or a forwarded request
+  naming another app (503 "not this app's node"), or no app (a node of an
+  older version). The page now has five series.
 - **`serve` and `deploy` of this version check the bucket before they
   write there**: they refuse while `cluster/migration` exists, and refuse
   a tenant whose state is still in the layout before 0.4.0, printing the
@@ -108,26 +131,34 @@ on a bucket that holds actor state.
 
 ### Upgrading to 0.4.0
 
-From 0.2.0 or 0.3.0, on a bucket prefix that holds actor state:
+From 0.3.0, on a bucket prefix that holds actor state (a prefix last run
+by 0.2.0 has the same layout and takes the same steps; read the notes
+under 0.3.0 for the rest of that upgrade):
 
-1. Freeze deploys and secret changes (CI included).
-2. Stop every node: the service units, not just the processes.
-3. `wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX`: read the plan;
+1. Freeze deploys, secret changes, `actor move` and drains (CI
+   included).
+2. Stop every node: the service units, not just the processes. Then back
+   up the bucket.
+3. Install 0.4.0 on every node, without starting it.
+4. `wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX`: read the plan;
    give `--heir` where it asks.
-4. Run it again with `--apply` (and the same `--heir`).
-5. Upgrade every node, start them all, and check the app.
+5. Run it again with `--apply` (and the same `--heir`).
+6. Start every node, and check the app.
+7. The same day: `cluster migrate --remove-old`, then `--remove-old
+   --apply`.
 
-**One-way after the first start.** Until a node of any version starts,
-`cluster migrate --rollback` puts the old layout back for the older
-binaries. Once one has started, the migration is one-way; the old keys
-stay in the bucket (`--remove-old`, which deletes them, is not built
-yet). Keep a backup from before the
-migration until then. Lifecycle rules, access policies and backup
+The whole procedure is in [upgrading to
+0.4.0](docs/deploy/upgrading-to-0.4.md). **One-way after the first
+start.** Until a node of any version starts, `cluster migrate
+--rollback` puts the old layout back for the older binaries. Once one
+has started, the migration is one-way; the old keys stay in the bucket
+until `--remove-old --apply`. Keep a backup from before the migration
+until then. Lifecycle rules, access policies and backup
 scripts written for `actors/<tenant>/` must move to `state/<t>/<a>/`.
 Nodes that followed an app with `--access` and no deployed rules must
 deploy those rules (`deploy --access`) and start without `--access`.
 
-Also when upgrading from 0.3.0, with or without actor state:
+With or without actor state:
 
 - Stop every node of a cluster, upgrade them all, start them all
   ([upgrading](docs/cluster.md#upgrading-wasmkeep)): nodes of this

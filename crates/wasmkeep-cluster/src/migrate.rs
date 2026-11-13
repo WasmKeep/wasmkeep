@@ -19,8 +19,9 @@
 //! 2. **Lock**: `cluster/migration`, with the plan, each app's `current`
 //!    token as found, and the `nodes/` listing the plan judged.
 //! 3. **Copy** server-side. History objects are create-only: skipped when
-//!    already there. Records, markers, alarms and moves are copied every
-//!    time; a bare record already replaced by a tombstone is not (its copy
+//!    already there. Records, markers and alarms are copied every
+//!    time (moves are not copied: see [`COPIED`]); a bare record already
+//!    replaced by a tombstone is not (its copy
 //!    was made and verified before the tombstone was written).
 //! 4. **Verify**: list the source again until it is unchanged; compare
 //!    each mutable object byte for byte; check that a restore plan on the
@@ -36,8 +37,11 @@
 //! 7. **Commit** `cluster/migrated/<tenant>`, then unlock.
 //!
 //! [`Migrator::rollback`] undoes it while no node of any version has run
-//! since (the `nodes/` listing is the one recorded). [`start_check`] is
-//! what a node or a command of this version checks before any write.
+//! since (the `nodes/` listing is the one recorded). [`Migrator::remove_old`]
+//! later deletes the old layout of each committed tenant but its
+//! tombstones, once the rollback is over (or given up), and makes it
+//! refuse for good. [`start_check`] is what a node or a command of this
+//! version checks before any write.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -57,6 +61,10 @@ pub const LOCK_KEY: &str = "cluster/migration";
 /// A tenant's commit, `cluster/migrated/<tenant>`: from it on, the roots
 /// are the truth for the tenant. Reserved since 0.3.0 too.
 pub const COMMIT_PREFIX: &str = "cluster/migrated/";
+/// A tenant's removal mark, `cluster/removed/<tenant>`, created by
+/// `--remove-old` before its first delete: from it on, `--rollback`
+/// refuses for good (the old layout is no longer whole).
+pub const REMOVED_PREFIX: &str = "cluster/removed/";
 /// The third token of an app's `current` once its state is rooted.
 pub const ROOTED_TOKEN: &str = "3";
 /// The first line of a tombstone over a bare ownership record. Older
@@ -72,7 +80,7 @@ const APPS: &str = "apps/";
 /// The families a run copies. Moves (`control/move/`) are not: they are
 /// transient intents with a 5-minute lifetime measured from their
 /// last-modified time, which a copy would renew; they stay in the old
-/// layout for `--remove-old`.
+/// layout, where `--remove-old` deletes them once expired.
 pub const COPIED: [Family; 4] = [
     Family::History,
     Family::Owners,
@@ -89,6 +97,50 @@ pub const MAX_KEY_BYTES: usize = 1024;
 const MAX_ROUNDS: usize = 4;
 /// Attempts at a `current` whose conditional write keeps conflicting.
 const TOKEN_ATTEMPTS: usize = 8;
+
+/// How `--remove-old` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveOptions {
+    /// Delete even while `--rollback` still works (no node has started
+    /// since the migration): the operator gives the rollback up.
+    pub forgo_rollback: bool,
+    /// Old-layout history younger than this (`--history-retention-secs`)
+    /// is kept for a later run, as collection keeps it (ADR 0012).
+    pub history_retention_ms: u64,
+}
+
+/// What `--remove-old` deletes (or would) for one migrated tenant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantRemoval {
+    /// The old-layout keys to delete.
+    pub delete: Vec<String>,
+    /// History objects kept: younger than the retention window.
+    pub young_history: usize,
+    /// Move requests kept: not expired yet.
+    pub live_moves: usize,
+    /// Tombstones over the old ownership records, kept for good.
+    pub tombstones: usize,
+    /// Whether `--rollback` would still work (no node ran since).
+    pub rollback_open: bool,
+}
+
+/// What `--remove-old` does (or would), and what refuses it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Removal {
+    /// Every migrated tenant with old-layout keys left.
+    pub tenants: BTreeMap<String, TenantRemoval>,
+    /// Tenants with old-layout keys and no commit: never touched.
+    pub skipped: Vec<String>,
+    /// The reasons to refuse: nothing is deleted while there is one.
+    pub refusals: Vec<String>,
+}
+
+impl Removal {
+    /// Keys to delete, in all.
+    pub fn deletes(&self) -> usize {
+        self.tenants.values().map(|t| t.delete.len()).sum()
+    }
+}
 
 /// One listed object.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -539,7 +591,7 @@ pub enum StartRefusal {
         "tenant {0} has actor state in the layout of a version before 0.4.0 ({1} exists) and \
          this bucket prefix was not migrated: stop every node, then run `wasmkeep cluster \
          migrate --bucket <this bucket>` (a dry run) and `--apply` \
-         (docs/deploy/backup-and-restore.md, Migrating to 0.4.0)"
+         (docs/deploy/upgrading-to-0.4.md)"
     )]
     Unmigrated(String, String),
     /// The bucket could not be read.
@@ -1380,6 +1432,16 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 outcome.failed.push((tenant.clone(), lost.to_string()));
                 break;
             }
+            // A mark with no commit is from a `--remove-old` that stopped
+            // before deleting (the commit it planned against was rolled
+            // back): it would refuse this commit's rollback for nothing.
+            // A `--remove-old` still running sees this run's commit, not
+            // its own, and stops too. A failure leaves the tenant for the
+            // next run, as a failed commit does.
+            if let Err(e) = self.clear_stale_mark(tenant, &key).await {
+                outcome.failed.push((tenant.clone(), e.to_string()));
+                continue;
+            }
             match self.store.create(&key, commit.encode(COMMIT_HEADER)).await {
                 Ok(_) => outcome.committed.push(tenant.clone()),
                 // A re-run after a crash between the write and its answer.
@@ -1928,9 +1990,35 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 .delete(&key)
                 .await
                 .map_err(bucket(format!("deleting {key}")))?;
+            // A mark only a `--remove-old` that saw this lock wrote: it
+            // stopped before deleting anything.
+            let mark = format!("{REMOVED_PREFIX}{tenant}");
+            self.store
+                .delete(&mark)
+                .await
+                .map_err(bucket(format!("deleting {mark}")))?;
         }
         self.release(&held).await?;
         Ok(tenants.into_iter().collect())
+    }
+
+    /// Deletes tenant `tenant`'s `--remove-old` mark if it has no commit
+    /// at `key` (read, not listed: a commit a listing left out keeps it).
+    async fn clear_stale_mark(&self, tenant: &str, key: &str) -> Result<(), MigrateError> {
+        if self
+            .store
+            .get(key)
+            .await
+            .map_err(bucket(format!("reading {key}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mark = format!("{REMOVED_PREFIX}{tenant}");
+        self.store
+            .delete(&mark)
+            .await
+            .map_err(bucket(format!("deleting {mark}")))
     }
 
     /// Why a rollback is now one-way, if it is: a `nodes/` change since
@@ -1956,6 +2044,18 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             return Ok(one_way(format!("{changed} has run")));
         }
         for (tenant, (c, _, committed_ms)) in commits {
+            let mark = format!("{REMOVED_PREFIX}{tenant}");
+            if self
+                .store
+                .get(&mark)
+                .await
+                .map_err(bucket(format!("reading {mark}")))?
+                .is_some()
+            {
+                return Ok(one_way(format!(
+                    "--remove-old started deleting tenant {tenant}'s old layout"
+                )));
+            }
             if c.nodes != recorded {
                 return Ok(one_way(format!(
                     "a node has run (since tenant {tenant}'s commit)"
@@ -2041,6 +2141,273 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 .map_err(bucket(format!("putting back {}", meta.key)))
         })
         .await
+    }
+
+    /// `--remove-old` as a dry run: what it would delete, and what refuses
+    /// it. Reads only.
+    pub async fn removal(&self, options: RemoveOptions) -> Result<Removal, MigrateError> {
+        Ok(self.planned_removal(options).await?.0)
+    }
+
+    /// [`Self::removal`], with the commit of each tenant it plans for.
+    async fn planned_removal(
+        &self,
+        options: RemoveOptions,
+    ) -> Result<(Removal, BTreeMap<String, Record>), MigrateError> {
+        let mut out = Removal::default();
+        let mut planned = BTreeMap::new();
+        if let Some((lock, _)) = self.read_record(LOCK_KEY, LOCK_HEADER).await? {
+            let flag = match lock.mode {
+                LockMode::Apply => "--apply",
+                LockMode::Rollback => "--rollback",
+            };
+            out.refusals.push(format!(
+                "{LOCK_KEY} exists: a `wasmkeep cluster migrate {flag}` is unfinished; run it \
+                 again to the end first"
+            ));
+        }
+        let commits = self.commits().await?;
+        let mut tenants = self.bare_tenants().await?;
+        tenants.extend(
+            self.store
+                .list_dirs(&format!("{}/", Family::Moves.bare()))
+                .await
+                .map_err(bucket(format!("listing {}/", Family::Moves.bare())))?,
+        );
+        let now = self.clock.now_ms();
+        for tenant in tenants {
+            let Some(commit) = commits.get(&tenant) else {
+                out.skipped.push(tenant);
+                continue;
+            };
+            let single = BTreeMap::from([(tenant.clone(), commit.clone())]);
+            let (t, refusals) = self
+                .tenant_removal(&tenant, commit, &single, now, options)
+                .await?;
+            out.refusals.extend(refusals);
+            planned.insert(tenant.clone(), commit.0.clone());
+            out.tenants.insert(tenant, t);
+        }
+        Ok((out, planned))
+    }
+
+    /// [`Self::removal`] for one migrated tenant.
+    async fn tenant_removal(
+        &self,
+        tenant: &str,
+        (commit, _, committed_ms): &Commit,
+        single: &BTreeMap<String, Commit>,
+        now: u64,
+        options: RemoveOptions,
+    ) -> Result<(TenantRemoval, Vec<String>), MigrateError> {
+        let mut t = TenantRemoval {
+            rollback_open: self.ran_since(&commit.nodes, single).await?.is_none(),
+            ..TenantRemoval::default()
+        };
+        let mut refusals = Vec::new();
+        if t.rollback_open && !options.forgo_rollback {
+            refusals.push(format!(
+                "tenant {tenant} can still be rolled back (no node has started since its \
+                 migration, nothing was deployed): start the nodes of this version and check \
+                 the app first, or pass --forgo-rollback to give the rollback up"
+            ));
+        }
+        let listed = |family: Family| {
+            let base = format!("{}/{tenant}/", family.bare());
+            async move {
+                let found = self
+                    .store
+                    .list(&base)
+                    .await
+                    .map_err(bucket(format!("listing {base}")))?;
+                Ok::<_, MigrateError>((base, found))
+            }
+        };
+        // The tombstones, kept: each names the actor's new key. Anything
+        // else there is a record an older binary wrote after the barrier.
+        let (base, owners) = listed(Family::Owners).await?;
+        // Read `concurrency` at a time: whether each is a tombstone
+        // (`None`: gone since the listing).
+        let kinds = std::sync::Mutex::new(BTreeMap::new());
+        each(&owners, self.options.concurrency, |meta| {
+            let kinds = &kinds;
+            async move {
+                let body = self
+                    .store
+                    .get(&meta.key)
+                    .await
+                    .map_err(bucket(format!("reading {}", meta.key)))?;
+                let kind = body.map(|(b, _)| tombstone_target(&b).is_some());
+                kinds
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(meta.key.clone(), kind);
+                Ok(())
+            }
+        })
+        .await?;
+        let kinds = kinds
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tombstoned = BTreeSet::new();
+        for meta in &owners {
+            let tail = meta.key.strip_prefix(&base).unwrap_or_default();
+            match kinds.get(&meta.key).copied().flatten() {
+                None => {}
+                Some(true) => {
+                    t.tombstones += 1;
+                    tombstoned.insert(tail.to_owned());
+                }
+                Some(false) => refusals.push(format!(
+                    "{} is an ownership record, not a tombstone: a binary of a version before \
+                     0.4.0 created that actor after the migration, and 0.4.0 does not see it. \
+                     Move its keys out of this prefix (or keep them elsewhere) and run this \
+                     again",
+                    meta.key
+                )),
+            }
+        }
+        // History, markers and alarms: each copied by the run that
+        // committed (its class has an heir there), none written since.
+        for family in [Family::History, Family::Leases, Family::Alarms] {
+            let (base, found) = listed(family).await?;
+            for meta in found {
+                let tail = meta.key.strip_prefix(&base).unwrap_or_default();
+                let class = class_of(family, tail);
+                if !class.is_some_and(|c| commit.heirs.contains_key(&format!("{tenant}/{c}"))) {
+                    refusals.push(format!(
+                        "{} names a class the migration of tenant {tenant} did not copy: it \
+                         was written since; move it out of this prefix and run this again",
+                        meta.key
+                    ));
+                    continue;
+                }
+                // Equal times count: a store may keep whole seconds, and
+                // nothing of these families was written in the run's last
+                // node-lease window.
+                if meta.modified_ms >= *committed_ms {
+                    refusals.push(format!(
+                        "{} was written after tenant {tenant}'s migration: a binary of a \
+                         version before 0.4.0 ran on this prefix. Its write is not in the \
+                         state 0.4.0 serves; move the key out of this prefix (or keep it \
+                         elsewhere) and run this again",
+                        meta.key
+                    ));
+                    continue;
+                }
+                if matches!(family, Family::History | Family::Leases) {
+                    let mut parts = tail.splitn(3, '/');
+                    let actor = format!(
+                        "{}/{}",
+                        parts.next().unwrap_or_default(),
+                        parts.next().unwrap_or_default()
+                    );
+                    if !tombstoned.contains(&actor) {
+                        refusals.push(format!(
+                            "{} belongs to an actor with no tombstone at {}/{tenant}/{actor}: \
+                             a binary of a version before 0.4.0 created it during the \
+                             migration; move its keys out of this prefix and run this again",
+                            meta.key,
+                            Family::Owners.bare()
+                        ));
+                        continue;
+                    }
+                }
+                if family == Family::History
+                    && now
+                        <= meta
+                            .modified_ms
+                            .saturating_add(options.history_retention_ms)
+                {
+                    t.young_history += 1;
+                    continue;
+                }
+                t.delete.push(meta.key);
+            }
+        }
+        // Moves: never read by this version, and an older `actor move`
+        // may still write one. Each expires; only expired ones go.
+        let (_, moves) = listed(Family::Moves).await?;
+        for meta in moves {
+            if now > meta.modified_ms.saturating_add(crate::control::MOVE_TTL_MS) {
+                t.delete.push(meta.key);
+            } else {
+                t.live_moves += 1;
+            }
+        }
+        Ok((t, refusals))
+    }
+
+    /// `--remove-old`: deletes the old-layout keys of every migrated
+    /// tenant ([`Self::removal`]), keeping the tombstones. Refuses while a
+    /// run of migrate is unfinished, while the rollback still works
+    /// (unless given up), and on any key an older binary wrote since.
+    /// Before its first delete it marks each tenant, after which
+    /// `--rollback` refuses; then, if a run took the lock meanwhile, it
+    /// stops. Run again after a crash, it goes on.
+    pub async fn remove_old(&self, options: RemoveOptions) -> Result<Removal, MigrateError> {
+        let (removal, planned) = self.planned_removal(options).await?;
+        if !removal.refusals.is_empty() {
+            return Err(MigrateError::Refused(removal.refusals));
+        }
+        // A tenant with nothing to delete is not marked: its rollback is
+        // not given up for nothing.
+        let deleting: Vec<&String> = removal
+            .tenants
+            .iter()
+            .filter(|(_, t)| !t.delete.is_empty())
+            .map(|(tenant, _)| tenant)
+            .collect();
+        for tenant in &deleting {
+            let mark = format!("{REMOVED_PREFIX}{tenant}");
+            match self.store.create(&mark, Vec::new()).await {
+                Ok(_) | Err(BucketError::Conflict) => {}
+                Err(e) => {
+                    return Err(MigrateError::Bucket {
+                        what: format!("writing {mark}"),
+                        error: e,
+                    });
+                }
+            }
+        }
+        // A rollback checks for the marks under its lock: one that takes
+        // it from here on sees them and refuses.
+        if self
+            .store
+            .get(LOCK_KEY)
+            .await
+            .map_err(bucket(format!("reading {LOCK_KEY}")))?
+            .is_some()
+        {
+            return Err(MigrateError::Aborted(format!(
+                "{LOCK_KEY} was taken by a run of migrate meanwhile: nothing was deleted; let \
+                 it finish and run this again"
+            )));
+        }
+        // One that took it and let it go since the listing deleted the
+        // commit under it (and put the old layout back as the only copy):
+        // each commit must still be the one planned against. The record,
+        // not the version, is compared: versions of two reads are opaque.
+        for tenant in &deleting {
+            let key = format!("{COMMIT_PREFIX}{tenant}");
+            let now = self.read_record(&key, COMMIT_HEADER).await?;
+            if now.as_ref().map(|(r, _)| r) != planned.get(*tenant) {
+                return Err(MigrateError::Aborted(format!(
+                    "{key} changed since the listing (a --rollback or --apply ran meanwhile): \
+                     nothing was deleted; run this again"
+                )));
+            }
+        }
+        for t in removal.tenants.values() {
+            each(&t.delete, self.options.concurrency, |key| async move {
+                self.store
+                    .delete(key)
+                    .await
+                    .map_err(bucket(format!("deleting {key}")))
+            })
+            .await?;
+        }
+        Ok(removal)
     }
 }
 
