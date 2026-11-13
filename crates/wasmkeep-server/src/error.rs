@@ -41,15 +41,6 @@ pub enum Error {
     #[error("lease timing: {0}")]
     LeaseTiming(String),
 
-    /// The node's configuration does not hold together.
-    #[error("configuration: {0}")]
-    Config(String),
-
-    /// The data directory holds databases of the layout before 0.4.0 that
-    /// cannot be moved into this app's root (ADR 0022), or the move failed.
-    #[error("data directory: {0}")]
-    LocalLayout(String),
-
     /// Accepting connections failed.
     #[error("listener error")]
     Io(#[from] std::io::Error),

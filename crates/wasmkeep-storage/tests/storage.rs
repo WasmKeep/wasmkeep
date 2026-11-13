@@ -462,28 +462,6 @@ fn pending_alarms_are_found_by_scanning_the_data_dir() {
     );
 }
 
-/// The scan reads this root's databases only: another app's, in a folder
-/// beside it, are its own node's to arm (ADR 0022).
-#[test]
-fn the_alarm_scan_reads_only_this_roots_databases() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = storage(&dir);
-    s.open("c", "mine").unwrap().set_alarm(10).unwrap();
-    let other = Storage::new(
-        StorageConfig::new(dir.path()),
-        StateDir {
-            dir: "actors/u".into(),
-            scratch: ".deleting".into(),
-            tenant: "u".into(),
-        },
-    );
-    other.open("c", "theirs").unwrap().set_alarm(20).unwrap();
-    assert_eq!(
-        s.pending_alarms().unwrap().found,
-        vec![("t".into(), "c".into(), "mine".into(), 10)]
-    );
-}
-
 #[test]
 fn one_unreadable_database_does_not_hide_the_other_alarms() {
     let dir = tempfile::tempdir().unwrap();

@@ -61,7 +61,7 @@ async fn forwarding_does_not_require_a_local_resident_slot() {
         0,
         "forwarding created a resident stub"
     );
-    assert!(!db.path().join(test_dir("t").join("remote.db")).exists());
+    assert!(!db.path().join("actors/default/t/remote.db").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -108,7 +108,7 @@ async fn remote_calls_do_not_evict_or_compete_with_the_local_caller() {
         (200, "200:default/t/local")
     );
     assert_eq!(b.service.resident(), 1, "only the local caller is resident");
-    assert!(!db.path().join(test_dir("t").join("remote.db")).exists());
+    assert!(!db.path().join("actors/default/t/remote.db").exists());
 }
 
 /// A client's `Connection: close` is for its own hop: the forwarding node

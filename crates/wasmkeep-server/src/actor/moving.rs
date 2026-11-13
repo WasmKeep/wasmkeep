@@ -296,8 +296,10 @@ impl ActorService {
 pub(super) async fn moves_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, active: &Active) {
     // One move per actor: the newest key counts, the others are deleted.
     let mut newest: BTreeMap<(String, String), MoveIntent> = BTreeMap::new();
-    // Only this app's moves are listed (under its root, ADR 0022).
     for intent in cluster.moves() {
+        if intent.tenant != inner.tenant {
+            continue;
+        }
         let actor = (intent.class.clone(), intent.name.clone());
         match newest.get(&actor) {
             Some(kept) if kept.written_at_ms >= intent.written_at_ms => {

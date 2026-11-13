@@ -173,9 +173,7 @@ opens one, for a mail relay your actors call over HTTP.
 ## 4. Back up the data
 
 Each actor is one SQLite file:
-`<data-dir>/state/<tenant>/<app>/actors/<class>/<name>.db` (`default/default`
-without `--app`; `<data-dir>/actors/<tenant>/...` before 0.4.0). Two ways to
-keep copies:
+`<data-dir>/actors/<tenant>/<class>/<name>.db`. Two ways to keep copies:
 
 **Continuous, to a bucket (recommended).** Run the node as a one-node
 cluster: every event's writes are uploaded to an S3-compatible bucket

@@ -208,16 +208,15 @@ async fn a_first_ownership_record_goes_above_every_generation_used() {
     down.store(true, Ordering::SeqCst);
     for name in ["x", "y"] {
         shared
-            .delete(&object_store::path::Path::from(test_key(
-                Family::Owners,
-                &format!("t/{name}"),
+            .delete(&object_store::path::Path::from(format!(
+                "owners/default/t/{name}"
             )))
             .await
             .unwrap();
     }
     shared
         .put(
-            &object_store::path::Path::from(test_key(Family::Leases, "t/x")),
+            &object_store::path::Path::from("leases/default/t/x"),
             b"wasmkeep-lease 1\na\n9\n0\n".to_vec().into(),
         )
         .await
@@ -247,9 +246,8 @@ async fn a_first_ownership_record_goes_above_every_generation_used() {
     // too.
     for (name, seed) in [("x", 9), ("y", 0)] {
         let body = shared
-            .get(&object_store::path::Path::from(test_key(
-                Family::Leases,
-                &format!("t/{name}"),
+            .get(&object_store::path::Path::from(format!(
+                "leases/default/t/{name}"
             )))
             .await
             .unwrap()
@@ -369,7 +367,7 @@ async fn a_live_old_lease_refuses_until_it_runs_out() {
     for (name, owner) in [("old", "a"), ("mine", "b")] {
         store
             .put(
-                &object_store::path::Path::from(test_key(Family::Leases, &format!("t/{name}"))),
+                &object_store::path::Path::from(format!("leases/default/t/{name}")),
                 format!("wasmkeep-lease 1\n{owner}\n4\n{until}\n")
                     .into_bytes()
                     .into(),

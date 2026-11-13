@@ -133,7 +133,7 @@ curl 'localhost:8080/actor/visits/about?who=carol'
 ```
 
 `home` and `about` are two actors, each with its own SQLite database under
-`.wasmkeep/data/state/default/default/actors/visits/`, in the directory the server
+`.wasmkeep/data/actors/default/visits/`, in the directory the server
 started in.
 
 ## 5. Restart it

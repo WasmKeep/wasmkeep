@@ -317,9 +317,5 @@ fn an_eight_instance_cli_node_can_run_an_actor_call() {
     let reply = request(addr, "POST", "/actor/t/a/call?to=t/b&path=/fired").unwrap();
     assert_eq!(reply.status, 200, "{reply:?}");
     assert_eq!(reply.body.trim(), "200:0", "{reply:?}");
-    assert!(
-        dir.path()
-            .join("data/state/default/default/actors/t/b.db")
-            .exists()
-    );
+    assert!(dir.path().join("data/actors/default/t/b.db").exists());
 }

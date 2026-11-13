@@ -38,7 +38,6 @@ use crate::http::text_response;
 use crate::replica::{Replica, ReplicaError};
 use crate::websocket::{Outgoing, SendError, Sockets, close_frame};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use wasmkeep_cluster::state_root::StateRoot;
 use wasmkeep_wit::wasmkeep::actor::websockets::{
     self, Message as WsMessageWit, SendError as WsSendError,
 };
@@ -92,11 +91,6 @@ pub struct ActorConfig {
     /// Tenant all actors belong to (one tenant per process for now; see
     /// ROADMAP.md).
     pub tenant: String,
-    /// The app, within the tenant, whose actors these are (ADR 0022): its
-    /// state lives under `state/<tenant>/<app>/`. The implicit app
-    /// `default` for classes given on the command line; a cluster's
-    /// [`ClusterConfig::app`], when set, wins.
-    pub app: String,
     /// Where actor databases live.
     pub storage: StorageConfig,
     /// Queue size and hibernation timeout.
@@ -152,7 +146,6 @@ impl ActorConfig {
     pub fn new(data_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             tenant: "default".into(),
-            app: crate::cluster::IMPLICIT_APP_NAME.into(),
             storage: StorageConfig::new(data_dir),
             mailbox: MailboxConfig::default(),
             wall_per_event: Duration::from_secs(30),
@@ -423,15 +416,14 @@ impl ActorService {
         tracing::info!(actors = resident, took = ?started.elapsed(), "actors stopped");
     }
 
-    /// Live nodes on the same bucket prefix of the version before the
-    /// implicit app (ADR 0022), which keep actor state in the layout before
-    /// 0.4.0. Empty outside a cluster.
+    /// Live nodes on the same bucket prefix serving the same tenant but
+    /// another app: their actors would share keys. Empty outside a cluster.
     ///
     /// # Errors
     /// The heartbeats could not be read.
-    pub async fn older_nodes(&self) -> Result<Vec<String>, String> {
+    pub async fn app_conflicts(&self) -> Result<Vec<String>, String> {
         match &self.inner.cluster {
-            Some(c) => c.older_nodes().await,
+            Some(c) => c.app_conflicts().await,
             None => Ok(Vec::new()),
         }
     }

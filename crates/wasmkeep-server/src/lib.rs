@@ -20,7 +20,6 @@ mod error;
 pub mod fds;
 pub mod guest_log;
 mod http;
-mod local_layout;
 pub mod metrics;
 mod replica;
 pub mod secret_store;
@@ -31,7 +30,7 @@ pub use access::{Access, AccessRules};
 pub use actor::{ActorConfig, ActorService};
 pub use cluster::{
     ClusterConfig, ClusterPlaintext, ClusterTlsConfig, DEFAULT_HEARTBEAT, IMPLICIT_APP_NAME,
-    failover_wait_default, heartbeat_horizon_ms, older_nodes_advice,
+    conflict_advice, failover_wait_default, heartbeat_horizon_ms,
 };
 pub use egress::{EgressPolicy, IpRange};
 pub use env::ActorEnv;
@@ -50,7 +49,7 @@ pub use wasmkeep_cluster::state_root::StateRoot;
 pub fn state_dir(root: &StateRoot) -> wasmkeep_storage::StateDir {
     wasmkeep_storage::StateDir {
         dir: root.local(wasmkeep_storage::encode_segment),
-        scratch: root.scratch(wasmkeep_storage::encode_segment),
+        scratch: root.scratch(),
         tenant: root.tenant().to_owned(),
     }
 }

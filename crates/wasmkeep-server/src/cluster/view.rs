@@ -119,12 +119,11 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
 }
 
 impl Cluster {
-    /// Reads the operator's intents (drains under `control/drain/`, this
-    /// app's moves under its root) and publishes whether
+    /// Reads the operator's intents under `control/` and publishes whether
     /// this node is asked to drain. A failed listing keeps the last intents
     /// read (ADR 0014).
     pub(super) async fn refresh_control(&self) {
-        match control::read(&self.control_keys, Some(&self.root), now_ms()).await {
+        match control::read(&self.control_keys, now_ms()).await {
             Ok(read) => {
                 let asked = read.draining.contains(&self.node_id);
                 let was = std::mem::replace(
@@ -290,7 +289,7 @@ impl Cluster {
                 self.note_old_versions(&all);
                 self.note_future_leases(&all);
                 let nodes = self.membership.live(all.clone());
-                let mixed = older_nodes(&self.node_id, &nodes);
+                let mixed = conflicts(&self.node_id, &self.serves, &nodes);
                 let now = now_ms();
                 let period = u64::try_from(self.heartbeat_every.as_millis()).unwrap_or(u64::MAX);
                 let logged = self
@@ -299,7 +298,7 @@ impl Cluster {
                 if !mixed.is_empty() && now.saturating_sub(logged) >= period {
                     self.conflict_logged_ms
                         .store(now, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!(serves = %self.serves, "{}", older_nodes_advice(&mixed));
+                    tracing::error!(serves = %self.serves, "{}", conflict_advice(&mixed));
                 }
                 if let Some(tls) = &self.tls
                     && tls.refresh(&nodes, self.heartbeat_horizon_ms)
@@ -564,37 +563,58 @@ impl Cluster {
     }
 }
 
-/// Live nodes of the version before the implicit app (ADR 0022), which
-/// name their tenant alone (`tenant/`): `node (tenant/)` each. They keep
-/// actor state in the layout before 0.4.0, so they must not run beside
-/// this version: upgrades stop every node. Another app of any tenant is
-/// fine (each app's state has its own root), and nodes that predate the
-/// app line are left to the start guard of ADR 0020.
-pub(crate) fn older_nodes(me: &str, nodes: &[NodeInfo]) -> Vec<String> {
+/// Live nodes serving the same tenant as `serves` but another app: `node
+/// (app)` each. Their actors would share keys in the bucket. Nodes that
+/// predate the app line are not judged; a node of the version before the
+/// implicit app (ADR 0022) names its tenant alone (`tenant/`), and is
+/// listed as an older version.
+pub(crate) fn conflicts(me: &str, serves: &str, nodes: &[NodeInfo]) -> Vec<String> {
+    let tenant = |app: &str| app.split('/').next().unwrap_or_default().to_owned();
     nodes
         .iter()
-        .filter(|n| n.id != me && n.app.ends_with('/'))
-        .map(|n| format!("{} ({})", n.id, n.app))
+        .filter(|n| n.id != me && !n.app.is_empty())
+        .filter(|n| tenant(&n.app) == tenant(serves) && n.app != serves)
+        .map(|n| {
+            if n.app.ends_with('/') {
+                format!("{} ({}{OLDER}", n.id, n.app)
+            } else {
+                format!("{} ({})", n.id, n.app)
+            }
+        })
         .collect()
 }
 
-/// What an operator reads about `older` ([`older_nodes`]).
-pub fn older_nodes_advice(older: &[String]) -> String {
+/// How [`conflicts`] marks a node of the version before the implicit app.
+const OLDER: &str = ", an older version)";
+
+/// What an operator reads about `mixed` ([`conflicts`]): when every entry
+/// is a node of the version before the implicit app (ADR 0022), WasmKeep
+/// itself was upgraded without stopping every node, and the advice is to
+/// do so; otherwise two apps of one tenant share a bucket prefix.
+pub fn conflict_advice(mixed: &[String]) -> String {
+    if !mixed.is_empty() && mixed.iter().all(|m| m.ends_with(OLDER)) {
+        return format!(
+            "a node of an earlier WasmKeep version is live on this bucket prefix ({}): stop \
+             every node and upgrade them together (docs/cluster.md, Upgrading WasmKeep)",
+            mixed.join(", ")
+        );
+    }
     format!(
-        "a node of an earlier WasmKeep version is live on this bucket prefix ({}): stop \
-         every node and upgrade them together (docs/cluster.md, Upgrading WasmKeep)",
-        older.join(", ")
+        "another app of this tenant already runs on this bucket prefix ({}): their actors \
+         would share data. Deploy one on another --bucket prefix, or under another tenant if \
+         another owner runs it (docs/cluster.md, Deploying)",
+        mixed.join(", ")
     )
 }
 
 impl Cluster {
-    /// [`older_nodes`] from a fresh read of the heartbeats.
-    pub(crate) async fn older_nodes(&self) -> Result<Vec<String>, String> {
+    /// [`conflicts`] from a fresh read of the heartbeats.
+    pub(crate) async fn app_conflicts(&self) -> Result<Vec<String>, String> {
         let nodes = self
             .membership
             .live_nodes()
             .await
             .map_err(|e| e.to_string())?;
-        Ok(older_nodes(&self.node_id, &nodes))
+        Ok(conflicts(&self.node_id, &self.serves, &nodes))
     }
 }

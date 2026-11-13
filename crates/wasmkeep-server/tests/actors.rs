@@ -112,7 +112,7 @@ async fn each_name_is_its_own_counter() {
     assert_eq!(value(addr, "GET", "/actor/counter/room").await, 0);
     assert!(
         data.path()
-            .join("state/default/default/actors/counter/room%201.db")
+            .join("actors/default/counter/room%201.db")
             .exists()
     );
 
@@ -204,7 +204,7 @@ async fn on_init_runs_again_for_a_new_component_version() {
     let init_version = |data: &Path| {
         let storage = wasmkeep_storage::Storage::new(
             wasmkeep_storage::StorageConfig::new(data),
-            wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default", "default")),
+            wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
         );
         storage
             .open("counter", "a")
