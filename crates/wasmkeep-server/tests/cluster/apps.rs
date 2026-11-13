@@ -106,6 +106,11 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
         "{}",
         r.body
     );
+    // A WebSocket upgrade relayed the same way: refused too.
+    assert_eq!(
+        upgrade_status_reachable(admin.addr, "/actor/t/x").await,
+        503
+    );
     // A call signed by a node of the other app: refused the same way.
     let secret = cluster_secret(&store).await;
     let path = "/actor/t/x/durable";

@@ -129,8 +129,9 @@ impl Cluster {
             .map_err(|_| format!("app {:?} cannot be sent in a header", self.serves))
     }
 
-    /// The answer to a hop (a request another node sent: `signed`, a
-    /// forward, or anything on the cluster port) that is not for this
+    /// The answer to a hop (a request another node sent: `signed`,
+    /// anything on the cluster port, or a forward, which on the public
+    /// port in refuse mode is a client's claim) that is not for this
     /// node's app, before anything of it is read (ADR 0022): 503 "not this
     /// app's node" when it names another app, and a refusal naming the
     /// cause when it names none (a node of an older version: upgrades stop
@@ -141,7 +142,9 @@ impl Cluster {
         req: &Request<B>,
         signed: bool,
     ) -> Option<Response<HyperOutgoingBody>> {
-        if !signed && !never_forward(req) {
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
+        let forwarded = req.headers().contains_key(FORWARDED) && !self.refuse_plaintext;
+        if !signed && !on_cluster_port && !forwarded {
             return None;
         }
         let mut named = req.headers().get_all(APP).iter();

@@ -672,7 +672,6 @@ async fn refuse_mode_honours_node_calls_on_the_cluster_port_only() {
     let forwarded = |path: &str| {
         format!(
             "POST {path} HTTP/1.1\r\nHost: n\r\nContent-Length: 0\r\nx-wasmkeep-forwarded: 1\r\n\
-             x-wasmkeep-app: default/default\r\n\
              x-wasmkeep-caller: {caller}\r\nConnection: close\r\n\r\n"
         )
     };
