@@ -1306,3 +1306,96 @@ fn a_rollback_after_a_deploy_or_a_late_root_key_is_refused() {
         }
     }
 }
+
+/// A deploy of an older version lands after the token barrier (its
+/// `current` without token 3): the check after the final proof aborts,
+/// nothing is committed, and the next run roots it and commits.
+#[test]
+fn a_deploy_of_an_older_version_after_the_barrier_stops_the_commit() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Sim::new(seed, fixture());
+            let before = sim.snapshot();
+            let done = Arc::new(Mutex::new(false));
+            for n in 1..3_000 {
+                let done = Arc::clone(&done);
+                sim.hooks
+                    .lock()
+                    .unwrap()
+                    .entry(n)
+                    .or_default()
+                    .push(Box::new(move |m: &mut Map, now| {
+                        let mut d = done.lock().unwrap();
+                        let barrier = m.iter().any(|(k, o)| {
+                            k.starts_with("owners/") && migrate::tombstone_target(&o.body).is_some()
+                        });
+                        if !*d && barrier {
+                            *d = true;
+                            m.insert(
+                                "apps/zeta/web/current".into(),
+                                Obj {
+                                    body: b"v5 5\n".to_vec(),
+                                    version: 8_888_888,
+                                    written: now,
+                                },
+                            );
+                        }
+                    }));
+            }
+            match apply(&sim).await {
+                Err(MigrateError::Aborted(why)) => {
+                    assert!(why.contains("token 3"), "seed {seed}: {why}");
+                }
+                r => panic!("seed {seed}: {:?}", r.map(drop)),
+            }
+            assert!(
+                !sim.snapshot().keys().any(|k| k.starts_with(COMMIT_PREFIX)),
+                "seed {seed}: committed over an unrooted current"
+            );
+            sim.hooks.lock().unwrap().clear();
+            apply(&sim)
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            check_migrated(seed, &sim.snapshot(), &before, &actors());
+        });
+    }
+}
+
+/// A rollback crashed after it started writing, then a node of an older
+/// version ran on the old layout (its `nodes/` object changed): the next
+/// `--rollback` finishes it all the same, since from its first write the
+/// old layout is the truth.
+#[test]
+fn a_started_rollback_finishes_whatever_ran_since() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Sim::new(seed, fixture());
+            let before = canonical(&sim.snapshot());
+            apply(&sim).await.unwrap();
+            let ops = *sim.ops.lock().unwrap();
+            // Past the lock and its re-check: a few requests into the
+            // records.
+            let i = 12 + Rng::new(seed ^ 0x5a).below(30);
+            *sim.crash_after.lock().unwrap() = Some(ops + i);
+            let first = rollback(&sim).await;
+            *sim.crash_after.lock().unwrap() = None;
+            if first.is_ok() {
+                return;
+            }
+            if !sim
+                .snapshot()
+                .get(LOCK_KEY)
+                .is_some_and(|o| o.body.windows(13).any(|w| w == b"mode rollback"))
+            {
+                return;
+            }
+            node_starts(&mut sim.objects.lock().unwrap(), Sim::now());
+            rollback(&sim)
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}, crash at {i}: {e}"));
+            assert_eq!(canonical(&sim.snapshot()), before, "seed {seed}");
+        });
+    }
+}

@@ -182,6 +182,9 @@ pub(crate) fn run(args: &MigrateArgs) -> anyhow::Result<i32> {
             prefix.len() + 1
         },
     };
+    // The longer window when a heartbeat from before node leases is
+    // seen; this line names the usual one.
+    let migrator_window_s = options.lease_window_ms.div_ceil(1000);
     anyhow::ensure!(
         options.heirs.len() == args.heirs.len(),
         "--heir names a tenant twice: give one heir per tenant"
@@ -221,6 +224,12 @@ pub(crate) fn run(args: &MigrateArgs) -> anyhow::Result<i32> {
             }
             return Ok(1);
         }
+        println!(
+            "Taking the lock, then waiting {} s (one node-lease window) before copying. Run \
+             one --apply or --rollback at a time: another run takes the lock over and this \
+             one stops.",
+            migrator_window_s
+        );
         match migrator.apply().await {
             Ok(outcome) => {
                 println!("{:<24} state", "tenant");

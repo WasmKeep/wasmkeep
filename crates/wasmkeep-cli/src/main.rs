@@ -740,8 +740,8 @@ pub(crate) fn serve_app_rules(
         }
         if deployed.restricted().is_empty() {
             tracing::warn!(
-                "this app has never deployed access rules: every class is open. \
-                 Deploy them with `wasmkeep deploy --access CLASS=MODE`"
+                "no class of this app has a deployed access rule: every class is open. \
+                 Deploy rules with `wasmkeep deploy --access CLASS=MODE`"
             );
         }
         for (class, mode) in deployed.restricted() {

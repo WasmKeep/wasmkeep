@@ -192,10 +192,11 @@ pub struct NodeSeen {
     pub meta: ObjectMeta,
     /// Whether it may still be live (a reason to refuse), and why.
     pub live: Option<String>,
-    /// Its version as a read of it returned (`None`: gone since the
-    /// listing). The final proof reads it again: reads are consistent
-    /// where listings may lag.
-    pub version: Option<Version>,
+    /// Its body as a read of it returned (`None`: gone since the
+    /// listing). The final proof reads it again and compares: every
+    /// renewal rewrites its time, and reads are consistent where listings
+    /// may lag.
+    pub body: Option<Vec<u8>>,
     /// A heartbeat in a format from before node leases.
     pub old: bool,
 }
@@ -884,19 +885,18 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 .get(&meta.key)
                 .await
                 .map_err(bucket(format!("reading {}", meta.key)))?;
-            let (live, version, old) = match found {
+            let (live, old) = match &found {
                 // Deleted since the listing: a forgotten node's.
-                None => (None, None, false),
-                Some((body, version)) => (
-                    self.judge(&meta, &body, now),
-                    Some(version),
-                    NodeLeaseObject::decode(&body).is_none() && NodeInfo::decode(&body).is_some(),
+                None => (None, false),
+                Some((body, _)) => (
+                    self.judge(&meta, body, now),
+                    NodeLeaseObject::decode(body).is_none() && NodeInfo::decode(body).is_some(),
                 ),
             };
             out.push(NodeSeen {
                 meta,
                 live,
-                version,
+                body: found.map(|(b, _)| b),
                 old,
             });
         }
@@ -923,8 +923,8 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 .get(&n.meta.key)
                 .await
                 .map_err(bucket(format!("reading {}", n.meta.key)))?
-                .map(|(_, v)| v);
-            if now != n.version {
+                .map(|(b, _)| b);
+            if now != n.body {
                 return Ok(Some(format!(
                     "node {}",
                     n.meta.key.strip_prefix(NODES).unwrap_or(&n.meta.key)
@@ -1376,7 +1376,10 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 at_ms: self.clock.now_ms(),
             };
             let key = format!("{COMMIT_PREFIX}{tenant}");
-            self.hold(&held).await?;
+            if let Err(lost) = self.hold(&held).await {
+                outcome.failed.push((tenant.clone(), lost.to_string()));
+                break;
+            }
             match self.store.create(&key, commit.encode(COMMIT_HEADER)).await {
                 Ok(_) => outcome.committed.push(tenant.clone()),
                 // A re-run after a crash between the write and its answer.
@@ -1397,7 +1400,11 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             // commit is deleting what the commit names: take it back.
             if let Err(lost) = self.hold(&held).await {
                 self.undo_commit(&key, &plan.hash).await?;
-                return Err(lost);
+                if outcome.committed.last() == Some(tenant) {
+                    outcome.committed.pop();
+                }
+                outcome.failed.push((tenant.clone(), lost.to_string()));
+                break;
             }
         }
         if outcome.committed.is_empty() && !outcome.failed.is_empty() {
@@ -1412,6 +1419,17 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         }
         if outcome.failed.is_empty() {
             self.release(&held).await?;
+        }
+        // Tenants never reached after the lock was lost.
+        for tenant in copied.keys() {
+            let seen = outcome.committed.contains(tenant)
+                || outcome.failed.iter().any(|(t, _)| t == tenant);
+            if !seen {
+                outcome.failed.push((
+                    tenant.clone(),
+                    "not committed: this run lost the lock".into(),
+                ));
+            }
         }
         Ok(outcome)
     }
