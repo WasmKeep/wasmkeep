@@ -189,6 +189,15 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
     // Nothing ran: the counter is where the first request left it.
     let r = send(shop.addr, "GET", "/actor/t/x/durable", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "1"));
+    // Each refusal counted with its own reason (this process's metrics:
+    // nextest runs each test alone): the three above and the probe that
+    // found the secret, which names an app no node serves.
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    assert!(
+        page.lines()
+            .any(|l| l == "wasmkeep_admission_refused_total{reason=\"wrong_app\"} 4"),
+        "{page}"
+    );
 }
 
 /// The app is in the signature: a call signed for one app and sent naming

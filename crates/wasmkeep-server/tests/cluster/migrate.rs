@@ -1,13 +1,15 @@
 //! `wasmkeep cluster migrate` (ADR 0022) against real nodes: a bucket in
 //! the layout before 0.4.0 (made by this version's nodes, then moved back
 //! to the bare keys, which have the same tails), refused at start,
-//! migrated, then served by a node of this version.
+//! migrated, then served by a node of this version, and its old layout
+//! removed.
 
 use super::*;
 use std::collections::BTreeMap;
 use wasmkeep_cluster::lease::Clock;
 use wasmkeep_cluster::migrate::{
-    self, AppInfo, LOCK_KEY, MigrateError, Migrator, Options, Pause, StartRefusal, Store as _,
+    self, AppInfo, LOCK_KEY, MigrateError, Migrator, Options, Pause, RemoveOptions, StartRefusal,
+    Store as _,
 };
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
 
@@ -141,6 +143,11 @@ async fn a_bucket_of_the_old_layout_is_refused_then_migrated_and_served() {
     nodes_quiet().await;
     let before = bucket_keys(&store).await;
     let migrator = Migrator::new(&b, &Now, Vec::new(), options(&[]));
+    // Nothing migrated yet: `--remove-old` leaves the tenant alone.
+    let early = migrator.remove_old(remove_options(true)).await.unwrap();
+    assert_eq!(early.skipped, ["default"]);
+    assert_eq!(early.deletes(), 0);
+    assert_eq!(bucket_keys(&store).await, before, "removed before a commit");
     let plan = migrator.plan().await.unwrap();
     assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
     assert_eq!(
@@ -245,7 +252,69 @@ async fn a_bucket_of_the_old_layout_is_refused_then_migrated_and_served() {
         .filter(|k| !k.starts_with("nodes/") && !k.starts_with(&test_key(Family::Alarms, "")))
         .collect();
     assert_eq!(after, kept);
+
+    // `--remove-old`: the rollback is over (a node ran), so no
+    // acknowledgement. The dry run deletes nothing.
+    let dry = migrator.removal(remove_options(false)).await.unwrap();
+    assert!(dry.refusals.is_empty(), "{:?}", dry.refusals);
+    let t = &dry.tenants["default"];
+    // The three actors and the one that set an alarm.
+    assert!(
+        !t.rollback_open && !t.delete.is_empty() && t.tombstones == names.len() + 1,
+        "{t:?}"
+    );
+    // The move request is minutes from expiring: kept.
+    assert_eq!(t.live_moves, 1);
+    let state_before = read_prefix(&b, "state/").await;
+    let removed = migrator.remove_old(remove_options(false)).await.unwrap();
+    assert_eq!(removed.deletes(), dry.deletes());
+    for family in [Family::History, Family::Leases, Family::Alarms] {
+        let base = format!("{}/default/", family.bare());
+        assert!(b.list(&base).await.unwrap().is_empty(), "{base} left");
+    }
+    assert_eq!(b.list("owners/default/").await.unwrap().len(), t.tombstones);
+    assert_eq!(b.list("control/move/default/").await.unwrap().len(), 1);
+    // Nothing under the roots changed but what the live node wrote.
+    let state_after = read_prefix(&b, "state/").await;
+    for (k, body) in &state_before {
+        if k.starts_with(&test_key(Family::Alarms, "")) || k.contains("/owners/") {
+            continue;
+        }
+        assert_eq!(state_after.get(k), Some(body), "{k}");
+    }
+    // The node still serves every actor from its root.
+    for name in names {
+        let path = format!("/actor/t/{}/durable", url_encode(name));
+        let r = send_runnable(c.addr, "GET", &path, "").await;
+        assert_eq!((r.status, r.body.trim()), (200, "3"), "{name}");
+    }
+    // And a rollback is refused for good.
+    match migrator.rollback().await {
+        Err(MigrateError::Refused(why)) => assert!(why.concat().contains("one-way"), "{why:?}"),
+        other => panic!("{other:?}"),
+    }
     drop(c);
+}
+
+fn remove_options(forgo_rollback: bool) -> RemoveOptions {
+    RemoveOptions {
+        forgo_rollback,
+        history_retention_ms: 0,
+    }
+}
+
+/// Every object under `prefix`, with its body.
+async fn read_prefix(b: &ObjectStoreBucket, prefix: &str) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for meta in b.list(prefix).await.unwrap() {
+        if let Some((body, _)) = wasmkeep_cluster::lease::Bucket::get(b, &meta.key)
+            .await
+            .unwrap()
+        {
+            out.insert(meta.key, body);
+        }
+    }
+    out
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -148,7 +148,12 @@ impl Cluster {
             return None;
         }
         let mut named = req.headers().get_all(APP).iter();
-        match (named.next(), named.next()) {
+        let (first, second) = (named.next(), named.next());
+        if !matches!((first, second), (Some(app), None) if app.as_bytes() == self.serves.as_bytes())
+        {
+            crate::metrics::refused(crate::metrics::Refusal::WrongApp);
+        }
+        match (first, second) {
             (Some(app), None) if app.as_bytes() == self.serves.as_bytes() => None,
             (None, _) => {
                 // On the public port, a forwarded mark alone may as well

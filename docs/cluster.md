@@ -639,7 +639,7 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
 
 - A bucket prefix that holds actor state written by a version before
   0.4.0 is migrated once with `wasmkeep cluster migrate` while every node
-  is stopped ([Migrating to 0.4.0](deploy/backup-and-restore.md#migrating-to-040)).
+  is stopped ([Upgrade a cluster to 0.4.0](deploy/upgrading-to-0.4.md)).
   Until then, nodes and `deploy` of this version refuse that tenant and
   print the command to run.
 - The tenant and app names of a new app match `[a-z][a-z0-9-]{0,63}`; an
@@ -1030,7 +1030,7 @@ for the rule; there may be others nobody has listed):
   tombstone over each migrated actor's old record and answers 503 for it
   (an actor it creates under the old keys is not seen by 0.4.0: running
   0.2 on a migrated bucket is unsupported). Going back after the first
-  0.4.0 start is not supported ([Migrating to 0.4.0](deploy/backup-and-restore.md#migrating-to-040)).
+  0.4.0 start is not supported ([Upgrade a cluster to 0.4.0](deploy/upgrading-to-0.4.md)).
 - **Calls between nodes**: the format of signed calls can change between
   versions.
   Old and new nodes refuse each other's calls (logged as "bad, expired or

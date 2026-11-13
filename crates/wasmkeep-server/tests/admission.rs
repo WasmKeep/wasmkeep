@@ -288,7 +288,13 @@ fn refused(reason: &str) -> u64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn admission_refusals_are_counted_by_reason() {
     // Every reason is on the page from the start, at 0.
-    for reason in ["access", "capacity", "overloaded", "unavailable"] {
+    for reason in [
+        "access",
+        "capacity",
+        "overloaded",
+        "unavailable",
+        "wrong_app",
+    ] {
         assert_eq!(refused(reason), 0, "{reason}");
     }
     let data = tempfile::tempdir().unwrap();

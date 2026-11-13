@@ -219,14 +219,19 @@ pub(crate) enum Refusal {
     /// the deployed version or the app's secrets not applied, the bucket
     /// not answering for its ownership.
     Unavailable,
+    /// A hop from another node not for this node's app (ADR 0022): it
+    /// names another app (503 "not this app's node"), or none (a node of
+    /// an older version).
+    WrongApp,
 }
 
 impl Refusal {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Access,
         Self::Capacity,
         Self::Overloaded,
         Self::Unavailable,
+        Self::WrongApp,
     ];
 
     fn label(self) -> &'static str {
@@ -235,6 +240,7 @@ impl Refusal {
             Self::Capacity => "capacity",
             Self::Overloaded => "overloaded",
             Self::Unavailable => "unavailable",
+            Self::WrongApp => "wrong_app",
         }
     }
 }

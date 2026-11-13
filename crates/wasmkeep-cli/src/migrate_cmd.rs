@@ -3,14 +3,16 @@
 //! protocol is `wasmkeep_cluster::migrate`; this reads the apps' deploys,
 //! prints the plan and the outcome, and sets the exit code: 0 done (or
 //! nothing to do), 1 refused or aborted with nothing new committed, 2
-//! some tenants committed and others not.
+//! some tenants committed and others not. `--remove-old` (with `--apply`)
+//! later deletes the old layout; its exit code is 0 done, 1 refused or
+//! stopped (run it again).
 
 use std::collections::BTreeMap;
 
 use clap::Args;
 use wasmkeep_cluster::lease::Clock;
 use wasmkeep_cluster::migrate::{
-    self, AppInfo, MigrateError, Migrator, Options, Pause, Plan, Store as _,
+    self, AppInfo, MigrateError, Migrator, Options, Pause, Plan, Removal, RemoveOptions, Store as _,
 };
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
 use wasmkeep_server::apps::AppRef;
@@ -22,7 +24,8 @@ pub(crate) struct MigrateArgs {
     #[arg(long)]
     bucket: String,
 
-    /// Migrate (without it: a dry run, which writes nothing).
+    /// Migrate, or with --remove-old delete (without it: a dry run, which
+    /// writes nothing).
     #[arg(long, conflicts_with = "rollback")]
     apply: bool,
 
@@ -30,6 +33,29 @@ pub(crate) struct MigrateArgs {
     /// (after that, it is one-way).
     #[arg(long)]
     rollback: bool,
+
+    /// Once the app answers on this version: list (with --apply, delete)
+    /// the copies a migration left in the layout before 0.4.0, for every
+    /// migrated tenant. Keeps the tombstones over the old ownership
+    /// records, history younger than --history-retention-secs and move
+    /// requests not yet expired; never touches state/, apps/ or nodes/.
+    /// Refuses while the rollback still works (no node started since),
+    /// unless given --forgo-rollback, and on any old-layout key written
+    /// after the migration (an older binary ran). From its first delete,
+    /// --rollback refuses. It can be run again after a crash.
+    #[arg(long, conflicts_with_all = ["rollback", "heirs"])]
+    remove_old: bool,
+
+    /// With --remove-old: delete even though the rollback would still
+    /// work (no node has started since the migration), giving it up.
+    #[arg(long, requires = "remove_old")]
+    forgo_rollback: bool,
+
+    /// With --remove-old: old-layout history younger than this is kept
+    /// for a later run, as garbage collection keeps it. Give the nodes'
+    /// value.
+    #[arg(long, requires = "remove_old", default_value_t = 3600)]
+    history_retention_secs: u64,
 
     /// The app of a tenant that inherits the classes no single app
     /// deploys (a class two apps deploy, or one no app deploys in a tenant
@@ -155,6 +181,100 @@ fn print_plan(plan: &Plan, concurrency: usize) {
     }
 }
 
+fn print_removal(removal: &Removal) {
+    if removal.tenants.is_empty() {
+        println!("No migrated tenant has keys left in the layout before 0.4.0.");
+    }
+    for (tenant, t) in &removal.tenants {
+        println!(
+            "  {tenant}: {} to delete; kept: {} tombstones, {} history objects younger than the \
+             retention, {} move requests not expired{}",
+            t.delete.len(),
+            t.tombstones,
+            t.young_history,
+            t.live_moves,
+            if t.rollback_open {
+                "; the rollback still works"
+            } else {
+                ""
+            }
+        );
+        for key in t.delete.iter().take(5) {
+            println!("    {key}");
+        }
+        if t.delete.len() > 5 {
+            println!("    ... and {} more", t.delete.len() - 5);
+        }
+    }
+    for tenant in &removal.skipped {
+        println!(
+            "  {tenant}: not migrated (keys in the layout before 0.4.0, no commit): left alone"
+        );
+    }
+}
+
+/// `--remove-old`; gives the exit code.
+async fn remove_old<S: migrate::Store, C: Pause>(
+    migrator: &Migrator<'_, S, C>,
+    args: &MigrateArgs,
+) -> i32 {
+    let options = RemoveOptions {
+        forgo_rollback: args.forgo_rollback,
+        history_retention_ms: args.history_retention_secs.saturating_mul(1000),
+    };
+    if !args.apply {
+        return match migrator.removal(options).await {
+            Ok(removal) => {
+                println!("Old layout of the migrated tenants:");
+                print_removal(&removal);
+                if removal.refusals.is_empty() {
+                    println!(
+                        "Dry run: nothing was deleted. Run this again with --apply to delete \
+                         {} keys; from then on, --rollback refuses.",
+                        removal.deletes()
+                    );
+                    0
+                } else {
+                    println!("Refused:");
+                    for r in &removal.refusals {
+                        println!("  {r}");
+                    }
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+    }
+    match migrator.remove_old(options).await {
+        Ok(removal) => {
+            println!("Deleted:");
+            print_removal(&removal);
+            let kept: usize = removal
+                .tenants
+                .values()
+                .map(|t| t.young_history + t.live_moves)
+                .sum();
+            if kept > 0 {
+                println!(
+                    "{kept} objects were kept until they are older: run this again later to \
+                     delete them."
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            if !matches!(e, MigrateError::Refused(_)) {
+                eprintln!("Run this again: it goes on from where it stopped.");
+            }
+            1
+        }
+    }
+}
+
 /// Runs the command; gives the exit code.
 pub(crate) fn run(args: &MigrateArgs) -> anyhow::Result<i32> {
     let (store, prefix) = crate::open_bucket_unchecked(&args.bucket)?;
@@ -192,6 +312,9 @@ pub(crate) fn run(args: &MigrateArgs) -> anyhow::Result<i32> {
     rt.block_on(async {
         let apps = read_apps(&bucket, &store, &prefix).await?;
         let migrator = Migrator::new(&bucket, &SystemClock, apps, options);
+        if args.remove_old {
+            return Ok(remove_old(&migrator, args).await);
+        }
         if args.rollback {
             return match migrator.rollback().await {
                 Ok(tenants) if tenants.is_empty() => {

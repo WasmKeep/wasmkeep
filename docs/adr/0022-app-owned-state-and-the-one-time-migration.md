@@ -1,8 +1,8 @@
 # 0022. App-owned state and the one-time migration
 
-- Status: accepted; built for 0.4.0, in no release yet, except
-  `--remove-old`: the layout (`crates/wasmkeep-cluster/src/state_root.rs`),
-  `cluster migrate` (`crates/wasmkeep-cluster/src/migrate.rs`,
+- Status: accepted; built for 0.4.0, in no release yet: the layout
+  (`crates/wasmkeep-cluster/src/state_root.rs`),
+  `cluster migrate` with `--remove-old` (`crates/wasmkeep-cluster/src/migrate.rs`,
   `crates/wasmkeep-cli/src/migrate_cmd.rs`; `sim/tests/madsim_migrate.rs`,
   `crates/wasmkeep-server/tests/cluster/migrate.rs`), the start checks and
   local moves (`crates/wasmkeep-server/src/local_layout.rs`), the implicit
@@ -48,6 +48,7 @@ Each app's actor state lives under its own root,
 | moves (ADR 0017) | `control/move/<t>/<c>/<n>/<target>` | `R moves/<c>/<n>/<target>` |
 | deploys, secrets | `apps/<t>/<a>/...` | unchanged |
 | shared by the prefix | `nodes/`, `control/drain/`, `cluster/secret`, `probe/` | unchanged |
+| migration (below) | | `cluster/migration`, `cluster/migrated/<t>`, `cluster/removed/<t>` |
 
 - **Key tails are byte-identical.** Everything after the family keeps
   today's encoding, so the migration only changes the front of a key
@@ -89,7 +90,8 @@ Heartbeats always name the app, `default/default` for `--actor` nodes.
 wasmkeep cluster migrate --bucket s3://B/P                 # dry run, read-only
 wasmkeep cluster migrate --bucket s3://B/P --apply [--heir T/A]...
 wasmkeep cluster migrate --bucket s3://B/P --rollback      # until a 0.4.0 node starts
-wasmkeep cluster migrate --bucket s3://B/P --remove-old    # once the app answers on 0.4.0
+wasmkeep cluster migrate --bucket s3://B/P --remove-old [--apply] [--forgo-rollback]
+                                                           # once the app answers on 0.4.0
 ```
 
 It runs while every node is stopped, which an upgrade across a lease
@@ -145,9 +147,40 @@ deletes R, and only while `nodes/` is unchanged since the commit, that
 is, while no node of any version has run, no app of the tenant was
 deployed, and no key in R is newer than the commit. **After the first 0.4.0 node
 starts, the migration is one-way.** The bare keys stay until
-`--remove-old`, which deletes them, keeps the tombstones for good, and
-refuses any bare key written after the commit (an old binary ran). It is
-meant for the same day.
+`--remove-old`, meant for the same day, once the app answers on 0.4.0:
+
+- **What it deletes**: for each tenant with a commit, the bare history,
+  markers and alarm entries, and the bare move requests older than their
+  5-minute lifetime (moves are never copied; an older `actor move` may
+  still write one, which no 0.4.0 node reads, so a live one is left for
+  a later run rather than refused). It keeps the tombstones for good:
+  without them a 0.2 `--actor` binary would recreate those actors empty
+  at generation 1. It keeps bare history younger than the history
+  retention (`--history-retention-secs`, ADR 0012) for a later run. It
+  never derives a key under `state/`, `apps/` or `nodes/`, and never
+  touches a tenant with no commit.
+- **When it refuses**, deleting nothing: while the lock exists; while
+  `--rollback` would still work (the rollback's own one-way test: no
+  `nodes/` change, no deploy, no newer key in R), unless given
+  `--forgo-rollback`; and on any bare key an older binary wrote since: a
+  history, marker or alarm key last modified at or after the commit (both
+  are the bucket's times; equal counts, since a store may keep whole
+  seconds and nothing of those families is written in the run's last
+  node-lease window), a key of a class the commit names no heir for, a
+  bare ownership record that is not a tombstone, or history or a marker
+  of an actor with no tombstone (a new actor created in the window between
+  the final proof and the commit). The refusal names each key.
+- **One-way for good**: before its first delete it creates
+  `cluster/removed/<tenant>`, which `--rollback` counts as one-way, then
+  reads the lock again and stops if a run took it meanwhile. A rollback
+  checks under its lock; so one of the two always sees the other, and a
+  rollback never restores records over deleted history. A rollback that
+  finishes deletes the mark with the commit (only a removal that saw its
+  lock, and so deleted nothing, can have written it).
+- It is a dry run without `--apply`, and resumes after a crash: it
+  recomputes everything from listings, and deletes are idempotent. It
+  takes no lock: nodes run while it does, and a held lock would refuse a
+  node that restarts.
 
 A 0.4.0 node or CLI checks before any write: it refuses while the lock
 exists, and refuses a tenant with bare keys and no commit, printing the

@@ -7,6 +7,11 @@
   five places a node claims, the hand-over racing its own release, alarms
   and sockets during a hand-over, and the cost of the control listing.
   The first draft's "warm-up" became an alarm hand-off.
+- Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)
+  (0.4.0): move keys are under the app's root, `state/<t>/<a>/moves/...`
+  (below, `control/move/<tenant>/...` is the layout before 0.4.0); calls
+  between nodes carry the caller's app; heartbeat line 6 always names an
+  app, the implicit `default/default` for `--actor` nodes.
 - Amended by [ADR 0020](0020-one-lease-per-node.md) (2026-11-07): ownership is a node lease plus an
   ownership record per actor; where this record says lease, read the
   actor's hold (`LeaseView`: the hold exists and the node lease is valid).
@@ -121,9 +126,11 @@ all of these:
   cluster address in phase B, through either address in phase A;
 - has no drain marker in D's last listing.
 
-Same app means the same tenant. For nodes serving classes given on the
-command line (`tenant/`), it does not guarantee the same classes; a peer
-without the class answers 404, as any node would.
+Same app means the same tenant. Line 6 is always `tenant/app`: since
+[ADR 0022](0022-app-owned-state-and-the-one-time-migration.md), nodes
+serving classes given on the command line (`--actor`) write their
+implicit app, `default/default`, where they wrote `tenant/` before. For them it does not guarantee the
+same classes; a peer without the class answers 404, as any node would.
 
 A peer that fails to take an event sent to it is **suspect** for a
 heartbeat horizon (10 s by default) and not chosen meanwhile. Failing

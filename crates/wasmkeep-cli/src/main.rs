@@ -153,6 +153,8 @@ enum ClusterCommand {
     /// and writes nothing. --apply copies, verifies, puts barriers in front
     /// of older binaries, proves no node ran, then commits; it can be run
     /// again after a crash. --rollback undoes it until a node starts.
+    /// --remove-old (a dry run; deletes with --apply) later removes the
+    /// copies left in the old layout, keeping the tombstones.
     /// Exits with 0 when done, 1 when refused or aborted (nothing new
     /// committed), 2 when some tenants were committed and others not.
     Migrate(migrate_cmd::MigrateArgs),
@@ -1511,8 +1513,20 @@ fn cluster_forget(args: &NodeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Writes `control/move/...` (ADR 0014).
+/// Writes the actor's move request (ADR 0017), under its app's root.
 fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
+    actor_move_on(args, || open_bucket(&args.bucket))
+}
+
+/// [`actor_move`] on the bucket `open` gives (opened once the request is
+/// valid): the start check `serve` runs
+/// first (ADR 0022), so that a request for a tenant left in the layout
+/// before 0.4.0 is refused with the migrate command rather than written
+/// where no node reads it.
+fn actor_move_on(
+    args: &MoveArgs,
+    open: impl FnOnce() -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)>,
+) -> anyhow::Result<()> {
     use wasmkeep_cluster::control::{self, Keys as _};
     let ((tenant, app), class, name) = move_target(&args.actor, args.app.as_ref())?;
     if let Some(warning) = move_target_warning(&args.actor, args.app.as_ref()) {
@@ -1525,7 +1539,8 @@ fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
         name,
         &args.to,
     )?;
-    let (store, prefix) = open_bucket(&args.bucket)?;
+    let (store, prefix) = open()?;
+    check_layout(&args.bucket, &store, &prefix, tenant)?;
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1857,6 +1872,70 @@ mod tests {
         put("wk/cluster/migration");
         let e = check("other").unwrap_err().to_string();
         assert!(e.contains("in progress"), "{e}");
+    }
+
+    /// `actor move` runs the start check `serve` runs (ADR 0022): it
+    /// refuses a tenant whose state is still in the layout before 0.4.0,
+    /// naming the migrate command, and writes nothing.
+    #[test]
+    fn actor_move_refuses_an_unmigrated_tenant() {
+        use clap::Parser as _;
+        use object_store::{
+            ObjectStore, ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path,
+        };
+        let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(store.put(&Path::from("wk/owners/acme/room/x"), PutPayload::from("x")))
+            .unwrap();
+        let super::Cli {
+            command: super::Command::Actor(super::ActorCommand::Move(args)),
+        } = super::Cli::try_parse_from([
+            "wasmkeep",
+            "actor",
+            "move",
+            "--app",
+            "acme/shop",
+            "room/x",
+            "--to",
+            "node-b",
+            "--force",
+            "--bucket",
+            "s3://b/wk",
+        ])
+        .unwrap()
+        else {
+            unreachable!()
+        };
+        let e = super::actor_move_on(&args, || Ok((std::sync::Arc::clone(&store), "wk".into())))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cluster migrate --bucket s3://b/wk"), "{e}");
+        let listed: Vec<_> = rt.block_on(async {
+            use futures_util::TryStreamExt as _;
+            store.list(None).try_collect::<Vec<_>>().await.unwrap()
+        });
+        assert_eq!(listed.len(), 1, "{listed:?}");
+    }
+
+    /// `--remove-old` takes its own flags only, and never with
+    /// `--rollback` or `--heir`.
+    #[test]
+    fn remove_old_flags_come_with_it() {
+        use clap::Parser as _;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["wasmkeep", "cluster", "migrate", "--bucket", "s3://b"];
+            argv.extend_from_slice(extra);
+            super::Cli::try_parse_from(argv)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        };
+        parse(&["--remove-old"]).unwrap();
+        parse(&["--remove-old", "--apply", "--forgo-rollback"]).unwrap();
+        parse(&["--remove-old", "--history-retention-secs", "0"]).unwrap();
+        assert!(parse(&["--forgo-rollback"]).is_err());
+        assert!(parse(&["--history-retention-secs", "0"]).is_err());
+        assert!(parse(&["--remove-old", "--rollback"]).is_err());
+        assert!(parse(&["--remove-old", "--heir", "a/b"]).is_err());
     }
 
     /// `actor move` names the actor's app with `--app`, or the implicit
