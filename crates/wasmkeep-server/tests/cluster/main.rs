@@ -19,9 +19,25 @@ use object_store::memory::InMemory;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+pub(crate) use wasmkeep_cluster::state_root::{Family, StateRoot};
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_server::apps::AppRef;
 use wasmkeep_server::{ActorConfig, ActorService, ClusterConfig, ClusterTlsConfig, LeaseConfig};
+
+/// The key `tail` of `family` in the state root of the implicit app
+/// `default/default`, where these nodes keep their actors (ADR 0022),
+/// relative to the bucket prefix.
+pub(crate) fn test_key(family: Family, tail: &str) -> String {
+    StateRoot::new("", "default", "default").key(family, tail)
+}
+
+/// The folder, relative to a node's data directory, of the databases of
+/// class `class` of the implicit app `default/default`.
+pub(crate) fn test_dir(class: &str) -> std::path::PathBuf {
+    StateRoot::new("", "default", "default")
+        .local(wasmkeep_storage::encode_segment)
+        .join(class)
+}
 
 #[path = "../support/guests.rs"]
 mod guests;
@@ -848,7 +864,9 @@ impl ObjectStore for Flaky {
                 source: "write refused".into(),
             });
         }
-        if location.as_ref().starts_with("owners/") && self.fail_owner_puts.load(Ordering::SeqCst) {
+        if location.as_ref().starts_with(&test_key(Family::Owners, ""))
+            && self.fail_owner_puts.load(Ordering::SeqCst)
+        {
             return Err(object_store::Error::Generic {
                 store: "flaky",
                 source: "ownership record write failed".into(),
@@ -1000,7 +1018,7 @@ impl ObjectStore for Flaky {
                 });
             }
         }
-        if location.as_ref().starts_with("owners/") {
+        if location.as_ref().starts_with(&test_key(Family::Owners, "")) {
             let delay = self.delay_lease_get_ms.load(Ordering::SeqCst);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -1045,7 +1063,9 @@ impl ObjectStore for Flaky {
                     let one = |p: object_store::path::Path| {
                         futures_util::stream::once(async move { Ok(p) }).boxed()
                     };
-                    if hold.load(Ordering::SeqCst) && path.as_ref().starts_with("alarms/") {
+                    if hold.load(Ordering::SeqCst)
+                        && path.as_ref().starts_with(&test_key(Family::Alarms, ""))
+                    {
                         held.fetch_add(1, Ordering::SeqCst);
                         let late = path.clone();
                         tokio::spawn(async move {
@@ -1149,7 +1169,7 @@ async fn lease_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String
 /// released) and its generation; `None` if there is none.
 async fn owner_record(store: &Arc<dyn ObjectStore>, name: &str) -> Option<(Option<String>, u64)> {
     use object_store::ObjectStoreExt as _;
-    let key = object_store::path::Path::from(format!("owners/default/t/{name}"));
+    let key = object_store::path::Path::from(test_key(Family::Owners, &format!("t/{name}")));
     let body = match store.get(&key).await {
         Ok(r) => String::from_utf8(r.bytes().await.unwrap().to_vec()).unwrap(),
         Err(object_store::Error::NotFound { .. }) => return None,
@@ -1205,7 +1225,7 @@ async fn request_move(
 ) -> object_store::path::Path {
     use object_store::ObjectStoreExt as _;
     let key = wasmkeep_cluster::control::checked_move_key(
-        &wasmkeep_cluster::state_root::StateRoot::new("", "default"),
+        &wasmkeep_cluster::state_root::StateRoot::new("", "default", "default"),
         "t",
         name,
         target,
@@ -1554,7 +1574,10 @@ async fn orphaned_alarm_fires(stuck: usize) {
     {
         use object_store::ObjectStoreExt as _;
         for i in 0..stuck {
-            let key = format!("alarms/default/{:015}/ghost/{:04x}", 1_000_000 + i, i);
+            let key = test_key(
+                Family::Alarms,
+                &format!("{:015}/ghost/{:04x}", 1_000_000 + i, i),
+            );
             shared
                 .put(
                     &object_store::path::Path::from(key),
@@ -1604,7 +1627,10 @@ async fn alarm_index(
     let started = std::time::Instant::now();
     loop {
         let listed: Vec<_> = store
-            .list(Some(&object_store::path::Path::from("alarms")))
+            .list(Some(&object_store::path::Path::from(test_key(
+                Family::Alarms,
+                "",
+            ))))
             .try_collect()
             .await
             .unwrap();
@@ -1732,13 +1758,17 @@ async fn index_entries_for_x(store: &Arc<dyn ObjectStore>) -> Vec<String> {
     index_entries_for(store, "x").await
 }
 
-/// The index entries for actor `t/<name>`: legacy (`…/t/<hex>`) and tagged
+/// The index entries for actor `t/<name>` (full keys, under the state
+/// root: `state/default/default/alarms/<at>/...`): legacy (`…/t/<hex>`) and tagged
 /// (`…/t.t/<hex>/<tag>`).
 async fn index_entries_for(store: &Arc<dyn ObjectStore>, name: &str) -> Vec<String> {
     use futures_util::TryStreamExt as _;
     let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
     let listed: Vec<_> = store
-        .list(Some(&object_store::path::Path::from("alarms")))
+        .list(Some(&object_store::path::Path::from(test_key(
+            Family::Alarms,
+            "",
+        ))))
         .try_collect()
         .await
         .unwrap();
@@ -1747,7 +1777,7 @@ async fn index_entries_for(store: &Arc<dyn ObjectStore>, name: &str) -> Vec<Stri
         .map(|m| m.location.to_string())
         .filter(|k| {
             let parts: Vec<&str> = k.split('/').collect();
-            matches!(parts.get(3), Some(&"t" | &"t.t")) && parts.get(4) == Some(&hex.as_str())
+            matches!(parts.get(5), Some(&"t" | &"t.t")) && parts.get(6) == Some(&hex.as_str())
         })
         .collect()
 }
@@ -1758,7 +1788,7 @@ async fn indexed_at(store: &Arc<dyn ObjectStore>, at: u128) -> bool {
     index_entries_for_x(store)
         .await
         .iter()
-        .any(|k| k.split('/').nth(2) == Some(due.as_str()))
+        .any(|k| k.split('/').nth(4) == Some(due.as_str()))
 }
 
 async fn wait_indexed_at(store: &Arc<dyn ObjectStore>, at: u128) {
@@ -1936,8 +1966,9 @@ async fn wait_unindexed(store: &Arc<dyn ObjectStore>, name: &str, within: Durati
 async fn actor_keys(store: &Arc<dyn ObjectStore>, name: &str) -> Vec<String> {
     use futures_util::TryStreamExt as _;
     let mut keys: Vec<String> = store
-        .list(Some(&object_store::path::Path::from(format!(
-            "actors/default/t/{name}"
+        .list(Some(&object_store::path::Path::from(test_key(
+            Family::History,
+            &format!("t/{name}"),
         ))))
         .map_ok(|m| m.location.to_string())
         .try_collect()
@@ -1990,7 +2021,7 @@ async fn node_retaining(
 /// The highest generation `t/<name>`'s keys in `store` carry.
 async fn highest_key_generation(store: &Arc<dyn ObjectStore>, name: &str) -> u64 {
     use futures_util::TryStreamExt;
-    let prefix = object_store::path::Path::from(format!("actors/default/t/{name}"));
+    let prefix = object_store::path::Path::from(test_key(Family::History, &format!("t/{name}")));
     let metas: Vec<_> = store.list(Some(&prefix)).try_collect().await.unwrap();
     let keys: Vec<String> = metas
         .iter()

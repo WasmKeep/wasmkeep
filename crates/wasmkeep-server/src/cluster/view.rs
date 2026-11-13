@@ -119,11 +119,12 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
 }
 
 impl Cluster {
-    /// Reads the operator's intents under `control/` and publishes whether
+    /// Reads the operator's intents (drains under `control/drain/`, this
+    /// app's moves under its root) and publishes whether
     /// this node is asked to drain. A failed listing keeps the last intents
     /// read (ADR 0014).
     pub(super) async fn refresh_control(&self) {
-        match control::read(&self.control_keys, now_ms()).await {
+        match control::read(&self.control_keys, Some(&self.root), now_ms()).await {
             Ok(read) => {
                 let asked = read.draining.contains(&self.node_id);
                 let was = std::mem::replace(

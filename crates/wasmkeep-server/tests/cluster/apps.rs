@@ -118,9 +118,9 @@ fn signed_headers(
     sign(secret, to, "POST", path, signed_app, sent_app, true)
 }
 
-/// A request another node relays names that node's app; the owner refuses
-/// one for an app it does not serve, before the actor runs. Without the
-/// check, two apps of one tenant on one prefix served each other's actors.
+/// Two apps of one tenant on one prefix each have their own actor of a
+/// name (ADR 0022); a hop naming another app is refused before the actor
+/// runs, so no node ever serves another app's actors.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -133,27 +133,16 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
         (r.status, r.body.trim(), r.node.as_deref()),
         (200, "1", Some("shop-1"))
     );
-    // Through the other app's node: relayed to the owner, which refuses it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let r = loop {
-        let r = send(admin.addr, "POST", "/actor/t/x/durable", "").await;
-        if !not_in_view(&r) || tokio::time::Instant::now() >= deadline {
-            break r;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // Through the other app's node: its own actor of that name, in its own
+    // state root (ADR 0022), never relayed to the first app's owner.
+    let r = send(admin.addr, "POST", "/actor/t/x/durable", "").await;
     assert_eq!(
-        (r.status, r.body.trim(), r.retry_after.as_deref()),
-        (503, "not this app's node", Some("1")),
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "1", Some("admin-1")),
         "{}",
         r.body
     );
-    // A WebSocket upgrade relayed the same way: refused too.
-    assert_eq!(
-        upgrade_status_reachable(admin.addr, "/actor/t/x").await,
-        503
-    );
-    // A call signed by a node of the other app: refused the same way.
+    // A call signed by a node of the other app: refused before its body.
     let secret = cluster_secret(&store, "shop-1", shop.addr).await;
     let path = "/actor/t/x/durable";
     let signed = signed_headers(

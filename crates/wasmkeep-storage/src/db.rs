@@ -13,7 +13,8 @@ use crate::{Rows, SqlError, SqlValue, StorageError};
 /// Storage settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageConfig {
-    /// Root data directory; databases live under `<data_dir>/actors/`.
+    /// Root data directory; databases live under it, where the server's
+    /// [`StateDir`] says (`<data_dir>/state/<tenant>/<app>/actors/`).
     pub data_dir: PathBuf,
     /// Size cap per database, in bytes (default: 1 GiB).
     pub max_db_bytes: u64,
@@ -189,16 +190,14 @@ impl Storage {
         Ok(db)
     }
 
-    /// Every actor with a pending alarm. Opens each database under the data
-    /// directory; run at startup. A database that cannot be read is
+    /// Every actor with a pending alarm. Opens each database of this root
+    /// ([`StateDir::dir`]); run at startup. A database that cannot be read is
     /// reported in [`PendingAlarms::skipped`], and the scan goes on: one
     /// broken file must not cost every other actor its alarm.
     pub fn pending_alarms(&self) -> Result<PendingAlarms, StorageError> {
         let mut found = Vec::new();
         let mut skipped = Vec::new();
-        // Every tenant's databases, not only this root's: the one local
-        // path spelled outside the server's `StateRoot`.
-        let root = self.config.data_dir.join("actors");
+        let root = self.config.data_dir.join(&self.state.dir);
         for file in db_files(&root)? {
             match Self::alarm_of(&file, &self.config) {
                 Ok(Some(alarm)) => found.push(alarm),
@@ -259,7 +258,7 @@ impl Storage {
 /// Meta key holding `tenant/class/name`.
 const ADDRESS_KEY: &str = "address";
 
-/// `*.db` files at `<root>/<tenant>/<class>/`.
+/// `*.db` files at `<root>/<class>/`.
 fn db_files(root: &Path) -> Result<Vec<PathBuf>, StorageError> {
     let read = |dir: &Path| -> Result<Vec<PathBuf>, StorageError> {
         match std::fs::read_dir(dir) {
@@ -272,14 +271,12 @@ fn db_files(root: &Path) -> Result<Vec<PathBuf>, StorageError> {
         }
     };
     let mut files = Vec::new();
-    for tenant in read(root)?.into_iter().filter(|p| p.is_dir()) {
-        for class in read(&tenant)?.into_iter().filter(|p| p.is_dir()) {
-            files.extend(
-                read(&class)?
-                    .into_iter()
-                    .filter(|p| p.extension().is_some_and(|e| e == "db")),
-            );
-        }
+    for class in read(root)?.into_iter().filter(|p| p.is_dir()) {
+        files.extend(
+            read(&class)?
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "db")),
+        );
     }
     files.sort();
     Ok(files)

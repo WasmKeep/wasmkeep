@@ -139,18 +139,26 @@ async fn the_bucket_knows_which_actors_have_alarms() {
 
     send(a.addr, "POST", "/actor/t/x/alarm?in=60000", "").await;
     let keys = alarm_index(&store, |k| !k.is_empty()).await;
-    // alarms/<tenant>/<due ms, 15 digits>/<class>.t/<name in hex>/
-    // <generation, 20 digits>-<nonce in hex>
+    // state/<tenant>/<app>/alarms/<due ms, 15 digits>/<class>.t/<name in
+    // hex>/<generation, 20 digits>-<nonce in hex>
     assert_eq!(keys.len(), 1, "{keys:?}");
     let parts: Vec<&str> = keys[0].split('/').collect();
-    assert_eq!(parts.len(), 6, "{keys:?}");
+    assert_eq!(parts.len(), 8, "{keys:?}");
     assert_eq!(
-        (parts[0], parts[1], parts[2].len(), parts[3], parts[4]),
-        ("alarms", "default", 15, "t.t", "78"),
+        (
+            parts[0],
+            parts[1],
+            parts[2],
+            parts[3],
+            parts[4].len(),
+            parts[5],
+            parts[6]
+        ),
+        ("state", "default", "default", "alarms", 15, "t.t", "78"),
         "{keys:?}"
     );
-    assert!(parts[2].bytes().all(|b| b.is_ascii_digit()), "{keys:?}");
-    let (generation, nonce) = parts[5].split_once('-').unwrap();
+    assert!(parts[4].bytes().all(|b| b.is_ascii_digit()), "{keys:?}");
+    let (generation, nonce) = parts[7].split_once('-').unwrap();
     assert!(
         generation.len() == 20 && generation.bytes().all(|b| b.is_ascii_digit()),
         "{keys:?}"
@@ -260,7 +268,10 @@ async fn a_stale_index_entry_is_removed_when_it_comes_due() {
         use object_store::ObjectStoreExt as _;
         store
             .put(
-                &object_store::path::Path::from(format!("alarms/default/{due:015}/t/78")),
+                &object_store::path::Path::from(test_key(
+                    Family::Alarms,
+                    &format!("{due:015}/t/78"),
+                )),
                 object_store::PutPayload::new(),
             )
             .await
@@ -298,7 +309,10 @@ async fn legacy_and_owned_entries_at_one_time_fire_once_and_are_removed() {
         use object_store::ObjectStoreExt as _;
         store
             .put(
-                &object_store::path::Path::from(format!("alarms/default/{due:015}/t/78")),
+                &object_store::path::Path::from(test_key(
+                    Family::Alarms,
+                    &format!("{due:015}/t/78"),
+                )),
                 object_store::PutPayload::new(),
             )
             .await
@@ -420,12 +434,10 @@ async fn er04_a_leftover_entry_cannot_bring_back_an_actor_its_alarm_deleted() {
     // The leftover: a tagged entry of a's generation, a second before the
     // alarm.
     let parts: Vec<&str> = indexed.split('/').collect();
-    let (due, tag): (u64, &str) = (parts[2].parse().unwrap(), parts[5]);
-    let leftover = format!(
-        "alarms/default/{:015}/t.t/{}/{}-ab",
-        due - 1_000,
-        parts[4],
-        &tag[..20]
+    let (due, tag): (u64, &str) = (parts[4].parse().unwrap(), parts[7]);
+    let leftover = test_key(
+        Family::Alarms,
+        &format!("{:015}/t.t/{}/{}-ab", due - 1_000, parts[6], &tag[..20]),
     );
     {
         use object_store::ObjectStoreExt as _;
@@ -564,10 +576,9 @@ async fn er04_an_entry_for_a_deleted_actor_is_removed_without_running_it() {
     assert!(!after_delete.is_empty(), "the delete is in the bucket");
 
     let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
-    let leftover = format!(
-        "alarms/default/{:015}/t.t/{hex}/{:020}-ab",
-        epoch_ms() - 10_000,
-        1
+    let leftover = test_key(
+        Family::Alarms,
+        &format!("{:015}/t.t/{hex}/{:020}-ab", epoch_ms() - 10_000, 1),
     );
     {
         use object_store::ObjectStoreExt as _;
@@ -695,10 +706,9 @@ async fn an_entry_for_an_actor_the_bucket_never_had_stays_without_creating_it() 
     settle().await;
     let name = "never";
     let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
-    let entry = format!(
-        "alarms/default/{:015}/t.t/{hex}/{:020}-ab",
-        epoch_ms() - 10_000,
-        1
+    let entry = test_key(
+        Family::Alarms,
+        &format!("{:015}/t.t/{hex}/{:020}-ab", epoch_ms() - 10_000, 1),
     );
     {
         use object_store::ObjectStoreExt as _;

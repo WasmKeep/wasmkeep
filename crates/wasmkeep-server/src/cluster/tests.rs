@@ -354,7 +354,7 @@ fn fast_node(id: &str, store: &Arc<dyn ObjectStore>) -> Arc<Cluster> {
     );
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
-    Cluster::new(&config, "t/", "t").unwrap()
+    Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap()
 }
 
 #[tokio::test]
@@ -522,8 +522,7 @@ fn node(id: &str) -> Arc<Cluster> {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     Cluster::new(
         &ClusterConfig::new(id, format!("http://{id}"), store),
-        "t/default",
-        "t",
+        &StateRoot::new("", "t", "default"),
     )
     .unwrap()
 }
@@ -533,7 +532,7 @@ async fn the_sweep_cursor_resumes_under_a_prefix_that_needs_escaping() {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let mut config = ClusterConfig::new("a", "http://a", store);
     config.prefix = "team~1".into(); // `~` is escaped in stored keys
-    let cluster = Cluster::new(&config, "t/", "t").unwrap();
+    let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
         let address = ActorAddress::new("t", "c", *name).unwrap();
         cluster
@@ -564,7 +563,7 @@ async fn an_actors_entries_at_one_time_are_listed_and_deleted_exactly() {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.prefix = "team~1".into();
-    let cluster = Cluster::new(&config, "t/", "t").unwrap();
+    let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let x = ActorAddress::new("t", "c", "x").unwrap();
     // "xy" is 7879 in hex: its keys start with x's (78), but not at a
     // segment boundary.
@@ -855,7 +854,7 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
     // Short, so the start check (ttl plus grace) fits the deadline below.
     config.lease = LeaseConfig::new(1_800, 200, 200, 100).unwrap();
     config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let tls = Arc::clone(a.tls().unwrap());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while a.published_ms.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -932,7 +931,7 @@ async fn connection_pools_are_dropped_when_an_address_changes_hands() {
     config.heartbeat = Duration::from_secs(3_600);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
     config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let publish = |pin: u8| {
         let store = Arc::clone(&store);
         async move {
@@ -970,7 +969,7 @@ async fn after_a_heartbeat_outage_the_identity_counts_as_published_anew() {
     config.heartbeat = Duration::from_secs(3_600);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
     config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let published = || a.published_ms.load(std::sync::atomic::Ordering::Relaxed);
     a.heartbeat_reached_bucket(1_000_000);
     assert_eq!(published(), 1_000_000);
@@ -993,11 +992,11 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
     // Refusing plain HTTP needs a cluster listener.
     config.cluster_plaintext = ClusterPlaintext::Refuse;
     assert!(matches!(
-        Cluster::new(&config, "t/", "t"),
+        Cluster::new(&config, &StateRoot::new("", "t", "default")),
         Err(crate::Error::ClusterTls(_))
     ));
     config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     *a.peers.write().unwrap() = HashMap::from([
         (
             "b".to_owned(),
@@ -1042,9 +1041,9 @@ async fn refuse_mode_honours_node_signatures_on_the_cluster_port_only() {
     config.heartbeat = Duration::from_secs(3_600);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
     config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
-    let accept = Cluster::new(&config, "t/", "t").unwrap();
+    let accept = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     config.cluster_plaintext = ClusterPlaintext::Refuse;
-    let refuse = Cluster::new(&config, "t/", "t").unwrap();
+    let refuse = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let path = "/actor/u/x/";
     let method = hyper::Method::POST;
     let ts = now_ms();
@@ -1069,7 +1068,7 @@ async fn each_refusal_reason_has_its_own_log_slot() {
     let mut config = ClusterConfig::new("a", "http://a", store);
     config.heartbeat = Duration::from_secs(3_600);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let t = 1_000_000;
     assert!(a.refusal_log_due("junk on the public port", t));
     assert!(!a.refusal_log_due("junk on the public port", t + 1));
@@ -1194,7 +1193,7 @@ async fn a_bad_cluster_address_is_refused_at_start() {
     let mut config = ClusterConfig::new("a", "http://a", store);
     config.cluster_tls = Some(ClusterTlsConfig::new("http://a.test:7443"));
     assert!(matches!(
-        Cluster::new(&config, "t/", "t"),
+        Cluster::new(&config, &StateRoot::new("", "t", "default")),
         Err(crate::Error::ClusterTls(_))
     ));
 }
@@ -1368,14 +1367,14 @@ fn a_heartbeat_period_above_a_third_of_the_ttl_is_refused() {
     let mut config = ClusterConfig::new("a", "http://a", store);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     config.heartbeat = Duration::from_millis(334);
-    let err = Cluster::new(&config, "t/", "t").unwrap_err();
+    let err = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap_err();
     assert!(err.to_string().contains("at most a third"), "{err}");
     config.heartbeat = Duration::from_millis(333);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async { Cluster::new(&config, "t/", "t").unwrap() });
+    rt.block_on(async { Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap() });
 }
 
 /// ADR 0020, section 4: a clean stop ends with the node lease written
@@ -1445,7 +1444,7 @@ impl ObjectStore for HangOneLeaseWrite {
         let slow = self
             .slow_owner_writes_ms
             .load(std::sync::atomic::Ordering::SeqCst);
-        if location.as_ref().starts_with("owners/") {
+        if location.as_ref().starts_with("state/t/default/owners/") {
             self.owner_writes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if slow > 0 {
@@ -1501,7 +1500,7 @@ impl ObjectStore for HangOneLeaseWrite {
         let slow = self
             .slow_owner_reads_ms
             .load(std::sync::atomic::Ordering::SeqCst);
-        if slow > 0 && location.as_ref().starts_with("owners/") {
+        if slow > 0 && location.as_ref().starts_with("state/t/default/owners/") {
             tokio::time::sleep(Duration::from_millis(slow)).await;
         }
         self.inner.get_opts(location, options).await
@@ -1560,7 +1559,7 @@ async fn one_hung_lease_write_does_not_make_the_node_not_ready() {
     let mut config = ClusterConfig::new("a", "http://a", store);
     config.heartbeat = Duration::from_millis(333);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     a.identity().await.unwrap();
     // Right after a write landed: the next one hangs.
     let mut valid = a.validity.subscribe();
@@ -1599,7 +1598,7 @@ async fn a_clean_stop_during_a_hung_lease_write_still_releases() {
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     a.identity().await.unwrap();
     gate.hang.store(true, std::sync::atomic::Ordering::SeqCst);
     while gate.hang.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1641,7 +1640,7 @@ async fn a_clean_stop_retries_a_failed_released_write() {
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     a.identity().await.unwrap();
     let limit = a.node_lease_stop_limit();
     let started = std::time::Instant::now();
@@ -1684,7 +1683,7 @@ async fn a_released_write_that_landed_unanswered_is_not_retried_wrongly() {
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     a.identity().await.unwrap();
     assert!(a.stop_node_lease(a.node_lease_stop_limit()).await);
     assert_eq!(
@@ -1790,7 +1789,7 @@ async fn a_fenced_node_s_pins_are_not_trusted() {
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     a.identity().await.unwrap();
     let pin = "ab".repeat(32);
     let body = |state: &str| {
@@ -1825,7 +1824,7 @@ async fn no_fence_is_started_without_room_left_in_the_lease() {
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.heartbeat = Duration::from_secs(3_600);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let attempt = u64::try_from(a.lease_attempt.as_millis()).unwrap();
     // b last wrote 4 h ago: stale by ttl plus grace.
     let at = now_ms() - 4 * 3_600_000;
@@ -1882,7 +1881,7 @@ async fn a_hung_fence_does_not_hold_up_the_listing() {
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.heartbeat = Duration::from_secs(3_600);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let attempt = u64::try_from(a.lease_attempt.as_millis()).unwrap();
     let at = now_ms() - 4 * 3_600_000;
     store
@@ -1926,7 +1925,7 @@ async fn a_lapse_after_a_node_was_found_due_cancels_its_fence() {
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.heartbeat = Duration::from_secs(3_600);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     let attempt = u64::try_from(a.lease_attempt.as_millis()).unwrap();
     let at = now_ms() - 4 * 3_600_000;
     let key = StorePath::from("nodes/b");
@@ -2159,7 +2158,7 @@ fn a_foreground_release_waits_at_most_a_second() {
         .build()
         .unwrap();
     let _guard = rt.enter();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     assert_eq!(a.release_attempt(), Duration::from_secs(1));
     let other: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let fast = fast_node("b", &other);
@@ -2559,7 +2558,7 @@ async fn an_acquisition_whose_epoch_moved_writes_nothing() {
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
-    let a = Cluster::new(&config, "t/", "t").unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     a.identity().await.unwrap();
     wait_lease_valid(&a).await;
     gate.slow_owner_reads_ms
@@ -2631,7 +2630,7 @@ fn waiting_node(max: usize, wait: Duration) -> Arc<Cluster> {
     config.lease = LeaseConfig::new(60_000, 5_000, 2_000, 1_000).unwrap();
     config.failover_wait = Some(wait);
     config.failover_wait_max = max;
-    let b = Cluster::new(&config, "t/", "t").unwrap();
+    let b = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     b.validity.set_until(Some(now_ms() + 60_000));
     let stale = listed("a", wasmkeep_cluster::node_lease::NodeState::Live, STALE);
     b.failover.observe(&[stale], now_ms());

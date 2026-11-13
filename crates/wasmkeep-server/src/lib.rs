@@ -20,6 +20,7 @@ mod error;
 pub mod fds;
 pub mod guest_log;
 mod http;
+mod local_layout;
 pub mod metrics;
 mod replica;
 pub mod secret_store;
@@ -49,7 +50,7 @@ pub use wasmkeep_cluster::state_root::StateRoot;
 pub fn state_dir(root: &StateRoot) -> wasmkeep_storage::StateDir {
     wasmkeep_storage::StateDir {
         dir: root.local(wasmkeep_storage::encode_segment),
-        scratch: root.scratch(),
+        scratch: root.scratch(wasmkeep_storage::encode_segment),
         tenant: root.tenant().to_owned(),
     }
 }

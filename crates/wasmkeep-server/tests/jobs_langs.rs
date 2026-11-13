@@ -167,7 +167,7 @@ fn shard_for(key: &[u8], shards: u64) -> u64 {
 
 /// The shard databases created so far, by actor name.
 fn shard_dbs(data: &std::path::Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(data.join("actors/default/kv"))
+    let mut names: Vec<String> = std::fs::read_dir(data.join("state/default/default/actors/kv"))
         .map(|dir| {
             dir.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .filter(|n| n.ends_with(".db"))

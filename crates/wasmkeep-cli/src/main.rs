@@ -997,6 +997,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 classes.push((class, component, wasm));
             }
             config.tenant = tenant.clone();
+            config.app = name.clone();
             tracing::info!(app = %format!("{tenant}/{name}"), version = %current.version, seq = current.seq, "serving the deployed version");
             follow = Some((app_ref, current.seq));
         }
@@ -1334,7 +1335,7 @@ fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
             );
         }
         let requested = rt
-            .block_on(control::read(&keys, status::now_ms()))
+            .block_on(control::read(&keys, None, status::now_ms()))
             .map_err(|e| anyhow::anyhow!("reading the drain requests: {e}"))?
             .draining
             .contains(id);
@@ -1490,7 +1491,7 @@ fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
     }
     let (tenant, class, name) = (&tenant, &class, &name);
     let key = control::checked_move_key(
-        &wasmkeep_cluster::state_root::StateRoot::new("", tenant.as_str()),
+        &wasmkeep_cluster::state_root::StateRoot::new("", tenant.as_str(), app.as_str()),
         class,
         name,
         &args.to,

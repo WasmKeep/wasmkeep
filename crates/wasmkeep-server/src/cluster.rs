@@ -522,13 +522,12 @@ impl Cluster {
         let _ = self.lapse_hook.set(hook);
     }
 
-    /// `serves`: what this node serves (see [`NodeInfo::app`]); `tenant`:
-    /// whose actors, the tenant of its [`StateRoot`].
-    pub(crate) fn new(
-        config: &ClusterConfig,
-        serves: &str,
-        tenant: &str,
-    ) -> Result<Arc<Self>, crate::Error> {
+    /// `root`: whose actors, under the bucket prefix of `config` (the
+    /// prefix given here is ignored); what this node serves (see
+    /// [`NodeInfo::app`]) is the root's `tenant/app`.
+    pub(crate) fn new(config: &ClusterConfig, root: &StateRoot) -> Result<Arc<Self>, crate::Error> {
+        let serves = format!("{}/{}", root.tenant(), root.app());
+        let serves = serves.as_str();
         let invalid_id =
             |e: InvalidNodeId| crate::Error::InvalidNodeId(config.node_id.clone(), e.to_string());
         // Every bucket request this node makes goes through here (leases,
@@ -611,7 +610,7 @@ impl Cluster {
             secret: tokio::sync::OnceCell::new(),
             ttl: Duration::from_millis(config.lease.ttl_ms()),
             store,
-            root: StateRoot::new(&config.prefix, tenant),
+            root: StateRoot::new(&config.prefix, root.tenant(), root.app()),
             alarm_overdue: Duration::from_millis(
                 config
                     .lease
