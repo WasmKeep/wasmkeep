@@ -845,14 +845,14 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE    STATE    VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
-a     yes   979ms  serving  0.2.0    acme/shop  http://a:8080  https://a:7443   pinned
-b     yes   2.2s   serving  0.2.0    acme/shop  http://b:8080  -                plain
-c     no    14m    serving  0.2.0    acme/shop  http://c:8080  https://c:7443   pinned
+a     yes   979ms  serving  0.3.0    acme/shop  http://a:8080  https://a:7443   pinned
+b     yes   2.2s   serving  0.3.0    acme/shop  http://b:8080  -                plain
+c     no    14m    serving  0.3.0    acme/shop  http://c:8080  https://c:7443   pinned
 
 APP        DEPLOYED VERSION  SEQ
 acme/shop  9cf4de9152d8dd29  1
 
-2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.2.0
+2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.3.0
 warning: mixed plain and TLS nodes: b still plain while a use the cluster listener; give every node a cluster listener, then drop --cluster-plaintext accept (ADR 0011)
 ```
 
@@ -993,7 +993,7 @@ the last stop and the first start, so plan a short window.
    version in the summary, no warning.
 
 Going back to the previous binary is the same procedure. Builds made from
-source report the version of the release they follow (`0.2.0` for any
+source report the version of the release they follow (`0.3.0` for any
 build since it), so the version column cannot tell two of them apart:
 step 3 is what proves no old node is left.
 

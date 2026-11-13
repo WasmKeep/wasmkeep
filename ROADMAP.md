@@ -5,36 +5,12 @@ Dates are not promised; the order is, and features come before speed.
 For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
-WasmKeep is **pre-alpha**. Its releases so far, `0.1.0` and `0.2.0`, are
-pre-releases for trying it, side projects and staging.
+WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0` and
+`0.3.0`, are pre-releases for trying it, side projects and staging.
 
 ## Now
 
-The next release, `0.3.0`: **our own app on it, and reliable enough to
-leave running.**
-
-1. **Our own app.** Watch, the uptime monitor in
-   [`examples/watch`](examples/watch), on a three-node cluster on a
-   released build, behind HTTPS, with dashboards, alerts and a nightly copy
-   of the bucket. What that shows is missing goes on this page.
-2. **The known ways it stalls.** A snapshot upload has a timeout and no
-   longer fails silently; a restore gets one deadline for the whole of it
-   (one took 56 s in the soak,
-   [measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)); a
-   request body the handler did not read no longer costs the answer.
-3. **A request waits for a takeover.** When an actor's node dies, a request
-   for that actor is held until another node may take it, 15 to about 21 s,
-   instead of being refused meanwhile. The wait before a takeover does not
-   change: one writer at a time is what it protects.
-4. **What running Watch showed is missing**: a guide to back up and restore
-   a cluster's bucket, alert rules as a file, and a page that says plainly
-   what happens when a node dies, what scales and what does not.
-5. **Tests that depend on timing** wait on events instead of the clock.
-6. **A twelve-hour soak** of the release candidate.
-
-## Next
-
-`0.4.0`: **an app is one thing.**
+The next release, `0.4.0`: **an app is one thing.**
 
 1. **A front for each app**: the stateless component receives every
    request outside `/actor/`, calls the app's actors with the same call
@@ -49,7 +25,7 @@ leave running.**
 4. **Load you can see**: actors and work per node and per app, in the
    metrics and in `wasmkeep cluster status`.
 
-## Then
+## Next
 
 `0.5.0`: **several apps on the same nodes.** For one owner's apps and for
 tenants the operator trusts: the limits are protection against a noisy
@@ -117,7 +93,7 @@ you, for standard Wasm components.
 ## Built
 
 By milestone, the names the [design decisions](docs/adr) use. In `0.1.0`
-unless marked `0.2.0`.
+unless marked with a later release.
 
 ### M0: Hello component
 
@@ -203,7 +179,8 @@ Languages, documentation, hardening, and `0.1.0`
 
 ### M4: Operating a cluster
 
-Started alongside M3; what is left of it is in [Next](#next).
+Started alongside M3; what is left of it is under [Now](#now) and
+[Next](#next).
 
 - Draining a node and moving one actor: `wasmkeep cluster drain` and
   `wasmkeep actor move`
@@ -218,6 +195,17 @@ Started alongside M3; what is left of it is in [Next](#next).
 - Durable workflows as an SDK pattern ([guide](docs/workflows.md),
   [ADR 0019](docs/adr/0019-workflows-as-an-sdk-pattern.md)): runners in
   Rust and TypeScript, clients in the Go, Python, C and Zig SDKs.
+- In `0.3.0`, reliable enough to leave running: a request for a dead
+  node's actor waits for the takeover instead of being refused; a
+  snapshot upload and a restore are bounded, tried again and counted; a
+  request body the handler did not read no longer costs the answer;
+  WebSockets close when their node loses the actor
+  ([what a caller sees](docs/failover-and-scaling.md)).
+- In `0.3.0`: guides to [back up and restore](docs/deploy/backup-and-restore.md)
+  a cluster's bucket, alert rules as a
+  [file](deploy/prometheus/alerts.yml), and the app model
+  ([ADR 0021](docs/adr/0021-the-app-model.md),
+  [ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md)).
 
 ## Stretch goal: the benchmark showdown
 

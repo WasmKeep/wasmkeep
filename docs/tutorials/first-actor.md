@@ -3,7 +3,7 @@
 You will write a small actor in Rust, build it into a WebAssembly component,
 serve it with WasmKeep, and see its state survive a restart.
 
-Applies to: WasmKeep `0.2.0` (pre-alpha). Commands assume Linux; on macOS,
+Applies to: WasmKeep `0.3.0` (pre-alpha). Commands assume Linux; on macOS,
 build the server from source (step 1).
 
 ## 1. Get WasmKeep
@@ -39,7 +39,7 @@ cargo add wasmkeep-sdk
 
 `cargo add` takes the newest version: the SDK carries the version of the
 server it is released with, so keep the two the same
-(`cargo add wasmkeep-sdk@0.2.0` names one). Add to `Cargo.toml`:
+(`cargo add wasmkeep-sdk@0.3.0` names one). Add to `Cargo.toml`:
 
 ```toml
 [lib]

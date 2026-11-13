@@ -5,7 +5,7 @@
   bucket refuses one that carries the migration's markers
   (`crates/wasmkeep-cli/src/main.rs`, `MIGRATION_MARKERS`).
 - Date: 2026-11-12
-- Release: [0.4.0](../../ROADMAP.md#next)
+- Release: [0.4.0](../../ROADMAP.md#now)
 - Amends: [ADR 0007](0007-replication-protocol.md),
   [0009](0009-alarms-in-a-cluster.md),
   [0012](0012-bucket-garbage-collection.md),

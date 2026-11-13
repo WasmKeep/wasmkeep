@@ -49,7 +49,7 @@ TinyGo against the WIT the module ships (`wit/`), and serve it (see also
 
 ```bash
 go mod init hits
-go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0
+go get github.com/wasmkeep/wasmkeep/sdks/go@v0.3.0
 go mod tidy   # records the module's one dependency
 SDK=$(go list -m -f '{{.Dir}}' github.com/wasmkeep/wasmkeep/sdks/go)
 tinygo build -target=wasip2 -no-debug -opt=2 \
@@ -67,11 +67,11 @@ program uses them (the host provides them inert: no directories).
 ## Install
 
 Add the module to an app at the version of the WasmKeep release it runs
-on, as above (`go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0`, then
+on, as above (`go get github.com/wasmkeep/wasmkeep/sdks/go@v0.3.0`, then
 `go mod tidy` once the app imports a package).
 
 The module carries the same version number as the server (in the
-repository, the module's own tag is `sdks/go/v0.2.0`). The `wasmkeep`
+repository, the module's own tag is `sdks/go/v0.3.0`). The `wasmkeep`
 package starts at `v0.2.0`: `v0.1.0` has only the `kv`, `queue` and
 `workflow` clients.
 

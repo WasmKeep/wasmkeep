@@ -10,7 +10,7 @@
   ([ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)), the project file.
   Later: several apps on the same nodes.
 - Date: 2026-11-12
-- Release: 0.3.0 and [0.4.0](../../ROADMAP.md#next)
+- Release: 0.3.0 and [0.4.0](../../ROADMAP.md#now)
 
 ## Context
 

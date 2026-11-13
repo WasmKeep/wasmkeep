@@ -41,16 +41,16 @@ different target, and does not make a language usable here.
 ### Getting an SDK
 
 Each SDK has the version of the server it is released with
-([versions](#versions)); here for `0.2.0`.
+([versions](#versions)); here for `0.3.0`.
 
 | Language | Get it | Build an actor |
 | --- | --- | --- |
 | Rust | `cargo add wasmkeep-sdk` (crates.io) | `cargo build --release --target wasm32-wasip2` ([tutorial](tutorials/first-actor.md)) |
 | TypeScript / JavaScript | `npm install @wasmkeep/sdk` (npm) | `npx wasmkeep-ts build src/index.ts -o actor.wasm` ([README](../sdks/typescript/README.md)) |
 | Python | `pip install wasmkeep` (PyPI) | `python -m wasmkeep build app -o actor.wasm` ([README](../sdks/python/README.md)) |
-| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0` (a module of this repository) | `tinygo build -target=wasip2`, with the WIT the module ships ([README](../sdks/go/README.md#install)) |
-| C / C++ | `wasmkeep-c-sdk-0.2.0.tar.gz`, a file of the [release](https://github.com/WasmKeep/wasmkeep/releases) | The build command in the archive's README ([C SDK](../sdks/c/README.md)) |
-| Zig | `wasmkeep-zig-sdk-0.2.0.tar.gz`, a file of the release | The build command in the archive's README ([Zig SDK](../sdks/zig/README.md)) |
+| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.3.0` (a module of this repository) | `tinygo build -target=wasip2`, with the WIT the module ships ([README](../sdks/go/README.md#install)) |
+| C / C++ | `wasmkeep-c-sdk-0.3.0.tar.gz`, a file of the [release](https://github.com/WasmKeep/wasmkeep/releases) | The build command in the archive's README ([C SDK](../sdks/c/README.md)) |
+| Zig | `wasmkeep-zig-sdk-0.3.0.tar.gz`, a file of the release | The build command in the archive's README ([Zig SDK](../sdks/zig/README.md)) |
 | D, MoonBit, C#, standard Go | The repository's source at the release's tag | Each example's `build.sh` |
 
 The release's files are signed:
@@ -174,7 +174,7 @@ needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
 provides them inert (no directories).
 
 An app adds the module with `go get
-github.com/wasmkeep/wasmkeep/sdks/go@v0.2.0`: the module carries the
+github.com/wasmkeep/wasmkeep/sdks/go@v0.3.0`: the module carries the
 server's version number. The `wasmkeep` package starts at `v0.2.0`
 (`v0.1.0` has only the clients); see the SDK's
 [Install](../sdks/go/README.md#install).
@@ -327,12 +327,13 @@ tested.
 
 | SDK | Server | WIT package |
 | --- | --- | --- |
+| 0.3.0 | 0.3.0 | `wasmkeep:actor@0.2.0` |
 | 0.2.0 | 0.2.0 | `wasmkeep:actor@0.2.0` |
 | 0.1.0 | 0.1.0 | `wasmkeep:actor@0.2.0` |
 
 `0.2.0` is the first version on the registries (crates.io, npm, PyPI);
 `0.1.0` was used from a clone of the repository. That the SDK and the WIT
-package both read `0.2.0` in the first row is a coincidence.
+package both read `0.2.0` in the `0.2.0` row is a coincidence.
 
 The WIT package version is another number: it is the version of the
 interface between a component and the host

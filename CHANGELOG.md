@@ -9,15 +9,22 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
-Since 0.2.0, in no release yet.
+Since 0.3.0, in no release yet.
+
+## 0.3.0 — 2026-11-13
+
+**Reliable enough to leave running.** This release fixes the known ways
+a cluster stalled or lost an answer when a node or the bucket misbehaved,
+keeps a request for a dead node's actor until the takeover instead of
+refusing it, and adds the guides that running an application on a cluster
+showed missing. Still a **pre-alpha pre-release**: for trying WasmKeep,
+side projects and staging, not production. The interface between an actor
+and the host is unchanged (`wasmkeep:actor@0.2.0`), and so are the SDKs'
+APIs: a component built for 0.1.0 or 0.2.0 runs as it is. See the
+[roadmap](ROADMAP.md) for what comes next.
 
 ### What changed
 
-- **A bucket a later version migrated is refused.** Every command that
-  opens a bucket first checks for the markers a later version writes while
-  it moves actor state to a new layout (`cluster/migration`,
-  `cluster/migrated/`), and stops with a message naming the marker. One
-  read and one listing per command, bounded to 10 s.
 - **A request waits for a takeover.** When an actor's node dies, a GET or
   HEAD without a body, or a WebSocket upgrade, for one of its actors is
   kept by the node that received it until the actor can be taken over (15
@@ -25,7 +32,7 @@ Since 0.2.0, in no release yet.
   instead of being answered 503 meanwhile. A request with a body, an
   actor-to-actor call and a forwarded request still get the 503 at once,
   which still means it did not run. A client that leaves while its
-  request is kept is dropped and its request never runs. At most a
+  request is kept is dropped, and its request never runs. At most a
   quarter of the node's connection limit, and 64 per actor, are kept;
   beyond that, the 503 at once. `--failover-wait-secs` sets the wait
   (about 25 s by default, from the lease timing); 0 turns it off. Set the
@@ -35,16 +42,38 @@ Since 0.2.0, in no release yet.
   [front door](docs/deploy/front-door.md)).
 - **A snapshot upload is bounded, tried again after a failure, and
   counted.** The snapshot an actor's owner adds every 64 writes holds the
-  actor while it uploads. It now gets one attempt, given up after 5 s plus
-  a second per megabyte and 10 s at most; the upload had no bound of its
-  own, so a bucket that left it unanswered held the actor until the bucket
-  client ended the request (30 s by default). One that fails costs no
-  write and fails no event, and is tried again
-  once the actor has made one more write and 30 s have passed, then 8
-  writes later, then every 64; a failure used to put the next snapshot 64
-  more writes away. The node keeps these waits while an idle actor is out
-  of its memory. `wasmkeep_snapshot_upload_failures_total` counts the
-  snapshot uploads that were not acknowledged
+  actor while it uploads. The upload had no bound of its own, so a bucket
+  that left it unanswered held the actor until the bucket client ended the
+  request (30 s by default). It now gets one attempt, given up after 5 s
+  plus a second per megabyte, 10 s at most. A snapshot that fails costs no
+  write and fails no event, and is tried again once the actor has made one
+  more write and 30 s have passed, then 8 writes later, then every 64; a
+  failure used to put the next snapshot 64 more writes away. The node
+  keeps these waits while an idle actor is out of its memory.
+  `wasmkeep_snapshot_upload_failures_total` counts the snapshot uploads
+  that were not acknowledged
+  ([replication](docs/cluster.md#replication),
+  [monitoring](docs/monitoring.md)).
+- **A restore's reads have one deadline, a refused read is sent again,
+  and failed restores are counted.** Restoring an actor from the bucket
+  bounded each read but not the reads together, so reads that each stayed
+  under their limit added up with the length of the history while every
+  caller of the actor waited. The reads of one restore now end within
+  30 s, plus a second per megabyte of what it reads and a second per
+  eight objects. The clock runs only while the restore waits for the
+  bucket to give it the object it applies next: the listing, work on the
+  local disk and the wait for a turn among the node's other restores are
+  not counted. Neither are the seconds that other restores' reads on the
+  node add to the limit of a read (a second per megabyte in flight, 256 at
+  most), so restores that read side by side after a takeover are not
+  ended for each other's bytes; a restore alone on the node has no more
+  than its own time. Running out of time is answered like a bucket that
+  does not answer, a 503 with `Retry-After`, and leaves the local file as
+  it was. A read the bucket refuses with an error a resend can get past
+  (a 5xx or a broken connection, after the bucket client's own retries)
+  used to fail the whole restore; it is now sent again after 0.5 s, then
+  1 s, three tries per object. `wasmkeep_restore_failures_total` counts
+  the restores that did not complete
   ([replication](docs/cluster.md#replication),
   [monitoring](docs/monitoring.md)).
 - **A request body the handler left unread no longer costs the upload or
@@ -58,37 +87,15 @@ Since 0.2.0, in no release yet.
   more, and a forwarded request that was written is never sent twice.**
   An upgrade relayed to the actor's node that the node provably never read
   (it refused the TLS handshake, or the upgrade came back unsent on a new
-  TLS connection) is sent once more, the client waiting meanwhile; it
-  used to get a 503 asking the client to retry. Between nodes, the only
-  other thing sent a second time is an `actors.call` the peer provably
-  never read in the same way, once, as 0.2.0 already did after a refused
+  TLS connection) is sent once more while the client waits; it used to
+  get a 503 asking the client to retry. Between nodes, the only other
+  thing sent a second time is an `actors.call` the peer provably never
+  read in the same way, once, as 0.2.0 already did after a refused
   handshake. A forwarded request is never sent again, whether its
-  connection could not be opened or it was written into a connection
-  that then failed: one that was written may have run on the owner, so
-  the client gets a 503, which does not say whether it ran
+  connection could not be opened or it was written into a connection that
+  then failed: one that was written may have run on the owner, so the
+  client gets a 503, which does not say whether it ran
   ([running a cluster](docs/cluster.md)).
-- **A restore's reads have one deadline, a refused read is sent again,
-  and failed restores are counted.** Restoring an actor from the bucket
-  bounded each read but not the reads together, so reads that each stayed
-  under their limit added up with the length of the history while every
-  caller of the actor waited. The reads of one restore now end within
-  30 s, plus a second per megabyte of what it reads and a second per
-  eight objects; the clock runs only while the restore waits for the
-  bucket to give it the object it applies next, so the listing, work on
-  the local disk and the wait for a turn among the node's other restores
-  are not counted. Neither are the seconds that other restores' reads on
-  the node add to the limit of a read (a second per megabyte in flight,
-  256 at most), so restores that read side by side after a takeover are
-  not ended for each other's bytes; a restore alone on the node has no
-  more than its own time. Running out of time is answered like a bucket that
-  does not answer, a 503 with `Retry-After`, and leaves the local file as
-  it was. A read the bucket refuses with an error a resend can get past
-  (a 5xx or a broken connection, after the bucket client's own retries)
-  used to fail the whole restore; it is sent again after 0.5 s, then 1 s,
-  three tries per object. `wasmkeep_restore_failures_total` counts the
-  restores that did not complete
-  ([replication](docs/cluster.md#replication),
-  [monitoring](docs/monitoring.md)).
 - **A client that only listens no longer misses a room's messages
   without a close.** A room that hibernates keeps its WebSockets open on
   its node and releases its ownership record. When a request then woke it
@@ -97,16 +104,15 @@ Since 0.2.0, in no release yet.
   stayed connected and silently missed everything the room said from then
   on. Now every socket of the room on that node closes with 1012 as soon
   as one of them sends, and an owner sweep, once a minute, closes the
-  sockets of rooms another node took even if none of them sends. A
-  node's sockets also close with 1012 when its lease runs out (8 s
-  without a write reaching the bucket, with the defaults), before any
-  other node can take its actors; nothing closed them before. A drain
-  closes the sockets of hibernated rooms, and reports `drained` only once
-  the node holds no socket. Each such close is counted in
-  `wasmkeep_websocket_owner_closes_total`
+  sockets of rooms another node took even if none of them sends. The
+  sweep reads at most 5,000 records a pass, counted in
+  `wasmkeep_websocket_sweep_reads_total`. A node's sockets also close with
+  1012 when its lease runs out (8 s without a write reaching the bucket,
+  with the defaults), before any other node can take its actors; nothing
+  closed them before. A drain closes the sockets of hibernated rooms, and
+  reports `drained` only once the node holds no socket. Each such close is
+  counted in `wasmkeep_websocket_owner_closes_total`
   ([running a cluster](docs/cluster.md), [monitoring](docs/monitoring.md)).
-  The sweep reads at most 5,000 records a pass, counted in
-  `wasmkeep_websocket_sweep_reads_total`.
 - **A WebSocket the server closed stops at the close.** Its client used to
   keep it open by not answering the close, and its messages still ran
   events; a node draining waited on it forever. Now nothing it sends after
@@ -121,42 +127,103 @@ Since 0.2.0, in no release yet.
   headers; it now removes every header in that range, so a client cannot
   pass a marker only nodes may set.
 - **Take and alarm hand-off calls between nodes keep their own record of
-  used signatures**, so a flood of other node calls that fills the record
-  (500,000 signatures at once) can no longer refuse the calls a drain and
-  a move depend on. Refusals because a record is full are counted in
-  `wasmkeep_signatures_refused_full_total`, and logged as a full record
-  rather than as a replay. The take and hand-off record holds 50,000.
+  used signatures**, so a flood of other node calls that fills the shared
+  record (500,000 signatures at once) can no longer refuse the calls a
+  drain and a move depend on. The take and hand-off record holds 50,000.
+  Refusals because a record is full are counted in
+  `wasmkeep_signatures_refused_full_total` and logged as a full record
+  rather than as a replay.
+- **A database set aside as `<name>.db.replaced` no longer has an older
+  WAL beside it.** When a node replaces a local database with the bucket's
+  copy and keeps the old file, a replacement without a WAL left the
+  previous replacement's WAL next to the newer copy, where SQLite would
+  apply it if the copy were opened for recovery. The previous copy's WAL
+  and shared memory are now removed first.
 - **`wasmkeep_admission_refused_total{reason}`** counts the requests,
   WebSocket upgrades and actor calls a node refused before their event
   ran: `access`, `capacity`, `overloaded` or `unavailable`
   ([monitoring](docs/monitoring.md#metrics)).
 - **`deploy` refuses a second app of a tenant on a bucket prefix.**
   Actors are keyed by tenant, class and name, so a second app would share
-  the first app's actors without a word: until now only a node refused to start, and
-  only while a node of the other app was live. The first deploy of an app
-  now lists `apps/<tenant>/` and refuses when another app there has a
-  `current`, naming it and saying what to do: another prefix, or another
-  tenant when another owner runs the app, or, for an abandoned app, the
-  keys to delete. Two apps of one
-  tenant already deployed on one prefix are left as they were (a node of
-  one still refuses to start while a node of the other is live), and `deploy` and
-  `serve --app` warn about them by name; a third is refused. This lasts
-  until apps own their state (planned for 0.4.0,
-  [deploying](docs/cluster.md#deploying)).
-- **ADR 0021, the app model**: an app is `tenant/app`, the unit of deploy,
-  rollback, secrets and (from 0.4.0) state; the tenant is the owner of
-  apps; what 0.4.0 plans (a front deployed with the app, app-owned state
-  with a one-time migration, classes `internal` by default with a project
-  file) and later (shared nodes for trusted tenants)
-  ([ADR 0021](docs/adr/0021-the-app-model.md)).
+  the first app's actors without a word; until now only a node refused to
+  start, and only while a node of the other app was live. The first deploy
+  of an app now lists `apps/<tenant>/` and refuses when another app there
+  has a `current`, naming it and saying what to do: another prefix,
+  another tenant when another owner runs the app, or, for an abandoned
+  app, the keys to delete. Two apps of one tenant already deployed on one
+  prefix are left as they were (a node of one still refuses to start while
+  a node of the other is live), and `deploy` and `serve --app` warn about
+  them by name; a third is refused. This lasts until apps own their state
+  (planned for 0.4.0, [deploying](docs/cluster.md#deploying)).
 - **A new app's tenant and app names follow the class grammar**,
   `[a-z][a-z0-9-]{0,63}`: the first `wasmkeep deploy` of an app refuses
-  others, and writes nothing. Actor addresses already required it of the
-  tenant; the app name had no rule. An app deployed before keeps its name, and
-  every later deploy and rollback of it works as before.
+  others and writes nothing. Actor addresses already required it of the
+  tenant; the app name had no rule. An app deployed before keeps its name,
+  and every later deploy and rollback of it works as before.
+- **A bucket a later version migrated is refused.** Every command that
+  opens a bucket first checks for the markers a later version writes while
+  it moves actor state to a new layout (`cluster/migration`,
+  `cluster/migrated/`), and stops with a message naming the marker. One
+  read and one listing per command, bounded to 10 s.
+- **The app model, in two decisions.**
+  [ADR 0021](docs/adr/0021-the-app-model.md): an app is `tenant/app`, the
+  unit of deploy, rollback, secrets and (from 0.4.0) state; the tenant is
+  the owner of apps; 0.4.0 plans a front deployed with the app, app-owned
+  state and classes `internal` by default with a project file, and later
+  shared nodes for trusted tenants.
+  [ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md):
+  the layout of app-owned state and the one-time migration to it, planned
+  for 0.4.0.
+- **Guides for running a cluster**: what happens when a node dies and how
+  a cluster scales ([failover and scaling](docs/failover-and-scaling.md));
+  backing up and restoring a cluster's bucket
+  ([backup and restore](docs/deploy/backup-and-restore.md)); the alerts
+  [monitoring](docs/monitoring.md) recommends as a Prometheus rules file,
+  [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml); and an
+  outbound tunnel in front of the nodes
+  ([front door](docs/deploy/front-door.md#an-outbound-tunnel)).
 - **Releases**: the npm job of the release workflow passed the tarball as
   a bare path, which npm read as a GitHub repository; it now publishes the
   file. See the correction under 0.2.0.
+
+### Upgrading from 0.2.0
+
+- Upgrade every node of a cluster together, as before
+  ([upgrading](docs/cluster.md#upgrading-wasmkeep)). The formats in the
+  bucket are unchanged.
+- Components built for 0.1.0 or 0.2.0 need no rebuild. The SDKs are at
+  `0.3.0` on their registries, with the server; their APIs are those of
+  0.2.0.
+- The front door: a server timeout above the failover wait (about 25 s by
+  default) and an idle timeout above 30 s
+  ([front door](docs/deploy/front-door.md)). `--failover-wait-secs 0`
+  answers 503 at once, as 0.2.0 did.
+- The first deploy of a new app refuses a tenant or app name outside
+  `[a-z][a-z0-9-]{0,63}`, and a second app of the same tenant on the same
+  bucket prefix. Apps already deployed keep deploying and rolling back.
+
+### Known limits
+
+The limits listed for 0.2.0 still hold:
+
+- Not production-ready: soaked against Cloudflare R2 and OVHcloud Object
+  Storage with nodes killed under load, nothing lost, but not yet carrying
+  real users' traffic, and not run against AWS S3
+  ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
+- Nodes of different versions are not supported in one cluster; one
+  tenant per process ([security](docs/security.md#known-gaps)); no
+  independent third-party security audit yet
+  ([security](docs/security.md#audits)).
+- Binaries are for Linux; on macOS and Windows, use the image or build
+  from source. The Zig SDK is an archive, not yet a package `zig fetch`
+  resolves; D and MoonBit are used from the source.
+
+### Install and verify
+
+[Install](README.md#install) downloads a binary or runs the image.
+[Single node](docs/deploy/single-node.md#1-install-the-binary) shows the
+cosign check, the same for every file of the release;
+[Compose](deploy/compose/README.md) checks the image.
 
 ## 0.2.0
 
