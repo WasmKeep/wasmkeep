@@ -122,6 +122,48 @@ pub(super) fn upgrade_headers(client: &hyper::HeaderMap) -> hyper::HeaderMap {
 /// lowercase in a `HeaderMap`).
 const RESERVED_PREFIX: &str = "x-wasmkeep-";
 
+impl Cluster {
+    /// [`APP`] for the hops this node sends.
+    pub(super) fn app_header(&self) -> Result<hyper::header::HeaderValue, String> {
+        hyper::header::HeaderValue::from_str(&self.serves)
+            .map_err(|_| format!("app {:?} cannot be sent in a header", self.serves))
+    }
+
+    /// The answer to a hop (a request another node sent: `signed`, a
+    /// forward, or anything on the cluster port) that is not for this
+    /// node's app, before anything of it is read (ADR 0022): 503 "not this
+    /// app's node" when it names another app, and a refusal naming the
+    /// cause when it names none (a node of an older version: upgrades stop
+    /// every node). `None` for a hop naming this app, and for a request
+    /// from outside, whose [`APP`] means nothing (the caller removes it).
+    pub(crate) fn wrong_app<B>(
+        &self,
+        req: &Request<B>,
+        signed: bool,
+    ) -> Option<Response<HyperOutgoingBody>> {
+        if !signed && !never_forward(req) {
+            return None;
+        }
+        let mut named = req.headers().get_all(APP).iter();
+        match (named.next(), named.next()) {
+            (Some(app), None) if app.as_bytes() == self.serves.as_bytes() => None,
+            (None, _) => {
+                self.note_refused(
+                    "no x-wasmkeep-app: a node of an older version (upgrades stop every node)",
+                );
+                Some(unavailable(
+                    "refused: sent by a node of an older version (no x-wasmkeep-app); \
+                     stop every node and upgrade them together\n",
+                ))
+            }
+            _ => {
+                self.note_refused("a hop for another app");
+                Some(unavailable("not this app's node\n"))
+            }
+        }
+    }
+}
+
 /// Whether a request must not be forwarded to another node: another node
 /// already forwarded it, or it arrived on the cluster port (ADR 0011).
 pub(crate) fn never_forward<B>(req: &Request<B>) -> bool {

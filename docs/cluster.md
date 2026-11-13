@@ -469,12 +469,22 @@ briefly stopped trusting" below).
 Nodes prove to each other that a call comes from the cluster with a
 signature: HMAC-SHA256, keyed with a random secret the first node stores at
 `cluster/secret` in the bucket, over the node the call is for, the method,
-path, body, calling actor, chain of waiting actors, a timestamp and a nonce
+path, body, calling actor, chain of waiting actors, the calling node's app,
+a timestamp and a nonce
 unique to each send (valid for a minute, and accepted once). Only a signed call's
 caller (`x-wasmkeep-caller`) and chain are believed, so a client cannot pass
 for an actor or reach an `internal` class, and a call cycle across nodes is
 refused instead of deadlocking. The secret itself never travels; a malformed
 one in the bucket stops calls between nodes rather than weakening them.
+
+**The app on every hop.** A forwarded request, a relayed WebSocket upgrade
+and a call between nodes name the sending node's app in
+`x-wasmkeep-app: tenant/app` (signed on calls). A node refuses a hop for
+an app it does not serve before reading it: 503, `Retry-After: 1`, "not
+this app's node"; the actor does not run. Nodes started without `--app`
+run as the implicit app `default/default`. The header is removed from what
+clients and actors send, and never reaches an actor
+([ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md)).
 
 Credentials, region and endpoint come from the standard `AWS_*` environment
 variables.
@@ -940,13 +950,18 @@ its one error.
 ## Moving one actor
 
 ```bash
-wasmkeep actor move acme/room/lobby --to node-c --bucket s3://acme-wasmkeep/prod
+wasmkeep actor move --app acme/shop room/lobby --to node-c --bucket s3://acme-wasmkeep/prod
 ```
+
+The actor is `CLASS/NAME` of the app `--app` names. Without `--app`, it is
+written `default/CLASS/NAME`, of the implicit app `default/default` (nodes
+started without `--app`); another tenant in front is refused, asking for
+`--app`.
 
 The target must be a live node: an id no live node has is refused without
 `--force`, and a target that is draining, or too old to take moved actors,
 gets a warning (the request is written; the owner keeps the actor), as
-does one that serves another tenant.
+does one that serves another app.
 
 Within a few seconds the actor's owner hands it to `node-c`
 ([ADR 0017](adr/0017-moving-one-actor.md)):
@@ -1000,6 +1015,11 @@ step 3 is what proves no old node is left.
 **What goes wrong if old and new nodes run together** (each is a reason
 for the rule; there may be others nobody has listed):
 
+- **Every hop, from 0.2 to a later version**: nodes after 0.2.0 name their
+  app on every hop to another node, and refuse a hop that names none: a
+  request forwarded, an upgrade relayed or a call made by a 0.2 node gets
+  503, "refused: sent by a node of an older version", and the 0.2 node
+  refuses the newer node's signed calls.
 - **Calls between nodes**: the format of signed calls can change between
   versions.
   Old and new nodes refuse each other's calls (logged as "bad, expired or

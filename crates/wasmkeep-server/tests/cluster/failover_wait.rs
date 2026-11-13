@@ -352,7 +352,11 @@ async fn unkept_requests_get_todays_answer_at_once(wait: Duration) {
     assert_eq!(
         at_once(
             "forwarded GET",
-            request("GET", x, "x-wasmkeep-forwarded: 1\r\n")
+            request(
+                "GET",
+                x,
+                "x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n"
+            )
         )
         .await,
         unavailable("actor ownership is changing; retry")

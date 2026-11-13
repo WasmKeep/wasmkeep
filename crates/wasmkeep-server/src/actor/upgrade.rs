@@ -14,6 +14,18 @@ impl ActorService {
         name: &str,
         mut req: Request<Incoming>,
     ) -> Response<HyperOutgoingBody> {
+        // A relayed upgrade from a node of another app (or of an older
+        // version) is refused first (ADR 0022); the header never reaches
+        // a guest.
+        if let Some(refused) = self
+            .inner
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.wrong_app(&req, false))
+        {
+            return refused;
+        }
+        req.headers_mut().remove(crate::cluster::APP);
         if !read(&self.inner.classes).contains_key(class) {
             return text_response(StatusCode::NOT_FOUND, "no such actor class\n");
         }

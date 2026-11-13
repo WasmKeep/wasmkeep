@@ -223,7 +223,7 @@ async fn a_forwarded_request_is_never_forwarded_again() {
         b.addr,
         "POST",
         "/actor/counter/alice",
-        "x-wasmkeep-forwarded: 1\r\n",
+        "x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n",
     )
     .await;
     assert_eq!(r.status, 503);

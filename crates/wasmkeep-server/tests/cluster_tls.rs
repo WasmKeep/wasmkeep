@@ -411,7 +411,11 @@ async fn connect_as(
 /// connection failed.
 async fn get_as(addr: SocketAddr, who: &Stranger, path: &str) -> Result<String, String> {
     let mut tls = connect_as(addr, who).await?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: n\r\nConnection: close\r\n\r\n");
+    // As a node of the app relays a request (ADR 0022).
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: n\r\nx-wasmkeep-app: default/default\r\n\
+         Connection: close\r\n\r\n"
+    );
     tls.write_all(req.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
@@ -423,6 +427,18 @@ async fn get_as(addr: SocketAddr, who: &Stranger, path: &str) -> Result<String, 
     } else {
         Err(format!("no response: {raw:?}"))
     }
+}
+
+/// A WebSocket upgrade of `url` as a node of the app relays one: naming
+/// the app (ADR 0022).
+fn relayed_upgrade(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "x-wasmkeep-app",
+        hyper::header::HeaderValue::from_static("default/default"),
+    );
+    req
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -458,10 +474,12 @@ async fn the_cluster_port_trusts_live_pins_only_and_never_forwards() {
     assert_eq!(r.status, 503, "{}", r.body);
     // A WebSocket x opens on the cluster port (as when relaying for a
     // client) works while x is trusted...
-    let (mut ws, _) =
-        tokio_tungstenite::client_async("ws://n/actor/t/on-b", connect_as(port, &x).await.unwrap())
-            .await
-            .unwrap();
+    let (mut ws, _) = tokio_tungstenite::client_async(
+        relayed_upgrade("ws://n/actor/t/on-b"),
+        connect_as(port, &x).await.unwrap(),
+    )
+    .await
+    .unwrap();
     ws.send(Message::text("hi")).await.unwrap();
     let echo = tokio::time::timeout(Duration::from_secs(5), ws.next())
         .await
@@ -547,14 +565,16 @@ fn signed_post(secret: &str, to: &str, path: &str, caller: &str) -> String {
         .map(|b| format!("{b:02x}"))
         .collect();
     let msg = format!(
-        "wasmkeep-call v4\n{ts}\n{nonce}\n{to}\nPOST\n{path}\n{hash}\nx-wasmkeep-caller:{caller}\n"
+        "wasmkeep-call v4\n{ts}\n{nonce}\n{to}\nPOST\n{path}\n{hash}\nx-wasmkeep-caller:{caller}\n\
+         x-wasmkeep-app:default/default\n"
     );
     let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
     format!(
         "POST {path} HTTP/1.1\r\nHost: n\r\nContent-Length: 0\r\n\
          x-wasmkeep-caller: {caller}\r\n\
          x-wasmkeep-internal: v4 {ts} {nonce} {hash} {mac}\r\n\
-         x-wasmkeep-forwarded: 1\r\nConnection: close\r\n\r\n"
+         x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n\
+         Connection: close\r\n\r\n"
     )
 }
 
@@ -652,6 +672,7 @@ async fn refuse_mode_honours_node_calls_on_the_cluster_port_only() {
     let forwarded = |path: &str| {
         format!(
             "POST {path} HTTP/1.1\r\nHost: n\r\nContent-Length: 0\r\nx-wasmkeep-forwarded: 1\r\n\
+             x-wasmkeep-app: default/default\r\n\
              x-wasmkeep-caller: {caller}\r\nConnection: close\r\n\r\n"
         )
     };

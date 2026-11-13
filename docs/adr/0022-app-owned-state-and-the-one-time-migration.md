@@ -3,7 +3,11 @@
 - Status: accepted, not yet built (planned for 0.4.0). Built in 0.3.0:
   the guard only (below, "Old binaries"): every command that opens a
   bucket refuses one that carries the migration's markers
-  (`crates/wasmkeep-cli/src/main.rs`, `MIGRATION_MARKERS`).
+  (`crates/wasmkeep-cli/src/main.rs`, `MIGRATION_MARKERS`). Built
+  since, in no release yet, keys unchanged: the implicit app and the app
+  between nodes (below; `crates/wasmkeep-server/src/cluster/forwarding.rs`,
+  `wrong_app`; `crates/wasmkeep-server/tests/cluster/apps.rs`), and
+  `actor move --app`.
 - Date: 2026-11-12
 - Release: [0.4.0](../../ROADMAP.md#next)
 - Amends: [ADR 0007](0007-replication-protocol.md),

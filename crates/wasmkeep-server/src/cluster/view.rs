@@ -567,16 +567,24 @@ impl Cluster {
     }
 }
 
-/// Live nodes serving the same tenant as `serves` but another app (or
-/// command-line classes): `node (app)` each. Their actors would share keys
-/// in the bucket. Nodes that predate the app line are not judged.
+/// Live nodes serving the same tenant as `serves` but another app: `node
+/// (app)` each. Their actors would share keys in the bucket. Nodes that
+/// predate the app line are not judged; a node of the version before the
+/// implicit app (ADR 0022) names its tenant alone (`tenant/`), and is
+/// listed as an older version.
 pub(crate) fn conflicts(me: &str, serves: &str, nodes: &[NodeInfo]) -> Vec<String> {
     let tenant = |app: &str| app.split('/').next().unwrap_or_default().to_owned();
     nodes
         .iter()
         .filter(|n| n.id != me && !n.app.is_empty())
         .filter(|n| tenant(&n.app) == tenant(serves) && n.app != serves)
-        .map(|n| format!("{} ({})", n.id, n.app))
+        .map(|n| {
+            if n.app.ends_with('/') {
+                format!("{} ({}, an older version)", n.id, n.app)
+            } else {
+                format!("{} ({})", n.id, n.app)
+            }
+        })
         .collect()
 }
 

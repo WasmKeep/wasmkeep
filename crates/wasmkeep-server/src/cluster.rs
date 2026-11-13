@@ -70,7 +70,7 @@ pub(crate) const SERVED_BY: &str = "x-wasmkeep-node";
 /// Header proving a call comes from another node: `v4 <ms> <nonce>
 /// <body-sha256> <hmac>`, an HMAC-SHA256 with the cluster secret over the
 /// timestamp, a nonce unique to this send, the node it is for, method, path,
-/// the body's SHA-256, caller and chain; each accepted once (the nonce makes
+/// the body's SHA-256, caller, chain and app; each accepted once (the nonce makes
 /// two identical calls in the same millisecond distinct). The receiver checks the body against it before the actor
 /// sees it. Only with it are [`CALLER`] and [`CHAIN`] believed; it
 /// never reaches a guest. The secret itself never travels.
@@ -81,6 +81,16 @@ const SIGNATURE_WINDOW_MS: u64 = 60_000;
 pub(crate) const CALLER: &str = "x-wasmkeep-caller";
 /// Actors waiting on a cross-node call, outermost first, one per value.
 pub(crate) const CHAIN: &str = "x-wasmkeep-chain";
+/// On every node-to-node hop (ADR 0022): the app (`tenant/app`) of the
+/// node that sent it, set by that node and never by a client. Signed on
+/// signed calls; a node refuses a hop that names another app, or none (a
+/// node of an older version). Stripped from anything a guest or a client
+/// sends, and never reaches a guest.
+pub(crate) const APP: &str = "x-wasmkeep-app";
+/// The app name of nodes given classes on the command line (`serve
+/// --actor`, `dev`): with their tenant, `default`, the implicit app
+/// `default/default` (ADR 0022).
+pub const IMPLICIT_APP_NAME: &str = "default";
 /// Where the cluster secret lives in the bucket.
 const SECRET_KEY: &str = "cluster/secret";
 /// Longest wait for the owner's response headers when forwarding.
@@ -110,8 +120,11 @@ pub struct ClusterConfig {
     /// it.
     pub socket_sweep: Duration,
     /// The deployed app this node serves (`tenant/app`), or empty for
-    /// classes given on the command line. Two apps of one tenant would
-    /// share actor keys in the bucket, so nodes refuse to mix them.
+    /// classes given on the command line, which run as the implicit app
+    /// `<tenant>/default` (`default/default` for `serve --actor`, ADR 0022).
+    /// Every hop between nodes names it, and a node refuses one for
+    /// another app. Two apps of one tenant would share actor keys in the
+    /// bucket, so nodes refuse to mix them.
     pub app: String,
     /// A cluster listener with mutual TLS (ADR 0011), or `None` (plain HTTP
     /// between nodes only). With it, the node makes a TLS identity in
@@ -819,8 +832,7 @@ impl Cluster {
 
     /// The live nodes as seen now, to decide many entries' shards against
     /// one view ([`AlarmShards::is_mine`]). Only nodes that deliver this
-    /// app's alarms count: the same app (or an older node that does not
-    /// say), and not draining (ADR 0014; a draining node hands its own
+    /// app's alarms count: the same app, and not draining (ADR 0014; a draining node hands its own
     /// alarms off). A node of another tenant on the prefix would never
     /// deliver its share, leaving it until it is anyone's (3x overdue).
     pub(crate) fn alarm_shards(&self) -> AlarmShards {
@@ -833,8 +845,7 @@ impl Cluster {
         let delivers = |id: &str, peer: Option<&Peer>| {
             !draining.contains(id)
                 && peer.is_none_or(|p| {
-                    (p.app.is_empty() || p.app == self.serves)
-                        && p.drain.is_none_or(|d| d == DrainState::Serving)
+                    p.app == self.serves && p.drain.is_none_or(|d| d == DrainState::Serving)
                 })
         };
         let mut nodes: Vec<String> = self
@@ -905,6 +916,7 @@ impl Cluster {
             let out = out
                 .uri(format!("{}{path}", base.trim_end_matches('/')))
                 .header(FORWARDED, "1")
+                .header(APP, self.serves.as_str())
                 .body(http_body_util::Empty::new());
             let Ok(out) = out else {
                 return unavailable("bad advertised address\n");
@@ -1317,6 +1329,8 @@ impl Cluster {
         let method = req.method().clone();
         let headers = req.headers_mut();
         headers.insert(FORWARDED, hyper::header::HeaderValue::from_static("1"));
+        // Signed below with the rest (ADR 0022).
+        headers.insert(APP, self.app_header()?);
         headers.remove(CHAIN);
         for a in chain {
             if let Ok(v) = hyper::header::HeaderValue::from_str(&encode_address(a)) {
@@ -1668,6 +1682,11 @@ impl Cluster {
         req.headers_mut().remove(hyper::header::EXPECT);
         req.headers_mut()
             .insert(FORWARDED, hyper::header::HeaderValue::from_static("1"));
+        // This node's app, never the client's (ADR 0022).
+        match self.app_header() {
+            Ok(app) => req.headers_mut().insert(APP, app),
+            Err(_) => return unavailable("cannot forward this request\n"),
+        };
         crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "request")]));
         // Bound the wait for the owner's response headers (a hung node or a
         // half-open connection); the body then streams as the owner sends it.

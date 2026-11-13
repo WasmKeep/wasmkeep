@@ -13,6 +13,24 @@ Since 0.2.0, in no release yet.
 
 ### What changed
 
+- **Every hop between nodes names its app, and a node refuses another
+  app's.** A forwarded request, a relayed WebSocket upgrade and a call
+  between nodes carry `x-wasmkeep-app: tenant/app`, the sending node's
+  app, covered by the signature on signed calls. A node answers a hop for
+  an app it does not serve with 503, `Retry-After: 1`, "not this app's
+  node", before reading its body, and the actor does not run. A client
+  cannot set the header: it is removed from what clients and guests send,
+  and never reaches an actor. `serve` without `--app` (classes given on
+  the command line) runs as the implicit app `default/default`, and says
+  so in its heartbeat (it said `default/` before); its keys are unchanged
+  ([ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md)).
+  Nodes of earlier versions send no app: see Upgrading below.
+- **`actor move` names the actor's app**: `wasmkeep actor move --app
+  acme/shop room/lobby --to node-c`. Without `--app`, the actor is written
+  `default/CLASS/NAME`, of the implicit app; another tenant in front
+  (`acme/room/lobby`) is refused with a message asking for `--app`. A
+  target serving another app gets a warning
+  ([moving one actor](docs/cluster.md#moving-one-actor)).
 - **A bucket a later version migrated is refused.** Every command that
   opens a bucket first checks for the markers a later version writes while
   it moves actor state to a new layout (`cluster/migration`,
@@ -157,6 +175,18 @@ Since 0.2.0, in no release yet.
 - **Releases**: the npm job of the release workflow passed the tarball as
   a bare path, which npm read as a GitHub repository; it now publishes the
   file. See the correction under 0.2.0.
+
+### Upgrading from 0.2.0
+
+- Stop every node of a cluster, upgrade them all, start them all
+  ([upgrading](docs/cluster.md#upgrading-wasmkeep)): nodes of this
+  version refuse every hop from a node of an earlier one (a forwarded
+  request, a relayed upgrade or a call, which carries no app) with a 503
+  saying it came from a node of an older version, and a node of an
+  earlier version refuses this version's signed calls.
+- `wasmkeep actor move TENANT/CLASS/NAME` becomes `wasmkeep actor move
+  --app TENANT/APP CLASS/NAME` for an actor of a deployed app; scripts
+  that move actors of `default/default` keep working.
 
 ## 0.2.0
 
