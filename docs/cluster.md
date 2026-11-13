@@ -482,8 +482,9 @@ and a call between nodes name the sending node's app in
 `x-wasmkeep-app: tenant/app` (signed on calls). A node refuses a hop for
 an app it does not serve before reading it: 503, `Retry-After: 1`, "not
 this app's node"; the actor does not run. Nodes started without `--app`
-run as the implicit app `default/default`. The header is removed from what
-clients and actors send, and never reaches an actor
+run as the implicit app `default/default`. A client's header is never
+believed or passed on: it is removed from what clients send to actors and
+from what actors send, and never reaches an actor
 ([ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md)).
 
 Credentials, region and endpoint come from the standard `AWS_*` environment
@@ -1018,8 +1019,16 @@ for the rule; there may be others nobody has listed):
 - **Every hop, from 0.2 to a later version**: nodes after 0.2.0 name their
   app on every hop to another node, and refuse a hop that names none: a
   request forwarded, an upgrade relayed or a call made by a 0.2 node gets
-  503, "refused: sent by a node of an older version", and the 0.2 node
-  refuses the newer node's signed calls.
+  503, "refused: sent by a node of an older version". The other way, the
+  0.2 node fails the newer node's signatures: calls to `internal` classes,
+  moves and alarm hand-offs fail, and other calls run there as requests
+  from outside, with no calling actor.
+- **Starting next to the other version**: a node started without `--app`
+  names its app `default/default` after 0.2.0 and `default/` in 0.2. A
+  newer node refuses to start while a 0.2 one is live on the bucket prefix,
+  asking to stop every node and upgrade them together; a 0.2 node started
+  next to a newer one refuses too, saying another app of the tenant runs
+  there.
 - **Calls between nodes**: the format of signed calls can change between
   versions.
   Old and new nodes refuse each other's calls (logged as "bad, expired or

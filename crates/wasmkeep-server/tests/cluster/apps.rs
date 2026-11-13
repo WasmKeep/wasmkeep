@@ -36,8 +36,11 @@ async fn app_node(
     .await
 }
 
-/// The cluster secret, once the first node has written it.
-async fn cluster_secret(store: &Arc<dyn ObjectStore>) -> String {
+/// The cluster secret, once the first node has written it and node `id`
+/// (at `addr`) has loaded it: a signed `GET` naming an app it does not
+/// serve, with no forwarded mark, is a hop (503) only once the signature
+/// checks out; before, it is a request from outside, served.
+async fn cluster_secret(store: &Arc<dyn ObjectStore>, id: &str, addr: SocketAddr) -> String {
     let key = object_store::path::Path::from("cluster/secret");
     let secret = loop {
         if let Ok(got) = object_store::ObjectStoreExt::get(store.as_ref(), &key).await {
@@ -45,14 +48,66 @@ async fn cluster_secret(store: &Arc<dyn ObjectStore>) -> String {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    // The node loads it at start; give it a moment.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    secret.trim().to_owned()
+    let secret = secret.trim().to_owned();
+    let path = "/actor/t/secret-probe/durable";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let probe = sign(
+            &secret,
+            id,
+            "GET",
+            path,
+            Some("probe/none"),
+            Some("probe/none"),
+            false,
+        );
+        let r = send(addr, "GET", path, &probe).await;
+        if r.status == 503 {
+            break secret;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{id} never loaded the cluster secret: {} {}",
+            r.status,
+            r.body
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
-/// The headers of a call signed as node calls are, for node `to`, `POST
+/// The headers of a call signed as node calls are, for node `to`, `method
 /// path` with an empty body, naming `signed_app` in the signature (no app
-/// line when `None`) and sending `sent_app` (no header when `None`).
+/// line when `None`), sending `sent_app` (no header when `None`) and the
+/// forwarded mark nodes put on their calls when `forwarded`.
+fn sign(
+    secret: &str,
+    to: &str,
+    method: &str,
+    path: &str,
+    signed_app: Option<&str>,
+    sent_app: Option<&str>,
+    forwarded: bool,
+) -> String {
+    static SENT: AtomicUsize = AtomicUsize::new(0);
+    let ts = now_ms();
+    let nonce = format!("{ts:x}0{:x}", SENT.fetch_add(1, Ordering::Relaxed));
+    let hash = sha256_hex(b"");
+    let mut msg = format!("wasmkeep-call v4\n{ts}\n{nonce}\n{to}\n{method}\n{path}\n{hash}\n");
+    if let Some(app) = signed_app {
+        msg.push_str(&format!("x-wasmkeep-app:{app}\n"));
+    }
+    let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
+    let mut headers = format!("x-wasmkeep-internal: v4 {ts} {nonce} {hash} {mac}\r\n");
+    if forwarded {
+        headers.push_str("x-wasmkeep-forwarded: 1\r\n");
+    }
+    if let Some(app) = sent_app {
+        headers.push_str(&format!("x-wasmkeep-app: {app}\r\n"));
+    }
+    headers
+}
+
+/// [`sign`] for `POST path`, with the forwarded mark, as nodes call.
 fn signed_headers(
     secret: &str,
     to: &str,
@@ -60,20 +115,7 @@ fn signed_headers(
     signed_app: Option<&str>,
     sent_app: Option<&str>,
 ) -> String {
-    let ts = now_ms();
-    let nonce = format!("{ts:x}{}", sent_app.unwrap_or("").len());
-    let hash = sha256_hex(b"");
-    let mut msg = format!("wasmkeep-call v4\n{ts}\n{nonce}\n{to}\nPOST\n{path}\n{hash}\n");
-    if let Some(app) = signed_app {
-        msg.push_str(&format!("x-wasmkeep-app:{app}\n"));
-    }
-    let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
-    let mut headers =
-        format!("x-wasmkeep-internal: v4 {ts} {nonce} {hash} {mac}\r\nx-wasmkeep-forwarded: 1\r\n");
-    if let Some(app) = sent_app {
-        headers.push_str(&format!("x-wasmkeep-app: {app}\r\n"));
-    }
-    headers
+    sign(secret, to, "POST", path, signed_app, sent_app, true)
 }
 
 /// A request another node relays names that node's app; the owner refuses
@@ -112,7 +154,7 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
         503
     );
     // A call signed by a node of the other app: refused the same way.
-    let secret = cluster_secret(&store).await;
+    let secret = cluster_secret(&store, "shop-1", shop.addr).await;
     let path = "/actor/t/x/durable";
     let signed = signed_headers(
         &secret,
@@ -141,7 +183,7 @@ async fn a_signed_app_header_cannot_be_altered() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();
     let shop = app_node("shop-1", dir.path(), &store, "acme/shop", true).await;
-    let secret = cluster_secret(&store).await;
+    let secret = cluster_secret(&store, "shop-1", shop.addr).await;
     let path = "/actor/t/x/durable";
     // As signed: a node's call, so the internal class answers.
     let signed = signed_headers(
@@ -204,15 +246,23 @@ async fn a_hop_without_the_app_is_refused_as_an_older_node() {
         test_actor_wasm(),
     )
     .await;
-    let secret = cluster_secret(&store).await;
+    let secret = cluster_secret(&store, "a", a.addr).await;
     let path = "/actor/t/x/durable";
-    // Signed as an older node signs: no app line, no header.
+    // Signed as an older node signs: no app line, no header; once more
+    // without the forwarded mark, so that only the signature makes it a hop.
     let old_call = signed_headers(&secret, "a", path, None, None);
+    let old_unmarked = sign(&secret, "a", "POST", path, None, None, false);
     // Relayed as an older node relays a client's request.
-    for extra in [old_call.as_str(), "x-wasmkeep-forwarded: 1\r\n"] {
+    for extra in [
+        old_call.as_str(),
+        old_unmarked.as_str(),
+        "x-wasmkeep-forwarded: 1\r\n",
+    ] {
         let r = send(a.addr, "POST", path, extra).await;
         assert_eq!(r.status, 503, "{extra:?}: {}", r.body);
         assert!(r.body.contains("older version"), "{extra:?}: {}", r.body);
+        // Only an operator can fix it: no invitation to retry every second.
+        assert_eq!(r.retry_after, None, "{extra:?}");
     }
     let r = send(a.addr, "GET", path, "").await;
     assert_eq!((r.status, r.body.trim()), (200, "0"), "nothing ran");

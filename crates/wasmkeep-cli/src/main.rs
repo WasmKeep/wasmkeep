@@ -1079,10 +1079,8 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("reading the cluster's heartbeats: {e}"))?;
         anyhow::ensure!(
             mixed.is_empty(),
-            "another app of this tenant already runs on this bucket prefix ({}): \
-             their actors would share data. Deploy one on another --bucket prefix, or under \
-             another tenant if another owner runs it (docs/cluster.md, Deploying).",
-            mixed.join(", ")
+            "{}.",
+            wasmkeep_server::conflict_advice(&mixed)
         );
         if let Some((app_ref, _)) = follow.take() {
             rt.spawn(app_ref.follow(service.clone(), std::time::Duration::from_secs(3)));
@@ -1487,6 +1485,9 @@ fn cluster_forget(args: &NodeArgs) -> anyhow::Result<()> {
 fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
     use wasmkeep_cluster::control::{self, Keys as _};
     let ((tenant, app), class, name) = move_target(&args.actor, args.app.as_ref())?;
+    if let Some(warning) = move_target_warning(&args.actor, args.app.as_ref()) {
+        eprintln!("warning: {warning}");
+    }
     let (tenant, class, name) = (&tenant, &class, &name);
     let key = control::checked_move_key(
         &wasmkeep_cluster::state_root::StateRoot::new("", tenant.as_str()),
@@ -1546,6 +1547,21 @@ fn move_target(
         class,
         name,
     ))
+}
+
+/// A warning for `actor move --app TENANT/APP TENANT/CLASS/NAME`, the
+/// syntax before `--app` with the tenant kept in front: it names class
+/// `TENANT`, which is allowed (a class may share its tenant's name) but
+/// most likely a mistake.
+fn move_target_warning(actor: &str, app: Option<&(String, String)>) -> Option<String> {
+    let (tenant, _) = app?;
+    let rest = actor.strip_prefix(tenant.as_str())?.strip_prefix('/')?;
+    rest.contains('/').then(|| {
+        format!(
+            "{actor} names class {tenant} of the app: with --app, the actor is CLASS/NAME. \
+             Did you mean {rest}?"
+        )
+    })
 }
 
 /// Why a live move target may not take the actor of `app` (`tenant/app`):
@@ -1749,7 +1765,9 @@ fn parse_bucket(url: &str) -> anyhow::Result<(&str, &str)> {
 mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
-    use super::{load_env, migration_marker, move_target, move_warnings, parse_bucket};
+    use super::{
+        load_env, migration_marker, move_target, move_target_warning, move_warnings, parse_bucket,
+    };
 
     #[tokio::test]
     async fn a_migrated_or_migrating_bucket_is_found() {
@@ -1814,6 +1832,17 @@ mod tests {
         assert!(move_target("room", Some(&shop)).is_err());
         assert!(move_target("room/", Some(&shop)).is_err());
         assert!(move_target("default/room", None).is_err());
+    }
+
+    /// The tenant kept in front with `--app` (the syntax before it) parses
+    /// as a class named like the tenant: allowed, with a warning.
+    #[test]
+    fn a_tenant_kept_in_front_with_app_gets_a_warning() {
+        let shop = ("acme".to_owned(), "shop".to_owned());
+        let w = move_target_warning("acme/room/lobby", Some(&shop)).expect("a warning");
+        assert!(w.contains("room/lobby"), "{w}");
+        assert!(move_target_warning("room/lobby", Some(&shop)).is_none());
+        assert!(move_target_warning("default/room/x", None).is_none());
     }
 
     /// A move target that cannot take the actor gets a warning saying why.

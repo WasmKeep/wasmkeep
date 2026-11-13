@@ -103,6 +103,28 @@ fn only_another_app_of_the_same_tenant_conflicts() {
     assert!(conflicts("me", "other/x", &nodes[..1]).is_empty());
 }
 
+/// A conflict with nodes of the version before the implicit app only
+/// (ADR 0022) is an upgrade that did not stop every node: the advice says
+/// so, instead of sending the operator to another bucket prefix.
+#[test]
+fn a_conflict_with_older_nodes_only_asks_for_a_stop_all_upgrade() {
+    let older = vec!["e (default/, an older version)".to_owned()];
+    let advice = conflict_advice(&older);
+    assert!(advice.contains("stop every node"), "{advice}");
+    assert!(
+        advice.contains("e (default/, an older version)"),
+        "{advice}"
+    );
+    assert!(!advice.contains("--bucket prefix"), "{advice}");
+    let mixed = vec![
+        "d (acme/admin)".to_owned(),
+        "e (acme/, an older version)".to_owned(),
+    ];
+    let advice = conflict_advice(&mixed);
+    assert!(advice.contains("another --bucket prefix"), "{advice}");
+    assert!(!advice.contains("stop every node"), "{advice}");
+}
+
 #[test]
 fn hmac_matches_rfc_4231() {
     let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();

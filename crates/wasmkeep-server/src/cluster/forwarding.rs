@@ -151,16 +151,36 @@ impl Cluster {
         match (named.next(), named.next()) {
             (Some(app), None) if app.as_bytes() == self.serves.as_bytes() => None,
             (None, _) => {
-                self.note_refused(
-                    "no x-wasmkeep-app: a node of an older version (upgrades stop every node)",
-                );
-                Some(unavailable(
+                // On the public port, a forwarded mark alone may as well
+                // be a client's (or a proxy's) as an older node's.
+                self.note_refused(if signed || on_cluster_port {
+                    "no x-wasmkeep-app: a node of an older version (upgrades stop every node)"
+                } else {
+                    "forwarded mark without x-wasmkeep-app on the public port: a node of an older version, or a client"
+                });
+                // Only an operator can fix it: no Retry-After.
+                Some(text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
                     "refused: sent by a node of an older version (no x-wasmkeep-app); \
                      stop every node and upgrade them together\n",
                 ))
             }
-            _ => {
-                self.note_refused("a hop for another app");
+            (Some(first), second) => {
+                let why = "a hop for another app";
+                if self.refusal_log_due_now(why) {
+                    // The sender's word: shown escaped and cut short.
+                    let named: String = String::from_utf8_lossy(first.as_bytes())
+                        .chars()
+                        .take(64)
+                        .collect();
+                    tracing::warn!(
+                        reason = why,
+                        serves = %self.serves,
+                        named = ?named,
+                        several = second.is_some(),
+                        "a call claiming to come from a node was refused"
+                    );
+                }
                 Some(unavailable("not this app's node\n"))
             }
         }

@@ -48,6 +48,7 @@ pub(crate) use lease_hold::*;
 pub(crate) use node_lease_task::lease_attempt;
 use node_lease_task::{lease_every, node_lease_loop};
 pub(crate) use signing::*;
+pub use view::conflict_advice;
 pub(crate) use view::*;
 
 /// On a signed node call: the body is an alarm handed off by a draining
@@ -913,10 +914,17 @@ impl Cluster {
             if let Some(headers) = out.headers_mut() {
                 *headers = upgrade_headers(req.headers());
             }
+            let app = match self.app_header() {
+                Ok(app) => app,
+                Err(e) => {
+                    tracing::error!(error = %e, "forwarding an upgrade refused");
+                    return unavailable("this node's app cannot be named to another node\n");
+                }
+            };
             let out = out
                 .uri(format!("{}{path}", base.trim_end_matches('/')))
                 .header(FORWARDED, "1")
-                .header(APP, self.serves.as_str())
+                .header(APP, app)
                 .body(http_body_util::Empty::new());
             let Ok(out) = out else {
                 return unavailable("bad advertised address\n");
@@ -1209,6 +1217,12 @@ impl Cluster {
                 "a call claiming to come from a node was refused"
             );
         }
+    }
+
+    /// [`Cluster::refusal_log_due`] now, for a refusal logged with more
+    /// than its reason.
+    fn refusal_log_due_now(&self, why: &'static str) -> bool {
+        self.refusal_log_due(why, now_ms())
     }
 
     /// Whether a refusal for `why` should be logged at `now`: at most once

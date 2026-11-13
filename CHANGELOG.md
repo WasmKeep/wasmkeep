@@ -18,9 +18,9 @@ Since 0.2.0, in no release yet.
   between nodes carry `x-wasmkeep-app: tenant/app`, the sending node's
   app, covered by the signature on signed calls. A node answers a hop for
   an app it does not serve with 503, `Retry-After: 1`, "not this app's
-  node", before reading its body, and the actor does not run. A client
-  cannot set the header: it is removed from what clients and guests send,
-  and never reaches an actor. `serve` without `--app` (classes given on
+  node", before reading its body, and the actor does not run. A client's
+  header is never believed or passed on: it is removed from what clients
+  send to actors and from what guests send, and never reaches an actor. `serve` without `--app` (classes given on
   the command line) runs as the implicit app `default/default`, and says
   so in its heartbeat (it said `default/` before); its keys are unchanged
   ([ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md)).
@@ -182,8 +182,15 @@ Since 0.2.0, in no release yet.
   ([upgrading](docs/cluster.md#upgrading-wasmkeep)): nodes of this
   version refuse every hop from a node of an earlier one (a forwarded
   request, a relayed upgrade or a call, which carries no app) with a 503
-  saying it came from a node of an older version, and a node of an
-  earlier version refuses this version's signed calls.
+  saying it came from a node of an older version. The other way, a node
+  of an earlier version fails the signature of this version's calls:
+  calls to `internal` classes, moves and alarm hand-offs fail, and other
+  calls run there as requests from outside, with no calling actor.
+- A node of this version started while a 0.2 node given classes on the
+  command line is still live on the bucket prefix (its heartbeat names
+  `default/`) refuses to start, and asks to stop every node and upgrade
+  them together; so does a 0.2 node started next to a live node of this
+  version, though its message speaks of another app of the tenant.
 - `wasmkeep actor move TENANT/CLASS/NAME` becomes `wasmkeep actor move
   --app TENANT/APP CLASS/NAME` for an actor of a deployed app; scripts
   that move actors of `default/default` keep working.
