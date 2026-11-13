@@ -118,6 +118,17 @@ fn signed_headers(
     sign(secret, to, "POST", path, signed_app, sent_app, true)
 }
 
+/// `wasmkeep_admission_refused_total{reason="wrong_app"}` (this process's
+/// metrics: nextest runs each test alone).
+fn wrong_app_refusals() -> u64 {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    page.lines()
+        .find_map(|l| l.strip_prefix("wasmkeep_admission_refused_total{reason=\"wrong_app\"} "))
+        .unwrap_or_else(|| panic!("no wrong_app series in:\n{page}"))
+        .parse()
+        .unwrap()
+}
+
 /// Two apps of one tenant on one prefix each have their own actor of a
 /// name (ADR 0022); a hop naming another app is refused before the actor
 /// runs, so no node ever serves another app's actors.
@@ -145,6 +156,7 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
     // A request relayed by a node of the other app (the forwarded mark and
     // its app, as a node relays a client's request): refused before it
     // runs, as is a relayed WebSocket upgrade.
+    let wrong_app_before = wrong_app_refusals();
     let relayed = "x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: acme/admin\r\n";
     let r = send(shop.addr, "POST", "/actor/t/x/durable", relayed).await;
     assert_eq!(
@@ -169,8 +181,12 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
             other => panic!("a relayed upgrade for another app: {:?}", other.map(drop)),
         }
     }
+    let relayed_refusals = wrong_app_refusals() - wrong_app_before;
     // A call signed by a node of the other app: refused before its body.
+    // (Finding the secret sends hops naming an app no node serves: counted
+    // too, and left out below.)
     let secret = cluster_secret(&store, "shop-1", shop.addr).await;
+    let signed_before = wrong_app_refusals();
     let path = "/actor/t/x/durable";
     let signed = signed_headers(
         &secret,
@@ -189,15 +205,10 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
     // Nothing ran: the counter is where the first request left it.
     let r = send(shop.addr, "GET", "/actor/t/x/durable", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "1"));
-    // Each refusal counted with its own reason (this process's metrics:
-    // nextest runs each test alone): the three above and the probe that
-    // found the secret, which names an app no node serves.
-    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
-    assert!(
-        page.lines()
-            .any(|l| l == "wasmkeep_admission_refused_total{reason=\"wrong_app\"} 4"),
-        "{page}"
-    );
+    // Each refusal counted with its own reason: the relayed request and
+    // upgrade, then the signed call.
+    assert_eq!(relayed_refusals, 2);
+    assert_eq!(wrong_app_refusals() - signed_before, 1);
 }
 
 /// The app is in the signature: a call signed for one app and sent naming

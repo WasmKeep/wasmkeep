@@ -1000,7 +1000,8 @@ the last stop and the first start, so plan a short window.
 
 Going back to the previous binary is the same procedure, except across
 the 0.4.0 layout change: `cluster migrate --rollback` works only until
-the first node starts after the migration. Builds made from
+the first node starts after the migration, and never after
+`--remove-old --apply` ([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
 source report the version of the release they follow (`0.3.0` for any
 build since it), so the version column cannot tell two of them apart:
 step 3 is what proves no old node is left.

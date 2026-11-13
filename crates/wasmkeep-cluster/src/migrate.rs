@@ -2184,22 +2184,39 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         // The tombstones, kept: each names the actor's new key. Anything
         // else there is a record an older binary wrote after the barrier.
         let (base, owners) = listed(Family::Owners).await?;
+        // Read `concurrency` at a time: whether each is a tombstone
+        // (`None`: gone since the listing).
+        let kinds = std::sync::Mutex::new(BTreeMap::new());
+        each(&owners, self.options.concurrency, |meta| {
+            let kinds = &kinds;
+            async move {
+                let body = self
+                    .store
+                    .get(&meta.key)
+                    .await
+                    .map_err(bucket(format!("reading {}", meta.key)))?;
+                let kind = body.map(|(b, _)| tombstone_target(&b).is_some());
+                kinds
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(meta.key.clone(), kind);
+                Ok(())
+            }
+        })
+        .await?;
+        let kinds = kinds
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut tombstoned = BTreeSet::new();
-        for meta in owners {
-            let body = self
-                .store
-                .get(&meta.key)
-                .await
-                .map_err(bucket(format!("reading {}", meta.key)))?
-                .map(|(b, _)| b);
+        for meta in &owners {
             let tail = meta.key.strip_prefix(&base).unwrap_or_default();
-            match body.as_deref().map(tombstone_target) {
+            match kinds.get(&meta.key).copied().flatten() {
                 None => {}
-                Some(Some(_)) => {
+                Some(true) => {
                     t.tombstones += 1;
                     tombstoned.insert(tail.to_owned());
                 }
-                Some(None) => refusals.push(format!(
+                Some(false) => refusals.push(format!(
                     "{} is an ownership record, not a tombstone: a binary of a version before \
                      0.4.0 created that actor after the migration, and 0.4.0 does not see it. \
                      Move its keys out of this prefix (or keep them elsewhere) and run this \

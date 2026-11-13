@@ -13,10 +13,9 @@ This page is the whole procedure, from the backup to removing the old
 keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
 `leases/` or `alarms/` folder) needs none of it: upgrade the nodes.
 
-> **Pre-alpha.** The migration has been run against the test suites and
-> simulations only. No measured duration is published yet: the dry run
-> prints an estimate from its own listing latency. Plan a maintenance
-> window, and keep the backup until the end.
+> **Pre-alpha.** No measured duration is published: the dry run prints
+> an estimate from its own listing latency. Plan a maintenance window,
+> and keep the backup until the end.
 
 ## Before you start
 
