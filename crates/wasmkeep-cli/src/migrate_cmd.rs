@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use clap::Args;
 use wasmkeep_cluster::lease::Clock;
-use wasmkeep_cluster::migrate::{self, AppInfo, MigrateError, Migrator, Options, Plan, Store as _};
+use wasmkeep_cluster::migrate::{
+    self, AppInfo, MigrateError, Migrator, Options, Pause, Plan, Store as _,
+};
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
 use wasmkeep_server::apps::AppRef;
 
@@ -48,7 +50,16 @@ impl Clock for SystemClock {
     }
 }
 
-/// Every app under `apps/` and the classes of its current version.
+impl Pause for SystemClock {
+    async fn pause_ms(&self, ms: u64) {
+        // Tokio's timers run on a monotonic clock.
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
+/// Every app under `apps/` with a `current`, and the classes of its
+/// current version. A folder without one (secrets only, a first deploy
+/// that failed) deploys nothing, so it inherits nothing.
 async fn read_apps(
     bucket: &ObjectStoreBucket,
     store: &std::sync::Arc<dyn object_store::ObjectStore>,
@@ -58,16 +69,15 @@ async fn read_apps(
     for tenant in bucket.list_dirs("apps/").await? {
         for app in bucket.list_dirs(&format!("apps/{tenant}/")).await? {
             let app_ref = AppRef::new(std::sync::Arc::clone(store), prefix, &tenant, &app);
-            let classes = match app_ref.current().await? {
-                Some(current) => app_ref
-                    .manifest(&current.version)
-                    .await?
-                    .classes
-                    .into_keys()
-                    .collect(),
-                // Uploads, secrets, no `current`: an app with no class.
-                None => Default::default(),
+            let Some(current) = app_ref.current().await? else {
+                continue;
             };
+            let classes = app_ref
+                .manifest(&current.version)
+                .await?
+                .classes
+                .into_keys()
+                .collect();
             out.push(AppInfo {
                 tenant: tenant.clone(),
                 app,
@@ -86,8 +96,10 @@ fn print_plan(plan: &Plan, concurrency: usize) {
     for (tenant, t) in &plan.tenants {
         let state = if t.committed {
             "migrated"
-        } else {
+        } else if t.pending() {
             "to migrate"
+        } else {
+            "nothing to do"
         };
         let counts: Vec<String> = t
             .counts
@@ -164,6 +176,11 @@ pub(crate) fn run(args: &MigrateArgs) -> anyhow::Result<i32> {
         )
         .saturating_add(lease.ttl_ms())
         .saturating_add(lease.grace_ms()),
+        prefix_bytes: if prefix.is_empty() {
+            0
+        } else {
+            prefix.len() + 1
+        },
     };
     anyhow::ensure!(
         options.heirs.len() == args.heirs.len(),

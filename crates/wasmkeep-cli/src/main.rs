@@ -738,6 +738,12 @@ pub(crate) fn serve_app_rules(
                 given.join(" ")
             );
         }
+        if deployed.restricted().is_empty() {
+            tracing::warn!(
+                "this app has never deployed access rules: every class is open. \
+                 Deploy them with `wasmkeep deploy --access CLASS=MODE`"
+            );
+        }
         for (class, mode) in deployed.restricted() {
             tracing::info!(%class, access = %mode, "access restricted (deployed)");
         }
@@ -1192,9 +1198,9 @@ fn require_rooted(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         current.rooted,
-        "{tenant}/{name} was last deployed by a version before 0.4.0: run `wasmkeep cluster \
-         migrate --bucket {bucket}` (with --apply), or deploy it once with this version, then \
-         start this node"
+        "{tenant}/{name} was last deployed by a version before 0.4.0: if this bucket prefix \
+         was not migrated yet, run `wasmkeep cluster migrate --bucket {bucket}` (with --apply); \
+         if it was, deploy {tenant}/{name} once with this version. Then start this node"
     );
     Ok(())
 }
@@ -1232,8 +1238,12 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let named = |e: wasmkeep_server::apps::DeployError| {
+        anyhow::anyhow!(e.to_string().replace("<this bucket>", &args.bucket))
+    };
     let deployed = if args.rollback {
-        rt.block_on(app_ref.rollback(args.allow_reopen))?
+        rt.block_on(app_ref.rollback(args.allow_reopen))
+            .map_err(named)?
     } else {
         anyhow::ensure!(
             !(args.actors.is_empty()
@@ -1277,7 +1287,8 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 args.requires.clone()
             },
         };
-        rt.block_on(app_ref.deploy_changes(&runtime, changes))?
+        rt.block_on(app_ref.deploy_changes(&runtime, changes))
+            .map_err(named)?
     };
     for line in deployed.diff.lines() {
         println!("  {line}");
@@ -1743,13 +1754,16 @@ fn refuse_locked(
         prefix,
     );
     let found = on_own_thread(async { bucket.get(wasmkeep_cluster::migrate::LOCK_KEY).await });
-    if let Some(Ok(Some(_))) = found {
-        anyhow::bail!(
+    match found {
+        Some(Ok(None)) => Ok(()),
+        Some(Ok(Some(_))) => anyhow::bail!(
             "bucket {url}: {}",
             wasmkeep_cluster::migrate::StartRefusal::InProgress
-        );
+        ),
+        // Fail closed, as the layout check does: a migration may hold it.
+        Some(Err(e)) => anyhow::bail!("bucket {url}: checking for a migration in progress: {e}"),
+        None => anyhow::bail!("bucket {url}: no answer while checking for a migration in progress"),
     }
-    Ok(())
 }
 
 /// What `serve` checks on a bucket before anything writes to it (ADR

@@ -44,7 +44,7 @@ use madsim::runtime::Runtime;
 use wasmkeep_cluster::alarm_index::{self, Entry};
 use wasmkeep_cluster::lease::{Bucket, BucketError, Clock, Version};
 use wasmkeep_cluster::migrate::{
-    self, AppInfo, COMMIT_PREFIX, LOCK_KEY, MigrateError, Migrator, ObjectMeta, Options,
+    self, AppInfo, COMMIT_PREFIX, LOCK_KEY, MigrateError, Migrator, ObjectMeta, Options, Pause,
 };
 use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState, OwnerRecord, encode_marker};
 use wasmkeep_cluster::replication::{
@@ -169,6 +169,28 @@ impl Clock for SimClock {
     fn now_ms(&self) -> u64 {
         let start = START.with(std::cell::Cell::get).expect("start_clock first");
         EPOCH_MS + u64::try_from(start.elapsed().as_millis()).unwrap_or(0)
+    }
+}
+
+impl Pause for SimClock {
+    async fn pause_ms(&self, ms: u64) {
+        madsim::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+/// The migrator's host with a wall clock this far ahead of the nodes'
+/// (no NTP): it judges a node lease written a moment ago as long past.
+struct AheadClock(u64);
+
+impl Clock for AheadClock {
+    fn now_ms(&self) -> u64 {
+        SimClock.now_ms() + self.0
+    }
+}
+
+impl Pause for AheadClock {
+    async fn pause_ms(&self, ms: u64) {
+        madsim::time::sleep(Duration::from_millis(ms)).await;
     }
 }
 
@@ -315,6 +337,9 @@ struct Actor {
     heir: &'static str,
     generation: u64,
     txid: u64,
+    /// Whether it has an ownership record: an actor last held before
+    /// records (ADR 0020 §6) has history and a marker only.
+    owned: bool,
 }
 
 impl Actor {
@@ -370,13 +395,17 @@ fn actors() -> Vec<Actor> {
         heir,
         generation,
         txid,
+        owned: true,
     };
+    let mut before_records = a("acme", "chat", "early", "early", "shop", 2, 2);
+    before_records.owned = false;
     vec![
         a("default", "t", "a", "a", "default", 2, 3),
         a("default", "t", &"x".repeat(256), &lossy(), "default", 1, 2),
         a("acme", "chat", "room 1", "room%201", "shop", 3, 4),
         a("acme", "post", "p", "p", "blog", 1, 1),
         a("acme", "gone", "old", "old", "blog", 1, 1),
+        before_records,
     ]
 }
 
@@ -392,6 +421,12 @@ fn apps() -> Vec<AppInfo> {
             app: "blog".into(),
             classes: BTreeSet::from(["post".into()]),
         },
+        // A tenant with an app and no actor state yet: only its token.
+        AppInfo {
+            tenant: "zeta".into(),
+            app: "web".into(),
+            classes: BTreeSet::from(["page".into()]),
+        },
     ]
 }
 
@@ -401,6 +436,7 @@ fn options() -> Options {
         concurrency: 4,
         lease_window_ms: 25_000,
         old_window_ms: 60_000,
+        prefix_bytes: 0,
     }
 }
 
@@ -444,13 +480,16 @@ fn fixture() -> Map {
         for (key, body) in history(&a) {
             m.insert(format!("{}/{key}", a.bare(Family::History)), obj(body));
         }
-        m.insert(a.bare(Family::Owners), obj(a.record()));
+        if a.owned {
+            m.insert(a.bare(Family::Owners), obj(a.record()));
+        }
         m.insert(a.bare(Family::Leases), obj(encode_marker(a.generation)));
         m.insert(a.bare(Family::Alarms), obj(Vec::new()));
         m.insert(a.bare(Family::Moves), obj(Vec::new()));
     }
     m.insert("apps/acme/shop/current".into(), obj("v1 4\n"));
     m.insert("apps/acme/blog/current".into(), obj("v2 7 2\n"));
+    m.insert("apps/zeta/web/current".into(), obj("v1 1\n"));
     // A node that stopped cleanly, and one that crashed long ago.
     m.insert(
         "nodes/node-a".into(),
@@ -475,13 +514,18 @@ fn fixture() -> Map {
 
 /// An old binary takes `a` (if its bare record is not a tombstone): a
 /// record of the next generation, of the same size, and a segment of it;
-/// its node lease shows it ran, then stopped. Gives the actor as it is
-/// now, or `None` if the tombstone refused it.
+/// with no record, it creates one seeded from the marker (v0.2.0's
+/// acquire). Its node lease shows it ran, then stopped. Gives the actor
+/// as it is now, or `None` if the tombstone refused it.
 fn old_takes(m: &mut Map, a: &Actor, now: u64) -> Option<Actor> {
     let key = a.bare(Family::Owners);
-    let record = OwnerRecord::decode(&m.get(&key)?.body)?;
+    let generation = match m.get(&key) {
+        Some(o) => OwnerRecord::decode(&o.body)?.generation,
+        None => a.generation,
+    };
     let mut taken = a.clone();
-    taken.generation = record.generation + 1;
+    taken.owned = true;
+    taken.generation = generation + 1;
     taken.txid += 1;
     let version = m.values().map(|o| o.version).max().unwrap_or(0) + 1;
     let put = |m: &mut Map, k: String, body: Vec<u8>, v: u64| {
@@ -554,8 +598,8 @@ fn check_migrated(seed: u64, m: &Map, before: &Map, actors: &[Actor]) {
             "seed {seed}: {t} not committed"
         );
     }
-    for app in ["shop", "blog"] {
-        let current = String::from_utf8(body(&format!("apps/acme/{app}/current"))).unwrap();
+    for app in ["acme/shop", "acme/blog", "zeta/web"] {
+        let current = String::from_utf8(body(&format!("apps/{app}/current"))).unwrap();
         assert_eq!(
             current.split_whitespace().nth(2),
             Some("3"),
@@ -565,13 +609,19 @@ fn check_migrated(seed: u64, m: &Map, before: &Map, actors: &[Actor]) {
     let mut wanted = BTreeSet::new();
     for a in actors {
         // The record under the root is the actor's latest; the bare one a
-        // tombstone naming it.
+        // tombstone naming it (one with no record: a tombstone all the
+        // same, which an older binary cannot create a record over).
         let rooted = a.rooted(Family::Owners);
-        assert_eq!(body(&rooted), a.record(), "seed {seed}: {rooted}");
+        if a.owned {
+            assert_eq!(body(&rooted), a.record(), "seed {seed}: {rooted}");
+        } else {
+            assert!(!m.contains_key(&rooted), "seed {seed}: {rooted}");
+        }
         assert_eq!(
             migrate::tombstone_target(&body(&a.bare(Family::Owners))),
             Some(rooted.as_str()),
-            "seed {seed}"
+            "seed {seed}: {}",
+            a.name
         );
         // Every other bare key has its copy, byte for byte.
         let bare_history = format!("{}/", a.bare(Family::History));
@@ -581,7 +631,9 @@ fn check_migrated(seed: u64, m: &Map, before: &Map, actors: &[Actor]) {
             assert_eq!(body(&to), o.body, "seed {seed}: {to}");
             wanted.insert(to);
         }
-        for family in [Family::Leases, Family::Alarms, Family::Moves] {
+        // Moves stay in the old layout: a copy would renew them.
+        assert!(!m.contains_key(&a.rooted(Family::Moves)), "seed {seed}");
+        for family in [Family::Leases, Family::Alarms] {
             assert_eq!(
                 body(&a.rooted(family)),
                 body(&a.bare(family)),
@@ -589,7 +641,9 @@ fn check_migrated(seed: u64, m: &Map, before: &Map, actors: &[Actor]) {
             );
             wanted.insert(a.rooted(family));
         }
-        wanted.insert(rooted);
+        if a.owned {
+            wanted.insert(rooted);
+        }
         // The same restore plan, ending at the last acknowledged write.
         let plan = |prefix: &str| {
             let keys: Vec<String> = m
@@ -1034,4 +1088,221 @@ fn a_rollback_after_a_node_ran_is_refused_and_changes_nothing() {
 #[test]
 fn a_seed_replays() {
     assert_eq!(clean(7), clean(7));
+}
+
+/// A node lease written just before the run, by a node that keeps
+/// acknowledging writes until its lease would run out, then dies without
+/// a word: the migrator's clock runs `ahead` ms in front, so the plan
+/// judges that lease long past. Every write it made must be under the
+/// root once committed.
+#[test]
+fn a_migrator_clock_ahead_of_the_nodes_loses_no_acknowledged_write() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let mut rng = Rng::new(seed ^ 0xc10c);
+            let mut m = fixture();
+            // Renewed 1 s ago on the node's clock; the next renewal never
+            // comes: the node dies within 2.5 s.
+            m.insert(
+                "nodes/node-c".into(),
+                obj(NodeLeaseObject {
+                    state: NodeState::Live,
+                    instance: Some("cc".into()),
+                    written_at_ms: EPOCH_MS - 1_000,
+                }
+                .encode()),
+            );
+            let sim = Arc::new(Sim::new(seed, m));
+            let before = sim.snapshot();
+            let dies = rng.below(2_500);
+            let mut now = actors();
+            let writer = usize::try_from(rng.below(now.len() as u64)).unwrap();
+            let acked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            {
+                let (sim, acked, a) = (Arc::clone(&sim), Arc::clone(&acked), now[writer].clone());
+                let mut rng = Rng::new(seed ^ 0xd1e);
+                madsim::task::spawn(async move {
+                    let mut txid = a.txid;
+                    loop {
+                        madsim::time::sleep(Duration::from_millis(1 + rng.below(300))).await;
+                        if Sim::now() >= EPOCH_MS + dies {
+                            return;
+                        }
+                        txid += 1;
+                        let key = format!(
+                            "{}/{}",
+                            a.bare(Family::History),
+                            segment_key(&Segment {
+                                id: SegmentId {
+                                    generation: a.generation,
+                                    txid,
+                                },
+                                parent_generation: a.generation,
+                            })
+                        );
+                        sim.write(&key, format!("tx {txid}").into_bytes());
+                        acked.lock().unwrap().push(key);
+                    }
+                });
+            }
+            let clock = AheadClock(30_000);
+            let migrator = Migrator::new(&*sim, &clock, apps(), options());
+            if migrator.apply().await.is_err() {
+                assert!(
+                    !sim.snapshot().keys().any(|k| k.starts_with(COMMIT_PREFIX)),
+                    "seed {seed}: a commit after an abort"
+                );
+                migrator
+                    .apply()
+                    .await
+                    .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            }
+            let m = sim.snapshot();
+            let acked = acked.lock().unwrap().clone();
+            now[writer].txid += u64::try_from(acked.len()).unwrap();
+            for key in &acked {
+                let to = key.replacen(
+                    &now[writer].bare(Family::History),
+                    &now[writer].rooted(Family::History),
+                    1,
+                );
+                assert!(
+                    m.contains_key(&to),
+                    "seed {seed}: the acknowledged {key} is not under the root"
+                );
+            }
+            check_migrated(seed, &m, &before, &now);
+        });
+    }
+}
+
+/// Two runs at once: an `--apply` with a second `--apply`, or with a
+/// `--rollback` started at a seeded moment. A commit never names a copy
+/// that is gone, and one more `--apply` alone ends in the clean state.
+fn two_runs(seed: u64, second_rolls_back: bool) {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Arc::new(Sim::new(seed, fixture()));
+        let before = sim.snapshot();
+        let delay = Rng::new(seed ^ 0x2a2a).below(27_000);
+        let first = {
+            let sim = Arc::clone(&sim);
+            madsim::task::spawn(async move { apply(&sim).await.map(drop) })
+        };
+        let second = {
+            let sim = Arc::clone(&sim);
+            madsim::task::spawn(async move {
+                madsim::time::sleep(Duration::from_millis(delay)).await;
+                if second_rolls_back {
+                    rollback(&sim).await.map(drop)
+                } else {
+                    apply(&sim).await.map(drop)
+                }
+            })
+        };
+        let (a, b) = (first.await.unwrap(), second.await.unwrap());
+        let m = sim.snapshot();
+        for t in ["acme", "default"] {
+            if !m.contains_key(&format!("{COMMIT_PREFIX}{t}")) {
+                continue;
+            }
+            for actor in actors().iter().filter(|x| x.tenant == t && x.owned) {
+                assert!(
+                    m.contains_key(&actor.rooted(Family::Owners)),
+                    "seed {seed} (rollback {second_rolls_back}, at {delay}): {t} committed but \
+                     {} is gone ({a:?}, {b:?})",
+                    actor.rooted(Family::Owners)
+                );
+            }
+        }
+        apply(&sim).await.unwrap_or_else(|e| {
+            panic!("seed {seed} (rollback {second_rolls_back}, at {delay}): {e} ({a:?}, {b:?})")
+        });
+        check_migrated(seed, &sim.snapshot(), &before, &actors());
+    });
+}
+
+#[test]
+fn two_runs_at_once_never_commit_a_missing_copy() {
+    for seed in 0..seeds() {
+        two_runs(seed, false);
+        two_runs(seed, true);
+    }
+}
+
+/// `--apply` crashed after request `i`, run again to the end, then
+/// `--rollback`: every token comes back, including those of a tenant with
+/// apps and no actor state (its originals live only in the first lock).
+fn crash_rerun_then_rollback(seed: u64, i: u64) {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        let before = canonical(&sim.snapshot());
+        *sim.crash_after.lock().unwrap() = Some(i);
+        let _ = apply(&sim).await;
+        *sim.crash_after.lock().unwrap() = None;
+        apply(&sim)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}, crash at {i}: {e}"));
+        rollback(&sim)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}, crash at {i}: {e}"));
+        assert_eq!(
+            canonical(&sim.snapshot()),
+            before,
+            "seed {seed}, crash at {i}: not the bare layout after the rollback"
+        );
+    });
+}
+
+#[test]
+fn a_crashed_run_finished_then_rolled_back_restores_every_token() {
+    let (ops, _) = clean(4);
+    for i in 0..=ops {
+        crash_rerun_then_rollback(4, i);
+    }
+    for seed in 0..seeds() {
+        let (ops, _) = clean(seed);
+        crash_rerun_then_rollback(seed, Rng::new(seed ^ 0x70c).below(ops + 1));
+    }
+}
+
+/// After the commit and before any node: a deploy of this version, or a
+/// key written under a root (a node whose `nodes/` object is gone, a
+/// restored backup), makes the migration one-way: `--rollback` refuses
+/// and changes nothing.
+#[test]
+fn a_rollback_after_a_deploy_or_a_late_root_key_is_refused() {
+    for seed in 0..seeds() {
+        for deploy in [true, false] {
+            runtime(seed).block_on(async move {
+                start_clock();
+                let sim = Sim::new(seed, fixture());
+                let before = sim.snapshot();
+                apply(&sim).await.unwrap();
+                madsim::time::sleep(Duration::from_millis(1 + Rng::new(seed).below(5_000))).await;
+                if deploy {
+                    sim.write("apps/zeta/web/current", b"v2 2 3\n".to_vec());
+                } else {
+                    sim.write("state/acme/shop/actors/chat/new/wal/x.ltx", b"tx".to_vec());
+                }
+                let migrated = sim.snapshot();
+                match rollback(&sim).await {
+                    Err(MigrateError::Refused(why)) => {
+                        assert!(why.concat().contains("one-way"), "seed {seed}: {why:?}");
+                    }
+                    r => panic!("seed {seed} (deploy {deploy}): {r:?}"),
+                }
+                assert_eq!(
+                    canonical(&sim.snapshot()),
+                    canonical(&migrated),
+                    "seed {seed}"
+                );
+                if deploy {
+                    check_migrated(seed, &sim.snapshot(), &before, &actors());
+                }
+            });
+        }
+    }
 }

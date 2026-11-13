@@ -97,8 +97,10 @@ change already requires (ADR 0020, section 6). The dry run writes
 nothing: it prints the plan, the live nodes it sees, object counts and
 an estimate of the time. Each class goes to the one app whose manifest
 deploys it; a class in no manifest goes to the tenant's only app (or to
-`default/default`); a class two apps deploy, or a tenant with several
-apps, needs `--heir`, with no default.
+`default/default`); a class two apps deploy, a tenant with several
+apps, or the tenant `default` with an app other than `default` (such a
+class may be an `--actor` node's), needs `--heir`, with no default.
+`--heir` names an app of the tenant, or `default/default`.
 
 `--apply`, in outline, resumable from any step, with one commit per
 tenant:
@@ -107,10 +109,16 @@ tenant:
    0020 rule; migrate fences nothing), an object too large for one
    server-side copy, a different earlier plan.
 2. **Lock**: create `cluster/migration` holding the plan, each app's
-   current `current` token and the full `nodes/` set.
+   current `current` token and the full `nodes/` set. Every later write
+   that another run would make wrong (deletes in R, barriers, commits)
+   first rewrites the lock conditionally, so a run whose lock was taken
+   over stops. Then wait one node-lease window: a node misjudged as
+   stopped (clocks apart) renews its lease in it, which step 6 sees, or
+   has lost it and acknowledges nothing after.
 3. **Copy** server-side into R. History objects, which are create-only,
    are skipped when present; mutable objects (records, markers, alarms)
-   are copied every time.
+   are copied every time. Move requests are not copied: a copy would
+   renew their lifetime, measured from the last write.
 4. **Verify**: list the source again until it is unchanged, compare
    mutable objects byte for byte, check that a restore plan on R ends at
    the same head as on the source, and delete keys in R the source no
@@ -118,9 +126,12 @@ tenant:
 5. **Barriers**: mark every app's `current` with a new token, `3`, that
    older binaries cannot read, and overwrite each bare ownership record,
    conditionally on what was copied, with a tombstone naming the new
-   root. A conflict means an old node took the actor: abort.
-6. **Final proof**: list `nodes/` again; any new or changed key means a
-   node ran, and the run aborts with nothing committed.
+   root; an actor with history and no record gets a tombstone created
+   where its record would be. A conflict means an old node took the
+   actor: abort.
+6. **Final proof**: list `nodes/` again and read each key; any new or
+   changed key means a node ran, and the run aborts with nothing
+   committed. Every `current` of the tenant must carry token 3.
 7. **Commit**: create `cluster/migrated/<tenant>`. From here, R is the
    truth for that tenant. Then unlock.
 
@@ -131,7 +142,8 @@ acknowledged write.
 
 `--rollback` restores the ownership records and the `current` tokens and
 deletes R, and only while `nodes/` is unchanged since the commit, that
-is, while no node of any version has run. **After the first 0.4.0 node
+is, while no node of any version has run, no app of the tenant was
+deployed, and no key in R is newer than the commit. **After the first 0.4.0 node
 starts, the migration is one-way.** The bare keys stay until
 `--remove-old`, which deletes them, keeps the tombstones for good, and
 refuses any bare key written after the commit (an old binary ran). It is

@@ -272,19 +272,29 @@ unmigrated tenant and prints the command.
    It writes nothing, and prints:
    - the app each class goes to: the one app whose current version
      deploys it; else the tenant's only app (`default/default` for the
-     tenant `default` with no app). A class two apps deploy, or one in no
-     app's current version when the tenant has several apps, needs
-     `--heir TENANT/APP`, with no default; the other apps start that class
-     empty;
+     tenant `default` with no app, or only an app named `default`). A
+     class two apps deploy, or one in no app's current version when the
+     tenant has several apps, needs `--heir TENANT/APP`, with no default;
+     the other apps start that class empty. So does such a class of the
+     tenant `default` when it has another app: it may be an `--actor`
+     node's, served from `default/default`. `--heir` must name an app of
+     the tenant, or `default/default`;
    - the node leases it sees, and whether each may still run (a node
      stopped cleanly is quiet at once; a crashed or fenced one once its
      lease is 16 s old, with the default timings);
    - the objects per family, and an estimate of the time.
 5. **Apply**: the same command with `--apply` (and the same `--heir`). It
-   copies inside the bucket (no download), checks every copy, writes the
-   barriers that stop older binaries (token `3` in every app's `current`,
-   and a tombstone over every old ownership record), proves that no node
-   ran meanwhile, and commits each tenant. After a crash or an abort, run
+   takes the lock, waits one node-lease window (16 s with the default
+   timings: a node the dry run judged stopped, because its clock and the
+   migrator's disagree, renews its lease in that time and the run
+   aborts), copies inside the bucket (no download), checks every copy,
+   writes the barriers that stop older binaries (token `3` in every app's
+   `current`, and a tombstone over every old ownership record, or where
+   an actor has history and no record), proves that no node ran
+   meanwhile, and commits each tenant. Move requests
+   (`control/move/`) are not copied: request them again after the
+   upgrade. Run one `--apply` or `--rollback` at a time: a second run
+   takes the lock over, and the first one stops. After a crash or an abort, run
    it again: it resumes. Exit codes: 0 done, 1 refused or aborted with
    nothing new committed, 2 some tenants committed and others not (run it
    again).
@@ -295,10 +305,16 @@ unmigrated tenant and prints the command.
    them into its app's folder instead.
 
 **Rollback.** Until a node of any version starts on the migrated prefix,
-`wasmkeep cluster migrate --bucket ... --rollback` puts the old layout and
-the `current` tokens back, for the older binaries. **After the first
-start, the migration is one-way**: the rollback refuses, and the state
-stays where 0.4.0 reads it. The old keys stay in the bucket: `--remove-old`,
+or an app of it is deployed, `wasmkeep cluster migrate --bucket ...
+--rollback` puts the old layout and the `current` tokens back, for the
+older binaries. **After the first start, the migration is one-way**: the
+rollback refuses, and the state stays where 0.4.0 reads it. It also
+refuses once a key under a migrated root is newer than the tenant's
+commit. A rollback that has started finishes when run again, whatever
+ran since. If a 0.4.0 node had already put its local databases aside
+(`<data_dir>/actors.pre-0.4/`) before it failed to start, move them back
+to `<data_dir>/actors/` and remove the file left at that path before
+starting the older binary. The old keys stay in the bucket: `--remove-old`,
 which will delete them (the tombstones excepted), is not built yet.
 
 Notes:
@@ -309,9 +325,10 @@ Notes:
   `actors/<tenant>/` must move to `state/<tenant>/<app>/`.
 - A backup from before 0.4.0 restores into an empty prefix, then is
   migrated. A backup synced without deleting over a migrated prefix leaves
-  both layouts: 0.4.0 reads only `state/`, and `cluster migrate` refuses a
-  tenant that has both with no migration in progress. Restore into an
-  empty prefix.
+  both layouts: 0.4.0 reads only `state/` for a migrated tenant and
+  ignores the old keys silently; for a tenant not migrated yet,
+  `cluster migrate` refuses one that has both with no migration in
+  progress. Restore into an empty prefix.
 - On a versioned bucket, the old keys keep their noncurrent versions until
   the lifecycle rules expire them.
 - A node of 0.2 started on a migrated prefix with `--actor` answers 503 for

@@ -7,7 +7,7 @@ use super::*;
 use std::collections::BTreeMap;
 use wasmkeep_cluster::lease::Clock;
 use wasmkeep_cluster::migrate::{
-    self, AppInfo, LOCK_KEY, MigrateError, Migrator, Options, StartRefusal, Store as _,
+    self, AppInfo, LOCK_KEY, MigrateError, Migrator, Options, Pause, StartRefusal, Store as _,
 };
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
 
@@ -16,6 +16,12 @@ struct Now;
 impl Clock for Now {
     fn now_ms(&self) -> u64 {
         u64::try_from(epoch_ms()).unwrap()
+    }
+}
+
+impl Pause for Now {
+    async fn pause_ms(&self, ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 }
 
@@ -29,6 +35,7 @@ fn options(heirs: &[(&str, &str)]) -> Options {
         concurrency: 8,
         lease_window_ms: 1_500,
         old_window_ms: 5_000,
+        prefix_bytes: 0,
     }
 }
 
@@ -145,14 +152,15 @@ async fn a_bucket_of_the_old_layout_is_refused_then_migrated_and_served() {
     let outcome = migrator.apply().await.unwrap();
     assert_eq!(outcome.committed, ["default"]);
     migrate::start_check(&b, "default").await.unwrap();
-    // The move is under the implicit app's root.
+    // The move is not copied (a copy would renew its lifetime): it stays
+    // in the old layout, which no node of this version reads.
+    let all = bucket_keys(&store).await;
     assert!(
-        bucket_keys(&store)
-            .await
-            .iter()
+        !all.iter()
             .any(|k| k.starts_with(&test_key(Family::Moves, "t/"))),
-        "the move was not copied"
+        "the move was copied"
     );
+    assert!(all.iter().any(|k| k.starts_with("control/move/default/t/")));
     // Every bare record is a tombstone naming its new key.
     for meta in b.list("owners/default/t/").await.unwrap() {
         let (body, _) = wasmkeep_cluster::lease::Bucket::get(&b, &meta.key)
@@ -343,6 +351,20 @@ async fn each_class_goes_to_the_app_that_deploys_it_and_a_shared_one_needs_an_he
         other => panic!("{other:?}"),
     }
     assert_eq!(bucket_keys(&store).await, before);
+    // An heir that is not an app of the tenant (a typo) is refused too.
+    match Migrator::new(&b, &Now, apps.clone(), options(&[("acme", "blgo")]))
+        .plan()
+        .await
+    {
+        Ok(plan) => assert!(
+            plan.refusals
+                .concat()
+                .contains("tenant acme has no app blgo"),
+            "{:?}",
+            plan.refusals
+        ),
+        other => panic!("{other:?}"),
+    }
     // A deploy refuses the tenant meanwhile.
     let e = AppRef::new(Arc::clone(&store), "", "acme", "shop")
         .deploy(&rt, vec![("chat".into(), wasm())])

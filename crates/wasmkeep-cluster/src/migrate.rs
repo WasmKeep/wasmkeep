@@ -69,6 +69,22 @@ pub const MAX_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const NODES: &str = "nodes/";
 /// Deploys.
 const APPS: &str = "apps/";
+/// The families a run copies. Moves (`control/move/`) are not: they are
+/// transient intents with a 5-minute lifetime measured from their
+/// last-modified time, which a copy would renew; they stay in the old
+/// layout for `--remove-old`.
+pub const COPIED: [Family; 4] = [
+    Family::History,
+    Family::Owners,
+    Family::Leases,
+    Family::Alarms,
+];
+/// The third line of a tombstone written where no ownership record
+/// existed (an actor from before records, ADR 0020 §6): a rollback deletes
+/// it rather than putting a record back.
+const UNOWNED: &str = "none";
+/// The longest key S3 takes, in bytes.
+pub const MAX_KEY_BYTES: usize = 1024;
 /// Rounds of copy and verify while the source keeps changing.
 const MAX_ROUNDS: usize = 4;
 /// Attempts at a `current` whose conditional write keeps conflicting.
@@ -104,8 +120,16 @@ pub trait Store: Bucket {
     async fn delete(&self, key: &str) -> Result<(), BucketError>;
 }
 
+/// Waiting, for a run: [`Clock`] for the time of day, and a pause that a
+/// change of the wall clock cannot shorten.
+#[allow(async_fn_in_trait)]
+pub trait Pause: Clock {
+    /// Waits at least `ms` milliseconds of elapsed (monotonic) time.
+    async fn pause_ms(&self, ms: u64);
+}
+
 /// An app as its deploys describe it: the classes of its current
-/// version (none if it has no `current`).
+/// version. Apps without a `current` are left out: they deploy nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppInfo {
     /// Its tenant.
@@ -131,6 +155,9 @@ pub struct Options {
     /// The same for a heartbeat in a format from before node leases: its
     /// horizon, plus a lease's ttl and grace.
     pub old_window_ms: u64,
+    /// Bytes of the bucket prefix in front of every key (a destination key
+    /// longer than [`MAX_KEY_BYTES`] with it is refused).
+    pub prefix_bytes: usize,
 }
 
 /// Why a run stopped.
@@ -165,6 +192,12 @@ pub struct NodeSeen {
     pub meta: ObjectMeta,
     /// Whether it may still be live (a reason to refuse), and why.
     pub live: Option<String>,
+    /// Its version as a read of it returned (`None`: gone since the
+    /// listing). The final proof reads it again: reads are consistent
+    /// where listings may lag.
+    pub version: Option<Version>,
+    /// A heartbeat in a format from before node leases.
+    pub old: bool,
 }
 
 /// One tenant's part of a plan.
@@ -184,14 +217,18 @@ pub struct TenantPlan {
     /// Apps whose `current` has no token 3 yet (written by an older
     /// version).
     pub unrooted: BTreeSet<String>,
+    /// Named by the lock of an unfinished run: its original tokens are
+    /// there, and its commit still to write.
+    pub locked: bool,
 }
 
 impl TenantPlan {
     /// Whether a run has something to do for it: not committed, and actor
-    /// state in the old layout or a `current` an older version wrote. A
-    /// tenant only this version ever wrote has nothing to migrate.
+    /// state in the old layout, a `current` an older version wrote, or an
+    /// unfinished run's lock naming it. A tenant only this version ever
+    /// wrote has nothing to migrate.
     pub fn pending(&self) -> bool {
-        !self.committed && (!self.counts.is_empty() || !self.unrooted.is_empty())
+        !self.committed && (!self.counts.is_empty() || !self.unrooted.is_empty() || self.locked)
     }
 }
 
@@ -276,6 +313,9 @@ struct Record {
     heirs: BTreeMap<String, String>,
     /// Commits only: objects per family.
     counts: BTreeMap<String, usize>,
+    /// Commits only: `tenant/app` → the `version seq` of its `current` as
+    /// committed. A rollback refuses once a deploy changed one.
+    deployed: BTreeMap<String, String>,
     at_ms: u64,
 }
 
@@ -304,6 +344,9 @@ impl Record {
         for (family, n) in &self.counts {
             let _ = writeln!(out, "count {family} {n}");
         }
+        for (app, current) in &self.deployed {
+            let _ = writeln!(out, "deployed {app} {current}");
+        }
         for n in &self.nodes {
             let _ = writeln!(
                 out,
@@ -331,6 +374,7 @@ impl Record {
             nodes: Vec::new(),
             heirs: BTreeMap::new(),
             counts: BTreeMap::new(),
+            deployed: BTreeMap::new(),
             at_ms: 0,
         };
         for line in lines {
@@ -360,6 +404,10 @@ impl Record {
                     let (family, n) = rest.split_once(' ')?;
                     record.counts.insert(family.to_owned(), n.parse().ok()?);
                 }
+                "deployed" => {
+                    let (app, current) = rest.split_once(' ')?;
+                    record.deployed.insert(app.to_owned(), current.to_owned());
+                }
                 "node" => {
                     let mut parts = rest.splitn(4, ' ');
                     let (etag, size, modified, key) =
@@ -382,6 +430,19 @@ impl Record {
 /// `moved_to`.
 pub fn tombstone(moved_to: &str) -> Vec<u8> {
     format!("{TOMBSTONE_HEADER}\n{moved_to}\n").into_bytes()
+}
+
+/// The body of a tombstone where no ownership record existed: its actor
+/// (history or an old-lease marker, no record) now lives at `moved_to`,
+/// and an older binary must not create a record for it.
+pub fn tombstone_unowned(moved_to: &str) -> Vec<u8> {
+    format!("{TOMBSTONE_HEADER}\n{moved_to}\n{UNOWNED}\n").into_bytes()
+}
+
+/// Whether `body` is a tombstone written where no record existed.
+fn is_unowned(body: &[u8]) -> bool {
+    tombstone_target(body).is_some()
+        && std::str::from_utf8(body).is_ok_and(|t| t.lines().nth(2) == Some(UNOWNED))
 }
 
 /// Where a tombstone says its actor went; `None` if `body` is not one.
@@ -411,7 +472,10 @@ pub fn class_of(family: Family, tail: &str) -> Option<&str> {
 /// The heir of class `class` of `tenant`: the one app whose current
 /// version deploys it; else, with no app deploying it, the tenant's heir
 /// (`--heir`, else its one app, else `default` for tenant `default` with no
-/// app); a class two apps deploy needs `--heir`. `Err` says what to give.
+/// app); a class two apps deploy needs `--heir`. Tenant `default` with an
+/// app other than `default` needs `--heir` for a class no app deploys: it
+/// may be an `--actor` node's (served from `default/default`) as well as a
+/// class the app removed. `Err` says what to give.
 pub fn heir_of(
     tenant: &str,
     class: Option<&str>,
@@ -430,6 +494,13 @@ pub fn heir_of(
         ([], Some(heir)) | ([_, _, ..], Some(heir)) => Ok(heir.clone()),
         ([], None) => match apps {
             [] if tenant == "default" => Ok("default".to_owned()),
+            [one] if tenant == "default" && one.app == "default" => Ok("default".to_owned()),
+            [_, ..] if tenant == "default" => Err(format!(
+                "class {} of tenant default is in no app's current version: it may be an \
+                 `--actor` node's (served from default/default) or a class an app removed; \
+                 give --heir default/default or --heir default/APP",
+                class.unwrap_or("(unreadable keys)")
+            )),
             [one] => Ok(one.app.clone()),
             [] => Err(format!(
                 "tenant {tenant} has actor state and no app: give --heir {tenant}/APP"
@@ -466,8 +537,8 @@ pub enum StartRefusal {
     #[error(
         "tenant {0} has actor state in the layout of a version before 0.4.0 ({1} exists) and \
          this bucket prefix was not migrated: stop every node, then run `wasmkeep cluster \
-         migrate --bucket <this bucket>` (a dry run) and `--apply` (docs/backup-and-restore.md, \
-         Migrating to 0.4.0)"
+         migrate --bucket <this bucket>` (a dry run) and `--apply` \
+         (docs/deploy/backup-and-restore.md, Migrating to 0.4.0)"
     )]
     Unmigrated(String, String),
     /// The bucket could not be read.
@@ -496,12 +567,7 @@ pub async fn start_check<S: Store>(store: &S, tenant: &str) -> Result<bool, Star
     {
         return Ok(true);
     }
-    for family in [
-        Family::History,
-        Family::Owners,
-        Family::Leases,
-        Family::Alarms,
-    ] {
+    for family in COPIED {
         let base = format!("{}/{tenant}/", family.bare());
         let dirs = store.list_dirs(&base).await.map_err(StartRefusal::Bucket)?;
         if let Some(first) = dirs.first() {
@@ -595,6 +661,18 @@ impl Outcome {
     }
 }
 
+/// The lock as this run wrote it, and the version its last write returned.
+/// Every write that another run's lock would make wrong rewrites it first,
+/// conditional on that version ([`Migrator::hold`]): a run whose lock was
+/// taken over stops before its next such write.
+struct Held {
+    body: Vec<u8>,
+    version: std::sync::Mutex<Version>,
+}
+
+/// A commit, its record, version and last-modified time (bucket clock).
+type Commit = (Record, Version, u64);
+
 /// A migration of one bucket prefix.
 #[allow(missing_debug_implementations)] // holds the store and clock by reference
 pub struct Migrator<'a, S, C> {
@@ -604,7 +682,7 @@ pub struct Migrator<'a, S, C> {
     options: Options,
 }
 
-impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
+impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
     /// A run over `store` (relative to the bucket prefix), judging time by
     /// `clock`, with `apps` as their deploys describe them.
     pub fn new(store: &'a S, clock: &'a C, apps: Vec<AppInfo>, options: Options) -> Self {
@@ -666,7 +744,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
     }
 
     /// The commit of every tenant that has one.
-    async fn commits(&self) -> Result<BTreeMap<String, (Record, Version)>, MigrateError> {
+    async fn commits(&self) -> Result<BTreeMap<String, Commit>, MigrateError> {
         let listed = self
             .store
             .list(COMMIT_PREFIX)
@@ -677,11 +755,78 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
             let Some(tenant) = meta.key.strip_prefix(COMMIT_PREFIX) else {
                 continue;
             };
-            if let Some(found) = self.read_record(&meta.key, COMMIT_HEADER).await? {
-                out.insert(tenant.to_owned(), found);
+            if let Some((record, version)) = self.read_record(&meta.key, COMMIT_HEADER).await? {
+                out.insert(tenant.to_owned(), (record, version, meta.modified_ms));
             }
         }
         Ok(out)
+    }
+
+    /// Rewrites the lock as this run holds it, conditional on the version
+    /// its last write returned. A conflict means another run (an `--apply`
+    /// or a `--rollback`) took it: stop, writing nothing more.
+    async fn hold(&self, held: &Held) -> Result<(), MigrateError> {
+        let version = held
+            .version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match self
+            .store
+            .replace(LOCK_KEY, held.body.clone(), &version)
+            .await
+        {
+            Ok(v) => {
+                *held
+                    .version
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = v;
+                Ok(())
+            }
+            Err(BucketError::Conflict) => Err(MigrateError::Aborted(format!(
+                "{LOCK_KEY} was taken by another run of migrate (an --apply or a --rollback): \
+                 this one stopped; let that one finish"
+            ))),
+            Err(e) => Err(MigrateError::Bucket {
+                what: "rewriting the lock".into(),
+                error: e,
+            }),
+        }
+    }
+
+    /// Writes the lock: created, or over `existing` (a run to resume).
+    async fn take_lock(
+        &self,
+        body: Vec<u8>,
+        existing: Option<&Version>,
+    ) -> Result<Held, MigrateError> {
+        let version = match existing {
+            None => self.store.create(LOCK_KEY, body.clone()).await,
+            Some(version) => self.store.replace(LOCK_KEY, body.clone(), version).await,
+        }
+        .map_err(|e| match e {
+            BucketError::Conflict => MigrateError::Aborted(format!(
+                "{LOCK_KEY} changed under this run: another run of migrate is active"
+            )),
+            e => MigrateError::Bucket {
+                what: "writing the lock".into(),
+                error: e,
+            },
+        })?;
+        Ok(Held {
+            body,
+            version: std::sync::Mutex::new(version),
+        })
+    }
+
+    /// Removes the lock this run holds: rewritten first (so a run that
+    /// lost it removes nothing), then deleted.
+    async fn release(&self, held: &Held) -> Result<(), MigrateError> {
+        self.hold(held).await?;
+        self.store
+            .delete(LOCK_KEY)
+            .await
+            .map_err(bucket("removing the lock"))
     }
 
     /// Whether the object at `meta` may still be a live node's, and why.
@@ -724,7 +869,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         }
     }
 
-    /// The `nodes/` listing, judged.
+    /// The `nodes/` listing, each object read and judged.
     async fn nodes(&self) -> Result<Vec<NodeSeen>, MigrateError> {
         let listed = self
             .store
@@ -734,26 +879,65 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         let now = self.clock.now_ms();
         let mut out = Vec::with_capacity(listed.len());
         for meta in listed {
-            let body = self
+            let found = self
                 .store
                 .get(&meta.key)
                 .await
-                .map_err(bucket(format!("reading {}", meta.key)))?
-                .map(|(b, _)| b);
-            let live = match body {
+                .map_err(bucket(format!("reading {}", meta.key)))?;
+            let (live, version, old) = match found {
                 // Deleted since the listing: a forgotten node's.
-                None => None,
-                Some(body) => self.judge(&meta, &body, now),
+                None => (None, None, false),
+                Some((body, version)) => (
+                    self.judge(&meta, &body, now),
+                    Some(version),
+                    NodeLeaseObject::decode(&body).is_none() && NodeInfo::decode(&body).is_some(),
+                ),
             };
-            out.push(NodeSeen { meta, live });
+            out.push(NodeSeen {
+                meta,
+                live,
+                version,
+                old,
+            });
         }
         Ok(out)
+    }
+
+    /// The final proof: `nodes/` as the plan judged it. The listing
+    /// catches a node id never seen; a read of each object catches a
+    /// rewrite a lagging listing would still hide. `Some(node)` names the
+    /// first that changed.
+    async fn nodes_changed(&self, plan: &[NodeSeen]) -> Result<Option<String>, MigrateError> {
+        let listed = self
+            .store
+            .list(NODES)
+            .await
+            .map_err(bucket("listing nodes/"))?;
+        let recorded: Vec<ObjectMeta> = plan.iter().map(|n| n.meta.clone()).collect();
+        if let Some(changed) = changed_nodes(&recorded, &listed) {
+            return Ok(Some(changed));
+        }
+        for n in plan {
+            let now = self
+                .store
+                .get(&n.meta.key)
+                .await
+                .map_err(bucket(format!("reading {}", n.meta.key)))?
+                .map(|(_, v)| v);
+            if now != n.version {
+                return Ok(Some(format!(
+                    "node {}",
+                    n.meta.key.strip_prefix(NODES).unwrap_or(&n.meta.key)
+                )));
+            }
+        }
+        Ok(None)
     }
 
     /// Every tenant with bare keys (from delimiter listings).
     async fn bare_tenants(&self) -> Result<BTreeSet<String>, MigrateError> {
         let mut tenants = BTreeSet::new();
-        for family in Family::ALL {
+        for family in COPIED {
             let base = format!("{}/", family.bare());
             tenants.extend(
                 self.store
@@ -771,7 +955,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         let apps = self.apps_of(tenant);
         let mut source = Source::default();
         let mut refusals = BTreeSet::new();
-        for family in Family::ALL {
+        for family in COPIED {
             let base = format!("{}/{tenant}/", family.bare());
             let listed = self
                 .store
@@ -789,9 +973,25 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                     ));
                     continue;
                 }
-                match heir_of(tenant, class_of(family, tail), &apps, &self.options.heirs) {
+                let Some(class) = class_of(family, tail) else {
+                    refusals.insert(format!(
+                        "{} names no class this version reads: move it out of this prefix \
+                         and run this again",
+                        meta.key
+                    ));
+                    continue;
+                };
+                match heir_of(tenant, Some(class), &apps, &self.options.heirs) {
                     Ok(heir) => {
                         let to = StateRoot::new("", tenant, heir).key(family, tail);
+                        if self.options.prefix_bytes + to.len() > MAX_KEY_BYTES {
+                            refusals.insert(format!(
+                                "{} would become {to}, longer than the {MAX_KEY_BYTES} bytes a \
+                                 key can have under this bucket prefix",
+                                meta.key
+                            ));
+                            continue;
+                        }
                         source.moves.push(Move {
                             family,
                             from: meta.clone(),
@@ -820,6 +1020,20 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 plan.refusals.push(format!(
                     "--heir {heir_tenant}/{heir}: not a valid TENANT/APP"
                 ));
+                continue;
+            }
+            // An heir no node serves would hide the classes it inherits.
+            let apps = self.apps_of(heir_tenant);
+            let implicit = heir_tenant == "default" && heir == "default";
+            if !apps.is_empty() && !implicit && !apps.iter().any(|a| &a.app == heir) {
+                plan.refusals.push(format!(
+                    "--heir {heir_tenant}/{heir}: tenant {heir_tenant} has no app {heir} (its \
+                     apps: {})",
+                    apps.iter()
+                        .map(|a| a.app.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
         }
         let lock = self.read_record(LOCK_KEY, LOCK_HEADER).await?;
@@ -836,11 +1050,18 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         let commits = self.commits().await?;
         requests += 1;
         let mut tenants = self.bare_tenants().await?;
-        requests += u64::try_from(Family::ALL.len()).unwrap_or(5);
+        requests += u64::try_from(COPIED.len()).unwrap_or(4);
         tenants.extend(self.apps.iter().map(|a| a.tenant.clone()));
         let tokens = self.tokens().await?;
         requests += u64::try_from(self.apps.len()).unwrap_or(0);
         for tenant in tenants {
+            if !wasmkeep_name(&tenant) {
+                plan.refusals.push(format!(
+                    "{tenant:?} has actor state but is not a tenant name this version takes: \
+                     move its keys out of this prefix and run this again"
+                ));
+                continue;
+            }
             let mut t = TenantPlan {
                 apps: self
                     .apps_of(&tenant)
@@ -859,11 +1080,14 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                     })
                     .map(|a| a.app.clone())
                     .collect(),
+                locked: lock
+                    .as_ref()
+                    .is_some_and(|(l, _)| l.mode == LockMode::Apply && l.tenants.contains(&tenant)),
                 ..TenantPlan::default()
             };
             if !t.committed {
                 let (source, refusals) = self.source(&tenant).await?;
-                requests += u64::try_from(Family::ALL.len()).unwrap_or(5);
+                requests += u64::try_from(COPIED.len()).unwrap_or(4);
                 plan.refusals.extend(refusals);
                 for m in &source.moves {
                     *t.counts.entry(m.family).or_default() += 1;
@@ -950,6 +1174,41 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         Ok(out)
     }
 
+    /// Every `current` of `tenant` now, listed again (an app deployed
+    /// during the run counts): each must carry token 3. Gives each one's
+    /// `version seq`.
+    async fn rooted_currents(
+        &self,
+        tenant: &str,
+    ) -> Result<BTreeMap<String, String>, MigrateError> {
+        let base = format!("{APPS}{tenant}/");
+        let mut out = BTreeMap::new();
+        for app in self
+            .store
+            .list_dirs(&base)
+            .await
+            .map_err(bucket(format!("listing {base}")))?
+        {
+            let key = format!("{base}{app}/current");
+            let Some((body, _)) = self
+                .store
+                .get(&key)
+                .await
+                .map_err(bucket(format!("reading {key}")))?
+            else {
+                continue;
+            };
+            if third_token(&body) != Some(ROOTED_TOKEN) {
+                return Err(MigrateError::Aborted(format!(
+                    "{key} was written during the migration by a version before 0.4.0 (no \
+                     token 3): freeze deploys and run this again; nothing was committed"
+                )));
+            }
+            out.insert(format!("{tenant}/{app}"), deployed_of(&body));
+        }
+        Ok(out)
+    }
+
     /// `--apply`: migrates every tenant not committed yet. `Err` only when
     /// nothing new was committed.
     pub async fn apply(&self) -> Result<Outcome, MigrateError> {
@@ -971,14 +1230,18 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 .collect(),
             ..Outcome::default()
         };
-        let pending: Vec<String> = plan.pending().iter().map(|t| (*t).to_owned()).collect();
+        let mut pending: Vec<String> = plan.pending().iter().map(|t| (*t).to_owned()).collect();
         let existing = self.read_record(LOCK_KEY, LOCK_HEADER).await?;
         if pending.is_empty() {
-            if existing.is_some() {
-                self.store
-                    .delete(LOCK_KEY)
-                    .await
-                    .map_err(bucket("removing the lock"))?;
+            if let Some((_, version)) = &existing {
+                let lock = self.take_lock(
+                    existing
+                        .as_ref()
+                        .map(|(l, _)| l.encode(LOCK_HEADER))
+                        .unwrap_or_default(),
+                    Some(version),
+                );
+                self.release(&lock.await?).await?;
             }
             return Ok(outcome);
         }
@@ -1008,22 +1271,35 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 })
                 .collect(),
             counts: BTreeMap::new(),
+            deployed: BTreeMap::new(),
             at_ms: self.clock.now_ms(),
         };
-        let body = lock.encode(LOCK_HEADER);
-        match &existing {
-            None => self.store.create(LOCK_KEY, body).await,
-            Some((_, version)) => self.store.replace(LOCK_KEY, body, version).await,
-        }
-        .map_err(|e| match e {
-            BucketError::Conflict => MigrateError::Aborted(format!(
-                "{LOCK_KEY} changed under this run: another run of migrate is active"
-            )),
-            e => MigrateError::Bucket {
-                what: "writing the lock".into(),
-                error: e,
-            },
-        })?;
+        let held = self
+            .take_lock(lock.encode(LOCK_HEADER), existing.as_ref().map(|(_, v)| v))
+            .await?;
+        // A tenant another run committed since the plan: its roots may
+        // already be a node's live state (it could start once the commit
+        // was there and no lock was), never touched again. From here on
+        // the lock keeps nodes of this version out.
+        let commits = self.commits().await?;
+        pending.retain(|t| {
+            let done = commits.contains_key(t);
+            if done {
+                outcome.already.push(t.clone());
+            }
+            !done
+        });
+
+        // The quiet window: a node misjudged dead (clocks apart) either
+        // renews its node lease in it, which the final proof sees, or has
+        // lost it, and acknowledges nothing after. Every source listing
+        // comes after it.
+        let window = if plan.nodes.iter().any(|n| n.old) {
+            self.options.old_window_ms.max(self.options.lease_window_ms)
+        } else {
+            self.options.lease_window_ms
+        };
+        self.clock.pause_ms(window).await;
 
         // 3, 4. Copy and verify each tenant.
         let mut copied = BTreeMap::new();
@@ -1035,7 +1311,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 .get(tenant)
                 .is_some_and(|t| !t.counts.is_empty());
             let done = if has_state {
-                self.copy_and_verify(tenant).await?
+                self.copy_and_verify(tenant, &held).await?
             } else {
                 (Source::default(), BTreeMap::new())
             };
@@ -1043,24 +1319,25 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         }
 
         // 5. Barriers: token 3, then the tombstones.
+        self.hold(&held).await?;
         for a in &self.apps {
             self.root_current(&a.tenant, &a.app).await?;
         }
-        for (tenant, (_, owners)) in &copied {
-            self.tombstones(tenant, owners).await?;
+        for (tenant, (source, owners)) in &copied {
+            self.tombstones(tenant, source, owners, &held).await?;
         }
 
-        // 6. The final proof: no node ran since the plan judged them.
-        let now = self
-            .store
-            .list(NODES)
-            .await
-            .map_err(bucket("listing nodes/"))?;
-        if let Some(changed) = changed_nodes(&lock.nodes, &now) {
+        // 6. The final proof: no node ran since the plan judged them, and
+        // no deploy of an older version slipped in.
+        if let Some(changed) = self.nodes_changed(&plan.nodes).await? {
             return Err(MigrateError::Aborted(format!(
                 "{changed} ran during the migration: stop it (the service unit, not just the \
                  process) and run this again; nothing was committed"
             )));
+        }
+        let mut deployed = BTreeMap::new();
+        for tenant in copied.keys() {
+            deployed.insert(tenant.clone(), self.rooted_currents(tenant).await?);
         }
 
         // 7. Commit each tenant, then unlock.
@@ -1095,9 +1372,11 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 nodes: lock.nodes.clone(),
                 heirs,
                 counts,
+                deployed: deployed.remove(tenant).unwrap_or_default(),
                 at_ms: self.clock.now_ms(),
             };
             let key = format!("{COMMIT_PREFIX}{tenant}");
+            self.hold(&held).await?;
             match self.store.create(&key, commit.encode(COMMIT_HEADER)).await {
                 Ok(_) => outcome.committed.push(tenant.clone()),
                 // A re-run after a crash between the write and its answer.
@@ -1114,6 +1393,12 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                     .failed
                     .push((tenant.clone(), format!("writing {key}: {e}"))),
             }
+            // A rollback that took the lock between the check and the
+            // commit is deleting what the commit names: take it back.
+            if let Err(lost) = self.hold(&held).await {
+                self.undo_commit(&key, &plan.hash).await?;
+                return Err(lost);
+            }
         }
         if outcome.committed.is_empty() && !outcome.failed.is_empty() {
             return Err(MigrateError::Aborted(
@@ -1126,12 +1411,24 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
             ));
         }
         if outcome.failed.is_empty() {
-            self.store
-                .delete(LOCK_KEY)
-                .await
-                .map_err(bucket("removing the lock"))?;
+            self.release(&held).await?;
         }
         Ok(outcome)
+    }
+
+    /// After this run lost its lock right after writing commit `key`:
+    /// keeps the commit only while a run of the same plan holds the lock
+    /// (it commits the same); otherwise (a rollback, or no lock) deletes
+    /// it.
+    async fn undo_commit(&self, key: &str, hash: &str) -> Result<(), MigrateError> {
+        match self.read_record(LOCK_KEY, LOCK_HEADER).await {
+            Ok(Some((l, _))) if l.mode == LockMode::Apply && l.hash == hash => Ok(()),
+            _ => self
+                .store
+                .delete(key)
+                .await
+                .map_err(bucket(format!("deleting {key}"))),
+        }
     }
 
     /// Copies tenant `tenant`'s bare keys into its roots until a second
@@ -1141,6 +1438,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
     async fn copy_and_verify(
         &self,
         tenant: &str,
+        held: &Held,
     ) -> Result<(Source, BTreeMap<String, (Version, String)>), MigrateError> {
         let mut round = 0;
         let source = loop {
@@ -1149,6 +1447,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
             if !refusals.is_empty() {
                 return Err(MigrateError::Aborted(refusals.join("; ")));
             }
+            self.hold(held).await?;
             self.copy(tenant, &source).await?;
             let (again, _) = self.source(tenant).await?;
             if again.fingerprint() == source.fingerprint() {
@@ -1161,7 +1460,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 )));
             }
         };
-        let owners = self.verify(tenant, &source).await?;
+        let owners = self.verify(tenant, &source, held).await?;
         Ok((source, owners))
     }
 
@@ -1209,12 +1508,14 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         .await
     }
 
-    /// Step 4 for one tenant: mutable objects byte for byte, history by
-    /// its restore plan, and nothing in the roots the source lacks.
+    /// Step 4 for one tenant: mutable objects byte for byte, nothing in
+    /// the heirs' roots the source lacks, then history by its restore
+    /// plan.
     async fn verify(
         &self,
         tenant: &str,
         source: &Source,
+        held: &Held,
     ) -> Result<BTreeMap<String, (Version, String)>, MigrateError> {
         let owners = std::sync::Mutex::new(BTreeMap::new());
         let mutable: Vec<&Move> = source
@@ -1242,6 +1543,14 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                     {
                         Ok(())
                     }
+                    // Written where no record existed: nothing to copy.
+                    (Some((body, _)), None)
+                        if m.family == Family::Owners
+                            && is_unowned(&body)
+                            && tombstone_target(&body) == Some(m.to.as_str()) =>
+                    {
+                        Ok(())
+                    }
                     (Some((a, version)), Some((b, _))) if a == b => {
                         if m.family == Family::Owners {
                             owners
@@ -1260,12 +1569,51 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         })
         .await?;
 
+        // Keys of the copied families in the heirs' roots that no source
+        // key maps to (alarms the source deleted since an earlier run,
+        // stale copies) go first, so the history check sees the root as
+        // it is committed. Other apps' roots are never touched.
+        let roots: BTreeSet<String> = source
+            .moves
+            .iter()
+            .filter_map(|m| {
+                let rest = m.to.strip_prefix(&format!("{STATE_PREFIX}{tenant}/"))?;
+                let (app, _) = rest.split_once('/')?;
+                Some(format!("{STATE_PREFIX}{tenant}/{app}/"))
+            })
+            .collect();
+        let wanted: BTreeSet<&str> = source.moves.iter().map(|m| m.to.as_str()).collect();
+        let mut there = Vec::new();
+        for root in &roots {
+            there.extend(
+                self.store
+                    .list(root)
+                    .await
+                    .map_err(bucket(format!("listing {root}")))?
+                    .into_iter()
+                    .filter(|m| {
+                        let rest = m.key.strip_prefix(root.as_str()).unwrap_or_default();
+                        COPIED
+                            .iter()
+                            .any(|f| rest.starts_with(&format!("{}/", f.folder())))
+                    }),
+            );
+        }
+        let (kept, extra): (Vec<ObjectMeta>, Vec<ObjectMeta>) = there
+            .into_iter()
+            .partition(|m| wanted.contains(m.key.as_str()));
+        if !extra.is_empty() {
+            self.hold(held).await?;
+        }
+        each(&extra, self.options.concurrency, |meta| async move {
+            self.store
+                .delete(&meta.key)
+                .await
+                .map_err(bucket(format!("deleting {}", meta.key)))
+        })
+        .await?;
+
         // History: per actor, the same restore plan on both sides.
-        let there = self
-            .store
-            .list(&format!("{STATE_PREFIX}{tenant}/"))
-            .await
-            .map_err(bucket(format!("listing {STATE_PREFIX}{tenant}/")))?;
         let mut sides: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
         let actor_of = |key: &str| -> Option<(String, String)> {
             // `<root>actors/<class>/<name>/` and the rest.
@@ -1281,7 +1629,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 sides.entry(actor).or_default().0.push(tail);
             }
         }
-        for meta in &there {
+        for meta in &kept {
             if let Some((actor, tail)) = actor_of(&meta.key) {
                 sides.entry(actor).or_default().1.push(tail);
             }
@@ -1298,22 +1646,6 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 )));
             }
         }
-
-        // Keys in the roots that no source key maps to: alarms the source
-        // deleted since an earlier run, stale copies.
-        let wanted: BTreeSet<&str> = source.moves.iter().map(|m| m.to.as_str()).collect();
-        let extra: Vec<String> = there
-            .into_iter()
-            .map(|m| m.key)
-            .filter(|k| !wanted.contains(k.as_str()))
-            .collect();
-        each(&extra, self.options.concurrency, |key| async move {
-            self.store
-                .delete(key)
-                .await
-                .map_err(bucket(format!("deleting {key}")))
-        })
-        .await?;
         Ok(owners
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner))
@@ -1356,63 +1688,94 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         )))
     }
 
-    /// The tombstones of one tenant, each on the version compared.
+    /// The tombstones of one tenant: over each record on the version
+    /// compared, and created where an actor has history or an old-lease
+    /// marker but no record (an older binary would create one, at a
+    /// generation of its own). The lock is rewritten before each batch.
     async fn tombstones(
         &self,
         tenant: &str,
+        source: &Source,
         owners: &BTreeMap<String, (Version, String)>,
+        held: &Held,
     ) -> Result<(), MigrateError> {
         let owners: Vec<(&String, &(Version, String))> = owners.iter().collect();
-        each(
-            &owners,
-            self.options.concurrency,
-            |(key, (version, to))| async move {
-                match self.store.replace(key, tombstone(to), version).await {
+        for chunk in owners.chunks(self.options.concurrency.max(1)) {
+            self.hold(held).await?;
+            each(
+                chunk,
+                self.options.concurrency,
+                |(key, (version, to))| async move {
+                    match self.store.replace(key, tombstone(to), version).await {
+                        Ok(_) => Ok(()),
+                        Err(BucketError::Conflict) => Err(MigrateError::Aborted(format!(
+                            "{key} changed after it was copied: a node of an older version \
+                             took the actor of tenant {tenant}; stop it and run this again (it \
+                             is copied again)"
+                        ))),
+                        Err(e) => Err(MigrateError::Bucket {
+                            what: format!("writing the tombstone over {key}"),
+                            error: e,
+                        }),
+                    }
+                },
+            )
+            .await?;
+        }
+        let unowned = unowned_actors(tenant, source);
+        for chunk in unowned.chunks(self.options.concurrency.max(1)) {
+            self.hold(held).await?;
+            each(chunk, self.options.concurrency, |(key, to)| async move {
+                match self.store.create(key, tombstone_unowned(to)).await {
                     Ok(_) => Ok(()),
+                    // Ours, from an answer this run did not get.
+                    Err(BucketError::Conflict)
+                        if self
+                            .store
+                            .get(key)
+                            .await
+                            .map_err(bucket(format!("reading {key}")))?
+                            .is_some_and(|(b, _)| is_unowned(&b)) =>
+                    {
+                        Ok(())
+                    }
                     Err(BucketError::Conflict) => Err(MigrateError::Aborted(format!(
-                        "{key} changed after it was copied: a node of an older version took the \
-                     actor of tenant {tenant}; stop it and run this again (it is copied again)"
+                        "{key} was created after the copy: a node of an older version took the \
+                         actor of tenant {tenant}; stop it and run this again (it is copied \
+                         again)"
                     ))),
                     Err(e) => Err(MigrateError::Bucket {
-                        what: format!("writing the tombstone over {key}"),
+                        what: format!("writing the tombstone at {key}"),
                         error: e,
                     }),
                 }
-            },
-        )
-        .await
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// `--rollback`: puts every migrated tenant back in the layout before
-    /// 0.4.0, while no node has run since its migration.
+    /// 0.4.0, while no node has run and no app was deployed since its
+    /// migration. A rollback already started is finished whatever ran
+    /// since: from its first write, the old layout is the truth again.
     pub async fn rollback(&self) -> Result<Vec<String>, MigrateError> {
         let lock = self.read_record(LOCK_KEY, LOCK_HEADER).await?;
         let commits = self.commits().await?;
         let recorded = match (&lock, commits.values().next()) {
             (Some((l, _)), _) => l.nodes.clone(),
-            (None, Some((c, _))) => c.nodes.clone(),
+            (None, Some((c, _, _))) => c.nodes.clone(),
             (None, None) => return Ok(Vec::new()),
         };
-        let now = self
-            .store
-            .list(NODES)
-            .await
-            .map_err(bucket("listing nodes/"))?;
-        let mut changed = changed_nodes(&recorded, &now);
-        for (tenant, (c, _)) in &commits {
-            if changed.is_none() && c.nodes != recorded {
-                changed = Some(format!("a node (since tenant {tenant}'s commit)"));
-            }
-        }
-        if let Some(changed) = changed {
-            return Err(MigrateError::Refused(vec![format!(
-                "{changed} has run since the migration: it is now one-way (ADR 0022). The \
-                 state stays where this version reads it"
-            )]));
+        let resuming = lock
+            .as_ref()
+            .is_some_and(|(l, _)| l.mode == LockMode::Rollback);
+        if !resuming && let Some(why) = self.ran_since(&recorded, &commits).await? {
+            return Err(MigrateError::Refused(vec![why]));
         }
         let mut tenants: BTreeSet<String> = commits.keys().cloned().collect();
         let mut originals = BTreeMap::new();
-        for (c, _) in commits.values() {
+        for (c, _, _) in commits.values() {
             originals.extend(c.originals.clone());
         }
         if let Some((l, _)) = &lock {
@@ -1435,65 +1798,49 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 .unwrap_or_default(),
             tenants: tenants.clone(),
             originals: originals.clone(),
-            nodes: recorded,
+            nodes: recorded.clone(),
             heirs: record_heirs.clone(),
             counts: BTreeMap::new(),
+            deployed: BTreeMap::new(),
             at_ms: self.clock.now_ms(),
         };
-        let body = record.encode(LOCK_HEADER);
-        match &lock {
-            None => self.store.create(LOCK_KEY, body).await,
-            Some((_, version)) => self.store.replace(LOCK_KEY, body, version).await,
-        }
-        .map_err(|e| match e {
-            BucketError::Conflict => MigrateError::Aborted(format!(
-                "{LOCK_KEY} changed under this run: another run of migrate is active"
-            )),
-            e => MigrateError::Bucket {
-                what: "writing the lock".into(),
-                error: e,
-            },
-        })?;
-
-        // Every record back before any root key goes.
-        for tenant in &tenants {
-            let base = format!("{}/{tenant}/", Family::Owners.bare());
-            let listed = self
-                .store
-                .list(&base)
-                .await
-                .map_err(bucket(format!("listing {base}")))?;
-            each(&listed, self.options.concurrency, |meta| async move {
-                let Some((body, version)) = self
-                    .store
-                    .get(&meta.key)
-                    .await
-                    .map_err(bucket(format!("reading {}", meta.key)))?
-                else {
-                    return Ok(());
-                };
-                let Some(to) = tombstone_target(&body) else {
-                    return Ok(());
-                };
-                let Some((record, _)) = self
-                    .store
-                    .get(to)
-                    .await
-                    .map_err(bucket(format!("reading {to}")))?
-                else {
-                    return Err(MigrateError::Aborted(format!(
-                        "{} names {to}, which is gone: nothing to put back",
-                        meta.key
-                    )));
-                };
-                self.store
-                    .replace(&meta.key, record, &version)
-                    .await
-                    .map(drop)
-                    .map_err(bucket(format!("putting back {}", meta.key)))
-            })
+        let held = self
+            .take_lock(record.encode(LOCK_HEADER), lock.as_ref().map(|(_, v)| v))
             .await?;
+        // Checked again under the lock: a node that started between the
+        // check and the lock. The lock goes back as it was.
+        if !resuming && let Some(why) = self.ran_since(&recorded, &commits).await? {
+            let version = held
+                .version
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            match &lock {
+                Some((l, _)) => {
+                    self.store
+                        .replace(LOCK_KEY, l.encode(LOCK_HEADER), &version)
+                        .await
+                        .map_err(bucket("putting the lock back"))?;
+                }
+                None => self
+                    .store
+                    .delete(LOCK_KEY)
+                    .await
+                    .map_err(bucket("removing the lock"))?,
+            }
+            return Err(MigrateError::Refused(vec![why]));
         }
+
+        // Every record back before any root key goes; twice, so a
+        // tombstone an `--apply` that lost the lock wrote meanwhile is
+        // put back too.
+        for _ in 0..2 {
+            self.hold(&held).await?;
+            for tenant in &tenants {
+                self.records_back(tenant).await?;
+            }
+        }
+        self.hold(&held).await?;
         for (app, token) in &originals {
             let key = format!("{APPS}{app}/current");
             let Some((body, version)) = self
@@ -1524,12 +1871,12 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         // Then the copies: only the keys a bare key maps to (by the heirs
         // recorded), never anything else under the roots.
         let mut heirs = record_heirs.clone();
-        for (c, _) in commits.values() {
+        for (c, _, _) in commits.values() {
             heirs.extend(c.heirs.clone());
         }
         for tenant in &tenants {
             let mut copies = Vec::new();
-            for family in Family::ALL {
+            for family in COPIED {
                 let base = format!("{}/{tenant}/", family.bare());
                 for meta in self
                     .store
@@ -1550,6 +1897,7 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                     }
                 }
             }
+            self.hold(&held).await?;
             each(&copies, self.options.concurrency, |key| async move {
                 self.store
                     .delete(key)
@@ -1563,12 +1911,170 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                 .await
                 .map_err(bucket(format!("deleting {key}")))?;
         }
-        self.store
-            .delete(LOCK_KEY)
-            .await
-            .map_err(bucket("removing the lock"))?;
+        self.release(&held).await?;
         Ok(tenants.into_iter().collect())
     }
+
+    /// Why a rollback is now one-way, if it is: a `nodes/` change since
+    /// the run (a node of any version ran), a deploy since a commit, or a
+    /// key under a migrated root written after its commit.
+    async fn ran_since(
+        &self,
+        recorded: &[ObjectMeta],
+        commits: &BTreeMap<String, Commit>,
+    ) -> Result<Option<String>, MigrateError> {
+        let one_way = |what: String| {
+            Some(format!(
+                "{what} since the migration: it is now one-way (ADR 0022). The state stays \
+                 where this version reads it"
+            ))
+        };
+        let now = self
+            .store
+            .list(NODES)
+            .await
+            .map_err(bucket("listing nodes/"))?;
+        if let Some(changed) = changed_nodes(recorded, &now) {
+            return Ok(one_way(format!("{changed} has run")));
+        }
+        for (tenant, (c, _, committed_ms)) in commits {
+            if c.nodes != recorded {
+                return Ok(one_way(format!(
+                    "a node has run (since tenant {tenant}'s commit)"
+                )));
+            }
+            let base = format!("{APPS}{tenant}/");
+            for app in self
+                .store
+                .list_dirs(&base)
+                .await
+                .map_err(bucket(format!("listing {base}")))?
+            {
+                let key = format!("{base}{app}/current");
+                let now = self
+                    .store
+                    .get(&key)
+                    .await
+                    .map_err(bucket(format!("reading {key}")))?
+                    .map(|(b, _)| deployed_of(&b));
+                if now.as_ref() != c.deployed.get(&format!("{tenant}/{app}")) {
+                    return Ok(one_way(format!("{tenant}/{app} was deployed")));
+                }
+            }
+            let root = format!("{STATE_PREFIX}{tenant}/");
+            if let Some(late) = self
+                .store
+                .list(&root)
+                .await
+                .map_err(bucket(format!("listing {root}")))?
+                .into_iter()
+                .find(|m| m.modified_ms > *committed_ms)
+            {
+                return Ok(one_way(format!("{} was written", late.key)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Puts tenant `tenant`'s ownership records back over their
+    /// tombstones (each conditional on the tombstone's version), and
+    /// removes the tombstones written where no record was.
+    async fn records_back(&self, tenant: &str) -> Result<(), MigrateError> {
+        let base = format!("{}/{tenant}/", Family::Owners.bare());
+        let listed = self
+            .store
+            .list(&base)
+            .await
+            .map_err(bucket(format!("listing {base}")))?;
+        each(&listed, self.options.concurrency, |meta| async move {
+            let Some((body, version)) = self
+                .store
+                .get(&meta.key)
+                .await
+                .map_err(bucket(format!("reading {}", meta.key)))?
+            else {
+                return Ok(());
+            };
+            let Some(to) = tombstone_target(&body) else {
+                return Ok(());
+            };
+            if is_unowned(&body) {
+                return self
+                    .store
+                    .delete(&meta.key)
+                    .await
+                    .map_err(bucket(format!("deleting {}", meta.key)));
+            }
+            let Some((record, _)) = self
+                .store
+                .get(to)
+                .await
+                .map_err(bucket(format!("reading {to}")))?
+            else {
+                return Err(MigrateError::Aborted(format!(
+                    "{} names {to}, which is gone: nothing to put back",
+                    meta.key
+                )));
+            };
+            self.store
+                .replace(&meta.key, record, &version)
+                .await
+                .map(drop)
+                .map_err(bucket(format!("putting back {}", meta.key)))
+        })
+        .await
+    }
+}
+
+/// The bare ownership keys of tenant `tenant`'s actors that have history
+/// or an old-lease marker in `source` but no record, each with the root
+/// key its tombstone names.
+fn unowned_actors(tenant: &str, source: &Source) -> Vec<(String, String)> {
+    let tail_of = |m: &Move| -> Option<String> {
+        let tail = m
+            .from
+            .key
+            .strip_prefix(&format!("{}/{tenant}/", m.family.bare()))?;
+        let mut parts = tail.splitn(3, '/');
+        Some(format!("{}/{}", parts.next()?, parts.next()?))
+    };
+    let owned: BTreeSet<String> = source
+        .moves
+        .iter()
+        .filter(|m| m.family == Family::Owners)
+        .filter_map(tail_of)
+        .collect();
+    let mut out = BTreeMap::new();
+    for m in source
+        .moves
+        .iter()
+        .filter(|m| matches!(m.family, Family::History | Family::Leases))
+    {
+        let Some(tail) = tail_of(m) else { continue };
+        if owned.contains(&tail) {
+            continue;
+        }
+        // The heir is the move's own root.
+        let Some(root) = m.to.strip_prefix(STATE_PREFIX).and_then(|r| {
+            let mut p = r.splitn(3, '/');
+            Some((p.next()?.to_owned(), p.next()?.to_owned()))
+        }) else {
+            continue;
+        };
+        let to = StateRoot::new("", root.0.as_str(), root.1.as_str()).key(Family::Owners, &tail);
+        out.insert(format!("{}/{tenant}/{tail}", Family::Owners.bare()), to);
+    }
+    out.into_iter().collect()
+}
+
+/// The `version seq` of a `current` body (its deploy, token aside).
+fn deployed_of(body: &[u8]) -> String {
+    std::str::from_utf8(body)
+        .unwrap_or_default()
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The first `nodes/` object that differs between `recorded` and `now`
@@ -1692,6 +2198,21 @@ mod tests {
             "default"
         );
         assert!(heir_of("other", Some("c"), &[], &none).is_err());
+        // Tenant `default` with a deployed app: a class in no manifest may
+        // be an `--actor` node's, so it needs --heir; its app `default` is
+        // the implicit one.
+        let foo = app("default", "foo", &["c"]);
+        let e = heir_of("default", Some("t"), &[&foo], &none).unwrap_err();
+        assert!(e.contains("--heir default/default"), "{e}");
+        assert_eq!(
+            heir_of("default", Some("c"), &[&foo], &none).unwrap(),
+            "foo"
+        );
+        let implicit = app("default", "default", &[]);
+        assert_eq!(
+            heir_of("default", Some("t"), &[&implicit], &none).unwrap(),
+            "default"
+        );
         assert_eq!(heir_of("acme", None, &[&shop], &none).unwrap(), "shop");
     }
 
@@ -1710,6 +2231,7 @@ mod tests {
             }],
             heirs: BTreeMap::from([("acme/chat".into(), "shop".into())]),
             counts: BTreeMap::from([("owners".into(), 2)]),
+            deployed: BTreeMap::from([("acme/shop".into(), "v1 4".into())]),
             at_ms: 5,
         };
         assert_eq!(
@@ -1727,6 +2249,14 @@ mod tests {
             Some("state/acme/shop/owners/chat/room")
         );
         assert_eq!(tombstone_target(b"wasmkeep-owner 1\na i\n3\n"), None);
+        let u = tombstone_unowned("state/acme/shop/owners/chat/room");
+        assert_eq!(
+            tombstone_target(&u),
+            Some("state/acme/shop/owners/chat/room")
+        );
+        assert!(is_unowned(&u) && !is_unowned(&t));
+        assert!(crate::node_lease::OwnerRecord::decode(&u).is_none());
+        assert_eq!(deployed_of(b"v2 7 3\n"), "v2 7");
         // Older binaries read only `wasmkeep-owner 1`.
         assert!(crate::node_lease::OwnerRecord::decode(&t).is_none());
         assert_eq!(with_token(b"v 3\n", "3").unwrap(), b"v 3 3\n");

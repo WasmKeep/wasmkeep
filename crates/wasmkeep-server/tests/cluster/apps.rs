@@ -335,3 +335,50 @@ async fn actor_nodes_form_a_cluster_as_default_default() {
         assert_eq!(body.lines().nth(6), Some("default/default"), "{id}: {body}");
     }
 }
+
+/// Two apps of one tenant on one prefix, the same class and name, each
+/// with an alarm: each alarm is indexed under its own app's root and fires
+/// once, in its own app (ADR 0022: no tenant filter on the alarm scan, and
+/// none needed).
+#[tokio::test(flavor = "multi_thread")]
+async fn alarms_of_two_apps_with_the_same_names_stay_apart() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let shop = app_node("shop-1", dirs.0.path(), &store, "acme/shop", false).await;
+    let blog = app_node("blog-1", dirs.1.path(), &store, "acme/blog", false).await;
+    settle().await;
+    for node in [&shop, &blog] {
+        let r = send_runnable(node.addr, "POST", "/actor/t/y/alarm?in=1500", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    for node in [&shop, &blog] {
+        loop {
+            let r = send_runnable(node.addr, "GET", "/actor/t/y/fired", "").await;
+            if r.body.trim() == "1" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an alarm never fired: {}",
+                r.body
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    // Once each, never twice in one app (a sweep of the other app's root).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for node in [&shop, &blog] {
+        let r = send_runnable(node.addr, "GET", "/actor/t/y/fired", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+    }
+    // Each app's history is under its own root.
+    let all = bucket_keys(&store).await;
+    for app in ["shop", "blog"] {
+        assert!(
+            all.iter()
+                .any(|k| k.starts_with(&format!("state/acme/{app}/actors/t/y/"))),
+            "no history under {app}'s root: {all:?}"
+        );
+    }
+}
