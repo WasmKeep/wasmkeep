@@ -68,6 +68,11 @@ async fn alarm_keys_carry_the_prefix() {
             format!("{p}alarms/acme/001700000000000/chat.t/726f6f6d2d31/00000000000000000007-ab12")
         );
         assert_eq!(
+            c.alarm_entries_base(&actor(PLAIN), 1_700_000_000_000)
+                .as_ref(),
+            format!("{p}alarms/acme/001700000000000/chat.t/726f6f6d2d31")
+        );
+        assert_eq!(
             c.alarm_key(&actor(ESCAPED), &Entry::legacy(5)).as_ref(),
             format!("{p}alarms/acme/000000000000005/chat/526f6f6d203120c3a9")
         );
@@ -80,16 +85,27 @@ async fn alarm_keys_carry_the_prefix() {
 
 #[test]
 fn move_keys_are_relative_to_the_prefix() {
-    assert_eq!(
-        wasmkeep_cluster::control::checked_move_key(
-            &StateRoot::new("", "acme"),
-            "chat",
-            ESCAPED,
-            "node-b"
-        )
-        .unwrap(),
-        "control/move/acme/chat/526f6f6d203120c3a9/node-b"
-    );
+    for prefix in ["", "p", "p/"] {
+        let root = StateRoot::new(prefix, "acme");
+        assert_eq!(
+            wasmkeep_cluster::control::checked_move_key(&root, "chat", ESCAPED, "node-b").unwrap(),
+            "control/move/acme/chat/526f6f6d203120c3a9/node-b"
+        );
+        assert_eq!(
+            wasmkeep_cluster::control::checked_move_key(&root, "chat", &long(), "node-b").unwrap(),
+            format!("control/move/acme/chat/{}/node-b", "78".repeat(256))
+        );
+    }
+}
+
+/// A key is built from the node's tenant, never the address's: an address
+/// of another tenant is refused in every build, not given this tenant's
+/// keys.
+#[tokio::test]
+#[should_panic(expected = "not of this node's tenant")]
+async fn a_key_for_another_tenant_is_refused() {
+    let other = ActorAddress::new("other", "chat", PLAIN).unwrap();
+    let _ = node_on("").owner_key(&other);
 }
 
 #[test]

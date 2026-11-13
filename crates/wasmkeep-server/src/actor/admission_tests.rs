@@ -319,3 +319,48 @@ async fn an_alarm_refused_for_capacity_retries_after_a_gated_blocker() {
     let _ = stop.send(());
     within(server).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn an_actor_of_another_tenant_never_starts() {
+    use wasmkeep_runtime::{Runtime, RuntimeConfig};
+    let wasm = guests::build_guest("tests/guests/test-actor", "test_actor");
+    let data = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
+    let component = runtime.compile(&wasm).unwrap();
+    let service = ActorService::new(
+        runtime,
+        ActorConfig::new(data.path()),
+        vec![("test".into(), component, wasm)],
+    )
+    .unwrap();
+    // Its database would be the root's tenant's (ADR 0022): refused,
+    // though its class is served (the same name of this tenant starts
+    // below).
+    let other = ActorAddress::new("other", "test", "x").unwrap();
+    let started = service
+        .inner
+        .mailboxes
+        .submit(&other, |state| {
+            Box::pin(async move { state.storage.clone() })
+        })
+        .await;
+    match started {
+        Err(MailboxError::Init { source, .. }) => {
+            assert!(
+                source.to_string().contains("not of this node's tenant"),
+                "{source}"
+            );
+        }
+        other => panic!("started: {other:?}"),
+    }
+    let mine = ActorAddress::new("default", "test", "x").unwrap();
+    let storage = service
+        .inner
+        .mailboxes
+        .submit(&mine, |state| {
+            Box::pin(async move { state.storage.clone() })
+        })
+        .await
+        .unwrap();
+    assert_eq!(storage.state().tenant, "default");
+}

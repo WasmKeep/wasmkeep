@@ -343,9 +343,8 @@ pub(crate) struct Cluster {
     pub(crate) ttl: Duration,
     /// The shared bucket, for replication.
     pub(crate) store: Arc<dyn ObjectStore>,
-    /// Key prefix in the bucket, ending in `/` (or empty).
-    prefix: String,
-    /// The root of every actor-state key (ADR 0022), under `prefix`.
+    /// The root of every actor-state key (ADR 0022), and the one copy of
+    /// the bucket prefix.
     root: StateRoot,
     /// How long after its due time an alarm counts as abandoned: a lease
     /// period plus grace, by which its owner fired it or lost the actor.
@@ -598,11 +597,6 @@ impl Cluster {
             secret: tokio::sync::OnceCell::new(),
             ttl: Duration::from_millis(config.lease.ttl_ms()),
             store,
-            prefix: if config.prefix.is_empty() || config.prefix.ends_with('/') {
-                config.prefix.clone()
-            } else {
-                format!("{}/", config.prefix)
-            },
             root: StateRoot::new(&config.prefix, tenant),
             alarm_overdue: Duration::from_millis(
                 config
@@ -667,7 +661,7 @@ impl Cluster {
     /// stops at "now"; the name as hex, so nothing in the key is escaped by
     /// the object store.
     fn alarm_key(&self, address: &ActorAddress, entry: &Entry) -> StorePath {
-        self.debug_assert_mine(address);
+        self.assert_mine(address);
         StorePath::from(self.root.bucket_key(
             Family::Alarms,
             &alarm_index::key_tail(address.class(), address.name(), entry),
@@ -681,9 +675,16 @@ impl Cluster {
 
     /// Every address whose keys this node builds is of its root's tenant:
     /// addresses are made with the service's tenant, and a node call
-    /// naming another is refused before any key is built.
-    pub(crate) fn debug_assert_mine(&self, address: &ActorAddress) {
-        debug_assert_eq!(address.tenant(), self.root.tenant(), "{address}");
+    /// naming another is refused before any key is built. Checked in
+    /// every build: a key is built from the root's tenant, never the
+    /// address's, so an address of another tenant reaching here would
+    /// otherwise read or write that tenant's actor under this one's keys.
+    pub(crate) fn assert_mine(&self, address: &ActorAddress) {
+        assert_eq!(
+            address.tenant(),
+            self.root.tenant(),
+            "{address} is not of this node's tenant"
+        );
     }
 
     /// Lists an alarm of `address` due at `at` in the bucket's index, as
@@ -733,6 +734,16 @@ impl Cluster {
         }
     }
 
+    /// The folder of `address`'s tagged entries due at `at`:
+    /// `alarms/<tenant>/<at, 15 digits>/<class>.t/<name as hex>`.
+    fn alarm_entries_base(&self, address: &ActorAddress, at: u64) -> StorePath {
+        self.assert_mine(address);
+        StorePath::from(self.root.bucket_key(
+            Family::Alarms,
+            &alarm_index::tagged_prefix(address.class(), address.name(), at),
+        ))
+    }
+
     /// `address`'s tagged entries due at `at`, as listed now (the legacy
     /// entry is elsewhere: [`alarm_index::entries_to_clear`] adds it).
     pub(crate) async fn alarm_entries_at(
@@ -741,11 +752,7 @@ impl Cluster {
         at: u64,
     ) -> Result<Vec<Entry>, object_store::Error> {
         use futures_util::TryStreamExt as _;
-        self.debug_assert_mine(address);
-        let base = StorePath::from(self.root.bucket_key(
-            Family::Alarms,
-            &alarm_index::tagged_prefix(address.class(), address.name(), at),
-        ));
+        let base = self.alarm_entries_base(address, at);
         let strip = format!("{}/", base.as_ref());
         let listed: Vec<_> = self.store.list(Some(&base)).try_collect().await?;
         Ok(listed
@@ -982,7 +989,7 @@ impl Cluster {
             .get_or_try_init(|| async {
                 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
                 let location =
-                    object_store::path::Path::from(format!("{}{SECRET_KEY}", self.prefix));
+                    object_store::path::Path::from(format!("{}{SECRET_KEY}", self.root.prefix()));
                 let fresh = random_hex(32).map_err(|e| e.to_string())?;
                 let opts = PutOptions {
                     mode: PutMode::Create,
@@ -1502,7 +1509,7 @@ impl Cluster {
 
     /// Key prefix in the bucket, ending in `/` (or empty).
     pub(crate) fn store_prefix(&self) -> &str {
-        &self.prefix
+        self.root.prefix()
     }
 
     /// An actor's per-actor lease from before ADR 0020, replaced by a
@@ -1510,7 +1517,7 @@ impl Cluster {
     /// seeds the first ownership record). The name is encoded like the
     /// database file name, so any actor name is a safe key.
     pub(crate) fn lease_key(&self, address: &ActorAddress) -> String {
-        self.debug_assert_mine(address);
+        self.assert_mine(address);
         self.root.key(
             Family::Leases,
             &format!(
@@ -1524,7 +1531,7 @@ impl Cluster {
     /// The folder of `address`'s history in the bucket (ADR 0007), with
     /// the prefix and without a trailing `/`.
     pub(crate) fn history_key(&self, address: &ActorAddress) -> String {
-        self.debug_assert_mine(address);
+        self.assert_mine(address);
         self.root.bucket_key(
             Family::History,
             &format!(

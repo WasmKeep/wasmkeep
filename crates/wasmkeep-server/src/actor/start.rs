@@ -128,6 +128,12 @@ impl ActorService {
                     let class = class.ok_or_else(|| -> BoxError {
                         format!("unknown class {}", address.class()).into()
                     })?;
+                    // The database path and the address recorded in it come
+                    // from the root's tenant, not the address's (ADR 0022):
+                    // an actor of another tenant never starts here.
+                    if address.tenant() != storage.state().tenant {
+                        return Err(format!("{address} is not of this node's tenant").into());
+                    }
                     Ok(ActorState {
                         address,
                         class,

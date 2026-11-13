@@ -4,8 +4,11 @@
 //!
 //! Every builder of an actor-state key or path starts from a [`StateRoot`]
 //! and never from an address's tenant, so a change of layout is a change
-//! here alone. Today the root is the bare layout, with the tenant after
-//! the family:
+//! here, plus two readers that span every tenant and so are not one
+//! root's: the listing and parsing of moves (`control::MOVE`) and the
+//! startup scan of local databases (`Storage::pending_alarms`, over
+//! `<data_dir>/actors`). Today the root is the bare layout, with the
+//! tenant after the family:
 //!
 //! ```text
 //! actors/<tenant>/<class>/<name>/{wal,snapshot}/...   history (ADR 0007)

@@ -196,6 +196,8 @@ impl Storage {
     pub fn pending_alarms(&self) -> Result<PendingAlarms, StorageError> {
         let mut found = Vec::new();
         let mut skipped = Vec::new();
+        // Every tenant's databases, not only this root's: the one local
+        // path spelled outside the server's `StateRoot`.
         let root = self.config.data_dir.join("actors");
         for file in db_files(&root)? {
             match Self::alarm_of(&file, &self.config) {
