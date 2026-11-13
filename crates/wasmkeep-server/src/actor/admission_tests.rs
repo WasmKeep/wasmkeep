@@ -25,7 +25,7 @@ fn fixture(idle_timeout: Duration) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(
         StorageConfig::new(directory.path()),
-        crate::state_dir(&crate::StateRoot::new("", "tenant")),
+        crate::state_dir(&crate::StateRoot::new("", "tenant", "default")),
     );
     let factory_storage = storage.clone();
     let mailboxes = Mailboxes::new_with_residency(
@@ -282,7 +282,7 @@ async fn an_alarm_refused_for_capacity_retries_after_a_gated_blocker() {
     // sole slot. Keep it there with the channel, not a guessed sleep interval.
     let storage = Storage::new(
         StorageConfig::new(data.path()),
-        crate::state_dir(&crate::StateRoot::new("", "default")),
+        crate::state_dir(&crate::StateRoot::new("", "default", "default")),
     );
     let path = actor_storage.db_path("test", "alarm");
     assert!(!actor_storage.is_open(&path));

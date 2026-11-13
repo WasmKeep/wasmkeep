@@ -289,13 +289,17 @@ async fn a_start_is_idempotent_and_unknown_ids_leave_nothing() {
     );
     // The calls created actor orders/nobody; it deleted itself.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let kept = data.path().join("actors/default/orders/same.db");
+    let kept = data
+        .path()
+        .join("state/default/default/actors/orders/same.db");
     assert!(
         kept.exists(),
         "{} is missing: wrong layout?",
         kept.display()
     );
-    let db = data.path().join("actors/default/orders/nobody.db");
+    let db = data
+        .path()
+        .join("state/default/default/actors/orders/nobody.db");
     assert!(!db.exists(), "{} is still there", db.display());
 }
 

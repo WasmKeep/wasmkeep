@@ -10,7 +10,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn counter_wasm() -> PathBuf {
@@ -105,30 +105,20 @@ fn rules_and_config_travel_with_deploys() {
     let (ok, out, err) = deploy(&url, &["--actor", &actor]);
     assert!(ok, "{err}");
     assert!(out.contains("class counter: added"), "{out}");
-
-    // Before rules are deployed, a node with --access starts (migration).
-    let addr = free_port();
-    let mut early = serve(
+    // Every deploy of this version marks the app (token 3, ADR 0022): rules
+    // come with deploys from the first one, and --access is refused.
+    assert!(out.contains("Access rules now come with deploys"), "{out}");
+    let early = serve(
         &url,
         &dir.path().join("early"),
-        addr,
+        free_port(),
         &["--access", "counter=existing"],
-    );
-    let early = Killed(early.stdout(Stdio::null()).spawn().unwrap());
-    let started = Instant::now();
-    while status(addr, "/actor/counter/x").is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the node never answered"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert_eq!(
-        status(addr, "/actor/counter/nobody"),
-        Some(404),
-        "--access applied"
-    );
-    drop(early);
+    )
+    .output()
+    .unwrap();
+    assert!(!early.status.success());
+    let err = String::from_utf8(early.stderr).unwrap();
+    assert!(err.contains("wasmkeep deploy --app acme/shop"), "{err}");
 
     // Rules and configuration, with no --actor: the classes are kept.
     let config = dir.path().join("counter.env");
@@ -149,7 +139,7 @@ fn rules_and_config_travel_with_deploys() {
     assert!(ok, "{err}");
     assert!(out.contains("access counter: open -> existing"), "{out}");
     assert!(out.contains("config counter: API_TOKEN added"), "{out}");
-    assert!(out.contains("Access rules now come with deploys"), "{out}");
+    assert!(!out.contains("Access rules now come with deploys"), "{out}");
     assert!(err.contains("API_TOKEN looks like a secret"), "{err}");
     assert!(
         !out.contains("tok-12345") && !err.contains("tok-12345"),
@@ -206,44 +196,48 @@ fn rules_and_config_travel_with_deploys() {
     assert!(out.contains("access counter: existing -> open"), "{out}");
 }
 
-/// Copies app `from`'s objects to app `to` under the bucket prefix: two
-/// apps of one tenant deployed before `deploy` refused the second.
-fn copy_app(bucket: &str, prefix: &str, from: &str, to: &str) {
-    use futures_util::TryStreamExt;
+/// Writes `body` at `key` under the bucket prefix.
+fn put(bucket: &str, key: &str, body: &str) {
+    use object_store::ObjectStoreExt as _;
     use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore as _, ObjectStoreExt as _};
     let store = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .build()
         .unwrap();
-    let rt = tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
+        .unwrap()
+        .block_on(store.put(&StorePath::from(key), body.to_owned().into()))
         .unwrap();
-    rt.block_on(async {
-        let base = format!("{prefix}/apps/{from}");
-        let keys: Vec<String> = store
-            .list(Some(&StorePath::from(base.as_str())))
-            .map_ok(|m| m.location.to_string())
-            .try_collect()
-            .await
-            .unwrap();
-        assert!(!keys.is_empty());
-        for key in keys {
-            let rest = key.strip_prefix(&format!("{base}/")).unwrap();
-            store
-                .copy(
-                    &StorePath::from(key.as_str()),
-                    &StorePath::from(format!("{prefix}/apps/{to}/{rest}")),
-                )
-                .await
-                .unwrap();
-        }
-    });
 }
 
+/// The current of `app` under the prefix.
+fn current(bucket: &str, prefix: &str, app: &str) -> String {
+    use object_store::ObjectStoreExt as _;
+    use object_store::path::Path as StorePath;
+    let store = object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .build()
+        .unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let r = store
+                .get(&StorePath::from(format!("{prefix}/apps/{app}/current")))
+                .await
+                .unwrap();
+            String::from_utf8(r.bytes().await.unwrap().to_vec()).unwrap()
+        })
+}
+
+/// Apps of one tenant share a prefix (ADR 0022); a `current` from before
+/// 0.4.0 is refused by `serve --app`; a migration in progress refuses
+/// deploys and starts.
 #[test]
-fn a_second_app_of_a_tenant_on_a_prefix_is_refused() {
+fn apps_of_a_tenant_share_a_prefix_and_old_currents_are_refused() {
     let Ok(bucket) = std::env::var("WASMKEEP_TEST_S3_BUCKET") else {
         eprintln!("WASMKEEP_TEST_S3_BUCKET not set; skipping");
         return;
@@ -252,58 +246,44 @@ fn a_second_app_of_a_tenant_on_a_prefix_is_refused() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let prefix = format!("second-app-{}-{now}", std::process::id());
+    let prefix = format!("two-apps-{}-{now}", std::process::id());
     let url = format!("s3://{bucket}/{prefix}");
     let actor = format!("counter={}", counter_wasm().display());
 
-    let (ok, _, err) = deploy(&url, &["--actor", &actor]);
-    assert!(ok, "{err}");
-    let (ok, _, err) = deploy_app(&url, "acme/admin", &["--actor", &actor]);
-    assert!(!ok, "a second app of acme was deployed");
-    assert!(err.contains("acme/shop is already deployed"), "{err}");
-    assert!(err.contains(&format!("{prefix}/apps/acme/shop/")), "{err}");
-    // Nothing deployed for it; another tenant is fine; a bad name is refused.
-    let (ok, _, err) = deploy_app(&url, "acme/admin", &["--rollback"]);
-    assert!(!ok && err.contains("nothing is deployed"), "{err}");
-    let (ok, _, err) = deploy_app(&url, "acme-2/admin", &["--actor", &actor]);
-    assert!(ok, "{err}");
+    for app in ["acme/shop", "acme/admin", "acme/blog"] {
+        let (ok, _, err) = deploy_app(&url, app, &["--actor", &actor]);
+        assert!(ok, "{app}: {err}");
+        assert!(!err.contains("apps of one tenant"), "{err}");
+        let body = current(&bucket, &prefix, app);
+        assert!(body.trim_end().ends_with(" 3"), "{app}: {body}");
+    }
     let (ok, _, err) = deploy_app(&url, "acme-2/Admin", &["--actor", &actor]);
     assert!(!ok && err.contains("[a-z][a-z0-9-]{0,63}"), "{err}");
 
-    // A pair from before the check: both keep deploying and serving, warned.
-    copy_app(&bucket, &prefix, "acme/shop", "acme/legacy");
-    let (ok, _, err) = deploy_app(&url, "acme/legacy", &["--access", "counter=existing"]);
-    assert!(ok, "{err}");
-    assert!(
-        err.contains("acme/legacy and acme/shop are apps of one tenant"),
-        "{err}"
-    );
+    // A current as 0.3 wrote it: refused at start, naming the command.
+    let body = current(&bucket, &prefix, "acme/blog");
+    let old = body.trim_end().trim_end_matches(" 3").to_owned() + " 2\n";
+    put(&bucket, &format!("{prefix}/apps/acme/blog/current"), &old);
     let dir = tempfile::tempdir().unwrap();
-    let addr = free_port();
-    let log = dir.path().join("node.log");
-    let mut node = Command::new(env!("CARGO_BIN_EXE_wasmkeep"));
-    node.args(["serve", "--app", "acme/legacy", "--bucket", &url])
+    let out = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+        .args(["serve", "--app", "acme/blog", "--bucket", &url])
         .arg("--data-dir")
         .arg(dir.path().join("data"))
-        .args(["--listen", &addr.to_string()])
-        .env("RUST_LOG", "wasmkeep=info")
-        .stdout(std::fs::File::create(&log).unwrap());
-    let _node = Killed(node.spawn().unwrap());
-    let started = Instant::now();
-    while status(addr, "/actor/counter/x").is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the node never answered"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let logged = std::fs::read_to_string(&log).unwrap();
-    assert!(
-        logged.contains("acme/legacy and acme/shop are apps of one tenant"),
-        "{logged}"
-    );
-    // A third is refused, naming both.
-    let (ok, _, err) = deploy_app(&url, "acme/blog", &["--actor", &actor]);
-    assert!(!ok, "a third app of acme was deployed");
-    assert!(err.contains("acme/legacy and acme/shop are"), "{err}");
+        .args(["--listen", &free_port().to_string()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("wasmkeep cluster migrate --bucket"), "{err}");
+
+    // A migration in progress: deploys and starts refused.
+    put(&bucket, &format!("{prefix}/cluster/migration"), "lock\n");
+    let (ok, _, err) = deploy_app(&url, "acme/shop", &["--actor", &actor]);
+    assert!(!ok && err.contains("in progress"), "{err}");
+    let out = serve(&url, &dir.path().join("shop"), free_port(), &[])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("in progress"), "{err}");
 }

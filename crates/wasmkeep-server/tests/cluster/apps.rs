@@ -118,9 +118,9 @@ fn signed_headers(
     sign(secret, to, "POST", path, signed_app, sent_app, true)
 }
 
-/// A request another node relays names that node's app; the owner refuses
-/// one for an app it does not serve, before the actor runs. Without the
-/// check, two apps of one tenant on one prefix served each other's actors.
+/// Two apps of one tenant on one prefix each have their own actor of a
+/// name (ADR 0022); a hop naming another app is refused before the actor
+/// runs, so no node ever serves another app's actors.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -133,27 +133,43 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
         (r.status, r.body.trim(), r.node.as_deref()),
         (200, "1", Some("shop-1"))
     );
-    // Through the other app's node: relayed to the owner, which refuses it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let r = loop {
-        let r = send(admin.addr, "POST", "/actor/t/x/durable", "").await;
-        if !not_in_view(&r) || tokio::time::Instant::now() >= deadline {
-            break r;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // Through the other app's node: its own actor of that name, in its own
+    // state root (ADR 0022), never relayed to the first app's owner.
+    let r = send(admin.addr, "POST", "/actor/t/x/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "1", Some("admin-1")),
+        "{}",
+        r.body
+    );
+    // A request relayed by a node of the other app (the forwarded mark and
+    // its app, as a node relays a client's request): refused before it
+    // runs, as is a relayed WebSocket upgrade.
+    let relayed = "x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: acme/admin\r\n";
+    let r = send(shop.addr, "POST", "/actor/t/x/durable", relayed).await;
     assert_eq!(
         (r.status, r.body.trim(), r.retry_after.as_deref()),
         (503, "not this app's node", Some("1")),
         "{}",
         r.body
     );
-    // A WebSocket upgrade relayed the same way: refused too.
-    assert_eq!(
-        upgrade_status_reachable(admin.addr, "/actor/t/x").await,
-        503
-    );
-    // A call signed by a node of the other app: refused the same way.
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let mut req = format!("ws://{}/actor/t/x", shop.addr)
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("x-wasmkeep-forwarded", "1".parse().unwrap());
+        req.headers_mut()
+            .insert("x-wasmkeep-app", "acme/admin".parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                assert_eq!(r.status().as_u16(), 503);
+            }
+            other => panic!("a relayed upgrade for another app: {:?}", other.map(drop)),
+        }
+    }
+    // A call signed by a node of the other app: refused before its body.
     let secret = cluster_secret(&store, "shop-1", shop.addr).await;
     let path = "/actor/t/x/durable";
     let signed = signed_headers(
@@ -317,5 +333,52 @@ async fn actor_nodes_form_a_cluster_as_default_default() {
         .unwrap();
         let body = String::from_utf8(got.bytes().await.unwrap().to_vec()).unwrap();
         assert_eq!(body.lines().nth(6), Some("default/default"), "{id}: {body}");
+    }
+}
+
+/// Two apps of one tenant on one prefix, the same class and name, each
+/// with an alarm: each alarm is indexed under its own app's root and fires
+/// once, in its own app (ADR 0022: no tenant filter on the alarm scan, and
+/// none needed).
+#[tokio::test(flavor = "multi_thread")]
+async fn alarms_of_two_apps_with_the_same_names_stay_apart() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let shop = app_node("shop-1", dirs.0.path(), &store, "acme/shop", false).await;
+    let blog = app_node("blog-1", dirs.1.path(), &store, "acme/blog", false).await;
+    settle().await;
+    for node in [&shop, &blog] {
+        let r = send_runnable(node.addr, "POST", "/actor/t/y/alarm?in=1500", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    for node in [&shop, &blog] {
+        loop {
+            let r = send_runnable(node.addr, "GET", "/actor/t/y/fired", "").await;
+            if r.body.trim() == "1" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an alarm never fired: {}",
+                r.body
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    // Once each, never twice in one app (a sweep of the other app's root).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for node in [&shop, &blog] {
+        let r = send_runnable(node.addr, "GET", "/actor/t/y/fired", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+    }
+    // Each app's history is under its own root.
+    let all = bucket_keys(&store).await;
+    for app in ["shop", "blog"] {
+        assert!(
+            all.iter()
+                .any(|k| k.starts_with(&format!("state/acme/{app}/actors/t/y/"))),
+            "no history under {app}'s root: {all:?}"
+        );
     }
 }

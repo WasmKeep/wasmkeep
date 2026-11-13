@@ -382,7 +382,7 @@ async fn a_reminder_fires_on_an_alarm_while_the_agent_hibernates() {
     assert_eq!(history(addr, "c1").await.len(), 5);
     let storage = wasmkeep_storage::Storage::new(
         wasmkeep_storage::StorageConfig::new(data.path()),
-        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default")),
+        wasmkeep_server::state_dir(&wasmkeep_server::StateRoot::new("", "default", "default")),
     );
     let mut db = storage.open("agent", "c1").unwrap();
     let pending = db

@@ -88,7 +88,9 @@ async fn an_idle_key_deletes_itself() {
         status(addr, "POST", "/actor/limit/once?window_ms=200").await,
         200
     );
-    let db = data.path().join("actors/default/limit/once.db");
+    let db = data
+        .path()
+        .join("state/default/default/actors/limit/once.db");
     assert!(db.exists());
     let deadline = Instant::now() + Duration::from_secs(5);
     while db.exists() {
