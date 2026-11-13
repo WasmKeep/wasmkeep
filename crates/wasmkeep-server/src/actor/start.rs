@@ -47,7 +47,11 @@ impl ActorService {
         let root = state_root(&config)?;
         // The local databases of the layout before 0.4.0, moved once
         // before anything else touches the data directory.
-        crate::local_layout::prepare(&config.storage.data_dir, &root, config.cluster.is_some())?;
+        crate::local_layout::prepare(
+            &config.storage.data_dir,
+            &root,
+            config.cluster.as_ref().is_some_and(|c| c.migrated),
+        )?;
         let cluster = match &config.cluster {
             Some(c) => Some(Cluster::new(c, &root)?),
             None => None,

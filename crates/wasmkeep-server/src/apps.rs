@@ -134,6 +134,7 @@ impl AppRef {
         );
         wasmkeep_cluster::migrate::start_check(&keys, &self.tenant)
             .await
+            .map(drop)
             .map_err(|e| match e {
                 wasmkeep_cluster::migrate::StartRefusal::Bucket(e) => bucket(e),
                 e => DeployError::Layout(e.to_string()),

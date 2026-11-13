@@ -744,17 +744,15 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo \
   made `internal` closes its open sockets (1008) at their next message.
 - A node that reads a version it cannot apply keeps the previous one and
   reports not ready (`/_wasmkeep/ready`) until it can.
-- **`--access` with `--app`** is refused once rules have been deployed
-  (the start-up error gives the `wasmkeep deploy` command). Before that it
-  still works, so a cluster started with `--access` moves in three steps:
-  1. upgrade every node, flags unchanged;
-  2. deploy the rules once:
-     `wasmkeep deploy --app acme/shop --bucket ... --access monitor=existing`
-     (nodes switch to them and log that `--access` is now ignored);
-  3. remove `--access` from the nodes' command lines.
-
-  A node following an app that never deployed rules, started without
-  `--access`, logs that every class is open.
+- **`--access` with `--app`** is refused: rules come with deploys. Every
+  deploy of 0.4.0 marks the app (its `current` carries token `3`, [ADR
+  0022](adr/0022-app-owned-state-and-the-one-time-migration.md)), and a
+  node refuses to follow a `current` from an earlier version. A cluster
+  that still passes `--access` to its nodes deploys those rules once
+  (`wasmkeep deploy --app acme/shop --bucket ... --access
+  monitor=existing`), then removes `--access` from their command lines;
+  the start-up error gives the `deploy` command. A node following an app
+  that never deployed rules logs that every class is open.
 
 ### Secrets in the bucket
 

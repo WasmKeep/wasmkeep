@@ -693,32 +693,61 @@ fn crash_then_rerun(seed: u64, i: u64, want: &BTreeMap<String, Vec<u8>>) {
 }
 
 /// A migrated bucket rolled back, with a crash after request `i` of the
-/// first rollback: the bare layout comes back byte for byte.
-fn rollback_with_crash(seed: u64, i: u64) {
+/// first rollback (`None`: no crash): the bare layout comes back byte for
+/// byte. Gives the clean rollback's requests.
+fn rollback_with_crash(seed: u64, i: Option<u64>) -> u64 {
     runtime(seed).block_on(async move {
         start_clock();
         let sim = Sim::new(seed, fixture());
         let before = canonical(&sim.snapshot());
         apply(&sim).await.unwrap();
         let ops = *sim.ops.lock().unwrap();
-        *sim.crash_after.lock().unwrap() = Some(ops + i);
+        *sim.crash_after.lock().unwrap() = i.map(|i| ops + i);
         let first = rollback(&sim).await;
+        let used = *sim.ops.lock().unwrap() - ops;
         *sim.crash_after.lock().unwrap() = None;
         if first.is_err() {
+            assert!(i.is_some(), "seed {seed}: {first:?}");
             rollback(&sim)
                 .await
-                .unwrap_or_else(|e| panic!("seed {seed}, rollback crash at {i}: {e}"));
+                .unwrap_or_else(|e| panic!("seed {seed}, rollback crash at {i:?}: {e}"));
         }
         let m = sim.snapshot();
         assert_eq!(
             canonical(&m),
             before,
-            "seed {seed}, rollback crash at {i}: not the bare layout again"
+            "seed {seed}, rollback crash at {i:?}: not the bare layout again"
         );
         assert!(!m.keys().any(|k| k.starts_with("cluster/")), "seed {seed}");
         // And it migrates again.
         apply(&sim).await.unwrap();
         check_migrated(seed, &sim.snapshot(), &fixture(), &actors());
+        used
+    })
+}
+
+/// `--apply` crashed after request `i`, then `--rollback`: the bare layout
+/// comes back byte for byte, from a lock of an unfinished run (some
+/// tombstones written, some tokens changed, or none).
+fn apply_crash_then_rollback(seed: u64, i: u64) {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        let before = canonical(&sim.snapshot());
+        *sim.crash_after.lock().unwrap() = Some(i);
+        let first = apply(&sim).await;
+        *sim.crash_after.lock().unwrap() = None;
+        let _ = first;
+        rollback(&sim)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}, apply crash at {i}: {e}"));
+        let m = sim.snapshot();
+        assert_eq!(
+            canonical(&m),
+            before,
+            "seed {seed}, apply crash at {i}: not the bare layout after the rollback"
+        );
+        assert!(!m.keys().any(|k| k.starts_with("cluster/")), "seed {seed}");
     });
 }
 
@@ -746,11 +775,26 @@ fn a_crash_at_every_request_then_a_rerun_ends_in_the_clean_state() {
 
 #[test]
 fn a_rollback_crashed_anywhere_restores_the_bare_layout() {
-    for i in 0..60 {
-        rollback_with_crash(2, i);
+    // Every request of one rollback.
+    let ops = rollback_with_crash(2, None);
+    for i in 0..=ops {
+        rollback_with_crash(2, Some(i));
     }
     for seed in 0..seeds() {
-        rollback_with_crash(seed, Rng::new(seed ^ 0xbac).below(60));
+        let ops = rollback_with_crash(seed, None);
+        rollback_with_crash(seed, Some(Rng::new(seed ^ 0xbac).below(ops + 1)));
+    }
+}
+
+#[test]
+fn an_apply_crashed_anywhere_then_rolled_back_restores_the_bare_layout() {
+    let (ops, _) = clean(3);
+    for i in 0..=ops {
+        apply_crash_then_rollback(3, i);
+    }
+    for seed in 0..seeds() {
+        let (ops, _) = clean(seed);
+        apply_crash_then_rollback(seed, Rng::new(seed ^ 0xab).below(ops + 1));
     }
 }
 

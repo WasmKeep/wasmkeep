@@ -5,10 +5,12 @@
 //! shared by every app of the tenant; they now live under the app's root,
 //! `<data_dir>/state/<t>/<a>/actors/`.
 //!
-//! - **In a cluster** the bucket is the truth (and `cluster migrate` moved
-//!   it): the old folder is put aside, at `<data_dir>/actors.pre-0.4/<t>`,
-//!   and each actor restores from its new root on its first wake.
-//! - **Alone** the local copy is the only one: the old folder becomes this
+//! - **In a cluster whose bucket was migrated** (`cluster/migrated/<t>`
+//!   exists) the bucket is the truth: the old folder is put aside, at
+//!   `<data_dir>/actors.pre-0.4/<t>`, and each actor restores from its new
+//!   root on its first wake.
+//! - **Otherwise** (alone, or joining a bucket with no state of the
+//!   tenant) the local copy is the only one: the old folder becomes this
 //!   app's, if no app of the tenant has local state yet. Otherwise the
 //!   start is refused: which app it belongs to is the operator's call.
 //!
@@ -31,9 +33,10 @@ use crate::Error;
 pub(crate) const PUT_ASIDE: &str = "actors.pre-0.4";
 
 /// Moves `root`'s tenant's databases of the layout before 0.4.0, if any:
-/// aside in a cluster (`cluster`), into `root` when alone. See the module
-/// documentation.
-pub(crate) fn prepare(data_dir: &Path, root: &StateRoot, cluster: bool) -> Result<(), Error> {
+/// aside when the bucket holds the migrated truth (`put_aside`), into
+/// `root` otherwise. See the module documentation.
+pub(crate) fn prepare(data_dir: &Path, root: &StateRoot, put_aside: bool) -> Result<(), Error> {
+    let cluster = put_aside;
     let old = data_dir.join(root.bare_local(encode_segment));
     let new = if cluster {
         data_dir.join(PUT_ASIDE).join(encode_segment(root.tenant()))
@@ -162,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn in_a_cluster_the_old_folder_is_put_aside() {
+    fn with_a_migrated_bucket_the_old_folder_is_put_aside() {
         let dir = tempfile::tempdir().unwrap();
         let old = old_layout(dir.path());
         prepare(dir.path(), &root(), true).unwrap();
@@ -206,7 +209,7 @@ mod tests {
         assert!(e.contains("never merged"), "{e}");
         assert!(e.contains("state/acme/shop"), "{e}");
         assert!(old.join("chat/room.db").is_file());
-        // In a cluster: a folder put aside earlier.
+        // A migrated bucket: a folder put aside earlier.
         std::fs::create_dir_all(dir.path().join("actors.pre-0.4/acme")).unwrap();
         let e = prepare(dir.path(), &root(), true).unwrap_err().to_string();
         assert!(e.contains("actors.pre-0.4"), "{e}");

@@ -181,6 +181,18 @@ pub struct TenantPlan {
     /// Classes two or more apps deploy: the apps other than the heir start
     /// them empty. `class: app, app`.
     pub shared: BTreeMap<String, Vec<String>>,
+    /// Apps whose `current` has no token 3 yet (written by an older
+    /// version).
+    pub unrooted: BTreeSet<String>,
+}
+
+impl TenantPlan {
+    /// Whether a run has something to do for it: not committed, and actor
+    /// state in the old layout or a `current` an older version wrote. A
+    /// tenant only this version ever wrote has nothing to migrate.
+    pub fn pending(&self) -> bool {
+        !self.committed && (!self.counts.is_empty() || !self.unrooted.is_empty())
+    }
 }
 
 /// What a run would do, and what refuses it.
@@ -205,7 +217,7 @@ impl Plan {
     pub fn pending(&self) -> Vec<&str> {
         self.tenants
             .iter()
-            .filter(|(_, t)| !t.committed)
+            .filter(|(_, t)| t.pending())
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -466,8 +478,8 @@ pub enum StartRefusal {
 /// What a node or command of this version checks for `tenant` before it
 /// writes anything to the bucket: no lock, and either a commit or no bare
 /// key (moves aside: they are transient, and an old `actor move` may still
-/// write one).
-pub async fn start_check<S: Store>(store: &S, tenant: &str) -> Result<(), StartRefusal> {
+/// write one). `Ok(true)` when the tenant was migrated (its commit exists).
+pub async fn start_check<S: Store>(store: &S, tenant: &str) -> Result<bool, StartRefusal> {
     if store
         .get(LOCK_KEY)
         .await
@@ -482,7 +494,7 @@ pub async fn start_check<S: Store>(store: &S, tenant: &str) -> Result<(), StartR
         .map_err(StartRefusal::Bucket)?
         .is_some()
     {
-        return Ok(());
+        return Ok(true);
     }
     for family in [
         Family::History,
@@ -499,7 +511,7 @@ pub async fn start_check<S: Store>(store: &S, tenant: &str) -> Result<(), StartR
             ));
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Polls `futures` together and gives their outputs in order.
@@ -826,6 +838,8 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         let mut tenants = self.bare_tenants().await?;
         requests += u64::try_from(Family::ALL.len()).unwrap_or(5);
         tenants.extend(self.apps.iter().map(|a| a.tenant.clone()));
+        let tokens = self.tokens().await?;
+        requests += u64::try_from(self.apps.len()).unwrap_or(0);
         for tenant in tenants {
             let mut t = TenantPlan {
                 apps: self
@@ -834,6 +848,17 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
                     .map(|a| a.app.clone())
                     .collect(),
                 committed: commits.contains_key(&tenant),
+                unrooted: self
+                    .apps_of(&tenant)
+                    .iter()
+                    .filter(|a| {
+                        let token = tokens
+                            .get(&format!("{}/{}", a.tenant, a.app))
+                            .map(String::as_str);
+                        !matches!(token, Some(ROOTED_TOKEN | "absent"))
+                    })
+                    .map(|a| a.app.clone())
+                    .collect(),
                 ..TenantPlan::default()
             };
             if !t.committed {
@@ -892,9 +917,13 @@ impl<'a, S: Store, C: Clock> Migrator<'a, S, C> {
         }
         plan.nodes = self.nodes().await?;
         requests += 1;
-        for n in &plan.nodes {
-            if let Some(why) = &n.live {
-                plan.refusals.push(why.clone());
+        // Live nodes refuse only a run with something to do: on a prefix
+        // already migrated (nodes of this version running), there is none.
+        if !plan.pending().is_empty() || plan.locked.is_some() {
+            for n in &plan.nodes {
+                if let Some(why) = &n.live {
+                    plan.refusals.push(why.clone());
+                }
             }
         }
         plan.request_ms = self.clock.now_ms().saturating_sub(started) / requests.max(1);

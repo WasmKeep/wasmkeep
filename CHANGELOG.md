@@ -48,8 +48,8 @@ on a bucket that holds actor state.
   (`cluster/migrated/<tenant>`). It refuses while a node may still run
   and fences nothing; after a crash, run it again. `--rollback` undoes it
   while no node of any version has started since; after that, it is
-  one-way. Nothing of the old layout is deleted yet (the next release
-  adds `--remove-old`). Exit codes: 0 done, 1 refused or aborted, 2
+  one-way. Nothing of the old layout is deleted: `--remove-old` is not
+  built yet. Exit codes: 0 done, 1 refused or aborted, 2
   partly committed ([backup and restore](docs/deploy/backup-and-restore.md#migrating-to-040)).
 - **A node or command of this version checks the bucket before it writes
   there**: it refuses while `cluster/migration` exists, and refuses a
@@ -88,7 +88,8 @@ From 0.2.0 or 0.3.0, on a bucket prefix that holds actor state:
 **One-way after the first start.** Until a node of any version starts,
 `cluster migrate --rollback` puts the old layout back for the older
 binaries. Once one has started, the migration is one-way; the old keys
-stay until `--remove-old` (next release). Keep a backup from before the
+stay in the bucket (`--remove-old`, which deletes them, is not built
+yet). Keep a backup from before the
 migration until then. Lifecycle rules, access policies and backup
 scripts written for `actors/<tenant>/` must move to `state/<t>/<a>/`.
 Nodes that followed an app with `--access` and no deployed rules must

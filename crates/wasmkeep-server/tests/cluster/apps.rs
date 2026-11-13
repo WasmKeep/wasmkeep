@@ -142,6 +142,33 @@ async fn a_hop_for_another_app_gets_503_and_nothing_runs() {
         "{}",
         r.body
     );
+    // A request relayed by a node of the other app (the forwarded mark and
+    // its app, as a node relays a client's request): refused before it
+    // runs, as is a relayed WebSocket upgrade.
+    let relayed = "x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: acme/admin\r\n";
+    let r = send(shop.addr, "POST", "/actor/t/x/durable", relayed).await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.retry_after.as_deref()),
+        (503, "not this app's node", Some("1")),
+        "{}",
+        r.body
+    );
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let mut req = format!("ws://{}/actor/t/x", shop.addr)
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("x-wasmkeep-forwarded", "1".parse().unwrap());
+        req.headers_mut()
+            .insert("x-wasmkeep-app", "acme/admin".parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                assert_eq!(r.status().as_u16(), 503);
+            }
+            other => panic!("a relayed upgrade for another app: {:?}", other.map(drop)),
+        }
+    }
     // A call signed by a node of the other app: refused before its body.
     let secret = cluster_secret(&store, "shop-1", shop.addr).await;
     let path = "/actor/t/x/durable";

@@ -945,12 +945,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // A `current` from before 0.4.0 (no token 3): its rules may still
             // be `--access` ones, which a deploy of this version would drop
             // at run time. Refuse it at start instead (ADR 0022).
-            anyhow::ensure!(
-                current.rooted,
-                "{tenant}/{name} was last deployed by a version before 0.4.0: run `wasmkeep \
-                 cluster migrate --bucket {bucket}` (with --apply), or deploy it once with this \
-                 version, then start this node"
-            );
+            require_rooted(&current, tenant, name, bucket)?;
             deployed_rules = Some((current.marked, deployed.access));
             config.config = deployed.config;
             config.requires = deployed.requires;
@@ -1070,9 +1065,9 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         // A cluster node checks the bucket's layout before it writes
         // anything there, even its heartbeat (ADR 0022).
-        if let (Some(bucket), Some(_)) = (&args.bucket, &config.cluster) {
+        if let (Some(bucket), Some(cluster)) = (&args.bucket, config.cluster.as_mut()) {
             let (store, prefix) = open_bucket(bucket)?;
-            check_layout(bucket, &store, &prefix, &config.tenant)?;
+            cluster.migrated = check_layout(bucket, &store, &prefix, &config.tenant)?;
         }
         let service = ActorService::new(runtime.clone(), config, classes)?;
         // Leases name their holder by node id: a second process with this
@@ -1183,6 +1178,25 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// Refuses to follow a `current` from before 0.4.0 (no token 3, ADR
+/// 0022): its nodes may still take their rules from `--access`, which the
+/// next deploy of this version (token 3 marks the app) would drop at run
+/// time, opening the classes. Refused at start instead, with what to do.
+fn require_rooted(
+    current: &wasmkeep_server::apps::Current,
+    tenant: &str,
+    name: &str,
+    bucket: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        current.rooted,
+        "{tenant}/{name} was last deployed by a version before 0.4.0: run `wasmkeep cluster \
+         migrate --bucket {bucket}` (with --apply), or deploy it once with this version, then \
+         start this node"
+    );
+    Ok(())
 }
 
 /// Resolves on Ctrl-C (SIGINT) or SIGTERM, the signal service managers
@@ -1738,15 +1752,15 @@ fn refuse_locked(
     Ok(())
 }
 
-/// What `serve` and `dev` check on a bucket before anything writes to it
-/// (ADR 0022): no migration in progress, and `tenant`'s actor state not
-/// left in the layout before 0.4.0.
+/// What `serve` checks on a bucket before anything writes to it (ADR
+/// 0022): no migration in progress, and `tenant`'s actor state not left in
+/// the layout before 0.4.0. `true` when the tenant was migrated.
 pub(crate) fn check_layout(
     url: &str,
     store: &std::sync::Arc<dyn object_store::ObjectStore>,
     prefix: &str,
     tenant: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
         std::sync::Arc::clone(store),
         prefix,
@@ -1757,7 +1771,7 @@ pub(crate) fn check_layout(
             "bucket {url}: {}",
             e.to_string().replace("<this bucket>", url)
         )),
-        Some(Ok(())) => Ok(()),
+        Some(Ok(migrated)) => Ok(migrated),
     }
 }
 
@@ -1778,6 +1792,20 @@ mod tests {
     use super::{
         check_layout, load_env, move_target, move_target_warning, move_warnings, parse_bucket,
     };
+
+    /// `serve --app` follows only a rooted `current` (token 3).
+    #[test]
+    fn a_current_from_before_0_4_is_refused_at_start() {
+        use wasmkeep_server::apps::Current;
+        let old = Current::parse(b"v 3 2\n").unwrap();
+        let e = super::require_rooted(&old, "acme", "shop", "s3://b/p")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cluster migrate --bucket s3://b/p"), "{e}");
+        assert!(e.contains("acme/shop"), "{e}");
+        let rooted = Current::parse(b"v 4 3\n").unwrap();
+        super::require_rooted(&rooted, "acme", "shop", "s3://b/p").unwrap();
+    }
 
     /// A command of this version refuses a prefix being migrated, and a
     /// tenant whose actor state is still in the layout before 0.4.0;

@@ -298,8 +298,8 @@ unmigrated tenant and prints the command.
 `wasmkeep cluster migrate --bucket ... --rollback` puts the old layout and
 the `current` tokens back, for the older binaries. **After the first
 start, the migration is one-way**: the rollback refuses, and the state
-stays where 0.4.0 reads it. The old keys stay in the bucket until a later
-release's `--remove-old` deletes them (the tombstones excepted).
+stays where 0.4.0 reads it. The old keys stay in the bucket: `--remove-old`,
+which will delete them (the tombstones excepted), is not built yet.
 
 Notes:
 

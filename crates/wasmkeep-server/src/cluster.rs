@@ -136,6 +136,13 @@ pub struct ClusterConfig {
     /// Whether plain HTTP between nodes is still used (ADR 0011, phase B).
     /// [`ClusterPlaintext::Refuse`] needs [`ClusterConfig::cluster_tls`].
     pub cluster_plaintext: ClusterPlaintext,
+    /// Whether the tenant's bucket state was migrated by `cluster migrate`
+    /// (`cluster/migrated/<tenant>` exists, as the start check found; ADR
+    /// 0022). Only then are the node's local databases of the layout
+    /// before 0.4.0 put aside, the bucket being their truth; otherwise
+    /// they are the only copy (a node joining with single-node data), and
+    /// move into the app's root.
+    pub migrated: bool,
     /// How long an actor's history stays in the bucket once garbage
     /// collection could delete it (ADR 0012): objects younger than this
     /// are kept for a later pass. Not applied after a delete.
@@ -214,6 +221,7 @@ impl ClusterConfig {
             app: String::new(),
             cluster_tls: None,
             cluster_plaintext: ClusterPlaintext::Accept,
+            migrated: false,
             history_retention: Duration::from_secs(3600),
             snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
             restore_budget: crate::replica::RESTORE_BUDGET,

@@ -170,13 +170,17 @@ async fn a_bucket_of_the_old_layout_is_refused_then_migrated_and_served() {
     // A node of this version on the same data directory: the old local
     // databases go aside (the bucket is the truth), and every actor
     // restores from its new root.
-    let c = node_with(
+    // As `serve` sets it from its start check: the tenant was migrated.
+    let c = node_configured(
         "c",
         data.path(),
         &store,
         Duration::from_secs(60),
-        "t",
+        &["t"],
         test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |config| config.cluster.as_mut().unwrap().migrated = true,
     )
     .await;
     settle().await;
@@ -207,6 +211,16 @@ async fn a_bucket_of_the_old_layout_is_refused_then_migrated_and_served() {
         "the alarm fired before it was due"
     );
 
+    // Run again while that node is live: nothing to do, not a refusal.
+    let again = migrator.apply().await.unwrap();
+    assert_eq!(
+        (
+            again.committed.len(),
+            again.already.as_slice(),
+            again.exit_code()
+        ),
+        (0, ["default".to_owned()].as_slice(), 0)
+    );
     // A node ran: the rollback is refused, and changes nothing.
     let keys_now = bucket_keys(&store).await;
     match migrator.rollback().await {
@@ -393,4 +407,55 @@ async fn deploys_and_starts_are_refused_while_a_migration_holds_the_prefix() {
             .any(|k| k.starts_with("apps/")),
         "the refused deploy wrote"
     );
+}
+
+/// A node joining a bucket with no state of its tenant, with databases of
+/// the layout before 0.4.0 from a single-node run: they are the only copy,
+/// so they move into its app's root (never aside), and it serves them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_joining_with_single_node_data_keeps_it() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let data = tempfile::tempdir().unwrap();
+    {
+        // Written alone, then laid out as a node before 0.4.0 kept it.
+        let alone = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
+        let component = runtime.compile(test_actor_wasm()).unwrap();
+        let service = ActorService::new(
+            runtime,
+            ActorConfig::new(alone.path()),
+            vec![("t".into(), component, test_actor_wasm().to_vec())],
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel::<()>();
+        spawn_serve(listener, None, service.clone(), async {
+            let _ = stopped.await;
+        });
+        for want in ["1", "2"] {
+            let r = send(addr, "POST", "/actor/t/kept/durable", "").await;
+            assert_eq!((r.status, r.body.trim()), (200, want));
+        }
+        service.shutdown(Duration::from_secs(5)).await;
+        drop((stop, service));
+        local_to_bare(alone.path());
+        std::fs::rename(alone.path().join("actors"), data.path().join("actors")).unwrap();
+    }
+    let b = keys(&store);
+    assert!(!migrate::start_check(&b, "default").await.unwrap());
+    let a = node_with(
+        "a",
+        data.path(),
+        &store,
+        Duration::from_secs(60),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    settle().await;
+    assert!(!data.path().join("actors.pre-0.4").exists());
+    assert!(data.path().join(test_dir("t")).is_dir());
+    let r = send_runnable(a.addr, "GET", "/actor/t/kept/durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
 }
