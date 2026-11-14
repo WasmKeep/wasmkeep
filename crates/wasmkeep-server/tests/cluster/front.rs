@@ -38,7 +38,9 @@ async fn front_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>, front: 
     .unwrap();
     let front = front.then(|| {
         let component = guests::compile(&runtime, front_wasm());
-        wasmkeep_server::HttpComponent::new(runtime.clone(), &component).unwrap()
+        wasmkeep_server::HttpComponent::new(runtime.clone(), &component)
+            .unwrap()
+            .with_max_requests(wasmkeep_server::fds::default_front_requests(16))
     });
     let app = wasmkeep_server::App {
         front,
@@ -159,7 +161,9 @@ async fn a_front_calls_an_actor_on_another_node_as_the_front() {
 }
 
 /// A client cannot pose as the front on a cluster either: a forged caller
-/// on a forwarded request is not believed by the owner.
+/// sent to a node that forwards it to the owner is not believed there, nor
+/// one sent straight to the owner as a forward (the mark and the app, as
+/// a node relays a request).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forged_front_caller_is_not_believed_across_nodes() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -173,8 +177,54 @@ async fn a_forged_front_caller_is_not_believed_across_nodes() {
         a.addr,
         "POST",
         "/actor/t/z/caller",
-        "x-wasmkeep-caller: default/_front/main\r\nx-wasmkeep-forwarded: 1\r\n",
+        "x-wasmkeep-caller: default/_front/main\r\n",
     )
     .await;
-    assert_ne!(r.body.trim(), "default/_front/main", "{}", r.body);
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "none", Some("b")),
+        "{}",
+        r.body
+    );
+    let r = send(
+        b.addr,
+        "POST",
+        "/actor/t/z/caller",
+        "x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n\
+         x-wasmkeep-caller: default/_front/main\r\n",
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "none", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
+/// A front passing on the answer of an actor on another node (status,
+/// every header, body) gets it through: the host's own headers on the
+/// hop's answer never reach the front.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_passes_a_remote_callees_answer_on() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = front_node("a", da.path(), &store, true).await;
+    let b = front_node("b", db.path(), &store, false).await;
+    settle().await;
+    let r = send_runnable(b.addr, "POST", "/actor/t/w/durable", "").await;
+    assert_eq!(r.node.as_deref(), Some("b"), "{}", r.body);
+    let r = front_get(
+        a.addr,
+        &format!("{}&copy", front_call("w", "POST", "/durable")),
+    )
+    .await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    assert_eq!(
+        r.header("x-callee-range").as_deref(),
+        Some(""),
+        "{}",
+        r.body
+    );
+    assert_eq!(lease_holder(&store, "w").await.as_deref(), Some("b"));
 }

@@ -506,7 +506,19 @@ struct Reply {
     status: u16,
     node: Option<String>,
     retry_after: Option<String>,
+    /// The status line and headers.
+    head: String,
     body: String,
+}
+
+impl Reply {
+    /// The first header `name` (any case), trimmed.
+    fn header(&self, name: &str) -> Option<String> {
+        self.head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+        })
+    }
 }
 
 async fn send(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
@@ -635,6 +647,7 @@ async fn try_exchange(addr: SocketAddr, req: &str) -> Result<Reply, String> {
         status,
         node,
         retry_after,
+        head: head.to_owned(),
         body: if chunked {
             dechunk(body)
         } else {

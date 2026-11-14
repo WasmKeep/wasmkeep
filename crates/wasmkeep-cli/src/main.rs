@@ -468,7 +468,8 @@ struct ServeArgs {
     /// Front requests running at once on this node; past it, 503 with
     /// `Retry-After: 1`. Their instances are kept from the pool: resident
     /// actors get the rest of --max-instances. By default a tenth of
-    /// --max-instances, rounded up.
+    /// --max-instances, rounded up, beside actors (--actor or --app), and
+    /// all of it on a node that serves only a component.
     #[arg(long, value_name = "N")]
     max_front_requests: Option<usize>,
 
@@ -649,11 +650,21 @@ fn load_front_env(files: &[PathBuf]) -> anyhow::Result<wasmkeep_server::env::Var
 }
 
 /// `--max-front-requests`, or its default: a tenth of the pool, rounded
-/// up. A value of 0, or one that leaves actors no instance beside a front
-/// (`both`), is refused; so is a pool too small for the default.
-fn front_requests(given: Option<usize>, pool: usize, both: bool) -> anyhow::Result<usize> {
-    let actors = both;
+/// up, on a node that serves actors, and the whole pool on a node that
+/// serves only a front (as before the front had its own slots). A value
+/// of 0, or one that leaves actors no instance beside a front, is refused;
+/// so is a pool too small for the default.
+fn front_requests(
+    given: Option<usize>,
+    pool: usize,
+    front: bool,
+    actors: bool,
+) -> anyhow::Result<usize> {
+    let both = front && actors;
     let Some(n) = given else {
+        if front && !actors {
+            return Ok(pool.max(1));
+        }
         let n = wasmkeep_server::fds::default_front_requests(pool).max(1);
         anyhow::ensure!(
             !both || n < pool,
@@ -663,7 +674,7 @@ fn front_requests(given: Option<usize>, pool: usize, both: bool) -> anyhow::Resu
         return Ok(n);
     };
     anyhow::ensure!(n > 0, "--max-front-requests must be at least 1");
-    if actors {
+    if both {
         anyhow::ensure!(
             n < pool,
             "--max-front-requests {n} leaves actors no room in --max-instances {pool}: \
@@ -947,7 +958,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         "--max-front-requests: no front is served (give a component, or --app)"
     );
     let front_requests =
-        front_requests(args.max_front_requests, pool, serves_actors && serves_front)?;
+        front_requests(args.max_front_requests, pool, serves_front, serves_actors)?;
     // Every resident actor holds three open files: size the caps to the
     // descriptors this process may open (raising the soft limit first).
     let wanted_resident = wasmkeep_server::fds::resident_limit(pool, front_requests);
@@ -1926,6 +1937,28 @@ mod tests {
     use super::{
         check_layout, load_env, move_target, move_target_warning, move_warnings, parse_bucket,
     };
+
+    /// The front's slots by default: the whole pool for a node serving
+    /// only a component, a tenth beside actors; an actor-only node keeps
+    /// a tenth out of its residents as before.
+    #[test]
+    fn front_slots_by_default_follow_what_the_node_serves() {
+        assert_eq!(
+            super::front_requests(None, 1000, true, false).unwrap(),
+            1000
+        );
+        assert_eq!(super::front_requests(None, 1, true, false).unwrap(), 1);
+        assert_eq!(super::front_requests(None, 1000, true, true).unwrap(), 100);
+        assert_eq!(super::front_requests(None, 1000, false, true).unwrap(), 100);
+        // `--app --max-instances 1`: no room for the front's slot and an
+        // actor.
+        assert!(super::front_requests(None, 1, true, true).is_err());
+        assert_eq!(
+            super::front_requests(Some(7), 1000, true, false).unwrap(),
+            7
+        );
+        assert!(super::front_requests(Some(1000), 1000, true, true).is_err());
+    }
 
     /// `serve --app` follows only a rooted `current` (token 3).
     #[test]

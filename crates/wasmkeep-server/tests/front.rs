@@ -71,7 +71,13 @@ async fn start(setup: Setup) -> Running {
     let data = tempfile::tempdir().unwrap();
     let component = guests::compile(&runtime, front_wasm());
     let mut front = HttpComponent::new(runtime.clone(), &component).unwrap();
-    if let Some(n) = setup.max_front_requests {
+    // Beside actors, the slots the actor service keeps for the front.
+    let slots = setup.max_front_requests.or_else(|| {
+        setup
+            .actors
+            .then(|| wasmkeep_server::fds::default_front_requests(40))
+    });
+    if let Some(n) = slots {
         front = front.with_max_requests(n);
     }
     if let Some(budget) = setup.front_cpu {
@@ -295,6 +301,8 @@ async fn wasmkeep_headers_are_stripped_both_ways() {
     );
     // The host passes the client's Host on as the authority, not a header
     // the guest can forge.
+    // The guest sets them without an error (a `refused:` line otherwise):
+    // the host removes them on the way out.
     let r = get(node.addr, "/respond?spoof", "").await;
     assert_eq!((r.status, r.body.as_str()), (200, "responded"));
     assert!(
@@ -350,14 +358,9 @@ async fn guest_set_wasmkeep_headers_do_not_reach_the_callee() {
 async fn an_informational_status_from_the_front_becomes_500() {
     let node = start(Setup::default()).await;
     for status in [101, 103, 199] {
-        let r = get(node.addr, &format!("/respond?status={status}&spoof"), "").await;
+        let r = get(node.addr, &format!("/respond?status={status}"), "").await;
         assert_eq!(r.status, 500, "{status}: {}", r.head);
-        assert!(!r.body.contains("responded"), "{}", r.body);
-        assert!(
-            !r.head.to_ascii_lowercase().contains("x-wasmkeep-"),
-            "{}",
-            r.head
-        );
+        assert_eq!(r.body, "internal server error\n", "{status}");
     }
     let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
     assert!(
@@ -560,6 +563,8 @@ async fn wasmkeep_trailers_are_stripped_both_ways() {
     let raw = String::from_utf8_lossy(&raw).to_ascii_lowercase();
     assert!(raw.contains("x-other: kept"), "{raw}");
     assert!(!raw.contains("x-wasmkeep-node: forged"), "{raw}");
+    // The guest set them all: the host removed the range on the way out.
+    assert!(!raw.contains("refused"), "{raw}");
 }
 
 /// A client that leaves before the answer frees the front's slot at once,
@@ -588,7 +593,110 @@ async fn a_client_that_leaves_frees_its_slot() {
         assert!(Instant::now() < deadline, "the slot stayed taken");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    on_page(&["\nwasmkeep_front_slots_in_use 0\n"]).await;
+    on_page(&[
+        "\nwasmkeep_front_slots_in_use 0\n",
+        "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"client_gone\"} 1\n",
+    ])
+    .await;
+}
+
+/// A front passing a callee's answer on (status, every header, body)
+/// gets it through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_passes_a_callees_answer_on() {
+    let node = start(Setup::default()).await;
+    let r = get(
+        node.addr,
+        &format!("{}&copy", call("t/a", "POST", "/durable")),
+        "",
+    )
+    .await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.head);
+    assert_eq!(
+        r.header("x-callee-range").as_deref(),
+        Some(""),
+        "{}",
+        r.head
+    );
+}
+
+/// `GET /actor/t/NAME/durable` until it answers `want` (5 s at most).
+async fn durable_reaches(addr: SocketAddr, name: &str, want: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = get(addr, &format!("/actor/t/{name}/durable"), "").await;
+        if r.body.trim() == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "t/{name} durable is {:?}, not {want}",
+            r.body
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A client with its whole answer is not a client gone: the front's
+/// instance runs on, its calls included, when the answer has no body
+/// (204, HEAD) or once its declared length went out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_finishing_after_a_whole_answer_is_not_stopped() {
+    let node = start(Setup::default()).await;
+    let r = get(node.addr, "/after?to=t/no-content&status=204", "").await;
+    assert_eq!(r.status, 204, "{}", r.head);
+    durable_reaches(node.addr, "no-content", "1").await;
+
+    let r = get(node.addr, "/after?to=t/length&len", "").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "body"), "{}", r.head);
+    durable_reaches(node.addr, "length", "1").await;
+
+    let r = exchange(
+        node.addr,
+        "HEAD /after?to=t/head&len HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_str()), (200, ""), "{}", r.head);
+    durable_reaches(node.addr, "head", "1").await;
+
+    on_page(&[
+        "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"ok\"} 3\n",
+    ])
+    .await;
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    assert!(!page.contains("outcome=\"client_gone\""), "{page}");
+}
+
+/// A client's own names in the host's range never reach an actor either,
+/// the SDKs' key-value and queue names included: only another actor (or
+/// the front) sends those.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clients_wasmkeep_headers_do_not_reach_an_actor() {
+    let node = start(Setup::default()).await;
+    for header in [
+        "x-wasmkeep-kv-expect",
+        "x-wasmkeep-kv-ttl-ms",
+        "x-wasmkeep-kv-durable",
+        "x-wasmkeep-queue-delay-ms",
+        "x-wasmkeep-node",
+        "x-wasmkeep-future",
+    ] {
+        let r = get(
+            node.addr,
+            &format!("/actor/t/a/header?name={header}"),
+            &format!("{header}: 1\r\n"),
+        )
+        .await;
+        assert_eq!((r.status, r.body.trim()), (200, "none"), "{header}");
+    }
+    // The host's own value still does.
+    let r = get(
+        node.addr,
+        "/actor/t/a/header?name=x-wasmkeep-actor",
+        "x-wasmkeep-actor: default/t/b\r\n",
+    )
+    .await;
+    assert_eq!(r.body.trim(), "default/t/a");
 }
 
 /// A front stopped while its response streams is counted by why it

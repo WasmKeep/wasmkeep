@@ -303,9 +303,19 @@ pub(super) async fn collect_response(
             }
         })?
         .to_bytes();
+    // The host's range never reaches the calling guest (ADR 0023): not
+    // the node that served a hop (`x-wasmkeep-node`), nor any name the
+    // callee set. No SDK reads one from an answer. Nor does the hop's
+    // framing: the body is whole here (its `content-length` stays true),
+    // and a guest passing the answer on could not set `transfer-encoding`
+    // or `connection` itself.
     let headers = parts
         .headers
         .iter()
+        .filter(|(k, _)| {
+            let k = k.as_str();
+            !is_wasmkeep_header(k) && (k == "content-length" || !HOP_BY_HOP.contains(&k))
+        })
         .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
         .collect();
     Ok(CallResponse {

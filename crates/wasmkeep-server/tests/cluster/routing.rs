@@ -662,6 +662,7 @@ async fn post_body(addr: SocketAddr, path: &str, len: usize) -> Result<Reply, St
         status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
         node: header("x-wasmkeep-node"),
         retry_after: header("retry-after"),
+        head: head.to_owned(),
         body: if header("transfer-encoding").as_deref() == Some("chunked") {
             dechunk(body)
         } else {

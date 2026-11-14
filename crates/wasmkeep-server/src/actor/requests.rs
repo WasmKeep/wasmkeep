@@ -13,6 +13,19 @@ pub(super) enum Held {
     Answer(Response<HyperOutgoingBody>),
 }
 
+/// Removes every name of the host's `x-wasmkeep-` range from a request
+/// from outside but the forwarded mark ([`crate::cluster::FORWARDED`]).
+fn strip_outside_headers(headers: &mut hyper::HeaderMap) {
+    let names: Vec<hyper::header::HeaderName> = headers
+        .keys()
+        .filter(|n| is_wasmkeep_header(n.as_str()) && n.as_str() != crate::cluster::FORWARDED)
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+}
+
 impl ActorService {
     /// Handles `/actor/<class>/<name><rest>`: `rest` (with the query) is the
     /// path the guest sees. Never fails; errors become HTTP statuses.
@@ -68,6 +81,15 @@ impl ActorService {
             Ok(a) => a,
             Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
+        // A request from outside (or forwarded by a node, unsigned) carries
+        // nothing of the host's range to the guest, as at the front's edge
+        // (ADR 0023): a client cannot set the SDKs' key-value or queue
+        // names an open actor might relay, nor any other. The forwarded
+        // mark stays: the host reads it below, so the request is never
+        // forwarded twice.
+        if !internal {
+            strip_outside_headers(req.headers_mut());
+        }
         // Set by the host, never by the client: the same encoding as calls
         // (the name percent-encoded), so it is plain ASCII and unambiguous.
         req.headers_mut().remove("x-wasmkeep-actor");
