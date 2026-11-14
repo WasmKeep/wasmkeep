@@ -1127,7 +1127,10 @@ async fn only_a_nodes_signed_hello_asks_for_a_listing() {
     };
     wanted(&a);
     let post = hyper::Method::POST;
-    let signed = |to: &str, nonce: &str, body: &[u8], path: &str| {
+    // Each hello gets a fresh nonce, as a sending node makes it.
+    let signed = |to: &str, body: &[u8], path: &str| {
+        let nonce = a.nonce();
+        let nonce = nonce.as_str();
         let ts = now_ms();
         let hash = body_sha256(body);
         let mut headers = hyper::HeaderMap::new();
@@ -1146,9 +1149,9 @@ async fn only_a_nodes_signed_hello_asks_for_a_listing() {
     );
     // Signed for another node, another path, or another body.
     for (headers, body) in [
-        (signed("b", "b1", b"", HELLO_PATH), &b""[..]),
-        (signed("a", "b2", b"", "/actor/u/x/"), &b""[..]),
-        (signed("a", "b3", b"", HELLO_PATH), &b"x"[..]),
+        (signed("b", b"", HELLO_PATH), &b""[..]),
+        (signed("a", b"", "/actor/u/x/"), &b""[..]),
+        (signed("a", b"", HELLO_PATH), &b"x"[..]),
     ] {
         assert_eq!(
             a.hello_received(&post, &headers, body, true),
@@ -1156,14 +1159,14 @@ async fn only_a_nodes_signed_hello_asks_for_a_listing() {
         );
     }
     // Another method than the one signed.
-    let headers = signed("a", "b4", b"", HELLO_PATH);
+    let headers = signed("a", b"", HELLO_PATH);
     assert_eq!(
         a.hello_received(&hyper::Method::GET, &headers, b"", true),
         StatusCode::FORBIDDEN
     );
     assert!(!wanted(&a), "a refused hello asked for a listing");
     // A node's hello: a listing; the same again (a replay): refused.
-    let headers = signed("a", "b5", b"", HELLO_PATH);
+    let headers = signed("a", b"", HELLO_PATH);
     assert_eq!(a.hello_received(&post, &headers, b"", true), StatusCode::OK);
     assert!(wanted(&a));
     assert_eq!(
@@ -1177,7 +1180,7 @@ async fn only_a_nodes_signed_hello_asks_for_a_listing() {
     let refuse = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     refuse.load_secret().await;
     wanted(&refuse);
-    let headers = signed("a", "b6", b"", HELLO_PATH);
+    let headers = signed("a", b"", HELLO_PATH);
     assert_eq!(
         refuse.hello_received(&post, &headers, b"", false),
         StatusCode::FORBIDDEN
