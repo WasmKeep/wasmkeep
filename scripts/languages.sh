@@ -86,6 +86,8 @@ for ex in examples/c-*/ examples/py-*/ examples/go-*/ examples/d-*/; do
 done
 echo '-- crates/wasmkeep-server/tests/guests/go-fetch'
 crates/wasmkeep-server/tests/guests/go-fetch/build.sh
+echo '-- crates/wasmkeep-server/tests/guests/ts-fetch'
+(cd crates/wasmkeep-server/tests/guests/ts-fetch && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm run --silent build:starlingmonkey)
 # Standard Go: componentize-go on PATH (it downloads its own binary into
 # the user's cache directory on first use) and Go 1.27.1+ ($GO_STD, or go).
 if command -v "${COMPONENTIZE_GO:-componentize-go}" >/dev/null 2>&1; then

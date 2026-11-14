@@ -428,6 +428,7 @@ jobs:
           cache-dependency-path: |
             sdks/typescript/package-lock.json
             examples/ts-*/package-lock.json
+            crates/wasmkeep-server/tests/guests/ts-fetch/package-lock.json
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
@@ -524,6 +525,7 @@ jobs:
           for ex in examples/py-*/; do "$ex/build.sh"; done
           for ex in examples/go-*/; do "$ex/build.sh"; done
           crates/wasmkeep-server/tests/guests/go-fetch/build.sh
+          (cd crates/wasmkeep-server/tests/guests/ts-fetch && npm ci && npm run build && npm run build:starlingmonkey)
           for ex in examples/d-*/; do "$ex/build.sh"; done
           for ex in examples/moonbit-*/; do "$ex/build.sh"; done
           for ex in examples/csharp-*/; do "$ex/build.sh"; done

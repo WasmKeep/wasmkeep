@@ -67,6 +67,9 @@ of 0.57 MB, measured with huge pages on).
 | `wk.setHeader(&response, name, value)` | Adds a header to a response |
 | `wk.deleteSelf()`, `wk.nowMs()` | |
 
+Not in the Zig SDK yet: outbound HTTP, one request or
+[several at once](https://github.com/WasmKeep/wasmkeep/blob/main/docs/languages.md#several-outbound-requests-at-once).
+
 ## Key-value and queues
 
 `wk.kv` and `wk.queue` ([`kv.zig`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/zig/kv.zig), [`queue.zig`](https://github.com/WasmKeep/wasmkeep/blob/main/sdks/zig/queue.zig))

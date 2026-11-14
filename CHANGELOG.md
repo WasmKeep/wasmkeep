@@ -11,6 +11,16 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.0, in no release yet.
 
+- **Several outbound HTTP requests at once** from the Rust, TypeScript and
+  Go SDKs: `http::fetch_all`, `http.fetchAll` (QuickJS and StarlingMonkey)
+  and `FetchAll` send a batch together and wait for all of it, one result
+  per request in input order, at most 16 open at once (the host's limit per
+  actor; the rest start as earlier ones finish). `fetch`, `http.fetch` and
+  `Fetch` are now a batch of one, with the same answers.
+  [Languages](docs/languages.md#several-outbound-requests-at-once) says what
+  each SDK does, Python, C, Zig, D and MoonBit included (no outbound HTTP
+  helper yet).
+
 ## 0.4.0
 
 **An app is one thing.** An app's classes and its front are deployed,

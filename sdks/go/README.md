@@ -103,12 +103,41 @@ line at the release's version; it fails while the line still names
 | `Request` | `Method`, `Path` (with the query), `Headers`; `Header(name)`, `LookupHeader`, `Body()`, `Text()`, `ReadBody()` |
 | `Text(status, body)`, `Bytes(status, type, body)`, `JSON(status, json)`, `Response{...}` | Responses; `.WithHeader(name, value)` adds one |
 | `Fetch(url, FetchOptions{...})` | Outbound HTTP, synchronous: `Method`, `Headers`, `Body`, `Timeout`, `Limit`; a `*Fetched` (`Status`, `Headers`, `Body`) |
+| `FetchAll([]FetchRequest{{URL: url, Options: FetchOptions{...}}, ...})` | Several outbound requests at once, waited for together: one `FetchResult` (`Fetched`, `Err`) per request, in input order ([below](#several-outbound-requests-at-once)) |
 | `Env(name)` | The class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins), and whether it is set |
 | `Self()` | This actor's `Address` (`Tenant`, `Class`, `Name`) |
 | `DeleteSelf()`, `NowMs()` | |
 
 A panic in a hook traps the instance: the event fails, as an error does.
 The full documentation is in the package comments (`go doc ./wasmkeep`).
+
+## Several outbound requests at once
+
+`Fetch` waits for its answer, and goroutines do not change that: on
+TinyGo they share one thread, which a waiting request blocks, so four
+goroutines fetching run one after the other. `FetchAll` sends a batch at
+once and waits for all of it:
+
+```go
+results := wasmkeep.FetchAll([]wasmkeep.FetchRequest{
+	{URL: "https://a.example/price"},
+	{URL: "https://b.example/price", Options: wasmkeep.FetchOptions{Timeout: 2 * time.Second}},
+})
+for _, r := range results {
+	if r.Err != nil {
+		// why it failed
+		continue
+	}
+	// r.Fetched.Status, r.Fetched.Body
+}
+```
+
+Each result is what `Fetch` would return, in input order; one failure
+does not fail the others. The requests are open together, their
+responses and bodies read as they come, so the batch takes about as long
+as its slowest request. Request bodies are written one after the other.
+The host lets an actor have 16 requests open at once: past 16, the rest
+start as earlier ones finish.
 
 ## Key-value, queues and workflows
 
@@ -144,8 +173,8 @@ their tests run on the host against a fake one.
 
 They pass the same black-box tests as the Rust examples
 (`crates/wasmkeep-server/tests/languages.rs`, `chat.rs`, `jobs_langs.rs`,
-`workflows_langs.rs`), and `fetch_langs.rs` checks `Fetch` against the
-Rust SDK's `http::fetch`.
+`workflows_langs.rs`), and `fetch_langs.rs` checks `Fetch` and
+`FetchAll` against the Rust SDK's `http::fetch` and `http::fetch_all`.
 
 ```bash
 go test ./...   # value conversion, rows, requests, URLs; the clients' golden bytes, shard choices and read cache

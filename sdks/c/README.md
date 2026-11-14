@@ -80,6 +80,9 @@ NUL-terminated; print with `"%.*s", (int)b.len, b.ptr`), valid until the rows
 or response holding them are freed. The parameter macros use the GNU `##`
 extension (clang and GCC); `wk_exec_v` and friends take an array instead.
 
+Not in the C SDK yet: outbound HTTP, one request or
+[several at once](../../docs/languages.md#several-outbound-requests-at-once).
+
 ## Key-value and queues
 
 The clients of [ADR 0015](../../docs/adr/0015-kv-and-queues-as-sdk-patterns.md)

@@ -76,7 +76,7 @@ pub fn method_name(method: &Method) -> String {
     }
 }
 
-/// A response from [`fetch`].
+/// A response from [`fetch`] or [`fetch_all`].
 #[derive(Debug, Clone)]
 pub struct Fetched {
     /// The HTTP status.
@@ -84,6 +84,53 @@ pub struct Fetched {
     /// The whole body, or its first `limit` bytes when it is longer (see
     /// [`fetch`]).
     pub body: Vec<u8>,
+}
+
+/// One request of a [`fetch_all`] batch: a GET with no headers and no body
+/// unless set.
+#[derive(Debug, Clone, Copy)]
+pub struct FetchRequest<'a> {
+    /// The method (`GET`, `POST`, ...).
+    pub method: &'a str,
+    /// `http://` or `https://`.
+    pub url: &'a str,
+    /// Headers to send.
+    pub headers: &'a [(&'a str, &'a str)],
+    /// The body to send (none when empty).
+    pub body: &'a [u8],
+}
+
+impl<'a> FetchRequest<'a> {
+    /// A GET of `url`.
+    #[must_use]
+    pub fn get(url: &'a str) -> Self {
+        Self::new("GET", url)
+    }
+
+    /// A `method` request to `url`.
+    #[must_use]
+    pub fn new(method: &'a str, url: &'a str) -> Self {
+        Self {
+            method,
+            url,
+            headers: &[],
+            body: &[],
+        }
+    }
+
+    /// With these headers.
+    #[must_use]
+    pub fn headers(mut self, headers: &'a [(&'a str, &'a str)]) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// With this body.
+    #[must_use]
+    pub fn body(mut self, body: &'a [u8]) -> Self {
+        self.body = body;
+        self
+    }
 }
 
 /// Sends an outbound HTTP request and waits for the response: `url` is
@@ -98,7 +145,8 @@ pub struct Fetched {
 ///
 /// The actor's event waits meanwhile (other events to it queue); waiting
 /// does not count against its CPU budget, but does against the event's
-/// wall-clock limit (30 s by default).
+/// wall-clock limit (30 s by default). For several requests at once, see
+/// [`fetch_all`].
 pub fn fetch(
     method: &str,
     url: &str,
@@ -107,9 +155,210 @@ pub fn fetch(
     timeout: std::time::Duration,
     limit: usize,
 ) -> Result<Fetched, String> {
+    let request = FetchRequest {
+        method,
+        url,
+        headers,
+        body,
+    };
+    fetch_all(&[request], timeout, limit)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Err(format!("{url}: no answer")))
+}
+
+/// Requests a batch keeps open at once: the host's limit per actor
+/// (`PER_ACTOR_REQUESTS` in the server's egress rules).
+const MAX_OPEN: usize = 16;
+/// Times a request the host refused for having too many open is tried
+/// again, [`RETRY_WAIT`] apart: the host frees a finished request's place
+/// a moment after its body ends.
+const RETRIES: u32 = 100;
+const RETRY_WAIT: u64 = 1_000_000; // 1 ms, in nanoseconds
+
+/// Sends every request of `requests` at once and waits for all of them:
+/// one result per request, in the same order, each as [`fetch`] gives it
+/// (`timeout` and `limit` apply to each). One failing does not fail the
+/// others.
+///
+/// The requests are open together, their responses and bodies read as
+/// they come, so the batch takes about as long as its slowest request
+/// rather than the sum. Request bodies are written one after the other,
+/// once the requests that fit have all started. The host lets an actor
+/// have 16 requests open at once: past 16, the rest start as earlier ones
+/// finish. The host's egress rules apply to each.
+///
+/// The actor's event waits meanwhile, as for [`fetch`].
+pub fn fetch_all(
+    requests: &[FetchRequest<'_>],
+    timeout: std::time::Duration,
+    limit: usize,
+) -> Vec<Result<Fetched, String>> {
+    use wasip2::clocks::monotonic_clock;
+    use wasip2::http::types::ErrorCode;
+    use wasip2::io::poll::{Pollable, poll};
+
+    let mut states: Vec<State> = requests.iter().map(|_| State::Queued(0)).collect();
+    // A refused request is started again only once a retry wait has passed.
+    let mut waited = false;
+    loop {
+        // Start what fits: every `handle` first, then the bodies.
+        let mut open = states.iter().filter(|s| s.is_open()).count();
+        let mut started = Vec::new();
+        for (i, state) in states.iter_mut().enumerate() {
+            if open >= MAX_OPEN {
+                break;
+            }
+            let State::Queued(tries) = *state else {
+                continue;
+            };
+            if tries > 0 && !waited {
+                continue;
+            }
+            *state = match start(&requests[i], timeout) {
+                Ok((future, outgoing)) => {
+                    open += 1;
+                    started.push((i, outgoing));
+                    State::Head {
+                        future,
+                        sending: None,
+                        tries,
+                    }
+                }
+                Err(e) => State::Done(Err(e)),
+            };
+        }
+        for (i, outgoing) in started {
+            match send_body(outgoing, requests[i].body) {
+                Sent::Yes => {}
+                Sent::Body(e) => {
+                    if let State::Head { sending, .. } = &mut states[i] {
+                        *sending = Some(e);
+                    }
+                }
+                Sent::Unfinished(e) => states[i] = State::Done(Err(e)),
+            }
+        }
+
+        // Advance each as far as it goes without waiting.
+        let mut retrying = false;
+        for (i, state) in states.iter_mut().enumerate() {
+            advance(state, requests[i].url, limit);
+            match *state {
+                State::Refused(tries) if tries < RETRIES => *state = State::Queued(tries + 1),
+                State::Refused(_) => {
+                    *state = State::Done(Err(format!("{:?}", ErrorCode::ConnectionLimitReached)));
+                }
+                _ => {}
+            }
+            retrying |= matches!(state, State::Queued(t) if *t > 0);
+        }
+        if states.iter().all(|s| matches!(s, State::Done(_))) {
+            break;
+        }
+        // Wait for any of them, and for a moment when one is to be retried
+        // (then something is always waited for: polling nothing traps).
+        let mut pollables: Vec<Pollable> = states.iter().filter_map(State::pollable).collect();
+        let clock = retrying.then(|| {
+            pollables.push(monotonic_clock::subscribe_duration(RETRY_WAIT));
+            pollables.len() - 1
+        });
+        let refs: Vec<&Pollable> = pollables.iter().collect();
+        let ready = poll(&refs);
+        waited = clock.is_some_and(|c| ready.iter().any(|&r| r as usize == c));
+        // Pollables are their resources' children: dropped here, before
+        // any of those changes.
+        drop(refs);
+        drop(pollables);
+    }
+    states
+        .into_iter()
+        .map(|s| match s {
+            State::Done(result) => result,
+            _ => Err("unfinished".to_owned()),
+        })
+        .collect()
+}
+
+/// Where one request of a batch is. Fields drop in order: each resource
+/// before the one it came from.
+enum State {
+    /// Not started; the number is how many times the host refused it for
+    /// having too many open.
+    Queued(u32),
+    /// Refused that many times: to start again, or give up.
+    Refused(u32),
+    /// Waiting for the response head.
+    Head {
+        future: wasip2::http::types::FutureIncomingResponse,
+        /// Why writing the request body failed, if it did.
+        sending: Option<String>,
+        tries: u32,
+    },
+    /// Reading the body.
+    Body {
+        stream: wasip2::io::streams::InputStream,
+        incoming: wasip2::http::types::IncomingBody,
+        status: u16,
+        body: Vec<u8>,
+        response: wasip2::http::types::IncomingResponse,
+        future: wasip2::http::types::FutureIncomingResponse,
+    },
+    /// The body ended: waiting for the trailers, which may report an error.
+    Trailers {
+        trailers: wasip2::http::types::FutureTrailers,
+        status: u16,
+        body: Vec<u8>,
+        // Held only to drop after the trailers.
+        #[allow(dead_code)]
+        response: wasip2::http::types::IncomingResponse,
+        #[allow(dead_code)]
+        future: wasip2::http::types::FutureIncomingResponse,
+    },
+    Done(Result<Fetched, String>),
+}
+
+impl State {
+    /// Holding one of the host's places for open requests.
+    fn is_open(&self) -> bool {
+        matches!(
+            self,
+            Self::Head { .. } | Self::Body { .. } | Self::Trailers { .. }
+        )
+    }
+
+    /// What it waits for.
+    fn pollable(&self) -> Option<wasip2::io::poll::Pollable> {
+        match self {
+            Self::Head { future, .. } => Some(future.subscribe()),
+            Self::Body { stream, .. } => Some(stream.subscribe()),
+            Self::Trailers { trailers, .. } => Some(trailers.subscribe()),
+            Self::Queued(_) | Self::Refused(_) | Self::Done(_) => None,
+        }
+    }
+}
+
+/// Builds the request and hands it to the host: its response's future, and
+/// the body to write.
+fn start(
+    request: &FetchRequest<'_>,
+    timeout: std::time::Duration,
+) -> Result<
+    (
+        wasip2::http::types::FutureIncomingResponse,
+        wasip2::http::types::OutgoingBody,
+    ),
+    String,
+> {
     use wasip2::http::outgoing_handler;
     use wasip2::http::types::{OutgoingRequest, RequestOptions, Scheme};
 
+    let FetchRequest {
+        method,
+        url,
+        headers,
+        body,
+    } = *request;
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("{url}: no scheme"))?;
@@ -176,29 +425,37 @@ pub fn fetch(
     let _ = options.set_between_bytes_timeout(Some(nanos));
 
     let future = outgoing_handler::handle(request, Some(options)).map_err(|e| format!("{e:?}"))?;
-    let wait = || loop {
-        if let Some(result) = future.get() {
-            break result;
-        }
-        future.subscribe().block();
-    };
+    Ok((future, outgoing))
+}
+
+/// How writing a request body went.
+enum Sent {
+    Yes,
+    /// The body's stream failed: the response, when one comes, says more.
+    Body(String),
+    /// Written, but not finished: the request fails.
+    Unfinished(String),
+}
+
+/// Writes the request body and finishes it.
+fn send_body(outgoing: OutgoingBody, body: &[u8]) -> Sent {
     let mut sent = Ok(());
     if !body.is_empty() {
-        let mut stream = outgoing
-            .write()
-            .map_err(|()| "request body unavailable".to_owned())?;
-        sent = stream
-            .write_all(body)
-            .map_err(|e| e.to_string())
-            .and_then(|()| stream.flush().map_err(|e| e.to_string()));
-    }
-    let response = match sent {
-        Ok(()) => {
-            OutgoingBody::finish(outgoing, None).map_err(|e| format!("{e:?}"))?;
-            wait()
-                .map_err(|()| "response already taken".to_owned())?
-                .map_err(|e| format!("{e:?}"))?
+        match outgoing.write() {
+            Ok(mut stream) => {
+                sent = stream
+                    .write_all(body)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| stream.flush().map_err(|e| e.to_string()));
+            }
+            Err(()) => return Sent::Unfinished("request body unavailable".to_owned()),
         }
+    }
+    match sent {
+        Ok(()) => match OutgoingBody::finish(outgoing, None) {
+            Ok(()) => Sent::Yes,
+            Err(e) => Sent::Unfinished(format!("{e:?}")),
+        },
         // The body's stream closes when the request ends before the guest
         // is done with it: either it failed (refused, no connection), and
         // the response says why where it can, or the server already
@@ -206,69 +463,148 @@ pub fn fetch(
         // and that answer is the result.
         Err(e) => {
             drop(outgoing);
-            match wait() {
-                Ok(Ok(response)) => response,
-                Ok(Err(code)) => return Err(format!("{code:?}")),
-                Err(()) => return Err(format!("sending the body: {e}")),
-            }
+            Sent::Body(e)
         }
-    };
-    let status = response.status();
-    let incoming = response
-        .consume()
-        .map_err(|()| format!("{url}: response body already taken"))?;
-    let body = read_response_body(incoming, limit).map_err(|e| format!("{url}: {e}"))?;
-    Ok(Fetched { status, body })
+    }
 }
 
-/// Reads a response body up to `limit` bytes. Past the limit nothing more is
-/// read (nor checked). Before it, the body must end normally: a stream that
-/// breaks (`last-operation-failed`: a reset, a close short of the
-/// Content-Length or inside a chunk, a timeout between bytes), or an error
-/// reported with the trailers after a normal close, fails with
-/// `incomplete body: ...` rather than passing the bytes that came for the
-/// whole answer.
-fn read_response_body(
-    incoming: wasip2::http::types::IncomingBody,
-    limit: usize,
-) -> Result<Vec<u8>, String> {
-    use wasip2::http::types::{IncomingBody, http_error_code};
+/// Moves `state` on as far as it goes without waiting. A state is replaced
+/// whole, never taken apart and dropped piecemeal, so its resources drop
+/// in field order: each before the one it came from.
+fn advance(state: &mut State, url: &str, limit: usize) {
+    use wasip2::http::types::{ErrorCode, IncomingBody, http_error_code};
     use wasip2::io::streams::StreamError;
 
-    let stream = incoming
-        .stream()
-        .map_err(|()| "incomplete body: its stream was already taken".to_owned())?;
-    let mut body = Vec::new();
-    while body.len() < limit {
-        let want = (limit - body.len()).min(65_536) as u64;
-        match stream.blocking_read(want) {
-            Ok(chunk) => body.extend_from_slice(&chunk),
-            Err(StreamError::Closed) => break,
-            Err(StreamError::LastOperationFailed(e)) => {
-                let why =
-                    http_error_code(&e).map_or_else(|| e.to_debug_string(), |c| format!("{c:?}"));
-                return Err(format!("incomplete body: {why}"));
+    loop {
+        match state {
+            State::Head {
+                future,
+                sending,
+                tries,
+            } => {
+                let Some(got) = future.get() else { return };
+                let response = match got {
+                    Err(()) => {
+                        let why = match sending.take() {
+                            Some(e) => format!("sending the body: {e}"),
+                            None => "response already taken".to_owned(),
+                        };
+                        *state = State::Done(Err(why));
+                        continue;
+                    }
+                    Ok(Err(ErrorCode::ConnectionLimitReached)) => {
+                        *state = State::Refused(*tries);
+                        continue;
+                    }
+                    Ok(Err(code)) => {
+                        *state = State::Done(Err(format!("{code:?}")));
+                        continue;
+                    }
+                    Ok(Ok(response)) => response,
+                };
+                let status = response.status();
+                let Ok(incoming) = response.consume() else {
+                    drop(response);
+                    *state = State::Done(Err(format!("{url}: response body already taken")));
+                    continue;
+                };
+                let Ok(stream) = incoming.stream() else {
+                    drop(incoming);
+                    drop(response);
+                    *state = State::Done(Err(format!(
+                        "{url}: incomplete body: its stream was already taken"
+                    )));
+                    continue;
+                };
+                let State::Head { future, .. } =
+                    std::mem::replace(state, State::Done(Err(String::new())))
+                else {
+                    unreachable!("matched above")
+                };
+                *state = State::Body {
+                    stream,
+                    incoming,
+                    status,
+                    body: Vec::new(),
+                    response,
+                    future,
+                };
             }
+            State::Body { stream, body, .. } => {
+                let mut ended = false;
+                while body.len() < limit {
+                    let want = (limit - body.len()).min(65_536) as u64;
+                    match wasip2::io::streams::InputStream::read(stream, want) {
+                        Ok(chunk) if chunk.is_empty() => return,
+                        Ok(chunk) => body.extend_from_slice(&chunk),
+                        Err(StreamError::Closed) => {
+                            ended = true;
+                            break;
+                        }
+                        Err(StreamError::LastOperationFailed(e)) => {
+                            let why = http_error_code(&e)
+                                .map_or_else(|| e.to_debug_string(), |c| format!("{c:?}"));
+                            drop(e);
+                            *state = State::Done(Err(format!("{url}: incomplete body: {why}")));
+                            break;
+                        }
+                    }
+                }
+                if let State::Body { status, body, .. } = state
+                    && !ended
+                {
+                    // At the limit: the rest is dropped unread.
+                    let fetched = Fetched {
+                        status: *status,
+                        body: std::mem::take(body),
+                    };
+                    *state = State::Done(Ok(fetched));
+                } else if ended {
+                    // Closed: the body's own end, unless the trailers say
+                    // otherwise.
+                    let State::Body {
+                        stream,
+                        incoming,
+                        status,
+                        body,
+                        response,
+                        future,
+                    } = std::mem::replace(state, State::Done(Err(String::new())))
+                    else {
+                        unreachable!("matched above")
+                    };
+                    drop(stream);
+                    *state = State::Trailers {
+                        trailers: IncomingBody::finish(incoming),
+                        status,
+                        body,
+                        response,
+                        future,
+                    };
+                }
+            }
+            State::Trailers {
+                trailers,
+                status,
+                body,
+                ..
+            } => {
+                let Some(got) = trailers.get() else { return };
+                let result = match &got {
+                    Ok(Ok(_)) => Ok(Fetched {
+                        status: *status,
+                        body: std::mem::take(body),
+                    }),
+                    Ok(Err(code)) => Err(format!("{url}: incomplete body: {code:?}")),
+                    Err(()) => Err(format!(
+                        "{url}: incomplete body: its trailers were already taken"
+                    )),
+                };
+                // Trailers received are the future's child: dropped first.
+                drop(got);
+                *state = State::Done(result);
+            }
+            State::Queued(_) | State::Refused(_) | State::Done(_) => return,
         }
-    }
-    if body.len() >= limit {
-        // The rest is dropped unread.
-        return Ok(body);
-    }
-    // Closed: the body's own end, unless the trailers say otherwise.
-    drop(stream);
-    let trailers = IncomingBody::finish(incoming);
-    // Declared after `trailers`, so dropped before it: trailers received are
-    // the future's child.
-    let result = loop {
-        if let Some(result) = trailers.get() {
-            break result;
-        }
-        trailers.subscribe().block();
-    };
-    match result {
-        Ok(Ok(_)) => Ok(body),
-        Ok(Err(code)) => Err(format!("incomplete body: {code:?}")),
-        Err(()) => Err("incomplete body: its trailers were already taken".to_owned()),
     }
 }
