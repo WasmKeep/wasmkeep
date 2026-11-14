@@ -51,10 +51,10 @@ class Toolchain(unittest.TestCase):
         self.assertIn('TINYGO_VERSION is 0.40.0 in deploy/toolchain/Dockerfile, 0.39.0 in release.yml', result.stderr)
 
     def test_a_pin_missing_from_the_release_fails(self):
-        self.edit('.github/workflows/release.yml', 'wit-bindgen-go@v', 'wit-bindgen-go@')
+        self.edit('.github/workflows/release.yml', 'componentize-py==', 'componentize-py>=')
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
-        self.assertIn('WIT_BINDGEN_GO_VERSION', result.stderr)
+        self.assertIn('COMPONENTIZE_PY_VERSION', result.stderr)
         self.assertIn('missing in release.yml', result.stderr)
 
     def test_a_pin_missing_from_the_image_fails(self):

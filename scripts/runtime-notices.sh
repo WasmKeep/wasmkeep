@@ -9,7 +9,8 @@
 #
 # The texts come from the installed tools where they ship one (Zig and the
 # libc it bundles, wasi-libc's Debian copyright file, the Go standard
-# library, componentize-py, componentize-qjs) and from deploy/notices/
+# library and the Go modules go-counter links, componentize-py,
+# componentize-qjs) and from deploy/notices/
 # where they do not (QuickJS-ng, CPython, TinyGo, the WASI adapter). Those
 # files name the tool version they were taken for: a tool at another
 # version fails here, so a pin is not moved without its text.
@@ -55,6 +56,10 @@ tinygo_version=$("$TINYGO" version | awk '{print $3}')
 goroot=$("$GO" env GOROOT)
 adapter=$(sed -n 's/^ADAPTER_VERSION=\([0-9.]*\).*/\1/p' scripts/componentize-core.sh)
 go_version=$("$GO" env GOVERSION)
+# The one module go-counter links besides the SDK (Apache-2.0 WITH
+# LLVM-exception), from the module cache its build filled.
+cm_dir=$(cd examples/go-counter && "$GO" list -m -f '{{.Dir}}' go.bytecodealliance.org/cm)
+cm_version=$(cd examples/go-counter && "$GO" list -m -f '{{.Version}}' go.bytecodealliance.org/cm)
 # Assignments, so that a failed check stops the script (set -e).
 quickjs=$(vendored quickjs-ng.txt "componentize-qjs $qjs_version")
 cpython=$(vendored cpython.txt "componentize-py $cpy_version")
@@ -71,9 +76,10 @@ sections=(
   "$cpy_license"
   "$cpython"
   --
-  "Go (counter-go.wasm): TinyGo $tinygo_version, the Go standard library ($go_version)"
+  "Go (counter-go.wasm): TinyGo $tinygo_version, the Go standard library ($go_version), go.bytecodealliance.org/cm $cm_version"
   "$tinygo"
   "$goroot/LICENSE"
+  "$cm_dir/LICENSE"
   --
   "C (counter-c.wasm): wasi-libc, the WASI adapter"
   "$wasi_libc"

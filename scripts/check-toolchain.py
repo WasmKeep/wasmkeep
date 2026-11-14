@@ -25,6 +25,9 @@ PINS = {
     'COMPONENTIZE_PY_VERSION': r'componentize-py==([0-9.]+)',
     'ZIGLANG_VERSION': r'ziglang==([0-9.]+)',
 }
+# Tools the release's counters do not need (their builds do not run them):
+# checked only when release.yml names them.
+OPTIONAL_IN_RELEASE = {'WIT_BINDGEN_GO_VERSION'}
 
 
 def args(text):
@@ -40,6 +43,8 @@ def check(root):
     errors = []
     for arg, pattern in PINS.items():
         found = sorted(set(re.findall(pattern, release)))
+        if arg in OPTIONAL_IN_RELEASE and not found:
+            continue
         if arg in image and found != [image[arg]]:
             errors.append(f'{arg} is {image[arg]} in deploy/toolchain/Dockerfile, '
                           f'{", ".join(found) or "missing"} in release.yml')

@@ -1,6 +1,7 @@
 QuickJS-ng 0.16.2 (MIT)
-The JavaScript engine componentize-qjs 0.5.0 embeds in a TypeScript component,
-through the rquickjs-sys 0.14.0 crate.
+The JavaScript engine componentize-qjs 0.5.0 embeds in a TypeScript component
+(its runtime links rquickjs-core 0.14.0; the text is from the matching
+rquickjs-sys 0.14.0 crate, which bundles QuickJS-ng 0.16.2).
 Source: https://static.crates.io/crates/rquickjs-sys/rquickjs-sys-0.14.0.crate, quickjs/LICENSE
 --------------------------------------------------------------------------------
 

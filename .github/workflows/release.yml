@@ -64,8 +64,14 @@ on:
       - scripts/componentize-core.sh
       - scripts/runtime-notices.sh
       - deploy/notices/**
-      - sdks/**
-      - examples/*counter/**
+      - sdks/typescript/**
+      - sdks/python/**
+      - sdks/go/**
+      - examples/ts-counter/**
+      - examples/py-counter/**
+      - examples/go-counter/**
+      - examples/c-counter/**
+      - examples/zig-counter/**
       - crates/wasmkeep-wit/wit/**
 
 permissions:
@@ -163,11 +169,12 @@ jobs:
           go-version: "1.24.7"
           cache: false
       - name: Toolchains (Go)
+        # TinyGo checked by the SHA-256 deploy/toolchain/Dockerfile pins.
         run: |
-          curl -sSL https://github.com/tinygo-org/tinygo/releases/download/v0.39.0/tinygo0.39.0.linux-amd64.tar.gz | tar xz -C "$RUNNER_TEMP"
+          curl -sSfL -o "$RUNNER_TEMP/tinygo.tar.gz" https://github.com/tinygo-org/tinygo/releases/download/v0.39.0/tinygo0.39.0.linux-amd64.tar.gz
+          echo "a119801579ef0a7a4f3ee285f0caf55241eaa9e115154c2028b696770b47a846  $RUNNER_TEMP/tinygo.tar.gz" | sha256sum -c
+          tar xzf "$RUNNER_TEMP/tinygo.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
-          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: The Rust components, with the pinned toolchain, validated, named; their notices
         run: |
           # The file in the release, the example's directory, the file
