@@ -27,10 +27,21 @@ The next release, `0.4.0`: **an app is one thing.**
 5. **WebSocket rooms behind a front**: a room with open sockets keeps
    its node while it hibernates, so a call from the front through another
    node does not close its sockets.
+6. **Calling several actors at once**: one call that runs several actor
+   calls in parallel and returns every answer, so a front gathering
+   several actors waits for the slowest, not for their sum. Rust and
+   TypeScript first.
+7. **Checking a bucket**: `wasmkeep cluster diagnose` tests that a bucket
+   does what WasmKeep relies on (conditional writes above all), and the
+   docs list the providers tested.
+
+Each release's notes say whether its upgrade is rolling (one node at a
+time) or stops the cluster; `0.4.0` stops it, once, for its migration.
 
 Then `0.4.1`: **sockets through the front.** The front accepts a
 WebSocket at its own path and hands it to an actor, so a room needs no
-public `/actor/` address.
+public `/actor/` address. The SDKs say how a handler makes several
+outbound HTTP requests at once.
 
 And right after: **actors that end.** Today an actor, once created, is
 kept for good; only its old history and old app versions are collected.
@@ -63,11 +74,14 @@ neighbour, not isolation from a hostile one
    the operator.
 3. **Limits per app** on each node, and suspending an app.
 4. **Placement when an actor wakes**: on a node with room, not only where
-   its request arrived. Most actors sleep most of the time, so this spreads
-   load without moving anything that is running.
+   its request arrived, starting by moving actors that are asleep. Most
+   actors sleep most of the time, so this spreads load without moving
+   anything that is running.
 5. **Automatic moves of running actors**, slowly and within limits, if
    placement at wake-up is not enough. Until then an operator moves an
    actor or drains a node ([how](docs/cluster.md)).
+6. **More buckets**: Google Cloud Storage and Azure Blob storage beside
+   S3-compatible stores, each checked by `cluster diagnose`.
 
 An actor runs on one node at a time, by design: a single actor that is too
 busy is split into more actors by its application, not by the platform.
@@ -80,7 +94,10 @@ Not before the releases above.
   (today every node is upgraded together,
   [how](docs/cluster.md#upgrading-wasmkeep)); inspect or export one actor;
   verify a bucket; back a cluster's bucket up to another and restore it;
-  traces. Required before a stable `1.0`: within `1.x`,
+  traces; a write acknowledged once another node holds it, if measuring
+  shows it is worth its design; asynchronous handlers once WebAssembly's
+  next system interface (WASI 0.3) is ready in Wasmtime and the SDK tools,
+  keeping one event at a time per actor by default. Required before a stable `1.0`: within `1.x`,
   every upgrade is rolling, one node at a time, with no stop of the whole
   cluster and no offline migration. Two consecutive versions work in one
   cluster, and a new bucket format is written only once every node reads
@@ -113,6 +130,7 @@ Each waits for a user who needs it.
   ([why](docs/deploy/three-nodes.md#one-region)).
 - **Native key-value and queue interfaces**, if the SDK patterns fall
   short.
+- **Vector search** in an actor's SQLite database.
 - **Cron triggers** (alarms cover them today) and optional built-ins: TLS
   termination, a Helm chart. Until static assets ship, serve them from
   the [front door](docs/deploy/front-door.md#static-files).
