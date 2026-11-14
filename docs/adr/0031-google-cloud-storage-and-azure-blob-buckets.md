@@ -16,8 +16,8 @@
   records, with the listing amendments of 2026-11-14), and
   [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)
   (`cluster migrate`).
-- Touches: ADR 0030, files and static assets (proposed in
-  [PR #129](https://github.com/WasmKeep/wasmkeep/pull/129), not merged).
+- Touches: [ADR 0030](0030-files-and-static-assets.md), files and static
+  assets (proposed).
   Its presigned links are S3-specific; section 7 says what each new
   backend can offer.
 
