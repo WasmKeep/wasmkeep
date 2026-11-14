@@ -16,6 +16,7 @@
 
 - [Concepts](concepts.md)
 - [Running a cluster](cluster.md)
+- [The project file](project-file.md)
 - [When a node dies, and how it scales](failover-and-scaling.md)
 - [Key-value and queues](kv-and-queues.md)
 - [Workflows](workflows.md)
@@ -68,3 +69,4 @@
 - [0023 The front](adr/0023-the-front.md)
 - [0024 Socket home](adr/0024-socket-home.md)
 - [0025 Calling several actors at once](adr/0025-calling-several-actors-at-once.md)
+- [0026 The project file](adr/0026-the-project-file.md)

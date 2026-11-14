@@ -22,3 +22,6 @@ token.txt
 # Local agent settings and notes
 /.claude/
 CLAUDE.local.md
+
+# wasmkeep dev local values (ADR 0026)
+.env.local

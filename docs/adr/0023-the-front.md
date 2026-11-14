@@ -12,7 +12,8 @@
   caller), [ADR 0016](0016-secrets-in-the-bucket.md) (a secrets scope for
   the front).
 - Amended by: [ADR 0024](0024-socket-home.md) (the socket home gate is
-  lifted).
+  lifted), [ADR 0026](0026-the-project-file.md) (the project file; format
+  3 also without a front, for an explicit `open`).
 
 ## Context
 
@@ -586,8 +587,9 @@ it.
 ## Not decided here
 
 - The project file (`wasmkeep.toml`), its `[front]` section, its default
-  of `internal`, and how `deploy` and `dev` read it.
-- `wasmkeep dev` with a front.
+  of `internal`, and how `deploy` and `dev` read it: decided by
+  [ADR 0026](0026-the-project-file.md).
+- `wasmkeep dev` with a front: [ADR 0026](0026-the-project-file.md).
 - Where an actor with open sockets wakes (its own ADR, a gate for
   clustered use).
 - The WebSocket hand-off through the front (0.4.1, its own ADR), and one

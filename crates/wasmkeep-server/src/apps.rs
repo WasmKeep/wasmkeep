@@ -65,8 +65,9 @@ pub enum DeployError {
     /// (ADR 0023): they could not read a version with a front. There is no
     /// `--force`.
     #[error(
-        "live nodes of {app} cannot read a version with a front ({nodes}): upgrade them first \
-         (this check has no --force: such a node could not read the version at all)"
+        "live nodes of {app} cannot read a version with a front or a rule written `open` \
+         (manifest format 3) ({nodes}): upgrade them first (this check has no --force: such a \
+         node could not read the version at all)"
     )]
     NodesWithoutFront {
         /// `tenant/app`.
@@ -77,6 +78,10 @@ pub enum DeployError {
     /// A rollback would make these classes more open (ADR 0013).
     #[error("rolling back would reopen {0}; pass --allow-reopen to do it anyway")]
     Reopens(String),
+    /// The caller stopped the deploy after seeing its plan
+    /// ([`AppRef::deploy_changes_with`]): nothing was written.
+    #[error("stopped before the switch: nothing was written")]
+    Stopped,
     /// A new app's tenant or app name is outside the grammar.
     #[error(
         "{what} {name:?} must match [a-z][a-z0-9-]{{0,63}} (lowercase letters, digits and \
@@ -409,7 +414,10 @@ impl AppRef {
             access: access.clone(),
             config,
         };
-        Ok(self.write(runtime, changes, Some(set)).await?.current)
+        Ok(self
+            .write(runtime, changes, Some(set), &mut |_| true)
+            .await?
+            .current)
     }
 
     /// `wasmkeep deploy` (ADR 0013): starting from the current version,
@@ -421,7 +429,21 @@ impl AppRef {
         runtime: &Runtime,
         changes: Changes,
     ) -> Result<Deployed, DeployError> {
-        self.write(runtime, changes, None).await
+        self.write(runtime, changes, None, &mut |_| true).await
+    }
+
+    /// [`Self::deploy_changes`], showing `plan` what the deploy changes
+    /// before anything is uploaded or switched (ADR 0026: the deploy says
+    /// what it removes before it switches). `plan` returning `false` stops
+    /// the deploy there with [`DeployError::Stopped`]. A deploy that
+    /// changes nothing does not call it.
+    pub async fn deploy_changes_with(
+        &self,
+        runtime: &Runtime,
+        changes: Changes,
+        mut plan: impl FnMut(&Diff) -> bool + Send,
+    ) -> Result<Deployed, DeployError> {
+        self.write(runtime, changes, None, &mut plan).await
     }
 
     /// Builds the new version on the current one and makes it current.
@@ -432,8 +454,10 @@ impl AppRef {
         runtime: &Runtime,
         changes: Changes,
         exact: Option<Settings>,
+        plan: &mut (dyn FnMut(&Diff) -> bool + Send),
     ) -> Result<Deployed, DeployError> {
         self.check_layout().await?;
+        let every_rule = changes.every_rule;
         if let Some(classes) = &changes.classes {
             let mut compiled = Vec::new();
             for (name, bytes) in classes {
@@ -645,6 +669,14 @@ impl AppRef {
                 manifest.access.insert(class, spec);
             }
         }
+        // Every class's rule written, `open` included (ADR 0026): format 3.
+        if every_rule {
+            for class in manifest.classes.keys() {
+                if !manifest.access.contains_key(class) {
+                    manifest.access.insert(class.clone(), "open".to_owned());
+                }
+            }
+        }
         // Stored as parsed, not as given: no comment (or commented-out
         // secret) is uploaded, and reformatting makes no new version.
         for (class, vars) in &set.config {
@@ -685,6 +717,9 @@ impl AppRef {
         // A node that cannot read format 3 would stay not ready on it: no
         // such node may be live (ADR 0023). Checked before any write.
         self.check_readers(&manifest).await?;
+        if !plan(&diff) {
+            return Err(DeployError::Stopped);
+        }
         let version = manifest.version_id();
         // News only for an app deployed before rules came with deploys (a
         // `current` without the marker): a new app has had them from its
@@ -971,6 +1006,10 @@ pub struct Changes {
     /// The names the front requires (`--front-requires`): `None` keeps
     /// them, an empty set removes them.
     pub front_requires: Option<std::collections::BTreeSet<String>>,
+    /// Write every class's rule in the manifest, `open` included (a deploy
+    /// from the project file, ADR 0026); else `open` is written as
+    /// absence, as flag deploys write it.
+    pub every_rule: bool,
 }
 
 /// What a deploy does with the front (ADR 0023).
@@ -1016,6 +1055,7 @@ impl std::fmt::Debug for Changes {
             .field("access", &self.access)
             .field("config", &config)
             .field("front", &self.front)
+            .field("every_rule", &self.every_rule)
             .finish_non_exhaustive()
     }
 }
@@ -1066,6 +1106,11 @@ pub struct Diff {
     /// With a front after the change: the classes whose rule is `open`,
     /// reachable from outside past it.
     pub open_past_front: Vec<String>,
+    /// `(class, written)`: kept classes that stay `open` but whose rule is
+    /// now written in the version (`true`, a deploy from the project file,
+    /// ADR 0026) or no longer written (`false`, a flag deploy after one).
+    /// The rule does not change; the version does.
+    pub open_written: Vec<(String, bool)>,
 }
 
 impl Diff {
@@ -1113,6 +1158,14 @@ impl Diff {
                 .filter(|c| as_.access.of(c) == crate::access::Access::Open)
                 .cloned()
                 .collect();
+        }
+        for class in am.classes.keys().filter(|c| bm.classes.contains_key(*c)) {
+            let (b, a) = (bm.access.get(class), am.access.get(class));
+            match (b.map(String::as_str), a.map(String::as_str)) {
+                (None, Some("open")) => diff.open_written.push((class.clone(), true)),
+                (Some("open"), None) => diff.open_written.push((class.clone(), false)),
+                _ => {}
+            }
         }
         let open = || "open".to_owned();
         // The classes, and the front's scope when either version has a
@@ -1176,6 +1229,13 @@ impl Diff {
                 .iter()
                 .map(|(c, b, a)| format!("access {c}: {b} -> {a}")),
         );
+        out.extend(self.open_written.iter().map(|(c, written)| {
+            if *written {
+                format!("access {c}: open, now written in the version")
+            } else {
+                format!("access {c}: open, no longer written in the version (the same rule)")
+            }
+        }));
         out.extend(self.config.iter().map(|l| format!("config {l}")));
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
         out.extend(

@@ -7,6 +7,8 @@
   same day (old deploy tools over new versions, reused version ids,
   rollback across the migration, the class an event takes, sockets,
   instances kept with old values).
+- Amended by: [ADR 0026](0026-the-project-file.md) (a deploy from the
+  project file writes every class's rule, `open` included).
 - Date: 2026-11-05
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 

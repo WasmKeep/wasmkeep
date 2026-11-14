@@ -626,7 +626,25 @@ signed calls, upgrades every node together ([below](#upgrading-wasmkeep)).
 ## Deploying
 
 Instead of giving every node `--actor CLASS=PATH`, deploy once to the bucket
-and let nodes follow:
+and let nodes follow. With a [project file](project-file.md)
+(`wasmkeep.toml`, [ADR 0026](adr/0026-the-project-file.md)) in the app's
+directory, the deploy is the file, built and printed before it switches:
+
+```bash
+wasmkeep deploy --bucket s3://wasmkeep-demo      # reads ./wasmkeep.toml
+```
+
+- The version is exactly the file: a class or front the file no longer
+  has is removed, every class's rule is written (`internal` unless the
+  file says otherwise), and configuration or required names the file does
+  not give are removed. The output lists each change, removals first
+  named, before anything is uploaded.
+- Beside a file, `--actor`, `--access`, `--config`, `--requires` and the
+  front flags are refused; `--no-project` deploys with flags only, as
+  below (classes added that way are `open` unless given `--access`).
+- `--rollback` reads only `[app]` from the file and runs no build.
+
+With flags only:
 
 ```bash
 wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo \

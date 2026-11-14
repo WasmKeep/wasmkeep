@@ -13,6 +13,26 @@ Since 0.3.0, in no release yet.
 
 ### What changed
 
+- **`wasmkeep.toml`: the app is what the file says**
+  ([ADR 0026](docs/adr/0026-the-project-file.md),
+  [reference](docs/project-file.md)). A project file names the app, its
+  front, its classes with their rule (`internal` unless it says
+  otherwise), configuration file and required names, and a build command
+  for each part. `wasmkeep deploy --bucket ...` in its directory (or with
+  `--project PATH`) runs the builds, prints every change before it
+  switches, and deploys exactly the file: a class or front the file no
+  longer has is removed, and configuration or required names it does not
+  give are removed. Every class's rule is written in the version, `open`
+  included (manifest format 3, now also without a front). Unknown keys
+  are refused with their line and column. `--rollback` runs no build.
+  `wasmkeep dev` with no crate directory runs the file: the front and the
+  classes with their rules, local values from `.env.local`, rebuilt from
+  each part's `watch` paths, for any language with a build command.
+  **Behaviour change:** in a directory with a `wasmkeep.toml`, `deploy`
+  refuses `--actor`, `--access`, `--config`, `--requires` and the front
+  flags, and `dev` refuses crate directories, `--access` and `--env`;
+  pass `--no-project` to use them. Deploys with flags elsewhere are
+  unchanged, their default of `open` included.
 - **A WebSocket room wakes where its sockets are**
   ([ADR 0024](docs/adr/0024-socket-home.md)). A room that hibernates with
   sockets open keeps its ownership record, so an event reaching it through

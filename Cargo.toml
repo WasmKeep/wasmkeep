@@ -74,6 +74,8 @@ ring = "=0.17.14"
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "=3.27.0"
 wat = "=1.263.0"
+# Parses wasmkeep.toml (ADR 0026) with spans, without serde; already in the tree via madsim.
+toml = { version = "=0.9.12", default-features = false, features = ["std", "parse"] }
 
 [workspace.lints.rust]
 # `madsim` is set only when running the madsim simulation (sim/).

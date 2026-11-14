@@ -1,0 +1,21 @@
+# The project file (docs/project-file.md, ADR 0026): the TypeScript front
+# over the `todos` class of examples/todo-front. Run `npm ci` here once
+# (after `npm ci` in sdks/typescript), then `wasmkeep dev`.
+
+[app]
+tenant = "acme"
+name = "todo"
+
+[front]
+component = "front.wasm"
+build = "npm run build"
+requires = ["TOKENS"]
+watch = ["src"]
+
+[classes.todos]
+component = "../todo-front/todos/target/wasm32-wasip2/release/todo_todos.wasm"
+build = "cd ../todo-front/todos && cargo build --release --target wasm32-wasip2"
+watch = ["../todo-front/todos/src"]
+
+[dev]
+port = 8080

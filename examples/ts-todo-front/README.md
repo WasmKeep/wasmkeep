@@ -6,7 +6,17 @@ front (`@wasmkeep/sdk/front`, built with `--world front`), over the same
 Sign-in, name checks and error answers follow the same rules; see
 [what to copy](../todo-front/README.md#what-to-copy-and-what-not).
 
-From the repository root:
+With the [project file](wasmkeep.toml) ([reference](../../docs/project-file.md)),
+from this directory (after `npm ci` in `sdks/typescript`):
+
+```bash
+npm ci
+printf 'TOKENS=alice:%s\n' "$(openssl rand -hex 32)" > .env.local
+cargo run -p wasmkeep-cli -- dev        # builds front.wasm and the todos class, serves both
+```
+
+`wasmkeep deploy --bucket ...` deploys the same file. Without it, from
+the repository root:
 
 ```bash
 (cd sdks/typescript && npm ci)

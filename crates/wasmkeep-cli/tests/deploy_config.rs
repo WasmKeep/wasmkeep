@@ -285,3 +285,131 @@ fn apps_of_a_tenant_share_a_prefix_and_old_currents_are_refused() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("in progress"), "{err}");
 }
+
+/// `wasmkeep deploy` from a project file (ADR 0026), in its directory: the
+/// plan before the switch, the version exactly the file (a class it lacks
+/// removed, configuration it does not give removed, every rule written,
+/// `internal` by default), the same file twice one version, and a node
+/// serving its rules.
+#[test]
+fn a_deploy_from_the_file_is_the_file() {
+    let Ok(bucket) = std::env::var("WASMKEEP_TEST_S3_BUCKET") else {
+        eprintln!("WASMKEEP_TEST_S3_BUCKET not set; skipping");
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let url = format!("s3://{bucket}/project-file-{}-{now}", std::process::id());
+    let wasm = counter_wasm();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Before the file, with flags: c, d and old open, configuration on c.
+    let config = dir.path().join("c.env");
+    std::fs::write(&config, "MODE=fast\n").unwrap();
+    let (ok, _, err) = deploy(
+        &url,
+        &[
+            "--actor",
+            &format!("c={}", wasm.display()),
+            "--actor",
+            &format!("d={}", wasm.display()),
+            "--actor",
+            &format!("old={}", wasm.display()),
+            "--config",
+            &format!("c={}", config.display()),
+        ],
+    );
+    assert!(ok, "{err}");
+
+    // The file: c open, d with no access (internal), old not there.
+    let project = dir.path().join("app");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::copy(&wasm, project.join("counter.wasm")).unwrap();
+    std::fs::write(
+        project.join("wasmkeep.toml"),
+        "[app]\ntenant = \"acme\"\nname = \"shop\"\n\n\
+         [classes.c]\ncomponent = \"counter.wasm\"\naccess = \"open\"\n\
+         build = \"echo built >> builds.txt\"\n\n\
+         [classes.d]\ncomponent = \"counter.wasm\"\n",
+    )
+    .unwrap();
+    let from_file = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+            .current_dir(&project)
+            .args(["deploy", "--bucket", &url])
+            .args(extra)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+    let (ok, out, err) = from_file(&[]);
+    assert!(ok, "{err}");
+    let plan = out.find("before switching:").expect(&out);
+    let switched = out.find("is current").expect(&out);
+    assert!(plan < switched, "{out}");
+    for want in [
+        "class old: removed",
+        "access d: open -> internal",
+        "config c: MODE removed",
+        "class old is not in",
+    ] {
+        let at = out.find(want).unwrap_or_else(|| panic!("{want}: {out}"));
+        assert!(at < switched, "{want} after the switch: {out}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(project.join("builds.txt")).unwrap(),
+        "built\n"
+    );
+    let first = current(&bucket, &url_prefix(&url), "acme/shop");
+
+    // The same file again: the same version.
+    let (ok, out, err) = from_file(&[]);
+    assert!(ok, "{err}");
+    assert!(out.contains("nothing changed"), "{out}");
+    assert_eq!(current(&bucket, &url_prefix(&url), "acme/shop"), first);
+
+    // Flags beside the file are refused; --no-project takes them.
+    let (ok, _, err) = from_file(&["--access", "c=internal"]);
+    assert!(!ok && err.contains("--no-project"), "{err}");
+
+    // A node serves the file's rules: d internal, c open.
+    let log = dir.path().join("file-node.log");
+    let node = serve(&url, &dir.path().join("node"), &[])
+        .stdout(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut node = Killed(node);
+    let addr = support::listening_on(&mut node.0, &log, Duration::from_secs(60));
+    let started = Instant::now();
+    while status(addr, "/actor/d/x") != Some(403) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "d never answered 403: {:?}",
+            status(addr, "/actor/d/x")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_ne!(status(addr, "/actor/c/x"), Some(403));
+    assert_eq!(status(addr, "/actor/old/x"), Some(404));
+
+    // A rollback runs no build and is refused: it would reopen d.
+    let (ok, _, err) = from_file(&["--rollback"]);
+    assert!(!ok, "{err}");
+    assert!(err.contains("d (internal -> open)"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("builds.txt")).unwrap(),
+        "built\nbuilt\n",
+        "a rollback ran a build"
+    );
+}
+
+/// The prefix of `s3://bucket/prefix`.
+fn url_prefix(url: &str) -> String {
+    url.splitn(4, '/').nth(3).unwrap_or_default().to_owned()
+}
