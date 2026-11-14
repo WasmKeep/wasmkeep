@@ -458,7 +458,7 @@ async fn a_client_that_leaves_while_its_request_is_kept_is_never_run() {
         "the abandoned request ran"
     );
     assert_eq!(
-        d.metric("wasmkeep_events_total{class=\"t\",kind=\"request\",outcome=\"ok\"}")
+        d.metric("wasmkeep_events_total{tenant=\"default\",app=\"default\",class=\"t\",kind=\"request\",outcome=\"ok\"}")
             .await,
         2,
         "a's visit and b's: no event for the request whose client left"

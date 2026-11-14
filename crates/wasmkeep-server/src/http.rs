@@ -983,11 +983,11 @@ pub async fn serve_metrics(
                 let page = req.uri().path() == "/metrics"
                     && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
                 let response = if page {
-                    let gauges = actors
-                        .as_ref()
-                        .map(ActorService::gauges)
-                        .unwrap_or_default();
-                    let mut r = text_response(StatusCode::OK, &crate::metrics::render(gauges));
+                    let body = actors.as_ref().map_or_else(
+                        || crate::metrics::render(crate::metrics::Gauges::default()),
+                        |a| crate::metrics::render_for(a.gauges(), a.metrics_identity()),
+                    );
+                    let mut r = text_response(StatusCode::OK, &body);
                     r.headers_mut().insert(
                         hyper::header::CONTENT_TYPE,
                         hyper::header::HeaderValue::from_static(

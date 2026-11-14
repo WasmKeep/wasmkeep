@@ -4,6 +4,12 @@
 use super::*;
 
 impl ActorService {
+    /// The tenant, app and node id this node's metrics page names
+    /// ([`crate::metrics::render_for`]).
+    pub fn metrics_identity(&self) -> &crate::metrics::Identity {
+        &self.inner.metrics_identity
+    }
+
     /// Links each `(class, component bytes)` against the actor world and
     /// prepares the mailboxes. Components are compiled by the caller (from
     /// the cache) and passed with their original bytes for versioning.
@@ -57,6 +63,17 @@ impl ActorService {
             None => None,
         };
         let root = cluster.as_ref().map_or(root, |c| c.state_root().clone());
+        // What this node's metrics page names: the app it serves, as
+        // resolved above, and its node id in a cluster.
+        let metrics_identity = crate::metrics::Identity {
+            tenant: root.tenant().to_owned(),
+            app: root.app().to_owned(),
+            node: config
+                .cluster
+                .as_ref()
+                .map(|c| c.node_id.clone())
+                .unwrap_or_default(),
+        };
         let factory_cluster = cluster.clone();
         // A guest statement runs on a blocking thread, which does not stop
         // when its event is cut: stop the statement no later than that.
@@ -188,6 +205,7 @@ impl ActorService {
                 disk_sampled_ms: std::sync::atomic::AtomicU64::new(0),
                 owner_hints: std::sync::Mutex::default(),
                 handed: std::sync::Mutex::default(),
+                metrics_identity,
             }),
         };
         let _ = fire_to.set(Arc::downgrade(&service.inner));

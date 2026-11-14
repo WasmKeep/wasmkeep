@@ -402,3 +402,41 @@ async fn alarms_of_two_apps_with_the_same_names_stay_apart() {
         );
     }
 }
+
+/// The metrics page of a node names its app: series with a class carry
+/// its tenant and app, and `wasmkeep_info` its version and node id.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_metrics_page_names_the_nodes_app_and_version() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let data = tempfile::tempdir().unwrap();
+    let shop = app_node("shop-1", data.path(), &store, "acme/shop", false).await;
+    settle().await;
+    let r = send_runnable(shop.addr, "POST", "/actor/t/x/durable", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics = listener.local_addr().unwrap();
+    tokio::spawn(wasmkeep_server::serve_metrics(
+        listener,
+        Some(shop.service.clone()),
+        std::future::pending(),
+    ));
+    let (status, page) = get_raw(metrics, "/metrics").await;
+    assert_eq!(status, 200);
+    assert!(
+        page.contains(
+            "\nwasmkeep_events_total{tenant=\"acme\",app=\"shop\",class=\"t\",kind=\"request\",outcome=\"ok\"} 1\n"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"t\"} "
+        ),
+        "{page}"
+    );
+    let info = format!(
+        "\nwasmkeep_info{{version=\"{}\",tenant=\"acme\",app=\"shop\",node=\"shop-1\"}} 1\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(page.contains(&info), "{page}");
+}
