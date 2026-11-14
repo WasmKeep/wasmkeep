@@ -38,7 +38,17 @@ hand-off only to a node that announces it. While both versions run,
 sockets off once every node runs 0.4.1. From 0.3.x, upgrade to 0.4.0
 first ([upgrading to 0.4.0](docs/deploy/upgrading-to-0.4.md)).
 
-TODO-SOAK: Soaked on three nodes against a real bucket ... (bench/results/<file>)
+Soaked on three nodes against a real bucket, a node killed every three
+minutes, for two hours on this release's code (commit `0bf0547`; later
+commits change these notes and versions only): 39 kills, 377,095
+acknowledged durable writes, none lost or duplicated; failover p50
+17.6 s, p99 23.1 s, max 27.1 s; no alarm missed; no stale read after a
+takeover; a restarted node ready again within 0.3 s
+(`bench/results/2026-11-14-0bf0547-soak-ovh-bhs-3vps-2h-0.4.1-rc.csv`).
+The rolling upgrade was tried on the same three nodes: one node on 0.4.0
+beside two on 0.4.1 kept one owner per actor, a node of either version
+killed was taken over by a node of the other with every write kept, and
+the last node was then rolled forward.
 
 ### What changed
 
