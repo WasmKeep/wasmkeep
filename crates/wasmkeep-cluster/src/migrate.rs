@@ -1561,7 +1561,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             // A rollback that took the lock between the check and the
             // commit is deleting what the commit names: take it back.
             if let Err(lost) = self.hold(&held).await {
-                self.undo_commit(&key, &plan.hash).await?;
+                self.undo_commit(tenant, &key, &plan.hash).await?;
                 if outcome.committed.last() == Some(tenant) {
                     outcome.committed.pop();
                 }
@@ -1596,19 +1596,34 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         Ok(outcome)
     }
 
-    /// After this run lost its lock right after writing commit `key`:
-    /// keeps the commit only while a run of the same plan holds the lock
-    /// (it commits the same); otherwise (a rollback, or no lock) deletes
-    /// it.
-    async fn undo_commit(&self, key: &str, hash: &str) -> Result<(), MigrateError> {
-        match self.read_record(LOCK_KEY, LOCK_HEADER).await {
-            Ok(Some((l, _))) if l.mode == LockMode::Apply && l.hash == hash => Ok(()),
-            _ => self
-                .store
-                .delete(key)
-                .await
-                .map_err(bucket(format!("deleting {key}"))),
+    /// After this run lost its lock right after writing commit `key`
+    /// (tenant `tenant`'s): keeps the commit while a run of the same plan
+    /// holds the lock (it commits the same), and while the tenant has a
+    /// `--remove-old` mark: a removal that found this commit and no lock
+    /// (a run with nothing to do releases a lock whose commits are all
+    /// there) may have deleted the old keys, and the roots are then the
+    /// only copy. Otherwise (a rollback, or no lock) deletes it.
+    async fn undo_commit(&self, tenant: &str, key: &str, hash: &str) -> Result<(), MigrateError> {
+        if let Ok(Some((l, _))) = self.read_record(LOCK_KEY, LOCK_HEADER).await
+            && l.mode == LockMode::Apply
+            && l.hash == hash
+        {
+            return Ok(());
         }
+        let mark = format!("{REMOVED_PREFIX}{tenant}");
+        if self
+            .store
+            .get(&mark)
+            .await
+            .map_err(bucket(format!("reading {mark}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.store
+            .delete(key)
+            .await
+            .map_err(bucket(format!("deleting {key}")))
     }
 
     /// Copies tenant `tenant`'s bare keys into its roots until a second

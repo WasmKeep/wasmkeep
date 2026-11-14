@@ -190,7 +190,11 @@ starts, the migration is one-way.** The bare keys stay until
   leaves them: the rollback is given up for those tenants (unless a
   checked rollback holds the lock, which removes them as it finishes),
   so a later `--remove-old` asks no `--forgo-rollback` for a marked
-  tenant. A rollback that finishes
+  tenant. An `--apply` that lost its lock right after writing a commit
+  (a run with nothing to do released it) keeps that commit when the
+  tenant is marked: a removal may have deleted on the strength of it,
+  and without it a later `--apply` would migrate the tenant again from
+  its tombstones over the only copy. A rollback that finishes
   deletes the mark with the commit, and `--apply`, under its lock,
   deletes the mark of a tenant it is about to commit that has no commit:
   only a removal that stopped before deleting can have left it.

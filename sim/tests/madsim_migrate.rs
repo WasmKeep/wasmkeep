@@ -43,6 +43,8 @@
 //!   the lock it replaced, and never deletes the only copy.
 //! - **A `--remove-old` stopped by a lock after its marks**: the rollback
 //!   stays given up, and a later removal needs no acknowledgement.
+//! - **Three runs of the same `--apply` and a `--remove-old`**: a commit
+//!   the removal deleted on the strength of is never undone.
 //!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --test madsim_migrate --target-dir target/madsim`
 
@@ -2299,5 +2301,187 @@ fn the_plan_counts_the_quiet_window_only_with_something_to_migrate() {
         assert!(plan.estimate_ms(8) >= options().lease_window_ms);
         apply(&sim).await.unwrap();
         assert_eq!(migrator.plan().await.unwrap().wait_ms, 0);
+    });
+}
+
+// Three runs of the same `--apply` and a `--remove-old`: a commit the
+// removal trusted is never undone.
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+
+#[derive(Default)]
+struct Flags {
+    a1_at_commit: AtomicBool,
+    a6_planned: AtomicBool,
+    a1_committed: AtomicBool,
+    x_done: AtomicBool,
+    undo_done: AtomicBool,
+}
+
+async fn wait_for(f: &AtomicBool) {
+    while !f.load(SeqCst) {
+        madsim::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[derive(PartialEq)]
+enum Role {
+    A1,
+    A6,
+}
+
+struct Gated {
+    sim: Arc<Sim>,
+    flags: Arc<Flags>,
+    role: Role,
+    lock_gets: AtomicU32,
+    after_commit: AtomicBool,
+    gated_replace: AtomicBool,
+}
+
+impl Bucket for Gated {
+    async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+        if self.role == Role::A6 && key == LOCK_KEY && self.lock_gets.fetch_add(1, SeqCst) == 1 {
+            self.flags.a6_planned.store(true, SeqCst);
+            wait_for(&self.flags.undo_done).await;
+        }
+        <Sim as Bucket>::get(&self.sim, key).await
+    }
+    async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
+        let last = key == format!("{COMMIT_PREFIX}default");
+        if self.role == Role::A1 && last {
+            self.flags.a1_at_commit.store(true, SeqCst);
+            wait_for(&self.flags.a6_planned).await;
+        }
+        let r = <Sim as Bucket>::create(&self.sim, key, body).await;
+        if self.role == Role::A1 && last {
+            self.after_commit.store(true, SeqCst);
+        }
+        r
+    }
+    async fn replace(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        expected: &Version,
+    ) -> Result<Version, BucketError> {
+        if self.role == Role::A1
+            && key == LOCK_KEY
+            && self.after_commit.load(SeqCst)
+            && !self.gated_replace.swap(true, SeqCst)
+        {
+            self.flags.a1_committed.store(true, SeqCst);
+            wait_for(&self.flags.x_done).await;
+        }
+        <Sim as Bucket>::replace(&self.sim, key, body, expected).await
+    }
+}
+
+impl migrate::Store for Gated {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, BucketError> {
+        migrate::Store::list(&*self.sim, prefix).await
+    }
+    async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, BucketError> {
+        migrate::Store::list_dirs(&*self.sim, prefix).await
+    }
+    async fn copy(&self, from: &str, to: &str) -> Result<(), BucketError> {
+        migrate::Store::copy(&*self.sim, from, to).await
+    }
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+        migrate::Store::put(&*self.sim, key, body).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), BucketError> {
+        migrate::Store::delete(&*self.sim, key).await
+    }
+}
+
+/// The fixture's apps without `zeta`, so that `default` is the last
+/// tenant an `--apply` commits.
+fn apps_no_zeta() -> Vec<AppInfo> {
+    apps().into_iter().filter(|a| a.tenant != "zeta").collect()
+}
+
+/// `--apply` A1 is slow between its last commit and the rewrite of its
+/// lock after it. The same `--apply` started again (A6) plans while A1's
+/// lock is there, then is slow before its lock read. A third (A2) finds
+/// every tenant committed and releases A1's lock; `--remove-old --apply
+/// --forgo-rollback` then deletes the old keys on the strength of A1's
+/// commit. A1, finding its lock gone, must keep that commit (the tenant
+/// is marked): otherwise A6 migrates the tenant again from its
+/// tombstones and deletes the roots, the only copy.
+#[test]
+fn a_commit_a_removal_trusted_is_never_undone() {
+    let seed = 1;
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Arc::new(Sim::new(seed, fixture()));
+        let flags = Arc::new(Flags::default());
+        let gated = |role| Gated {
+            sim: Arc::clone(&sim),
+            flags: Arc::clone(&flags),
+            role,
+            lock_gets: AtomicU32::new(0),
+            after_commit: AtomicBool::new(false),
+            gated_replace: AtomicBool::new(false),
+        };
+        // A1: `--apply`, slow between its last commit and the hold after.
+        let a1 = {
+            let g = gated(Role::A1);
+            madsim::task::spawn(async move {
+                let r = Migrator::new(&g, &SimClock, apps_no_zeta(), options())
+                    .apply()
+                    .await;
+                format!("{r:?}")
+            })
+        };
+        wait_for(&flags.a1_at_commit).await;
+        // A6: the same `--apply` started again; its plan runs while A1's
+        // lock is there, then it is slow before its lock read.
+        let a6 = {
+            let g = gated(Role::A6);
+            madsim::task::spawn(async move {
+                let r = Migrator::new(&g, &SimClock, apps_no_zeta(), options())
+                    .apply()
+                    .await;
+                format!("{r:?}")
+            })
+        };
+        wait_for(&flags.a1_committed).await;
+        // A2: the same `--apply` once more: nothing pending, it releases
+        // A1's lock.
+        let a2 = Migrator::new(&*sim, &SimClock, apps_no_zeta(), options())
+            .apply()
+            .await;
+        a2.unwrap();
+        assert!(!sim.snapshot().contains_key(LOCK_KEY));
+        // X: `--remove-old --apply --forgo-rollback`.
+        let x = Migrator::new(&*sim, &SimClock, apps_no_zeta(), options())
+            .remove_old(remove_options(true))
+            .await;
+        assert!(x.unwrap().deletes() > 0);
+        flags.x_done.store(true, SeqCst);
+        let a1 = a1.await.unwrap();
+        assert!(
+            sim.snapshot()
+                .contains_key(&format!("{COMMIT_PREFIX}default")),
+            "A1 ({a1}) undid the commit the removal trusted"
+        );
+        flags.undo_done.store(true, SeqCst);
+        let a6 = a6.await.unwrap();
+        let m = sim.snapshot();
+        let mut lost = Vec::new();
+        for a in actors().iter().filter(|a| a.tenant == "default") {
+            for (key, _) in history(a) {
+                let bare = format!("{}/{key}", a.bare(Family::History));
+                let rooted = format!("{}/{key}", a.rooted(Family::History));
+                if !m.contains_key(&bare) && !m.contains_key(&rooted) {
+                    lost.push(rooted);
+                }
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "A6 ({a6}) deleted the only copy: {lost:#?}"
+        );
     });
 }
