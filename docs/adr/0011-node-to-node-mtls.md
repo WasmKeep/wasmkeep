@@ -5,6 +5,11 @@
   the known security gaps between nodes; the open questions below were answered with the
   recommended option and can be revisited (question 4 is still open,
   see below).
+- Amended 2026-11-14 (0.4.2): peers list `nodes/` every ten periods and
+  read the nodes they know every period ([ADR 0020](0020-one-lease-per-node.md),
+  amendment of the same day); a node that starts says hello, a signed
+  node call that makes each peer list at once, so its pin still reaches
+  them within a period. See "Amendment of 2026-11-14" at the end.
 - Date: 2026-11-05
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
@@ -248,3 +253,94 @@ change who is trusted get an adversarial review.
    ([single node](../deploy/single-node.md)). The library's
    `ClusterConfig` keeps `Accept` as its default, for embedders and the
    tests; the CLI is what operators run.)
+
+## Amendment of 2026-11-14: a hello for new pins
+
+Peers now list `nodes/` every ten heartbeat periods and read the objects
+of the nodes they know in between
+([ADR 0020](0020-one-lease-per-node.md), amendment of the same day). A
+new node's pin would then reach them up to 30 s after its start, while
+its readiness waits a period and a half for them to have listed it.
+
+### The hello
+
+- After its first refresh of the view (its own listing, after its first
+  lease write), a node sends each peer it found a **hello**: `POST
+  /_wasmkeep/hello`, empty body, signed as a node call (the cluster
+  secret, addressed to that peer, a nonce, the body's hash), on the
+  cluster port with TLS, else at the plain address.
+- A node that receives one checks it as any node call: the signature and
+  its addressee, the timestamp window, the body's hash, the record of
+  used signatures (a replay is refused), and in refuse mode only on the
+  cluster port. Anything else gets 403 and changes nothing. A valid hello
+  asks for a listing of `nodes/` (`wasmkeep_node_hellos_total`).
+- A listing asked for, by a hello, by an unknown pin knocking, or by an
+  ownership record naming a node this node has never seen, is made at
+  once: at most one such early listing a period, none in a period whose
+  own refresh was a listing, and one asked for after that at the next
+  period. A node so lists at most twice a period, the bound before the
+  amendment over TLS (a scheduled or asked-for listing and an early one).
+  Strangers cannot send a valid hello; over TLS they can still knock with
+  a pin, as before.
+- A peer that did not take a hello (no answer, a refused handshake, an
+  answer other than 200 or the 404 of 0.4.1) gets it again the next
+  period, for three rounds at most. Over TLS the first round is usually
+  refused at the handshake (the peer has not listed the new pin yet),
+  which makes the peer list; the next round then lands.
+- If two nodes start at once, each lists after its own first lease
+  write, so the later of the two listings sees the other, whose hello
+  then makes the earlier one list.
+
+### What still holds
+
+- **Pins of known nodes** are refreshed every period from the same
+  bodies, so revocation is as before: a peer fenced, released, deleted or
+  with a new key at its address is distrusted within a period; one that
+  stops writing, at its heartbeat's expiry (10 s), also when this node
+  cannot read the bucket.
+- **Readiness** waits a period and a half after the identity was
+  published, as before: the hello lands within milliseconds of the new
+  node's first refresh, and a peer lists then or at its next period. On a
+  slow bucket (the new node's first listing, or its secret, late) a node
+  can be ready a little before every peer listed it; its first calls to
+  such a peer are refused at the handshake and sent again (the existing
+  retry), a transient, as it was before when a peer's own listing was
+  late.
+- **An unknown pin** knocking still makes the node list sooner, as
+  before; with the scheduled listing every ten periods it also covers a
+  node whose hello was lost.
+
+### What got slower, worst cases at the defaults
+
+A node whose hellos do not reach a peer (lost three times, or a node of
+0.4.1, which sends none): over TLS, its first handshake with that peer
+is refused and makes the peer list within a period, and the call is sent
+again once the peer's listing shows it (the existing retry after a
+refused handshake). Over plain HTTP, the peer does not know it until its
+next scheduled listing (30 s) or until it meets an ownership record
+naming it, which makes it list at once: requests reaching that peer for
+the new node's actors get a 503 to retry for about a period, not more.
+Neither touches ownership.
+
+### Rolling upgrades
+
+0.4.1 answers a hello 404 (`/_wasmkeep/` is reserved and never reaches a
+component) and lists every period anyway. A node of 0.4.1 that starts
+beside nodes of 0.4.2 sends no hello: see above.
+
+### Tests
+
+`tests/cluster/listings.rs`, plain and over TLS (the cluster suite also
+runs from `tests/cluster_over_tls.rs`, every node behind a cluster
+listener):
+`a_node_that_joins_is_listed_by_its_peers_within_a_period` (fails without
+the hello, over TLS too), and
+`a_node_without_hellos_is_found_by_the_scheduled_listing` (the 404 of
+0.4.1 changes nothing). `tests/cluster_tls.rs`: the test's stranger
+heartbeats, which say no hello, are now waited for a scheduled listing
+(`settle_joined`, ten periods and a second) before their pins are
+expected trusted; what is checked about pins is unchanged.
+`cluster::tests::only_a_nodes_signed_hello_asks_for_a_listing`: unsigned,
+addressed to another node, for another path, with a body, with another
+method, replayed, and on the public port in refuse mode, a hello is
+refused and asks for nothing.

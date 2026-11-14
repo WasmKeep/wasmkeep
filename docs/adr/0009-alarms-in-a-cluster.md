@@ -3,6 +3,7 @@
 - Status: accepted (implemented 2026-11-03, revised after three rounds of adversarial review the same day; index keys tagged with the owner's generation and a nonce on 2026-11-05, closing a race with deletes that land late; R4, an alarm from before joining listed before the first upload, the same day). Mutation-checked tests cover the sweep delivering an orphaned alarm, sweeps getting past stuck entries, the cursor under an escaped prefix, committed retries, backoff for handlers that reschedule and fail, a fresh backoff per alarm, recording the listed entry, stale-entry cleanup, late deletes after a takeover and after an owner's own reschedule (the alarm still delivered by a node that never ran the actor), the owner's generation in new keys, and legacy entries next to tagged ones. Not covered by tests: listing from `exec-durable`, giving the actor up after a failed listing, the timer's backoff horizon, resuming after the delivery cap, and sharding when nodes disagree; R1 to R4 and the fence are also checked under deterministic simulation (`sim/tests/madsim_alarm_index.rs`): three owners in turns on node leases (`wasmkeep_sim::node`, ADR 0020: holds, fences, releases), state uploads following replication's late-commit rule, requests applied late, deletes timing out and landing later, crashes, with the invariant that a committed alarm's named entry exists checked every 50 ms. Some nodes join with an alarm in their own data. 200 seeds per push; untagged keys, no generation check, no fence, a first upload before its entry, and clearing while the bucket has nothing for the actor are each caught by some seed (the last two with a budget of 2,000 seeds; the empty-bucket case is reached by a fault aimed at a joining node's first upload, and a separate test shows the rules keep every entry under that fault). Cluster tests cover R4 (`an_alarm_from_single_node_data_is_indexed_before_its_first_upload`) and the entry left while the bucket has nothing (`an_entry_for_an_actor_the_bucket_never_had_stays_without_creating_it`). Not modelled there: `exec-durable`'s mid-event index update, deleting an actor, the PUT retry, legacy migration and timer delivery (cluster tests cover those). One known exception to the invariant as the simulation states it: if recording the new entry in the database fails after its PUT, the event is still replicated naming the previous entry (at another time), while the new, unnamed entry lists the alarm; nothing is lost (that entry is delivered, then removed as unnamed).
 - Amended by [ADR 0020](0020-one-lease-per-node.md) (2026-11-07): ownership is a node lease plus an ownership record per actor; where this record says lease, read the actor's hold (`LeaseView`: the hold exists and the node lease is valid). `sim/tests/madsim_alarm_index.rs` runs on node leases since 2026-11-07 (`wasmkeep_sim::node`, holds acting by the server's own rule): over 200 seeds, 1,511 takeovers, 3,993 alarms and the invariant held throughout (2,000 seeds: 15,086 takeovers); every unsafe variant is caught, within 20 seeds. On node leases a takeover during a joining node's first upload needs that node cut off and fenced (its lease keeps renewing while the upload is only slow), so "clearing while the bucket has nothing" is reached by a fault aimed at that upload (delayed at the bucket, the node cut off), under which the rules also hold.
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): the alarm index moves under the app's root, `state/<tenant>/<app>/`.
+- Amended 2026-11-14 (0.4.2): a sweep with nothing due waits until the earliest entry it listed is the sweep's, at most six sweep periods (60 s), and a change in the view of the nodes wakes it. See "Amendment of 2026-11-14" at the end.
 - Date: 2026-11-03
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
@@ -106,7 +107,8 @@ pending alarms that any node can read cheaply, and every node sweeps it.
    it. So the backoff survives hibernation and moves, a handler that
    reschedules itself and fails still backs off, and the index lists the
    retry time: no sweep delivers it early.
-4. **Sweep.** Every `alarm_sweep` (10 s) each node reads its tenant's index
+4. **Sweep.** Every `alarm_sweep` (10 s; less often when nothing is due,
+   amendment of 2026-11-14) each node reads its tenant's index
    up to "now minus a lease period plus grace", stopping at the first entry
    not that overdue. It reads at most 2048 entries and resumes after the
    last one next time, so entries nobody can act on (a class no node serves,
@@ -140,7 +142,10 @@ pending alarms that any node can read cheaply, and every node sweeps it.
 ## Consequences
 
 - An alarm whose owner dies fires on another node a lease period plus grace
-  after it was due, plus up to one sweep: about 25 s with the defaults.
+  after it was due, plus up to one sweep: about 25 s with the defaults
+  (since the amendment of 2026-11-14, for an entry the survivors' sweeps
+  had listed, or written before the owner left their view; see there for
+  the one case that waits up to 75 s).
 - One extra PUT per event that changes the alarm (plus a DELETE of the old
   entry); none for events that leave it alone, even under a new lease
   generation. A sweep reads only overdue entries.
@@ -208,3 +213,84 @@ pending alarms that any node can read cheaply, and every node sweeps it.
   have to read every entry, due or not (the first version did this; the
   review caught it).
 - **A per-node list of owned actors**: the dead node cannot hand it over.
+
+## Amendment of 2026-11-14: the sweep waits when nothing is due
+
+An idle node listed its alarm index every 10 s, 0.1 LIST/s per node,
+whether the index held anything or not, and on R2 and S3 a LIST costs
+what a PUT costs. What a sweep can deliver is known from its own listing:
+it stops at the first entry not overdue, and that entry becomes the
+sweep's at its due time plus a lease period plus grace.
+
+### The rule
+
+`alarm_index::next_sweep_wait_ms`, used by `sweep_alarms` and by
+`sim/tests/madsim_alarm_sweep.rs`:
+
+- After a sweep that listed entries due (delivered or not), stopped at
+  its scan cap, resumed after an earlier page (whose skipped entries stay
+  due), or failed: the next sweep a period later (`alarm_sweep`, 10 s), as
+  before.
+- After a sweep with nothing due: when the earliest entry it listed
+  becomes the sweep's, but at least a period and at most
+  `IDLE_SWEEP_FACTOR` (6) periods later, so 10 to 60 s; 60 s with an
+  empty index.
+- At once when the node's view of the nodes changes (a node joined,
+  left, went stale, was fenced, released, or restarted as a new
+  instance), at most one sweep a period: that is when a dead node's
+  entries need the sweep. The view is refreshed every heartbeat period
+  ([ADR 0020](0020-one-lease-per-node.md), amendment of the same day).
+
+### What still holds
+
+- The index, its keys and R1 to R4 are unchanged; only when a sweep runs
+  changed. Sharding, the scan and delivery caps, and anyone's entries are
+  unchanged.
+- An entry the sweep had listed is delivered at the latest a period after
+  it became the sweep's, as before: about 25 s after its due time with
+  the defaults. So is an entry of a node that dies, written before the
+  survivors saw it leave: its departure wakes their sweep, which lists the
+  entry and waits for its turn.
+
+### What got slower, worst case at the defaults
+
+An entry written after a node's last sweep, due before the earliest
+entry that sweep listed, whose owner stays alive and in view but never
+fires it (a timer lost to a bug, the case the sweep backstops; the
+common cases, an owner that died or a class nobody serves, are covered
+above and by the backlog rule): found by the next idle sweep, up to 60 s
+after the previous one, so up to 75 s after its due time instead of
+25 s. An index with entries coming due keeps the sweeps at their due
+times: an alarm actor firing every 15 s on a live node costs its peers
+about one listing every 15 to 30 s, against one every 10 s before.
+
+### Cost after
+
+Per node: one LIST a minute on an empty index, 0.017 LIST/s from 0.1.
+Measured in `tests/cluster/listings.rs`
+(`an_idle_node_lists_and_reads_what_its_cadences_say`: 10 sweeps in 120
+heartbeat periods with a 200 ms sweep period, the six-period wait).
+
+### Rolling upgrades
+
+A node of 0.4.1 sweeps every 10 s as before; the sweeps of the two
+versions share the index as they did, by the same hash.
+
+### Tests
+
+- `sim/tests/madsim_alarm_sweep.rs` spaces its sweeps by the rule, a
+  change in the lingering node's view waking them. Its liveness and rate
+  checks hold at 200 seeds; a light run (no backlog, agreeing views,
+  alarms coming due over 20 s) checks the latency the rule promises,
+  each entry delivered within a period (and the drift and the delivery's
+  own time) of becoming the sweep's
+  (`an_idle_sweep_delivers_each_alarm_within_a_period_of_its_turn`), and
+  an idle sweep that always waits its longest, ignoring the earliest
+  entry, is caught (`an_idle_sweep_that_ignores_the_earliest_entry_is_caught`).
+- `tests/cluster/listings.rs`, `a_view_change_wakes_the_alarm_sweep`: a
+  peer's clean stop makes the survivor sweep within five heartbeat
+  periods, where the idle wait is twelve; with the wake-up removed the
+  test fails.
+- `alarm_index::tests::an_idle_sweep_waits_for_the_earliest_entry_within_bounds`.
+- The cluster tests of orphaned alarms (`tests/cluster/alarms.rs`) pass
+  unchanged.
