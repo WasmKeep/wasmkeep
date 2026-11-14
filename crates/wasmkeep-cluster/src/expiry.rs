@@ -58,7 +58,7 @@ pub fn parse_idle(text: &str) -> Result<u64, String> {
     let n: u64 = number
         .parse()
         .map_err(|_| format!("{text:?}: a whole number and one unit, as in 7d"))?;
-    let secs = n.checked_mul(per).unwrap_or(u64::MAX);
+    let secs = n.saturating_mul(per);
     if secs < MIN_IDLE_SECS {
         return Err(format!("{text:?}: the shortest limit is one hour (1h)"));
     }
