@@ -903,21 +903,15 @@ fn is_broken_pipe_panic(message: &str) -> bool {
         && (message.contains("Broken pipe") || message.contains("os error 32"))
 }
 
-/// Whether a command failed on a write to a closed pipe.
-fn is_broken_pipe_error(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
-    })
-}
-
 /// A command whose reader went away (`wasmkeep cluster status --json |
 /// head`) stops quietly with [`BROKEN_PIPE_EXIT`], as a command killed by
 /// SIGPIPE would, instead of panicking: Rust ignores SIGPIPE, so the print
-/// fails instead. Every other panic is reported as before. Logs are not
-/// affected (the log writer drops what it cannot write), so a node whose
-/// log reader goes away keeps serving.
+/// fails instead. Every other panic is reported as before, and so is every
+/// error a command returns (an EPIPE on a bucket connection is a real
+/// failure). Logs are not affected (the log writer drops what it cannot
+/// write), so a node whose log reader goes away keeps serving: `serve`
+/// must log through `tracing`, never `println!`, which would end the node
+/// here without releasing its lease.
 fn quiet_broken_pipes() {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -936,14 +930,6 @@ fn quiet_broken_pipes() {
 
 fn main() -> anyhow::Result<()> {
     quiet_broken_pipes();
-    let result = run();
-    if result.as_ref().is_err_and(is_broken_pipe_error) {
-        std::process::exit(BROKEN_PIPE_EXIT);
-    }
-    result
-}
-
-fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -2619,10 +2605,6 @@ mod tests {
             "failed printing to stdout: No space left on device (os error 28)"
         ));
         assert!(!super::is_broken_pipe_panic("Broken pipe somewhere else"));
-        let pipe = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            .context("writing the report");
-        assert!(super::is_broken_pipe_error(&pipe));
-        assert!(!super::is_broken_pipe_error(&anyhow::anyhow!("other")));
     }
 
     #[test]
