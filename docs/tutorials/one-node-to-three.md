@@ -390,6 +390,8 @@ moto kept the bucket in memory, so it is gone too.
 
 ## Next
 
+- [Going to production](going-to-production.md): the checklist that
+  takes this cluster to production, tried first on your machine.
 - [Running a cluster](../cluster.md): how ownership, forwarding and
   replication work, every flag, deploys and rollbacks.
 - [When a node dies, and how it scales](../failover-and-scaling.md): what

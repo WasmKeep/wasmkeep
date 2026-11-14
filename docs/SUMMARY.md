@@ -9,6 +9,7 @@
 
 - [Your first actor](tutorials/first-actor.md)
 - [From one node to three](tutorials/one-node-to-three.md)
+- [Going to production](tutorials/going-to-production.md)
 - [Languages](languages.md)
 
 # Guide
