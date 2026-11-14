@@ -565,14 +565,55 @@ fn not_in_view(reply: &Reply) -> bool {
             && body.ends_with(" is not reachable"))
 }
 
+/// [`send`], or why no reply came: the connection failed or closed before
+/// a whole head arrived. Only for a request that may be sent again (a
+/// read), polled until it is answered: no reply says nothing about the
+/// actor, and the request may still have run.
+async fn try_send(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra: &str,
+) -> Result<Reply, String> {
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n{extra}Connection: close\r\n\r\n"
+    );
+    try_exchange(addr, &req).await
+}
+
 /// Sends a raw request (which must close the connection) and reads the reply.
 async fn exchange(addr: SocketAddr, req: &str) -> Reply {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    stream.write_all(req.as_bytes()).await.unwrap();
+    try_exchange(addr, req).await.unwrap_or_else(|e| {
+        let line = req.lines().next().unwrap_or_default();
+        panic!("{addr}, {line}: {e}")
+    })
+}
+
+/// [`exchange`], or why no reply came.
+async fn try_exchange(addr: SocketAddr, req: &str) -> Result<Reply, String> {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connecting: {e}"))?;
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("writing the request: {e}"))?;
     let mut raw = String::new();
-    stream.read_to_string(&mut raw).await.unwrap();
-    let (head, body) = raw.split_once("\r\n\r\n").unwrap();
-    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    stream
+        .read_to_string(&mut raw)
+        .await
+        .map_err(|e| format!("reading the reply: {e}"))?;
+    if raw.is_empty() {
+        return Err("the connection closed without a reply".to_owned());
+    }
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("no whole head in the reply: {raw:?}"))?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("no status in the reply: {head:?}"))?;
     let node = head.lines().find_map(|l| {
         let (k, v) = l.split_once(':')?;
         k.eq_ignore_ascii_case("x-wasmkeep-node")
@@ -588,7 +629,7 @@ async fn exchange(addr: SocketAddr, req: &str) -> Reply {
             name.eq_ignore_ascii_case("transfer-encoding") && value.trim() == "chunked"
         })
     });
-    Reply {
+    Ok(Reply {
         status,
         node,
         retry_after,
@@ -597,7 +638,29 @@ async fn exchange(addr: SocketAddr, req: &str) -> Reply {
         } else {
             body.to_owned()
         },
-    }
+    })
+}
+
+/// A connection closed without a reply is an error the caller sees, not
+/// a panic in the helper.
+#[tokio::test]
+async fn a_connection_closed_without_a_reply_is_reported() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut chunk = [0u8; 1024];
+            let _ = socket.read(&mut chunk).await;
+            drop(socket);
+        }
+    });
+    let got = try_send(addr, "GET", "/actor/t/x/durable", "").await;
+    assert!(
+        got.as_ref().is_err_and(|e| e.contains("without a reply")),
+        "{:?}",
+        got.map(|r| r.status)
+    );
 }
 
 fn dechunk(body: &str) -> String {

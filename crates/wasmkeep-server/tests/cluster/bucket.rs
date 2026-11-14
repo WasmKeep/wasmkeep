@@ -120,10 +120,14 @@ async fn a_node_s_restores_share_one_limit_on_reads() {
             let (addr, path) = (b.addr, path.clone());
             tokio::spawn(async move {
                 loop {
-                    let r =
-                        tokio::time::timeout(Duration::from_secs(5), send(addr, "GET", &path, ""))
-                            .await;
-                    if let Ok(r) = r
+                    // No reply in time, or none at all (a connection
+                    // closed under load): not served yet, asked again.
+                    let r = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        try_send(addr, "GET", &path, ""),
+                    )
+                    .await;
+                    if let Ok(Ok(r)) = r
                         && r.node.as_deref() == Some("b")
                     {
                         assert_eq!((r.status, r.body.trim()), (200, "30"));
