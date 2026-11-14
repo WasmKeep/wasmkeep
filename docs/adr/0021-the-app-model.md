@@ -5,13 +5,13 @@
   prefix, and new apps' names follow the class grammar
   (`crates/wasmkeep-server/src/apps.rs`,
   `crates/wasmkeep-server/tests/cluster/deploys.rs`,
-  `crates/wasmkeep-cli/tests/deploy_config.rs`). Planned for 0.4.0, each
-  with its own ADR: the front, app-owned actor state
+  `crates/wasmkeep-cli/tests/deploy_config.rs`). Built in 0.4.0, each
+  with its own ADR: the front ([ADR 0023](0023-the-front.md)), app-owned actor state
   ([ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)), the project file
   ([ADR 0026](0026-the-project-file.md)).
   Later: several apps on the same nodes.
 - Date: 2026-11-12
-- Release: 0.3.0 and [0.4.0](../../ROADMAP.md#now)
+- Release: 0.3.0 and [0.4.0](../../ROADMAP.md#m4-operating-a-cluster)
 
 ## Context
 

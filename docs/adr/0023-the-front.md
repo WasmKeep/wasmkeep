@@ -1,8 +1,8 @@
 # 0023. The front
 
-- Status: accepted (2026-11-14), planned for 0.4.0
+- Status: accepted (2026-11-14), built in 0.4.0
 - Date: 2026-11-14
-- Release: [0.4.0](../../ROADMAP.md#now)
+- Release: [0.4.0](../../ROADMAP.md#m4-operating-a-cluster)
 - Follows: [ADR 0021](0021-the-app-model.md) ("Front") and
   [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (the app
   between nodes).

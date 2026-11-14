@@ -34,7 +34,7 @@ const std = @import("std");
 
 /// This SDK's version: the WasmKeep release it comes with, the server's
 /// version (scripts/check-versions.py keeps them equal).
-pub const version = "0.3.0";
+pub const version = "0.4.0";
 
 /// The C SDK (`wasmkeep.h`), translated.
 pub const c = @import("wasmkeep_c");

@@ -1,8 +1,8 @@
 # 0026. The project file
 
-- Status: accepted (2026-11-14), planned for 0.4.0
+- Status: accepted (2026-11-14), built in 0.4.0
 - Date: 2026-11-14
-- Release: [0.4.0](../../ROADMAP.md#now)
+- Release: [0.4.0](../../ROADMAP.md#m4-operating-a-cluster)
 - Follows: [ADR 0021](0021-the-app-model.md) ("Who may reach a class":
   with a project file a class is `internal` unless it says otherwise) and
   [ADR 0023](0023-the-front.md) ("Not decided here": the project file,

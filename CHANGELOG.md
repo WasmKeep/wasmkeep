@@ -9,7 +9,43 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
-Since 0.3.0, in no release yet.
+Since 0.4.0, in no release yet.
+
+## 0.4.0
+
+**An app is one thing.** An app's classes and its front are deployed,
+versioned and rolled back together, and the app owns its actors' state:
+each app keys its actors under its own root in the bucket, so two apps
+never share an actor, and a one-time migration moves a bucket prefix
+written by 0.2 or 0.3 there. The front, a stateless component deployed
+with the app, receives every request outside `/actor/` and calls the
+app's actors, several at once with `call-many`. A project file,
+`wasmkeep.toml`, says what the app is, for `deploy` and `dev`, with
+classes `internal` unless it says otherwise. Load you can see: actors,
+sockets and events per node and per app in `cluster status` and the
+metrics. A WebSocket room that hibernates wakes where its sockets are,
+so a call through another node keeps its clients connected. `wasmkeep
+cluster diagnose` checks that a bucket does what WasmKeep relies on.
+Still a **pre-alpha pre-release**: for trying WasmKeep, side projects
+and staging, not production. The interface between a component and the
+host stays `wasmkeep:actor@0.2.0`, with the worlds `front` and
+`front-core` and the interface `calls` added: a component built for an
+earlier release runs as it is. Fronts and `call-many` are in the Rust
+and TypeScript SDKs first. See the [roadmap](ROADMAP.md) for what comes
+next.
+
+**Upgrade: stop-all.** Every node is stopped for a one-time migration of
+the bucket layout ([upgrading to 0.4.0](docs/deploy/upgrading-to-0.4.md));
+no rolling upgrade from 0.3.x.
+
+Soaked on three nodes against a real bucket, on a bucket prefix migrated
+to the new layout, a node killed every three minutes: two hours on the
+code of app-owned state and the migration (commit `7e03c05`; the front
+and the later changes came after it). 39 kills, 393,063 acknowledged
+durable writes, none lost or duplicated; failover p50 17.3 s, p99
+22.3 s, max 24.9 s; no alarm missed; no stale read after a takeover; a
+restarted node ready again within 0.2 s
+(`bench/results/2026-11-14-7e03c05-soak-ovh-bhs-3vps-2h-0.4.csv`).
 
 ### What changed
 
@@ -32,7 +68,10 @@ Since 0.3.0, in no release yet.
   refuses `--actor`, `--access`, `--config`, `--requires` and the front
   flags, and `dev` refuses crate directories, `--access` and `--env`;
   pass `--no-project` to use them. Deploys with flags elsewhere are
-  unchanged, their default of `open` included.
+  unchanged, their default of `open` included. A build runs without
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`:
+  the deploy's bucket credentials are not the build's, and a build that
+  needs credentials of its own takes them from a profile or a file.
 - **A WebSocket room wakes where its sockets are**
   ([ADR 0024](docs/adr/0024-socket-home.md)). A room that hibernates with
   sockets open keeps its ownership record, so an event reaching it through
@@ -175,11 +214,11 @@ Since 0.3.0, in no release yet.
   a secrets change); the Grafana dashboard charts both in a new row
   ([alerts](docs/monitoring.md#alerts-worth-having)).
 - **A build names its commit.** A build from a git checkout reports
-  `0.3.0+<commit>` (`wasmkeep --version`, its heartbeat, so the VERSION
-  column of `cluster status`, and `wasmkeep_info{version}`); a build of a
-  release's tag, or one without git (a source tarball, a container image
-  built locally), reports the release alone. Before, every build reported
-  `0.3.0`. The usage report still sends the release version alone.
+  the release and its commit, `0.4.0+<commit>` (`wasmkeep --version`, its
+  heartbeat, so the VERSION column of `cluster status`, and
+  `wasmkeep_info{version}`); a build of a release's tag, or one without
+  git (a source tarball, a container image built locally), reports the
+  release alone. Before, every build reported the release alone. The usage report still sends the release version alone.
 - **Clock skew, one figure.** The pages that gave the lease timings'
   tolerance as "a few seconds" now say what the code allows, as
   `cluster diagnose` does: 1 s between nodes, and between a node and the
@@ -267,7 +306,7 @@ Since 0.3.0, in no release yet.
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md#3-the-ownership-record),
   amended 2026-11-14).
 
-### The front, host side (for 0.4.0)
+### The front, host side
 
 The stateless component given to `serve` becomes the app's front
 ([ADR 0023](docs/adr/0023-the-front.md)). It ships with the app's deploy:
@@ -339,7 +378,7 @@ Behaviour changes:
 - The guest log names the stateless component `actor=_front` instead of
   `actor=stateless`.
 
-### The front in deploys (for 0.4.0)
+### The front in deploys
 
 An app's front ships in its version, with the classes
 ([ADR 0023](docs/adr/0023-the-front.md),
@@ -394,7 +433,7 @@ An app's front ships in its version, with the classes
   reads them), with no `--force`: such a node could not read the version,
   or any of the app's secrets.
 
-### App-owned state (for 0.4.0)
+### App-owned state
 
 These change the layout in the bucket and on disk; they supersede the
 second-app refusal and the migration guard listed under 0.3.0. See
@@ -538,6 +577,30 @@ With or without actor state:
 - `wasmkeep actor move TENANT/CLASS/NAME` becomes `wasmkeep actor move
   --app TENANT/APP CLASS/NAME` for an actor of a deployed app; scripts
   that move actors of `default/default` keep working.
+- Components built for 0.1.0 to 0.3.0 need no rebuild. The SDKs are at
+  `0.4.0` on their registries, with the server. Actors built with the
+  Rust SDK keep its default features; a Rust front depends on
+  `wasmkeep-sdk` with `default-features = false`.
+- Dashboards, recording rules and exact selectors on the series with a
+  `class` label add `tenant` and `app`; log queries on `actor=` use
+  `app=TENANT/APP actor=CLASS/NAME` (both under What changed).
+
+### Known limits
+
+The limits listed for 0.3.0 still hold. Also:
+
+- The front cannot yet accept a WebSocket at its own path and hand it to
+  an actor: a room is still reached at `/actor/<class>/<name>` (planned
+  for 0.4.1, [roadmap](ROADMAP.md#now)).
+- Fronts and `call-many` are in the Rust and TypeScript SDKs only; the
+  other SDKs build actors as before.
+
+### Install and verify
+
+[Install](README.md#install) downloads a binary or runs the image.
+[Single node](docs/deploy/single-node.md#1-install-the-binary) shows the
+cosign check, the same for every file of the release;
+[Compose](deploy/compose/README.md) checks the image.
 
 ## 0.3.0
 

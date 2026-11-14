@@ -140,7 +140,7 @@ On Linux, x86_64 or aarch64 (glibc 2.28 or newer), download a release. Name
 the version: releases are pre-releases for now, so there is no `latest`.
 
 ```bash
-v=0.3.0
+v=0.4.0
 f=wasmkeep-$v-$(uname -m)-unknown-linux-gnu.tar.gz
 curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v$v/$f"
 tar xzf "$f" && sudo install -m 755 "${f%.tar.gz}/wasmkeep" /usr/local/bin/wasmkeep
@@ -149,7 +149,7 @@ wasmkeep --version
 
 Every file of a release is signed:
 [check a download](docs/deploy/single-node.md#1-install-the-binary) before
-you trust it. Or use the container image, `ghcr.io/wasmkeep/wasmkeep:0.3.0`,
+you trust it. Or use the container image, `ghcr.io/wasmkeep/wasmkeep:0.4.0`,
 for linux/amd64 and linux/arm64
 ([running it](deploy/compose/README.md#the-image-on-its-own)). On macOS and Windows,
 use the image or build from source (below).
@@ -207,8 +207,8 @@ of your server:
 | Rust | `cargo add wasmkeep-sdk` | [Your first actor in 10 minutes](docs/tutorials/first-actor.md) |
 | TypeScript | `npm install @wasmkeep/sdk` | [its README](sdks/typescript/README.md) |
 | Python | `pip install wasmkeep` | [its README](sdks/python/README.md) |
-| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.3.0` | [its README](sdks/go/README.md) |
-| C, Zig | `wasmkeep-c-sdk-0.3.0.tar.gz`, `wasmkeep-zig-sdk-0.3.0.tar.gz` from the release | the README in each archive |
+| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.4.0` | [its README](sdks/go/README.md) |
+| C, Zig | `wasmkeep-c-sdk-0.4.0.tar.gz`, `wasmkeep-zig-sdk-0.4.0.tar.gz` from the release | the README in each archive |
 
 [Languages](docs/languages.md) has the trade-offs of each, with numbers.
 
@@ -265,7 +265,7 @@ All of it also builds as a site: `./scripts/docs-site.sh` (needs
 ## Status
 
 WasmKeep is young and **pre-alpha**: its releases so far, `0.1.0`,
-`0.2.0` and `0.3.0`, are pre-releases ([changelog](CHANGELOG.md)).
+`0.2.0`, `0.3.0` and `0.4.0`, are pre-releases ([changelog](CHANGELOG.md)).
 
 - **Works, and is tested**: everything in the status note at the top,
   each feature with tests that run before every merge, the node lease,

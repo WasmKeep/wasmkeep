@@ -56,7 +56,7 @@ cargo build --release --target wasm32-wasip2
 
 The result, `target/wasm32-wasip2/release/<name>.wasm`, is a component for
 the `wasmkeep:actor/actor` world; run it with `wasmkeep serve`. The
-[tutorial](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/tutorials/first-actor.md)
+[tutorial](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/tutorials/first-actor.md)
 goes from an empty directory to an actor whose state survives a restart.
 
 ## What is in the crate
@@ -66,7 +66,7 @@ goes from an empty directory to an actor whose state survives a restart.
 - `actors`: calls to other actors of the same app.
 - `calls`: several of those calls at once (`calls::call_many`, at most 16,
   one result per call in input order), from actors and fronts
-  ([ADR 0025](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0025-calling-several-actors-at-once.md)).
+  ([ADR 0025](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/adr/0025-calling-several-actors-at-once.md)).
 - `websockets`: connections to this actor, with the `Actor::on_websocket_*` hooks.
 - `env`: configuration and secrets the operator gives the class (or the front).
 - `caller`, `Caller`: who sent a request (the app's front, another actor,
@@ -74,17 +74,17 @@ goes from an empty directory to an actor whose state survives a restart.
 - `http`: the request handler, helpers to answer, and outbound requests.
 - `kv`, `queue`, `workflow`: a key-value store, queues and durable workflows,
   each built from actors
-  ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/kv-and-queues.md),
-  [workflows](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/workflows.md)).
+  ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/kv-and-queues.md),
+  [workflows](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/workflows.md)).
 - `wasi`: the WASI 0.2 bindings (the `wasip2` crate).
 
-The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/reference/api.md)
+The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/reference/api.md)
 lists every host function with its name in each SDK.
 
 ## Writing a front
 
 A front is an app's stateless `wasi:http` component
-([ADR 0023](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0023-the-front.md)):
+([ADR 0023](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/adr/0023-the-front.md)):
 it receives every request outside `/actor/` and `/_wasmkeep/`, routes,
 signs users in, and calls the app's actors with `actors::call` as an
 inside caller, so it reaches `internal` classes. It targets the
@@ -152,7 +152,7 @@ The `front` module has:
 
 Validate any name you take from a request before using it in an address:
 each new name is a new actor with its own database.
-[`examples/todo-front`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/todo-front)
+[`examples/todo-front`](https://github.com/WasmKeep/wasmkeep/tree/v0.4.0/examples/todo-front)
 is a front with a page, a JSON API, sign-in by token, and an `internal`
 class that checks `caller()`.
 
@@ -163,8 +163,8 @@ Without the `actor` feature the crate has `front`, `actors`, `env`,
 ## Versions
 
 The crate has the version of the WasmKeep server it is released with: use
-the two at the same version (`cargo add wasmkeep-sdk@0.3.0` for server
-0.3.0). It needs Rust 1.97 or later. The interface it binds to, `wasmkeep:actor@0.2.0`, is versioned on its own: the
+the two at the same version (`cargo add wasmkeep-sdk@0.4.0` for server
+0.4.0). It needs Rust 1.97 or later. The interface it binds to, `wasmkeep:actor@0.2.0`, is versioned on its own: the
 WIT files are in `wit/`, a copy of the ones the server is built from.
 
 ## License
