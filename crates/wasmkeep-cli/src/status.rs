@@ -97,6 +97,10 @@ impl Node {
 pub(crate) struct App {
     pub(crate) name: String,
     pub(crate) current: Result<Option<Current>, String>,
+    /// Whether the deployed version has a front (ADR 0023), from its
+    /// manifest; `None` without a deployed version or when its manifest
+    /// cannot be read (which is no error here: nodes refuse it).
+    pub(crate) front: Option<bool>,
 }
 
 /// Everything `cluster status` prints.
@@ -135,14 +139,14 @@ pub(crate) async fn read(
         read_at_ms: now_ms,
         horizon_ms,
         nodes,
-        apps: read_apps(store.as_ref(), prefix, bucket).await?,
+        apps: read_apps(&store, prefix, bucket).await?,
     })
 }
 
 /// `apps/<tenant>/<app>/current` for every app, listing one level at a time
-/// (never the uploaded components).
+/// (never the uploaded components), and its version's manifest.
 async fn read_apps(
-    store: &dyn ObjectStore,
+    store: &Arc<dyn ObjectStore>,
     prefix: &str,
     bucket: &str,
 ) -> anyhow::Result<Vec<App>> {
@@ -164,11 +168,11 @@ async fn read_apps(
             .await
             .map_err(listing_failed)?;
         for app in names.common_prefixes {
-            let name = format!(
-                "{}/{}",
+            let (tenant_name, app_name) = (
                 tenant.filename().unwrap_or_default(),
-                app.filename().unwrap_or_default()
+                app.filename().unwrap_or_default(),
             );
+            let name = format!("{tenant_name}/{app_name}");
             let current = match store.get(&app.clone().join("current")).await {
                 Ok(r) => match r.bytes().await {
                     Ok(body) => Current::parse(&body)
@@ -179,7 +183,24 @@ async fn read_apps(
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
                 Err(e) => Err(e.to_string()),
             };
-            apps.push(App { name, current });
+            let front = match &current {
+                Ok(Some(c)) => wasmkeep_server::apps::AppRef::new(
+                    Arc::clone(store),
+                    prefix,
+                    tenant_name,
+                    app_name,
+                )
+                .manifest(&c.version)
+                .await
+                .ok()
+                .map(|m| m.front.is_some()),
+                _ => None,
+            };
+            apps.push(App {
+                name,
+                current,
+                front,
+            });
         }
     }
     apps.sort_by(|a, b| a.name.cmp(&b.name));
@@ -376,6 +397,7 @@ impl Report {
                     "actors": n.load().map(|l| l.actors),
                     "sockets": n.load().map(|l| l.sockets),
                     "events_per_min": n.load().and_then(|l| l.events_per_min),
+                    "front_per_min": n.load().and_then(|l| l.front_per_min),
                 })
             })
             .collect();
@@ -386,13 +408,13 @@ impl Report {
                 let actors = self.app_actors(&a.name);
                 match &a.current {
                     Ok(Some(c)) => {
-                        json!({"app": a.name, "version": c.version, "seq": c.seq, "actors": actors})
+                        json!({"app": a.name, "version": c.version, "seq": c.seq, "actors": actors, "front": a.front})
                     }
                     Ok(None) => {
-                        json!({"app": a.name, "version": null, "seq": null, "actors": actors})
+                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "front": null})
                     }
                     Err(e) => {
-                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "error": e})
+                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "front": null, "error": e})
                     }
                 }
             })
@@ -428,7 +450,7 @@ impl Report {
         if self.nodes.is_empty() {
             out.push_str("No nodes.\n");
         } else {
-            let rows: Vec<[String; 12]> = self
+            let rows: Vec<[String; 13]> = self
                 .nodes
                 .iter()
                 .map(|n| {
@@ -450,6 +472,7 @@ impl Report {
                         count(n.load().map(|l| l.actors)),
                         count(n.load().map(|l| l.sockets)),
                         count(n.load().and_then(|l| l.events_per_min)),
+                        count(n.load().and_then(|l| l.front_per_min)),
                         n.info.version.clone(),
                         or_dash(&n.info.app),
                         n.info.address.clone(),
@@ -475,6 +498,7 @@ impl Report {
                     "ACTORS",
                     "SOCKETS",
                     "EV/MIN",
+                    "FRONT/MIN",
                     "VERSION",
                     "APP",
                     "ADDRESS",
@@ -488,7 +512,7 @@ impl Report {
         if self.apps.is_empty() {
             out.push_str("No deployed apps.\n");
         } else {
-            let rows: Vec<[String; 4]> = self
+            let rows: Vec<[String; 5]> = self
                 .apps
                 .iter()
                 .map(|a| {
@@ -502,12 +526,17 @@ impl Report {
                         version,
                         seq,
                         count(self.app_actors(&a.name)),
+                        match a.front {
+                            Some(true) => "yes".to_owned(),
+                            Some(false) => "no".to_owned(),
+                            None => "-".to_owned(),
+                        },
                     ]
                 })
                 .collect();
             table(
                 &mut out,
-                ["APP", "DEPLOYED VERSION", "SEQ", "ACTORS"],
+                ["APP", "DEPLOYED VERSION", "SEQ", "ACTORS", "FRONT"],
                 &rows,
             );
         }
@@ -941,17 +970,26 @@ mod tests {
     /// or of a version without the line shows `-`, never a stale count.
     #[test]
     fn load_is_shown_for_live_nodes_and_summed_per_app() {
-        let load = |actors, sockets, events_per_min| {
+        let load = |actors, sockets, events_per_min, front_per_min| {
             Some(membership::Load {
                 actors,
                 sockets,
                 events_per_min,
+                front_per_min,
             })
         };
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         block_on(async {
-            beat_with(&store, "a", NOW, false, "acme/shop", load(3, 1, Some(120))).await;
-            beat_with(&store, "b", NOW, false, "acme/shop", load(2, 0, None)).await;
+            beat_with(
+                &store,
+                "a",
+                NOW,
+                false,
+                "acme/shop",
+                load(3, 1, Some(120), Some(45)),
+            )
+            .await;
+            beat_with(&store, "b", NOW, false, "acme/shop", load(2, 0, None, None)).await;
             // c: a version without line 10.
             beat(&store, "c", NOW, false, "acme/shop").await;
             // d: stale, its last load kept.
@@ -961,11 +999,19 @@ mod tests {
                 NOW - 60_000,
                 false,
                 "acme/shop",
-                load(40, 4, Some(9)),
+                load(40, 4, Some(9), Some(9)),
             )
             .await;
             // e: fenced, its last load kept.
-            beat_with(&store, "e", NOW, false, "beta/new", load(50, 5, Some(9))).await;
+            beat_with(
+                &store,
+                "e",
+                NOW,
+                false,
+                "beta/new",
+                load(50, 5, Some(9), Some(9)),
+            )
+            .await;
             let key = StorePath::from("demo/nodes/e");
             let live = store.get(&key).await.unwrap().bytes().await.unwrap();
             let fenced =
@@ -980,6 +1026,19 @@ mod tests {
             )
             .await;
             put(&store, "demo/apps/beta/new/current", "fedcba9876543210 1\n").await;
+            // acme/shop's version has a front, beta/new's has not.
+            put(
+                &store,
+                "demo/apps/acme/shop/0123456789abcdef/manifest",
+                "wasmkeep-manifest 3\nfront main 44\n",
+            )
+            .await;
+            put(
+                &store,
+                "demo/apps/beta/new/fedcba9876543210/manifest",
+                "wasmkeep-manifest 1\nclass chat 11\n",
+            )
+            .await;
         });
         let r = report(store);
         let j = r.to_json();
@@ -989,15 +1048,22 @@ mod tests {
                 n["actors"].clone(),
                 n["sockets"].clone(),
                 n["events_per_min"].clone(),
+                n["front_per_min"].clone(),
             )
         };
-        assert_eq!(cells(0), (json!(3), json!(1), json!(120)));
-        assert_eq!(cells(1), (json!(2), json!(0), Value::Null));
+        assert_eq!(cells(0), (json!(3), json!(1), json!(120), json!(45)));
+        assert_eq!(cells(1), (json!(2), json!(0), Value::Null, Value::Null));
         for i in 2..5 {
-            assert_eq!(cells(i), (Value::Null, Value::Null, Value::Null), "{i}");
+            assert_eq!(
+                cells(i),
+                (Value::Null, Value::Null, Value::Null, Value::Null),
+                "{i}"
+            );
         }
         assert_eq!(j["apps"][0]["actors"], 5);
         assert_eq!(j["apps"][1]["actors"], Value::Null);
+        assert_eq!(j["apps"][0]["front"], true);
+        assert_eq!(j["apps"][1]["front"], false);
 
         let text = r.to_text();
         let row = |id: &str| {
@@ -1009,17 +1075,17 @@ mod tests {
         };
         let header: Vec<&str> = text.lines().nth(2).unwrap().split_whitespace().collect();
         assert_eq!(
-            header[3..7],
-            ["STATE", "ACTORS", "SOCKETS", "EV/MIN"],
+            header[3..8],
+            ["STATE", "ACTORS", "SOCKETS", "EV/MIN", "FRONT/MIN"],
             "{text}"
         );
-        assert_eq!(row("a")[4..7], ["3", "1", "120"], "{text}");
-        assert_eq!(row("b")[4..7], ["2", "0", "-"], "{text}");
+        assert_eq!(row("a")[4..8], ["3", "1", "120", "45"], "{text}");
+        assert_eq!(row("b")[4..8], ["2", "0", "-", "-"], "{text}");
         for id in ["c", "d"] {
-            assert_eq!(row(id)[4..7], ["-", "-", "-"], "{text}");
+            assert_eq!(row(id)[4..8], ["-", "-", "-", "-"], "{text}");
         }
         // e's LIVE cell is two words: `no (fenced)`.
-        assert_eq!(row("e")[5..8], ["-", "-", "-"], "{text}");
+        assert_eq!(row("e")[5..9], ["-", "-", "-", "-"], "{text}");
         // STATE too: a node not live serves nothing, whatever its last
         // heartbeat said; LIVE says why.
         assert_eq!(row("a")[3], "serving", "{text}");
@@ -1030,14 +1096,17 @@ mod tests {
             assert_eq!(j["nodes"][i]["state"], Value::Null, "{i}");
         }
         assert!(
-            text.contains("APP        DEPLOYED VERSION  SEQ  ACTORS"),
+            text.contains("APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT"),
             "{text}"
         );
         assert_eq!(
             row("acme/shop"),
-            ["acme/shop", "0123456789abcdef", "4", "5"]
+            ["acme/shop", "0123456789abcdef", "4", "5", "yes"]
         );
-        assert_eq!(row("beta/new"), ["beta/new", "fedcba9876543210", "1", "-"]);
+        assert_eq!(
+            row("beta/new"),
+            ["beta/new", "fedcba9876543210", "1", "-", "no"]
+        );
     }
 
     #[test]
@@ -1070,6 +1139,7 @@ mod tests {
                 actors: 7,
                 sockets: 0,
                 events_per_min: None,
+                front_per_min: None,
             };
             beat_with(&store, "a", NOW, false, "acme/shop", Some(load)).await;
             put(
@@ -1095,14 +1165,15 @@ mod tests {
         assert_eq!(
             j["apps"],
             json!([
-                {"app": "acme/admin", "version": null, "seq": null, "actors": null, "error": "unreadable current"},
-                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4, "actors": 7},
-                {"app": "beta/new", "version": null, "seq": null, "actors": null},
+                {"app": "acme/admin", "version": null, "seq": null, "actors": null, "front": null, "error": "unreadable current"},
+                // An unreadable manifest: not known, and no error.
+                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4, "actors": 7, "front": null},
+                {"app": "beta/new", "version": null, "seq": null, "actors": null, "front": null},
             ])
         );
         let text = r.to_text();
         assert!(
-            text.contains("acme/shop   0123456789abcdef      4    7\n"),
+            text.contains("acme/shop   0123456789abcdef      4    7       -\n"),
             "{text}"
         );
     }

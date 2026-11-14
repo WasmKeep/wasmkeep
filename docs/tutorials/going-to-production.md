@@ -150,13 +150,13 @@ wasmkeep cluster status --bucket "$BUCKET"
 ```text
 Cluster s3://demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE   STATE    ACTORS  SOCKETS  EV/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
-a     yes   2.0s  serving  1       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
-b     yes   2.0s  serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
-c     yes   2.0s  serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
+NODE  LIVE  AGE   STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
+a     yes   2.0s  serving  1       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
+b     yes   2.0s  serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
+c     yes   2.0s  serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
 
-APP        DEPLOYED VERSION  SEQ  ACTORS
-demo/shop  7973128b9d723db8  1    1
+APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT
+demo/shop  7973128b9d723db8  1    1       no
 
 3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0+4f1c2a9e7b3d
 ```
@@ -167,7 +167,7 @@ and no `warning:` line follows. A node started with `--cluster-plaintext
 accept` and no listener shows `plain`, with a warning: move such a
 cluster to TLS in two rounds, as
 [Operating it](../deploy/three-nodes.md#operating-it) says. (The ACTORS,
-SOCKETS and EV/MIN columns are **main only**.)
+SOCKETS, EV/MIN, FRONT/MIN and FRONT columns are **main only**.)
 
 ## 4. The front door
 
@@ -285,11 +285,11 @@ wasmkeep deploy --app "$APP" --bucket "$BUCKET" --rollback
 
 ```text
   requires counter: ADMIN_TOKEN no longer required
-demo/shop: version 7973128b9d723db8 is current (deploy 3)
+rolled back demo/shop: 1ce5b445d3fa0b38 -> 7973128b9d723db8 (deploy 3)
 ```
 
-The version id is the first deploy's again, at a new `seq` (`cluster
-status` shows both in its app table). `deploy` keeps the current version
+The version rolled back to is the first deploy's again, at a new `seq`
+(`cluster status` shows both in its app table). `deploy` keeps the current version
 and the five before it, so you can roll back that many times in a row.
 
 ## 7. Monitoring

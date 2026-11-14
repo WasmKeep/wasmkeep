@@ -1,6 +1,7 @@
 //! This node's load, published with its heartbeat (payload line 10 of the
-//! node lease, `load actors=<n> sockets=<n> events_per_min=<n|->`) for
-//! `wasmkeep cluster status`. Advisory: nothing decides on it.
+//! node lease, `load actors=<n> sockets=<n> events_per_min=<n|->
+//! front_per_min=<n|->`) for `wasmkeep cluster status`. Advisory: nothing
+//! decides on it.
 
 use std::collections::VecDeque;
 
@@ -61,18 +62,24 @@ fn millis(d: Duration) -> u64 {
 /// line 10): actors and sockets as of that write, so `cluster status` lags
 /// what the node runs by at most one heartbeat period, and shows the drain
 /// state of the same moment. No write of its own: it rides on the lease
-/// writes. Events are the process's (every node it runs).
+/// writes. Events and front requests are the process's (every node it
+/// runs), each measured as [`EventRate`] measures events.
 pub(super) fn load_source(
     service: std::sync::Weak<ServiceInner>,
 ) -> wasmkeep_cluster::membership::LoadSource {
     let start = tokio::time::Instant::now();
     let rate = std::sync::Mutex::new(EventRate::default());
+    let front_rate = std::sync::Mutex::new(EventRate::default());
     Box::new(move || {
         let at = millis(start.elapsed());
         let events_per_min = rate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sample(at, crate::metrics::METRICS.events.total());
+        let front_per_min = front_rate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sample(at, crate::metrics::METRICS.front_requests.total());
         // Gone (the service is stopping): nothing runs here any more.
         let (actors, sockets) = service.upgrade().map_or((0, 0), |inner| {
             (inner.mailboxes.resident(), inner.sockets.len())
@@ -81,6 +88,7 @@ pub(super) fn load_source(
             actors: u64::try_from(actors).unwrap_or(u64::MAX),
             sockets: u64::try_from(sockets).unwrap_or(u64::MAX),
             events_per_min,
+            front_per_min,
         }
     })
 }

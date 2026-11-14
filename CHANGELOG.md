@@ -213,6 +213,31 @@ Since 0.3.0, in no release yet.
   - A command whose output goes to a closed pipe (`wasmkeep cluster
     status --json | head`) exits quietly with status 141 instead of
     panicking with "failed printing to stdout: Broken pipe".
+  - `serve --app` started before the app's first deploy waits for it
+    (`waiting for the first deploy of demo/shop (wasmkeep deploy --app
+    demo/shop --bucket s3://demo ...): this node starts serving when one
+    lands`), reading `current` every 3 s as for new versions, instead of
+    exiting with "nothing is deployed for demo/shop yet". It neither
+    listens nor writes a heartbeat until then; nodes and the first deploy
+    may now start in any order.
+  - A deploy that changes nothing says `demo/shop: nothing changed:
+    version V is already current (deploy N)` (it wrote nothing and `N` is
+    unchanged), and a rollback says `rolled back demo/shop: FROM -> TO
+    (deploy N)`, instead of the line of a new deploy. From a project
+    file, the no-op line replaces `nothing changed: the deployed version
+    is the file's`. Scripts that read `version V is current` after a
+    rollback need the new line.
+  - The warning when a deploy or rollback removes the front of an app
+    with secrets gives the two commands to run in full, with the bucket
+    and app filled in: `wasmkeep secrets list --bucket B --app T/A --key
+    KEY_FILE` and `wasmkeep secrets unset --bucket B --app T/A --key
+    KEY_FILE --front NAME...`.
+  - `cluster status` shows front requests per minute per node
+    (FRONT/MIN; `front_per_min` in `--json`, and a new
+    `front_per_min=<n|->` key on the heartbeat's load line, which
+    earlier readers skip), and whether each app's deployed version has a
+    front (FRONT, `yes` or `no`; `front` in `--json`). EV/MIN still
+    counts actor events only.
 - **A move of a room parked with open sockets waits for its record's
   release**: one whose release did not land was reported done, its
   request deleted, while the room stayed. A lapse or a clean stop no
