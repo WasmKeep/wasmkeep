@@ -355,10 +355,16 @@ macro_rules! try_or {
 /// scratch prefix, then deletes everything written. `Err` if it did not
 /// start (nothing written).
 pub(crate) async fn run<T: Target>(target: &T, options: &Options) -> Result<Report, NotRun> {
-    match Store::list(target, "").await {
-        Ok(found) if !found.is_empty() => return Err(NotRun::NotEmpty(found.len())),
-        Ok(_) => {}
-        Err(e) => return Err(NotRun::Unreachable(e.to_string())),
+    match tokio::time::timeout(options.check_timeout, Store::list(target, "")).await {
+        Ok(Ok(found)) if !found.is_empty() => return Err(NotRun::NotEmpty(found.len())),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(NotRun::Unreachable(e.to_string())),
+        Err(_) => {
+            return Err(NotRun::Unreachable(format!(
+                "no answer within {} s",
+                options.check_timeout.as_secs_f64()
+            )));
+        }
     }
     let t = Tracked {
         inner: target,
@@ -386,7 +392,15 @@ pub(crate) async fn run<T: Target>(target: &T, options: &Options) -> Result<Repo
     bounded!("replace-if-match", replace_if_match(&t));
     bounded!("read-after-write", read_after_write(&t));
     bounded!("read-after-overwrite", read_after_overwrite(&t));
-    let (seen, gone) = list_lag(&t, options).await;
+    let (seen, gone) = tokio::time::timeout(options.check_timeout, list_lag(&t, options))
+        .await
+        .unwrap_or_else(|_| {
+            let late = || format!("no answer within {} s", options.check_timeout.as_secs_f64());
+            (
+                check("list-new-key", Status::Error, late()),
+                check("list-deleted-key", Status::Error, late()),
+            )
+        });
     checks.push(seen);
     checks.push(gone);
     bounded!("delete-absent", delete_absent(&t));
@@ -415,12 +429,10 @@ async fn cleanup<T: Target>(
     t: &Tracked<'_, T>,
     options: &Options,
 ) -> (Option<usize>, Option<String>) {
-    let mut keys: BTreeSet<String> = t.written.borrow().clone();
+    // Only what this run wrote: anything else found under the prefix is
+    // reported, never deleted.
+    let keys: BTreeSet<String> = t.written.borrow().clone();
     let mut error = None;
-    match t.list("").await {
-        Ok(listed) => keys.extend(listed.into_iter().map(|(k, _, _)| k)),
-        Err(e) => error = Some(format!("listing: {e}")),
-    }
     let keys: Vec<String> = keys.into_iter().collect();
     for chunk in keys.chunks(32) {
         for (key, result) in chunk
@@ -930,41 +942,59 @@ async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Chec
 /// time in whole seconds widens the bound by a second.
 async fn clock_skew<T: Target>(t: &Tracked<'_, T>, lease: &LeaseConfig) -> Check {
     const NAME: &str = "clock-skew";
-    let before = now_ms();
-    try_or!(NAME, "writing", t.put("clock/k", Vec::new()).await);
-    let after = now_ms();
-    let Some(modified) = try_or!(NAME, "head", t.inner.head_modified_ms("clock/k").await) else {
-        return check(
-            NAME,
-            Status::Fail,
-            "a head right after a write found nothing",
-        );
-    };
-    let precision = if modified % 1_000 == 0 { 1_000 } else { 1 };
-    judge_skew(
-        NAME,
-        modified,
-        precision,
-        before,
-        after,
-        lease.max_skew_ms(),
-    )
+    // Several writes spread over more than a second: with whole-second
+    // stamps, each bounds the skew to a window a second wide, shifted by
+    // where the second boundary fell; together they narrow it.
+    let mut window: Option<(i128, i128)> = None;
+    for i in 0..SKEW_SAMPLES {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+        }
+        let key = format!("clock/{i}");
+        let before = now_ms();
+        try_or!(NAME, "writing", t.put(&key, Vec::new()).await);
+        let after = now_ms();
+        let Some(modified) = try_or!(NAME, "head", t.inner.head_modified_ms(&key).await) else {
+            return check(
+                NAME,
+                Status::Fail,
+                "a head right after a write found nothing",
+            );
+        };
+        let precision = if modified % 1_000 == 0 { 1_000 } else { 1 };
+        let (lo, hi) = skew_window(modified, precision, before, after);
+        window = Some(narrow(window, (lo, hi)));
+    }
+    let (lo, hi) = window.unwrap_or((0, 0));
+    judge_skew(NAME, lo, hi, lease.max_skew_ms())
+}
+
+const SKEW_SAMPLES: usize = 4;
+
+/// Both windows hold the skew: their overlap. Disjoint windows (the
+/// bucket's clock moved, or two of its servers disagree) give the span of
+/// both, never a false precision.
+fn narrow(window: Option<(i128, i128)>, (lo, hi): (i128, i128)) -> (i128, i128) {
+    match window {
+        None => (lo, hi),
+        Some((l, h)) if lo.max(l) > hi.min(h) => (lo.min(l), hi.max(h)),
+        Some((l, h)) => (lo.max(l), hi.min(h)),
+    }
 }
 
 /// The bucket's time `stamp` (to `precision` ms, rounded down) was taken
 /// between this machine's `before` and `after`: the bucket's clock minus
 /// this machine's is in `[stamp - after, stamp + precision - before]`.
-/// Fails when all of it is beyond `max_skew_ms`, warns when part is.
-fn judge_skew(
-    name: &'static str,
-    stamp: u64,
-    precision: u64,
-    before: u64,
-    after: u64,
-    max_skew_ms: u64,
-) -> Check {
-    let lo = i128::from(stamp) - i128::from(after);
-    let hi = i128::from(stamp) + i128::from(precision) - i128::from(before);
+fn skew_window(stamp: u64, precision: u64, before: u64, after: u64) -> (i128, i128) {
+    (
+        i128::from(stamp) - i128::from(after),
+        i128::from(stamp) + i128::from(precision) - i128::from(before),
+    )
+}
+
+/// The bucket's clock minus this machine's is in `[lo, hi]` (ms): fails
+/// when all of it is beyond `max_skew_ms`, warns when part is.
+fn judge_skew(name: &'static str, lo: i128, hi: i128, max_skew_ms: u64) -> Check {
     let max = i128::from(max_skew_ms);
     let secs = |ms: i128| format!("{:+.1} s", ms as f64 / 1000.0);
     let value = format!(
@@ -1073,11 +1103,7 @@ pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
     };
     let target = ObjectStoreBucket::new(store, prefix.clone());
     let options = Options::production(args.skip_paging);
-    let report = match rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(60), run(&target, &options))
-            .await
-            .unwrap_or_else(|_| Err(NotRun::Unreachable("no answer within 60 s".into())))
-    }) {
+    let report = match rt.block_on(run(&target, &options)) {
         Ok(r) => r,
         Err(NotRun::NotEmpty(n)) => {
             return fail(format!(
@@ -1287,6 +1313,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_deletes_only_what_the_run_wrote() {
+        let (store, bucket) = memory("scratch");
+        let t = Tracked {
+            inner: &bucket,
+            written: RefCell::new(BTreeSet::new()),
+        };
+        t.put("mine", b"x".to_vec()).await.unwrap();
+        Store::put(&bucket, "theirs", b"y".to_vec()).await.unwrap();
+        let (left, why) = cleanup(&t, &quick()).await;
+        assert_eq!((left, why), (Some(1), None));
+        assert_eq!(everything_under(&store).await, ["scratch/theirs"]);
+    }
+
+    #[tokio::test]
     async fn a_scratch_prefix_that_holds_anything_is_refused_untouched() {
         let (store, bucket) = memory("scratch");
         Store::put(&bucket, "theirs", b"keep".to_vec())
@@ -1363,17 +1403,25 @@ mod tests {
     fn skew_is_judged_on_the_whole_interval() {
         let max = 1_000;
         // Whole seconds, written within 200 ms: within tolerance.
-        let c = judge_skew("s", 10_000, 1_000, 10_100, 10_300, max);
-        assert_eq!(c.status, Status::Pass, "{c:?}");
+        let judge = |stamp, precision, before, after| {
+            let (lo, hi) = skew_window(stamp, precision, before, after);
+            judge_skew("s", lo, hi, max).status
+        };
+        assert_eq!(judge(10_000, 1_000, 10_100, 10_300), Status::Pass);
         // The bucket 3 s ahead whatever the rounding.
-        let c = judge_skew("s", 13_000, 1_000, 10_000, 10_200, max);
-        assert_eq!(c.status, Status::Fail, "{c:?}");
+        assert_eq!(judge(13_000, 1_000, 10_000, 10_200), Status::Fail);
         // 3 s behind.
-        let c = judge_skew("s", 7_000, 1_000, 10_000, 10_200, max);
-        assert_eq!(c.status, Status::Fail, "{c:?}");
+        assert_eq!(judge(7_000, 1_000, 10_000, 10_200), Status::Fail);
         // Maybe beyond: part of the interval is out.
-        let c = judge_skew("s", 11_000, 1_000, 10_000, 10_200, max);
-        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert_eq!(judge(11_000, 1_000, 10_000, 10_200), Status::Warn);
+        // A second boundary between the readings widens one window past
+        // the tolerance; intersected with the next, it is back within.
+        assert_eq!(skew_window(10_000, 1_000, 9_900, 10_100), (-100, 1_100));
+        assert_eq!(skew_window(10_000, 1_000, 10_250, 10_300), (-300, 750));
+        let both = narrow(Some((-100, 1_100)), (-300, 750));
+        assert_eq!(both, (-100, 750));
+        assert_eq!(judge_skew("s", both.0, both.1, max).status, Status::Pass);
+        assert_eq!(narrow(Some((0, 100)), (500, 600)), (0, 600));
     }
 
     #[test]

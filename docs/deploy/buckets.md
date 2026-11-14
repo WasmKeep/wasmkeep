@@ -42,7 +42,8 @@ below the URL's prefix (or `--prefix-for-test`, also below it), never at
 the prefix itself, so it can run beside a live cluster without touching
 its keys. It refuses a scratch prefix that already holds an object, and
 deletes everything it wrote when it ends, whether the checks passed or
-not; if that cleanup fails it says how many objects are left and where.
+not, and nothing else (an object someone else writes there meanwhile is
+reported as left, not deleted); if that cleanup fails it says how many objects are left and where.
 A run takes a few seconds next to the bucket (the paging check writes
 and deletes 1,001 empty objects; `--skip-paging` leaves it out).
 
@@ -79,9 +80,11 @@ unexpected error) or `skip`. The last line is the verdict:
 | 2 | `could not finish: ...`, or an error before any check | No verdict: the bucket did not answer, refused the credentials, or the scratch prefix was not empty. Try again |
 
 A bucket that does not answer is never reported as unsafe. The clock
-check brackets one write between two readings of this machine's clock
-and compares the bucket's last-modified time with them; it fails only
-when the whole interval is beyond the allowed skew, and then the clock
+check brackets four writes, spread over about a second, between
+readings of this machine's clock, and compares the bucket's
+last-modified times with them (the clock `cluster fence` checks against;
+the HTTP `Date` header is not read). It fails only when the whole
+interval is beyond the allowed skew, warns when part of it is, and then the clock
 to fix may be this machine's: run it again from another. `--json`
 prints the same as one object: `checks` (`name`, `status`, `value`),
 `cleanup`, `verdict` (`safe`, `unsafe`, `incomplete`), `summary` and
