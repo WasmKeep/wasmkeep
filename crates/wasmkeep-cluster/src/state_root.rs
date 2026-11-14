@@ -13,6 +13,7 @@
 //! state/<t>/<a>/leases/<class>/<name>                      old-lease marker (ADR 0020)
 //! state/<t>/<a>/alarms/<at>/...                            alarm index (ADR 0009)
 //! state/<t>/<a>/moves/<class>/<name hex>/<target>          moves (ADR 0014)
+//! state/<t>/<a>/deletes/<class>/<name hex>/<id>             deletes (ADR 0028)
 //! <data_dir>/state/<t>/<a>/actors/<class>/<name>.db        local databases
 //! <data_dir>/state/<t>/<a>/.deleting/                      local scratch space
 //! ```
@@ -38,6 +39,10 @@ pub enum Family {
     Alarms,
     /// Requests to move an actor (ADR 0014).
     Moves,
+    /// Requests to delete an actor (ADR 0028). Not in [`Family::ALL`]:
+    /// they came after 0.4.0, so no layout before it has them and no
+    /// migration copies them.
+    Deletes,
 }
 
 impl Family {
@@ -58,6 +63,7 @@ impl Family {
             Self::Leases => "leases",
             Self::Alarms => "alarms",
             Self::Moves => "moves",
+            Self::Deletes => "deletes",
         }
     }
 
@@ -70,6 +76,8 @@ impl Family {
             Self::Leases => "leases",
             Self::Alarms => "alarms",
             Self::Moves => "control/move",
+            // Never written: nothing before 0.4.0 deleted actors on request.
+            Self::Deletes => "control/delete",
         }
     }
 }
@@ -193,6 +201,10 @@ mod tests {
             assert_eq!(
                 root.key(Family::Moves, "c/6e/t"),
                 "state/acme/blog/moves/c/6e/t"
+            );
+            assert_eq!(
+                root.key(Family::Deletes, "c/6e"),
+                "state/acme/blog/deletes/c/6e"
             );
             assert_eq!(root.bucket_base(Family::Alarms), "p/state/acme/blog/alarms");
             assert_eq!(

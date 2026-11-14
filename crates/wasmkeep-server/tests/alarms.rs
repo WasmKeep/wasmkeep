@@ -234,6 +234,29 @@ async fn delete_self_removes_the_actor() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn delete_self_durable_without_a_bucket_removes_the_files_in_the_call() {
+    // ADR 0028: on one node the files are gone (and the directory
+    // fsynced) before the call returns; later storage calls are refused.
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    ok(addr, "POST", "/durable").await;
+    ok(addr, "POST", "/alarm?in=300").await;
+    assert_eq!(
+        call(addr, "POST", "/delete-durable?then=sql").await,
+        (200, "err:SqlErrorKind::NotAllowed".to_owned())
+    );
+    assert_eq!(number(addr, "/durable").await, 0);
+    assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
+    assert_eq!(
+        call(addr, "POST", "/delete-durable").await,
+        (200, "deleted".to_owned())
+    );
+    assert_eq!(number(addr, "/durable").await, 0);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(number(addr, "/attempts").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_new_alarm_starts_its_backoff_afresh() {
     // An alarm fails five times (backoff 50, 100, 200, 400 ms ...); then a
     // new alarm is set and fails once. Its retry comes after 50 ms, not

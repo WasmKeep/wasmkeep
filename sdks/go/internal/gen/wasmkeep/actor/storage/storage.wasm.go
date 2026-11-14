@@ -23,3 +23,7 @@ func wasmimport_Query(sql0 *uint8, sql1 uint32, params0 *Value, params1 uint32, 
 //go:wasmimport wasmkeep:actor/storage@0.2.0 delete-self
 //go:noescape
 func wasmimport_DeleteSelf()
+
+//go:wasmimport wasmkeep:actor/storage@0.2.0 delete-self-durable
+//go:noescape
+func wasmimport_DeleteSelfDurable(result *cm.Result[SQLError, struct{}, SQLError])

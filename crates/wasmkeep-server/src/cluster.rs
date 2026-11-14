@@ -1585,6 +1585,24 @@ impl Cluster {
             .clone()
     }
 
+    /// The delete requests this node last read (ADR 0028).
+    pub(crate) fn deletes(&self) -> Vec<wasmkeep_cluster::control::DeleteIntent> {
+        self.control
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .deletes
+            .clone()
+    }
+
+    /// Deletes a delete request once it is done, best effort: a request
+    /// left behind is listed again and found done (ADR 0028).
+    pub(crate) async fn delete_request(&self, intent: &wasmkeep_cluster::control::DeleteIntent) {
+        use wasmkeep_cluster::control::Keys as _;
+        if let Err(e) = self.control_keys.delete(&intent.key()).await {
+            tracing::debug!(error = %e, "deleting a delete request failed");
+        }
+    }
+
     /// Deletes a move request, best effort.
     pub(crate) async fn delete_move(&self, intent: &wasmkeep_cluster::control::MoveIntent) {
         use wasmkeep_cluster::control::Keys as _;

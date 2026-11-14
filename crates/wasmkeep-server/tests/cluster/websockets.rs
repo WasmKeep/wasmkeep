@@ -918,3 +918,45 @@ async fn a_lapse_releases_a_parked_record_once() {
         "the freed slot released it too"
     );
 }
+
+/// An operator delete (ADR 0028) of a room parked with its sockets open
+/// on a: a closes them with 1000 (not 1012, which would bring the client
+/// straight back to recreate the room), wakes it and deletes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_delete_closes_a_parked_rooms_sockets_with_1000() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let wasm = chat_wasm();
+    let a = node_with(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_millis(300),
+        "chat",
+        wasm,
+    )
+    .await;
+    let _b = node_with(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        "chat",
+        wasm,
+    )
+    .await;
+    settle().await;
+    let mut client = join_lobby(a.addr).await;
+    lobby_parked(&store, &a).await;
+    let key = request_delete_of(&store, "chat", "lobby").await;
+    let (code, reason) = closed_within(&mut client, Duration::from_secs(10)).await;
+    assert_eq!((code, reason.as_str()), (1000, "actor deleted"));
+    eventually("the request done", async || {
+        use object_store::ObjectStoreExt as _;
+        matches!(
+            store.head(&key).await,
+            Err(object_store::Error::NotFound { .. })
+        )
+    })
+    .await;
+}

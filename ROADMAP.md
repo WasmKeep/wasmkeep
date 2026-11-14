@@ -11,13 +11,14 @@ projects and staging.
 
 ## Now
 
-**Actors that end.** Today an actor ends only when its
-own code calls `storage.delete-self`, a delete replicated like a plain
-write; otherwise it is kept for good, and only its old history and old
-app versions are collected. Next: an operator can delete an actor
-(`wasmkeep actor delete`), a delete that is durable when asked, a class
-can expire actors left idle for a stated time (sessions, carts,
-temporary rooms), and then an app can be deleted as a whole.
+**Actors that end**
+([ADR 0028](docs/adr/0028-actors-that-end.md)). Until now an actor ended
+only when its own code called `storage.delete-self`, a delete replicated
+like a plain write. Built: an operator can delete an actor (`wasmkeep
+actor delete`), and `storage.delete-self-durable` returns once the delete
+is in the bucket. Next, as the ADR decides: a class can expire actors
+left idle for a stated time (sessions, carts, temporary rooms), and then
+an app can be deleted as a whole.
 
 Then **files and databases**, each with its design first: files for actors
 and the front in the app's part of the bucket, with links a browser

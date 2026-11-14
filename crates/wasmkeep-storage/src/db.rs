@@ -235,6 +235,17 @@ impl Storage {
 
     /// Removes an actor's database files. The database must not be open.
     pub fn delete(&self, class: &str, name: &str) -> Result<(), StorageError> {
+        self.remove_files(class, name, false)
+    }
+
+    /// Like [`Self::delete`], and durable: the directory is fsynced once
+    /// the files are gone (`delete-self-durable` on a single node, ADR
+    /// 0028).
+    pub fn delete_durably(&self, class: &str, name: &str) -> Result<(), StorageError> {
+        self.remove_files(class, name, true)
+    }
+
+    fn remove_files(&self, class: &str, name: &str, sync: bool) -> Result<(), StorageError> {
         let path = self.db_path(class, name);
         #[cfg(feature = "fault-injection")]
         if crate::faults::take("delete") {
@@ -243,12 +254,27 @@ impl Storage {
                 source: std::io::Error::other("injected failure"),
             });
         }
-        for suffix in ["", "-wal", "-shm"] {
+        // The WAL first: a crash part way must never leave a WAL without
+        // its database, which SQLite would replay into a new one.
+        for suffix in ["-wal", "-shm", ""] {
             let file = PathBuf::from(format!("{}{suffix}", path.display()));
             match std::fs::remove_file(&file) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(source) => return Err(StorageError::Io { path: file, source }),
+            }
+        }
+        if sync && let Some(dir) = path.parent() {
+            match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+                Ok(()) => {}
+                // No directory: nothing was there to remove.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StorageError::Io {
+                        path: dir.to_owned(),
+                        source,
+                    });
+                }
             }
         }
         Ok(())

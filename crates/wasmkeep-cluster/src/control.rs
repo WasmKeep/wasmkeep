@@ -1,5 +1,6 @@
 //! Cluster-wide intents written by an operator: drain a node, move an actor
-//! ([ADR 0014](../../../docs/adr/0014-draining-a-node-and-moving-an-actor.md)).
+//! ([ADR 0014](../../../docs/adr/0014-draining-a-node-and-moving-an-actor.md)),
+//! delete an actor ([ADR 0028](../../../docs/adr/0028-actors-that-end.md)).
 //!
 //! An intent is an object *key* under `control/`; bodies are empty and never
 //! read. Nodes list the prefix once per heartbeat period, reading keys and
@@ -8,10 +9,14 @@
 //! ```text
 //! control/drain/<node-id>
 //! state/<tenant>/<app>/moves/<class>/<name hex>/<target node-id>
+//! state/<tenant>/<app>/deletes/<class>/<name hex>/<request id>
 //! ```
 //!
-//! A drain names a node, shared by the bucket prefix; a move is an app's,
-//! under its state root (ADR 0022). Moves written under the layout before
+//! A drain names a node, shared by the bucket prefix; a move or a delete
+//! is an app's, under its state root (ADR 0022). Each delete request has
+//! an id of its own, so a node that carried one out deletes exactly that
+//! key and never a later request for the same actor; its last-modified
+//! time orders it among them. Moves written under the layout before
 //! 0.4.0 (`control/move/<tenant>/...`) are not read.
 
 use std::collections::BTreeSet;
@@ -27,6 +32,10 @@ const DRAIN: &str = "control/drain/";
 /// A move key older than this, by the bucket's clock, is ignored and
 /// deleted by the next node that lists it.
 pub const MOVE_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// A delete request older than this, by the bucket's clock, is ignored
+/// and deleted by the next node that lists it (ADR 0028).
+pub const DELETE_TTL_MS: u64 = 60 * 60 * 1000;
 
 /// Keys and their last-modified time, and deletes: what intents need.
 #[allow(async_fn_in_trait)]
@@ -71,6 +80,52 @@ impl MoveIntent {
     }
 }
 
+/// An operator's request to delete an actor (ADR 0028).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteIntent {
+    /// The actor's tenant.
+    pub tenant: String,
+    /// The actor's app, within the tenant.
+    pub app: String,
+    /// The actor's class.
+    pub class: String,
+    /// The actor's name, as given.
+    pub name: String,
+    /// The request's own id ([`new_request_id`]).
+    pub id: String,
+    /// When the key was written, by the bucket's clock (ms): what the
+    /// actor records once the request is carried out.
+    pub written_at_ms: u64,
+}
+
+impl DeleteIntent {
+    /// Its key, relative to the bucket prefix.
+    pub fn key(&self) -> String {
+        delete_key(
+            &StateRoot::new("", self.tenant.as_str(), self.app.as_str()),
+            &self.class,
+            &self.name,
+            &self.id,
+        )
+    }
+}
+
+/// A fresh id for a delete request: 16 hex digits, from the standard
+/// library's randomly seeded hasher and the clock.
+pub fn new_request_id() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        h.write_u128(t.as_nanos());
+    }
+    h.write_u32(std::process::id());
+    format!("{:016x}", h.finish())
+}
+
+fn request_id(id: &str) -> bool {
+    (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// What the intents say, as of one listing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Control {
@@ -78,6 +133,8 @@ pub struct Control {
     pub draining: BTreeSet<String>,
     /// Moves not yet expired.
     pub moves: Vec<MoveIntent>,
+    /// Deletes not yet expired.
+    pub deletes: Vec<DeleteIntent>,
 }
 
 /// An intent that cannot be written: a bad node id, tenant or class.
@@ -102,6 +159,29 @@ pub fn checked_move_key(
     target: &str,
 ) -> Result<String, InvalidIntent> {
     validate_node_id(target).map_err(|e| InvalidIntent(e.to_string()))?;
+    check_actor(root, class, name)?;
+    Ok(move_key(root, class, name, target))
+}
+
+/// The key of request `id` ([`new_request_id`]) to delete actor
+/// `class/name` of `root` (ADR 0028), with the same checks as
+/// [`checked_move_key`].
+pub fn checked_delete_key(
+    root: &StateRoot,
+    class: &str,
+    name: &str,
+    id: &str,
+) -> Result<String, InvalidIntent> {
+    check_actor(root, class, name)?;
+    if !request_id(id) {
+        return Err(InvalidIntent(format!(
+            "invalid request id {id:?}: 1 to 32 lowercase hex digits"
+        )));
+    }
+    Ok(delete_key(root, class, name, id))
+}
+
+fn check_actor(root: &StateRoot, class: &str, name: &str) -> Result<(), InvalidIntent> {
     for (what, part) in [
         ("tenant", root.tenant()),
         ("app", root.app()),
@@ -116,7 +196,14 @@ pub fn checked_move_key(
     if name.is_empty() {
         return Err(InvalidIntent("empty actor name".into()));
     }
-    Ok(move_key(root, class, name, target))
+    Ok(())
+}
+
+fn delete_key(root: &StateRoot, class: &str, name: &str, id: &str) -> String {
+    root.key(
+        Family::Deletes,
+        &format!("{class}/{}/{id}", hex(name.as_bytes())),
+    )
 }
 
 fn move_key(root: &StateRoot, class: &str, name: &str, target: &str) -> String {
@@ -134,9 +221,10 @@ fn segment(s: &str) -> bool {
         && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Reads the intents: drain markers, and the moves of `moves_of`'s app
-/// (none without it) written within [`MOVE_TTL_MS`] of `now_ms`. Moves
-/// older than that are deleted, best effort. Keys that do not parse are
+/// Reads the intents: drain markers, and the moves and deletes of
+/// `moves_of`'s app (none without it) written within [`MOVE_TTL_MS`]
+/// (moves) or [`DELETE_TTL_MS`] (deletes) of `now_ms`. Older ones are
+/// deleted, best effort. Keys that do not parse are
 /// ignored. A failed listing is an error: callers keep what they read
 /// last (ADR 0014).
 pub async fn read<K: Keys>(
@@ -150,6 +238,10 @@ pub async fn read<K: Keys>(
             keys.list_keys(&format!("{}/", root.base(Family::Moves)))
                 .await?,
         );
+        listed.extend(
+            keys.list_keys(&format!("{}/", root.base(Family::Deletes)))
+                .await?,
+        );
     }
     let (control, expired) = parse(&listed, now_ms);
     for key in expired {
@@ -160,7 +252,7 @@ pub async fn read<K: Keys>(
     Ok(control)
 }
 
-/// The intents in `listed`, and the expired move keys to delete.
+/// The intents in `listed`, and the expired move and delete keys to delete.
 pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
     let mut control = Control::default();
     let mut expired = Vec::new();
@@ -170,6 +262,14 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
                 control.draining.insert(node.to_owned());
             }
         } else if let Some(rest) = key.strip_prefix(STATE_PREFIX) {
+            if let Some(intent) = parse_delete(rest, *modified) {
+                if now_ms.saturating_sub(*modified) > DELETE_TTL_MS {
+                    expired.push(key.clone());
+                } else {
+                    control.deletes.push(intent);
+                }
+                continue;
+            }
             let Some(intent) = parse_move(rest, *modified) else {
                 continue;
             };
@@ -204,6 +304,31 @@ fn parse_move(rest: &str, written_at_ms: u64) -> Option<MoveIntent> {
         class: (*class).to_owned(),
         name,
         target: (*target).to_owned(),
+        written_at_ms,
+    })
+}
+
+/// `<tenant>/<app>/deletes/<class>/<name hex>/<id>`, after `state/`.
+fn parse_delete(rest: &str, written_at_ms: u64) -> Option<DeleteIntent> {
+    let parts: Vec<&str> = rest.split('/').collect();
+    let [tenant, app, family, class, name, id] = parts.as_slice() else {
+        return None;
+    };
+    if *family != Family::Deletes.folder()
+        || !segment(tenant)
+        || !segment(app)
+        || !segment(class)
+        || !request_id(id)
+    {
+        return None;
+    }
+    let name = String::from_utf8(unhex(name)?).ok()?;
+    (!name.is_empty()).then(|| DeleteIntent {
+        tenant: (*tenant).to_owned(),
+        app: (*app).to_owned(),
+        class: (*class).to_owned(),
+        name,
+        id: (*id).to_owned(),
         written_at_ms,
     })
 }
@@ -270,6 +395,58 @@ mod tests {
         let (control, expired) = parse(&[(mv.clone(), 1_000)], 1_001 + MOVE_TTL_MS);
         assert!(control.moves.is_empty());
         assert_eq!(expired, [mv]);
+    }
+
+    #[test]
+    fn delete_keys_read_back_and_expire_after_an_hour() {
+        let root = StateRoot::new("", "acme", "blog");
+        let key = checked_delete_key(&root, "cart", "u/1 ünï", "0a1b").unwrap();
+        assert!(key.starts_with("state/acme/blog/deletes/cart/"), "{key}");
+        assert!(key.ends_with("/0a1b"), "{key}");
+        let (control, expired) = parse(&[(key.clone(), 1_000)], 1_000 + DELETE_TTL_MS);
+        assert!(expired.is_empty() && control.moves.is_empty());
+        assert_eq!(
+            control.deletes,
+            [DeleteIntent {
+                tenant: "acme".into(),
+                app: "blog".into(),
+                class: "cart".into(),
+                name: "u/1 ünï".into(),
+                id: "0a1b".into(),
+                written_at_ms: 1_000,
+            }]
+        );
+        assert_eq!(control.deletes[0].key(), key);
+        let (control, expired) = parse(&[(key.clone(), 1_000)], 1_001 + DELETE_TTL_MS);
+        assert!(control.deletes.is_empty());
+        assert_eq!(expired, [key]);
+        for junk in [
+            "state/acme/blog/deletes/cart",
+            "state/acme/blog/deletes/cart/78",
+            "state/acme/blog/deletes/cart/zz/0a",
+            "state/acme/blog/deletes/cart//0a",
+            "state/acme/blog/deletes/cart/78/",
+            "state/acme/blog/deletes/cart/78/XY",
+            "state/acme/blog/deletes/cart/78/0a/extra",
+            "state/../blog/deletes/cart/78/0a",
+            "state/acme/blog/delete/cart/78/0a",
+        ] {
+            assert_eq!(
+                parse(&[(junk.into(), 0)], 0),
+                (Control::default(), Vec::new()),
+                "{junk}"
+            );
+        }
+        assert!(checked_delete_key(&root, "", "x", "0a").is_err());
+        assert!(checked_delete_key(&root, "cart", "", "0a").is_err());
+        assert!(checked_delete_key(&root, "cart", "x", "").is_err());
+        assert!(checked_delete_key(&root, "cart", "x", "0A").is_err());
+        assert!(checked_delete_key(&root, "cart", "x", &"a".repeat(33)).is_err());
+        assert!(
+            checked_delete_key(&StateRoot::new("", "ac/me", "blog"), "cart", "x", "0a").is_err()
+        );
+        let (a, b) = (new_request_id(), new_request_id());
+        assert!(request_id(&a) && a.len() == 16 && a != b, "{a} {b}");
     }
 
     #[test]

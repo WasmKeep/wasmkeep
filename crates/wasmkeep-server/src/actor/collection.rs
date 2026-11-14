@@ -126,6 +126,7 @@ pub(super) async fn run_collection(address: &ActorAddress, request: &CollectRequ
 pub(super) fn empty_database_snapshot(
     storage: &Storage,
     address: &ActorAddress,
+    operator_delete: Option<&str>,
 ) -> Result<wasmkeep_storage::wal::Changes, String> {
     // Unique per call in this process (two actors may be deleted at the
     // same instant), and per process.
@@ -145,9 +146,22 @@ pub(super) fn empty_database_snapshot(
         let mut db = fresh
             .open(address.class(), address.name())
             .map_err(|e| format!("{e:#}"))?;
+        mark_deleted(&mut db, operator_delete)?;
         db.start_capture().map_err(|e| e.to_string())?;
         db.snapshot().map_err(|e| e.to_string())
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// Writes the operator delete marker (ADR 0028) into the empty database a
+/// delete leaves, before its snapshot is taken, so it travels with the
+/// reset.
+pub(super) fn mark_deleted(db: &mut ActorDb, operator_delete: Option<&str>) -> Result<(), String> {
+    match operator_delete {
+        Some(at) => db
+            .set_meta(OPERATOR_DELETE_KEY, at)
+            .map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
 }

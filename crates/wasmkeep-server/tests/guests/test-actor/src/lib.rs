@@ -7,6 +7,9 @@
 //! - `POST /fail-next?n=K`: the next K `on-alarm` runs return an error
 //! - `POST /repeat?n=K`: `on-alarm` re-arms itself (+20 ms) until K fired
 //! - `POST /trap`: panics; `POST /delete`: `delete-self`
+//! - `POST /delete-durable`: `delete-self-durable`; answers `deleted`, or
+//!   503 with the error (then `?then=sql` runs a `query` after it and
+//!   answers `ok` or `err:KIND`)
 //! - `POST /delete-on-alarm`: the next `on-alarm` run calls `delete-self`
 //! - `POST /call?to=CLASS/NAME&path=P` (P percent-encoded): `actors.call`
 //!   with GET P; answers `STATUS:BODY` or the call error (`&times=N`: the
@@ -606,6 +609,19 @@ impl http::Guest for TestActor {
                     None => format!("(none) wasi={wasi}"),
                 }
             }
+            (Method::Post, "/delete-durable") => match storage::delete_self_durable() {
+                Ok(()) if query_param(&full, "then").as_deref() == Some("sql") => {
+                    match storage::query("SELECT 1", &[]) {
+                        Ok(_) => "ok".to_owned(),
+                        Err(e) => format!("err:{:?}", e.kind),
+                    }
+                }
+                Ok(()) => "deleted".to_owned(),
+                Err(e) => {
+                    http::respond(out, 503, "text/plain", format!("{e:?}\n").as_bytes());
+                    return;
+                }
+            },
             (Method::Post, "/delete") => {
                 storage::delete_self();
                 "ok".to_owned()

@@ -71,6 +71,38 @@ enum ActorCommand {
     /// idle, its next event may claim it elsewhere. The request expires
     /// after 5 minutes.
     Move(MoveArgs),
+    /// Delete an actor (ADR 0028): its owner, or any node serving its
+    /// class if nobody holds it, closes its WebSockets with 1000, removes
+    /// its data and alarm, and records the delete in the bucket. The next
+    /// event to the address starts a new, empty actor. Waits until the
+    /// delete is recorded (60 s by default); the request stays for an
+    /// hour otherwise. Cannot be undone.
+    Delete(DeleteArgs),
+}
+
+#[derive(Debug, Args)]
+struct DeleteArgs {
+    /// The actor: CLASS/NAME with `--app`, or `default/CLASS/NAME` for
+    /// the implicit app `default/default` (the name may contain `/`).
+    actor: String,
+
+    /// The actor's app, TENANT/APP; `default/default` (classes given on
+    /// the command line) when the actor is written `default/CLASS/NAME`.
+    #[arg(long, value_parser = parse_app)]
+    app: Option<(String, String)>,
+
+    /// Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from
+    /// the AWS_* environment variables).
+    #[arg(long)]
+    bucket: String,
+
+    /// How long to wait for the delete to be recorded, in seconds.
+    #[arg(long, default_value_t = 60, conflicts_with = "no_wait")]
+    wait: u64,
+
+    /// Write the request and return at once.
+    #[arg(long)]
+    no_wait: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1049,6 +1081,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
+        Command::Actor(ActorCommand::Delete(args)) => actor_delete(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
         Command::Dev(args) => dev(args),
         Command::New(args) => new_cmd::run(&args),
@@ -2228,6 +2261,84 @@ fn actor_move_on(
     Ok(())
 }
 
+/// Writes the actor's delete request (ADR 0028), under its app's root, and
+/// waits for a node to carry it out.
+fn actor_delete(args: &DeleteArgs) -> anyhow::Result<()> {
+    actor_delete_on(
+        args,
+        || open_bucket(&args.bucket),
+        std::time::Duration::from_millis(500),
+    )
+}
+
+/// [`actor_delete`] on the bucket `open` gives, looking every `poll`.
+/// Refuses an actor with no history in the bucket (nothing is written),
+/// and a tenant left in the layout before 0.4.0. Done once the request's
+/// key is gone: a node deletes it only after the delete is recorded.
+fn actor_delete_on(
+    args: &DeleteArgs,
+    open: impl FnOnce() -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)>,
+    poll: std::time::Duration,
+) -> anyhow::Result<()> {
+    use wasmkeep_cluster::control::{self, Keys as _};
+    let ((tenant, app), class, name) = move_target(&args.actor, args.app.as_ref())?;
+    if let Some(warning) = move_target_warning(&args.actor, args.app.as_ref()) {
+        eprintln!("warning: {warning}");
+    }
+    let root = wasmkeep_cluster::state_root::StateRoot::new("", tenant.as_str(), app.as_str());
+    let key = control::checked_delete_key(&root, &class, &name, &control::new_request_id())?;
+    let (store, prefix) = open()?;
+    check_layout(&args.bucket, &store, &prefix, &tenant)?;
+    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let actor = format!("{class}/{name} of {tenant}/{app}");
+    let history = wasmkeep_server::history_folder(&root, &class, &name);
+    anyhow::ensure!(
+        !rt.block_on(keys.list_keys(&history))?.is_empty(),
+        "no such actor: {actor} has nothing in the bucket (nothing was written)"
+    );
+    // Listed by its folder: a listing of a key itself shows only what is
+    // under it.
+    let folder = format!("{}/", key.rsplit_once('/').map_or("", |(f, _)| f));
+    let listed = |keys: &wasmkeep_cluster::object_store::ObjectStoreBucket| {
+        rt.block_on(keys.list_keys(&folder))
+            .map(|l| l.into_iter().find(|(k, _)| *k == key).map(|(_, at)| at))
+    };
+    rt.block_on(keys.put_empty(&key))?;
+    let written = listed(&keys)?;
+    let until = written.map_or_else(
+        || "an hour from now".to_owned(),
+        |at| {
+            format!(
+                "{} ms since the epoch, the bucket's clock",
+                at + control::DELETE_TTL_MS
+            )
+        },
+    );
+    if args.no_wait {
+        println!("Asked the cluster to delete {actor} (the request expires at {until}).");
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.wait);
+    loop {
+        if listed(&keys)?.is_none() {
+            println!("Deleted {actor}: the delete is recorded in the bucket.");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "requested; {actor} is not deleted yet after {} s. The cluster keeps trying \
+                 until {until}: run this again to wait (a node of the app must serve class \
+                 {class} and be able to hold the actor)",
+                args.wait
+            );
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// The app (`tenant`, `app`), class and name of `actor move`'s actor:
 /// `CLASS/NAME` of `app`, or, without `--app`, `default/CLASS/NAME` of the
 /// implicit app `default/default` (ADR 0022). Another tenant written in
@@ -2685,6 +2796,126 @@ mod tests {
             store.list(None).try_collect::<Vec<_>>().await.unwrap()
         });
         assert_eq!(listed.len(), 1, "{listed:?}");
+    }
+
+    fn delete_args(extra: &[&str]) -> super::DeleteArgs {
+        use clap::Parser as _;
+        let mut argv = vec![
+            "wasmkeep",
+            "actor",
+            "delete",
+            "--app",
+            "acme/shop",
+            "room/x 1",
+            "--bucket",
+            "s3://b/wk",
+        ];
+        argv.extend_from_slice(extra);
+        let super::Cli {
+            command: super::Command::Actor(super::ActorCommand::Delete(args)),
+        } = super::Cli::try_parse_from(argv).unwrap()
+        else {
+            unreachable!()
+        };
+        args
+    }
+
+    fn keys_of(store: &std::sync::Arc<dyn object_store::ObjectStore>) -> Vec<String> {
+        use futures_util::TryStreamExt as _;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut keys: Vec<String> = rt.block_on(async {
+            store
+                .list(None)
+                .map_ok(|m| m.location.to_string())
+                .try_collect()
+                .await
+                .unwrap()
+        });
+        keys.sort();
+        keys
+    }
+
+    /// `actor delete` (ADR 0028) refuses an actor with nothing in the
+    /// bucket and writes nothing; otherwise it writes the request under the
+    /// app's root and waits for its key to be gone.
+    #[test]
+    fn actor_delete_writes_its_request_and_waits_for_it() {
+        use clap::Parser as _;
+        use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, memory::InMemory};
+        let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+        let open = || Ok((std::sync::Arc::clone(&store), "wk".to_owned()));
+        let poll = std::time::Duration::from_millis(20);
+        let e = super::actor_delete_on(&delete_args(&["--no-wait"]), open, poll)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no such actor"), "{e}");
+        assert!(keys_of(&store).is_empty());
+        // Its history: one segment.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let segment = object_store::path::Path::from(format!(
+            "wk/{}wal/1-1-0.ltx",
+            wasmkeep_server::history_folder(
+                &wasmkeep_cluster::state_root::StateRoot::new("", "acme", "shop"),
+                "room",
+                "x 1"
+            )
+        ));
+        rt.block_on(store.put(&segment, PutPayload::from("x")))
+            .unwrap();
+        super::actor_delete_on(&delete_args(&["--no-wait"]), open, poll).unwrap();
+        let keys = keys_of(&store);
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert_eq!(keys[0], segment.to_string());
+        let request = keys[1].clone();
+        let id = request
+            .strip_prefix("wk/state/acme/shop/deletes/room/782031/")
+            .unwrap_or_else(|| panic!("{request}"));
+        assert_eq!(id.len(), 16, "{request}");
+        // Nobody acts: it says so, and its request stays (a request of its
+        // own, beside the first).
+        let e = super::actor_delete_on(&delete_args(&["--wait", "0"]), open, poll)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not deleted yet"), "{e}");
+        assert_eq!(keys_of(&store).len(), 3);
+        // Requests carried out: their keys deleted, as a node does.
+        let clear = |store: &std::sync::Arc<dyn ObjectStore>| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            for k in keys_of(store)
+                .into_iter()
+                .filter(|k| k.contains("/deletes/"))
+            {
+                rt.block_on(store.delete(&object_store::path::Path::from(k)))
+                    .unwrap();
+            }
+        };
+        clear(&store);
+        // A node carries it out (deletes the key): done.
+        let remover = std::sync::Arc::clone(&store);
+        let node = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            clear(&remover);
+        });
+        super::actor_delete_on(&delete_args(&["--wait", "10"]), open, poll).unwrap();
+        node.join().unwrap();
+        assert_eq!(keys_of(&store), [segment.to_string()]);
+        assert!(
+            super::Cli::try_parse_from([
+                "wasmkeep",
+                "actor",
+                "delete",
+                "room/x",
+                "--app",
+                "acme/shop",
+                "--bucket",
+                "s3://b",
+                "--no-wait",
+                "--wait",
+                "5",
+            ])
+            .is_err(),
+            "--no-wait with --wait"
+        );
     }
 
     /// `--remove-old` takes its own flags only, and never with
