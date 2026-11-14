@@ -579,7 +579,15 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> (Store, Counts, Opti
             .create_node()
             .name("bucket")
             .ip("10.0.0.1".parse().unwrap())
-            .init(move || bucket_node_with(Arc::clone(&store), Faults { slow_one_in: 10 }))
+            .init(move || {
+                bucket_node_with(
+                    Arc::clone(&store),
+                    Faults {
+                        slow_one_in: 10,
+                        late_reply_one_in: 0,
+                    },
+                )
+            })
             .build();
         let mut nodes = Vec::new();
         for i in 1..=3u32 {

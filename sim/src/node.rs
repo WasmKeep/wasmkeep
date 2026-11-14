@@ -91,6 +91,10 @@ pub struct Breaks {
     /// release is sent before the hold leaves the live set (the server
     /// empties the hold's cell first, ADR 0020 section 1's amendment).
     pub release_before_stop: bool,
+    /// A hold acts while it is in the live set, whatever the lease's
+    /// validity: with [`Self::release_before_stop`], a hold an event gives
+    /// up after a lapse acts until its release is answered.
+    pub act_on_cell_only: bool,
 }
 
 /// How long the resolver waits for an unresolved acquire's unchanged record
@@ -301,7 +305,9 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         s.holds
             .get(&held.key)
             .is_some_and(|h| h.generation == held.generation)
-            && if self.setup.breaks.epoch_ignored {
+            && if self.setup.breaks.act_on_cell_only {
+                true
+            } else if self.setup.breaks.epoch_ignored {
                 let valid = s.validity.valid(now);
                 if valid && held.epoch != s.validity.epoch {
                     OLD_EPOCH_ACTS.with(|k| k.set(k.get() + 1));

@@ -51,7 +51,9 @@ Since 0.4.0, in no release yet.
   helper yet).
 - **A node whose lease writes fail while its other writes land** hands an
   actor over as soon as an event reaches it after its lease ran out (8 s
-  after its last acknowledged lease write, with the defaults), before
+  after the send of its last acknowledged lease write, with the
+  defaults; the lapse closes its WebSockets, so every actor with sockets
+  open goes then), before
   the node sees the lapse: the release of the hold its actor dropped can
   land, and another node takes the actor at once, without a fence. That
   was already so, and is safe by ordering (the node stops acting before
@@ -59,7 +61,8 @@ Since 0.4.0, in no release yet.
   release landed), but ADR 0020 said otherwise and nothing showed it. It
   is now documented ([ADR 0020](docs/adr/0020-one-lease-per-node.md),
   section 1), counted on the releasing node in
-  `wasmkeep_releases_after_lapse_total` with a warning in its log
+  `wasmkeep_releases_after_lapse_total` (a lower bound: a release whose
+  reply was lost is not counted) with a warning in its log
   ([monitoring](docs/monitoring.md#failovers)), and pinned by a cluster
   test and a simulation (`madsim_early_release`).
 

@@ -238,6 +238,7 @@ async fn run_node(
         resolver_ends_unchanged: variant == Variant::ResolverEndsUnchanged,
         resolver_never_ends: variant == Variant::ResolverNeverEnds,
         release_before_stop: false,
+        act_on_cell_only: false,
         ..Breaks::default()
     };
     loop {
@@ -621,7 +622,15 @@ fn simulate(seed: u64, variant: Variant, scenario: bool) -> Outcome {
             .init({
                 let store = Arc::clone(&store);
                 let slow_one_in = if scenario { 0 } else { 25 };
-                move || bucket_node_with(Arc::clone(&store), bucket::Faults { slow_one_in })
+                move || {
+                    bucket_node_with(
+                        Arc::clone(&store),
+                        bucket::Faults {
+                            slow_one_in,
+                            late_reply_one_in: 0,
+                        },
+                    )
+                }
             })
             .build();
         let max_skew = config().max_skew_ms();

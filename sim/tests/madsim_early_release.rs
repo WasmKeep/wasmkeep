@@ -4,7 +4,7 @@
 //! writes are refused for a while (a slow or throttled bucket timing them
 //! out, an error on that one key), long enough for its lease to run out;
 //! its ownership records still land. The bucket also applies one request
-//! in 25 late.
+//! in 25 late, and answers another in 25 only after its client gave up.
 //!
 //! Each process runs on the simulations' shared node (`wasmkeep_sim::node`,
 //! the server's rules). Its actor writes while its hold may act: each write
@@ -21,8 +21,12 @@
 //! hold after a later generation's acquisition landed (the new owner's
 //! restore could miss it: an acknowledged write lost). The correct run
 //! must hand the actor over that way (releases after a lapse that landed,
-//! then acquisitions from nobody); the broken variant, a hold that keeps
-//! acting until its release is answered, must be caught on some seed.
+//! then acquisitions from nobody). Two broken variants must be caught on
+//! some seed: a hold that keeps acting until its release is answered (on
+//! a hibernation's release, while the lease is valid), and, with no
+//! hibernation, a hold that acts on its cell alone and keeps acting until
+//! its release is answered: what is left after a lapse if the node did not
+//! also stop acting by its own clock.
 //!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --target-dir target/madsim`
 
@@ -191,6 +195,7 @@ async fn run_node(
     skew_ms: i64,
     seed: u64,
     breaks: Breaks,
+    hibernate: bool,
     cut: Arc<AtomicBool>,
     shared: Arc<Mutex<Shared>>,
 ) {
@@ -266,6 +271,14 @@ async fn run_node(
                 break;
             }
             match hold.take() {
+                // An event reaches the actor after a lapse the lease task
+                // has not seen yet: the server's actor finds the hold no
+                // longer valid by the lease, and gives it up.
+                Some(h) if node.still_held(&h) && !node.lease_valid() && rng.chance(40) => {
+                    end(&shared);
+                    give_up(h.clone());
+                    hold = Some(h);
+                }
                 Some(h) if node.may_act(&h) => {
                     let until = node
                         .valid_until_ms()
@@ -278,7 +291,7 @@ async fn run_node(
                         from_ms: env.now(),
                         until_ms: until,
                     });
-                    if rng.chance(10) {
+                    if hibernate && rng.chance(10) {
                         // A hibernation: given up while it may act.
                         give_up(h.clone());
                         if !breaks.release_before_stop {
@@ -300,19 +313,11 @@ async fn run_node(
                     }
                 }
                 Some(h) if node.still_held(&h) => {
-                    // No longer valid (a lapse the lease task has not seen
-                    // yet), or given up with its release unanswered: an
-                    // event that reaches the actor now gives it up.
+                    // No longer valid and no event yet, or given up with
+                    // its release unanswered (the broken variants keep it
+                    // meanwhile).
                     end(&shared);
-                    if node.lease_valid() {
-                        // Released in the background, not answered yet
-                        // (the broken variant keeps it meanwhile).
-                        hold = Some(h);
-                    } else if rng.chance(40) {
-                        give_up(h);
-                    } else {
-                        hold = Some(h);
-                    }
+                    hold = Some(h);
                 }
                 Some(_) => end(&shared),
                 None if rng.chance(20) => {
@@ -348,7 +353,8 @@ struct Outcome {
     cuts: u64,
 }
 
-fn simulate(seed: u64, breaks: Breaks, duration: Duration) -> Outcome {
+/// `hibernate`: holds are also given up while they may act.
+fn simulate(seed: u64, breaks: Breaks, hibernate: bool, duration: Duration) -> Outcome {
     let rt = Runtime::with_seed_and_config(seed, madsim::Config::default());
     let shared = Arc::new(Mutex::new(Shared::default()));
     let out = Arc::clone(&shared);
@@ -362,7 +368,15 @@ fn simulate(seed: u64, breaks: Breaks, duration: Duration) -> Outcome {
             .ip("10.0.0.1".parse().unwrap())
             .init({
                 let store = Store::default();
-                move || bucket_node_with(Arc::clone(&store), bucket::Faults { slow_one_in: 25 })
+                move || {
+                    bucket_node_with(
+                        Arc::clone(&store),
+                        bucket::Faults {
+                            slow_one_in: 25,
+                            late_reply_one_in: 25,
+                        },
+                    )
+                }
             })
             .build();
         let max_skew = config().max_skew_ms();
@@ -384,6 +398,7 @@ fn simulate(seed: u64, breaks: Breaks, duration: Duration) -> Outcome {
                         skew_ms,
                         node_seed,
                         breaks,
+                        hibernate,
                         Arc::clone(&cut),
                         Arc::clone(&shared),
                     )
@@ -436,7 +451,7 @@ fn seeds() -> u64 {
 fn a_release_after_a_lapse_hands_the_actor_over_safely() {
     let (mut sent, mut landed, mut from_nobody, mut acquired, mut cuts) = (0, 0, 0, 0, 0);
     for seed in 0..seeds() {
-        let o = simulate(seed, Breaks::default(), Duration::from_secs(20));
+        let o = simulate(seed, Breaks::default(), true, Duration::from_secs(20));
         if let Some(d) = double_ownership(&o.claims) {
             panic!("seed {seed}: two owners: {d:?}");
         }
@@ -470,15 +485,30 @@ fn a_release_after_a_lapse_hands_the_actor_over_safely() {
 
 /// A hold that keeps acting until its release is answered is caught: the
 /// node that takes the record once it landed acts beside it, and a write
-/// is acknowledged after that acquisition.
+/// is acknowledged after that acquisition. Once with hibernations (a
+/// release while the lease is valid), once without, with holds acting on
+/// their cell alone: only releases after a lapse then hand the actor over.
 #[test]
 fn a_hold_acting_until_its_release_is_answered_is_caught() {
-    let breaks = Breaks {
+    let before_stop = Breaks {
         release_before_stop: true,
         ..Breaks::default()
     };
+    caught(before_stop, true, "release before stop, hibernating");
+    let after_lapse = Breaks {
+        act_on_cell_only: true,
+        ..before_stop
+    };
+    caught(
+        after_lapse,
+        false,
+        "release before stop, acting on the cell alone",
+    );
+}
+
+fn caught(breaks: Breaks, hibernate: bool, what: &str) {
     let caught = (0..seeds().max(200)).find_map(|seed| {
-        let o = simulate(seed, breaks, Duration::from_secs(20));
+        let o = simulate(seed, breaks, hibernate, Duration::from_secs(20));
         if double_ownership(&o.claims).is_some() {
             Some((seed, "two owners"))
         } else if o.lost_ack.is_some() {
@@ -487,10 +517,10 @@ fn a_hold_acting_until_its_release_is_answered_is_caught() {
             None
         }
     });
-    eprintln!("release before stop: caught by {caught:?}");
+    eprintln!("{what}: caught by {caught:?}");
     assert!(
         caught.is_some(),
-        "never caught in {} seeds",
+        "{what}: never caught in {} seeds",
         seeds().max(200)
     );
 }
