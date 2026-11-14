@@ -232,10 +232,10 @@ reads only the three lease lines.
   their write landed, each release after a lapse answered late) and
   `madsim_replication` with lease cuts (real uploads, late ones
   included, checked by the final restore). They catch a hold that keeps
-  acting until its release is answered on a tenth of the seeds or more:
-  on a hibernation's release, and on a release after a lapse with holds
-  also acting on their cell alone, since the node's own clock already
-  stops them there.
+  acting until its release is answered on many seeds (about a fifth to a
+  third of them in the first, a tenth in the second): on a hibernation's
+  release, and on a release after a lapse with holds also acting on
+  their cell alone, since the node's own clock already stops them there.
 - **Twins** (two processes with one id) are caught by the condition
   itself: the second writer's condition fails and its re-read shows the
   other instance.
