@@ -7,7 +7,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
+
+mod support;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -261,19 +263,18 @@ fn dev_on_the_example() -> Dev {
         format!("TOKENS=alice:{ALICE}\n"),
     )
     .unwrap();
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let log = std::fs::File::create(dir.path().join("dev.log")).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+    let log_path = dir.path().join("dev.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
         .current_dir(dir.path())
-        .args(["dev", "--listen", &addr.to_string(), "--poll-ms", "100"])
+        .args(["dev", "--listen", "127.0.0.1:0", "--poll-ms", "100"])
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .stdin(Stdio::null())
         .spawn()
         .unwrap();
+    // Builds both crates first: a cold build takes minutes.
+    let addr = support::listening_on(&mut child, &log_path, Duration::from_secs(600));
     let dev = Dev { child, addr, dir };
     let started = Instant::now();
     while request(addr, "GET", "/", "", "").is_none() {

@@ -137,6 +137,7 @@ pub(crate) fn run(project: Project, options: Options) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding {}", options.listen))?;
         let addr = listener.local_addr()?;
+        tracing::info!("listening on http://{addr}");
         tracing::info!(
             app = %format!("{}/{}", project.tenant, project.name),
             file = %project.path.display(),

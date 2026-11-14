@@ -12,7 +12,7 @@ mod support;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn counter_wasm() -> PathBuf {
@@ -379,12 +379,13 @@ fn a_deploy_from_the_file_is_the_file() {
     assert!(!ok && err.contains("--no-project"), "{err}");
 
     // A node serves the file's rules: d internal, c open.
-    let addr = free_port();
-    let node = serve(&url, &dir.path().join("node"), addr, &[])
-        .stdout(Stdio::null())
+    let log = dir.path().join("file-node.log");
+    let node = serve(&url, &dir.path().join("node"), &[])
+        .stdout(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let _node = Killed(node);
+    let mut node = Killed(node);
+    let addr = support::listening_on(&mut node.0, &log, Duration::from_secs(60));
     let started = Instant::now();
     while status(addr, "/actor/d/x") != Some(403) {
         assert!(

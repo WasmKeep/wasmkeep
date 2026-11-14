@@ -258,7 +258,8 @@ fn item(
 
 /// Parses the file at `path` (its `text`): every key checked, errors with
 /// the file, line, column and key.
-pub(crate) fn parse(text: &str, path: &Path) -> Result<Project, String> {
+#[cfg(test)]
+fn parse(text: &str, path: &Path) -> Result<Project, String> {
     parse_with(text, path, false)
 }
 
@@ -451,10 +452,6 @@ fn parse_with(text: &str, path: &Path, app_only: bool) -> Result<Project, String
 }
 
 /// Reads and parses the project file at `path`.
-pub(crate) fn load(path: &Path) -> anyhow::Result<Project> {
-    load_with(path, false)
-}
-
 fn load_with(path: &Path, app_only: bool) -> anyhow::Result<Project> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
