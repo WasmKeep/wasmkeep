@@ -125,6 +125,49 @@ fn hmac_matches_rfc_4231() {
     );
 }
 
+/// Header values are signed as their bytes: two values that differ only
+/// in bytes that are not UTF-8 never share a signature (a lossy decoding
+/// would read both as U+FFFD).
+#[test]
+fn signatures_sign_header_bytes_not_their_lossy_text() {
+    let secret = "ab".repeat(32);
+    let method = hyper::Method::POST;
+    let path = "/actor/u/x/durable";
+    let ts = 1_000_000;
+    let body = body_sha256(b"");
+    let nonce = "0f1e";
+    let with = |value: &[u8]| {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            CALLER,
+            hyper::header::HeaderValue::from_bytes(value).unwrap(),
+        );
+        headers
+    };
+    let (ff, fe) = (with(b"default/v/\xff"), with(b"default/v/\xfe"));
+    let mac = signature(&secret, ts, nonce, "b", &method, path, &body, &ff);
+    assert_ne!(
+        mac,
+        signature(&secret, ts, nonce, "b", &method, path, &body, &fe)
+    );
+    let given = format!("v4 {ts} {nonce} {body} {mac}");
+    assert!(verify(&secret, &given, ts, "b", &method, path, &ff).is_some());
+    assert!(verify(&secret, &given, ts, "b", &method, path, &fe).is_none());
+    // Valid UTF-8 signs as it always did: the line is its text.
+    let plain = with(b"default/v/a");
+    let msg = format!(
+        "wasmkeep-call v4\n{ts}\n{nonce}\nb\n{method}\n{path}\n{body}\n{CALLER}:default/v/a\n"
+    );
+    let want: String = hmac_sha256(secret.as_bytes(), msg.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        signature(&secret, ts, nonce, "b", &method, path, &body, &plain),
+        want
+    );
+}
+
 #[test]
 fn signatures_cover_every_field_and_expire() {
     let secret = "ab".repeat(32);
