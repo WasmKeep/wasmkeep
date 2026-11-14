@@ -423,4 +423,6 @@ for every actor on the node.
 
 Each actor may have 16 outbound requests open at once (256 per node), and
 each step (connect, first byte, between bytes) waits at most 60 s (30 s
-unless the guest asks otherwise).
+unless the guest asks otherwise). A handler waits for each request it
+sends; to have several open at once, it sends them as one batch with its
+SDK's helper ([per language](languages.md#several-outbound-requests-at-once)).

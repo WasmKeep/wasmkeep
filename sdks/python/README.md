@@ -133,6 +133,18 @@ the event (an alarm is retried).
 One instance of your class handles events until the actor hibernates; keep
 anything that must survive in `storage`, not on `self`.
 
+## Several outbound requests at once
+
+The Python SDK has no outbound HTTP helper yet, for one request or
+several. componentize-py's own bindings for `wasi:http` are in the
+component, and they can keep several requests open together: start each
+with `wit_world.imports.outgoing_handler.handle`, then wait on their
+futures' pollables at once with `wit_world.imports.poll.poll`, keeping
+each future's result the first time `get()` returns one (a second `get()`
+fails). Tried by hand, outside the shared tests; the Rust, TypeScript and
+Go SDKs have helpers for it (`http::fetch_all`, `http.fetchAll`,
+`FetchAll`).
+
 ## Key-value and queues
 
 `wasmkeep.kv` and `wasmkeep.queue` are clients for key-value shards and

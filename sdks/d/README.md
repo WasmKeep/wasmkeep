@@ -97,9 +97,10 @@ without copying it (with `malloc`). `eventAlloc` and `eventCopy` give the
 app memory with the same lifetime. `replyText` does not copy its text: pass
 a literal or arena memory.
 
-Not in the D SDK yet: outbound HTTP (`wasi:http/outgoing-handler`, usable
-through the generated bindings directly) and the key-value, queue and
-workflow clients.
+Not in the D SDK yet: outbound HTTP, one request or
+[several at once](https://github.com/WasmKeep/wasmkeep/blob/main/docs/languages.md#several-outbound-requests-at-once)
+(`wasi:http/outgoing-handler`, usable through the generated bindings
+directly), and the key-value, queue and workflow clients.
 
 ## Examples
 

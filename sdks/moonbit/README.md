@@ -84,8 +84,9 @@ official installer does this, some distribution packages do not.
 | `self_address()` | This actor's `Address` (`tenant`, `class`, `name`) |
 | `delete_self()`, `now_ms()` | |
 
-Not in the MoonBit SDK yet: outbound HTTP and the key-value, queue and
-workflow clients.
+Not in the MoonBit SDK yet: outbound HTTP, one request or
+[several at once](https://github.com/WasmKeep/wasmkeep/blob/main/docs/languages.md#several-outbound-requests-at-once),
+and the key-value, queue and workflow clients.
 
 ## Examples
 

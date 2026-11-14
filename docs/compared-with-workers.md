@@ -54,7 +54,9 @@ Workers strong is the platform, not the runtime.
   API), npm compatibility and mature tooling. WasmKeep is pre-alpha.
 - **Concurrency inside a request.** A Worker can await several things at
   once. A WasmKeep handler is synchronous: an outbound `http.fetch` blocks
-  the actor until it answers, and the actor's other events wait.
+  the actor until it answers, and the actor's other events wait. A batch
+  of requests (`http.fetchAll`) or of actor calls (`actors.callMany`) is
+  waited for together, but not alongside other work.
 - **Hostile tenants side by side.** Cloudflare runs untrusted code from
   many customers on shared machines. WasmKeep's WebAssembly sandbox is
   strong, but a tier for tenants who do not trust each other (a process or

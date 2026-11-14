@@ -71,7 +71,8 @@ goes from an empty directory to an actor whose state survives a restart.
 - `env`: configuration and secrets the operator gives the class (or the front).
 - `caller`, `Caller`: who sent a request (the app's front, another actor,
   or a client), and the `front` module (below).
-- `http`: the request handler, helpers to answer, and outbound requests.
+- `http`: the request handler, helpers to answer, and outbound requests
+  (`http::fetch`, and `http::fetch_all` for several at once).
 - `kv`, `queue`, `workflow`: a key-value store, queues and durable workflows,
   each built from actors
   ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/kv-and-queues.md),
@@ -80,6 +81,34 @@ goes from an empty directory to an actor whose state survives a restart.
 
 The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/reference/api.md)
 lists every host function with its name in each SDK.
+
+## Several outbound requests at once
+
+`http::fetch` waits for its answer, and the handler with it. To call
+several services, `http::fetch_all` sends a batch at once and waits for
+all of it: one result per request, in order, each what `http::fetch`
+would give, so one failure does not fail the others.
+
+```rust
+use std::time::Duration;
+use wasmkeep_sdk::http::{self, FetchRequest};
+
+let urls = ["https://a.example/price", "https://b.example/price"];
+let requests: Vec<_> = urls.iter().map(|u| FetchRequest::get(u)).collect();
+for result in http::fetch_all(&requests, Duration::from_secs(10), 64 * 1024) {
+    match result {
+        Ok(r) => { /* r.status, r.body */ }
+        Err(e) => { /* why it failed, as text */ }
+    }
+}
+```
+
+The requests are open together, their responses and bodies read as they
+come, so the batch takes about as long as its slowest request.
+`FetchRequest::new(method, url)` with `.headers(...)` and `.body(...)`
+sends more than a GET; bodies are written one after the other. The host
+lets an actor have 16 requests open at once: past 16, the rest start as
+earlier ones finish.
 
 ## Writing a front
 

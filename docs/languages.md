@@ -75,6 +75,33 @@ component imports it or not.
 The release's files are signed:
 [check a download](deploy/single-node.md#1-install-the-binary).
 
+### Several outbound requests at once
+
+A handler is synchronous: one outbound request waits for its answer
+before the next one starts. Goroutines do not change that on TinyGo
+(tried on 0.43): they share the one thread a waiting request blocks.
+StarlingMonkey's own `fetch` returns promises a synchronous handler
+cannot await: the requests go out, and their answers are lost when the
+handler returns.
+
+A batch helper in the SDK starts every request of a list, then waits for
+them together on `wasi:io/poll`, reading each response and body as it
+comes: the batch takes about as long as its slowest request rather than
+the sum. Request bodies are written one after the other. Past the host's
+16 open requests per actor, the rest start as earlier ones finish. Each
+result is what a single fetch gives, in input order, and one failure
+does not fail the others. `fetch_langs` checks each helper against the
+same requests sent one at a time, and that the server has its requests
+open together. The helpers are newer than `0.4.0` (in no release yet).
+
+| Language | Several outbound requests at once |
+| --- | --- |
+| Rust | `http::fetch_all` |
+| TypeScript (both engines) | `http.fetchAll` |
+| Go (TinyGo) | `FetchAll` |
+| Python | No outbound HTTP in the SDK yet; on componentize-py's own bindings, start each request with `outgoing_handler.handle` and wait on their futures together with `poll.poll` (tried by hand; not part of the shared tests) |
+| C, Zig, D, MoonBit | No outbound HTTP in the SDK yet |
+
 ### Next, in order
 
 Each is experimental once a counter passes the shared tests; numbers
@@ -159,7 +186,8 @@ What does not work, or works differently, on QuickJS:
   `btoa`, `queueMicrotask`, `performance` and `WeakRef`. For outbound
   HTTP on either engine, the SDK has `http.fetch`: synchronous, as
   handlers are (StarlingMonkey's own `fetch` returns a promise a handler
-  cannot await).
+  cannot await), and `http.fetchAll` for
+  [several at once](#several-outbound-requests-at-once).
 - **`console` comes from the SDK**, writing one line per call to stdout
   (`log`, `info`, `debug`) or stderr (`warn`, `error`), as StarlingMonkey's
   does; objects are shown as JSON. WasmKeep logs both
@@ -186,7 +214,7 @@ it is given. The [Go SDK](../sdks/go) is a `wasmkeep` package over the
 bindings `wit-bindgen-go` generates (committed in the module, so an app
 needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
 `Rows`, alarms, `Call`, WebSockets, `Env`, `Self` and a synchronous
-`Fetch`, plus the [key-value, queue](kv-and-queues.md#go) and
+`Fetch` (and `FetchAll`, several at once), plus the [key-value, queue](kv-and-queues.md#go) and
 [workflow](workflows.md#go) clients. TinyGo's runtime imports
 `wasi:filesystem` whether or not the program uses it, so the module's
 `wit/` adds those imports to the actor world (`actor-tinygo`); the host
@@ -200,7 +228,8 @@ server's version number. The `wasmkeep` package starts at `v0.2.0`
 
 The [counter](../examples/go-counter), [chat room](../examples/go-chat-room)
 and [jobs app](../examples/go-jobs) pass the shared tests, and
-`fetch_langs` checks `Fetch` against the Rust SDK's `http::fetch`.
+`fetch_langs` checks `Fetch` and `FetchAll` against the Rust SDK's
+`http::fetch` and `http::fetch_all`.
 Trade-offs:
 
 - **A garbage collector.** TinyGo's runs inside the request: the

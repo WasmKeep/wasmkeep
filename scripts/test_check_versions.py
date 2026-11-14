@@ -25,6 +25,7 @@ class Versions(unittest.TestCase):
         self.lock('1.2.3', '1.2.3')
         for example in EXAMPLES:
             self.example(example, '1.2.3')
+        self.guest('1.2.3')
         self.python('1.2.3')
         self.header('1.2.3')
         self.zig('1.2.3')
@@ -50,6 +51,12 @@ class Versions(unittest.TestCase):
         path = self.root / 'examples' / name / 'package-lock.json'
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({'packages': {'../../sdks/typescript': {'version': linked}}}))
+
+    def guest(self, linked):
+        # The TypeScript test guest of fetch_langs, deeper in the tree.
+        path = self.root / 'crates/wasmkeep-server/tests/guests/ts-fetch/package-lock.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'packages': {'../../../../../sdks/typescript': {'version': linked}}}))
 
     def workspace(self, version):
         # A dependency's version comes first: only [workspace.package] counts.
@@ -123,6 +130,11 @@ class Versions(unittest.TestCase):
     def test_an_example_lockfile_with_another_sdk_version_fails(self):
         self.example('ts-jobs', '0.0.0')
         self.fails('examples/ts-jobs/package-lock.json: packages.../../sdks/typescript.version is 0.0.0')
+
+    def test_the_test_guest_lockfile_with_another_sdk_version_fails(self):
+        self.guest('0.0.0')
+        self.fails('crates/wasmkeep-server/tests/guests/ts-fetch/package-lock.json: '
+                   'packages.../../../../../sdks/typescript.version is 0.0.0')
 
     def test_a_workspace_bump_alone_fails_for_every_manifest(self):
         self.workspace('1.3.0')

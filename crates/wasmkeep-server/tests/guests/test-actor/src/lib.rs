@@ -43,6 +43,10 @@
 //! - `GET /fetch?url=U` (U percent-encoded): outbound GET, answers
 //!   `STATUS:BODY` or `error: ...`; with `&send=N`, a POST with an N-byte
 //!   body instead
+//! - `GET /fetch-all?u=I&u=...` (each I percent-encoded `N URL`): those
+//!   requests (a GET, or a POST of N bytes when N > 0) with
+//!   `http::fetch_all`, one answer per line as `/fetch` words it; with
+//!   `seq=1`, one `http::fetch` after the other instead
 //! - `GET /env?name=N`: `env.get(N)`, and whether WASI saw N
 
 use wasmkeep_sdk::actors::{self, CallError};
@@ -433,6 +437,43 @@ impl http::Guest for TestActor {
                     Ok(r) => format!("{}:{}", r.status, String::from_utf8_lossy(&r.body)),
                     Err(e) => format!("error: {e}"),
                 }
+            }
+            (Method::Get, "/fetch-all") => {
+                let query = full.split_once('?').map_or("", |(_, q)| q);
+                let items: Vec<(usize, String)> = query
+                    .split('&')
+                    .filter_map(|pair| pair.strip_prefix("u="))
+                    .filter_map(|v| {
+                        let item = percent_decode(v);
+                        let (send, url) = item.split_once(' ')?;
+                        Some((send.parse().ok()?, url.to_owned()))
+                    })
+                    .collect();
+                let bodies: Vec<Vec<u8>> = items.iter().map(|(n, _)| vec![b'x'; *n]).collect();
+                let requests: Vec<http::FetchRequest<'_>> = items
+                    .iter()
+                    .zip(&bodies)
+                    .map(|((send, url), body)| {
+                        let method = if *send > 0 { "POST" } else { "GET" };
+                        http::FetchRequest::new(method, url).body(body)
+                    })
+                    .collect();
+                let timeout = std::time::Duration::from_secs(5);
+                let results = if query_param(&full, "seq").is_some() {
+                    requests
+                        .iter()
+                        .map(|r| http::fetch(r.method, r.url, r.headers, r.body, timeout, 4096))
+                        .collect()
+                } else {
+                    http::fetch_all(&requests, timeout, 4096)
+                };
+                results
+                    .into_iter()
+                    .map(|r| match r {
+                        Ok(r) => format!("{}:{}\n", r.status, String::from_utf8_lossy(&r.body)),
+                        Err(e) => format!("error: {e}\n"),
+                    })
+                    .collect::<String>()
             }
             (Method::Post, "/memory") => {
                 static MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

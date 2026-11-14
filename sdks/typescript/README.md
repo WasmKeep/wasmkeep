@@ -82,6 +82,7 @@ after `npm ci` in `sdks/typescript`).
 | `new queue.Client("class/name")` | a Rust queue actor: `send`, `sendDelayed`, `sendBatch`, `lease`, `ack`, `retry`, `settle`, `stats`, `deadLetters` |
 | `queue.isDelivery(req)`, `queue.handleDelivery(req, handle)` | answer a queue's push delivery, one outcome per message |
 | `http.fetch(url, { method, headers, body, timeoutMs, limit })` | outbound HTTP, synchronously: `{ status, headers, body, text(), json() }`; throws `http.FetchError` when there is no response, or when its body breaks before its end (`incomplete body`; a body longer than `limit`, 16 MiB by default, is cut to it without an error). Works on both engines (QuickJS has no `fetch`, and StarlingMonkey's is asynchronous) |
+| `http.fetchAll([{ url, ...options }, ...])` | several outbound requests at once, waited for together: one `{ ok: true, response }` or `{ ok: false, error }` per request, in input order ([below](#several-outbound-requests-at-once)) |
 | `workflow.define(fn, config)`, `new workflow.Client(class)` | durable workflows: `wf.step`, `wf.sleep`, `wf.waitForEvent` ([guide](https://github.com/WasmKeep/wasmkeep/blob/v0.4.0/docs/workflows.md#typescript)) |
 
 SQL errors throw `SqlError` (with `kind`), failed calls throw `CallError`.
@@ -92,6 +93,34 @@ and `req.text(limit)` return `undefined` for a body longer than `limit`
 bytes, having read at most `limit + 1` of it: check a size this way, as a
 chunked body has no `Content-Length` to check first
 (`const body = req.bytes(1000); if (body === undefined) return { status: 413 };`).
+
+## Several outbound requests at once
+
+A handler is synchronous, so `http.fetch` waits for its answer, and
+`Promise.all` over StarlingMonkey's own `fetch` cannot be awaited (the
+handler returns before the answers come). `http.fetchAll` sends a batch
+at once and waits for all of it, on both engines:
+
+```ts
+import { defineActor, http } from "@wasmkeep/sdk";
+
+export default defineActor({
+  fetch(req) {
+    const results = http.fetchAll([
+      { url: "https://a.example/price" },
+      { url: "https://b.example/price", timeoutMs: 2000 },
+    ]);
+    return results.map((r) => (r.ok ? r.response.text() : r.error.message)).join("\n");
+  },
+});
+```
+
+Each result is what `http.fetch` would return or throw, in input order;
+one failure does not fail the others. The requests are open together,
+their responses and bodies read as they come, so the batch takes about as
+long as its slowest request. Request bodies are written one after the
+other. The host lets an actor have 16 requests open at once: past 16, the
+rest start as earlier ones finish.
 
 ## Writing a front
 
