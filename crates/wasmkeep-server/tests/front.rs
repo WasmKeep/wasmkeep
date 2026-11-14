@@ -758,3 +758,209 @@ async fn the_guest_log_names_the_front() {
     }
     let _ = std::io::stderr().flush();
 }
+
+/// `/call-many` on the test front: `method path` on each of `to`.
+fn call_many(to: &[&str], method: &str, path: &str) -> String {
+    call(&to.join(","), method, path).replacen("/call?", "/call-many?", 1)
+}
+
+/// ADR 0025: the calls of one batch run at once, so four slow actors cost
+/// about one round trip, not four.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_of_four_slow_calls_takes_about_one_round_trip() {
+    let node = start(Setup::default()).await;
+    let to = ["t/s1", "t/s2", "t/s3", "t/s4"];
+    // Warm: each actor's instance and database exist before timing.
+    let r = get(node.addr, &call_many(&to, "GET", "/slept"), "").await;
+    assert_eq!(r.body, "200:0 | 200:0 | 200:0 | 200:0");
+    let started = Instant::now();
+    let r = get(node.addr, &call_many(&to, "POST", "/sleep?ms=600"), "").await;
+    let took = started.elapsed();
+    assert_eq!(
+        r.body, "200:slept | 200:slept | 200:slept | 200:slept",
+        "in input order"
+    );
+    // One after the other would take 2.4 s.
+    assert!(
+        took >= Duration::from_millis(600) && took < Duration::from_millis(1_500),
+        "took {took:?}"
+    );
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    assert!(
+        page.contains(
+            "wasmkeep_front_calls_total{tenant=\"default\",app=\"default\",outcome=\"ok\"} 8\n"
+        ),
+        "each entry counts as a call: {page}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_entry_of_a_batch_has_its_own_result() {
+    let node = start(Setup::default()).await;
+    let r = get(
+        node.addr,
+        &call_many(&["t/a", "nope/x", "just-a-name", "t/b"], "GET", "/slept"),
+        "",
+    )
+    .await;
+    let parts: Vec<&str> = r.body.split(" | ").collect();
+    assert_eq!(parts.len(), 4, "{}", r.body);
+    assert_eq!(parts[0], "200:0");
+    assert!(parts[1].starts_with("err:invalid-address:"), "{}", r.body);
+    assert!(parts[2].starts_with("err:invalid-address:"), "{}", r.body);
+    assert_eq!(parts[3], "200:0");
+    // A callee that traps fails its own entry only.
+    let r = get(node.addr, &call_many(&["t/a", "t/b"], "POST", "/trap"), "").await;
+    assert!(r.body.starts_with("err:failed:"), "{}", r.body);
+    let r = get(node.addr, &call_many(&["t/a", "t/c"], "GET", "/slept"), "").await;
+    assert_eq!(r.body, "200:0 | 200:0");
+    // An empty batch answers an empty list.
+    let r = get(node.addr, "/call-many?to=&path=/slept", "").await;
+    assert_eq!(r.body, "");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_has_at_most_sixteen_calls() {
+    let node = start(Setup::default()).await;
+    let names: Vec<String> = (0..17).map(|i| format!("t/n{i}")).collect();
+    let to: Vec<&str> = names.iter().map(String::as_str).collect();
+    let r = get(node.addr, &call_many(&to, "POST", "/sleep?ms=0"), "").await;
+    let parts: Vec<&str> = r.body.split(" | ").collect();
+    assert_eq!(parts.len(), 17, "{}", r.body);
+    assert!(
+        parts
+            .iter()
+            .all(|p| *p == "err:failed:too many calls: at most 16 in one call-many"),
+        "{}",
+        r.body
+    );
+    // None of them ran.
+    let r = get(node.addr, &call("t/n0", "GET", "/slept"), "").await;
+    assert_eq!(r.body, "200:0");
+    // Sixteen run.
+    let r = get(node.addr, &call_many(&to[..16], "POST", "/sleep?ms=0"), "").await;
+    assert_eq!(r.body, vec!["200:slept"; 16].join(" | "));
+}
+
+/// The requests of one batch together are at most 16 MiB: past it, no
+/// entry starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batchs_requests_share_one_body_limit() {
+    let node = start(Setup::default()).await;
+    let path = "/body-len";
+    let nine_mib = 9 << 20;
+    let r = get(
+        node.addr,
+        &format!(
+            "{}&body={nine_mib}",
+            call_many(&["t/a", "t/b"], "POST", path)
+        ),
+        "",
+    )
+    .await;
+    assert_eq!(r.body, "err:too-large | err:too-large");
+    let r = get(node.addr, &call("t/a", "GET", "/slept"), "").await;
+    assert_eq!(r.body, "200:0", "nothing ran");
+    let r = get(
+        node.addr,
+        &format!(
+            "{}&body={}",
+            call_many(&["t/a", "t/b"], "POST", path),
+            7 << 20
+        ),
+        "",
+    )
+    .await;
+    assert_eq!(r.body, format!("200:{0} | 200:{0}", 7 << 20));
+}
+
+/// One deadline for the batch: the entries that answered keep their
+/// answers, the one still waiting is `timeout`, and the batch ends with
+/// the front's call deadline (5 s before its wall).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_has_one_deadline() {
+    let node = start(Setup {
+        front_wall: Duration::from_secs(7),
+        ..Setup::default()
+    })
+    .await;
+    // Each entry with its own path (`;`, percent-encoded as `%3B`).
+    let entry = |to: &str, path: &str| {
+        format!("{to};{path}")
+            .replace(';', "%3B")
+            .replace('/', "%2F")
+            .replace('?', "%3F")
+            .replace('=', "%3D")
+    };
+    let to = [
+        entry("t/fast", "/sleep?ms=100"),
+        entry("t/slow", "/sleep?ms=10000"),
+        "nope/x".to_owned(),
+    ];
+    let started = Instant::now();
+    let r = get(
+        node.addr,
+        &format!("/call-many?method=POST&to={}", to.join(",")),
+        "",
+    )
+    .await;
+    let took = started.elapsed();
+    let parts: Vec<&str> = r.body.split(" | ").collect();
+    assert_eq!(parts.len(), 3, "{}", r.body);
+    assert_eq!(parts[0], "200:slept", "{}", r.body);
+    assert_eq!(parts[1], "err:timeout", "{}", r.body);
+    assert!(parts[2].starts_with("err:invalid-address:"), "{}", r.body);
+    assert!(
+        took >= Duration::from_millis(1_800) && took < Duration::from_secs(4),
+        "took {took:?}"
+    );
+    // Started with less than the margin left: every entry at once.
+    let started = Instant::now();
+    let r = get(
+        node.addr,
+        &format!(
+            "{}&delay=2500",
+            call_many(&["t/fast", "t/other"], "GET", "/slept")
+        ),
+        "",
+    )
+    .await;
+    assert_eq!(r.body, "err:timeout | err:timeout");
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// Each entry counts against the per-actor bound (here 1) while it waits:
+/// a second entry to the same actor is refused, the first runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_entry_counts_against_the_per_actor_bound() {
+    let node = start(Setup {
+        max_front_requests: Some(4),
+        ..Setup::default()
+    })
+    .await;
+    let r = get(
+        node.addr,
+        &call_many(&["t/hot", "t/hot", "t/cold"], "POST", "/sleep?ms=200"),
+        "",
+    )
+    .await;
+    let parts: Vec<&str> = r.body.split(" | ").collect();
+    assert_eq!(parts.len(), 3, "{}", r.body);
+    let busy = "err:failed:front busy: too many front requests waiting on this actor";
+    assert_eq!(
+        parts[..2].iter().filter(|p| **p == busy).count(),
+        1,
+        "{}",
+        r.body
+    );
+    assert_eq!(
+        parts[..2].iter().filter(|p| **p == "200:slept").count(),
+        1,
+        "{}",
+        r.body
+    );
+    assert_eq!(parts[2], "200:slept");
+    // The bound is free again once the batch ended.
+    let r = get(node.addr, &call("t/hot", "GET", "/slept"), "").await;
+    assert_eq!(r.body, "200:1");
+}

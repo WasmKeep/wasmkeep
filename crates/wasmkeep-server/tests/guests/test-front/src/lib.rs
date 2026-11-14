@@ -8,6 +8,11 @@
 //!   status, headers (trapping if one is refused) and body as they came,
 //!   plus `x-callee-range: NAMES`: the names of the callee's headers in
 //!   the `x-wasmkeep-` range, comma-separated.
+//! - `/call-many?to=A,B,...&path=P[&method=M][&body=N][&delay=MS]`: one
+//!   `calls.call-many` with an entry per address (CLASS/NAME, comma-separated,
+//!   or CLASS/NAME;PATH for an entry's own path), each M (GET) P with an
+//!   N-byte body; answers each entry as `/call` does,
+//!   joined by ` | `, in input order
 //! - `/headers`: the method, then every request header as `name: value`
 //! - `/respond?status=N[&spoof]`: answers status N (with `spoof`, with
 //!   `x-wasmkeep-` headers the host must drop)
@@ -45,7 +50,7 @@ mod bindings {
     });
 }
 
-use bindings::wasmkeep::actor::{actors, env};
+use bindings::wasmkeep::actor::{actors, calls, env};
 
 wasip2::http::proxy::export!(Front);
 
@@ -120,6 +125,23 @@ const SPOOFED: &[(&str, &str)] = &[
     ("x-wasmkeep-future", "anything"),
 ];
 
+/// A call's result as `STATUS:BODY` (trailing whitespace trimmed) or
+/// `err:KIND[:DETAIL]`.
+fn answer(result: Result<actors::Response, actors::CallError>) -> String {
+    match result {
+        Ok(r) => format!(
+            "{}:{}",
+            r.status,
+            String::from_utf8_lossy(&r.body).trim_end()
+        ),
+        Err(actors::CallError::InvalidAddress(m)) => format!("err:invalid-address:{m}"),
+        Err(actors::CallError::Reentrant) => "err:reentrant".into(),
+        Err(actors::CallError::TooLarge) => "err:too-large".into(),
+        Err(actors::CallError::Timeout) => "err:timeout".into(),
+        Err(actors::CallError::Failed(m)) => format!("err:failed:{m}"),
+    }
+}
+
 fn method_name(method: &Method) -> String {
     match method {
         Method::Get => "GET".into(),
@@ -187,19 +209,40 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
                     let _ = OutgoingBody::finish(outgoing, None);
                     return;
                 }
-                let answer = match actors::call(&to, &request) {
-                    Ok(r) => format!(
-                        "{}:{}",
-                        r.status,
-                        String::from_utf8_lossy(&r.body).trim_end()
-                    ),
-                    Err(actors::CallError::InvalidAddress(m)) => format!("err:invalid-address:{m}"),
-                    Err(actors::CallError::Reentrant) => "err:reentrant".into(),
-                    Err(actors::CallError::TooLarge) => "err:too-large".into(),
-                    Err(actors::CallError::Timeout) => "err:timeout".into(),
-                    Err(actors::CallError::Failed(m)) => format!("err:failed:{m}"),
-                };
+                let answer = answer(actors::call(&to, &request));
                 respond(out, 200, &[], &answer);
+            }
+            "/call-many" => {
+                if let Some(ms) = param(query, "delay").and_then(|v| v.parse().ok()) {
+                    sleep_ms(ms);
+                }
+                let to = param(query, "to").unwrap_or_default();
+                let len: usize = param(query, "body")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let request = actors::Request {
+                    method: param(query, "method").unwrap_or_else(|| "GET".into()),
+                    path: param(query, "path").unwrap_or_else(|| "/".into()),
+                    headers: Vec::new(),
+                    body: vec![b'x'; len],
+                };
+                let entries: Vec<(String, actors::Request)> = to
+                    .split(',')
+                    .filter(|a| !a.is_empty())
+                    .map(|a| match a.split_once(';') {
+                        Some((a, path)) => (
+                            a.to_owned(),
+                            actors::Request {
+                                path: path.to_owned(),
+                                ..request.clone()
+                            },
+                        ),
+                        None => (a.to_owned(), request.clone()),
+                    })
+                    .collect();
+                let answers: Vec<String> =
+                    calls::call_many(&entries).into_iter().map(answer).collect();
+                respond(out, 200, &[], &answers.join(" | "));
             }
             "/headers" => {
                 let mut text = method_name(&request.method());

@@ -24,7 +24,7 @@ use wasmkeep_wit::FrontCore;
 use wasmkeep_wit::wasmkeep::actor::actors::{
     self, CallError, Request as CallRequest, Response as CallResponse,
 };
-use wasmkeep_wit::wasmkeep::actor::env;
+use wasmkeep_wit::wasmkeep::actor::{calls, env};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
@@ -32,7 +32,7 @@ use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::actor::{FRONT_CLASS, FRONT_NAME};
+use crate::actor::{BodyBudget, FRONT_CLASS, FRONT_NAME, refuse_batch};
 use crate::http::{CappedBody, text_response};
 use crate::metrics::{METRICS, inc};
 use crate::{ActorService, Error};
@@ -92,28 +92,54 @@ impl WasiHttpView for FrontHost {
 }
 
 impl FrontHost {
-    async fn call_inner(
-        &mut self,
+    /// When a call starting now must give up (ADR 0023): while the margin
+    /// of the request's wall remains, or after the actors' call limit,
+    /// whichever comes first. `None`: less than the margin is left, so a
+    /// call fails at once with `timeout`.
+    fn call_deadline(&self, service: &ActorService) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        let left = self.deadline.saturating_duration_since(now);
+        let limit = left.checked_sub(CALL_MARGIN).filter(|l| !l.is_zero())?;
+        Some(now + limit.min(service.call_wall()))
+    }
+
+    /// One call, as `actors.call` makes it and as each entry of a
+    /// `calls.call-many` does: counted in the per-actor bound while it
+    /// waits, given up at `deadline`, its response taken from `budget`.
+    async fn entry(
+        service: &ActorService,
+        waits: &Arc<Waits>,
+        per_actor: usize,
         address: String,
         request: CallRequest,
+        deadline: Option<tokio::time::Instant>,
+        budget: &BodyBudget,
     ) -> Result<CallResponse, CallError> {
-        let Some(service) = self.actors.clone() else {
-            return Err(CallError::InvalidAddress("no such actor class".into()));
-        };
         let target = service.front_target(&address)?;
-        let left = self
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now());
-        // A call started with less than the margin left fails at once.
-        let Some(limit) = left.checked_sub(CALL_MARGIN).filter(|l| !l.is_zero()) else {
+        let Some(deadline) = deadline else {
             return Err(CallError::Timeout);
         };
-        let limit = limit.min(service.call_wall());
-        let Some(_waiting) = Waits::enter(&self.waits, &target, self.per_actor) else {
+        let limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if limit.is_zero() {
+            return Err(CallError::Timeout);
+        }
+        let Some(_waiting) = Waits::enter(waits, &target, per_actor) else {
             return Err(CallError::Failed(BUSY.into()));
         };
-        service.front_call(target, request, limit).await
+        service.front_call(target, request, limit, budget).await
     }
+}
+
+/// Counts a call's outcome in `wasmkeep_front_calls_total`. Every other
+/// failure (invalid-address, reentrant, too-large) is `failed`.
+fn count(result: &Result<CallResponse, CallError>) {
+    let outcome = match result {
+        Ok(_) => "ok",
+        Err(CallError::Timeout) => "timeout",
+        Err(CallError::Failed(m)) if m == BUSY => "busy",
+        Err(_) => "failed",
+    };
+    inc(&METRICS.front_calls.get(&[("outcome", outcome)]));
 }
 
 impl actors::Host for FrontHost {
@@ -122,16 +148,24 @@ impl actors::Host for FrontHost {
         address: String,
         request: CallRequest,
     ) -> wasmtime::Result<Result<CallResponse, CallError>> {
-        let result = self.call_inner(address, request).await;
-        // Every other failure (invalid-address, reentrant, too-large) is
-        // `failed`.
-        let outcome = match &result {
-            Ok(_) => "ok",
-            Err(CallError::Timeout) => "timeout",
-            Err(CallError::Failed(m)) if m == BUSY => "busy",
-            Err(_) => "failed",
+        let result = match self.actors.clone() {
+            None => Err(CallError::InvalidAddress("no such actor class".into())),
+            Some(service) => {
+                let deadline = self.call_deadline(&service);
+                let budget = BodyBudget::one();
+                Self::entry(
+                    &service,
+                    &self.waits,
+                    self.per_actor,
+                    address,
+                    request,
+                    deadline,
+                    &budget,
+                )
+                .await
+            }
         };
-        inc(&METRICS.front_calls.get(&[("outcome", outcome)]));
+        count(&result);
         Ok(result)
     }
 
@@ -141,6 +175,38 @@ impl actors::Host for FrontHost {
             class: FRONT_CLASS.to_owned(),
             name: FRONT_NAME.to_owned(),
         })
+    }
+}
+
+impl calls::Host for FrontHost {
+    /// ADR 0025: every entry is an `actors.call` from the front, all
+    /// started at once, under the deadline a call starting now would have
+    /// and one response budget; each counts in the per-actor bound and in
+    /// the metrics as a call.
+    async fn call_many(
+        &mut self,
+        calls: Vec<(String, CallRequest)>,
+    ) -> wasmtime::Result<Vec<Result<CallResponse, CallError>>> {
+        let results = if let Some(refused) = refuse_batch(&calls) {
+            refused
+        } else if let Some(service) = self.actors.clone() {
+            let deadline = self.call_deadline(&service);
+            let budget = BodyBudget::one();
+            let (waits, per_actor) = (&self.waits, self.per_actor);
+            let entries = calls.into_iter().map(|(address, request)| {
+                Self::entry(
+                    &service, waits, per_actor, address, request, deadline, &budget,
+                )
+            });
+            futures_util::future::join_all(entries).await
+        } else {
+            calls
+                .iter()
+                .map(|_| Err(CallError::InvalidAddress("no such actor class".into())))
+                .collect()
+        };
+        results.iter().for_each(count);
+        Ok(results)
     }
 }
 

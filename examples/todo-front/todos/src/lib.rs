@@ -8,6 +8,7 @@
 //! - `GET /`: the list, as JSON `[{"id":1,"text":"..."}]`
 //! - `POST /`: adds the body (text, 1 to 1,000 bytes); answers the new id
 //! - `DELETE /<id>`: removes an item
+//! - `GET /count`: how many items the list has
 
 use wasmkeep_sdk::http::{self, IncomingRequest, Method, ResponseOutparam};
 use wasmkeep_sdk::{Actor, Caller, Value, caller, params, storage};
@@ -40,6 +41,7 @@ impl http::Guest for Todos {
         let path = request.path_with_query().unwrap_or_else(|| "/".into());
         match (request.method(), path.as_str()) {
             (Method::Get, "/") => list(out),
+            (Method::Get, "/count") => count(out),
             (Method::Post, "/") => match http::read_body(&request, MAX_TEXT) {
                 Some(body) if !body.is_empty() => match String::from_utf8(body) {
                     Ok(text) => add(out, &text),
@@ -74,6 +76,16 @@ fn list(out: ResponseOutparam) {
                 .collect();
             let body = format!("[{}]\n", items.join(","));
             http::respond(out, 200, "application/json", body.as_bytes());
+        }
+        Err(e) => failed(out, &e),
+    }
+}
+
+fn count(out: ResponseOutparam) {
+    match storage::query("SELECT count(*) AS n FROM todos", &[]) {
+        Ok(rows) => {
+            let n = rows.get(0, "n").and_then(|v| v.as_i64()).unwrap_or(0);
+            http::respond(out, 200, "text/plain", format!("{n}\n").as_bytes());
         }
         Err(e) => failed(out, &e),
     }

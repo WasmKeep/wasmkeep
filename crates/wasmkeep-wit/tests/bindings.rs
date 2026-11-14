@@ -10,7 +10,7 @@ use std::process::Command;
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_wit::wasmkeep::actor::actors::{CallError, Request, Response};
 use wasmkeep_wit::wasmkeep::actor::types::{Rows, SqlError, Value};
-use wasmkeep_wit::wasmkeep::actor::{actors, alarms, storage, types, websockets};
+use wasmkeep_wit::wasmkeep::actor::{actors, alarms, calls, storage, types, websockets};
 use wasmkeep_wit::{ActorCore, ActorCorePre};
 use wasmtime::component::{HasSelf, Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -162,6 +162,15 @@ impl actors::Host for Fake {
     }
 }
 
+impl calls::Host for Fake {
+    async fn call_many(
+        &mut self,
+        calls: Vec<(String, Request)>,
+    ) -> wasmtime::Result<Vec<Result<Response, CallError>>> {
+        Ok(calls.iter().map(|_| Err(CallError::Reentrant)).collect())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn counter_on_init_reaches_the_host() {
     let runtime = Runtime::new(&RuntimeConfig {
@@ -170,6 +179,20 @@ async fn counter_on_init_reaches_the_host() {
     })
     .unwrap();
     let component = runtime.compile(&counter_wasm()).unwrap();
+    // The counter does not use `calls` (ADR 0025): its component does not
+    // import it, as one built before the interface existed, and links
+    // against host bindings that provide it.
+    let imports: Vec<String> = component
+        .component_type()
+        .imports(runtime.engine())
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    assert!(
+        !imports
+            .iter()
+            .any(|i| i.starts_with("wasmkeep:actor/calls@")),
+        "{imports:?}"
+    );
 
     let mut linker = Linker::<State>::new(runtime.engine());
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).unwrap();

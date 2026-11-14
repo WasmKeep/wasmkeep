@@ -52,9 +52,10 @@ pub mod bindings {
         export_macro_name: "export_core",
         default_bindings_module: "::wasmkeep_sdk::bindings",
         additional_derives: [PartialEq, Clone],
-        // One `actors` and one `env` for actors and fronts alike.
+        // One `actors`, `calls` and `env` for actors and fronts alike.
         with: {
             "wasmkeep:actor/actors@0.2.0": crate::front::actors,
+            "wasmkeep:actor/calls@0.2.0": crate::front::calls,
             "wasmkeep:actor/env@0.2.0": crate::front::env,
         },
     });
@@ -88,6 +89,8 @@ pub use bindings::wasmkeep::actor::websockets;
 pub use bindings::wasmkeep::actor::websockets::Message;
 /// Calls to other actors of the same app.
 pub use front::actors;
+/// Several calls to other actors at once ([`calls::call_many`], ADR 0025).
+pub use front::calls;
 /// Configuration and secrets the operator gives this class, or the front
 /// (`env::get("API_KEY")`).
 pub use front::env;

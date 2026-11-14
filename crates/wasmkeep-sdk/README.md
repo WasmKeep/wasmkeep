@@ -64,6 +64,9 @@ goes from an empty directory to an actor whose state survives a restart.
 - `storage`: the actor's own SQLite database (`exec`, `query`, `params!`).
 - `alarms`: one pending alarm per actor, delivered to `Actor::on_alarm`.
 - `actors`: calls to other actors of the same app.
+- `calls`: several of those calls at once (`calls::call_many`, at most 16,
+  one result per call in input order), from actors and fronts
+  ([ADR 0025](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0025-calling-several-actors-at-once.md)).
 - `websockets`: connections to this actor, with the `Actor::on_websocket_*` hooks.
 - `env`: configuration and secrets the operator gives the class (or the front).
 - `caller`, `Caller`: who sent a request (the app's front, another actor,

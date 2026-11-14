@@ -264,6 +264,18 @@ actor of the same tenant and waits for the answer.
   order, see [cluster](cluster.md)): treat them like any client's.
 - A call that would come back to an actor already waiting in the chain (A
   calls B calls A) is refused with `reentrant` instead of deadlocking.
+- **Several at once**: `calls.call-many([(address, request), ...])` (Rust
+  `calls::call_many`, TypeScript `actors.callMany`) starts up to 16 calls
+  together and returns one result per call, in input order, once all have
+  answered or the batch's one deadline passed (an actor's call limit, a
+  front's call deadline): a front gathering four actors pays about one
+  round trip, not four. Each entry is a call in every other respect: its
+  caller value, its chain (an entry naming the caller is `reentrant`), its
+  own error, and, from a front, its count against the per-actor bound.
+  The requests of a batch together, and its responses together, are capped
+  at 16 MB. A batch's callees are not in each other's chain: two of them
+  calling each other wait on each other until the deadline, so do not
+  let them ([ADR 0025](adr/0025-calling-several-actors-at-once.md)).
 - Request bodies are capped at 16 MB (413 when declared larger; a failed
   read past it otherwise). Calls between actors cap both ways. A handler
   may answer without reading the body: the server reads and discards what

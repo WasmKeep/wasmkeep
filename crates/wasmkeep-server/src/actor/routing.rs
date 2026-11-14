@@ -3,8 +3,68 @@
 
 use super::*;
 
-/// Largest request or response body for `actors.call`.
+/// Largest request or response body for `actors.call`, and for the
+/// requests, and the responses, of one `calls.call-many` together.
 pub(super) const MAX_CALL_BODY: usize = 16 * 1024 * 1024;
+
+/// Most entries in one `calls.call-many` (ADR 0025).
+pub(crate) const MAX_BATCH: usize = 16;
+
+/// What every entry of a batch past [`MAX_BATCH`] gets.
+pub(crate) const TOO_MANY: &str = "too many calls: at most 16 in one call-many";
+
+/// The response bytes calls may still buffer: one call's own
+/// ([`BodyBudget::one`]), or shared by the entries of a batch, so that a
+/// batch buffers no more than one call (ADR 0025).
+#[derive(Debug)]
+pub(crate) struct BodyBudget(std::sync::atomic::AtomicUsize);
+
+impl BodyBudget {
+    /// [`MAX_CALL_BODY`], for one call or one batch.
+    pub(crate) fn one() -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(MAX_CALL_BODY))
+    }
+
+    /// Takes `n` bytes, or nothing and `false` if fewer are left.
+    fn take(&self, n: usize) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut left = self.0.load(Acquire);
+        loop {
+            let Some(rest) = left.checked_sub(n) else {
+                return false;
+            };
+            match self.0.compare_exchange_weak(left, rest, AcqRel, Acquire) {
+                Ok(_) => return true,
+                Err(now) => left = now,
+            }
+        }
+    }
+
+    /// Gives back `n` bytes taken by a response that was dropped.
+    fn give(&self, n: usize) {
+        self.0.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The answer for every entry when a batch is refused as a whole, before
+/// any call starts: more than [`MAX_BATCH`] entries, or request bodies
+/// past [`MAX_CALL_BODY`] together (ADR 0025). `None`: the batch runs.
+pub(crate) fn refuse_batch(
+    calls: &[(String, CallRequest)],
+) -> Option<Vec<Result<CallResponse, CallError>>> {
+    let refusal = if calls.len() > MAX_BATCH {
+        CallError::Failed(TOO_MANY.to_owned())
+    } else if calls
+        .iter()
+        .try_fold(0usize, |sum, (_, r)| sum.checked_add(r.body.len()))
+        .is_none_or(|sum| sum > MAX_CALL_BODY)
+    {
+        CallError::TooLarge
+    } else {
+        return None;
+    };
+    Some(calls.iter().map(|_| Err(refusal.clone())).collect())
+}
 
 impl ServiceInner {
     /// Route a cold address before it consumes a local actor slot. A live
@@ -92,7 +152,9 @@ impl ServiceInner {
 
     /// `actors.call`: delivers `request` to `target` (from
     /// [`call_target`](Self::call_target)) and returns its buffered response,
-    /// or `timeout` after `limit`.
+    /// or `timeout` after `limit`. The response takes its bytes from
+    /// `budget`: past it, `too-large`. One entry of a `calls.call-many` is
+    /// this call, with the batch's shared budget.
     ///
     /// A call to an actor already waiting in this chain (including the
     /// caller) fails with `reentrant`. A cycle across two independent chains
@@ -105,6 +167,7 @@ impl ServiceInner {
         target: ActorAddress,
         request: CallRequest,
         limit: Duration,
+        budget: &BodyBudget,
     ) -> Result<CallResponse, CallError> {
         let me = match caller {
             Caller::Actor(me) => Some(me),
@@ -130,7 +193,7 @@ impl ServiceInner {
                 && let Some(cluster) = &self.cluster
             {
                 return match cluster.call(&owner, &target, &waiting, req).await {
-                    Ok(response) => collect_response(response).await,
+                    Ok(response) => collect_response(response, budget).await,
                     Err(error) => {
                         self.forget_owner(&target);
                         Err(CallError::Failed(error))
@@ -150,7 +213,7 @@ impl ServiceInner {
             let event = tokio::spawn(event);
 
             match response_rx.await {
-                Ok(Outcome::Served(response)) => collect_response(response).await,
+                Ok(Outcome::Served(response)) => collect_response(response, budget).await,
                 Ok(Outcome::Failed(e)) => Err(CallError::Failed(e)),
                 Ok(Outcome::Refused(e)) => {
                     crate::metrics::refused(crate::metrics::Refusal::Unavailable);
@@ -169,7 +232,7 @@ impl ServiceInner {
                     self.remember_owner(&target, &owner);
                     match &self.cluster {
                         Some(cluster) => match cluster.call(&owner, &target, &waiting, req).await {
-                            Ok(response) => collect_response(response).await,
+                            Ok(response) => collect_response(response, budget).await,
                             Err(e) => {
                                 self.forget_owner(&target);
                                 Err(CallError::Failed(e))
@@ -184,7 +247,7 @@ impl ServiceInner {
                     self.mailboxes.hibernate(&target);
                     match &self.cluster {
                         Some(cluster) => match cluster.call(&peer, &target, &waiting, req).await {
-                            Ok(response) => collect_response(response).await,
+                            Ok(response) => collect_response(response, budget).await,
                             Err(e) => {
                                 cluster.suspect(&peer);
                                 Err(CallError::Failed(e))
@@ -196,7 +259,7 @@ impl ServiceInner {
                 Err(_) => match event.await {
                     Ok(Err(MailboxError::Capacity(_))) => {
                         crate::metrics::refused(crate::metrics::Refusal::Capacity);
-                        collect_response(capacity_response()).await
+                        collect_response(capacity_response(), budget).await
                     }
                     Ok(Err(MailboxError::Full(_))) => {
                         crate::metrics::refused(crate::metrics::Refusal::Overloaded);
@@ -289,20 +352,33 @@ const WASMKEEP_PREFIX: &str = "x-wasmkeep-";
 
 pub(super) async fn collect_response(
     response: Response<HyperOutgoingBody>,
+    budget: &BodyBudget,
 ) -> Result<CallResponse, CallError> {
     use http_body_util::BodyExt;
-    let (parts, body) = response.into_parts();
-    let body = http_body_util::Limited::new(body, MAX_CALL_BODY)
-        .collect()
-        .await
-        .map_err(|e| {
-            if e.is::<http_body_util::LengthLimitError>() {
-                CallError::TooLarge
-            } else {
-                CallError::Failed(format!("reading the response body: {e}"))
+    let (parts, mut body) = response.into_parts();
+    // Counted as it arrives, so that the entries of a batch together
+    // never hold more than the budget.
+    let mut taken = 0usize;
+    let mut bytes = Vec::new();
+    let read = async {
+        while let Some(frame) = body.frame().await {
+            let frame =
+                frame.map_err(|e| CallError::Failed(format!("reading the response body: {e}")))?;
+            if let Ok(data) = frame.into_data() {
+                if !budget.take(data.len()) {
+                    return Err(CallError::TooLarge);
+                }
+                taken += data.len();
+                bytes.extend_from_slice(&data);
             }
-        })?
-        .to_bytes();
+        }
+        Ok(())
+    };
+    if let Err(e) = read.await {
+        budget.give(taken);
+        return Err(e);
+    }
+    let body = bytes;
     // The host's range never reaches the calling guest (ADR 0023): not
     // the node that served a hop (`x-wasmkeep-node`), nor any name the
     // callee set. No SDK reads one from an answer. Nor does the hop's
@@ -321,6 +397,6 @@ pub(super) async fn collect_response(
     Ok(CallResponse {
         status: parts.status.as_u16(),
         headers,
-        body: body.to_vec(),
+        body,
     })
 }

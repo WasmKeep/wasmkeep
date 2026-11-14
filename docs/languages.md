@@ -64,6 +64,14 @@ and [TypeScript](../sdks/typescript/README.md#writing-a-front) READMEs and
 MoonBit build actors only; their front targets come later. Any plain
 `wasi:http` component is a front too, without the SDK.
 
+**Several calls at once** (`calls.call-many`,
+[ADR 0025](adr/0025-calling-several-actors-at-once.md)): Rust
+(`calls::call_many`) and TypeScript (`actors.callMany`), from actors and
+fronts. Python, Go, C, Zig, D and MoonBit get it later; until then they
+call one actor at a time with `actors.call`, and keep building unchanged:
+the interface is an import of its own, which the host provides whether a
+component imports it or not.
+
 The release's files are signed:
 [check a download](deploy/single-node.md#1-install-the-binary).
 

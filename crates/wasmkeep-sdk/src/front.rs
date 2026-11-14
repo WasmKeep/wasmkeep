@@ -58,6 +58,31 @@ pub mod bindings {
 /// From a front, the call is inside: it reaches `internal` classes, and
 /// the callee reads `<tenant>/_front/main` as its caller.
 pub use bindings::wasmkeep::actor::actors;
+/// Several calls at once (ADR 0025): `calls::call_many(&[(address,
+/// request), ...])` starts every call together and returns one
+/// `Result<Response, CallError>` per entry, in input order, once all have
+/// answered or the batch's deadline passed. At most 16 entries; each is an
+/// [`actors::call`] in every other respect (caller value, chain, errors).
+/// A front gathering several actors pays about one round trip, not one
+/// per actor.
+///
+/// ```ignore
+/// use wasmkeep_sdk::{actors, calls};
+///
+/// let get = |path: &str| actors::Request {
+///     method: "GET".into(),
+///     path: path.into(),
+///     headers: vec![],
+///     body: vec![],
+/// };
+/// let [cart, profile] = calls::call_many(&[
+///     ("cart/alice".into(), get("/")),
+///     ("profile/alice".into(), get("/")),
+/// ])
+/// .try_into()
+/// .expect("one result per entry");
+/// ```
+pub use bindings::wasmkeep::actor::calls;
 /// Configuration and secrets the operator gives the front (`--front-config`
 /// and `secrets set --front` in a deploy, `--front-env` on `serve`), or the
 /// class in an actor.

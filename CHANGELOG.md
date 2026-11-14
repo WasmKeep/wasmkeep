@@ -50,6 +50,27 @@ Since 0.3.0, in no release yet.
   class) and [`examples/ts-todo-front`](examples/ts-todo-front). Python,
   Go, C, Zig, D and MoonBit fronts come later
   ([ADR 0023](docs/adr/0023-the-front.md)).
+- **Calling several actors at once.** A new interface,
+  `wasmkeep:actor/calls`, imported by worlds `actor-core` and
+  `front-core`: `call-many(list<(address, request)>)` starts up to 16
+  calls together and returns one `result<response, call-error>` per
+  entry, in input order, once all have answered or the batch's one
+  deadline passed (an actor's call limit, a front's call deadline). A
+  front gathering four slow actors pays about one round trip, not four.
+  Each entry is an `actors.call` in every other respect: caller value,
+  chain (an entry naming the caller is `reentrant`), routing and signed
+  hops between nodes, and from a front, its count against the per-actor
+  bound and in `wasmkeep_front_calls_total`. A batch of more than 16
+  starts nothing and fails every entry with `failed("too many calls:
+  ...")`; its requests together, and its responses together, are capped
+  at 16 MiB (`too-large`). Two callees of one batch that call each other
+  wait until the deadline (`timeout`). Rust: `calls::call_many` (also
+  `wasmkeep_sdk::front::calls`); TypeScript: `actors.callMany`, which
+  returns a `CallError` per failed entry instead of throwing. Other SDKs
+  later. The package stays `@0.2.0`: built components do not import the
+  interface and run unchanged; one that imports it needs this release.
+  The todo-front examples gain `GET /api/team`, every user's count from
+  one batch ([ADR 0025](docs/adr/0025-calling-several-actors-at-once.md)).
 - **`wasmkeep cluster status` shows each node's load**: ACTORS, SOCKETS
   and EV/MIN (events per minute over the last minute or more) per live
   node, and ACTORS per app, summed over its live nodes; `actors`,

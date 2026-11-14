@@ -130,6 +130,9 @@ front's paths (see "The WebSocket hand-off").
 - `actors.call("class/name", request)` from a front works as from an
   actor: buffered, 16 MiB each way, one call at a time per front
   instance. The callee is in the front's own app.
+  - Note (2026-11-14): [ADR 0025](0025-calling-several-actors-at-once.md)
+    adds `calls.call-many`, up to 16 calls at once from one instance,
+    each counted against the per-actor bound below.
 - The call is **inside** (ADR 0010): the front reaches `internal`
   classes, and creates actors of any class by calling them, as actors
   do. Access rules are checked for outside requests only (`admit`,

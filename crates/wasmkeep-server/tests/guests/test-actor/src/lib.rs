@@ -11,6 +11,9 @@
 //! - `POST /call?to=CLASS/NAME&path=P` (P percent-encoded): `actors.call`
 //!   with GET P; answers `STATUS:BODY` or the call error (`&times=N`: the
 //!   same call N times in a row, answers joined by ` | `)
+//! - `POST /call-many?to=A,B,...&path=P`: one `calls::call_many` with a
+//!   POST P to each address (comma-separated, P percent-encoded); answers
+//!   each entry as `/call` does, joined by ` | `, in input order
 //! - `POST /sleep?ms=MS`: waits MS on the host clock (no CPU used), counts
 //!   in `slept`; `GET /slept`
 //! - `POST /durable`: adds 1 to `durable` with `exec-durable`; answers the
@@ -42,9 +45,9 @@
 //!   body instead
 //! - `GET /env?name=N`: `env.get(N)`, and whether WASI saw N
 
-use wasmkeep_sdk::http::{self, IncomingRequest, Method, ResponseOutparam};
 use wasmkeep_sdk::actors::{self, CallError};
-use wasmkeep_sdk::{Actor, Value, alarms, env, now_ms, params, storage};
+use wasmkeep_sdk::http::{self, IncomingRequest, Method, ResponseOutparam};
+use wasmkeep_sdk::{Actor, Value, alarms, calls, env, now_ms, params, storage};
 
 struct TestActor;
 
@@ -82,7 +85,8 @@ impl Actor for TestActor {
             storage::exec(sql, &[]).map_err(|e| e.to_string())?;
         }
         // Actors named alarm-on-init... set an alarm from on-init, 1.5 s out.
-        if actors::self_address().name.starts_with("alarm-on-init") && alarms::get_alarm().is_none() {
+        if actors::self_address().name.starts_with("alarm-on-init") && alarms::get_alarm().is_none()
+        {
             alarms::set_alarm(now_ms() + 1_500);
         }
         Ok(())
@@ -124,12 +128,23 @@ impl Actor for TestActor {
             set("fail_next", failures - 1);
             return Err("failing on purpose".into());
         }
-        storage::exec("INSERT INTO fired VALUES (?1)", &params![now])
-            .map_err(|e| e.to_string())?;
+        storage::exec("INSERT INTO fired VALUES (?1)", &params![now]).map_err(|e| e.to_string())?;
         if count("fired") < get("repeat") {
             alarms::set_alarm(now_ms() + 20);
         }
         Ok(())
+    }
+}
+
+/// A call's result: `STATUS:BODY` (trimmed), or the error.
+fn answer(result: Result<actors::Response, CallError>) -> String {
+    match result {
+        Ok(r) => format!("{}:{}", r.status, String::from_utf8_lossy(&r.body).trim()),
+        Err(CallError::Reentrant) => "reentrant".into(),
+        Err(CallError::InvalidAddress(m)) => format!("invalid-address:{m}"),
+        Err(CallError::Failed(m)) => format!("failed:{m}"),
+        Err(CallError::Timeout) => "timeout".into(),
+        Err(CallError::TooLarge) => "too-large".into(),
     }
 }
 
@@ -139,7 +154,10 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() + 1 {
-            if let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            if let Some(v) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
                 out.push(v);
                 i += 3;
                 continue;
@@ -153,18 +171,24 @@ fn percent_decode(s: &str) -> String {
 
 fn query_param(path: &str, key: &str) -> Option<String> {
     let query = path.split_once('?')?.1;
-    query.split('&').find_map(|pair| match pair.split_once('=') {
-        Some((k, v)) if k == key => Some(v.to_owned()),
-        None if pair == key => Some(String::new()),
-        _ => None,
-    })
+    query
+        .split('&')
+        .find_map(|pair| match pair.split_once('=') {
+            Some((k, v)) if k == key => Some(v.to_owned()),
+            None if pair == key => Some(String::new()),
+            _ => None,
+        })
 }
 
 impl http::Guest for TestActor {
     fn handle(request: IncomingRequest, out: ResponseOutparam) {
         let full = request.path_with_query().unwrap_or_default();
         let path = full.split('?').next().unwrap_or("/").to_owned();
-        let num = |k: &str| query_param(&full, k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let num = |k: &str| {
+            query_param(&full, k)
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
         let body = match (request.method(), path.as_str()) {
             (Method::Post, "/alarm") => {
                 let rollback = query_param(&full, "rollback").is_some();
@@ -204,7 +228,8 @@ impl http::Guest for TestActor {
                 // Every way out besides outbound HTTP must be closed: raw
                 // TCP, name lookups, the filesystem.
                 let port = num("port");
-                let tcp = std::net::TcpStream::connect(("127.0.0.1", u16::try_from(port).unwrap_or(1)));
+                let tcp =
+                    std::net::TcpStream::connect(("127.0.0.1", u16::try_from(port).unwrap_or(1)));
                 let dns = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 80));
                 let dir = std::fs::read_dir("/");
                 let file = std::fs::read("/etc/passwd");
@@ -226,23 +251,47 @@ impl http::Guest for TestActor {
             }
             (Method::Post, "/trap") => panic!("trap requested"),
             (Method::Post, "/call") => {
-                let to = query_param(&full, "to").map(|t| percent_decode(&t)).unwrap_or_default();
-                let path = query_param(&full, "path").map_or("/fired".to_owned(), |p| percent_decode(&p));
+                let to = query_param(&full, "to")
+                    .map(|t| percent_decode(&t))
+                    .unwrap_or_default();
+                let path =
+                    query_param(&full, "path").map_or("/fired".to_owned(), |p| percent_decode(&p));
                 let request = actors::Request {
                     method: "POST".into(),
                     path,
                     headers: vec![],
                     body: vec![],
                 };
-                let call = || match actors::call(&to, &request) {
-                    Ok(r) => format!("{}:{}", r.status, String::from_utf8_lossy(&r.body).trim()),
-                    Err(CallError::Reentrant) => "reentrant".into(),
-                    Err(CallError::InvalidAddress(m)) => format!("invalid-address:{m}"),
-                    Err(CallError::Failed(m)) => format!("failed:{m}"),
-                    Err(CallError::Timeout) => "timeout".into(),
-                    Err(CallError::TooLarge) => "too-large".into(),
-                };
-                (0..num("times").max(1)).map(|_| call()).collect::<Vec<_>>().join(" | ")
+                let call = || answer(actors::call(&to, &request));
+                (0..num("times").max(1))
+                    .map(|_| call())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            }
+            (Method::Post, "/call-many") => {
+                let to = query_param(&full, "to")
+                    .map(|t| percent_decode(&t))
+                    .unwrap_or_default();
+                let path =
+                    query_param(&full, "path").map_or("/fired".to_owned(), |p| percent_decode(&p));
+                let entries: Vec<(String, actors::Request)> = to
+                    .split(',')
+                    .filter(|a| !a.is_empty())
+                    .map(|a| {
+                        let request = actors::Request {
+                            method: "POST".into(),
+                            path: path.clone(),
+                            headers: vec![],
+                            body: vec![],
+                        };
+                        (a.to_owned(), request)
+                    })
+                    .collect();
+                calls::call_many(&entries)
+                    .into_iter()
+                    .map(answer)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             }
             (Method::Post, "/durable") => {
                 let r = storage::exec_durable(
@@ -328,7 +377,10 @@ impl http::Guest for TestActor {
                 let text = query_param(&full, "text").unwrap_or_default();
                 let conns = wasmkeep_sdk::websockets::connections();
                 for c in &conns {
-                    let _ = wasmkeep_sdk::websockets::send(*c, &wasmkeep_sdk::Message::Text(text.clone()));
+                    let _ = wasmkeep_sdk::websockets::send(
+                        *c,
+                        &wasmkeep_sdk::Message::Text(text.clone()),
+                    );
                 }
                 conns.len().to_string()
             }
@@ -348,21 +400,36 @@ impl http::Guest for TestActor {
                 .headers()
                 .get("x-wasmkeep-caller")
                 .first()
-                .map_or("none".to_owned(), |v| String::from_utf8_lossy(v).into_owned()),
+                .map_or("none".to_owned(), |v| {
+                    String::from_utf8_lossy(v).into_owned()
+                }),
             (Method::Get, "/header") => {
                 let name = query_param(&full, "name").unwrap_or_default();
                 request
                     .headers()
                     .get(&name)
                     .first()
-                    .map_or("none".to_owned(), |v| String::from_utf8_lossy(v).into_owned())
+                    .map_or("none".to_owned(), |v| {
+                        String::from_utf8_lossy(v).into_owned()
+                    })
             }
             (Method::Get, "/fetch") => {
-                let url = query_param(&full, "url").map(|u| percent_decode(&u)).unwrap_or_default();
-                let send: usize = query_param(&full, "send").and_then(|n| n.parse().ok()).unwrap_or(0);
+                let url = query_param(&full, "url")
+                    .map(|u| percent_decode(&u))
+                    .unwrap_or_default();
+                let send: usize = query_param(&full, "send")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
                 let body = vec![b'x'; send];
                 let method = if send > 0 { "POST" } else { "GET" };
-                match wasmkeep_sdk::http::fetch(method, &url, &[], &body, std::time::Duration::from_secs(5), 4096) {
+                match wasmkeep_sdk::http::fetch(
+                    method,
+                    &url,
+                    &[],
+                    &body,
+                    std::time::Duration::from_secs(5),
+                    4096,
+                ) {
                     Ok(r) => format!("{}:{}", r.status, String::from_utf8_lossy(&r.body)),
                     Err(e) => format!("error: {e}"),
                 }
@@ -372,10 +439,13 @@ impl http::Guest for TestActor {
                 (MEMORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).to_string()
             }
             (Method::Post, "/sql") => {
-                let sql = String::from_utf8(http::read_body(&request, 64 * 1024).unwrap_or_default())
-                    .unwrap_or_default();
+                let sql =
+                    String::from_utf8(http::read_body(&request, 64 * 1024).unwrap_or_default())
+                        .unwrap_or_default();
                 let blob = query_param(&full, "blob").and_then(|n| n.parse::<usize>().ok());
-                let params: Vec<Value> = blob.map(|n| vec![Value::Blob(vec![0x41; n])]).unwrap_or_default();
+                let params: Vec<Value> = blob
+                    .map(|n| vec![Value::Blob(vec![0x41; n])])
+                    .unwrap_or_default();
                 match storage::query(&sql, &params) {
                     Ok(rows) => format!("ok:{}", rows.values.len()),
                     Err(e) => format!("err:{:?}", e.kind),
@@ -402,7 +472,11 @@ impl http::Guest for TestActor {
                 // `env.get`, and whether the same name leaked into the WASI
                 // environment (it must not).
                 let name = query_param(&full, "name").unwrap_or_default();
-                let wasi = if std::env::var_os(&name).is_some() { "set" } else { "unset" };
+                let wasi = if std::env::var_os(&name).is_some() {
+                    "set"
+                } else {
+                    "unset"
+                };
                 match env::get(&name) {
                     Some(v) => format!("{v} wasi={wasi}"),
                     None => format!("(none) wasi={wasi}"),
