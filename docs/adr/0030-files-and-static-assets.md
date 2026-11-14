@@ -11,7 +11,7 @@
   [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (the
   app's root, `state/<tenant>/<app>/`), [ADR 0023](0023-the-front.md)
   (the front, routing), [ADR 0026](0026-the-project-file.md) (the project
-  file), and ADR 0028 (actors that end, proposed in its own change: the
+  file), and [ADR 0028](0028-actors-that-end.md) (actors that end: the
   delete routine, idle expiry and `app delete`).
 - Amends: [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)
   (two families under an app's root, `blobs/` and `blob-sweeps/`, and one
@@ -20,7 +20,8 @@
   `/_wasmkeep/blobs/`; `front-core` imports `blobs`),
   [ADR 0026](0026-the-project-file.md) (an `[assets]` section),
   [ADR 0012](0012-bucket-garbage-collection.md) (collecting unused
-  assets), and ADR 0028 (a delete also ends the actor's files).
+  assets), and [ADR 0028](0028-actors-that-end.md) (a delete also ends
+  the actor's files).
 
 ## Context
 
