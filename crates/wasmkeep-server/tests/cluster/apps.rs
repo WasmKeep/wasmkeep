@@ -529,7 +529,7 @@ async fn the_metrics_page_names_the_nodes_app_and_version() {
     );
     let info = format!(
         "\nwasmkeep_info{{version=\"{}\",tenant=\"acme\",app=\"shop\",node=\"shop-1\"}} 1\n",
-        env!("CARGO_PKG_VERSION")
+        wasmkeep_server::VERSION
     );
     assert!(page.contains(&info), "{page}");
 }

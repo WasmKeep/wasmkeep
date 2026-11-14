@@ -891,7 +891,12 @@ async fn readiness_follows_the_bucket_and_metrics_count_events() {
     // One actor: created once, its on-init run once, four requests.
     assert_eq!(events("init", "ok"), 1, "{page}");
     assert_eq!(events("request", "ok"), 4, "{page}");
-    assert!(!page.contains("outcome=\"failed\""), "{page}");
+    assert!(
+        !page
+            .lines()
+            .any(|l| l.starts_with("wasmkeep_events_total{") && l.contains("outcome=\"failed\"")),
+        "{page}"
+    );
     assert_eq!(value("wasmkeep_wakes_total"), 1, "{page}");
     assert_eq!(value("wasmkeep_hibernations_total"), 0, "{page}");
     assert_eq!(value("wasmkeep_instantiate_seconds_count"), 1, "{page}");

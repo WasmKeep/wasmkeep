@@ -46,6 +46,8 @@ pub use http::{
     App, HEALTH_PATH, HttpComponent, MAX_BODY_BYTES, READY_PATH, ServeLimits, serve, serve_metrics,
     serve_with, serve_with_cluster_listener,
 };
+/// The version this build reports ([`wasmkeep_cluster::VERSION`]).
+pub use wasmkeep_cluster::VERSION;
 pub use wasmkeep_cluster::lease::LeaseConfig;
 pub use wasmkeep_cluster::state_root::StateRoot;
 

@@ -750,7 +750,7 @@ mod tests {
             beat(&store, "a", NOW, false, "acme/shop").await;
             // The same version as `a`: only the format is old, so the
             // format is the one warning.
-            let version = env!("CARGO_PKG_VERSION");
+            let version = wasmkeep_server::VERSION;
             let old = |at: u64| {
                 format!("wasmkeep-node 2\nb\nhttp://b:8080\n{version}\n{at}\nacme/shop\n")
             };
@@ -903,7 +903,7 @@ mod tests {
             let base = |id: &str| {
                 format!(
                     "wasmkeep-node 3\nlive i-{id}\n{NOW}\n{id}\nhttp://{id}:8080\n{}\nacme/shop\n",
-                    env!("CARGO_PKG_VERSION")
+                    wasmkeep_server::VERSION
                 )
             };
             put(&store, "demo/nodes/b", &format!("{}\n\nstuck\n", base("b"))).await;

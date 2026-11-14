@@ -17,10 +17,6 @@
 #   Grafana import: they need the real machines and a Prometheus.
 # - Backups, the restore drill and upgrades: they stop a real cluster and
 #   copy a real bucket with tools of the reader's choice.
-# - The series the page says appear only once they count
-#   (wasmkeep_failover_waits_total, wasmkeep_not_ready,
-#   wasmkeep_bucket_requests_total{status="error"}): the practice cluster
-#   loses no node and no bucket request.
 # - Stopping the drained node with systemctl: the practice nodes are not
 #   services; the page's undrain block runs on the drained node instead.
 
@@ -131,6 +127,8 @@ run metrics
 expect_status 0
 expect '^wasmkeep_ready 1$'
 expect '^wasmkeep_bucket_requests_total\{operation="get",status="ok"\} [0-9]+$'
+# On the page from the start, before any bucket error.
+expect '^wasmkeep_bucket_requests_total\{operation="get",status="error"\} [0-9]+$'
 for reason in access capacity overloaded unavailable wrong_app; do
   expect "^wasmkeep_admission_refused_total\{reason=\"$reason\"\} [0-9]+$"
 done

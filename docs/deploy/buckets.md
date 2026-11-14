@@ -18,7 +18,7 @@ those guarantees on a bucket before you trust a cluster to it.
 | **Deleting an absent key** succeeds and removes nothing else | Garbage collection and the alarm index delete keys that may already be gone |
 | **Large objects** (one `PUT` of a database snapshot) come back whole | Restores |
 | **Last-modified times**, whole seconds at least, never earlier for a later write, the same in a head and a listing | `cluster migrate` compares them to tell writes after its commit from writes before; `cluster fence` checks this machine's clock against the bucket's |
-| **The clock**: the bucket's time and each node's within the lease's allowed skew (1 s with the default timings) | Leases are measured on each node's clock ([how](../cluster.md#how-it-works)) |
+| **The clock**: the bucket's time and each node's within the lease's allowed skew of 1 s | Leases are measured on each node's clock ([how](../cluster.md#how-it-works)) |
 
 Every node also proves the first two at start, on a throwaway object
 under `probe/`, and refuses to run on a store that ignores them. `cluster

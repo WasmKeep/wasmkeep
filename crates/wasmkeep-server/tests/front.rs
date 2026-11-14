@@ -664,7 +664,13 @@ async fn a_front_finishing_after_a_whole_answer_is_not_stopped() {
     ])
     .await;
     let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
-    assert!(!page.contains("outcome=\"client_gone\""), "{page}");
+    // On the page from the start (at 0): never counted here.
+    assert!(
+        page.contains(
+            "\nwasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"client_gone\"} 0\n"
+        ),
+        "{page}"
+    );
 }
 
 /// A client's own names in the host's range never reach an actor either,
@@ -715,7 +721,13 @@ async fn a_cut_while_streaming_is_not_counted_ok() {
     ])
     .await;
     let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
-    assert!(!page.contains("outcome=\"ok\""), "{page}");
+    // On the page from the start (at 0): never counted here.
+    assert!(
+        page.contains(
+            "\nwasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"ok\"} 0\n"
+        ),
+        "{page}"
+    );
 }
 
 /// The log lines this test process wrote, for the `wasmkeep::guest` target.

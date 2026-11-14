@@ -124,6 +124,35 @@ Since 0.3.0, in no release yet.
   working. The new gauge `wasmkeep_info{version,tenant,app,node}`, always
   1, shows which version each node runs (`node` only in a cluster); other
   series are unchanged ([metrics](docs/monitoring.md#metrics)).
+- **Series from zero, and rules for failover waits and refusals.**
+  Counters whose labels take a fixed set of values are on the metrics
+  page from the node's start, every series at 0:
+  `wasmkeep_failover_waits_total`, `wasmkeep_bucket_requests_total`
+  (`status="error"` included), `wasmkeep_event_cuts_total`,
+  `wasmkeep_forwards_total`, `wasmkeep_signatures_refused_full_total`,
+  `wasmkeep_websocket_owner_closes_total`,
+  `wasmkeep_parked_releases_total` and the front's two counters, so
+  `increase()` counts the first event. `wasmkeep_not_ready` has one series
+  per reason, 1 for the reason the node is not ready and 0 for the others,
+  where it had a single series only while not ready: count not-ready
+  nodes with `count(wasmkeep_not_ready == 1)`, as the dashboard now does.
+  `deploy/prometheus/alerts.yml` adds `WasmKeepFailoverWaitsFailed`
+  (requests kept for a takeover that got a 503: `expired`, `over_cap`),
+  `WasmKeepAdmissionRefused` (5 minutes of `capacity`, `overloaded` or
+  `wrong_app` refusals) and `WasmKeepAdmissionUnavailable` (15 minutes of
+  `unavailable`, which ticks briefly while nodes catch up with a deploy or
+  a secrets change); the Grafana dashboard charts both in a new row
+  ([alerts](docs/monitoring.md#alerts-worth-having)).
+- **A build names its commit.** A build from a git checkout reports
+  `0.3.0+<commit>` (`wasmkeep --version`, its heartbeat, so the VERSION
+  column of `cluster status`, and `wasmkeep_info{version}`); a build of a
+  release's tag, or one without git (a source tarball, a container image
+  built locally), reports the release alone. Before, every build reported
+  `0.3.0`. The usage report still sends the release version alone.
+- **Clock skew, one figure.** The pages that gave the lease timings'
+  tolerance as "a few seconds" now say what the code allows, as
+  `cluster diagnose` does: 1 s between nodes, and between a node and the
+  bucket.
 - **Clearer command and start messages.**
   - The first `wasmkeep deploy` of a new app no longer prints that access
     rules now come with deploys; only an app deployed before they did is
