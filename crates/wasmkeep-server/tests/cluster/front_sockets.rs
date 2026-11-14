@@ -290,11 +290,7 @@ async fn only_a_signed_hand_off_opens_an_internal_room_from_another_node() {
     assert!(body.contains("already used"), "{body}");
     // A relay with its upgrade removed is not a call either: a signed
     // request carrying the mark is refused unless it is an upgrade.
-    let (status, body) = (|| async {
-        let r = send(a.addr, "GET", path, &relay(path, true, now() + 2)).await;
-        (r.status, r.body)
-    })()
-    .await;
-    assert_eq!(status, 403, "{body}");
+    let r = send(a.addr, "GET", path, &relay(path, true, now() + 2)).await;
+    assert_eq!(r.status, 403, "{}", r.body);
     drop(stream);
 }
