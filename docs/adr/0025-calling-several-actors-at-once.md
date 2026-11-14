@@ -100,8 +100,10 @@ world front-core {
     so which entry fails depends on arrival order: an answer still
     arriving holds what it has taken, and can make a sibling that would
     fit alone `too-large`. An answer whose `Content-Length` is larger
-    than what is left fails before taking anything. A partial answer
-    that then fails gives its bytes back.
+    than what is left fails before taking anything, unless it has no
+    body whatever its length says (the answer to a HEAD, a 204, a 304):
+    those are judged on what arrives. A partial answer that then fails
+    gives its bytes back.
 - **Order.** The calls run concurrently; no order between entries is
   promised, not even between two entries to the same callee. Each callee
   still runs its events one at a time, so two entries to one actor are
@@ -116,10 +118,19 @@ world front-core {
 
 ### Deadline
 
-One deadline for the batch, fixed when `call-many` is entered:
+One deadline for the batch:
 
-- In an actor: the actors' call limit (`wall_per_event`, 30 s by
-  default), as for `actors.call`.
+- In an actor: the event's call deadline, as for `actors.call`: the
+  event's wall (`wall_per_event`, 30 s by default) from when the event
+  started, less the margin the event keeps to answer: 5 s, as the
+  front's (ADR 0023), or a fifth of a wall shorter than 25 s. A batch
+  entered after that deadline fails every entry with `timeout` at once
+  (but one with an invalid address).
+  - Note (2026-11-14, review): the first build gave an actor's batch,
+    and its single calls, the whole wall from when the call started. The
+    event's own wall, counted from the event's start, then always ran
+    out first and cut the event: an actor never saw a `timeout` from a
+    call, and a batch's answers were lost with the event.
 - In a front: the front's call deadline (ADR 0023): 5 s before the
   request's wall ends, or the actors' call limit, whichever is first. A
   batch started with less than 5 s left fails every entry with `timeout`
@@ -128,8 +139,9 @@ One deadline for the batch, fixed when `call-many` is entered:
 
 Every entry starts at once and waits at most until that deadline. An
 entry still waiting then is `timeout`; the entries that answered keep
-their answers. So a batch takes as long as its slowest entry, never more
-than one `actors.call` could wait.
+their answers, and the caller, its event not cut, can use them. So a
+batch takes as long as its slowest entry, never more than one
+`actors.call` could wait.
 
 ### Chain and reentrancy
 
@@ -148,9 +160,9 @@ than one `actors.call` could wait.
   chains today (`actors.call`'s doc: "a cycle across two independent
   chains ... ends in timeout"). A batch makes this reachable from one
   caller, where sequential calls could not. Every call involved gives up
-  at its deadline (an actor's call limit is also its event's wall, so an
-  actor caller's event ends then too, and its client gets the failed
-  event's answer), the events end, and the actors serve again; nothing
+  at its deadline (the outermost caller's first, as its event started
+  first: it answers with `timeout` for those entries and the answers of
+  the others), the events end, and the actors serve again; nothing
   stays stuck. The docs tell batch callees not to call each other.
 
 ### Limits

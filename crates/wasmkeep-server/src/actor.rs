@@ -670,6 +670,16 @@ struct CallContext {
     me: ActorAddress,
     /// Actors waiting on this event; calling any of them would deadlock.
     chain: Chain,
+    /// When this event's calls give up (ADR 0025): its wall less the
+    /// margin it keeps to answer with what they returned.
+    deadline: tokio::time::Instant,
+}
+
+/// What an actor's event keeps of its wall after its calls give up, so it
+/// can still answer: the front's margin (ADR 0023), or a fifth of a wall
+/// shorter than five of them.
+fn call_margin(wall: Duration) -> Duration {
+    crate::front::CALL_MARGIN.min(wall / 5)
 }
 
 fn hex(bytes: &[u8]) -> String {

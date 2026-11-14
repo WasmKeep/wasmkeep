@@ -341,14 +341,21 @@ impl actors::Host for ActorHost {
             Ok(target) => target,
             Err(e) => return Ok(Err(e)),
         };
-        let wall = service.wall;
+        // Its deadline passed: the event keeps the rest of its wall to
+        // answer (ADR 0025).
+        let limit = ctx
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if limit.is_zero() {
+            return Ok(Err(CallError::Timeout));
+        }
         Ok(service
             .call(
                 &Caller::Actor(ctx.me.clone()),
                 &ctx.chain,
                 target,
                 request,
-                wall,
+                limit,
                 &BodyBudget::one(),
             )
             .await)
@@ -371,8 +378,8 @@ impl actors::Host for ActorHost {
 
 impl calls::Host for ActorHost {
     /// ADR 0025: every entry is an `actors.call` from this actor, with the
-    /// chain one call would carry, all started at once, under one deadline
-    /// and one response budget.
+    /// chain one call would carry, all started at once, under the event's
+    /// call deadline and one response budget.
     async fn call_many(
         &mut self,
         calls: Vec<(String, CallRequest)>,
@@ -392,7 +399,7 @@ impl calls::Host for ActorHost {
         let Some(service) = ctx.service.as_ref().and_then(std::sync::Weak::upgrade) else {
             return failed("node is shutting down");
         };
-        let deadline = tokio::time::Instant::now() + service.wall;
+        let deadline = ctx.deadline;
         let caller = Caller::Actor(ctx.me.clone());
         let budget = BodyBudget::one();
         let entries = calls.into_iter().map(|(address, request)| {
@@ -401,6 +408,9 @@ impl calls::Host for ActorHost {
             async move {
                 let target = service.call_target(ctx.me.tenant(), &address)?;
                 let limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if limit.is_zero() {
+                    return Err(CallError::Timeout);
+                }
                 service
                     .call(caller, &ctx.chain, target, request, limit, budget)
                     .await

@@ -51,16 +51,18 @@ Since 0.3.0, in no release yet.
   of this version keeps closing its own sockets as before.
 - **`wasmkeep cluster diagnose` checks a bucket.** It runs, through the
   nodes' own bucket code, what WasmKeep relies on: conditional creates
-  and replaces (one winner among simultaneous creates, a stale or
-  deleted version refused, a read's version accepted), reads right after
+  and replaces (one winner among simultaneous creates, and among
+  simultaneous replaces of one version, a stale, deleted or overwritten
+  version refused, a read's version accepted), reads right after
   writes, overwrites and deletes, listings that show a new key and drop
   a deleted one (the lag is measured) and return more than one page,
   deletes of absent keys, a 16 MiB round trip, last-modified order and
   precision, and this machine's clock against the bucket's. One line per
   check, then `safe for WasmKeep` (exit 0), `not safe: ...` (1) or no
-  verdict (2); `--json` for scripts. It writes only under a scratch
-  prefix (`diagnose/run-<time>-<pid>/`, or `--prefix-for-test`) that must
-  be empty, and deletes it afterwards even when a check fails. The
+  verdict (2, also for a safe run whose cleanup failed); `--json` for
+  scripts. It writes only under a scratch prefix of its own
+  (`run-<time>-<pid>/` in `diagnose/`, or in `--prefix-for-test`) that
+  must be empty, and deletes it afterwards even when a check fails. The
   bucket requirements, how to run it and the providers checked so far
   (moto and OVHcloud Object Storage) are in
   [Buckets](docs/deploy/buckets.md).
@@ -90,7 +92,7 @@ Since 0.3.0, in no release yet.
   `front-core`: `call-many(list<(address, request)>)` starts up to 16
   calls together and returns one `result<response, call-error>` per
   entry, in input order, once all have answered or the batch's one
-  deadline passed (an actor's call limit, a front's call deadline). A
+  deadline passed (an actor's call deadline, a front's call deadline). A
   front gathering four slow actors pays about one round trip, not four.
   Each entry is an `actors.call` in every other respect: caller value,
   chain (an entry naming the caller is `reentrant`), routing and signed
@@ -109,6 +111,14 @@ Since 0.3.0, in no release yet.
   interface and run unchanged; one that imports it needs this release.
   The todo-front examples gain `GET /api/team`, every user's count from
   one batch ([ADR 0025](docs/adr/0025-calling-several-actors-at-once.md)).
+- **An actor's `actors.call` gives up before its own event is cut.** A
+  call from an actor now fails with `timeout` while 5 s of the caller's
+  event wall remain (a fifth of a wall shorter than 25 s), as a front's
+  call does; before, it waited the whole wall from
+  when it started, so the caller's event was always cut first and its
+  client got the failed event's answer instead of what the guest made of
+  the `timeout`. A batch's entries share that deadline, so the ones that
+  answered keep their answers.
 - **`wasmkeep cluster status` shows each node's load**: ACTORS, SOCKETS
   and EV/MIN (events per minute over the last minute or more) per live
   node, and ACTORS per app, summed over its live nodes; `actors`,

@@ -255,6 +255,9 @@ due, `on-alarm` runs as an event.
 actor of the same tenant and waits for the answer.
 
 - The caller's event stays open meanwhile: other events to the caller wait.
+- A call gives up with `timeout` while 5 s of the caller's event wall
+  remain (a fifth of a wall under 25 s), so the caller can still answer
+  with what it got.
 - The callee sees `x-wasmkeep-caller: tenant/class/name` (the name
   percent-encoded: `room 1` arrives as `room%201`), which outside
   clients cannot forge, so it can trust who is calling. A request
@@ -267,7 +270,7 @@ actor of the same tenant and waits for the answer.
 - **Several at once**: `calls.call-many([(address, request), ...])` (Rust
   `calls::call_many`, TypeScript `actors.callMany`) starts up to 16 calls
   together and returns one result per call, in input order, once all have
-  answered or the batch's one deadline passed (an actor's call limit, a
+  answered or the batch's one deadline passed (an actor's call deadline, a
   front's call deadline): a front gathering four actors pays about one
   round trip, not four. Each entry is a call in every other respect: its
   caller value, its chain (an entry naming the caller is `reentrant`), its

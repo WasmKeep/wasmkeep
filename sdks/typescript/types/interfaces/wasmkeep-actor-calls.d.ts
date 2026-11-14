@@ -14,8 +14,8 @@ declare module 'wasmkeep:actor/calls@0.2.0' {
    * Limits, for the batch as a whole:
    * - at most 16 entries: a longer batch starts no call, and every entry
    *   is `failed("too many calls: ...")`;
-   * - one deadline, fixed when the call starts (an actor's call limit,
-   *   or a front's call deadline): an entry still waiting then is
+   * - one deadline, the caller's (its event's wall less a margin kept
+   *   to answer, or a front's call deadline): an entry still waiting then is
    *   `timeout`, and the others keep their answers;
    * - request bodies together at most 16 MB (else every entry is
    *   `too-large` and none starts), responses together at most 16 MB

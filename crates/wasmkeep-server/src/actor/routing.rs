@@ -163,7 +163,7 @@ impl ServiceInner {
     ///
     /// A call to an actor already waiting in this chain (including the
     /// caller) fails with `reentrant`. A cycle across two independent chains
-    /// cannot be seen here and ends in `timeout` after the wall-clock limit.
+    /// cannot be seen here and ends in `timeout` at the caller's deadline.
     /// The front is never in a chain: it cannot be called back.
     pub(super) async fn call(
         self: Arc<Self>,
@@ -185,6 +185,7 @@ impl ServiceInner {
             return Err(CallError::TooLarge);
         }
 
+        let head = request.method.eq_ignore_ascii_case("HEAD");
         let req = build_request(caller, &target, request).map_err(CallError::Failed)?;
         let mut chain = chain.to_vec();
         if let Some(me) = me {
@@ -198,7 +199,7 @@ impl ServiceInner {
                 && let Some(cluster) = &self.cluster
             {
                 return match cluster.call(&owner, &target, &waiting, req).await {
-                    Ok(response) => collect_response(response, budget).await,
+                    Ok(response) => collect_response(response, budget, head).await,
                     Err(error) => {
                         self.forget_owner(&target);
                         Err(CallError::Failed(error))
@@ -218,7 +219,7 @@ impl ServiceInner {
             let event = tokio::spawn(event);
 
             match response_rx.await {
-                Ok(Outcome::Served(response)) => collect_response(response, budget).await,
+                Ok(Outcome::Served(response)) => collect_response(response, budget, head).await,
                 Ok(Outcome::Failed(e)) => Err(CallError::Failed(e)),
                 Ok(Outcome::Refused(e)) => {
                     crate::metrics::refused(crate::metrics::Refusal::Unavailable);
@@ -237,7 +238,7 @@ impl ServiceInner {
                     self.remember_owner(&target, &owner);
                     match &self.cluster {
                         Some(cluster) => match cluster.call(&owner, &target, &waiting, req).await {
-                            Ok(response) => collect_response(response, budget).await,
+                            Ok(response) => collect_response(response, budget, head).await,
                             Err(e) => {
                                 self.forget_owner(&target);
                                 Err(CallError::Failed(e))
@@ -252,7 +253,7 @@ impl ServiceInner {
                     self.mailboxes.hibernate(&target);
                     match &self.cluster {
                         Some(cluster) => match cluster.call(&peer, &target, &waiting, req).await {
-                            Ok(response) => collect_response(response, budget).await,
+                            Ok(response) => collect_response(response, budget, head).await,
                             Err(e) => {
                                 cluster.suspect(&peer);
                                 Err(CallError::Failed(e))
@@ -264,7 +265,7 @@ impl ServiceInner {
                 Err(_) => match event.await {
                     Ok(Err(MailboxError::Capacity(_))) => {
                         crate::metrics::refused(crate::metrics::Refusal::Capacity);
-                        collect_response(capacity_response(), budget).await
+                        collect_response(capacity_response(), budget, false).await
                     }
                     Ok(Err(MailboxError::Full(_))) => {
                         crate::metrics::refused(crate::metrics::Refusal::Overloaded);
@@ -355,19 +356,28 @@ const SDK_HEADERS: [&str; 4] = [
 /// The prefix of every header the host sets or reads itself.
 const WASMKEEP_PREFIX: &str = "x-wasmkeep-";
 
+/// Reads a call's answer into memory, its bytes taken from `budget`.
+/// `head`: the call was a HEAD, whose answer has no body.
 pub(super) async fn collect_response(
     response: Response<HyperOutgoingBody>,
     budget: &BodyBudget,
+    head: bool,
 ) -> Result<CallResponse, CallError> {
     use http_body_util::BodyExt;
     let (parts, mut body) = response.into_parts();
     // An answer that says it is larger than what is left fails before
-    // taking anything, so it cannot push a sibling's answer out.
+    // taking anything, so it cannot push a sibling's answer out. An answer
+    // known to have no body (a HEAD's, a 1xx, 204 or 304) may still give
+    // the length a GET would get: only what arrives is counted there.
+    let bodiless = head
+        || parts.status.is_informational()
+        || parts.status == StatusCode::NO_CONTENT
+        || parts.status == StatusCode::NOT_MODIFIED;
     let declared = parts
         .headers
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
-    if declared.is_some_and(|n| n > budget.left() as u64) {
+    if !bodiless && declared.is_some_and(|n| n > budget.left() as u64) {
         return Err(CallError::TooLarge);
     }
     // Counted as it arrives, so that the entries of a batch together
@@ -438,7 +448,7 @@ mod budget_tests {
         let budget = BodyBudget::one();
         let nine = 9 << 20;
         assert_eq!(
-            collect_response(answer(nine, None), &budget)
+            collect_response(answer(nine, None), &budget, false)
                 .await
                 .unwrap()
                 .body
@@ -448,27 +458,56 @@ mod budget_tests {
         // The second 9 MiB answer passes the batch's 16 MiB: refused, and
         // what it had taken is given back.
         assert!(matches!(
-            collect_response(answer(nine, None), &budget).await,
+            collect_response(answer(nine, None), &budget, false).await,
             Err(CallError::TooLarge)
         ));
         assert_eq!(budget.left(), MAX_CALL_BODY - nine);
         assert!(
-            collect_response(answer(1 << 20, None), &budget)
+            collect_response(answer(1 << 20, None), &budget, false)
                 .await
                 .is_ok()
         );
+    }
+
+    /// A HEAD's answer, a 204 and a 304 have no body whatever their
+    /// `content-length` says (it describes the body a GET would get), so
+    /// the declared length is not held against the budget.
+    #[tokio::test]
+    async fn an_answer_without_a_body_is_not_judged_on_its_length() {
+        let budget = BodyBudget::one();
+        let declared = MAX_CALL_BODY + 1;
+        let mut ok = answer(0, Some(declared));
+        let r = collect_response(ok, &budget, true).await.unwrap();
+        assert_eq!((r.status, r.body.len()), (200, 0));
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "content-length" && *v == declared.to_string())
+        );
+        for status in [StatusCode::NO_CONTENT, StatusCode::NOT_MODIFIED] {
+            ok = answer(0, Some(declared));
+            *ok.status_mut() = status;
+            let r = collect_response(ok, &budget, false).await.unwrap();
+            assert_eq!(r.status, status.as_u16());
+        }
+        assert_eq!(budget.left(), MAX_CALL_BODY);
+        // A GET's answer is still refused on its declared length.
+        assert!(matches!(
+            collect_response(answer(0, Some(declared)), &budget, false).await,
+            Err(CallError::TooLarge)
+        ));
     }
 
     #[tokio::test]
     async fn an_answer_declared_too_large_takes_nothing() {
         let budget = BodyBudget::one();
         assert!(matches!(
-            collect_response(answer(10, Some(MAX_CALL_BODY + 1)), &budget).await,
+            collect_response(answer(10, Some(MAX_CALL_BODY + 1)), &budget, false).await,
             Err(CallError::TooLarge)
         ));
         assert_eq!(budget.left(), MAX_CALL_BODY);
         // A single call still takes its whole 16 MiB.
-        let r = collect_response(answer(MAX_CALL_BODY, Some(MAX_CALL_BODY)), &budget).await;
+        let r = collect_response(answer(MAX_CALL_BODY, Some(MAX_CALL_BODY)), &budget, false).await;
         assert_eq!(r.unwrap().body.len(), MAX_CALL_BODY);
     }
 }

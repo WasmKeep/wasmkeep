@@ -401,6 +401,7 @@ async fn call_from(
         service: None,
         me: ActorAddress::new(tenant, "test", "caller").unwrap(),
         chain: Arc::from(Vec::new()),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
     };
     let request = super::CallRequest {
         method: "GET".into(),

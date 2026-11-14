@@ -588,12 +588,16 @@ impl ActorState {
         Ok(())
     }
 
-    /// Gives the instance what `actors.call` needs for the current event.
+    /// Gives the instance what `actors.call` needs for the current event,
+    /// which starts now: its calls give up while the margin of its wall
+    /// remains, before the wall cuts the event.
     pub(super) fn install_call_context(&mut self) {
+        let wall = self.limits.wall;
         let ctx = CallContext {
             service: self.service.get().cloned(),
             me: self.address.clone(),
             chain: Arc::clone(&self.chain),
+            deadline: tokio::time::Instant::now() + (wall - super::call_margin(wall)),
         };
         if let Some(live) = self.live.as_mut() {
             live.store.data_mut().call = Some(ctx);

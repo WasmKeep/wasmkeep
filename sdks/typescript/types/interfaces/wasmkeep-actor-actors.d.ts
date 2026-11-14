@@ -59,7 +59,7 @@ declare module 'wasmkeep:actor/actors@0.2.0' {
     tag: 'too-large',
   }
   /**
-   * The callee did not answer within the event's wall-clock limit.
+   * The callee did not answer by the caller's call deadline.
    */
   export interface CallErrorTimeout {
     tag: 'timeout',
