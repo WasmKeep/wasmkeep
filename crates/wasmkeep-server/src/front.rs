@@ -725,6 +725,15 @@ impl HttpComponent {
         };
         let slot = Slot::new(permit);
         strip_wasmkeep_headers(req.headers_mut());
+        // A WebSocket upgrade: kept aside, for a hand-off (ADR 0027), and
+        // marked for the front after the strip, so only the host sets it.
+        let upgrade = Upgrade::take(&mut req);
+        if upgrade.is_some() {
+            req.headers_mut().insert(
+                crate::cluster::UPGRADE_MARK,
+                hyper::header::HeaderValue::from_static("websocket"),
+            );
+        }
         let head = req.method() == hyper::Method::HEAD;
         let observe = move || METRICS.front_request_seconds.observe(started.elapsed());
         match self.try_handle(req, actors, slot, version).await {
@@ -742,6 +751,38 @@ impl HttpComponent {
                     outcome("guest_error");
                     observe();
                     return internal_error();
+                }
+                // Honoured only on an upgrade the host marked.
+                if let Some(upgrade) = upgrade {
+                    match HandOff::read(response.headers()) {
+                        Ok(None) => {}
+                        Ok(Some(to)) => {
+                            // Its slot goes back now: the socket opens
+                            // without the front's instance.
+                            running.abort.silence();
+                            drop(running);
+                            drop(response);
+                            outcome("handoff");
+                            observe();
+                            return match actors {
+                                Some(actors) => match upgrade.request(&to.path) {
+                                    Some(req) => actors.hand_off(&to.class, &to.name, req).await,
+                                    None => internal_error(),
+                                },
+                                None => {
+                                    text_response(StatusCode::NOT_FOUND, "no such actor class\n")
+                                }
+                            };
+                        }
+                        Err(why) => {
+                            tracing::warn!(reason = why, "front answered a broken hand-off");
+                            running.abort.silence();
+                            drop(running);
+                            outcome("guest_error");
+                            observe();
+                            return internal_error();
+                        }
+                    }
                 }
                 strip_wasmkeep_headers(response.headers_mut());
                 // From here the instance's own end says how the request
@@ -889,6 +930,95 @@ impl HttpComponent {
                 Err(cause.context("guest did not set a response"))
             }
         }
+    }
+}
+
+/// The front's answer naming the actor a WebSocket goes to (ADR 0027).
+pub(crate) const HANDOFF_CLASS: &str = "x-wasmkeep-handoff-class";
+/// The name, percent-encoded.
+pub(crate) const HANDOFF_NAME: &str = "x-wasmkeep-handoff-name";
+/// The path and query `on-websocket-open` sees.
+pub(crate) const HANDOFF_PATH: &str = "x-wasmkeep-handoff-path";
+
+/// A client's WebSocket upgrade to the front, kept aside while the front
+/// runs: its headers and the connection's upgrade.
+struct Upgrade {
+    headers: hyper::HeaderMap,
+    on_upgrade: hyper::upgrade::OnUpgrade,
+}
+
+impl Upgrade {
+    /// Takes the upgrade from `req` if it is a WebSocket upgrade (the test
+    /// an `/actor/` upgrade uses), after its `x-wasmkeep-` headers went.
+    fn take<B>(req: &mut Request<B>) -> Option<Self> {
+        let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+        let websocket = req.method() == hyper::Method::GET
+            && header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+            && header("sec-websocket-version") == Some("13")
+            && header("sec-websocket-key").is_some();
+        if !websocket {
+            return None;
+        }
+        let on_upgrade = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>()?;
+        Some(Self {
+            headers: req.headers().clone(),
+            on_upgrade,
+        })
+    }
+
+    /// The upgrade as a request for `path`, to open on an actor.
+    fn request(self, path: &str) -> Option<Request<()>> {
+        let mut req = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(path)
+            .body(())
+            .ok()?;
+        *req.headers_mut() = self.headers;
+        req.extensions_mut().insert(self.on_upgrade);
+        Some(req)
+    }
+}
+
+/// Where the front hands a WebSocket (ADR 0027).
+#[derive(Debug, PartialEq, Eq)]
+struct HandOff {
+    class: String,
+    name: String,
+    path: String,
+}
+
+impl HandOff {
+    /// The hand-off a front's answer names: `None` without any of its
+    /// headers, `Err` when they are not each there once and valid.
+    fn read(headers: &hyper::HeaderMap) -> Result<Option<Self>, &'static str> {
+        let fields = [HANDOFF_CLASS, HANDOFF_NAME, HANDOFF_PATH];
+        if fields.iter().all(|f| !headers.contains_key(*f)) {
+            return Ok(None);
+        }
+        let one = |name: &str| {
+            let mut values = headers.get_all(name).iter();
+            match (values.next(), values.next()) {
+                (Some(v), None) => v.to_str().map_err(|_| "a hand-off header is not text"),
+                (None, _) => Err("a hand-off header is missing"),
+                (Some(_), Some(_)) => Err("a hand-off header is repeated"),
+            }
+        };
+        let class = one(HANDOFF_CLASS)?.to_owned();
+        let name = crate::http::percent_decode(one(HANDOFF_NAME)?)
+            .ok_or("the hand-off name is not percent-encoded UTF-8")?;
+        let path = one(HANDOFF_PATH)?;
+        let valid = path.starts_with('/')
+            && path
+                .parse::<hyper::http::uri::PathAndQuery>()
+                .is_ok_and(|p| p.as_str() == path);
+        if !valid {
+            return Err("the hand-off path is not a path and query starting with /");
+        }
+        Ok(Some(Self {
+            class,
+            name,
+            path: path.to_owned(),
+        }))
     }
 }
 
@@ -1171,6 +1301,53 @@ mod tests {
 
     /// Every name of the range goes, in any case, every value of it;
     /// names that only look alike stay.
+    fn handoff_headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn a_hand_off_is_three_headers_each_once() {
+        let full = [
+            (HANDOFF_CLASS, "room"),
+            (HANDOFF_NAME, "lobby%201%2Fa%25%C3%A9"),
+            (HANDOFF_PATH, "/ws?user=alice"),
+        ];
+        assert_eq!(
+            HandOff::read(&handoff_headers(&full)),
+            Ok(Some(HandOff {
+                class: "room".into(),
+                name: "lobby 1/a%\u{e9}".into(),
+                path: "/ws?user=alice".into(),
+            }))
+        );
+        assert_eq!(
+            HandOff::read(&handoff_headers(&[("x-other", "1")])),
+            Ok(None)
+        );
+        // Missing, repeated, badly encoded, or a path that is not one.
+        for broken in [
+            &full[..2],
+            &[full[0], full[1], full[2], (HANDOFF_CLASS, "other")][..],
+            &[full[0], (HANDOFF_NAME, "bad%zz"), full[2]][..],
+            &[full[0], (HANDOFF_NAME, "%ff"), full[2]][..],
+            &[full[0], full[1], (HANDOFF_PATH, "ws")][..],
+            &[full[0], full[1], (HANDOFF_PATH, "http://elsewhere/ws")][..],
+            &[full[0], full[1], (HANDOFF_PATH, "/a b")][..],
+        ] {
+            assert!(
+                HandOff::read(&handoff_headers(broken)).is_err(),
+                "{broken:?}"
+            );
+        }
+    }
+
     #[test]
     fn strip_wasmkeep_headers_removes_the_whole_range() {
         let mut headers = hyper::HeaderMap::new();

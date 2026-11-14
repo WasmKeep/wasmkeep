@@ -2752,6 +2752,7 @@ mod tests {
             reads_secrets: true,
             can_take,
             can_front: true,
+            can_handoff: true,
             instance: None,
             lease: None,
             load: None,

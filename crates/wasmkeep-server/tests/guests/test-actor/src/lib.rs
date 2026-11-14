@@ -30,7 +30,8 @@
 //! - `POST /caller`: the `x-wasmkeep-caller` header, or `none`
 //! - `GET /header?name=N`: the request's header N, or `none`
 //! - WebSockets: accepted (refused with "go away" when the path contains
-//!   `refuse`); text is echoed; `POST /ws-closed` counts close callbacks
+//!   `refuse`); text is echoed; `POST /ws-closed` counts close callbacks;
+//!   `GET /opened`: the path of the last socket opened, or `none`
 //! - `POST /broadcast?text=T`: sends T to every connection it sees
 //! - `POST /memory`: adds 1 to a counter in the instance's memory (not
 //!   the database) and answers it: 1 again means a new instance
@@ -84,6 +85,7 @@ impl Actor for TestActor {
             "CREATE TABLE IF NOT EXISTS attempts (at INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS inits (n INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS opened (n INTEGER PRIMARY KEY, path TEXT NOT NULL)",
             "INSERT INTO inits VALUES (1)",
         ] {
             storage::exec(sql, &[]).map_err(|e| e.to_string())?;
@@ -101,6 +103,7 @@ impl Actor for TestActor {
         if path.contains("refuse") {
             return Err("go away".into());
         }
+        let _ = storage::exec("INSERT INTO opened (path) VALUES (?1)", &params![path]);
         Ok(())
     }
 
@@ -509,6 +512,12 @@ impl http::Guest for TestActor {
                 None => "unreadable".into(),
             },
             (Method::Get, "/inits") => count("inits").to_string(),
+            (Method::Get, "/opened") => {
+                storage::query("SELECT path FROM opened ORDER BY n DESC LIMIT 1", &[])
+                    .ok()
+                    .and_then(|r| r.get(0, "path").and_then(|v| v.as_str().map(str::to_owned)))
+                    .unwrap_or_else(|| "none".into())
+            }
             (Method::Get, "/env") => {
                 // `env.get`, and whether the same name leaked into the WASI
                 // environment (it must not).

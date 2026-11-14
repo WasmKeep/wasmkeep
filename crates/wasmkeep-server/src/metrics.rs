@@ -403,8 +403,9 @@ pub(crate) const SWEEP_UNREADABLE_READS: [&str; 2] = ["owner", "parked"];
 pub(crate) const PARKED_RELEASE_REASONS: [&str; 5] =
     ["last_socket", "drain", "move", "lapse", "stop"];
 /// `outcome` of `wasmkeep_front_requests_total`.
-pub(crate) const FRONT_REQUEST_OUTCOMES: [&str; 7] = [
+pub(crate) const FRONT_REQUEST_OUTCOMES: [&str; 8] = [
     "ok",
+    "handoff",
     "busy",
     "unconfigured",
     "cpu_budget",

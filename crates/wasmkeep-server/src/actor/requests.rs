@@ -126,8 +126,10 @@ impl ActorService {
         // The same for a take (ADR 0017).
         let take = internal && req.headers().contains_key(crate::cluster::TAKE);
         req.headers_mut().remove(crate::cluster::TAKE);
-        // The secret never reaches a guest.
+        // The secret never reaches a guest, nor a hand-off's mark (ADR
+        // 0027), which only relayed upgrades carry.
         req.headers_mut().remove(INTERNAL);
+        req.headers_mut().remove(crate::cluster::UPGRADE_MARK);
         req.headers_mut().remove(CHAIN);
 
         let Some(signed) = signed_body else {

@@ -9,9 +9,13 @@
 //! - `POST /`: adds the body (text, 1 to 1,000 bytes); answers the new id
 //! - `DELETE /<id>`: removes an item
 //! - `GET /count`: how many items the list has
+//! - WebSocket `/live`: handed over by the front (ADR 0027) to a signed-in
+//!   user's list; on every change the list sends `{"count":N}` to each
+//!   socket. The class is `internal`, so every socket it has came through
+//!   the front, which checked the token.
 
 use wasmkeep_sdk::http::{self, IncomingRequest, Method, ResponseOutparam};
-use wasmkeep_sdk::{Actor, Caller, Value, caller, params, storage};
+use wasmkeep_sdk::{Actor, Caller, Message, Value, caller, params, storage, websockets};
 
 /// The longest item accepted, in bytes.
 const MAX_TEXT: usize = 1_000;
@@ -29,6 +33,34 @@ impl Actor for Todos {
         )
         .map(drop)
         .map_err(|e| e.to_string())
+    }
+
+    /// Only the front's hand-off reaches an `internal` class, at the path
+    /// it names.
+    fn on_websocket_open(conn: u64, path: String) -> Result<(), String> {
+        if path != "/live" {
+            return Err("not found".into());
+        }
+        let _ = websockets::send(conn, &Message::Text(count_json()));
+        Ok(())
+    }
+}
+
+/// `{"count":N}` for the list as it is now.
+fn count_json() -> String {
+    let n = storage::query("SELECT count(*) AS n FROM todos", &[])
+        .ok()
+        .and_then(|rows| rows.get(0, "n").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    format!("{{\"count\":{n}}}")
+}
+
+/// Tells every open socket of this list its new size.
+fn changed() {
+    let message = Message::Text(count_json());
+    for conn in websockets::connections() {
+        // A slow reader misses a count; the next one replaces it.
+        let _ = websockets::send(conn, &message);
     }
 }
 
@@ -97,6 +129,7 @@ fn add(out: ResponseOutparam, text: &str) {
     match added {
         Ok(rows) => {
             let id = rows.get(0, "id").and_then(|v| v.as_i64()).unwrap_or(0);
+            changed();
             http::respond(
                 out,
                 201,
@@ -111,7 +144,10 @@ fn add(out: ResponseOutparam, text: &str) {
 fn remove(out: ResponseOutparam, id: i64) {
     match storage::exec("DELETE FROM todos WHERE id = ?1", &params![id]) {
         Ok(0) => http::respond(out, 404, "text/plain", b"not found\n"),
-        Ok(_) => http::respond(out, 204, "text/plain", b""),
+        Ok(_) => {
+            changed();
+            http::respond(out, 204, "text/plain", b"");
+        }
         Err(e) => failed(out, &e),
     }
 }

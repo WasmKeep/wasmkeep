@@ -8,7 +8,9 @@
   rollback across the migration, the class an event takes, sockets,
   instances kept with old values).
 - Amended by: [ADR 0026](0026-the-project-file.md) (a deploy from the
-  project file writes every class's rule, `open` included).
+  project file writes every class's rule, `open` included),
+  [ADR 0027](0027-sockets-through-the-front.md) (a class made `internal`
+  keeps the sockets its front handed over).
 - Date: 2026-11-05
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
@@ -269,6 +271,9 @@ admission under a rule the event's class does not have would be.
   other. Under `existing` the actor must still exist (as before); under a
   class a deploy made `internal`, the socket is closed (1008) at its next
   event.
+  - Note (2026-11-14): a socket the app's front handed over is inside
+    ([ADR 0027](0027-sockets-through-the-front.md)): its events admit as
+    the front's calls do, and a class made `internal` keeps it.
 - **Values on resident instances.** A deploy that changes a class's values
   but not its bytes drops the class's resident instances at their next
   event: the database is kept and `on-init` does not rerun (it is keyed on

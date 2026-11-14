@@ -71,3 +71,4 @@
 - [0024 Socket home](adr/0024-socket-home.md)
 - [0025 Calling several actors at once](adr/0025-calling-several-actors-at-once.md)
 - [0026 The project file](adr/0026-the-project-file.md)
+- [0027 Sockets through the front](adr/0027-sockets-through-the-front.md)

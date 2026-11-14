@@ -75,6 +75,9 @@ declare module 'wasmkeep:actor/actor@0.2.0' {
   * client that leaves before the 101 (or a node relaying for it, which
   * gives up after 30 s) still gets this event if it was already queued,
   * followed by `on-websocket-close` with code 1006.
+  * A socket the app's front handed to the actor (ADR 0027) has the path
+  * the front named, and a refusal reaches its client as an HTTP 403 with
+  * the error as body instead.
   */
   export function onWebsocketOpen(conn: bigint, path: string): void;
   /**

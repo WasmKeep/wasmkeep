@@ -36,7 +36,7 @@ use crate::cluster::{
 };
 use crate::http::text_response;
 use crate::replica::{Replica, ReplicaError};
-use crate::websocket::{Outgoing, SendError, Sockets, close_frame};
+use crate::websocket::{Opener, Outgoing, SendError, Sockets, close_frame};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use wasmkeep_cluster::state_root::StateRoot;
 use wasmkeep_wit::wasmkeep::actor::websockets::{

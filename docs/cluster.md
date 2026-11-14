@@ -480,6 +480,19 @@ can take up to four heartbeat periods (12 s with the defaults) when the
 owner refuses the relaying node's certificate (see "A caller its peer
 briefly stopped trusting" below).
 
+**Sockets through the front.** A front on any node can hand a client's
+WebSocket to a room ([ADR 0027](adr/0027-sockets-through-the-front.md)).
+When the room is owned by another node (or parked there with its sockets),
+the front's node relays the upgrade to it **signed**, as a call between
+nodes is: the front's caller value and the upgrade mark are among the
+signed headers, and each relay is accepted once. The owner opens the
+socket as the front's, so an `internal` room accepts it, and the socket
+lives there, under the socket home rules above. An unsigned upgrade,
+whatever headers it carries, is a client's: an `internal` room refuses
+it. A node relays a hand-off only to a node that announces the `handoff`
+word in its heartbeat (0.4.1 on); to an older one the client gets a 503
+and retries.
+
 **Calls between nodes.** `actors.call` reaches an actor wherever it runs.
 Nodes prove to each other that a call comes from the cluster with a
 signature: HMAC-SHA256, keyed with a random secret the first node stores at

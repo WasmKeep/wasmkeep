@@ -4,6 +4,8 @@
 - Date: 2026-11-02
 - Milestone: [M1](../../ROADMAP.md#m1-actors-on-one-node)
 - Supersedes: nothing; extends [ADR 0002](0002-wasmkeep-actor-wit-v0.1.md), which deferred WebSockets
+- Extended by: [ADR 0027](0027-sockets-through-the-front.md) (the app's
+  front hands sockets to actors; the WIT is unchanged)
 
 ## Context
 

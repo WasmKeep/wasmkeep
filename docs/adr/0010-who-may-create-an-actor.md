@@ -12,6 +12,8 @@
     - no lease or snapshot for an unknown name, over HTTP and WebSocket;
     - an actor created on one node is reachable through another;
     - an `internal` actor answers a call from another node, and refuses outside requests even with forged node and caller headers.
+- Amended by: [ADR 0027](0027-sockets-through-the-front.md) (sockets the
+  front hands over are inside).
 - Date: 2026-11-04
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
@@ -51,6 +53,10 @@ under `existing` and `internal` so is every socket event (in the same event
 as the work, so a delete in between counts), and a delete closes the
 actor's sockets. A socket event never recreates a deleted actor of such a
 class. Open classes keep their sockets on delete, as before.
+- Note (2026-11-14): [ADR 0027](0027-sockets-through-the-front.md) adds
+  one inside opener of sockets: the app's front, which hands a client's
+  upgrade to an actor. Such a socket, and each of its events, admits as
+  inside; sockets opened at `/actor/` stay outside.
 
 **Existence** is decided without creating anything, before the lease. The
 actor exists if it is in memory on this node, has a database file here, or,

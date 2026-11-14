@@ -120,3 +120,43 @@ export function unavailable(err: unknown): ActorResponse {
   }
   return { status: 500, body: "internal error\n" };
 }
+
+/** Whether `req`, received by the front, is a client's WebSocket upgrade,
+ * which the front may hand to an actor with `handOff` (ADR 0027). The host
+ * says so in `x-wasmkeep-upgrade`; a client cannot send that header. */
+export function isWebSocket(req: ActorRequest): boolean {
+  return first(req, "x-wasmkeep-upgrade") === "websocket";
+}
+
+/** Percent-encodes every byte of the UTF-8 text but ASCII letters, digits
+ * and `-._~`, as the host encodes names in `x-wasmkeep-caller`. */
+export function encodeName(name: string): string {
+  let out = "";
+  for (const b of new TextEncoder().encode(name)) {
+    const c = String.fromCharCode(b);
+    out += /[A-Za-z0-9\-._~]/.test(c) ? c : "%" + b.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
+/** The front's answer that hands the client's WebSocket to actor
+ * `cls/name` (ADR 0027): the host opens the socket on that actor of the app
+ * as an inside caller, so the class can be `internal`, and its
+ * `websocket.open` receives `path` (starting with `/`, query included).
+ * Return it only when `isWebSocket(req)`; to any other request the host
+ * passes it on as a plain `426`. Check what you must (a token, the name)
+ * first: the actor trusts the path when its class is `internal`. If the
+ * actor refuses, the client gets `403` with the actor's error. Never copy
+ * another server's answer headers onto it. */
+export function handOff(cls: string, name: string, path: string): ActorResponse {
+  return {
+    status: 426,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "x-wasmkeep-handoff-class": cls,
+      "x-wasmkeep-handoff-name": encodeName(name),
+      "x-wasmkeep-handoff-path": path,
+    },
+    body: "websocket upgrade required\n",
+  };
+}

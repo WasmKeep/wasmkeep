@@ -11,6 +11,11 @@
 //!   `TOKENS` has, as JSON `{"alice":2,"bob":0}` (`null` for a list that
 //!   did not answer), gathered from every user's actor with one
 //!   `calls::call_many` (ADR 0025): one round trip, not one per user
+//! - WebSocket `/api/live`, with `Authorization: Bearer <token>`: handed
+//!   to the signed-in user's `todos` actor (ADR 0027), which sends the
+//!   list's size on every change. For clients that can set the header; a
+//!   browser cannot on a WebSocket, and would need a short-lived ticket
+//!   (never the token itself in a URL).
 //!
 //! Sign-in is a token per user, from the front's secret `TOKENS`:
 //! `alice:<token>,bob:<token>`, each token at least 32 characters (make one
@@ -52,6 +57,16 @@ impl http::Guest for Front {
                 );
                 let body = format!("{{\"todos\":{}}}\n", json_string(&base));
                 http::respond(out, 200, "application/json", body.as_bytes());
+            }
+            (Method::Get, "/api/live") => {
+                if !front::is_websocket(&request) {
+                    return http::respond(out, 426, "text/plain", b"websocket upgrade required\n");
+                }
+                match signed_in(&request) {
+                    // The user's own list; the actor sees only `/live`.
+                    Some(user) => http::respond_with(out, &front::hand_off(CLASS, &user, "/live")),
+                    None => unauthorized(out),
+                }
             }
             (Method::Get, "/api/team") => match signed_in(&request) {
                 Some(_) => team(out),

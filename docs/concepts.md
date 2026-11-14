@@ -100,8 +100,21 @@ node's actors with `actors.call`:
   body slowly holds the slot up to the wall, so put a proxy that buffers
   request bodies in front of the node (nginx does by default, see [the
   front door](deploy/front-door.md)).
-- **Upgrades.** A WebSocket upgrade outside `/actor/` reaches the front as
-  a plain GET; reach sockets at `/actor/<class>/<name>`.
+- **WebSockets** ([ADR 0027](adr/0027-sockets-through-the-front.md)). A
+  WebSocket upgrade outside `/actor/` reaches the front as a plain GET
+  that the host marks with `x-wasmkeep-upgrade: websocket` (a client
+  cannot send it). The front may answer with a **hand-off**, three
+  headers naming the class, the name (percent-encoded) and the path
+  (`hand_off(class, name, path)` in Rust, `handOff` in TypeScript): its
+  instance stops and its slot is freed, and the host opens the socket on
+  that actor of the app as an inside caller, so the class can be
+  `internal`. `on-websocket-open` receives the front's path; every event
+  of that socket admits as inside, after hibernation too. A refusal
+  (unknown class, invalid name, the actor's own error) reaches the client
+  as an HTTP error (404, 400, 403 with the actor's reason), never as a
+  socket that opens and closes. Sockets at `/actor/<class>/<name>` are
+  outside, as before: an actor whose class is `internal` therefore knows
+  every socket it has came through the front.
 - **SDKs.** Rust (`wasmkeep_sdk::front`) and TypeScript
   (`@wasmkeep/sdk/front`, `wasmkeep-ts build --world front`) build fronts,
   with helpers: `caller()` (the front, an actor, or outside; actors use it
@@ -304,7 +317,8 @@ not the instance, so connections stay open while the actor hibernates; the
 next message wakes it.
 
 - `on-websocket-open` may refuse a connection (it is closed with code 1008
-  and the guest's reason). Until it accepts, the socket is invisible to the
+  and the guest's reason; a socket the front handed over gets a 403
+  instead, see "The front"). Until it accepts, the socket is invisible to the
   actor's other events: no broadcast reaches a socket it may refuse. It
   runs before the client sees the upgrade's 101, so once a client is
   connected, every later event of the actor (a broadcast, say) sees its

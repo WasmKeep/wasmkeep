@@ -71,6 +71,10 @@ pub struct NodeInfo {
     /// `false` from nodes that predate it, which cannot read such a
     /// version or set.
     pub can_front: bool,
+    /// It opens sockets the front hands over, from a signed relay
+    /// (heartbeat line 11, `handoff`, ADR 0027); `false` from nodes that
+    /// predate it, which take such a relay for an outside upgrade.
+    pub can_handoff: bool,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which
     /// each notices in its next listing. `None` from nodes that predate it.
@@ -371,6 +375,7 @@ impl NodeInfo {
             reads_secrets,
             can_take: words.can_take,
             can_front: words.can_front,
+            can_handoff: words.can_handoff,
             instance: lease.instance,
             lease: Some(lease.state),
             load,
@@ -380,11 +385,15 @@ impl NodeInfo {
 
 impl NodeInfo {
     /// The capability words this node announces on line 11, in order
-    /// (`take`, `front`). Readers ignore words they do not know.
+    /// (`take`, `front`, `handoff`). Readers ignore words they do not know.
     fn capabilities(&self) -> impl Iterator<Item = &'static str> {
-        [(self.can_take, "take"), (self.can_front, "front")]
-            .into_iter()
-            .filter_map(|(has, word)| has.then_some(word))
+        [
+            (self.can_take, "take"),
+            (self.can_front, "front"),
+            (self.can_handoff, "handoff"),
+        ]
+        .into_iter()
+        .filter_map(|(has, word)| has.then_some(word))
     }
 
     /// What line 11 says: capability words (`take`, `front`) and the process's
@@ -408,6 +417,7 @@ impl NodeInfo {
             load: None,
             can_take: words.contains(&"take"),
             can_front: words.contains(&"front"),
+            can_handoff: words.contains(&"handoff"),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
                 let ok = !token.is_empty()
@@ -652,6 +662,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             reads_secrets: self.reads_secrets,
             can_take: true,
             can_front: true,
+            can_handoff: true,
             instance: self.instance.clone(),
             lease: None,
             load,
@@ -834,6 +845,7 @@ mod tests {
             reads_secrets: false,
             can_take: false,
             can_front: false,
+            can_handoff: false,
             instance: None,
             lease: None,
             load: None,
@@ -868,6 +880,7 @@ mod tests {
             reads_secrets: false,
             can_take: false,
             can_front: false,
+            can_handoff: false,
             instance: None,
             lease: None,
             load: None,
@@ -938,6 +951,7 @@ mod tests {
             reads_secrets: false,
             can_take: false,
             can_front: false,
+            can_handoff: false,
             instance: None,
             lease: None,
             load: None,
@@ -1083,6 +1097,7 @@ mod tests {
             reads_secrets: false,
             can_take: true,
             can_front: false,
+            can_handoff: false,
             instance: None,
             ..tls_node()
         };
@@ -1103,6 +1118,7 @@ mod tests {
         let none = NodeInfo {
             can_take: false,
             can_front: false,
+            can_handoff: false,
             instance: None,
             ..node
         };
@@ -1203,6 +1219,7 @@ mod tests {
             reads_secrets: true,
             can_take: true,
             can_front: true,
+            can_handoff: true,
             // Ignored by the payload: the lease line names the process.
             instance: Some("dead".into()),
             ..tls_node()
@@ -1303,6 +1320,7 @@ mod tests {
             reads_secrets,
             can_take: words.can_take,
             can_front: false,
+            can_handoff: false,
             instance: lease.instance,
             lease: Some(lease.state),
             load: None,
@@ -1315,6 +1333,7 @@ mod tests {
             reads_secrets: true,
             can_take: true,
             can_front: false,
+            can_handoff: false,
             load: Some(Load {
                 actors: 12,
                 sockets: 3,
@@ -1377,6 +1396,7 @@ mod tests {
         // ADR 0023: `front` beside `take`, as a list of words.
         let node = NodeInfo {
             can_front: true,
+            can_handoff: false,
             ..loaded_node()
         };
         let payload = String::from_utf8(node.payload()).unwrap();
@@ -1412,7 +1432,35 @@ mod tests {
         let t = Cell::new(0);
         let a = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
         let payload = String::from_utf8(a.lease_payload()).unwrap();
-        assert_eq!(payload.lines().nth(8), Some("take front"), "{payload}");
+        assert_eq!(
+            payload.lines().nth(8),
+            Some("take front handoff"),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn line_11_says_the_node_takes_hand_offs_and_older_readers_ignore_it() {
+        // ADR 0027: `handoff` after `front`.
+        let node = NodeInfo {
+            can_front: true,
+            can_handoff: true,
+            ..loaded_node()
+        };
+        let payload = String::from_utf8(node.payload()).unwrap();
+        assert_eq!(payload.lines().nth(8), Some("take front handoff"));
+        let read = NodeInfo::decode(&format3(&node, NodeState::Live, "beef")).unwrap();
+        assert!(read.can_take && read.can_front && read.can_handoff);
+        let read = NodeInfo::decode(&node.encode()).unwrap();
+        assert!(read.can_handoff);
+        // The version before reads its own words and ignores this one.
+        assert!(
+            decode_before_load(&format3(&node, NodeState::Live, "beef"))
+                .is_some_and(|n| n.can_take)
+        );
+        let body =
+            "wasmkeep-node 3\nlive beef\n5\na\nhttp://a\n1\nacme/shop\n\n\nserving\n\ntake front\n";
+        assert!(!NodeInfo::decode(body.as_bytes()).unwrap().can_handoff);
     }
 
     #[test]

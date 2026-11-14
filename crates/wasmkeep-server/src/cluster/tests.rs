@@ -85,6 +85,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         reads_secrets: false,
         can_take: false,
         can_front: false,
+        can_handoff: false,
         instance: None,
         lease: None,
         load: None,
@@ -733,6 +734,7 @@ async fn only_serving_peers_of_the_same_app_that_are_not_draining_are_chosen() {
         app: app.into(),
         drain,
         can_take: false,
+        can_handoff: false,
         instance: None,
     };
     let serving = Some(DrainState::Serving);
@@ -791,6 +793,7 @@ async fn only_nodes_that_deliver_this_apps_alarms_share_the_sweep() {
         app: app.into(),
         drain,
         can_take: false,
+        can_handoff: false,
         instance: None,
     };
     let serving = Some(DrainState::Serving);
@@ -842,6 +845,7 @@ async fn live_nodes_split_the_alarm_sweep_between_them() {
             app: "t/default".to_owned(),
             drain: None,
             can_take: false,
+            can_handoff: false,
             instance: None,
         };
         *c.peers.write().unwrap() = HashMap::from([
@@ -911,6 +915,7 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     app: String::new(),
                     drain: None,
                     can_take: false,
+                    can_handoff: false,
                     instance: None,
                 },
             ),
@@ -922,6 +927,7 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     app: String::new(),
                     drain: None,
                     can_take: false,
+                    can_handoff: false,
                     instance: None,
                 },
             ),
@@ -933,6 +939,7 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     app: String::new(),
                     drain: None,
                     can_take: false,
+                    can_handoff: false,
                     instance: None,
                 },
             ),
@@ -1028,6 +1035,7 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 app: String::new(),
                 drain: None,
                 can_take: false,
+                can_handoff: false,
                 instance: None,
             },
         ),
@@ -1039,6 +1047,7 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 app: String::new(),
                 drain: None,
                 can_take: false,
+                can_handoff: false,
                 instance: None,
             },
         ),
@@ -2611,6 +2620,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         reads_secrets: false,
         can_take: false,
         can_front: false,
+        can_handoff: false,
         instance: Some("iz".into()),
         lease: Some(wasmkeep_cluster::node_lease::NodeState::Live),
         load: None,
@@ -2723,6 +2733,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         reads_secrets: false,
         can_take: false,
         can_front: false,
+        can_handoff: false,
         instance: Some("0011223344556677".to_owned()),
         lease: Some(state),
         load: None,

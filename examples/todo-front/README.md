@@ -7,8 +7,8 @@ actor per user as an inside caller, so the actors' class can be
 
 | Crate | World | Role |
 | --- | --- | --- |
-| [`front`](front) | `wasmkeep:actor/front` | `GET /` (the page), `GET /api`, `/api/todos` (`GET`, `POST`, `DELETE /api/todos/<id>`) for the signed-in user, and `GET /api/team`: every user's count, from one `calls::call_many` |
-| [`todos`](todos) | `wasmkeep:actor/actor` | class `todos`: one actor per user (`todos/alice`), its list in SQLite (`GET /count` its size); it answers its app's front only |
+| [`front`](front) | `wasmkeep:actor/front` | `GET /` (the page), `GET /api`, `/api/todos` (`GET`, `POST`, `DELETE /api/todos/<id>`) for the signed-in user, `GET /api/team`: every user's count, from one `calls::call_many`, and the WebSocket `/api/live`, handed to the user's list ([ADR 0027](../../docs/adr/0027-sockets-through-the-front.md)) |
+| [`todos`](todos) | `wasmkeep:actor/actor` | class `todos`: one actor per user (`todos/alice`), its list in SQLite (`GET /count` its size); it answers its app's front only, and sends `{"count":N}` on every change to the sockets the front handed it |
 
 The same front in TypeScript is [`examples/ts-todo-front`](../ts-todo-front),
 over this `todos` class.
@@ -40,6 +40,7 @@ curl -H "Authorization: Bearer $token" localhost:8080/api/todos                 
 curl -H "Authorization: Bearer $token" localhost:8080/api/team                  # {"alice":1}
 curl -i localhost:8080/api/todos                                                # 401
 curl -i localhost:8080/actor/todos/alice                                        # 403: internal
+websocat -H "Authorization: Bearer $token" ws://localhost:8080/api/live          # {"count":1}, then each change
 ```
 
 To deploy it, the same file, and `TOKENS` as a secret of the front:
@@ -75,6 +76,15 @@ todos=internal --front-env front.env`, after building each crate.
   deployed `open`. A client cannot pose as the front: the host removes any
   `x-wasmkeep-` header a client sends, and sets `x-wasmkeep-caller`
   itself on every call.
+- **Sockets go through the front, to an `internal` class.** `/api/live`
+  checks the token like the API, then answers `front::hand_off("todos",
+  user, "/live")`: the host opens the socket on the user's own list as an
+  inside caller. A socket event has no `caller()` to check, so the list
+  relies on its class being `internal`: then every socket it has came
+  through the front. Deployed `open`, anyone could open
+  `/actor/todos/<user>/live`. A browser cannot set `Authorization` on a
+  WebSocket; a real page would get a short-lived ticket from the API
+  first, never put the token itself in the URL.
 - **Failed calls answer 503, without the detail.** `front::unavailable`
   turns `failed` and `timeout` into `503` with `Retry-After: 1`; the
   error itself goes to the log (`eprintln!`), not to the client.

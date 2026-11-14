@@ -1,19 +1,52 @@
 //! WebSocket upgrades: `GET /actor/<class>/<name>/...` with an upgrade
-//! header, accepted by the actor's `on-websocket-open` before 101.
+//! header, accepted by the actor's `on-websocket-open` before 101; and
+//! sockets the front hands to an actor (ADR 0027).
 
 use super::requests::Held;
+use super::sockets::Refused;
 use super::*;
+
+/// Why a socket was not opened before its 101.
+enum NotOpened {
+    /// Over a cap: others raced in since `can_open`. Nothing registered.
+    Full(crate::websocket::OpenError),
+    /// The actor refused a hand-off, or could not run its open event.
+    Refused(Refused),
+}
 
 impl ActorService {
     /// Accepts a WebSocket upgrade for `/actor/<class>/<name><path>`: answers
     /// 101 and runs the socket in the background; `on-websocket-open` decides
-    /// whether it stays open.
+    /// whether it stays open. A client's upgrade, or another node's signed
+    /// relay of a hand-off by the front (ADR 0027).
     pub async fn upgrade(
         &self,
         class: &str,
         name: &str,
         mut req: Request<Incoming>,
     ) -> Response<HyperOutgoingBody> {
+        // A node's signature, if this is one: only the front's hand-off is
+        // relayed signed. Anything else (a client's forged mark or caller,
+        // a bad signature) is an outside upgrade.
+        let signed = self.inner.cluster.as_ref().and_then(|cluster| {
+            let on_cluster_port = req
+                .extensions()
+                .get::<crate::http::ArrivedOnClusterPort>()
+                .is_some();
+            let path = req
+                .extensions()
+                .get::<crate::http::OriginalPath>()
+                .map_or_else(
+                    || {
+                        req.uri()
+                            .path_and_query()
+                            .map_or("/", |p| p.as_str())
+                            .to_owned()
+                    },
+                    |p| p.0.clone(),
+                );
+            cluster.is_internal(req.method(), &path, req.headers(), on_cluster_port)
+        });
         // A relayed upgrade from a node of another app (or of an older
         // version) is refused first (ADR 0022); the header never reaches
         // a guest.
@@ -21,10 +54,83 @@ impl ActorService {
             .inner
             .cluster
             .as_ref()
-            .and_then(|cluster| cluster.wrong_app(&req, false))
+            .and_then(|cluster| cluster.wrong_app(&req, signed.is_some()))
         {
             return refused;
         }
+        let opener = match signed {
+            None => Opener::Outside,
+            Some(signed) => {
+                let one = |name: &str| {
+                    let mut values = req.headers().get_all(name).iter();
+                    match (values.next(), values.next()) {
+                        (Some(v), None) => Some(v.as_bytes().to_vec()),
+                        _ => None,
+                    }
+                };
+                let front = Caller::Front.value(&self.inner.tenant);
+                let handed = req.method() == hyper::Method::GET
+                    && signed.body == crate::cluster::body_sha256(b"")
+                    && one(CALLER).as_deref() == Some(front.as_bytes())
+                    && one(crate::cluster::UPGRADE_MARK).as_deref()
+                        == Some(b"websocket".as_slice());
+                if !handed {
+                    crate::metrics::refused(crate::metrics::Refusal::Access);
+                    return text_response(
+                        StatusCode::FORBIDDEN,
+                        "a node's upgrade must be the front's hand-off\n",
+                    );
+                }
+                // Spent once: a relay seen on the wire cannot open another.
+                let fresh = self
+                    .inner
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|cluster| cluster.first_use(&signed, false));
+                if !fresh {
+                    return text_response(StatusCode::FORBIDDEN, "signature already used\n");
+                }
+                Opener::Front
+            }
+        };
+        for name in [INTERNAL, CALLER, CHAIN, crate::cluster::UPGRADE_MARK] {
+            req.headers_mut().remove(name);
+        }
+        self.open_socket(class, name, req, opener).await
+    }
+
+    /// A WebSocket upgrade the app's front handed to `class/name`, to open
+    /// at `path` (ADR 0027): opened here as an inside caller's, or relayed,
+    /// signed, to the actor's owner. `req` carries the client's headers and
+    /// the connection's upgrade; its body is never read.
+    pub(crate) async fn hand_off<B: Send + 'static>(
+        &self,
+        class: &str,
+        name: &str,
+        mut req: Request<B>,
+    ) -> Response<HyperOutgoingBody> {
+        let path = req
+            .uri()
+            .path_and_query()
+            .map_or("/", |p| p.as_str())
+            .to_owned();
+        // Where a relay to the owner goes, as for an `/actor/` upgrade.
+        req.extensions_mut()
+            .insert(crate::http::OriginalPath(format!(
+                "/actor/{class}/{}{path}",
+                crate::cluster::percent_encode(name)
+            )));
+        self.open_socket(class, name, req, Opener::Front).await
+    }
+
+    /// Opens a socket on `class/name` for `opener`, here or on its owner.
+    async fn open_socket<B: Send + 'static>(
+        &self,
+        class: &str,
+        name: &str,
+        mut req: Request<B>,
+        opener: Opener,
+    ) -> Response<HyperOutgoingBody> {
         req.headers_mut().remove(crate::cluster::APP);
         if !read(&self.inner.classes).contains_key(class) {
             return text_response(StatusCode::NOT_FOUND, "no such actor class\n");
@@ -45,10 +151,12 @@ impl ActorService {
         let Some(key) = header("sec-websocket-key").filter(|_| is_upgrade) else {
             return text_response(StatusCode::BAD_REQUEST, "bad websocket upgrade\n");
         };
-        // ADR 0010. Sockets always come from outside (actors cannot open
-        // one); a relayed upgrade is checked again on the owner, where the
-        // actor is resident, so that check is immediate.
-        if self.early_rule(class, address.name()) == crate::access::Access::Internal {
+        // ADR 0010. A client's socket is outside (actors cannot open one);
+        // a relayed upgrade is checked again on the owner, where the actor
+        // is resident, so that check is immediate. The front's hand-off is
+        // inside (ADR 0027).
+        let outside = opener == Opener::Outside;
+        if outside && self.early_rule(class, address.name()) == crate::access::Access::Internal {
             crate::metrics::refused(crate::metrics::Refusal::Access);
             return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
         }
@@ -78,7 +186,7 @@ impl ActorService {
                     Held::Answer(response) => return response,
                     Held::Forward => {}
                 }
-                let response = cluster.forward_upgrade(&owner, req).await;
+                let response = cluster.forward_upgrade(&owner, req, opener).await;
                 if response.status().is_server_error() {
                     self.inner.forget_owner(&address);
                 }
@@ -90,7 +198,7 @@ impl ActorService {
                 .inner
                 .mailboxes
                 .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
-                    Box::pin(async move { state.admit(true).await })
+                    Box::pin(async move { state.admit(outside).await })
                 })
                 .await;
             match probe {
@@ -163,7 +271,7 @@ impl ActorService {
                             Held::Answer(response) => return response,
                             Held::Forward => {}
                         }
-                        return cluster.forward_upgrade(&owner, req).await;
+                        return cluster.forward_upgrade(&owner, req, opener).await;
                     }
                     Ok(Err(Some((peer, true)))) => {
                         self.inner.mailboxes.hibernate(&address);
@@ -171,7 +279,7 @@ impl ActorService {
                             ticket.end("forwarded");
                         }
                         let sent = !crate::cluster::never_forward(&req);
-                        let response = cluster.forward_upgrade(&peer, req).await;
+                        let response = cluster.forward_upgrade(&peer, req, opener).await;
                         if sent && response.status().is_server_error() {
                             cluster.suspect(&peer);
                         }
@@ -229,13 +337,22 @@ impl ActorService {
         let inner = Arc::clone(&self.inner);
         let opening = address.clone();
         tokio::spawn(async move {
-            let accepted = match inner.accept_socket(opening.clone(), path).await {
+            let accepted = match inner.accept_socket(opening.clone(), path, opener).await {
                 Ok(accepted) => accepted,
                 Err(e) => {
-                    let _ = opened_tx.send(Err(e));
+                    let _ = opened_tx.send(Err(NotOpened::Full(e)));
                     return;
                 }
             };
+            // A hand-off the actor refused is answered with an HTTP error,
+            // never a socket that opens and closes (ADR 0027).
+            if opener == Opener::Front
+                && let Some(refused) = accepted.refused()
+            {
+                inner.discard_refused(accepted);
+                let _ = opened_tx.send(Err(NotOpened::Refused(refused)));
+                return;
+            }
             let _ = opened_tx.send(Ok(()));
             let upgraded = match on_upgrade.await {
                 Ok(u) => u,
@@ -255,7 +372,23 @@ impl ActorService {
         });
         match opened_rx.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            Ok(Err(NotOpened::Refused(refused))) => {
+                return match refused {
+                    Refused::Guest(reason) => {
+                        crate::metrics::refused(crate::metrics::Refusal::Access);
+                        text_response(StatusCode::FORBIDDEN, &format!("{reason}\n"))
+                    }
+                    Refused::Busy => {
+                        crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                        capacity_response()
+                    }
+                    Refused::Failed => {
+                        crate::metrics::refused(crate::metrics::Refusal::Unavailable);
+                        crate::cluster::unavailable("actor unavailable\n")
+                    }
+                };
+            }
+            Ok(Err(NotOpened::Full(e))) => {
                 // Over a cap after all: others raced in since `can_open`.
                 // Nothing was registered.
                 tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = ?e, "websocket refused");
