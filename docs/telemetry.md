@@ -14,7 +14,7 @@ One small JSON document, a minute after the node starts and then once a
 day, as an HTTP POST:
 
 ```json
-{"schema":1,"version":"0.3.0","os":"linux","arch":"x86_64","cluster":true,"classes":"1-9","resident_actors":"10-99"}
+{"schema":1,"version":"0.4.0","os":"linux","arch":"x86_64","cluster":true,"classes":"1-9","resident_actors":"10-99"}
 ```
 
 | Field | Meaning |

@@ -1,8 +1,8 @@
 # 0025. Calling several actors at once
 
-- Status: accepted (2026-11-14), planned for 0.4.0
+- Status: accepted (2026-11-14), built in 0.4.0
 - Date: 2026-11-14
-- Release: [0.4.0](../../ROADMAP.md#now)
+- Release: [0.4.0](../../ROADMAP.md#m4-operating-a-cluster)
 - Follows: [ADR 0023](0023-the-front.md) ("Not decided here": concurrent
   calls).
 - Amends: [ADR 0023](0023-the-front.md) ("one call at a time per front

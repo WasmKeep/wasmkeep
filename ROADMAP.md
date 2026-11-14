@@ -5,43 +5,16 @@ Dates are not promised; the order is, and features come before speed.
 For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
-WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0` and
-`0.3.0`, are pre-releases for trying it, side projects and staging.
+WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
+`0.3.0` and `0.4.0`, are pre-releases for trying it, side projects and
+staging.
 
 ## Now
 
-The next release, `0.4.0`: **an app is one thing.**
-
-1. **A front for each app**: the stateless component receives every
-   request outside `/actor/`, calls the app's actors with the same call
-   actors use between themselves, and is deployed, versioned and rolled
-   back with them. Routing, sign-in and hostnames are handled there, in
-   the app's own code. Rust and TypeScript first.
-2. **A project file**, `wasmkeep.toml`, read by `wasmkeep deploy` and
-   `wasmkeep dev`: the deployed app is what the file says.
-3. **An app owns its actors**: two apps never share actors, whatever bucket
-   they use. Each class says who may reach it; with a project file a class
-   is reachable only from inside the app unless it says otherwise.
-4. **Load you can see**: actors and work per node and per app, in the
-   metrics and in `wasmkeep cluster status`.
-5. **WebSocket rooms behind a front**: a room with open sockets keeps
-   its node while it hibernates, so a call from the front through another
-   node does not close its sockets.
-6. **Calling several actors at once**: one call that runs several actor
-   calls in parallel and returns every answer, so a front gathering
-   several actors waits for the slowest, not for their sum. Rust and
-   TypeScript first.
-7. **Checking a bucket**: `wasmkeep cluster diagnose` tests that a bucket
-   does what WasmKeep relies on (conditional writes above all), and the
-   docs list the providers tested.
-
-Each release's notes say whether its upgrade is rolling (one node at a
-time) or stops the cluster; `0.4.0` stops it, once, for its migration.
-
-Then `0.4.1`: **sockets through the front.** The front accepts a
-WebSocket at its own path and hands it to an actor, so a room needs no
-public `/actor/` address. The SDKs say how a handler makes several
-outbound HTTP requests at once.
+The next release, `0.4.1`: **sockets through the front.** The front
+accepts a WebSocket at its own path and hands it to an actor, so a room
+needs no public `/actor/` address. The SDKs say how a handler makes
+several outbound HTTP requests at once.
 
 And right after: **actors that end.** Today an actor ends only when its
 own code calls `storage.delete-self`, a delete replicated like a plain
@@ -59,6 +32,9 @@ rule for paths that match no file (pass to the front, a single-page app's
 `index.html`, or a 404 page); and a database client in the SDKs, for a
 database kept by one actor. Redirects and routes stay in the front's own
 code, with SDK helpers.
+
+Each release's notes say whether its upgrade is rolling (one node at a
+time) or stops the cluster; `0.4.0` stopped it, once, for its migration.
 
 ## Next
 
@@ -260,6 +236,21 @@ Started alongside M3; what is left of it is under [Now](#now) and
   [file](deploy/prometheus/alerts.yml), and the app model
   ([ADR 0021](docs/adr/0021-the-app-model.md),
   [ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md)).
+- In `0.4.0`, an app is one thing: a front for each app, deployed,
+  versioned and rolled back with its classes
+  ([ADR 0023](docs/adr/0023-the-front.md)); each app owns its actors'
+  state, two apps never share an actor, with a one-time migration
+  ([ADR 0022](docs/adr/0022-app-owned-state-and-the-one-time-migration.md),
+  [upgrading](docs/deploy/upgrading-to-0.4.md)); a project file,
+  `wasmkeep.toml`, with classes `internal` unless it says otherwise
+  ([ADR 0026](docs/adr/0026-the-project-file.md)).
+- In `0.4.0`: load per node and per app in the metrics and in `wasmkeep
+  cluster status`; WebSocket rooms that wake where their sockets are
+  ([ADR 0024](docs/adr/0024-socket-home.md)); calling several actors at
+  once, in Rust and TypeScript first
+  ([ADR 0025](docs/adr/0025-calling-several-actors-at-once.md)); and
+  `wasmkeep cluster diagnose`, which checks a bucket
+  ([buckets](docs/deploy/buckets.md)).
 
 ## Stretch goal: the benchmark showdown
 

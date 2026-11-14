@@ -8,9 +8,9 @@ run a node, give the front its secret, change the front and roll the
 change back.
 
 This follows [Your first actor](first-actor.md). Applies to: WasmKeep
-built from `main` (the release after `0.3.0`). The front, the project
-file (`wasmkeep.toml`), `wasmkeep dev` without crate directories and
-`secrets set --front` are all **main only**: `0.3.0` has none of them.
+`0.4.0` and later. The front, the project file (`wasmkeep.toml`),
+`wasmkeep dev` without crate directories and `secrets set --front` are
+all new in `0.4.0`: `0.3.0` has none of them.
 Commands assume Linux and one terminal: what you start runs in its
 background, and the variables you set stay set.
 

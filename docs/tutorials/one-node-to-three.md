@@ -6,7 +6,7 @@ see one actor, kill a node and watch its actor come back on another with
 its value, then drain a node and take it out.
 
 This follows [Your first actor](first-actor.md). Applies to: WasmKeep
-built from `main` (the release after `0.3.0`). Commands assume Linux and
+`0.4.0` and later. Commands assume Linux and
 one terminal: the nodes run in its background, and the variables you set
 stay set. Run every command from the clone's directory.
 
@@ -194,14 +194,14 @@ wasmkeep cluster status --bucket s3://demo
 Cluster s3://demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
-a     yes   2.0s   serving  1       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
-b     yes   2.0s   serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
-c     yes   1.9s   serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
+a     yes   2.0s   serving  1       0        -       -          0.4.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
+b     yes   2.0s   serving  0       0        -       -          0.4.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
+c     yes   1.9s   serving  0       0        -       -          0.4.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
 
 APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT
 demo/shop  469fcd8d39aa32f2  1    1       no
 
-3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0+4f1c2a9e7b3d
+3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.4.0+4f1c2a9e7b3d
 ```
 
 - **LIVE** is `yes` when the node's heartbeat in the bucket is recent;

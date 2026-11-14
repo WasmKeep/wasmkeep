@@ -1,6 +1,6 @@
 # 0022. App-owned state and the one-time migration
 
-- Status: accepted; built for 0.4.0, in no release yet: the layout
+- Status: accepted; built in 0.4.0: the layout
   (`crates/wasmkeep-cluster/src/state_root.rs`),
   `cluster migrate` with `--remove-old` (`crates/wasmkeep-cluster/src/migrate.rs`,
   `crates/wasmkeep-cli/src/migrate_cmd.rs`; `sim/tests/madsim_migrate.rs`,
@@ -11,7 +11,7 @@
   (`sim/tests/madsim_two_apps.rs`). Built in 0.3.0: the guard only
   (below, "Old binaries").
 - Date: 2026-11-12
-- Release: [0.4.0](../../ROADMAP.md#now)
+- Release: [0.4.0](../../ROADMAP.md#m4-operating-a-cluster)
 - Amends: [ADR 0007](0007-replication-protocol.md),
   [0009](0009-alarms-in-a-cluster.md),
   [0012](0012-bucket-garbage-collection.md),

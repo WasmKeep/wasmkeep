@@ -8,11 +8,11 @@ each step and check it before the next. Each step is short and links to
 the page that covers it in depth.
 
 This follows [From one node to three](one-node-to-three.md). Applies to:
-WasmKeep built from `main` (the release after `0.3.0`). Steps or flags
-that `0.3.0` does not have are marked **main only**. A build from a git
-checkout of `main` reports the release it follows and its commit, such as
-`0.3.0+4f1c2a9e7b3d` (`wasmkeep --version`, and the VERSION column of
-`cluster status`); the release reports `0.3.0` alone.
+WasmKeep `0.4.0` and later. Steps or flags that `0.3.0` does not have
+are marked **0.4.0 and later**. A build from a git checkout reports the
+release it follows and its commit, such as `0.4.0+4f1c2a9e7b3d`
+(`wasmkeep --version`, and the VERSION column of `cluster status`); the
+release reports `0.4.0` alone.
 
 > **Pre-alpha.** The cluster is tested in simulation, with real processes
 > against an S3 API, and against real buckets with nodes killed under load
@@ -83,7 +83,7 @@ thing to get right:
 - [ ] **Credentials for the nodes** that read, write, list and delete
   under the cluster's prefix, and nothing else; set as `AWS_*` variables
   ([by provider](../deploy/three-nodes.md#connection-settings-by-provider)).
-- [ ] **It passes `cluster diagnose`** (**main only**), run from one of
+- [ ] **It passes `cluster diagnose`** (**0.4.0 and later**), run from one of
   the nodes with their credentials:
 
 <!-- test: diagnose -->
@@ -151,14 +151,14 @@ wasmkeep cluster status --bucket "$BUCKET"
 Cluster s3://demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE   STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
-a     yes   2.0s  serving  1       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
-b     yes   2.0s  serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
-c     yes   2.0s  serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
+a     yes   2.0s  serving  1       0        -       -          0.4.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
+b     yes   2.0s  serving  0       0        -       -          0.4.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
+c     yes   2.0s  serving  0       0        -       -          0.4.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
 
 APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT
 demo/shop  7973128b9d723db8  1    1       no
 
-3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0+4f1c2a9e7b3d
+3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.4.0+4f1c2a9e7b3d
 ```
 
 Each node is live, has a `CLUSTER ADDRESS` and shows `pinned` under TLS;
@@ -167,7 +167,7 @@ and no `warning:` line follows. A node started with `--cluster-plaintext
 accept` and no listener shows `plain`, with a warning: move such a
 cluster to TLS in two rounds, as
 [Operating it](../deploy/three-nodes.md#operating-it) says. (The ACTORS,
-SOCKETS, EV/MIN, FRONT/MIN and FRONT columns are **main only**.)
+SOCKETS, EV/MIN, FRONT/MIN and FRONT columns are **0.4.0 and later**.)
 
 ## 4. The front door
 
@@ -195,7 +195,7 @@ configurations; whichever you use, check:
   proxy_set_header X-Forwarded-For $remote_addr;     # replace, never append
   ```
 
-  The SDKs' `host()` and `scheme()` helpers (**main only**) read them:
+  The SDKs' `host()` and `scheme()` helpers (**0.4.0 and later**) read them:
   `scheme()` is `https` when the first `X-Forwarded-Proto` value is.
   `X-Forwarded-For` is the [client address](../deploy/front-door.md#client-addresses),
   which the load balancer must replace, never append to.
@@ -246,7 +246,7 @@ demo/shop: seq 2
   counter: ADMIN_TOKEN
 ```
 
-`--class` sets a class's secret, `--front` (**main only**) the front's.
+`--class` sets a class's secret, `--front` (**0.4.0 and later**) the front's.
 Nodes pick a change up within a few seconds, with no deploy and no
 restart. `secrets list` shows names, never values. Then delete the files
 the values came from.
@@ -321,7 +321,7 @@ wasmkeep_admission_refused_total{reason="wrong_app"} 0
 ```
 
   Counters with a fixed set of labels are on the page from the start, at
-  0 (**main only**; `0.3.0` adds a series at its first count):
+  0 (**0.4.0 and later**; `0.3.0` adds a series at its first count):
   `wasmkeep_bucket_requests_total{status="error"}`,
   `wasmkeep_failover_waits_total{kind,outcome}`, and
   `wasmkeep_not_ready{reason}` with one series per reason, 1 for the
@@ -338,14 +338,14 @@ wasmkeep_admission_refused_total{reason="wrong_app"} 0
 | --- | --- | --- |
 | Not-ready nodes: `wasmkeep_ready`, `wasmkeep_not_ready{reason}`, `up` | A node out of the load balancer: shutting down, cut off from the bucket, out of disk, or down | `WasmKeepNodeNotReady`, `WasmKeepNodeDown` |
 | Bucket errors: `wasmkeep_bucket_requests_total{status="error"}`, `wasmkeep_node_lease_failures_total` | The bucket refusing or not answering; two lease writes failing in a row and a node drops its actors | `WasmKeepBucketErrors`, `WasmKeepNodeLeaseWriteFailing` |
-| Failover waits: `wasmkeep_failover_waits_total{outcome}` | Requests kept while a node died; `expired` and `over_cap` are callers who got a 503 ([what each outcome means](../monitoring.md#metrics)) | `WasmKeepFailoverWaitsFailed` (**main only**) |
-| Refused admissions: `wasmkeep_admission_refused_total{reason}` | Requests refused before they ran: `capacity` and `overloaded` (the node is full), `unavailable` (a required value not set, secrets the node cannot open), `wrong_app` (**main only**) | `WasmKeepAdmissionRefused` (5 minutes of `capacity`, `overloaded` or `wrong_app`), `WasmKeepAdmissionUnavailable` (15 minutes of `unavailable`, which ticks briefly while nodes catch up with a deploy or a secrets change) (**main only**) |
+| Failover waits: `wasmkeep_failover_waits_total{outcome}` | Requests kept while a node died; `expired` and `over_cap` are callers who got a 503 ([what each outcome means](../monitoring.md#metrics)) | `WasmKeepFailoverWaitsFailed` (**0.4.0 and later**) |
+| Refused admissions: `wasmkeep_admission_refused_total{reason}` | Requests refused before they ran: `capacity` and `overloaded` (the node is full), `unavailable` (a required value not set, secrets the node cannot open), `wrong_app` (**0.4.0 and later**) | `WasmKeepAdmissionRefused` (5 minutes of `capacity`, `overloaded` or `wrong_app`), `WasmKeepAdmissionUnavailable` (15 minutes of `unavailable`, which ticks briefly while nodes catch up with a deploy or a secrets change) (**0.4.0 and later**) |
 
   Thresholds and durations are starting points: adjust them to your
   traffic in the file. The rules also fire on fences and failovers (`WasmKeepNodeFenced`,
   `WasmKeepFailover`), slow durable writes and failing events. The
   dashboard charts the last two rows in its "Failover waits and
-  refusals" row (**main only**).
+  refusals" row (**0.4.0 and later**).
 - [ ] **An alert seen once**: stop one node (`systemctl stop
   wasmkeep`) at a quiet hour, check that `WasmKeepNodeDown` reaches
   whoever is paged after a minute (a stopped node exports nothing, so

@@ -122,8 +122,8 @@ have not been checked this way yet.
 
 | Provider | Date | WasmKeep | Verdict |
 | --- | --- | --- | --- |
-| moto 5.2.5 (the S3 server of the test suites, in memory) | 2026-11-14 | `main` after 0.3.0, with `concurrent-replaces` | safe for WasmKeep |
-| OVHcloud Object Storage (S3 API), from a VPS in the same region | 2026-11-14 | `main` after 0.3.0, with `concurrent-replaces` | safe for WasmKeep (three runs, the last with the races over warm connections: one winner in each race of eight creates and of eight replaces), listings within 14 to 210 ms, 16 MiB written in 0.7 to 1.7 s and read in 0.2 to 0.6 s, whole-second last-modified times |
+| moto 5.2.5 (the S3 server of the test suites, in memory) | 2026-11-14 | 0.4.0 (a build of `main` before the tag), with `concurrent-replaces` | safe for WasmKeep |
+| OVHcloud Object Storage (S3 API), from a VPS in the same region | 2026-11-14 | 0.4.0 (a build of `main` before the tag), with `concurrent-replaces` | safe for WasmKeep (three runs, the last with the races over warm connections: one winner in each race of eight creates and of eight replaces), listings within 14 to 210 ms, 16 MiB written in 0.7 to 1.7 s and read in 0.2 to 0.6 s, whole-second last-modified times |
 | Cloudflare R2 | | | not checked yet |
 | AWS S3 | | | not checked yet |
 | MinIO | | | not checked yet |

@@ -3,7 +3,7 @@
 You will write a small actor in Rust, build it into a WebAssembly component,
 serve it with WasmKeep, and see its state survive a restart.
 
-Applies to: WasmKeep `0.3.0` (pre-alpha). Commands assume Linux; on macOS,
+Applies to: WasmKeep `0.4.0` (pre-alpha). Commands assume Linux; on macOS,
 build the server from source (step 1).
 
 ## 1. Get WasmKeep
@@ -39,7 +39,7 @@ cargo add wasmkeep-sdk
 
 `cargo add` takes the newest version: the SDK carries the version of the
 server it is released with, so keep the two the same
-(`cargo add wasmkeep-sdk@0.3.0` names one). Add to `Cargo.toml`:
+(`cargo add wasmkeep-sdk@0.4.0` names one). Add to `Cargo.toml`:
 
 ```toml
 [lib]
@@ -168,7 +168,7 @@ The count survived because it lives in the actor's database, not in memory.
 
 ## Next
 
-- [Your first app](first-app.md) (**main only**): a front that
+- [Your first app](first-app.md) (**0.4.0 and later**): a front that
   serves a page and an API over an internal class, run with `wasmkeep
   dev`, deployed to a local bucket and rolled back.
 - [From one node to three](one-node-to-three.md): run three nodes on
