@@ -351,7 +351,11 @@ ignores the conditions) would let two nodes own one actor, so the node
 logs why, stays not ready and `wasmkeep serve` exits. A bucket that does
 not answer yet is tried again, as at any start. Cloudflare R2 and
 OVHcloud Object Storage pass it (tested); AWS S3 and MinIO document both
-conditions. For a quick local try,
+conditions. `wasmkeep cluster diagnose --bucket s3://BUCKET` checks the rest of
+what a cluster needs from a bucket (listings, deletes, large objects,
+last-modified times, the clock) under a scratch prefix it deletes
+afterwards, and says whether it is safe for WasmKeep
+([buckets](deploy/buckets.md)). For a quick local try,
 [moto](https://github.com/getmoto/moto)'s S3 server is enough (it keeps
 everything in memory):
 
@@ -982,6 +986,11 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   nodes log the same, at most once a minute.
 - The exit code is 1 when no node is live (an empty prefix included), 0
   otherwise, warnings or not; a bucket it cannot read is an error.
+
+To check the bucket itself rather than the nodes, `wasmkeep cluster
+diagnose --bucket s3://wasmkeep-demo` runs WasmKeep's bucket conformance
+checks under a scratch prefix and prints a verdict: safe for WasmKeep
+(exit 0), not safe (1), or no verdict (2). See [Buckets](deploy/buckets.md).
 
 ## Draining a node
 

@@ -34,6 +34,7 @@ app's actor state is under its own root, `state/<tenant>/<app>/` (written
 | `cluster/migration`, `cluster/migrated/<tenant>`, `cluster/removed/<tenant>` | The lock of a running `cluster migrate`, each migrated tenant's commit, and the mark `--remove-old` writes before it deletes the tenant's old keys ([upgrading to 0.4.0](upgrading-to-0.4.md)) | By `cluster migrate` |
 | `R leases/<class>/<name>` | One small marker per actor, written by the node that first takes it. It carries the generation the actor's first ownership record starts from, and keeps a binary from before node leases from taking the actor ([ADR 0020](../adr/0020-one-lease-per-node.md)) | Created once, never collected |
 | `probe/` | The object a node's start check writes to test conditional writes | Deleted right after the check |
+| `diagnose/` | Scratch objects of `wasmkeep cluster diagnose` ([buckets](buckets.md)) | Deleted when the run ends |
 
 History objects are deleted only by garbage collection, by the node that
 holds the actor, after a newer snapshot of its own was acknowledged, and

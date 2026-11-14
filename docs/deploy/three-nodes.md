@@ -60,7 +60,9 @@ desktop to R2: [measured](../benchmarks.md#three-nodes-against-a-real-bucket)).
 
 "Tested" means the storage, failover and cluster suites and a 30-minute
 soak passed against it. Every node also checks conditional writes at
-start, whatever the provider. Requests cost money on R2 and S3 (before
+start, whatever the provider, and `wasmkeep cluster diagnose` checks the
+rest of what WasmKeep needs from a bucket before you use it
+([buckets](buckets.md)). Requests cost money on R2 and S3 (before
 [ADR 0020](../adr/0020-one-lease-per-node.md), per-actor lease renewals
 were most of them: see the
 [benchmarks](../benchmarks.md#three-nodes-against-a-real-bucket); node
