@@ -8,6 +8,7 @@
 # Getting started
 
 - [Your first actor](tutorials/first-actor.md)
+- [From one node to three](tutorials/one-node-to-three.md)
 - [Languages](languages.md)
 
 # Guide

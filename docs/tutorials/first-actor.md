@@ -168,6 +168,8 @@ The count survived because it lives in the actor's database, not in memory.
 
 ## Next
 
+- [From one node to three](one-node-to-three.md): run three nodes on
+  your machine, kill one and watch its actors carry on.
 - `wasmkeep dev .` rebuilds and reloads your actor every time you save,
   keeping its data.
 - [`examples/rate-limiter`](../../examples/rate-limiter) uses **alarms**:
