@@ -95,6 +95,7 @@ fn the_test_store_is_safe_and_left_as_found() {
         "create-if-absent",
         "concurrent-creates",
         "replace-if-match",
+        "concurrent-replaces",
         "read-after-write",
         "read-after-overwrite",
         "list-new-key",
@@ -136,9 +137,11 @@ fn the_test_store_is_safe_and_left_as_found() {
     assert_eq!(listed(&store, &prefix), [format!("{prefix}/nodes/a")]);
 }
 
+/// Two runs given one `--prefix-for-test` at once: each writes in its own
+/// folder below it, both pass, and an object already there is left alone.
 #[test]
-fn a_scratch_prefix_that_holds_anything_is_refused() {
-    let Some((bucket, prefix, store)) = s3("diagnose-busy") else {
+fn two_runs_at_once_on_one_prefix_do_not_meet() {
+    let Some((bucket, prefix, store)) = s3("diagnose-twice") else {
         return;
     };
     let key = format!("{prefix}/scratch/theirs");
@@ -148,15 +151,28 @@ fn a_scratch_prefix_that_holds_anything_is_refused() {
         .unwrap();
     rt.block_on(store.put(&Path::from(key.as_str()), PutPayload::from_static(b"keep")))
         .unwrap();
-    let out = diagnose(
-        &format!("s3://{bucket}/{prefix}"),
-        &["--prefix-for-test", "scratch"],
-    );
-    let shown = text(&out);
-    assert_eq!(out.status.code(), Some(2), "{shown}");
-    assert!(shown.contains("already holds 1 object(s)"), "{shown}");
-    assert_eq!(listed(&store, &prefix), [key]);
-    rt.block_on(store.delete(&Path::from(format!("{prefix}/scratch/theirs"))))
+    let url = format!("s3://{bucket}/{prefix}");
+    let runs: Vec<_> = (0..2)
+        .map(|_| {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                diagnose(&url, &["--prefix-for-test", "scratch", "--skip-paging"])
+            })
+        })
+        .collect();
+    let mut scratch = Vec::new();
+    for run in runs {
+        let out = run.join().unwrap();
+        let shown = text(&out);
+        assert_eq!(out.status.code(), Some(0), "{shown}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first = stdout.lines().next().unwrap_or_default();
+        assert!(first.contains(&format!("{prefix}/scratch/run-")), "{shown}");
+        scratch.push(first.to_owned());
+    }
+    assert_ne!(scratch[0], scratch[1], "each run has its own folder");
+    assert_eq!(listed(&store, &prefix), std::slice::from_ref(&key));
+    rt.block_on(store.delete(&Path::from(key.as_str())))
         .unwrap();
 }
 

@@ -28,8 +28,9 @@ pub(crate) struct DiagnoseArgs {
     #[arg(long)]
     bucket: String,
 
-    /// Where under PREFIX the checks write (deleted afterwards). Refused if
-    /// it already holds an object. [default: diagnose/run-<ms>-<pid>]
+    /// Where under PREFIX the checks write: each run writes in its own
+    /// run-<ms>-<pid>/ folder below it, deleted afterwards, so two runs
+    /// never share one. [default: diagnose]
     #[arg(long, value_name = "PREFIX")]
     prefix_for_test: Option<String>,
 
@@ -92,8 +93,11 @@ pub(crate) struct Options {
     pub(crate) modified_gap: Duration,
     /// The lease timings the clock is checked against.
     pub(crate) lease: LeaseConfig,
-    /// The longest one check may take.
+    /// The longest one check may take, and the cleanup.
     pub(crate) check_timeout: Duration,
+    /// How long to wait, after the cleanup, for writes that a check cut
+    /// by its timeout had in flight, before listing once more.
+    pub(crate) settle: Duration,
 }
 
 impl Options {
@@ -105,6 +109,7 @@ impl Options {
             modified_gap: Duration::from_millis(1_100),
             lease: LeaseConfig::default_safe(),
             check_timeout: Duration::from_secs(120),
+            settle: Duration::from_secs(5),
         }
     }
 }
@@ -166,6 +171,20 @@ impl Verdict {
 }
 
 impl Report {
+    /// Whether the scratch prefix was left empty.
+    fn cleaned(&self) -> bool {
+        self.left == Some(0) && self.cleanup_error.is_none()
+    }
+
+    /// The exit code: the verdict's, but 2 for a safe verdict whose
+    /// cleanup failed (objects are left to delete by hand).
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self.verdict().code() {
+            0 if !self.cleaned() => 2,
+            code => code,
+        }
+    }
+
     pub(crate) fn verdict(&self) -> Verdict {
         let named = |s: Status| -> Vec<&'static str> {
             self.checks
@@ -232,7 +251,7 @@ impl Report {
                 "value": c.value,
             })).collect::<Vec<_>>(),
             "cleanup": {
-                "ok": self.left == Some(0) && self.cleanup_error.is_none(),
+                "ok": self.cleaned(),
                 "left": self.left,
                 "error": self.cleanup_error,
             },
@@ -242,7 +261,7 @@ impl Report {
                 Verdict::Incomplete(_) => "incomplete",
             },
             "summary": verdict.text(),
-            "exit_code": verdict.code(),
+            "exit_code": self.exit_code(),
         })
     }
 }
@@ -272,6 +291,9 @@ impl<T> Tracked<'_, T> {
 impl<T: Target> Tracked<'_, T> {
     async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
         Bucket::get(self.inner, key).await
+    }
+    async fn get_owned(&self, key: String) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+        self.get(&key).await
     }
     async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
         self.note(key);
@@ -371,17 +393,20 @@ pub(crate) async fn run<T: Target>(target: &T, options: &Options) -> Result<Repo
         written: RefCell::new(BTreeSet::new()),
     };
     let mut checks = Vec::new();
+    // A check cut by its timeout may have writes in flight: they can land
+    // after the cleanup.
+    let mut cut = false;
+    let late = || format!("no answer within {} s", options.check_timeout.as_secs_f64());
     // Each check is bounded and returns its outcome: none can skip the
     // cleanup below.
     macro_rules! bounded {
         ($name:expr, $fut:expr) => {{
             let outcome = match tokio::time::timeout(options.check_timeout, $fut).await {
                 Ok(c) => c,
-                Err(_) => check(
-                    $name,
-                    Status::Error,
-                    format!("no answer within {} s", options.check_timeout.as_secs_f64()),
-                ),
+                Err(_) => {
+                    cut = true;
+                    check($name, Status::Error, late())
+                }
             };
             checks.push(outcome);
         }};
@@ -390,21 +415,24 @@ pub(crate) async fn run<T: Target>(target: &T, options: &Options) -> Result<Repo
     bounded!("create-if-absent", create_if_absent(&t));
     bounded!("concurrent-creates", concurrent_creates(&t));
     bounded!("replace-if-match", replace_if_match(&t));
+    bounded!("concurrent-replaces", concurrent_replaces(&t));
     bounded!("read-after-write", read_after_write(&t));
     bounded!("read-after-overwrite", read_after_overwrite(&t));
-    let (seen, gone) = tokio::time::timeout(options.check_timeout, list_lag(&t, options))
-        .await
-        .unwrap_or_else(|_| {
-            let late = || format!("no answer within {} s", options.check_timeout.as_secs_f64());
-            (
-                check("list-new-key", Status::Error, late()),
-                check("list-deleted-key", Status::Error, late()),
-            )
-        });
+    let (seen, gone) =
+        match tokio::time::timeout(options.check_timeout, list_lag(&t, options)).await {
+            Ok(both) => both,
+            Err(_) => {
+                cut = true;
+                (
+                    check("list-new-key", Status::Error, late()),
+                    check("list-deleted-key", Status::Error, late()),
+                )
+            }
+        };
     checks.push(seen);
     checks.push(gone);
     bounded!("delete-absent", delete_absent(&t));
-    bounded!("large-object", large_object(&t, options.large_bytes));
+    bounded!("large-object", large_object(&t, options));
     bounded!("last-modified", last_modified(&t, options));
     bounded!("clock-skew", clock_skew(&t, &options.lease));
     match options.paging_keys {
@@ -415,7 +443,14 @@ pub(crate) async fn run<T: Target>(target: &T, options: &Options) -> Result<Repo
             "not run (--skip-paging)",
         )),
     }
-    let (left, cleanup_error) = cleanup(&t, options).await;
+    let mut ended = bounded_cleanup(&t, options).await;
+    // A write cut short above may land after its delete: list once more
+    // when it had time to, and delete what this run wrote again.
+    if cut && ended == (Some(0), None) {
+        tokio::time::sleep(options.settle).await;
+        ended = bounded_cleanup(&t, options).await;
+    }
+    let (left, cleanup_error) = ended;
     Ok(Report {
         checks,
         left,
@@ -423,8 +458,27 @@ pub(crate) async fn run<T: Target>(target: &T, options: &Options) -> Result<Repo
     })
 }
 
-/// Deletes every key written (and any other under the scratch prefix),
-/// then lists until the prefix shows empty or the listing wait runs out.
+/// [`cleanup`], given up after the check timeout.
+async fn bounded_cleanup<T: Target>(
+    t: &Tracked<'_, T>,
+    options: &Options,
+) -> (Option<usize>, Option<String>) {
+    tokio::time::timeout(options.check_timeout, cleanup(t, options))
+        .await
+        .unwrap_or_else(|_| {
+            (
+                None,
+                Some(format!(
+                    "no answer within {} s",
+                    options.check_timeout.as_secs_f64()
+                )),
+            )
+        })
+}
+
+/// Deletes every key this run tried to write, then lists until the
+/// scratch prefix shows empty or the listing wait runs out. Anything else
+/// found there is counted as left, never deleted.
 async fn cleanup<T: Target>(
     t: &Tracked<'_, T>,
     options: &Options,
@@ -471,13 +525,93 @@ async fn start_check<T: Target>(t: &Tracked<'_, T>) -> Check {
     }
 }
 
+/// How a conditional write that should succeed came out.
+enum Wrote {
+    /// Accepted, with the new version.
+    Done(Version),
+    /// Answered 412, but the object holds the body just sent, with this
+    /// version: the write landed, its answer was lost (a 5xx, a timeout)
+    /// and the client's retry found its own write. Not a refusal.
+    Landed(Version),
+    /// Refused: the object holds this instead (`None`: absent).
+    Refused(Option<Vec<u8>>),
+}
+
+/// After a 412: whether the object holds `body` (the write landed).
+async fn read_back<T: Target>(
+    t: &Tracked<'_, T>,
+    key: &str,
+    body: &[u8],
+) -> Result<Wrote, BucketError> {
+    Ok(match t.get(key).await? {
+        Some((got, version)) if got == body => Wrote::Landed(version),
+        other => Wrote::Refused(other.map(|(b, _)| b)),
+    })
+}
+
+/// A create that should succeed: a 412 is read back ([`Wrote`]).
+async fn create_checked<T: Target>(
+    t: &Tracked<'_, T>,
+    key: &str,
+    body: &[u8],
+) -> Result<Wrote, BucketError> {
+    match t.create(key, body.to_vec()).await {
+        Ok(v) => Ok(Wrote::Done(v)),
+        Err(BucketError::Conflict) => read_back(t, key, body).await,
+        Err(e) => Err(e),
+    }
+}
+
+/// A replace that should succeed: a 412 is read back ([`Wrote`]).
+async fn replace_checked<T: Target>(
+    t: &Tracked<'_, T>,
+    key: &str,
+    body: &[u8],
+    expected: &Version,
+) -> Result<Wrote, BucketError> {
+    match t.replace(key, body.to_vec(), expected).await {
+        Ok(v) => Ok(Wrote::Done(v)),
+        Err(BucketError::Conflict) => read_back(t, key, body).await,
+        Err(e) => Err(e),
+    }
+}
+
+/// What a check adds to its value when a write answered 412 yet landed.
+fn landed_note(landed: usize) -> String {
+    if landed == 0 {
+        String::new()
+    } else {
+        format!(" ({landed} write(s) answered 412 after the client retried them, but had landed)")
+    }
+}
+
+fn shown(body: Option<&[u8]>) -> String {
+    body.map_or("nothing".into(), |b| {
+        format!("{:?}", String::from_utf8_lossy(b))
+    })
+}
+
 /// `If-None-Match: *`: a create over an existing object is refused, and
 /// one after a delete succeeds (an ownership record removed and taken
 /// again).
 async fn create_if_absent<T: Target>(t: &Tracked<'_, T>) -> Check {
     const NAME: &str = "create-if-absent";
     let key = "create/k";
-    try_or!(NAME, "creating", t.create(key, b"1".to_vec()).await);
+    let mut landed = 0;
+    match try_or!(NAME, "creating", create_checked(t, key, b"1").await) {
+        Wrote::Done(_) => {}
+        Wrote::Landed(_) => landed += 1,
+        Wrote::Refused(got) => {
+            return check(
+                NAME,
+                Status::Error,
+                format!(
+                    "a create of a fresh key was refused (it holds {})",
+                    shown(got.as_deref())
+                ),
+            );
+        }
+    }
     match t.create(key, b"2".to_vec()).await {
         Err(BucketError::Conflict) => {}
         Ok(_) => {
@@ -498,56 +632,231 @@ async fn create_if_absent<T: Target>(t: &Tracked<'_, T>) -> Check {
         );
     }
     try_or!(NAME, "deleting", t.delete(key).await);
-    match t.create(key, b"3".to_vec()).await {
-        Ok(_) => check(
-            NAME,
-            Status::Pass,
-            "create over an existing object refused; create after a delete accepted",
+    match try_or!(
+        NAME,
+        "creating after the delete",
+        create_checked(t, key, b"3").await
+    ) {
+        Wrote::Done(_) => {}
+        Wrote::Landed(_) => landed += 1,
+        // Refused, and the deleted object is back: the delete did not
+        // take effect.
+        Wrote::Refused(Some(got)) if got == b"1" => {
+            return check(
+                NAME,
+                Status::Fail,
+                "a create after a delete was refused (the delete did not take effect)",
+            );
+        }
+        Wrote::Refused(got) => {
+            return check(
+                NAME,
+                Status::Error,
+                format!(
+                    "a create after a delete was refused, and the key holds {}",
+                    shown(got.as_deref())
+                ),
+            );
+        }
+    }
+    check(
+        NAME,
+        Status::Pass,
+        format!(
+            "create over an existing object refused; create after a delete accepted{}",
+            landed_note(landed)
         ),
-        Err(BucketError::Conflict) => check(
-            NAME,
+    )
+}
+
+/// Contenders in each race, and the races run.
+const CONTENDERS: usize = 8;
+const RACES: usize = 5;
+
+/// Opens as many connections to the bucket as a race has contenders (a
+/// read each, at once), so that the race's writes leave together instead
+/// of one per new connection.
+async fn warm<T: Target>(t: &Tracked<'_, T>) -> Result<(), BucketError> {
+    for r in join_all((0..CONTENDERS).map(|i| t.get_owned(format!("warm/{i}")))).await {
+        r?;
+    }
+    Ok(())
+}
+
+/// One race's outcome: how many writes won, which, and how many were
+/// refused.
+struct Race {
+    won: Vec<usize>,
+    refused: usize,
+    other: Option<String>,
+}
+
+fn race(results: Vec<Result<Version, BucketError>>) -> Race {
+    let mut out = Race {
+        won: Vec::new(),
+        refused: 0,
+        other: None,
+    };
+    for (i, r) in results.into_iter().enumerate() {
+        match r {
+            Ok(_) => out.won.push(i),
+            Err(BucketError::Conflict) => out.refused += 1,
+            Err(e) => {
+                out.other.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// After a race on `key` among `bodies`: `Ok(())` if exactly one write
+/// won and the object holds its body (or none won, every write answered
+/// 412, and the object holds one contender's body: that write landed and
+/// its retry was refused, counted in `landed`).
+async fn judge_race<T: Target>(
+    t: &Tracked<'_, T>,
+    name: &'static str,
+    what: &str,
+    key: &str,
+    bodies: &[Vec<u8>],
+    race: Race,
+    landed: &mut usize,
+) -> Result<(), Check> {
+    let n = bodies.len();
+    if race.won.len() > 1 {
+        return Err(check(
+            name,
             Status::Fail,
-            "a create after a delete was refused (the delete did not take effect)",
-        ),
-        Err(e) => error(NAME, "creating after the delete", &e),
+            format!(
+                "{} of {n} simultaneous {what} of one key succeeded",
+                race.won.len()
+            ),
+        ));
+    }
+    if let Some(why) = race.other {
+        return Err(check(
+            name,
+            Status::Error,
+            format!(
+                "{} won, {} refused, the rest failed: {why}",
+                race.won.len(),
+                race.refused
+            ),
+        ));
+    }
+    let stored = match t.get(key).await {
+        Ok(got) => got.map(|(b, _)| b),
+        Err(e) => return Err(error(name, "reading the winner", &e)),
+    };
+    match race.won.first() {
+        Some(&w) if stored.as_deref() == Some(bodies[w].as_slice()) => Ok(()),
+        Some(&w) => Err(check(
+            name,
+            Status::Fail,
+            format!(
+                "the {what} by contender {w} won, but the object holds {}",
+                shown(stored.as_deref())
+            ),
+        )),
+        None if stored.as_ref().is_some_and(|s| bodies.contains(s)) => {
+            *landed += 1;
+            Ok(())
+        }
+        None => Err(check(
+            name,
+            Status::Error,
+            format!(
+                "none of {n} simultaneous {what} won, and the object holds {}",
+                shown(stored.as_deref())
+            ),
+        )),
     }
 }
 
-/// Eight creates of one key at once: exactly one wins.
+/// Eight creates of one key at once, five times on fresh keys over warm
+/// connections: exactly one wins each time, and the object is its.
 async fn concurrent_creates<T: Target>(t: &Tracked<'_, T>) -> Check {
     const NAME: &str = "concurrent-creates";
-    const N: usize = 8;
-    let results = join_all((0..N).map(|i| t.create("race/k", format!("{i}").into_bytes()))).await;
-    let won = results.iter().filter(|r| r.is_ok()).count();
-    let lost = results
-        .iter()
-        .filter(|r| matches!(r, Err(BucketError::Conflict)))
-        .count();
-    if won > 1 {
-        return check(
+    try_or!(NAME, "opening connections", warm(t).await);
+    let mut landed = 0;
+    for r in 0..RACES {
+        let key = format!("race/{r}");
+        let bodies: Vec<Vec<u8>> = (0..CONTENDERS)
+            .map(|i| format!("{r}-{i}").into_bytes())
+            .collect();
+        let results = join_all(bodies.iter().map(|b| t.create(&key, b.clone()))).await;
+        if let Err(c) = judge_race(
+            t,
             NAME,
-            Status::Fail,
-            format!("{won} of {N} simultaneous creates of one key succeeded"),
-        );
+            "creates",
+            &key,
+            &bodies,
+            race(results),
+            &mut landed,
+        )
+        .await
+        {
+            return c;
+        }
     }
-    if won == 1 && lost == N - 1 {
-        return check(
-            NAME,
-            Status::Pass,
-            format!("1 of {N} simultaneous creates won, {lost} refused"),
-        );
-    }
-    let why = results
-        .iter()
-        .find_map(|r| match r {
-            Err(BucketError::Unavailable(e)) => Some(e.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "no create won".into());
     check(
         NAME,
-        Status::Error,
-        format!("{won} won, {lost} refused, the rest failed: {why}"),
+        Status::Pass,
+        format!(
+            "{RACES} races of {CONTENDERS} simultaneous creates: one won each{}",
+            landed_note(landed)
+        ),
+    )
+}
+
+/// Eight replaces of one object at once, all with its current version,
+/// five times: exactly one wins each time and the object holds its body
+/// (two nodes taking over one lease at once).
+async fn concurrent_replaces<T: Target>(t: &Tracked<'_, T>) -> Check {
+    const NAME: &str = "concurrent-replaces";
+    try_or!(NAME, "opening connections", warm(t).await);
+    let mut landed = 0;
+    for r in 0..RACES {
+        let key = format!("swap/{r}");
+        let base = format!("{r}-base").into_bytes();
+        let version = match try_or!(NAME, "creating", create_checked(t, &key, &base).await) {
+            Wrote::Done(v) | Wrote::Landed(v) => v,
+            Wrote::Refused(got) => {
+                return check(
+                    NAME,
+                    Status::Error,
+                    format!(
+                        "a create of a fresh key was refused (it holds {})",
+                        shown(got.as_deref())
+                    ),
+                );
+            }
+        };
+        let bodies: Vec<Vec<u8>> = (0..CONTENDERS)
+            .map(|i| format!("{r}-{i}").into_bytes())
+            .collect();
+        let results = join_all(bodies.iter().map(|b| t.replace(&key, b.clone(), &version))).await;
+        if let Err(c) = judge_race(
+            t,
+            NAME,
+            "replaces",
+            &key,
+            &bodies,
+            race(results),
+            &mut landed,
+        )
+        .await
+        {
+            return c;
+        }
+    }
+    check(
+        NAME,
+        Status::Pass,
+        format!(
+            "{RACES} races of {CONTENDERS} simultaneous replaces of one version: one won each{}",
+            landed_note(landed)
+        ),
     )
 }
 
@@ -558,12 +867,53 @@ async fn concurrent_creates<T: Target>(t: &Tracked<'_, T>) -> Check {
 async fn replace_if_match<T: Target>(t: &Tracked<'_, T>) -> Check {
     const NAME: &str = "replace-if-match";
     let key = "replace/k";
-    let v1 = try_or!(NAME, "creating", t.create(key, b"1".to_vec()).await);
-    let v2 = try_or!(
+    let mut landed = 0;
+    let refused = |what: &str, got: Option<Vec<u8>>, old: &[u8]| {
+        // Still the old body: a real refusal. Anything else: unexplained.
+        if got.as_deref() == Some(old) {
+            check(NAME, Status::Fail, format!("{what} was refused"))
+        } else {
+            check(
+                NAME,
+                Status::Error,
+                format!(
+                    "{what} was refused, and the object holds {}",
+                    shown(got.as_deref())
+                ),
+            )
+        }
+    };
+    let v1 = match try_or!(NAME, "creating", create_checked(t, key, b"1").await) {
+        Wrote::Done(v) => v,
+        Wrote::Landed(v) => {
+            landed += 1;
+            v
+        }
+        Wrote::Refused(got) => {
+            return check(
+                NAME,
+                Status::Error,
+                format!(
+                    "a create of a fresh key was refused (it holds {})",
+                    shown(got.as_deref())
+                ),
+            );
+        }
+    };
+    let v2 = match try_or!(
         NAME,
         "replacing with the current version",
-        t.replace(key, b"2".to_vec(), &v1).await
-    );
+        replace_checked(t, key, b"2", &v1).await
+    ) {
+        Wrote::Done(v) => v,
+        Wrote::Landed(v) => {
+            landed += 1;
+            v
+        }
+        Wrote::Refused(got) => {
+            return refused("a replace with the version a write returned", got, b"1");
+        }
+    };
     match t.replace(key, b"x".to_vec(), &v1).await {
         Err(BucketError::Conflict) => {}
         Ok(_) => {
@@ -588,16 +938,19 @@ async fn replace_if_match<T: Target>(t: &Tracked<'_, T>) -> Check {
             ),
         );
     }
-    let v3 = match t.replace(key, b"3".to_vec(), &read).await {
-        Ok(v) => v,
-        Err(BucketError::Conflict) => {
-            return check(
-                NAME,
-                Status::Fail,
-                "a replace with the version a read returned was refused",
-            );
+    let v3 = match try_or!(
+        NAME,
+        "replacing with a read's version",
+        replace_checked(t, key, b"3", &read).await
+    ) {
+        Wrote::Done(v) => v,
+        Wrote::Landed(v) => {
+            landed += 1;
+            v
         }
-        Err(e) => return error(NAME, "replacing with a read's version", &e),
+        Wrote::Refused(got) => {
+            return refused("a replace with the version a read returned", got, b"2");
+        }
     };
     match t.replace(key, b"x".to_vec(), &v2).await {
         Err(BucketError::Conflict) => {}
@@ -615,7 +968,10 @@ async fn replace_if_match<T: Target>(t: &Tracked<'_, T>) -> Check {
         Err(BucketError::Conflict) => check(
             NAME,
             Status::Pass,
-            "current version (written or read) accepted; stale and deleted refused",
+            format!(
+                "current version (written or read) accepted; stale and deleted refused{}",
+                landed_note(landed)
+            ),
         ),
         Ok(_) => check(
             NAME,
@@ -663,18 +1019,53 @@ async fn read_after_write<T: Target>(t: &Tracked<'_, T>) -> Check {
     )
 }
 
-/// A read right after a replace or an overwrite returns the new body.
+/// A read right after a replace or an overwrite returns the new body,
+/// and a plain overwrite makes the version before it stale (a lease
+/// overwritten by hand is not renewed over).
 async fn read_after_overwrite<T: Target>(t: &Tracked<'_, T>) -> Check {
     const NAME: &str = "read-after-overwrite";
     let key = "rao/k";
-    let mut version = try_or!(NAME, "creating", t.create(key, b"0".to_vec()).await);
+    let mut landed = 0;
+    let mut version = match try_or!(NAME, "creating", create_checked(t, key, b"0").await) {
+        Wrote::Done(v) => v,
+        Wrote::Landed(v) => {
+            landed += 1;
+            v
+        }
+        Wrote::Refused(got) => {
+            return check(
+                NAME,
+                Status::Error,
+                format!(
+                    "a create of a fresh key was refused (it holds {})",
+                    shown(got.as_deref())
+                ),
+            );
+        }
+    };
     for i in 1..=ROUNDS {
         let body = format!("replaced {i}").into_bytes();
-        try_or!(
+        let before = match try_or!(
             NAME,
             "replacing",
-            t.replace(key, body.clone(), &version).await
-        );
+            replace_checked(t, key, &body, &version).await
+        ) {
+            Wrote::Done(v) => v,
+            Wrote::Landed(v) => {
+                landed += 1;
+                v
+            }
+            Wrote::Refused(got) => {
+                return check(
+                    NAME,
+                    Status::Error,
+                    format!(
+                        "a replace with the current version was refused (it holds {})",
+                        shown(got.as_deref())
+                    ),
+                );
+            }
+        };
         let got = try_or!(NAME, "reading", t.get(key).await).map(|(b, _)| b);
         if got.as_deref() != Some(body.as_slice()) {
             return check(
@@ -695,15 +1086,28 @@ async fn read_after_overwrite<T: Target>(t: &Tracked<'_, T>) -> Check {
                 "a read right after an overwrite returned the old body",
             );
         }
+        match t.replace(key, b"x".to_vec(), &before).await {
+            Err(BucketError::Conflict) => {}
+            Ok(_) => {
+                return check(
+                    NAME,
+                    Status::Fail,
+                    "a replace with the version from before a plain overwrite was accepted",
+                );
+            }
+            Err(e) => return error(NAME, "replacing with the version before the overwrite", &e),
+        }
         version = read;
     }
     check(
         NAME,
         Status::Pass,
         format!(
-            "{} of {} reads right after a replace or overwrite were current",
+            "{} of {} reads right after a replace or overwrite were current; \
+             an overwrite made the version before it stale{}",
             2 * ROUNDS,
-            2 * ROUNDS
+            2 * ROUNDS,
+            landed_note(landed)
         ),
     )
 }
@@ -810,52 +1214,108 @@ fn pattern(len: usize) -> Vec<u8> {
     out
 }
 
-/// A large object (a database snapshot is one PUT) comes back whole.
-async fn large_object<T: Target>(t: &Tracked<'_, T>, len: usize) -> Check {
+/// A listing of `prefix`, `(key, last-modified ms, size)` each.
+type Listing = Vec<(String, u64, u64)>;
+
+/// Lists `prefix` until `ready` holds or the listing wait runs out: the
+/// last listing, and how long until it was ready (`None`: never).
+async fn list_until<T: Target>(
+    t: &Tracked<'_, T>,
+    prefix: &str,
+    options: &Options,
+    ready: impl Fn(&Listing) -> bool,
+) -> Result<(Listing, Option<Duration>), BucketError> {
+    let start = Instant::now();
+    loop {
+        let listed = t.list(prefix).await?;
+        if ready(&listed) {
+            return Ok((listed, Some(start.elapsed())));
+        }
+        if start.elapsed() >= options.list_wait {
+            return Ok((listed, None));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A listing that took more than a second to show a write: a warning, as
+/// in `list-new-key`.
+fn lag_note(lag: Duration) -> Option<String> {
+    (lag > Duration::from_secs(1)).then(|| {
+        format!(
+            "; the listing showed the writes only after {} ms",
+            lag.as_millis()
+        )
+    })
+}
+
+/// A large object (a database snapshot is one PUT) comes back whole, and
+/// is listed with its size.
+async fn large_object<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Check {
     const NAME: &str = "large-object";
+    let len = options.large_bytes;
+    let key = "large/k";
     let body = pattern(len);
     let up = Instant::now();
-    try_or!(NAME, "writing", t.put("large/k", body.clone()).await);
+    try_or!(NAME, "writing", t.put(key, body.clone()).await);
     let up = up.elapsed();
     let down = Instant::now();
-    let got = try_or!(NAME, "reading", t.get("large/k").await);
+    let got = try_or!(NAME, "reading", t.get(key).await);
     let down = down.elapsed();
-    let listed = try_or!(NAME, "listing", t.list("large/").await);
     let mib = len as f64 / f64::from(1u32 << 20);
     match got {
-        Some((got, _)) if got == body => {
-            if listed.first().map(|(_, _, size)| *size) != Some(len as u64) {
-                return check(
-                    NAME,
-                    Status::Fail,
-                    format!("the listing gives the wrong size: {listed:?}"),
-                );
-            }
-            check(
+        Some((got, _)) if got == body => {}
+        Some((got, _)) => {
+            return check(
                 NAME,
-                Status::Pass,
+                Status::Fail,
                 format!(
-                    "{mib:.0} MiB round trip intact (write {:.1} s, read {:.1} s)",
-                    up.as_secs_f64(),
-                    down.as_secs_f64()
+                    "{mib:.0} MiB written, {} bytes read back, not the same",
+                    got.len()
                 ),
-            )
+            );
         }
-        Some((got, _)) => check(
+        None => return check(NAME, Status::Fail, "a large object read back as absent"),
+    }
+    let (listed, lag) = try_or!(
+        NAME,
+        "listing",
+        list_until(t, "large/", options, |l| l.iter().any(|(k, _, _)| k == key)).await
+    );
+    let Some(lag) = lag else {
+        return check(
             NAME,
             Status::Fail,
             format!(
-                "{mib:.0} MiB written, {} bytes read back, not the same",
-                got.len()
+                "the large object was not listed within {} s",
+                options.list_wait.as_secs_f64()
             ),
-        ),
-        None => check(NAME, Status::Fail, "a large object read back as absent"),
+        );
+    };
+    let size = listed.iter().find(|(k, _, _)| k == key).map(|(_, _, s)| *s);
+    if size != Some(len as u64) {
+        return check(
+            NAME,
+            Status::Fail,
+            format!("the listing gives the wrong size: {size:?}, not {len}"),
+        );
+    }
+    let value = format!(
+        "{mib:.0} MiB round trip intact (write {:.1} s, read {:.1} s)",
+        up.as_secs_f64(),
+        down.as_secs_f64()
+    );
+    match lag_note(lag) {
+        Some(note) => check(NAME, Status::Warn, value + &note),
+        None => check(NAME, Status::Pass, value),
     }
 }
 
 /// Last-modified times as the migration and `cluster fence` use them: a
-/// later write (or overwrite) never lists earlier, one more than a second
-/// later lists later, and a head and a listing agree within a second.
+/// write (or overwrite) more than a second after another lists later, a
+/// head and a listing agree within a second, and two writes back to back
+/// list in order, or out of order by less than the allowed clock skew (a
+/// store's servers may stamp them; a warning).
 async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Check {
     const NAME: &str = "last-modified";
     let time = |listed: &[(String, u64, u64)], key: &str| {
@@ -863,12 +1323,22 @@ async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Chec
     };
     try_or!(NAME, "writing", t.put("mod/a", b"1".to_vec()).await);
     try_or!(NAME, "writing", t.put("mod/b", b"1".to_vec()).await);
-    let first = try_or!(NAME, "listing", t.list("mod/").await);
+    let (first, lag1) = try_or!(
+        NAME,
+        "listing",
+        list_until(t, "mod/", options, |l| {
+            time(l, "mod/a").is_some() && time(l, "mod/b").is_some()
+        })
+        .await
+    );
     let (Some(a1), Some(b1)) = (time(&first, "mod/a"), time(&first, "mod/b")) else {
         return check(
             NAME,
             Status::Fail,
-            "a listing right after two writes missed one",
+            format!(
+                "a listing missed one of two writes for {} s",
+                options.list_wait.as_secs_f64()
+            ),
         );
     };
     if a1 == 0 || b1 == 0 {
@@ -878,22 +1348,41 @@ async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Chec
             "the listing gives no last-modified time",
         );
     }
+    let mut notes = Vec::new();
     if b1 < a1 {
-        return check(
-            NAME,
-            Status::Fail,
-            format!("a later write lists earlier ({b1} < {a1} ms)"),
-        );
+        let by = a1 - b1;
+        if by > options.lease.max_skew_ms() {
+            return check(
+                NAME,
+                Status::Fail,
+                format!(
+                    "a later write lists {by} ms earlier ({b1} < {a1} ms), past the allowed skew"
+                ),
+            );
+        }
+        notes.push(format!(
+            "; two writes back to back list {by} ms out of order (within the allowed skew)"
+        ));
     }
     tokio::time::sleep(options.modified_gap).await;
     try_or!(NAME, "writing", t.put("mod/c", b"1".to_vec()).await);
     try_or!(NAME, "overwriting", t.put("mod/a", b"2".to_vec()).await);
-    let second = try_or!(NAME, "listing", t.list("mod/").await);
+    let (second, lag2) = try_or!(
+        NAME,
+        "listing",
+        list_until(t, "mod/", options, |l| {
+            time(l, "mod/c").is_some() && time(l, "mod/a").is_some_and(|a| a != a1)
+        })
+        .await
+    );
     let (Some(a2), Some(c)) = (time(&second, "mod/a"), time(&second, "mod/c")) else {
         return check(
             NAME,
             Status::Fail,
-            "a listing right after two writes missed one",
+            format!(
+                "a listing missed one of two writes for {} s",
+                options.list_wait.as_secs_f64()
+            ),
         );
     };
     let gap = options.modified_gap.as_millis();
@@ -926,14 +1415,22 @@ async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Chec
             format!("a head and a listing disagree by {diff} ms"),
         );
     }
+    let lag = lag1.max(lag2).unwrap_or_default();
+    notes.extend(lag_note(lag));
     let whole = [a1, b1, a2, c, head].iter().all(|m| m % 1_000 == 0);
+    let value = format!(
+        "{} precision, writes a second apart in order; head and listing agree within {diff} ms{}",
+        if whole { "whole-second" } else { "millisecond" },
+        notes.concat()
+    );
     check(
         NAME,
-        Status::Pass,
-        format!(
-            "{} precision, in write order; head and listing agree within {diff} ms",
-            if whole { "whole-second" } else { "millisecond" }
-        ),
+        if notes.is_empty() {
+            Status::Pass
+        } else {
+            Status::Warn
+        },
+        value,
     )
 }
 
@@ -1047,9 +1544,18 @@ async fn paging<T: Target>(t: &Tracked<'_, T>, n: usize, options: &Options) -> C
     }
 }
 
-/// The default scratch prefix: unique to this run.
-fn default_scratch() -> String {
-    format!("diagnose/run-{}-{}", now_ms(), std::process::id())
+/// This run's folder name: unique to this process.
+fn run_folder() -> String {
+    format!("run-{}-{}", now_ms(), std::process::id())
+}
+
+/// Where a run writes, below the URL's prefix: its own `run` folder under
+/// `--prefix-for-test` (or `diagnose`), so that two runs at once never
+/// share a prefix. `None` if the given prefix names no folder.
+fn scratch_for(given: Option<&str>, run: &str) -> Option<String> {
+    let base = given.unwrap_or("diagnose").trim_matches('/');
+    scratch_prefix("", base)?;
+    Some(format!("{base}/{run}"))
 }
 
 /// Joins the URL's prefix and the scratch prefix; `None` if the scratch
@@ -1071,7 +1577,7 @@ fn scratch_prefix(url_prefix: &str, scratch: &str) -> Option<String> {
 }
 
 /// `wasmkeep cluster diagnose`: the exit code (0 safe, 1 not safe, 2 not
-/// run or not finished).
+/// run, not finished, or safe but not cleaned up).
 pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
     let fail = |msg: String| {
         eprintln!("error: {msg}");
@@ -1081,10 +1587,12 @@ pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
         Ok(v) => v,
         Err(e) => return fail(format!("{e:#}")),
     };
-    let scratch = args.prefix_for_test.clone().unwrap_or_else(default_scratch);
-    let Some(prefix) = scratch_prefix(&url_prefix, &scratch) else {
+    let Some(prefix) = scratch_for(args.prefix_for_test.as_deref(), &run_folder())
+        .and_then(|scratch| scratch_prefix(&url_prefix, &scratch))
+    else {
         return fail(format!(
-            "--prefix-for-test must name a folder, got {scratch:?}"
+            "--prefix-for-test must name a folder, got {:?}",
+            args.prefix_for_test.as_deref().unwrap_or_default()
         ));
     };
     let bucket_name = args
@@ -1108,7 +1616,7 @@ pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
         Err(NotRun::NotEmpty(n)) => {
             return fail(format!(
                 "{scratch_url} already holds {n} object(s): refusing to write there \
-                 (give an empty --prefix-for-test)"
+                 (run it again: the next run gets another folder)"
             ));
         }
         Err(NotRun::Unreachable(why)) => {
@@ -1120,16 +1628,17 @@ pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
     } else {
         print!("{}", report.to_text(&args.bucket, &scratch_url));
     }
-    if report.left != Some(0) || report.cleanup_error.is_some() {
+    if !report.cleaned() {
         eprintln!("warning: {}", report.cleanup_text(&scratch_url));
     }
-    report.verdict().code()
+    report.exit_code()
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)] // test code
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use object_store::ObjectStore;
@@ -1146,6 +1655,7 @@ mod tests {
             modified_gap: Duration::from_millis(20),
             lease: LeaseConfig::default_safe(),
             check_timeout: Duration::from_secs(30),
+            settle: Duration::from_millis(10),
         }
     }
 
@@ -1154,15 +1664,58 @@ mod tests {
         (Arc::clone(&store), ObjectStoreBucket::new(store, prefix))
     }
 
-    /// A store that accepts every conditional write as a plain one: what a
-    /// provider that ignores `If-None-Match` and `If-Match` does.
-    struct Lax {
-        inner: ObjectStoreBucket,
-        create: bool,
-        replace: bool,
+    /// What a broken store gets wrong.
+    #[derive(Default)]
+    struct Faults {
+        /// Creates ignore `If-None-Match` (plain writes).
+        lax_create: bool,
+        /// Replaces ignore `If-Match` (plain writes).
+        lax_replace: bool,
+        /// `If-Match` checked, then written, not atomically: simultaneous
+        /// replaces of one version all win.
+        racy_replace: bool,
+        /// A plain overwrite does not change the version `If-Match` takes.
+        keeps_version: bool,
+        /// A create or replace of these keys that succeeds answers 412, as
+        /// a client's retry of a write that landed but whose answer was
+        /// lost does.
+        landed: &'static [&'static str],
+        /// ... and the object is then gone (not explained by a retry).
+        wipe: bool,
+        /// Listings show a key only this long after its last write.
+        list_lag: Option<Duration>,
+        /// Listings give `mod/b` a time this much earlier than it is.
+        shift_b_ms: u64,
+        /// A plain write of this key lands this long after it was sent,
+        /// and its answer never comes.
+        late_put: Option<(&'static str, Duration)>,
     }
 
-    impl Lax {
+    struct Fake {
+        store: Arc<dyn ObjectStore>,
+        prefix: &'static str,
+        inner: ObjectStoreBucket,
+        f: Faults,
+        written: RefCell<HashMap<String, Instant>>,
+        versions: RefCell<HashMap<String, Version>>,
+        lock: tokio::sync::Mutex<()>,
+    }
+
+    fn fake(f: Faults) -> (Arc<dyn ObjectStore>, Fake) {
+        let (store, inner) = memory("scratch");
+        let fake = Fake {
+            store: Arc::clone(&store),
+            prefix: "scratch",
+            inner,
+            f,
+            written: RefCell::default(),
+            versions: RefCell::default(),
+            lock: tokio::sync::Mutex::new(()),
+        };
+        (store, fake)
+    }
+
+    impl Fake {
         async fn overwrite(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
             Store::put(&self.inner, key, body).await?;
             Ok(Bucket::get(&self.inner, key)
@@ -1170,18 +1723,47 @@ mod tests {
                 .map(|(_, v)| v)
                 .unwrap_or(Version(String::new())))
         }
+
+        fn wrote(
+            &self,
+            key: &str,
+            r: Result<Version, BucketError>,
+        ) -> Result<Version, BucketError> {
+            let v = r?;
+            self.written
+                .borrow_mut()
+                .insert(key.to_owned(), Instant::now());
+            self.versions.borrow_mut().insert(key.to_owned(), v.clone());
+            Ok(v)
+        }
+
+        async fn after(
+            &self,
+            key: &str,
+            r: Result<Version, BucketError>,
+        ) -> Result<Version, BucketError> {
+            let v = self.wrote(key, r)?;
+            if self.f.landed.contains(&key) {
+                if self.f.wipe {
+                    Store::delete(&self.inner, key).await?;
+                }
+                return Err(BucketError::Conflict);
+            }
+            Ok(v)
+        }
     }
 
-    impl Bucket for Lax {
+    impl Bucket for Fake {
         async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
             Bucket::get(&self.inner, key).await
         }
         async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
-            if self.create {
+            let r = if self.f.lax_create {
                 self.overwrite(key, body).await
             } else {
                 self.inner.create(key, body).await
-            }
+            };
+            self.after(key, r).await
         }
         async fn replace(
             &self,
@@ -1189,17 +1771,44 @@ mod tests {
             body: Vec<u8>,
             expected: &Version,
         ) -> Result<Version, BucketError> {
-            if self.replace {
+            let r = if self.f.lax_replace {
                 self.overwrite(key, body).await
+            } else if self.f.racy_replace {
+                let current = Bucket::get(&self.inner, key).await?.map(|(_, v)| v);
+                tokio::task::yield_now().await;
+                if current.as_ref() == Some(expected) {
+                    self.overwrite(key, body).await
+                } else {
+                    Err(BucketError::Conflict)
+                }
+            } else if self.f.keeps_version {
+                let _one_at_a_time = self.lock.lock().await;
+                let known = self.versions.borrow().get(key).cloned();
+                if known.as_ref() == Some(expected) {
+                    self.overwrite(key, body).await
+                } else {
+                    self.inner.replace(key, body, expected).await
+                }
             } else {
                 self.inner.replace(key, body, expected).await
-            }
+            };
+            self.after(key, r).await
         }
     }
 
-    impl Store for Lax {
+    impl Store for Fake {
         async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, BucketError> {
-            Store::list(&self.inner, prefix).await
+            let mut listed = Store::list(&self.inner, prefix).await?;
+            if let Some(lag) = self.f.list_lag {
+                let written = self.written.borrow();
+                listed.retain(|m| written.get(&m.key).is_none_or(|at| at.elapsed() >= lag));
+            }
+            for m in &mut listed {
+                if m.key == "mod/b" {
+                    m.modified_ms -= self.f.shift_b_ms;
+                }
+            }
+            Ok(listed)
         }
         async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, BucketError> {
             self.inner.list_dirs(prefix).await
@@ -1208,26 +1817,49 @@ mod tests {
             self.inner.copy(from, to).await
         }
         async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
-            Store::put(&self.inner, key, body).await
+            if let Some((late, after)) = self.f.late_put
+                && late == key
+            {
+                let bucket = ObjectStoreBucket::new(Arc::clone(&self.store), self.prefix);
+                let key = key.to_owned();
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    Store::put(&bucket, &key, body).await
+                });
+                return std::future::pending().await;
+            }
+            Store::put(&self.inner, key, body).await?;
+            self.written
+                .borrow_mut()
+                .insert(key.to_owned(), Instant::now());
+            // A plain write makes a new version, unless the store is broken.
+            if !self.f.keeps_version {
+                self.versions.borrow_mut().remove(key);
+            }
+            Ok(())
         }
         async fn delete(&self, key: &str) -> Result<(), BucketError> {
+            self.versions.borrow_mut().remove(key);
             Store::delete(&self.inner, key).await
         }
     }
 
-    impl Target for Lax {
+    impl Target for Fake {
         async fn head_modified_ms(&self, key: &str) -> Result<Option<u64>, BucketError> {
             self.inner.head_modified_ms(key).await
         }
     }
 
-    fn status_of(report: &Report, name: &str) -> Status {
+    fn of<'a>(report: &'a Report, name: &str) -> &'a Check {
         report
             .checks
             .iter()
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no check {name}: {report:?}"))
-            .status
+    }
+
+    fn status_of(report: &Report, name: &str) -> Status {
+        of(report, name).status
     }
 
     async fn everything_under(store: &Arc<dyn ObjectStore>) -> Vec<String> {
@@ -1249,11 +1881,18 @@ mod tests {
             report.checks.iter().all(|c| c.status == Status::Pass),
             "{report:#?}"
         );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "concurrent-replaces"),
+            "{report:#?}"
+        );
         assert_eq!(report.left, Some(0));
         assert_eq!(everything_under(&store).await, Vec::<String>::new());
         let text = report.to_text("s3://b/wk", "s3://b/wk/diagnose/run-1/");
         assert!(text.ends_with("safe for WasmKeep\n"), "{text}");
-        assert_eq!(report.verdict().code(), 0);
+        assert_eq!(report.exit_code(), 0);
         let json = report.to_json("s3://b/wk", "s3://b/wk/diagnose/run-1/");
         assert_eq!(json["verdict"], "safe");
         assert_eq!(
@@ -1262,54 +1901,272 @@ mod tests {
         );
     }
 
+    /// Runs against a broken store: exactly `broken` fail, and it is left
+    /// empty all the same.
+    async fn unsafe_with(f: Faults, broken: &[&str]) -> Report {
+        let (store, bucket) = fake(f);
+        let report = run(&bucket, &quick()).await.unwrap();
+        for name in broken {
+            assert_eq!(
+                status_of(&report, name),
+                Status::Fail,
+                "{name}: {report:#?}"
+            );
+        }
+        let Verdict::Unsafe(failed) = report.verdict() else {
+            panic!("{report:#?}");
+        };
+        assert_eq!(failed, broken, "{report:#?}");
+        assert_eq!(report.exit_code(), 1);
+        let text = report.to_text("s3://b", "s3://b/scratch/");
+        assert!(text.contains(&format!("not safe: {}", broken[0])), "{text}");
+        assert_eq!(
+            report.to_json("s3://b", "s3://b/scratch/")["verdict"],
+            "unsafe"
+        );
+        // Cleaned up even though it failed.
+        assert_eq!(everything_under(&store).await, Vec::<String>::new());
+        report
+    }
+
     #[tokio::test]
     async fn a_store_that_ignores_conditions_is_not_safe() {
-        for (create, replace, broken) in [
-            (
-                true,
-                true,
-                &[
-                    "start-check",
-                    "create-if-absent",
-                    "concurrent-creates",
-                    "replace-if-match",
-                ][..],
-            ),
-            (
-                true,
-                false,
-                &["start-check", "create-if-absent", "concurrent-creates"][..],
-            ),
-            (false, true, &["start-check", "replace-if-match"][..]),
+        let replaces = [
+            "replace-if-match",
+            "concurrent-replaces",
+            "read-after-overwrite",
+        ];
+        let creates = ["start-check", "create-if-absent", "concurrent-creates"];
+        let both: Vec<&str> = creates.iter().chain(&replaces).copied().collect();
+        let f = Faults {
+            lax_create: true,
+            lax_replace: true,
+            ..Faults::default()
+        };
+        unsafe_with(f, &both).await;
+        let f = Faults {
+            lax_create: true,
+            ..Faults::default()
+        };
+        unsafe_with(f, &creates).await;
+        let f = Faults {
+            lax_replace: true,
+            ..Faults::default()
+        };
+        let mut broken = vec!["start-check"];
+        broken.extend(replaces);
+        unsafe_with(f, &broken).await;
+    }
+
+    /// The lease takeover race: a store that checks `If-Match` and then
+    /// writes, not atomically, passes every sequential check.
+    #[tokio::test]
+    async fn simultaneous_replaces_that_all_win_are_not_safe() {
+        let f = Faults {
+            racy_replace: true,
+            ..Faults::default()
+        };
+        let report = unsafe_with(f, &["concurrent-replaces"]).await;
+        let value = &of(&report, "concurrent-replaces").value;
+        assert!(value.contains("8 of 8 simultaneous replaces"), "{value}");
+    }
+
+    #[tokio::test]
+    async fn a_version_that_survives_an_overwrite_is_not_safe() {
+        let f = Faults {
+            keeps_version: true,
+            ..Faults::default()
+        };
+        let report = unsafe_with(f, &["read-after-overwrite"]).await;
+        let value = &of(&report, "read-after-overwrite").value;
+        assert!(value.contains("before a plain overwrite"), "{value}");
+    }
+
+    /// A write that landed, lost its answer (a 503) and was retried by the
+    /// client gets a 412 for the retry: read back, it is the write's own
+    /// body, so it is no refusal.
+    #[tokio::test]
+    async fn a_write_that_landed_before_its_retry_got_412_is_no_failure() {
+        let f = Faults {
+            landed: &["create/k", "race/0", "replace/k", "swap/1", "rao/k"],
+            ..Faults::default()
+        };
+        let (store, bucket) = fake(f);
+        let report = run(&bucket, &quick()).await.unwrap();
+        assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
+        for name in [
+            "create-if-absent",
+            "concurrent-creates",
+            "replace-if-match",
+            "concurrent-replaces",
+            "read-after-overwrite",
         ] {
-            let (store, inner) = memory("scratch");
-            let lax = Lax {
-                inner,
-                create,
-                replace,
-            };
-            let report = run(&lax, &quick()).await.unwrap();
-            for name in broken {
-                assert_eq!(
-                    status_of(&report, name),
-                    Status::Fail,
-                    "{name}: {report:#?}"
-                );
-            }
-            let Verdict::Unsafe(failed) = report.verdict() else {
-                panic!("{report:#?}");
-            };
-            assert_eq!(failed, broken, "{report:#?}");
-            assert_eq!(report.verdict().code(), 1);
-            let text = report.to_text("s3://b", "s3://b/scratch/");
-            assert!(text.contains("not safe: start-check"), "{text}");
-            assert_eq!(
-                report.to_json("s3://b", "s3://b/scratch/")["verdict"],
-                "unsafe"
-            );
-            // Cleaned up even though it failed.
-            assert_eq!(everything_under(&store).await, Vec::<String>::new());
+            let c = of(&report, name);
+            assert_eq!(c.status, Status::Pass, "{c:?}");
+            assert!(c.value.contains("but had landed"), "{c:?}");
         }
+        assert_eq!(everything_under(&store).await, Vec::<String>::new());
+    }
+
+    /// A 412 the object does not explain (it holds neither the new body
+    /// nor the old one) is no verdict, not a failure.
+    #[tokio::test]
+    async fn an_unexplained_412_is_an_error() {
+        let f = Faults {
+            landed: &["create/k", "replace/k"],
+            wipe: true,
+            ..Faults::default()
+        };
+        let (_, bucket) = fake(f);
+        let report = run(&bucket, &quick()).await.unwrap();
+        assert_eq!(
+            report.verdict(),
+            Verdict::Incomplete(vec!["create-if-absent", "replace-if-match"]),
+            "{report:#?}"
+        );
+        assert_eq!(report.exit_code(), 2);
+    }
+
+    /// A listing that shows writes late warns in every check that lists,
+    /// as `list-new-key` does; none fails.
+    #[tokio::test]
+    async fn a_lagging_listing_warns() {
+        let f = Faults {
+            list_lag: Some(Duration::from_millis(1_200)),
+            ..Faults::default()
+        };
+        let (store, bucket) = fake(f);
+        let options = Options {
+            list_wait: Duration::from_secs(5),
+            paging_keys: None,
+            ..quick()
+        };
+        let report = run(&bucket, &options).await.unwrap();
+        for name in ["list-new-key", "large-object", "last-modified"] {
+            assert_eq!(
+                status_of(&report, name),
+                Status::Warn,
+                "{name}: {report:#?}"
+            );
+        }
+        assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
+        assert_eq!(everything_under(&store).await, Vec::<String>::new());
+    }
+
+    /// Two writes back to back may list out of order by less than the
+    /// allowed skew (a warning); by more, the order is broken.
+    #[tokio::test]
+    async fn back_to_back_writes_may_list_slightly_out_of_order() {
+        let (_, bucket) = fake(Faults {
+            shift_b_ms: 300,
+            ..Faults::default()
+        });
+        let c = last_modified(
+            &Tracked {
+                inner: &bucket,
+                written: RefCell::default(),
+            },
+            &quick(),
+        )
+        .await;
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(c.value.contains("out of order"), "{c:?}");
+        let (_, bucket) = fake(Faults {
+            shift_b_ms: 1_500,
+            ..Faults::default()
+        });
+        let c = last_modified(
+            &Tracked {
+                inner: &bucket,
+                written: RefCell::default(),
+            },
+            &quick(),
+        )
+        .await;
+        assert_eq!(c.status, Status::Fail, "{c:?}");
+    }
+
+    /// A write a check's timeout cut short may land after the cleanup:
+    /// it is listed and deleted again.
+    #[tokio::test]
+    async fn a_write_landing_after_the_cleanup_is_deleted_too() {
+        let f = Faults {
+            // Lands after the checks that follow and the cleanup's listing.
+            late_put: Some(("large/k", Duration::from_secs(4))),
+            ..Faults::default()
+        };
+        let (store, bucket) = fake(f);
+        let options = Options {
+            check_timeout: Duration::from_secs(1),
+            settle: Duration::from_secs(4),
+            paging_keys: None,
+            ..quick()
+        };
+        let report = run(&bucket, &options).await.unwrap();
+        assert_eq!(status_of(&report, "large-object"), Status::Error);
+        assert_eq!((report.left, &report.cleanup_error), (Some(0), &None));
+        // Past the late write, whenever the run ended: nothing is left.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(everything_under(&store).await, Vec::<String>::new());
+    }
+
+    /// A store that never answers a delete: the cleanup gives up, says so,
+    /// and a run otherwise safe exits 2.
+    #[tokio::test]
+    async fn a_cleanup_that_hangs_is_given_up() {
+        struct Hangs(ObjectStoreBucket);
+        impl Bucket for Hangs {
+            async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+                Bucket::get(&self.0, key).await
+            }
+            async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
+                self.0.create(key, body).await
+            }
+            async fn replace(
+                &self,
+                key: &str,
+                body: Vec<u8>,
+                expected: &Version,
+            ) -> Result<Version, BucketError> {
+                self.0.replace(key, body, expected).await
+            }
+        }
+        impl Store for Hangs {
+            async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, BucketError> {
+                Store::list(&self.0, prefix).await
+            }
+            async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, BucketError> {
+                self.0.list_dirs(prefix).await
+            }
+            async fn copy(&self, from: &str, to: &str) -> Result<(), BucketError> {
+                self.0.copy(from, to).await
+            }
+            async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+                Store::put(&self.0, key, body).await
+            }
+            async fn delete(&self, _: &str) -> Result<(), BucketError> {
+                std::future::pending().await
+            }
+        }
+        impl Target for Hangs {
+            async fn head_modified_ms(&self, key: &str) -> Result<Option<u64>, BucketError> {
+                self.0.head_modified_ms(key).await
+            }
+        }
+        let (_, inner) = memory("scratch");
+        let bucket = Hangs(inner);
+        let t = Tracked {
+            inner: &bucket,
+            written: RefCell::default(),
+        };
+        t.put("mine", b"x".to_vec()).await.unwrap();
+        let options = Options {
+            check_timeout: Duration::from_millis(200),
+            ..quick()
+        };
+        let (left, why) = bounded_cleanup(&t, &options).await;
+        assert_eq!(left, None);
+        assert!(why.unwrap().contains("no answer"));
     }
 
     #[tokio::test]
@@ -1352,6 +2209,35 @@ mod tests {
         assert_eq!(everything_under(&store).await, ["wk/nodes/a"]);
     }
 
+    /// Two runs given one `--prefix-for-test` at once: each in its own
+    /// folder, both safe, and neither deletes the other's keys.
+    #[tokio::test]
+    async fn two_runs_at_once_do_not_meet() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        Store::put(
+            &ObjectStoreBucket::new(Arc::clone(&store), "wk/shared"),
+            "theirs",
+            b"keep".to_vec(),
+        )
+        .await
+        .unwrap();
+        let bucket = |run: &str| {
+            let scratch = scratch_for(Some("shared"), run).unwrap();
+            ObjectStoreBucket::new(Arc::clone(&store), scratch_prefix("wk", &scratch).unwrap())
+        };
+        let (one, two) = (bucket("run-1-1"), bucket("run-1-2"));
+        let options = Options {
+            paging_keys: None,
+            ..quick()
+        };
+        let (a, b) = tokio::join!(run(&one, &options), run(&two, &options));
+        for report in [a.unwrap(), b.unwrap()] {
+            assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
+            assert_eq!(report.left, Some(0), "{report:#?}");
+        }
+        assert_eq!(everything_under(&store).await, ["wk/shared/theirs"]);
+    }
+
     #[tokio::test]
     async fn paging_can_be_skipped() {
         let (_, bucket) = memory("scratch");
@@ -1376,7 +2262,7 @@ mod tests {
             cleanup_error: None,
         };
         assert_eq!(report.verdict(), Verdict::Incomplete(vec!["b"]));
-        assert_eq!(report.verdict().code(), 2);
+        assert_eq!(report.exit_code(), 2);
         let report = Report {
             checks: vec![check("b", Status::Error, ""), check("d", Status::Fail, "")],
             ..report
@@ -1384,8 +2270,10 @@ mod tests {
         assert_eq!(report.verdict(), Verdict::Unsafe(vec!["d"]));
     }
 
+    /// A failed cleanup keeps the verdict, but a safe run exits 2: objects
+    /// are left to delete by hand. An unsafe one still exits 1.
     #[test]
-    fn a_failed_cleanup_says_where_it_wrote() {
+    fn a_failed_cleanup_says_where_it_wrote_and_exits_2() {
         let report = Report {
             checks: vec![check("a", Status::Pass, "")],
             left: Some(3),
@@ -1396,7 +2284,22 @@ mod tests {
             text.contains("cleanup FAILED: 3 object(s) left under s3://b/p/diagnose/run-1/"),
             "{text}"
         );
-        assert_eq!(report.to_json("s3://b/p", "s")["cleanup"]["ok"], false);
+        assert!(text.ends_with("safe for WasmKeep\n"), "{text}");
+        assert_eq!(report.exit_code(), 2);
+        let json = report.to_json("s3://b/p", "s");
+        assert_eq!(json["cleanup"]["ok"], false);
+        assert_eq!(json["exit_code"], 2);
+        let left_only = Report {
+            cleanup_error: None,
+            left: Some(1),
+            ..report.clone()
+        };
+        assert_eq!(left_only.exit_code(), 2);
+        let failed = Report {
+            checks: vec![check("a", Status::Fail, "")],
+            ..report
+        };
+        assert_eq!(failed.exit_code(), 1);
     }
 
     #[test]
@@ -1434,6 +2337,23 @@ mod tests {
         for bad in ["", "/", "a//b", "../x", "a/./b"] {
             assert_eq!(scratch_prefix("wk", bad), None, "{bad:?}");
         }
-        assert!(default_scratch().starts_with("diagnose/run-"));
+    }
+
+    /// Every run gets its own folder, under `--prefix-for-test` too.
+    #[test]
+    fn every_run_writes_in_its_own_folder() {
+        assert_eq!(
+            scratch_for(None, "run-1").as_deref(),
+            Some("diagnose/run-1")
+        );
+        assert_eq!(
+            scratch_for(Some("/diagnose/today/"), "run-1").as_deref(),
+            Some("diagnose/today/run-1")
+        );
+        for bad in ["", "/", "a//b", "../x"] {
+            assert_eq!(scratch_for(Some(bad), "run-1"), None, "{bad:?}");
+        }
+        assert!(run_folder().starts_with("run-"));
+        assert_ne!(run_folder().split('-').nth(2), None, "run-<ms>-<pid>");
     }
 }
