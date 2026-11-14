@@ -291,8 +291,11 @@ names nobody (released), keeping the generation.
   never by version token: a record's content never comes back once it
   changed (every acquisition raises the generation, a release keeps it
   and names nobody). The deadline is set when the entry is made: 30 s
-  later, `object_store`'s own request timeout, so a write the client gave
-  up on has as long again to land. It bounds liveness only: a write
+  later, `object_store`'s own request timeout (its default, which the
+  server does not change), so a write the client gave up on has as long
+  again to land. The deadline is on the node's wall clock, like every
+  time in this record: a clock step moves it, which changes only how
+  long a drain may wait. It bounds liveness only: a write
   landing later still is the case this rule narrows, harmless while the
   node serves the actor (its next event takes the record back as its
   own) and freed when the node stops or is fenced. Nothing in it rests on
@@ -302,7 +305,9 @@ names nobody (released), keeping the generation.
   the entry only on a fresh read. Two acquisitions of one actor that
   read the same record and both went unanswered keep one entry. A drain
   reports drained only once such an entry ends, so it may wait up to the
-  deadline (plus the retries' back-off, at most 4 s); a clean stop does not
+  deadline (plus a second: a pass whose entries only wait runs again a
+  second later, and a waiting entry is not counted as a refusal by the
+  pass's throttle); a clean stop does not
   wait for one, since its `released` write frees a record such a write
   left, landed or still to land.
   The drain and move outcomes that today say "the lease expires on its

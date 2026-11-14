@@ -33,7 +33,9 @@
 //! that forgets parked holds, releasing on hibernation (the behaviour
 //! before ADR 0024, which loses the sockets), and a resolver that ends an
 //! unresolved acquire on its first read of an unchanged record (ADR 0020
-//! before its amendment: a write landing after that read is a leak).
+//! before its amendment: a write landing after that read is a leak), or
+//! that waits for one without a bound (an unresolved acquire kept past its
+//! deadline, which would hold a drain forever).
 //!
 //! The scenario (`a_room_wakes_where_its_sockets_are`): without faults, a
 //! room with a socket on n1 is called through n2 and n3 and wakes on n1
@@ -99,6 +101,8 @@ enum Variant {
     /// The resolver ends an unresolved acquire on its first read of an
     /// unchanged record (ADR 0020 before its 2026-11-14 amendment).
     ResolverEndsUnchanged,
+    /// The resolver waits for an unchanged record without a bound.
+    ResolverNeverEnds,
 }
 
 #[derive(Clone, Copy)]
@@ -232,6 +236,7 @@ async fn run_node(
         resolver_ignores_parked_generation: variant == Variant::ResolverIgnoresGeneration,
         unknown_wake_drops_parked: variant == Variant::UnknownWakeDropsParked,
         resolver_ends_unchanged: variant == Variant::ResolverEndsUnchanged,
+        resolver_never_ends: variant == Variant::ResolverNeverEnds,
         ..Breaks::default()
     };
     loop {
@@ -288,6 +293,7 @@ async fn run_node(
         let mut held_since = 0u64;
         let mut drain_until: Option<u64> = None;
         let mut leak_suspect: Option<u64> = None;
+        let mut overdue_seen = false;
         let mut next_leak_check = 0u64;
         let gone = |s: &mut Shared| {
             s.running.remove(&i);
@@ -505,6 +511,19 @@ async fn run_node(
             // seen twice at one generation while the lease is valid.
             if hold.is_none() && env.now() >= next_leak_check {
                 next_leak_check = env.now() + 500;
+                // An unresolved acquire still pending well past its
+                // deadline, seen twice while the lease is valid: the
+                // resolver's wait has no bound, and a drain never ends.
+                if node.overdue_unresolved(1_500) {
+                    if overdue_seen {
+                        shared.lock().unwrap().leaks.push(format!(
+                            "at {t}: n{i} keeps an unresolved acquire past its deadline"
+                        ));
+                    }
+                    overdue_seen = true;
+                } else {
+                    overdue_seen = false;
+                }
                 let idle = !node.is_parked(ACTOR) && node.nothing_pending() && node.lease_valid();
                 let mine = match record(&bucket).await {
                     Some((Some((n, inst)), g)) if n == id && inst == instance => Some(g),
@@ -782,6 +801,7 @@ fn each_broken_variant_is_caught() {
         Variant::ResolverIgnoresGeneration,
         Variant::UnknownWakeDropsParked,
         Variant::ResolverEndsUnchanged,
+        Variant::ResolverNeverEnds,
     ] {
         // The two resolver variants need an unknown wake of a parked room,
         // rarer: up to 20 times the seeds.

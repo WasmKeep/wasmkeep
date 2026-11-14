@@ -83,6 +83,10 @@ pub struct Breaks {
     /// landing after that read leaves the record naming this node with
     /// nothing here to release it.
     pub resolver_ends_unchanged: bool,
+    /// The resolver waits for an unresolved acquire's unchanged record
+    /// without a bound: an entry whose write never lands stays, and a
+    /// drain never ends.
+    pub resolver_never_ends: bool,
 }
 
 /// How long the resolver waits for an unresolved acquire's unchanged record
@@ -112,6 +116,10 @@ struct Shared {
     /// Holds parked by hibernations with sockets open (ADR 0024).
     parked: Parked<()>,
     pending: Vec<PendingEntry>,
+    /// When each unresolved acquire (key, generation) was last made, for
+    /// [`LeaseNode::overdue_unresolved`]: by the node's own count, not the
+    /// entry's deadline, which a broken wait may not bound.
+    unresolved_since: HashMap<(String, u64), u64>,
     /// Releases sent and retry passes under way: their entries are in
     /// neither `holds` nor `pending` meanwhile, and the set must not read
     /// as empty (the server's `InFlight`).
@@ -223,6 +231,8 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         }
         let wait = if setup.breaks.resolver_ends_unchanged {
             0
+        } else if setup.breaks.resolver_never_ends {
+            u64::MAX
         } else {
             UNRESOLVED_WAIT_MS
         };
@@ -387,6 +397,11 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
             }
             Err(e) => {
                 if let Some(entry) = PendingEntry::unresolved(&self.owners, key, &e) {
+                    if let PendingEntry::Unresolved { generation, .. } = &entry {
+                        let now = self.clock.now_ms();
+                        s.unresolved_since
+                            .insert((key.to_owned(), *generation), now);
+                    }
                     holds::add(&mut s.pending, entry);
                 }
                 Err(e)
@@ -434,6 +449,25 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         }
         self.release(held).await;
         false
+    }
+
+    /// Whether an unresolved acquire waits in the pending set more than
+    /// `slack_ms` past [`UNRESOLVED_WAIT_MS`] after it was made (this
+    /// node's clock) while the lease is valid: the resolver should have
+    /// ended it on its first pass after its deadline.
+    pub fn overdue_unresolved(&self, slack_ms: u64) -> bool {
+        let now = self.clock.now_ms();
+        let s = lock(&self.shared);
+        s.validity.valid(now)
+            && s.pending.iter().any(|e| match e {
+                PendingEntry::Unresolved {
+                    key, generation, ..
+                } => s
+                    .unresolved_since
+                    .get(&(key.clone(), *generation))
+                    .is_some_and(|since| since.saturating_add(UNRESOLVED_WAIT_MS + slack_ms) < now),
+                PendingEntry::Release(_) => false,
+            })
     }
 
     /// Whether the record at `key` is parked here.

@@ -2115,7 +2115,7 @@ async fn the_resolver_waits_for_a_write_that_lands_late() {
     assert!(!a.nothing_pending(), "ended on an unchanged record");
     assert!(
         a.releases_done(Duration::from_millis(100)).await,
-        "a clean stop waits for an unresolved acquire"
+        "a clean stop does not wait for an unresolved acquire"
     );
     // The write lands now, after that read.
     put(
