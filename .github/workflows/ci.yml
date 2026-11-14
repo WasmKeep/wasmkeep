@@ -375,6 +375,8 @@ jobs:
         run: cargo nextest run -p wasmkeep-cli --test cluster_status --locked
       - name: deploy configuration against S3
         run: cargo nextest run -p wasmkeep-cli --test deploy_config --locked
+      - name: cluster diagnose against S3 (bucket conformance)
+        run: cargo nextest run -p wasmkeep-cli --test cluster_diagnose --locked
 
   ltx:
     name: LTX conformance (Go reference)

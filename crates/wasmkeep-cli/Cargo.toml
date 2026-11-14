@@ -26,13 +26,13 @@ anyhow.workspace = true
 wasmtime.workspace = true
 object_store = { workspace = true, features = ["aws"] }
 reqwest.workspace = true
+# Concurrent requests in `cluster diagnose`; already a workspace dependency.
+futures-util.workspace = true
 # The workspace's rustix, with `thread` for prctl(PR_SET_THP_DISABLE).
 rustix = { workspace = true, features = ["thread"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-# Listing a bucket in tests; already a workspace dependency (wasmkeep-server).
-futures-util.workspace = true
 
 [lints]
 workspace = true

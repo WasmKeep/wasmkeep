@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod dev;
+mod diagnose;
 mod migrate_cmd;
 mod secrets_cmd;
 mod status;
@@ -159,6 +160,14 @@ enum ClusterCommand {
     /// Exits with 0 when done, 1 when refused or aborted (nothing new
     /// committed), 2 when some tenants were committed and others not.
     Migrate(migrate_cmd::MigrateArgs),
+    /// Check that a bucket does what WasmKeep needs from it: conditional
+    /// creates and replaces, reads and listings that follow writes and
+    /// deletes, large objects, last-modified times and the clock. Runs
+    /// through the nodes' own bucket code, writing only under a scratch
+    /// prefix it requires to be empty and deletes afterwards. One line per
+    /// check, then a verdict. Exits with 0 when safe, 1 when not safe, 2
+    /// when it could not run or finish.
+    Diagnose(diagnose::DiagnoseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -905,6 +914,12 @@ fn main() -> anyhow::Result<()> {
         Command::Cluster(ClusterCommand::Undrain(args)) => cluster_drain(&args, false),
         Command::Cluster(ClusterCommand::Fence(args)) => cluster_fence(&args),
         Command::Cluster(ClusterCommand::Forget(args)) => cluster_forget(&args),
+        Command::Cluster(ClusterCommand::Diagnose(args)) => {
+            let code = diagnose::command(&args);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        }
         Command::Cluster(ClusterCommand::Migrate(args)) => {
             let code = migrate_cmd::run(&args)?;
             if code != 0 {

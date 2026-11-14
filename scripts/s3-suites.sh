@@ -2,7 +2,8 @@
 # The suites gated on an S3 bucket, which return at once without one: the
 # lease and ownership tests on an S3 API, failover with production timings,
 # two nodes over the cluster listener, `cluster status` and deploy
-# configuration against a bucket.
+# configuration against a bucket, and `cluster diagnose` (the bucket
+# conformance check).
 #
 # With WASMKEEP_TEST_S3_BUCKET and the AWS_* variables already set, they run
 # against that bucket (R2, OVHcloud, AWS: see docs/deploy). Otherwise this
@@ -44,4 +45,4 @@ fi
 
 cargo nextest run -p wasmkeep-cluster --test s3 --locked
 cargo nextest run -p wasmkeep-cli --locked --no-capture \
-  --test failover --test cluster_tls --test cluster_status --test deploy_config
+  --test failover --test cluster_tls --test cluster_status --test deploy_config --test cluster_diagnose
