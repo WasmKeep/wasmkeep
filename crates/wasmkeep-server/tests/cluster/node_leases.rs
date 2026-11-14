@@ -330,7 +330,7 @@ async fn a_fence_over_a_deleted_heartbeat_frees_its_actors() {
         "{fenced:?}"
     );
     loop {
-        let r = send(b.addr, "GET", "/actor/t/x/durable", "").await;
+        let r = poll_get(b.addr, "/actor/t/x/durable").await;
         if r.status == 200 {
             assert_eq!(r.body.trim(), "1");
             break;
@@ -394,7 +394,7 @@ async fn a_live_old_lease_refuses_until_it_runs_out() {
     for name in ["old", "mine"] {
         let started = std::time::Instant::now();
         loop {
-            let r = send(b.addr, "GET", &format!("/actor/t/{name}/durable"), "").await;
+            let r = poll_get(b.addr, &format!("/actor/t/{name}/durable")).await;
             if r.status == 200 {
                 break;
             }
@@ -460,7 +460,7 @@ async fn a_deleted_heartbeat_frees_nothing() {
     stop_listening(a).await;
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
-        let r = send(b.addr, "GET", "/actor/t/x/durable", "").await;
+        let r = poll_get(b.addr, "/actor/t/x/durable").await;
         assert_ne!(
             r.status, 200,
             "b took x from a deleted heartbeat: {}",
@@ -484,7 +484,7 @@ async fn a_deleted_heartbeat_frees_nothing() {
     again.service.node_id_checked().await.unwrap();
     let started = std::time::Instant::now();
     loop {
-        let r = send(b.addr, "GET", "/actor/t/x/durable", "").await;
+        let r = poll_get(b.addr, "/actor/t/x/durable").await;
         if r.status == 200 {
             assert_eq!(r.body.trim(), "1", "{}", r.body);
             break;

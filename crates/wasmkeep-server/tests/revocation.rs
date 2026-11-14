@@ -69,6 +69,14 @@ const SLOW_CALL_MS: u64 = 2_500;
 
 /// One node's view of the shared bucket, with switches the tests flip:
 /// its own heartbeat writes, and its listings of the heartbeats.
+///
+/// A node never writes another node's `nodes/<id>` through it: that is a
+/// fence (ADR 0020), which `a` may write once the lease ttl plus grace
+/// (1.2 s here, well past the 400 ms trust horizon) passed after `b`'s
+/// last write, and then take `b`'s actors.
+/// These tests are about trust: a call to one of `b`'s actors answered by
+/// `a`'s own copy of it would say nothing about whether `a` still trusts
+/// `b`.
 #[derive(Debug)]
 struct Gate {
     inner: Arc<dyn ObjectStore>,
@@ -86,6 +94,21 @@ impl Gate {
             beats: AtomicBool::new(true),
             lists: AtomicBool::new(true),
         })
+    }
+
+    /// Whether a write to `location` goes through: never to another node's
+    /// heartbeat (a fence), and to this node's own only while it beats.
+    /// Every write path asks, conditional or not.
+    fn may_write(&self, location: &StorePath) -> object_store::Result<()> {
+        let key = location.as_ref();
+        if key == self.heartbeat {
+            if !self.beats.load(Ordering::SeqCst) {
+                return Err(Self::refused("heartbeat"));
+            }
+        } else if key.starts_with("nodes/") {
+            return Err(Self::refused("another node's lease (a fence)"));
+        }
+        Ok(())
     }
 
     fn refused(what: &str) -> object_store::Error {
@@ -110,9 +133,7 @@ impl ObjectStore for Gate {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        if location.as_ref() == self.heartbeat && !self.beats.load(Ordering::SeqCst) {
-            return Err(Self::refused("heartbeat"));
-        }
+        self.may_write(location)?;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -121,6 +142,7 @@ impl ObjectStore for Gate {
         location: &StorePath,
         opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.may_write(location)?;
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -164,6 +186,7 @@ impl ObjectStore for Gate {
         to: &StorePath,
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
+        self.may_write(to)?;
         self.inner.copy_opts(from, to, options).await
     }
 }
@@ -395,7 +418,8 @@ enum Revoke {
 }
 
 /// Makes `a` stop trusting `b`; returns when the revoking event happened
-/// (the deadline runs from there), and a task to stop at the end.
+/// (the deadline runs from there: for a silent `b`, its last heartbeat
+/// write), and a task to stop at the end.
 async fn revoke(
     how: Revoke,
     store: &Arc<dyn ObjectStore>,
@@ -410,7 +434,10 @@ async fn revoke(
         }
         Revoke::Silent => {
             b.gate.beats.store(false, Ordering::SeqCst);
-            (Instant::now(), None)
+            // Let a write already past the gate land, then count from the
+            // last one that did: a's trust in b runs from its written_at.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            (last_written(store, "b").await, None)
         }
         Revoke::Deleted => {
             b.gate.beats.store(false, Ordering::SeqCst);
@@ -459,6 +486,30 @@ async fn revoke(
             (since, Some(writer))
         }
     }
+}
+
+/// `nodes/<id>`'s state line and `written_at` (format 3, ADR 0020).
+async fn lease_of(store: &Arc<dyn ObjectStore>, id: &str) -> (String, u64) {
+    let key = StorePath::from(format!("nodes/{id}"));
+    let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let mut lines = body.lines();
+    assert_eq!(lines.next(), Some("wasmkeep-node 3"), "{body}");
+    let state = lines.next().unwrap().to_owned();
+    let written_at = lines.next().unwrap().parse().unwrap();
+    (state, written_at)
+}
+
+/// When `id`'s last heartbeat was written, on this process's clock (the
+/// nodes share it).
+async fn last_written(store: &Arc<dyn ObjectStore>, id: &str) -> Instant {
+    let (_, written_at) = lease_of(store, id).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let ago = now.saturating_sub(u128::from(written_at));
+    Instant::now() - Duration::from_millis(u64::try_from(ago).unwrap())
 }
 
 /// The pin of a fresh key: `b` restarted.
@@ -535,6 +586,10 @@ async fn a_stops_trusting_b(how: Revoke) {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let (since, writer) = revoke(how, &store, &a, &b).await;
+    let silenced = match how {
+        Revoke::Silent => Some(lease_of(&store, "b").await),
+        _ => None,
+    };
     let bound = HORIZON + SLACK;
 
     // a no longer sends to b: the connection it pooled is not reused (b
@@ -621,7 +676,12 @@ async fn a_stops_trusting_b(how: Revoke) {
         "/actor/t/caller-a/call?to=t/on-b&path=/fired",
     )
     .await;
-    assert!(r.body.starts_with("failed:"), "a called b: {}", r.body);
+    assert!(
+        r.body.starts_with("failed:"),
+        "a called b: {} ({:?} after the event)",
+        r.body,
+        since.elapsed()
+    );
     let r = send(
         b.addr,
         "POST",
@@ -630,6 +690,16 @@ async fn a_stops_trusting_b(how: Revoke) {
     .await;
     assert!(!r.body.starts_with("200:"), "b called a: {}", r.body);
 
+    if let Some(silenced) = silenced {
+        // Silent to the end: no write of b's reached the bucket past the
+        // gate (the times above count from its last one), and a fenced
+        // nothing.
+        assert_eq!(
+            lease_of(&store, "b").await,
+            silenced,
+            "b's lease changed after its writes were stopped"
+        );
+    }
     eprintln!(
         "revocation ({how:?}, horizon {HORIZON:?}): a stops sending {sends:?} ({refusal}); \
          b's kept-alive request refused {kept_alive:?}; new handshake refused by {handshake:?}; \

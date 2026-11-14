@@ -38,7 +38,7 @@ async fn takeover_time(
     down.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     loop {
-        let r = tokio::time::timeout(Duration::from_secs(2), send(b.addr, "GET", path, "")).await;
+        let r = tokio::time::timeout(Duration::from_secs(2), poll_get(b.addr, path)).await;
         if let Ok(r) = r
             && r.node.as_deref() == Some("b")
         {
@@ -202,7 +202,7 @@ async fn a_hung_read_does_not_stall_a_restore() {
     let started = std::time::Instant::now();
     let r = loop {
         // A request waiting on a stalled restore would wait for good.
-        let r = tokio::time::timeout(Duration::from_secs(2), send(b.addr, "GET", path, "")).await;
+        let r = tokio::time::timeout(Duration::from_secs(2), poll_get(b.addr, path)).await;
         if let Ok(r) = r
             && r.node.as_deref() == Some("b")
         {
@@ -317,7 +317,7 @@ fn restore_leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
 async fn restores_cleanly(b: &Node, path: &str, writes: u32) {
     let started = std::time::Instant::now();
     loop {
-        let r = send(b.addr, "GET", path, "").await;
+        let r = poll_get(b.addr, path).await;
         if r.status == 200 {
             assert_eq!(
                 (r.body.trim(), r.node.as_deref()),
@@ -587,7 +587,7 @@ async fn restores_side_by_side_are_not_ended_for_each_others_bytes() {
             let (addr, path) = (b.addr, path.clone());
             tokio::spawn(async move {
                 loop {
-                    let r = send(addr, "GET", &path, "").await;
+                    let r = poll_get(addr, &path).await;
                     if r.status == 200 && r.node.as_deref() == Some("b") {
                         assert_eq!(r.body.trim(), "1");
                         return;
@@ -778,7 +778,7 @@ async fn a_chain_too_large_for_the_node_is_refused_and_leaves_nothing_behind() {
 
     let started = std::time::Instant::now();
     loop {
-        let r = send(b.addr, "GET", "/actor/t/x/inits", "").await;
+        let r = poll_get(b.addr, "/actor/t/x/inits").await;
         // Forwarded to a while a's lease lasts; b itself must never serve.
         assert!(
             !(r.status == 200 && r.node.as_deref() == Some("b")),
@@ -816,7 +816,7 @@ async fn writes_committed_before_a_startup_error_still_reach_the_bucket() {
     p.flaky.down.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     let r = loop {
-        let r = send(p.b.addr, "GET", "/actor/t/x/inits", "").await;
+        let r = poll_get(p.b.addr, "/actor/t/x/inits").await;
         if r.node.as_deref() == Some("b") || started.elapsed() > Duration::from_secs(10) {
             break r;
         }
@@ -967,7 +967,7 @@ async fn history_below_the_owners_snapshot_is_collected() {
     drop(a);
     let started = std::time::Instant::now();
     loop {
-        let r = send(b.addr, "GET", "/actor/t/gc/durable", "").await;
+        let r = poll_get(b.addr, "/actor/t/gc/durable").await;
         // a may still answer one forwarded request while it shuts down,
         // before it hands the actor over: wait for b.
         if r.status == 200 && r.node.as_deref() == Some("b") {
@@ -1056,7 +1056,7 @@ async fn a_deleted_actors_history_is_collected_down_to_two_objects() {
     let b = node_retaining("b", db.path(), &store, None).await;
     let started = std::time::Instant::now();
     loop {
-        let r = send(b.addr, "GET", "/actor/t/gone/durable", "").await;
+        let r = poll_get(b.addr, "/actor/t/gone/durable").await;
         if r.status == 200 {
             assert_eq!((r.body.trim(), r.node.as_deref()), ("0", Some("b")));
             break;
@@ -1119,7 +1119,7 @@ async fn a_delete_whose_local_files_cannot_be_removed_still_records_an_empty_act
     let b = node_retaining("b", db.path(), &store, None).await;
     let started = std::time::Instant::now();
     loop {
-        let r = send(b.addr, "GET", "/actor/t/stuck/durable", "").await;
+        let r = poll_get(b.addr, "/actor/t/stuck/durable").await;
         if r.status == 200 {
             assert_eq!(
                 (r.body.trim(), r.node.as_deref()),
@@ -1145,7 +1145,7 @@ async fn a_delete_whose_local_files_cannot_be_removed_still_records_an_empty_act
     let c = node_retaining("c", dc.path(), &store, None).await;
     let started = std::time::Instant::now();
     loop {
-        let r = send(c.addr, "GET", "/actor/t/stuck/durable", "").await;
+        let r = poll_get(c.addr, "/actor/t/stuck/durable").await;
         if r.status == 200 {
             assert_eq!((r.body.trim(), r.node.as_deref()), ("1", Some("c")));
             break;

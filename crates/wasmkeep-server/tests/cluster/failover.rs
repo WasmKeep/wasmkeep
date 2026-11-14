@@ -197,7 +197,7 @@ async fn a_failover_is_counted_and_a_hand_off_is_not() {
     down.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     loop {
-        let r = send(b.addr, "GET", "/actor/t/stranded/durable", "").await;
+        let r = poll_get(b.addr, "/actor/t/stranded/durable").await;
         if r.node.as_deref() == Some("b") {
             assert_eq!(r.status, 200, "{}", r.body);
             break;
