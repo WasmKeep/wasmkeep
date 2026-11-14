@@ -10,6 +10,7 @@
   public release, since changing leases requires stopping every node at
   once (section 6).
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): ownership records and lease markers move under the app's root; `nodes/` stays shared.
+- Amended by [ADR 0024](0024-socket-home.md) (planned, 0.4.0): a hibernation with sockets open keeps the record (parked) instead of releasing it; every wake still acquires at a new generation.
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 - Amends: [ADR 0007](0007-replication-protocol.md),

@@ -250,6 +250,12 @@ impl ActorService {
                     socket_owners::close_for_lapse(&sockets);
                 }
             }));
+            if let Some(vacated) = sockets.on_vacated() {
+                tokio::spawn(socket_owners::release_vacated(
+                    Arc::downgrade(&service.inner),
+                    vacated,
+                ));
+            }
             tokio::spawn(socket_owners::sweep_sockets(
                 Arc::downgrade(&service.inner),
                 cluster.socket_sweep,

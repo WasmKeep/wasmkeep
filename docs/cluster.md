@@ -444,12 +444,21 @@ with the same id.
 not own the actor relays the upgrade to the owner and joins the two
 connections, so everyone in a room shares one actor wherever they connected.
 If the actor later moves, its sockets close with code 1012; clients
-reconnect. A room that hibernates keeps its sockets open on its node but
-releases its ownership record, so a request that reaches it through
-another node wakes it there; its sockets on the first node then close with
-1012 when one of them next sends a message, or at the node's owner sweep
-(once a minute), so a client that only listens is closed too, a minute
-later at most. Sockets also close with 1012 when their node drains and
+reconnect. A room that hibernates with sockets open keeps them, and keeps
+its ownership record naming its node
+([ADR 0024](adr/0024-socket-home.md)): a request, a call (from a front,
+say) or an upgrade that reaches the room through another node is relayed
+to that node and wakes the room there, so its clients stay connected. The
+record is released when the room's last socket there closes, so the room's
+next event may then wake it anywhere. A room parked like this stays on its
+node until then (a move or a drain closes its sockets, below); if its node
+dies, the room is free once the node is fenced, about 15 to 20 s with the
+defaults, like any actor of that node. If the record changes behind the
+node's back anyway (a node of a version before 0.4.0 does not park, or a
+fault), the sockets close with 1012 when one of them next sends a message,
+or at the node's owner sweep (once a minute), so a client that only
+listens is closed too, a minute later at most (ten minutes for a room the
+node had parked). Sockets also close with 1012 when their node drains and
 another node can take its actors (see "Draining a node" below), and when
 its lease runs out (no write reached
 the bucket for ttl minus safety, 8 s with the defaults): before any other
@@ -996,9 +1005,9 @@ While it drains, the node ([ADR 0014](adr/0014-draining-a-node-and-moving-an-act
   - the lease is released, and each pending alarm moves to the new
     owner's timer, so it fires on time even after this node stops;
 - **closes the WebSockets of rooms that hibernated with sockets open**
-  with 1012. Their clients reconnect through another node; their
-  `on-websocket-close` events do not run, since the draining node does not
-  take the room back to run them;
+  with 1012, and releases their ownership records at once. Their clients
+  reconnect through another node; their `on-websocket-close` events do not
+  run, since the draining node does not take the room back to run them;
 - **reports `drained`** once it holds nothing, no WebSocket included, and
   keeps running and forwarding until you stop it. You can then stop it
   with nothing left to hand over. A WebSocket this node relays to another
@@ -1049,7 +1058,11 @@ Within a few seconds the actor's owner hands it to `node-c`
 4. `node-c` takes it: it acquires the lease, restores the actor and arms
    its alarm.
 
-If no node holds the actor, `node-c` takes it itself. A name that was
+If no node holds the actor, `node-c` takes it itself. A room that
+hibernated with sockets open on a node is that node's to move: it releases
+the room's record and closes its sockets with 1012; their close events wake
+the room there again, and the next pass moves it as above (or `node-c`
+takes it first). A name that was
 never an actor is not created.
 
 - **The target** must be live, serve the same app, not be draining or

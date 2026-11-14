@@ -106,6 +106,8 @@ impl Registry {
 pub(crate) struct Sockets {
     next_id: AtomicU64,
     registry: Mutex<Registry>,
+    /// Told the actor whose last slot was freed ([`Self::on_vacated`]).
+    vacated: std::sync::OnceLock<mpsc::UnboundedSender<ActorAddress>>,
 }
 
 /// A connection's queue, for its writer.
@@ -184,9 +186,36 @@ impl Sockets {
         }
     }
 
-    /// Forgets a connection (its writer then drains and stops).
+    /// Forgets a connection (its writer then drains and stops). If it was
+    /// its actor's last slot, the receiver of [`Self::on_vacated`] is told.
     pub(crate) fn remove(&self, id: u64) {
-        self.lock().remove(id);
+        let mut registry = self.lock();
+        let Some(conn) = registry.remove(id) else {
+            return;
+        };
+        let vacated = !registry.by_owner.contains_key(&conn.owner);
+        drop(registry);
+        if vacated && let Some(tx) = self.vacated.get() {
+            let _ = tx.send(conn.owner);
+        }
+    }
+
+    /// The actors whose last slot is freed from now on, one message each
+    /// (ADR 0024: a parked record is released then). Once per registry;
+    /// `None` if already taken.
+    pub(crate) fn on_vacated(&self) -> Option<mpsc::UnboundedReceiver<ActorAddress>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.vacated.set(tx).ok().map(|()| rx)
+    }
+
+    /// Whether `owner` has a connection here that is not closing (accepted,
+    /// or being opened): a hibernation then parks its record (ADR 0024).
+    pub(crate) fn has_open(&self, owner: &ActorAddress) -> bool {
+        let registry = self.lock();
+        registry.by_owner.get(owner).is_some_and(|ids| {
+            ids.iter()
+                .any(|id| registry.conns.get(id).is_some_and(|c| c.tx.is_some()))
+        })
     }
 
     /// Hides a closing connection until its close event has been delivered.

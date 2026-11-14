@@ -275,13 +275,39 @@ async fn chat_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String>
     (node != "-").then_some(node)
 }
 
-/// Room `lobby` hibernated on `a` with its sockets open: its record
-/// released, no instance left.
+/// Room `lobby` hibernated on `a` with its sockets open: no instance
+/// left, its record kept naming `a` (ADR 0024, parked).
 async fn lobby_parked(store: &Arc<dyn ObjectStore>, a: &Node) {
-    eventually("the lobby hibernated on a", async || {
-        a.service.resident() == 0 && chat_holder(store, "lobby").await.is_none()
+    eventually("the lobby hibernated on a, its record kept", async || {
+        a.service.resident() == 0 && chat_holder(store, "lobby").await.as_deref() == Some("a")
     })
     .await;
+}
+
+/// The lobby's record made to name nobody behind its node's back, at a
+/// higher generation: a fault ADR 0024 does not expect (a parked record
+/// that no longer matches), so that another node can take the room while
+/// its sockets stay on the first.
+async fn release_lobby_behind(store: &Arc<dyn ObjectStore>) {
+    use object_store::ObjectStoreExt as _;
+    let key = object_store::path::Path::from(test_key(Family::Owners, "chat/lobby"));
+    let body = String::from_utf8(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let generation: u64 = body.lines().nth(2).unwrap().parse().unwrap();
+    let released = wasmkeep_cluster::node_lease::OwnerRecord {
+        holder: None,
+        generation: generation + 1,
+    };
+    store.put(&key, released.encode().into()).await.unwrap();
 }
 
 /// b takes the lobby with a plain request, and holds it.
@@ -344,6 +370,7 @@ async fn a_room_taken_by_another_node_closes_all_its_sockets_on_the_first_messag
     let mut talker = join_lobby(a.addr).await;
     let mut listener = join_lobby(a.addr).await;
     lobby_parked(&store, &a).await;
+    release_lobby_behind(&store).await;
     b_takes_lobby(&store, &b).await;
     talker.send(Message::text("anyone?")).await.unwrap();
     assert_eq!(
@@ -384,7 +411,9 @@ async fn sweep_reads(metrics: SocketAddr) -> u64 {
 /// A client that only listens never sends a frame, so no event finds its
 /// room gone: the owner sweep reads the record of each room with sockets
 /// and no hold here, and closes them with 1012 once another node holds
-/// it. A parked room that nobody took keeps its sockets.
+/// it. A parked room (ADR 0024) is read only on one pass in ten, as a
+/// safeguard: here its record is released behind a's back, a fault, and
+/// b takes the room. A parked room that nobody took keeps its sockets.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_owner_sweep_closes_a_listening_client_of_a_room_taken_elsewhere() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -421,6 +450,7 @@ async fn the_owner_sweep_closes_a_listening_client_of_a_room_taken_elsewhere() {
     })
     .await;
     stays_open(&mut listener, Duration::from_millis(100)).await;
+    release_lobby_behind(&store).await;
     b_takes_lobby(&store, &b).await;
     let (code, reason) = closed_within(&mut listener, Duration::from_secs(5)).await;
     assert_eq!(code, 1012, "{reason}");
@@ -520,6 +550,12 @@ async fn a_drain_closes_the_sockets_of_a_hibernated_room() {
         }
     });
     drain(&store, "a").await;
+    // The parked record is released at once (ADR 0024), before the socket
+    // is gone: no record names a draining node for a room it gives up.
+    eventually("the drain released the parked lobby", async || {
+        chat_holder(&store, "lobby").await.is_none()
+    })
+    .await;
     // Several drain passes: the socket is closing, still here, counted.
     let body = heartbeats(&store, "a", 3).await;
     assert_eq!(a.service.websockets(), 1, "the socket went early");
@@ -536,4 +572,104 @@ async fn a_drain_closes_the_sockets_of_a_hibernated_room() {
         }
     };
     assert_eq!(code, 1012);
+}
+
+/// The next text message `ws` gets within 5 s, past pings.
+async fn next_text(ws: &mut Client) -> String {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => return t.to_string(),
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            other => panic!("no message: {other:?}"),
+        }
+    }
+}
+
+/// ADR 0024: a room that hibernated with its sockets open on a keeps its
+/// record, so a request reaching it through b is relayed to a and wakes
+/// it there (each time, at a new generation): the socket stays open and
+/// the room still answers it. Once the last socket closes, the record is
+/// released: any node may take the room.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_with_open_sockets_wakes_on_their_node() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let wasm = chat_wasm();
+    let a = node_with(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_millis(300),
+        "chat",
+        wasm,
+    )
+    .await;
+    let b = node_with(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        "chat",
+        wasm,
+    )
+    .await;
+    settle().await;
+    let mut client = join_lobby(a.addr).await;
+    for round in 0..2 {
+        lobby_parked(&store, &a).await;
+        let r = send_reachable(b.addr, "GET", "/actor/chat/lobby/", "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("a")),
+            "round {round}: {}",
+            r.body
+        );
+        assert_eq!(chat_holder(&store, "lobby").await.as_deref(), Some("a"));
+        client
+            .send(Message::text(format!("still here {round}")))
+            .await
+            .unwrap();
+        assert_eq!(next_text(&mut client).await, format!("still here {round}"));
+    }
+    assert_eq!(b.service.resident(), 0, "b ran the room");
+    // The last socket goes: released, then free for any node.
+    client.close(None).await.unwrap();
+    eventually("a released the lobby after its last socket", async || {
+        a.service.websockets() == 0 && chat_holder(&store, "lobby").await.is_none()
+    })
+    .await;
+}
+
+/// ADR 0024: a socket that goes without a close event (dropped by the
+/// client without a close frame) still releases a parked record, once its
+/// slot is freed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_record_is_released_when_its_socket_drops() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, _db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node_configured(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_millis(300),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        |c: &mut ActorConfig| c.cluster.as_mut().unwrap().socket_sweep = Duration::from_secs(600),
+    )
+    .await;
+    settle().await;
+    let client = join_lobby(a.addr).await;
+    lobby_parked(&store, &a).await;
+    drop(client);
+    eventually(
+        "a released the lobby after the socket dropped",
+        async || a.service.websockets() == 0 && chat_holder(&store, "lobby").await.is_none(),
+    )
+    .await;
 }

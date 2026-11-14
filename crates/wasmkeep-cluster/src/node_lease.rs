@@ -1024,6 +1024,26 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         }
     }
 
+    /// Whether the record at `key` still names this instance at
+    /// `generation` (one read): the safeguard re-read of a parked hold
+    /// (ADR 0024, section 5). `Ok(false)` once it names anything else, or
+    /// no record exists; `Err` if the bucket did not answer.
+    pub async fn still_names_this(&self, key: &str, generation: u64) -> Result<bool, AcquireError> {
+        let read = self
+            .bucket
+            .get(key)
+            .await
+            .map_err(|_| AcquireError::Unavailable)?;
+        Ok(read
+            .and_then(|(body, _)| OwnerRecord::decode(&body))
+            .is_some_and(|r| {
+                r.generation == generation
+                    && r.holder
+                        .as_ref()
+                        .is_some_and(|(n, i)| n == &self.node && i == &self.instance)
+            }))
+    }
+
     /// After a conflict: `Superseded` unless the record still names this
     /// instance at `generation` (then the release may still be needed).
     async fn still_this_hold(&self, key: &str, generation: u64) -> Released {

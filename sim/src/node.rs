@@ -10,14 +10,17 @@
 //! [`LeaseNode::release`], and [`LeaseNode::may_act`] wherever the server
 //! asks `LeaseView::is_valid`. A renewal can time out, a lease lapse, a
 //! release land and another node take the actor while the workload's own
-//! upload is still in flight, as in production.
+//! upload is still in flight, as in production. A hold may also be parked
+//! ([`LeaseNode::park`], ADR 0024: an actor hibernating with sockets open)
+//! in the server's parked set ([`Parked`]), woken by an acquisition and
+//! released by [`LeaseNode::release_parked`], a lapse or a clean stop.
 //!
 //! [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use wasmkeep_cluster::holds::{self, PendingEntry, Validity};
+use wasmkeep_cluster::holds::{self, Parked, PendingEntry, Validity};
 use wasmkeep_cluster::lease::{Bucket, Clock, LeaseConfig, Version};
 use wasmkeep_cluster::node_lease::{
     AcquireError, Fence, FenceWatch, Hold, NodeLease, NodeLeaseError, NodeLeaseObject, NodeState,
@@ -62,6 +65,14 @@ pub struct Breaks {
     /// A retry pass's entries are not counted while they are out of the
     /// pending set: nothing reads as pending meanwhile.
     pub pending_uncounted: bool,
+    /// A wake of a parked actor takes the parked hold back without
+    /// writing the record (keeping ownership across hibernation, ADR
+    /// 0020's rejected first draft): the woken hold shares its generation.
+    pub wake_reuses_parked: bool,
+    /// A lapse forgets the parked holds instead of making them pending
+    /// releases: their records keep naming this node with nothing here to
+    /// release them.
+    pub lapse_forgets_parked: bool,
 }
 
 /// A hold an actor workload keeps: what [`LeaseNode::may_act`] checks.
@@ -81,6 +92,8 @@ struct Shared {
     validity: Validity,
     /// Live holds by record key.
     holds: HashMap<String, Hold>,
+    /// Holds parked by hibernations with sockets open (ADR 0024).
+    parked: Parked<()>,
     pending: Vec<PendingEntry>,
     /// Releases sent and retry passes under way: their entries are in
     /// neither `holds` nor `pending` meanwhile, and the set must not read
@@ -323,6 +336,9 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         let got = write(&valid).await;
         let mut s = lock(&self.shared);
         s.acquiring.remove(key);
+        // A parked hold of this actor: dropped if the write may have moved
+        // the record (the server's rule, `Parked::after_wake`).
+        let _ = s.parked.after_wake(key, &got);
         match got {
             Ok(hold) => {
                 let held = Held {
@@ -349,6 +365,103 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
                 Err(e)
             }
         }
+    }
+
+    /// Wakes the parked actor at `key` as an event would: an acquisition
+    /// ([`Self::acquire`]), which writes the record at a new generation.
+    /// With [`Breaks::wake_reuses_parked`], a parked hold is taken back
+    /// instead, unwritten, in the current epoch.
+    pub async fn wake(&self, key: &str, first_generation: u64) -> Result<Held, AcquireError> {
+        if self.setup.breaks.wake_reuses_parked {
+            let mut s = lock(&self.shared);
+            if let Some((hold, ())) = s.parked.take(key) {
+                let held = Held {
+                    key: key.to_owned(),
+                    generation: hold.generation,
+                    epoch: s.validity.epoch,
+                };
+                s.holds.insert(key.to_owned(), hold);
+                return Ok(held);
+            }
+        }
+        self.acquire(key, first_generation).await
+    }
+
+    /// Parks `held` (ADR 0024): it stops acting at once, and its record
+    /// keeps naming this node, unwritten. In one step under the node's
+    /// lock, and only if it may still act in its epoch; otherwise it is
+    /// released as [`Self::release`] does. `true` if parked.
+    pub async fn park(&self, held: &Held) -> bool {
+        {
+            let mut s = lock(&self.shared);
+            let Some(hold) = s.holds.remove(&held.key) else {
+                return false;
+            };
+            if s.validity.valid_in(held.epoch, self.clock.now_ms()) {
+                if let Some(earlier) = s.parked.park(hold, ()) {
+                    s.pending.push(PendingEntry::Release(earlier));
+                }
+                return true;
+            }
+            s.holds.insert(held.key.clone(), hold);
+        }
+        self.release(held).await;
+        false
+    }
+
+    /// Whether the record at `key` is parked here.
+    pub fn is_parked(&self, key: &str) -> bool {
+        lock(&self.shared).parked.contains(key)
+    }
+
+    /// A probe of this node's state for `key`, for checks run from other
+    /// nodes' tasks: (parked here, lease valid now, its epoch).
+    pub fn probe(&self, key: &str) -> impl Fn() -> (bool, bool, u64) + Send + Sync + 'static
+    where
+        C: Send + Sync + 'static,
+    {
+        let shared = Arc::clone(&self.shared);
+        let clock = self.clock;
+        let key = key.to_owned();
+        move || {
+            let s = lock(&shared);
+            (
+                s.parked.contains(&key),
+                s.validity.valid(clock.now_ms()),
+                s.validity.epoch,
+            )
+        }
+    }
+
+    /// The validity's epoch now: it moves on every lapse, a lost lease and
+    /// a clean stop (the server closes every socket then).
+    pub fn epoch(&self) -> u64 {
+        lock(&self.shared).validity.epoch
+    }
+
+    /// Releases the parked record at `key` (its last socket closed, a
+    /// drain): taken out of the parked set under the actor's lock (an
+    /// acquisition holding it now: `false`, try later), then released as a
+    /// hold is. `true` if nothing is left to do for it.
+    pub async fn release_parked(&self, key: &str) -> bool {
+        let hold = {
+            let mut s = lock(&self.shared);
+            if s.acquiring.contains(key) {
+                return false;
+            }
+            let Some((hold, ())) = s.parked.take(key) else {
+                return true;
+            };
+            s.in_flight += 1;
+            hold
+        };
+        let released = self.owners.release(&hold).await;
+        let mut s = lock(&self.shared);
+        s.in_flight -= 1;
+        if released == Released::Pending {
+            s.pending.push(PendingEntry::Release(hold));
+        }
+        true
     }
 
     /// Gives `held` up: it stops acting at once; the release is sent, and
@@ -379,7 +492,12 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
     /// lease invalid here and writes it `released`, which frees whatever
     /// did not land. Waits for the lease task to end.
     pub async fn clean_stop(&self, env: &impl Env) {
-        let held: Vec<Hold> = lock(&self.shared).holds.drain().map(|(_, h)| h).collect();
+        let held: Vec<Hold> = {
+            let mut s = lock(&self.shared);
+            let mut held: Vec<Hold> = s.holds.drain().map(|(_, h)| h).collect();
+            held.extend(s.parked.take_all().into_iter().map(|(h, ())| h));
+            held
+        };
         for hold in held {
             if self.owners.release(&hold).await == Released::Pending {
                 lock(&self.shared).pending.push(PendingEntry::Release(hold));
@@ -398,10 +516,11 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         self.owners.other_owner(key, |_, _| true).await
     }
 
-    /// Whether nothing waits for its outcome (a drain is drained only then).
+    /// Whether nothing waits for its outcome and no record is parked (a
+    /// drain is drained only then).
     pub fn nothing_pending(&self) -> bool {
         let s = lock(&self.shared);
-        s.pending.is_empty() && s.in_flight == 0
+        s.pending.is_empty() && s.in_flight == 0 && s.parked.is_empty()
     }
 }
 
@@ -421,6 +540,7 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
                 let mut s = lock(&self.shared);
                 s.validity.invalidate();
                 s.holds.clear();
+                let _ = s.parked.take_all();
                 s.pending.clear();
                 s.lost = true;
                 s.stopped = true;
@@ -435,6 +555,11 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
                     let ended: Vec<Hold> = s.holds.drain().map(|(_, h)| h).collect();
                     s.pending
                         .extend(ended.into_iter().map(PendingEntry::Release));
+                    let parked = s.parked.take_all();
+                    if !self.setup.breaks.lapse_forgets_parked {
+                        s.pending
+                            .extend(parked.into_iter().map(|(h, ())| PendingEntry::Release(h)));
+                    }
                 }
             }
             self.fence_stale_peers(&env).await;
@@ -449,6 +574,9 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
             let mut s = lock(&self.shared);
             s.validity.invalidate();
             s.holds.clear();
+            let parked = s.parked.take_all();
+            s.pending
+                .extend(parked.into_iter().map(|(h, ())| PendingEntry::Release(h)));
         }
         self.retry_pending_while_stopping().await;
         let _ = self.lease.release().await;
@@ -547,16 +675,32 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
             // later.
             let key = entry.key().to_owned();
             let locked = matches!(entry, PendingEntry::Unresolved { .. });
+            let tried = match &entry {
+                PendingEntry::Unresolved { generation, .. } => Some(*generation),
+                PendingEntry::Release(_) => None,
+            };
             if locked && !lock(&self.shared).acquiring.insert(key.clone()) {
                 lock(&self.shared).pending.push(entry);
                 continue;
             }
             let shared = &self.shared;
             let held_here = !self.setup.breaks.resolve_while_held;
-            let still = holds::retry(&self.owners, entry, |k| {
-                held_here && lock(shared).holds.contains_key(k)
+            let still = holds::retry(&self.owners, entry, |k, generation| {
+                let s = lock(shared);
+                held_here && (s.holds.contains_key(k) || s.parked.holds_at(k, generation))
             })
             .await;
+            // An unresolved acquire that ended: a hold parked at an
+            // earlier generation is forgotten if the record no longer names
+            // it (the server's `forget_parked_behind`).
+            if let (None, Some(tried)) = (&still, tried) {
+                let parked = lock(&self.shared).parked.generation(&key);
+                if let Some(g) = parked.filter(|g| *g < tried)
+                    && matches!(self.owners.still_names_this(&key, g).await, Ok(false))
+                {
+                    let _ = lock(&self.shared).parked.take_at(&key, g);
+                }
+            }
             let mut s = lock(&self.shared);
             if locked {
                 s.acquiring.remove(&key);
@@ -576,7 +720,7 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
     async fn retry_pending_while_stopping(&mut self) {
         let entries = std::mem::take(&mut lock(&self.shared).pending);
         for entry in entries {
-            let _ = holds::retry(&self.owners, entry, |_| false).await;
+            let _ = holds::retry(&self.owners, entry, |_, _| false).await;
         }
     }
 }

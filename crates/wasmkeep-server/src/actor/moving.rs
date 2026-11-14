@@ -374,8 +374,19 @@ async fn move_one(
         }
         return;
     }
-    // The owner: only for an actor resident here.
+    // The owner: for an actor resident here, or parked here (ADR 0024).
     if !inner.mailboxes.contains(&address) {
+        // Parked: the target refuses a record naming this live node, so
+        // release it, then close its sockets with 1012. Their close events
+        // wake it here again, as a free record, and a later pass moves it
+        // as a resident actor; or the target takes it first.
+        if cluster.is_parked(&address) && cluster.can_take(&intent.target) {
+            cluster.release_parked(&address, "move").await;
+            let closed = inner
+                .sockets
+                .close_owner(&address, 1012, "actor moving; reconnect");
+            crate::metrics::owner_closes("move", closed);
+        }
         return;
     }
     // A target that cannot take actors now (down, draining, not seen yet,

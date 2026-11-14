@@ -9,9 +9,10 @@
 //! and releases the lease, waiting for the release to be written. The
 //! actor is then dropped from memory; events queued behind the job find no
 //! lease and go to the chosen peer, which claims. Its alarm, if any, is
-//! handed to that peer, which arms it in its own timer. Sockets of rooms
-//! that hibernated with them open (not resident, so not handed over) are
-//! closed too; their close events are lost.
+//! handed to that peer, which arms it in its own timer. Rooms that
+//! hibernated with sockets open (not resident, so not handed over) have
+//! their parked records released (ADR 0024) and their sockets closed;
+//! their close events are lost.
 
 use std::collections::HashMap;
 
@@ -212,9 +213,12 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
                 }
             }
             // Rooms that hibernated with sockets open are not resident, so
-            // no hand-over closes them: close them here, and their clients
+            // no hand-over closes them: release their parked records (ADR
+            // 0024; on every pass, since a park may land just after the
+            // drain began), then close their sockets, and their clients
             // reconnect to the peer. Their close events find no hold on
             // this draining node and are lost.
+            cluster.release_all_parked("drain").await;
             for address in inner.sockets.owners() {
                 if !inner.mailboxes.contains(&address) {
                     let closed =
