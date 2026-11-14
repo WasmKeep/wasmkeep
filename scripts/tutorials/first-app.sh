@@ -114,7 +114,8 @@ run deploy
 expect_status 0
 expect '^acme/todo from wasmkeep.toml, before switching:$'
 expect '^  front: added$'
-expect '^  class todos: added$'
+expect '^  class todos: added \(internal\)$'
+expect_not '^  access todos:'
 expect '^  requires _front: TOKENS now required$'
 expect '^acme/todo: version [0-9a-f]{16} is current \(deploy 1\)$'
 v1=$(printf '%s\n' "$OUT" | sed -n 's/^acme\/todo: version \([0-9a-f]*\) is current.*/\1/p')

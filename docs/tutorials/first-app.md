@@ -303,16 +303,13 @@ wasmkeep deploy --bucket s3://demo
 ```text
 acme/todo from wasmkeep.toml, before switching:
   front: added
-  class todos: added
-  access todos: open -> internal
+  class todos: added (internal)
   requires _front: TOKENS now required
 acme/todo: version b12d4cbcc397044d is current (deploy 1)
 ```
 
 The front and the class are new, `todos` is `internal` as the file says,
-and the front (`_front`) requires `TOKENS`. The `access` line reads
-`open -> internal` even on a first deploy: the plan compares with `open`,
-the default of a deploy with flags. `todos` was never open. The version holds the front
+and the front (`_front`) requires `TOKENS`. The version holds the front
 and the class together.
 
 ## 9. Start a node
