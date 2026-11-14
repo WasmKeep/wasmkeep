@@ -686,7 +686,10 @@ impl AppRef {
         // such node may be live (ADR 0023). Checked before any write.
         self.check_readers(&manifest).await?;
         let version = manifest.version_id();
-        let was_marked = read.as_ref().is_some_and(|(c, _)| c.marked);
+        // News only for an app deployed before rules came with deploys (a
+        // `current` without the marker): a new app has had them from its
+        // first deploy.
+        let from_before = read.as_ref().is_some_and(|(c, _)| !c.marked);
         // Every deploy of this version writes token 3 (ADR 0022), which
         // marks the app (ADR 0013): its nodes take their rules from
         // deploys, and refuse `--access`.
@@ -731,7 +734,7 @@ impl AppRef {
                 rooted: true,
             },
             diff,
-            newly_marked: marked && !was_marked,
+            newly_marked: marked && from_before,
         })
     }
 
@@ -1031,8 +1034,10 @@ pub struct Deployed {
     pub current: Current,
     /// Against the version before.
     pub diff: Diff,
-    /// This change set the marker: nodes take their rules from deploys
-    /// from now on, and ignore `--access`.
+    /// This change set the marker on an app deployed before it existed:
+    /// its nodes take their rules from deploys from now on, and ignore
+    /// `--access`. Never for a new app's first deploy (nothing changes
+    /// for it).
     pub newly_marked: bool,
 }
 

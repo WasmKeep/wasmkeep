@@ -152,9 +152,8 @@ impl ActorService {
             .map_err(|e| (name.clone(), e))?;
             linked.push((name.clone(), class));
         }
-        for (class, mode) in rules.restricted() {
-            tracing::info!(%class, access = %mode, seq, "access restricted");
-        }
+        let names: Vec<&str> = classes.iter().map(|(name, _, _)| name.as_str()).collect();
+        tracing::info!(seq, "access rules (deployed): {}", rules.describe(&names));
         // Values are built, and the configuration stored, under the class
         // lock, as `apply_secrets` does: a deploy and a secrets change
         // landing together each see the other's layer (ADR 0016).

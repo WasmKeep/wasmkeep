@@ -7,8 +7,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
+mod support;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,19 +54,14 @@ fn deploy_app(url: &str, app: &str, args: &[&str]) -> (bool, String, String) {
     )
 }
 
-fn free_port() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
-fn serve(url: &str, dir: &Path, addr: SocketAddr, extra: &[&str]) -> Command {
+/// `serve --app acme/shop` on a port it binds itself, to read from its
+/// log with `support::listening_on`.
+fn serve(url: &str, dir: &Path, extra: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wasmkeep"));
     cmd.args(["serve", "--app", "acme/shop", "--bucket", url])
         .arg("--data-dir")
         .arg(dir)
-        .args(["--listen", &addr.to_string()])
+        .args(["--listen", "127.0.0.1:0"])
         .args(extra);
     cmd
 }
@@ -106,12 +103,12 @@ fn rules_and_config_travel_with_deploys() {
     assert!(ok, "{err}");
     assert!(out.contains("class counter: added"), "{out}");
     // Every deploy of this version marks the app (token 3, ADR 0022): rules
-    // come with deploys from the first one, and --access is refused.
-    assert!(out.contains("Access rules now come with deploys"), "{out}");
+    // come with deploys from the first one, and --access is refused. A new
+    // app is not told so: nothing changed for it.
+    assert!(!out.contains("Access rules now come with deploys"), "{out}");
     let early = serve(
         &url,
         &dir.path().join("early"),
-        free_port(),
         &["--access", "counter=existing"],
     )
     .output()
@@ -150,7 +147,6 @@ fn rules_and_config_travel_with_deploys() {
     let refused = serve(
         &url,
         &dir.path().join("late"),
-        free_port(),
         &["--access", "counter=open"],
     )
     .output()
@@ -160,15 +156,15 @@ fn rules_and_config_travel_with_deploys() {
     assert!(err.contains("wasmkeep deploy --app acme/shop"), "{err}");
 
     // A node with no --access takes the deployed rules.
-    let addr = free_port();
     let log = dir.path().join("node.log");
-    let node = serve(&url, &dir.path().join("node"), addr, &[])
+    let node = serve(&url, &dir.path().join("node"), &[])
         .env("RUST_LOG", "wasmkeep_server=info,wasmkeep=info")
         // The log goes to stdout.
         .stdout(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let _node = Killed(node);
+    let mut node = Killed(node);
+    let addr = support::listening_on(&mut node.0, &log, Duration::from_secs(60));
     let started = Instant::now();
     while status(addr, "/actor/counter/x").is_none() {
         assert!(
@@ -180,7 +176,11 @@ fn rules_and_config_travel_with_deploys() {
     assert_eq!(status(addr, "/actor/counter/nobody"), Some(404));
     let logged = std::fs::read_to_string(&log).unwrap();
     assert!(logged.contains("serving the deployed version"), "{logged}");
-    assert!(logged.contains("access restricted (deployed)"), "{logged}");
+    assert!(
+        logged.contains("access rules (deployed): classes open to outside requests:"),
+        "{logged}"
+    );
+    assert!(logged.contains("existing actors only: counter"), "{logged}");
     assert!(
         logged.contains("monitor") || logged.contains("counter"),
         "{logged}"
@@ -269,7 +269,7 @@ fn apps_of_a_tenant_share_a_prefix_and_old_currents_are_refused() {
         .args(["serve", "--app", "acme/blog", "--bucket", &url])
         .arg("--data-dir")
         .arg(dir.path().join("data"))
-        .args(["--listen", &free_port().to_string()])
+        .args(["--listen", "127.0.0.1:0"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -280,9 +280,7 @@ fn apps_of_a_tenant_share_a_prefix_and_old_currents_are_refused() {
     put(&bucket, &format!("{prefix}/cluster/migration"), "lock\n");
     let (ok, _, err) = deploy_app(&url, "acme/shop", &["--actor", &actor]);
     assert!(!ok && err.contains("in progress"), "{err}");
-    let out = serve(&url, &dir.path().join("shop"), free_port(), &[])
-        .output()
-        .unwrap();
+    let out = serve(&url, &dir.path().join("shop"), &[]).output().unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("in progress"), "{err}");

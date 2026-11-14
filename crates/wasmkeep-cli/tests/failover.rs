@@ -7,8 +7,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
+mod support;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +18,17 @@ use std::time::{Duration, Instant};
 struct Node {
     child: Child,
     addr: SocketAddr,
+    log: PathBuf,
+}
+
+impl Node {
+    /// Once this process listens on its address: a picked port another
+    /// test's server could have taken meanwhile fails here, never answers
+    /// for it (support/mod.rs).
+    fn listening(&mut self) {
+        let addr = support::listening_on(&mut self.child, &self.log, Duration::from_secs(90));
+        assert_eq!(addr, self.addr, "listening elsewhere");
+    }
 }
 
 impl Drop for Node {
@@ -23,13 +36,6 @@ impl Drop for Node {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_port() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
 }
 
 fn counter_wasm() -> PathBuf {
@@ -51,8 +57,8 @@ fn counter_wasm() -> PathBuf {
 }
 
 fn start(id: &str, dir: &Path, wasm: &Path, bucket: &str) -> Node {
-    let addr = free_port();
-    let log = std::fs::File::create(dir.join(format!("{id}.log"))).unwrap();
+    let addr = support::picked_port();
+    let log = dir.join(format!("{id}.log"));
     let child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
         .args(["serve", "--actor"])
         .arg(format!("counter={}", wasm.display()))
@@ -63,12 +69,13 @@ fn start(id: &str, dir: &Path, wasm: &Path, bucket: &str) -> Node {
         // Plain HTTP between nodes, on loopback (the TLS cluster is
         // tests/cluster_tls.rs).
         .args(["--cluster-plaintext", "accept"])
-        .env("RUST_LOG", "wasmkeep_server=info")
-        .stdout(Stdio::null())
-        .stderr(log)
+        .env("RUST_LOG", "wasmkeep_server=info,wasmkeep=info")
+        // The log goes to stdout.
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    Node { child, addr }
+    Node { child, addr, log }
 }
 
 /// (status, x-wasmkeep-node, body); `None` if the node does not answer.
@@ -126,8 +133,10 @@ fn killing_the_owner_loses_no_committed_write() {
             .as_millis()
     );
     let url = format!("s3://{bucket}/{prefix}");
-    let a = start("a", dir.path(), &wasm, &url);
-    let b = start("b", dir.path(), &wasm, &url);
+    let mut a = start("a", dir.path(), &wasm, &url);
+    let mut b = start("b", dir.path(), &wasm, &url);
+    a.listening();
+    b.listening();
     let up = |n: &Node| wait_until(Duration::from_secs(30), || send(n.addr, "GET", "/healthz"));
     up(&a).expect("a did not start");
     up(&b).expect("b did not start");

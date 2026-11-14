@@ -223,11 +223,8 @@ impl ActorService {
         tokio::spawn(sample_disk(Arc::downgrade(&service.inner), data_dir));
         // In a cluster, deliver alarms whose owner never fired them.
         if let Some(cluster) = service.inner.cluster.clone() {
-            // Its load, with every heartbeat (payload line 10).
-            tokio::spawn(load::publish_load(
-                Arc::downgrade(&service.inner),
-                cluster.heartbeat_period(),
-            ));
+            // Its load, read by every node lease write (payload line 10).
+            cluster.set_load_source(load::load_source(Arc::downgrade(&service.inner)));
             tokio::spawn(sweep_alarms(
                 Arc::downgrade(&service.inner),
                 Arc::clone(&cluster),

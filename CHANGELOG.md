@@ -124,6 +124,31 @@ Since 0.3.0, in no release yet.
   working. The new gauge `wasmkeep_info{version,tenant,app,node}`, always
   1, shows which version each node runs (`node` only in a cluster); other
   series are unchanged ([metrics](docs/monitoring.md#metrics)).
+- **Clearer command and start messages.**
+  - The first `wasmkeep deploy` of a new app no longer prints that access
+    rules now come with deploys; only an app deployed before they did is
+    told, once.
+  - Nodes log their access rules as one INFO line per start and per
+    deploy (`access rules (deployed): classes open to outside requests:
+    counter; existing actors only: hub`), instead of a WARN that every
+    class is open and a line per restricted class. A node following an
+    app that never deployed rules still warns.
+  - `cluster status` shows `-` in STATE for a node that is not live
+    (fenced, released or stale), as it already did for its load; LIVE
+    says why. `state` is `null` in `--json` for such a node.
+  - A node's load is read as each heartbeat is written, with its drain
+    state of the same moment: ACTORS lags by at most one heartbeat (an
+    actor just taken over shows at the next one), and a `drained` node no
+    longer shows the actors it just handed over.
+  - `cluster drain` says the node reports `draining`, then `drained` once
+    its actors are handed over, and that a small drain may go straight
+    to `drained`.
+  - A cluster node logs `checking that no other process runs node id a;
+    ready in about 15 s` when its start check begins, and `no other
+    process runs node id a: ready to take actors` when it ends.
+  - A command whose output goes to a closed pipe (`wasmkeep cluster
+    status --json | head`) exits quietly with status 141 instead of
+    panicking with "failed printing to stdout: Broken pipe".
 
 ### The front, host side (for 0.4.0)
 

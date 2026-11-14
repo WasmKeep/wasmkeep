@@ -175,9 +175,9 @@ impl Cluster {
         self.membership.set_drain_state(state);
     }
 
-    /// What this node's next heartbeats say on payload line 10.
-    pub(crate) fn set_load(&self, load: wasmkeep_cluster::membership::Load) {
-        self.membership.set_load(load);
+    /// Where this node's heartbeats read payload line 10, as each is built.
+    pub(crate) fn set_load_source(&self, source: wasmkeep_cluster::membership::LoadSource) {
+        self.membership.set_load_source(source);
     }
 
     /// Whether the operator asked this node to drain, as last read.

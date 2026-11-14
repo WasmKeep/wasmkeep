@@ -930,7 +930,7 @@ Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
 a     yes   979ms  serving  12      3        840     0.4.0    acme/shop  http://a:8080  https://a:7443   pinned
 b     yes   2.2s   serving  4       0        95      0.4.0    acme/shop  http://b:8080  -                plain
-c     no    14m    serving  -       -        -       0.4.0    acme/shop  http://c:8080  https://c:7443   pinned
+c     no    14m    -        -       -        -       0.4.0    acme/shop  http://c:8080  https://c:7443   pinned
 
 APP        DEPLOYED VERSION  SEQ  ACTORS
 acme/shop  9cf4de9152d8dd29  1    16
@@ -945,7 +945,9 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   `serving`, or, while it is drained ([ADR 0014](adr/0014-draining-a-node-and-moving-an-actor.md)),
   `draining`, `drained` (no actors or WebSockets left) or `stuck` (actors
   or WebSockets left and no node of the same app to hand them to); `-` from a node that
-  predates draining. A node is **live** if its heartbeat was
+  predates draining, and for a node not live (fenced, released or stale:
+  it serves nothing, whatever its last heartbeat said; `state` is `null`
+  in `--json`). A node is **live** if its heartbeat was
   written within 10 s (three heartbeats plus the allowed clock skew), the
   rule the nodes themselves use with the default settings. Ages are
   measured on the clock of the machine running the command, so keep it in
@@ -957,9 +959,11 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
 - **Load** is what each live node says with every heartbeat: **actors**
   resident in memory, open **WebSockets** (`SOCKETS`), and **events per
   minute** (`EV/MIN`) over the last minute or more, `-` for its first
-  minute. It is as of the node's last heartbeat (up to two heartbeat
-  periods old; a node that crashed keeps showing its last load until its
-  heartbeat is older than the horizon), and nothing places actors by it.
+  minute. It is read as each heartbeat is written, with the state of the
+  same moment, so it lags what the node runs by at most one heartbeat
+  period (3 s by default): an actor a node just took over shows at its
+  next heartbeat. A node that crashed keeps showing its last load until
+  its heartbeat is older than the horizon. Nothing places actors by it.
   A node not live shows `-` (a fenced or released heartbeat keeps the
   last load it wrote, which no longer holds), and so does a node of a
   version before 0.4.0. In

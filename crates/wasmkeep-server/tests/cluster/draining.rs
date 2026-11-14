@@ -710,3 +710,59 @@ async fn a_draining_node_alone_still_serves() {
     );
     wait_drain_line(&store, "a", "stuck").await;
 }
+
+/// Payload line 10 is read as each node lease write is built: the
+/// actors a node took show by its next write, and a heartbeat that says
+/// `drained` never carries actors counted before the hand-over (load and
+/// drain state of one moment).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_heartbeat_carries_load_and_drain_state_of_one_moment() {
+    use object_store::ObjectStoreExt as _;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", da.path(), &store, idle, "t", test_actor_wasm()).await;
+    let _b = node_with("b", db.path(), &store, idle, "t", test_actor_wasm()).await;
+    wait_drain_line(&store, "b", "serving").await;
+    settle().await;
+    let heartbeat = async |id: &str| {
+        let key = object_store::path::Path::from(format!("nodes/{id}"));
+        let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let actors = body
+            .lines()
+            .find_map(|l| l.strip_prefix("load actors="))
+            .and_then(|rest| rest.split(' ').next())
+            .map(|n| n.parse::<u64>().unwrap());
+        (drain_line(&body).map(str::to_owned), actors)
+    };
+    for i in 0..3 {
+        let r = send(a.addr, "POST", &format!("/actor/t/x{i}/durable"), "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("a")),
+            "{}",
+            r.body
+        );
+    }
+    // Within a write or two (100 ms apart here), not a sampler period on.
+    eventually("a's heartbeat shows its 3 actors", async || {
+        heartbeat("a").await.1 == Some(3)
+    })
+    .await;
+
+    drain(&store, "a").await;
+    let started = std::time::Instant::now();
+    loop {
+        let (state, actors) = heartbeat("a").await;
+        if state.as_deref() == Some("drained") {
+            assert_eq!(actors, Some(0), "drained with actors");
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a never drained: {state:?} {actors:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}

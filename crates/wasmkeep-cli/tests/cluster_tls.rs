@@ -8,8 +8,10 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
+mod support;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -18,6 +20,17 @@ struct Node {
     child: Child,
     addr: SocketAddr,
     cluster: SocketAddr,
+    log: PathBuf,
+}
+
+impl Node {
+    /// Once this process listens on its address: a picked port another
+    /// test's server could have taken meanwhile fails here, never answers
+    /// for it (support/mod.rs).
+    fn listening(&mut self) {
+        let addr = support::listening_on(&mut self.child, &self.log, Duration::from_secs(90));
+        assert_eq!(addr, self.addr, "listening elsewhere");
+    }
 }
 
 impl Drop for Node {
@@ -25,13 +38,6 @@ impl Drop for Node {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_port() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
 }
 
 fn counter_wasm() -> PathBuf {
@@ -56,8 +62,13 @@ fn counter_wasm() -> PathBuf {
 /// nobody listens on: anything another node sends it must go over TLS.
 /// `extra` arguments follow.
 fn start(id: &str, dir: &Path, wasm: &Path, bucket: &str, extra: &[&str]) -> Node {
-    let (addr, cluster, nowhere) = (free_port(), free_port(), free_port());
-    let log = std::fs::File::create(dir.join(format!("{id}.log"))).unwrap();
+    let (addr, cluster, nowhere) = (
+        support::picked_port(),
+        support::picked_port(),
+        support::picked_port(),
+    );
+    let path = dir.join(format!("{id}.log"));
+    let log = std::fs::File::create(&path).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
         .args(["serve", "--actor"])
         .arg(format!("counter={}", wasm.display()))
@@ -82,6 +93,7 @@ fn start(id: &str, dir: &Path, wasm: &Path, bucket: &str, extra: &[&str]) -> Nod
         child,
         addr,
         cluster,
+        log: path,
     }
 }
 
@@ -149,7 +161,7 @@ fn two_nodes_relay_over_the_cluster_listener() {
             .as_millis()
     );
     let url = format!("s3://{bucket}/{prefix}");
-    let a = start(
+    let mut a = start(
         "a",
         dir.path(),
         &wasm,
@@ -158,7 +170,9 @@ fn two_nodes_relay_over_the_cluster_listener() {
     );
     // a still accepts plain HTTP between nodes (moving a cluster to TLS);
     // b refuses it, the default (it reaches a over TLS anyway).
-    let b = start("b", dir.path(), &wasm, &url, &[]);
+    let mut b = start("b", dir.path(), &wasm, &url, &[]);
+    a.listening();
+    b.listening();
     // Ready means each node's identity has been published for a while.
     for (id, n) in [("a", &a), ("b", &b)] {
         wait_until(Duration::from_secs(60), || {
@@ -205,7 +219,6 @@ fn two_nodes_relay_over_the_cluster_listener() {
     assert!(log.contains("plain HTTP between nodes refused"), "{log}");
 
     // SIGTERM stops both ports.
-    let mut a = a;
     let status = Command::new("kill")
         .args(["-TERM", &a.child.id().to_string()])
         .status()

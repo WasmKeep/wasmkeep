@@ -654,6 +654,46 @@ async fn required_names_travel_with_deploys() {
     assert!(refused.is_err());
 }
 
+/// The note that rules now come with deploys is news only for an app
+/// deployed before they did (a `current` with no third token): never for
+/// a new app, and once.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_an_app_from_before_deployed_rules_is_told_they_now_come_with_deploys() {
+    use object_store::ObjectStoreExt as _;
+    use wasmkeep_server::apps::Changes;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    let classes = |wasm: &[u8]| Changes {
+        classes: Some(vec![("c".into(), wasm.to_vec())]),
+        ..Changes::default()
+    };
+    let first = app
+        .deploy_changes(&rt, classes(counter_wasm()))
+        .await
+        .unwrap();
+    assert!(!first.newly_marked, "a new app");
+    // `current` as a version before deployed rules wrote it.
+    let unmarked = format!("{} {}\n", first.current.version, first.current.seq);
+    store
+        .put(
+            &"apps/default/shop/current".into(),
+            unmarked.into_bytes().into(),
+        )
+        .await
+        .unwrap();
+    let marking = app
+        .deploy_changes(&rt, classes(test_actor_wasm()))
+        .await
+        .unwrap();
+    assert!(marking.newly_marked, "an app deployed before rules were");
+    let after = app
+        .deploy_changes(&rt, classes(counter_wasm()))
+        .await
+        .unwrap();
+    assert!(!after.newly_marked, "told once");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deploy_changes_what_it_names_and_keeps_the_rest() {
     use object_store::ObjectStoreExt as _;
@@ -692,7 +732,9 @@ async fn a_deploy_changes_what_it_names_and_keeps_the_rest() {
         )
         .await
         .unwrap();
-    assert!(v1.newly_marked);
+    // A new app: rules came with deploys from its first one, nothing to
+    // announce.
+    assert!(!v1.newly_marked);
     // New code only, as a CI job would deploy it: rules and values kept.
     let v2 = app
         .deploy_changes(

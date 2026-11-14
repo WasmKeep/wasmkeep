@@ -8,8 +8,10 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
+mod support;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -87,10 +89,6 @@ fn start(tokens: Option<&str>) -> Server {
 fn start_front(front: PathBuf, tokens: Option<&str>) -> Server {
     let todos = build("todos", "todo_todos");
     let dir = tempfile::tempdir().unwrap();
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wasmkeep"));
     cmd.arg("serve")
         .arg(&front)
@@ -100,7 +98,10 @@ fn start_front(front: PathBuf, tokens: Option<&str>) -> Server {
         .arg(dir.path().join("data"))
         .arg("--cache-dir")
         .arg(dir.path().join("cache"))
-        .args(["--listen", &addr.to_string()])
+        // Bound by the server, read from its log: a port picked here could
+        // be another test's by then (support/mod.rs).
+        .args(["--listen", "127.0.0.1:0"])
+        .env("RUST_LOG", "info")
         // The CLI logs to stdout.
         .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .stderr(Stdio::null());
@@ -109,11 +110,13 @@ fn start_front(front: PathBuf, tokens: Option<&str>) -> Server {
         std::fs::write(&env, format!("TOKENS={tokens}\n")).unwrap();
         cmd.arg("--front-env").arg(env);
     }
-    let server = Server {
-        child: cmd.spawn().unwrap(),
-        addr,
-        dir,
-    };
+    let mut child = cmd.spawn().unwrap();
+    let addr = support::listening_on(
+        &mut child,
+        &dir.path().join("serve.log"),
+        Duration::from_secs(120),
+    );
+    let server = Server { child, addr, dir };
     let started = Instant::now();
     while request(addr, "GET", "/", "", "").is_none() {
         assert!(
