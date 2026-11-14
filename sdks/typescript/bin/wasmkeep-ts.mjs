@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-// wasmkeep-ts build <entry.ts> [-o out.wasm] [--engine quickjs|starlingmonkey]
+// wasmkeep-ts build <entry.ts> [-o out.wasm] [--engine quickjs|starlingmonkey] [--world actor|front]
 // wasmkeep-ts --help | --version
 //
 // Bundles a TypeScript (or JavaScript) actor whose default export is
 // `defineActor({...})`, and turns it into a WebAssembly component
-// implementing the `wasmkeep:actor/actor` world: by default with
+// implementing the `wasmkeep:actor/actor` world; with `--world front`, a
+// front whose default export is `defineFront({...})` (from
+// `@wasmkeep/sdk/front`), implementing `wasmkeep:actor/front`. By default with
 // componentize-qjs (the QuickJS engine: small, and light per actor), or
 // with ComponentizeJS (StarlingMonkey, with Web APIs such as fetch, URL
 // and crypto) under `--engine starlingmonkey`. Either way the engine is
@@ -21,7 +23,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const sdkRoot = resolve(here, "..");
 const require = createRequire(import.meta.url);
 
-const usageLine = "usage: wasmkeep-ts build <entry.ts> [-o out.wasm] [--engine quickjs|starlingmonkey]";
+const usageLine =
+  "usage: wasmkeep-ts build <entry.ts> [-o out.wasm] [--engine quickjs|starlingmonkey] [--world actor|front]";
 
 function usage(msg) {
   if (msg) console.error(`error: ${msg}`);
@@ -34,7 +37,8 @@ if (args[0] === "--help" || args[0] === "-h") {
   console.log(usageLine);
   console.log("       wasmkeep-ts --help | --version");
   console.log("\nBuilds a TypeScript or JavaScript actor into a WebAssembly component,");
-  console.log("with the QuickJS engine unless --engine says otherwise.");
+  console.log("with the QuickJS engine unless --engine says otherwise. With --world front,");
+  console.log("builds a front (defineFront, from @wasmkeep/sdk/front) instead.");
   process.exit(0);
 }
 if (args[0] === "--version" || args[0] === "-V") {
@@ -48,12 +52,19 @@ const out = resolve(oi > 0 ? args[oi + 1] : `${basename(entry).replace(/\.[cm]?[
 const ei = args.indexOf("--engine");
 const engine = ei > 0 ? args[ei + 1] : "quickjs";
 if (engine !== "starlingmonkey" && engine !== "quickjs") usage(`unknown engine ${engine}`);
+const wi = args.indexOf("--world");
+const world = wi > 0 ? args[wi + 1] : "actor";
+if (world !== "actor" && world !== "front") usage(`unknown world ${world}`);
 
 // The generated entry module: the component's exports, from the actor's
 // default export. The SDK comes first, so what it installs on engines that
 // lack it (TextEncoder, TextDecoder and console on QuickJS) is there before any of the
 // actor's modules run.
-const wrapper = `
+const wrapper = world === "front" ? `
+import { frontExportsFor } from "@wasmkeep/sdk/front";
+import definition from ${JSON.stringify(entry)};
+export const incomingHandler = frontExportsFor(definition).incomingHandler;
+` : `
 import { exportsFor } from "@wasmkeep/sdk";
 import definition from ${JSON.stringify(entry)};
 const e = exportsFor(definition);
@@ -74,7 +85,10 @@ const bundle = await build({
   platform: "neutral",
   target: "es2022",
   external: ["wasi:*", "wasmkeep:*"],
-  alias: { "@wasmkeep/sdk": join(sdkRoot, "src", "index.ts") },
+  alias: {
+    "@wasmkeep/sdk/front": join(sdkRoot, "src", "front.ts"),
+    "@wasmkeep/sdk": join(sdkRoot, "src", "index.ts"),
+  },
   logLevel: "warning",
 });
 const source = bundle.outputFiles[0].text;
@@ -95,7 +109,7 @@ try {
       "--wit",
       join(sdkRoot, "wit"),
       "--world-name",
-      "actor",
+      world,
       ...(engine === "quickjs" ? ["--backend", "quickjs", "--backend-qjs-disable-async"] : []),
       "-o",
       out,
@@ -107,6 +121,14 @@ try {
   // which engine has the global it names, if that is why.
   const output = String(e.stderr ?? "");
   process.stderr.write(output);
+  // A front that imports the actor world (`@wasmkeep/sdk` rather than
+  // `@wasmkeep/sdk/front`, or storage, alarms or WebSockets directly).
+  if (world === "front" && /wasmkeep:actor\/(storage|alarms|websockets|types)/.test(output + source)) {
+    console.error(
+      "\nerror: a front imports only actors and env: import from @wasmkeep/sdk/front, not @wasmkeep/sdk",
+    );
+    process.exit(1);
+  }
   const engines = await enginesModule();
   const name = engines.missingOnQuickjs(output);
   if (engine === "quickjs" && name !== undefined) console.error(`\nerror: ${engines.engineHint(name)}`);

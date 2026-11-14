@@ -101,6 +101,14 @@ node's actors with `actors.call`:
   front door](deploy/front-door.md)).
 - **Upgrades.** A WebSocket upgrade outside `/actor/` reaches the front as
   a plain GET; reach sockets at `/actor/<class>/<name>`.
+- **SDKs.** Rust (`wasmkeep_sdk::front`) and TypeScript
+  (`@wasmkeep/sdk/front`, `wasmkeep-ts build --world front`) build fronts,
+  with helpers: `caller()` (the front, an actor, or outside; actors use it
+  to answer their front only), `host()`, `scheme()` (from the first
+  `X-Forwarded-Proto`, only as good as the proxy that sets it) and
+  `unavailable(err)` (503 with `Retry-After: 1` for `failed` and
+  `timeout`). Other languages come later ([Languages](languages.md)).
+  [`examples/todo-front`](../examples/todo-front) is one.
 - **Where it runs.** On the node that received the request, on the public
   port only: it is never forwarded, and the cluster port does not serve
   it. Its calls to an actor on another node are signed hops, as an

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Todos</title>
+<script src="/app.js" defer></script>
+</head>
+<body>
+<h1>Todos</h1>
+<form id="signin">
+  <label>Token <input id="token" type="password" autocomplete="off" required></label>
+  <button>Sign in</button>
+</form>
+<form id="add" hidden>
+  <input id="text" maxlength="1000" required>
+  <button>Add</button>
+</form>
+<ul id="list"></ul>
+<p id="status" role="status"></p>
+</body>
+</html>

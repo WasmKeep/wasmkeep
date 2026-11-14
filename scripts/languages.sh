@@ -46,6 +46,8 @@ rust_examples=(
   'workflows/orders|workflows_orders|actor'
   'workflows/ledger|workflows_ledger|actor'
   'workflows/app|workflows_app|actor'
+  'todo-front/todos|todo_todos|actor'
+  'todo-front/front|todo_front|front'
 )
 for entry in "${rust_examples[@]}"; do
   IFS='|' read -r dir name world <<<"$entry"

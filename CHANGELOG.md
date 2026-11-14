@@ -13,6 +13,24 @@ Since 0.3.0, in no release yet.
 
 ### What changed
 
+- **Fronts in Rust and TypeScript.** The Rust SDK has a `front` module
+  (from world `front-core`): `actors` and `env` as in an actor,
+  `export_front!`, and `http::respond_with`. A front crate depends on
+  `wasmkeep-sdk` with `default-features = false`: the new default feature
+  `actor` holds the actor world (storage, alarms, WebSockets, `Actor`,
+  `export!`, `kv`, `queue`, `workflow`), which a front must not import.
+  Actors keep the defaults and change nothing. The TypeScript SDK has
+  `@wasmkeep/sdk/front` (`defineFront({ fetch })`) and `wasmkeep-ts build
+  --world front`. Both have the helpers `caller()` (`Front`, `Actor`, or
+  `Outside`; only the exact `<tenant>/_front/main` is the front), `host()`,
+  `scheme()` (`https` when the first `X-Forwarded-Proto` value is) and
+  `unavailable(err)` (503 with `Retry-After: 1` for `failed` and
+  `timeout`, 500 otherwise, with a generic body), exported for actors too.
+  TypeScript requests gain `authority` and `headerList`. Example:
+  [`examples/todo-front`](examples/todo-front) (Rust front and `internal`
+  class) and [`examples/ts-todo-front`](examples/ts-todo-front). Python,
+  Go, C, Zig, D and MoonBit fronts come later
+  ([ADR 0023](docs/adr/0023-the-front.md)).
 - **`wasmkeep cluster status` shows each node's load**: ACTORS, SOCKETS
   and EV/MIN (events per minute over the last minute or more) per live
   node, and ACTORS per app, summed over its live nodes; `actors`,

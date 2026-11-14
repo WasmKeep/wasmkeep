@@ -3,7 +3,8 @@
 # with `npm pack`, installs the tarball into an empty directory with a copy
 # of examples/ts-counter (its sources and tsconfig.json), builds the actor
 # with `npx wasmkeep-ts build` on both engines and type-checks it with
-# `tsc --noEmit`. Nothing is published.
+# `tsc --noEmit`, then builds examples/ts-todo-front's front
+# (`@wasmkeep/sdk/front`, `--world front`). Nothing is published.
 #
 #   sdks/typescript/scripts/pack-test.sh [directory]
 #
@@ -43,7 +44,7 @@ cp -R "$example/src" "$example/tsconfig.json" .
 printf '{ "name": "pack-test", "private": true, "type": "module" }\n' > package.json
 npm install --loglevel=error --no-audit --no-fund "$tarball" "typescript@$typescript"
 # What the NOTICE names, and what a consumer imports, is in the package.
-for f in LICENSE NOTICE README.md wit/deps types/actor.d.ts; do
+for f in LICENSE NOTICE README.md wit/deps types/actor.d.ts src/front.ts; do
   [ -e "node_modules/@wasmkeep/sdk/$f" ] || { echo "pack-test: $f is not in the package" >&2; exit 1; }
 done
 
@@ -63,4 +64,8 @@ npx --no -- wasmkeep-ts build src/index.ts -o counter-starlingmonkey.wasm --engi
 [ -s counter.wasm ]
 [ -s counter-starlingmonkey.wasm ]
 npx --no -- tsc --noEmit
-echo 'pack-test: the packed SDK installs, builds on both engines and type-checks'
+mkdir front
+cp -R "$repo/examples/ts-todo-front/src" front/
+npx --no -- wasmkeep-ts build front/src/index.ts --world front -o front.wasm
+[ -s front.wasm ]
+echo 'pack-test: the packed SDK installs, builds on both engines, type-checks and builds a front'

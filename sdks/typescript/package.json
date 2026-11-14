@@ -10,7 +10,7 @@
   "repository": { "type": "git", "url": "git+https://github.com/WasmKeep/wasmkeep.git", "directory": "sdks/typescript" },
   "engines": { "node": ">=22" },
   "publishConfig": { "access": "public" },
-  "exports": { ".": "./src/index.ts" },
+  "exports": { ".": "./src/index.ts", "./front": "./src/front.ts" },
   "types": "./src/index.ts",
   "bin": { "wasmkeep-ts": "./bin/wasmkeep-ts.mjs" },
   "files": ["src", "bin", "wit", "types", "NOTICE"],

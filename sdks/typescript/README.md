@@ -75,6 +75,8 @@ after `npm ci` in `sdks/typescript`).
 | `actors.call("class/name", { method, path, headers, body })` | call another actor, wherever it runs |
 | `sockets.send(conn, data)`, `sockets.broadcast(data, except?)`, `sockets.close(conn)`, `sockets.connections()` | WebSockets held by the host, open across hibernation |
 | `json(value, status?)` | a JSON response |
+| `caller(req)` | who sent the request: `{ kind: "front" }`, `{ kind: "actor", address }` or `{ kind: "outside" }` (see [Writing a front](#writing-a-front)) |
+| `host(req)`, `scheme(req)`, `unavailable(err)` | the request's authority, `"https"` or `"http"`, and the answer to a failed call (see [Writing a front](#writing-a-front)) |
 | `new kv.Client(class, shards)` | key-value over Rust shard actors: `get`, `getFresh`, `put`, `putWith`, `compareAndSet`, `delete`, `deleteIf`, `list`, `withReadCache` |
 | `new queue.Client("class/name")` | a Rust queue actor: `send`, `sendDelayed`, `sendBatch`, `lease`, `ack`, `retry`, `settle`, `stats`, `deadLetters` |
 | `queue.isDelivery(req)`, `queue.handleDelivery(req, handle)` | answer a queue's push delivery, one outcome per message |
@@ -84,6 +86,63 @@ after `npm ci` in `sdks/typescript`).
 SQL errors throw `SqlError` (with `kind`), failed calls throw `CallError`.
 A `fetch` handler returns a string, bytes, or `{ status, headers, body }`;
 an exception becomes a 500.
+
+## Writing a front
+
+A front is an app's stateless `wasi:http` component
+([ADR 0023](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0023-the-front.md)):
+it receives every request outside `/actor/` and `/_wasmkeep/`, routes,
+signs users in, and calls the app's actors with `actors.call` as an inside
+caller, so it reaches `internal` classes. It targets the
+`wasmkeep:actor/front` world (`actors` and `env`, no storage, alarms or
+WebSockets): import from `@wasmkeep/sdk/front`, whose default export is a
+`defineFront({ fetch })`, and build with `--world front`.
+
+```ts
+import { actors, defineFront, unavailable } from "@wasmkeep/sdk/front";
+
+export default defineFront({
+  fetch(req) {
+    try {
+      return actors.call("todos/alice", { path: "/" }).text();
+    } catch (e) {
+      return unavailable(e);
+    }
+  },
+});
+```
+
+```bash
+npx wasmkeep-ts build src/index.ts --world front -o front.wasm
+wasmkeep serve front.wasm --actor todos=todos.wasm --front-env front.env
+```
+
+`@wasmkeep/sdk/front` has `actors`, `env`, `CallError`, `json`, `http`
+and the request helpers, which `@wasmkeep/sdk` exports too, for actors:
+
+- `caller(req)`: from the `x-wasmkeep-caller` header the host sets. A
+  client cannot set it: the host removes it from what clients send, and
+  from what guests send on `actors.call`. Only the exact value
+  `<tenant>/_front/main` is the front; any value the host never sends is
+  `outside`. An actor answers its front only with
+  `if (caller(req).kind !== "front") return { status: 403, body: "forbidden\n" }`,
+  which keeps a sensitive class closed if it is ever deployed `open`.
+- `host(req)`: the request's authority (`req.authority`), the client's
+  `Host`; behind a proxy, only if the proxy passes it.
+- `scheme(req)`: `"https"` when the first `X-Forwarded-Proto` value is
+  `https`, else `"http"`. A client can send that header too, so it is only
+  as good as the proxy in front of the node, which must replace it: use it
+  for links and redirects, never to decide what a request may do.
+- `unavailable(err)`: `503` with `Retry-After: 1` for a `CallError` of kind
+  `failed` or `timeout`, `500` for anything else, with a generic body (log
+  the detail; do not send it to the client).
+
+A front's `fetch` that throws answers a generic 500, and the error goes to
+the log. Validate any name taken from a request before using it in an
+address: each new name is a new actor with its own database.
+[`examples/ts-todo-front`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/ts-todo-front)
+is a front over the `todos` class of
+[`examples/todo-front`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/todo-front).
 
 ## Key-value and queues
 

@@ -1,0 +1,24 @@
+[package]
+name = "todo-front"
+description = "The todo-front example's front: a page and a JSON API, signed in with a token, over an internal actor class."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Built for wasm32-wasip2, so it is its own workspace, outside the host one.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Without the default `actor` feature: a front imports `actors` and `env`
+# only (world `wasmkeep:actor/front`).
+wasmkeep-sdk = { path = "../../../crates/wasmkeep-sdk", default-features = false }
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
