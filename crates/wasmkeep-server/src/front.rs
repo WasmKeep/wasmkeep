@@ -282,7 +282,9 @@ impl HttpComponent {
     pub fn new(runtime: Runtime, component: &Component) -> Result<Self, Error> {
         let version = FrontVersion::link(&runtime, component, Arc::default())?;
         let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
-        let max_requests = crate::fds::default_front_requests(pool).max(1);
+        // Alone on its node, the front has the whole pool, as before it had
+        // its own slots; beside actors, size it (`with_max_requests`).
+        let max_requests = pool.max(1);
         Ok(Self {
             runtime,
             version: Arc::new(RwLock::new(Arc::new(version))),
@@ -321,10 +323,12 @@ impl HttpComponent {
     }
 
     /// Front requests running at once on this node (at least 1; by default
-    /// a tenth of the instance pool, rounded up). Past it a request gets
-    /// 503 with `Retry-After: 1`, without an instance. Give the actor
-    /// service the same number ([`crate::ActorConfig::max_front_requests`]),
-    /// so the slots are always free in the pool.
+    /// the whole instance pool, for a node without actors). Past it a
+    /// request gets 503 with `Retry-After: 1`, without an instance. Beside
+    /// actors, give this and the actor service the same number
+    /// ([`crate::ActorConfig::max_front_requests`], by default
+    /// [`crate::fds::default_front_requests`]), so the slots are always
+    /// free in the pool.
     #[must_use]
     pub fn with_max_requests(mut self, n: usize) -> Self {
         let n = n.max(1);
@@ -368,8 +372,7 @@ impl HttpComponent {
             wasi: self.guest_log.wasi(FRONT_CLASS.to_owned()),
             http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
-            egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress))
-                .forbidding_wasmkeep_headers(),
+            egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress)),
             tenant: actors.map_or_else(|| "default".to_owned(), |a| a.tenant().to_owned()),
             actors: actors.cloned(),
             env,
@@ -417,6 +420,7 @@ impl HttpComponent {
         };
         let slot = Slot::new(permit);
         strip_wasmkeep_headers(req.headers_mut());
+        let head = req.method() == hyper::Method::HEAD;
         let observe = move || METRICS.front_request_seconds.observe(started.elapsed());
         match self.try_handle(req, actors, slot).await {
             Ok((mut response, running)) => {
@@ -428,6 +432,7 @@ impl HttpComponent {
                         status = response.status().as_u16(),
                         "front answered with an informational status"
                     );
+                    running.abort.silence();
                     drop(running);
                     outcome("guest_error");
                     observe();
@@ -436,13 +441,32 @@ impl HttpComponent {
                 strip_wasmkeep_headers(response.headers_mut());
                 // From here the instance's own end says how the request
                 // went: a cut while the body streams is not `ok`.
-                let Running { abort, sent } = running;
+                let Running { mut abort, sent } = running;
                 let _ = sent.send(());
+                // The client has its whole answer once the declared length
+                // went out, or at once when the answer has no body: hyper
+                // may then drop the body without reading it to its end.
+                let status = response.status();
+                let left = if head
+                    || status == StatusCode::NO_CONTENT
+                    || status == StatusCode::NOT_MODIFIED
+                {
+                    Some(0)
+                } else {
+                    response
+                        .headers()
+                        .get(hyper::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+                };
+                if left == Some(0) {
+                    abort.disarm();
+                }
                 response.map(|body| {
                     Timed {
                         inner: body,
                         observe: Some(Box::new(observe)),
                         abort,
+                        left,
                     }
                     .boxed_unsync()
                 })
@@ -479,6 +503,8 @@ impl HttpComponent {
             self.cpu_budget,
         );
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        // The client's trailers lose the host's range as its headers did.
+        let req = req.map(|body| body.map_frame(strip_wasmkeep_trailers as fn(_) -> _));
         let req = store
             .data_mut()
             .http()
@@ -488,6 +514,10 @@ impl HttpComponent {
         // Said once the response went to the client: the instance's end is
         // then the request's outcome. Dropped otherwise.
         let (sent, was_sent) = tokio::sync::oneshot::channel::<()>();
+        // Whoever counts the request first: the instance's end, or the
+        // client leaving before the end of its answer.
+        let counted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let counts = Arc::clone(&counted);
 
         // The guest may keep streaming the body after it has set the
         // response, so it runs in its own task, which holds the slot for as
@@ -507,7 +537,7 @@ impl HttpComponent {
             let result = tokio::time::timeout(wall, run)
                 .await
                 .unwrap_or_else(|_| Err(WallExceeded(wall).into()));
-            if was_sent.await.is_ok() {
+            if was_sent.await.is_ok() && !counts.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 match &result {
                     Ok(()) => outcome("ok"),
                     Err(e) => {
@@ -525,17 +555,26 @@ impl HttpComponent {
         });
         // A client that leaves before the answer stops the instance, and
         // frees its slot.
-        let abort = AbortOnDrop(Some(task.abort_handle()));
+        let abort = AbortOnDrop {
+            task: Some(task.abort_handle()),
+            counted,
+        };
 
         let Ok(received) = tokio::time::timeout(wall, receiver).await else {
+            abort.silence();
             return Err(WallExceeded(wall).into());
         };
+        // Every failure below is counted by the caller.
         match received {
             Ok(Ok(response)) => Ok((response, Running { abort, sent })),
-            Ok(Err(code)) => Err(code.into()),
+            Ok(Err(code)) => {
+                abort.silence();
+                Err(code.into())
+            }
             // The sender was dropped with the store: the guest returned or
             // trapped without setting a response.
             Err(_) => {
+                abort.silence();
                 drop(sent);
                 let cause = match task.await {
                     Ok(Ok(())) => wasmtime::format_err!("guest returned without a response"),
@@ -584,19 +623,35 @@ struct Running {
     sent: tokio::sync::oneshot::Sender<()>,
 }
 
-/// Aborts a task when dropped, unless disarmed.
-struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+/// Aborts a front instance's task when dropped, unless disarmed, and
+/// counts the request as `client_gone` unless it was counted already.
+struct AbortOnDrop {
+    task: Option<tokio::task::AbortHandle>,
+    /// Set by whoever counts the request first.
+    counted: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl AbortOnDrop {
+    /// The client has its whole answer: the instance may finish on its
+    /// own, up to its wall, and counts the request when it ends.
     fn disarm(&mut self) {
-        self.0 = None;
+        self.task = None;
+    }
+
+    /// The caller counts the request: still aborted when dropped.
+    fn silence(&self) {
+        self.counted
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
+        if let Some(task) = self.task.take() {
             task.abort();
+            if !self.counted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                outcome("client_gone");
+            }
         }
     }
 }
@@ -612,6 +667,15 @@ impl std::fmt::Display for WallExceeded {
 }
 
 impl std::error::Error for WallExceeded {}
+
+/// A body frame with the host's `x-wasmkeep-` range removed from its
+/// trailers (ADR 0023).
+fn strip_wasmkeep_trailers(mut frame: hyper::body::Frame<Bytes>) -> hyper::body::Frame<Bytes> {
+    if let Some(trailers) = frame.trailers_mut() {
+        strip_wasmkeep_headers(trailers);
+    }
+    frame
+}
 
 /// Removes every header of the host's `x-wasmkeep-` range (ADR 0023).
 fn strip_wasmkeep_headers(headers: &mut hyper::HeaderMap) {
@@ -630,19 +694,30 @@ fn internal_error() -> Response<HyperOutgoingBody> {
 }
 
 /// A response body that records the request's duration once its last
-/// byte went out (or the client left), and stops the instance if the
-/// client leaves before the end.
+/// byte went out (or the client left), removes the host's range from the
+/// guest's trailers, and stops the instance if the client leaves before
+/// the end. The end is the body's last frame, its trailers, or its
+/// declared length sent (wasmtime's body never says it ended on its own).
 struct Timed {
     inner: HyperOutgoingBody,
     observe: Option<Box<dyn FnOnce() + Send>>,
     abort: AbortOnDrop,
+    /// Bytes of the declared `Content-Length` not sent yet.
+    left: Option<u64>,
+}
+
+impl Timed {
+    /// The client has its whole answer.
+    fn ended(&mut self) {
+        self.abort.disarm();
+        if let Some(observe) = self.observe.take() {
+            observe();
+        }
+    }
 }
 
 impl Drop for Timed {
     fn drop(&mut self) {
-        if hyper::body::Body::is_end_stream(&self.inner) {
-            self.abort.disarm();
-        }
         if let Some(observe) = self.observe.take() {
             observe();
         }
@@ -658,12 +733,24 @@ impl hyper::body::Body for Timed {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        if matches!(polled, std::task::Poll::Ready(None)) {
-            // Whole: the instance may finish on its own, up to its wall.
-            self.abort.disarm();
-            if let Some(observe) = self.observe.take() {
-                observe();
+        match polled {
+            std::task::Poll::Ready(None) => self.ended(),
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if frame.is_trailers() {
+                    let frame = strip_wasmkeep_trailers(frame);
+                    self.ended();
+                    return std::task::Poll::Ready(Some(Ok(frame)));
+                }
+                if let (Some(left), Some(data)) = (self.left, frame.data_ref()) {
+                    let left = left.saturating_sub(data.len() as u64);
+                    self.left = Some(left);
+                    if left == 0 {
+                        self.ended();
+                    }
+                }
+                return std::task::Poll::Ready(Some(Ok(frame)));
             }
+            _ => {}
         }
         polled
     }
@@ -674,5 +761,55 @@ impl hyper::body::Body for Timed {
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)] // test code
+
+    use super::*;
+
+    /// Every name of the range goes, in any case, every value of it;
+    /// names that only look alike stay.
+    #[test]
+    fn strip_wasmkeep_headers_removes_the_whole_range() {
+        let mut headers = hyper::HeaderMap::new();
+        for (k, v) in [
+            ("x-wasmkeep-caller", "default/admin/root"),
+            ("X-WasmKeep-Internal", "v4 0 0 0 0"),
+            ("x-wasmkeep-future", "a"),
+            ("x-wasmkeep-future", "b"),
+            ("x-wasmkeep-kv-expect", "none"),
+            ("x-wasmkeepers", "kept"),
+            ("x-other", "kept"),
+            ("wasmkeep-caller", "kept"),
+        ] {
+            headers.append(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        strip_wasmkeep_headers(&mut headers);
+        let mut left: Vec<&str> = headers
+            .keys()
+            .map(hyper::header::HeaderName::as_str)
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, ["wasmkeep-caller", "x-other", "x-wasmkeepers"]);
+    }
+
+    /// Trailers lose the range; data frames pass as they are.
+    #[test]
+    fn trailers_lose_the_range() {
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert("x-wasmkeep-node", "forged".parse().unwrap());
+        trailers.insert("x-other", "kept".parse().unwrap());
+        let frame = strip_wasmkeep_trailers(hyper::body::Frame::trailers(trailers));
+        let trailers = frame.into_trailers().unwrap();
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(trailers["x-other"], "kept");
+        let data = strip_wasmkeep_trailers(hyper::body::Frame::data(Bytes::from_static(b"x")));
+        assert_eq!(data.into_data().unwrap(), Bytes::from_static(b"x"));
     }
 }

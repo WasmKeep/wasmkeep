@@ -1,13 +1,21 @@
 //! Test front: a component of the `wasmkeep:actor/front` world. Routes (any
 //! method; the query's values percent-encoded):
-//! - `/call?to=CLASS/NAME&path=P[&method=M][&delay=MS][&spoof]`: waits MS
-//!   (no CPU), then `actors.call` with M (GET) and P; answers `STATUS:BODY`
-//!   (the body's trailing whitespace trimmed),
+//! - `/call?to=CLASS/NAME&path=P[&method=M][&delay=MS][&spoof][&copy]`:
+//!   waits MS (no CPU), then `actors.call` with M (GET) and P; answers
+//!   `STATUS:BODY` (the body's trailing whitespace trimmed),
 //!   or `err:KIND[:DETAIL]`. With `spoof`, the request carries
-//!   `x-wasmkeep-` headers the host must drop.
+//!   `x-wasmkeep-` headers the host must drop. With `copy`, answers the callee's
+//!   status, headers (trapping if one is refused) and body as they came,
+//!   plus `x-callee-range: NAMES`: the names of the callee's headers in
+//!   the `x-wasmkeep-` range, comma-separated.
 //! - `/headers`: the method, then every request header as `name: value`
 //! - `/respond?status=N[&spoof]`: answers status N (with `spoof`, with
 //!   `x-wasmkeep-` headers the host must drop)
+//! - `/after?to=CLASS/NAME[&status=N][&len]`: answers status N (200), with
+//!   `Content-Length: 4` and `body` when `len`; finishes the body (with
+//!   `len`, only after the call), waits 300 ms, then `POST /durable` on
+//!   the actor: the call must complete although the client has its
+//!   whole answer
 //! - `/self`: `self-address` as `tenant/class/name`
 //! - `/env?name=N`: `env.get(N)`, or `none`
 //! - `/sleep?ms=MS`: waits MS (no CPU), answers `slept`
@@ -16,8 +24,10 @@
 //! - `/trailers-in`: reads the body to its end, answers the request's
 //!   trailers as `name: value` lines
 //! - `/trailers-out`: answers `body` with trailers in and out of the
-//!   `x-wasmkeep-` range (the guest's attempts to set them are ignored
-//!   when refused)
+//!   `x-wasmkeep-` range
+//!
+//! Every answer whose headers or trailers the guest could not set ends
+//! with a line `refused:NAMES` (comma-separated).
 //! - `/stream-spin`: answers 200, sends `started`, then never returns
 //! - anything else: `front ok`
 
@@ -70,11 +80,25 @@ fn sleep_ms(ms: u64) {
     wasip2::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000).block();
 }
 
-fn respond(out: ResponseOutparam, status: u16, headers: &[(&str, &str)], body: &str) {
+/// `fields` with `headers` appended; the names refused, as a last line.
+fn fields_of(headers: &[(&str, &str)]) -> (Fields, String) {
     let fields = Fields::new();
-    for (k, v) in headers {
-        let _ = fields.append(k, v.as_bytes());
-    }
+    let refused: Vec<&str> = headers
+        .iter()
+        .filter(|(k, v)| fields.append(k, v.as_bytes()).is_err())
+        .map(|(k, _)| *k)
+        .collect();
+    let note = if refused.is_empty() {
+        String::new()
+    } else {
+        format!("\nrefused:{}", refused.join(","))
+    };
+    (fields, note)
+}
+
+fn respond(out: ResponseOutparam, status: u16, headers: &[(&str, &str)], body: &str) {
+    let (fields, refused) = fields_of(headers);
+    let body = format!("{body}{refused}");
     let response = OutgoingResponse::new(fields);
     let _ = response.set_status_code(status);
     let outgoing = response.body().unwrap();
@@ -133,6 +157,36 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
                     headers,
                     body: Vec::new(),
                 };
+                if param(query, "copy").is_some() {
+                    // As a front passing the callee's answer on would: its
+                    // status, every header and the body as they came.
+                    let r = actors::call(&to, &request).expect("the call");
+                    let range: Vec<&str> = r
+                        .headers
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .filter(|k| k.to_ascii_lowercase().starts_with("x-wasmkeep-"))
+                        .collect();
+                    let fields = Fields::new();
+                    for (k, v) in &r.headers {
+                        fields
+                            .append(k, v.as_bytes())
+                            .expect("a header of the callee's answer");
+                    }
+                    fields
+                        .append("x-callee-range", range.join(",").as_bytes())
+                        .unwrap();
+                    let response = OutgoingResponse::new(fields);
+                    let _ = response.set_status_code(r.status);
+                    let outgoing = response.body().unwrap();
+                    ResponseOutparam::set(out, Ok(response));
+                    let mut stream = outgoing.write().unwrap();
+                    let _ = stream.write_all(&r.body);
+                    let _ = stream.flush();
+                    drop(stream);
+                    let _ = OutgoingBody::finish(outgoing, None);
+                    return;
+                }
                 let answer = match actors::call(&to, &request) {
                     Ok(r) => format!(
                         "{}:{}",
@@ -165,6 +219,44 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
                     &[]
                 };
                 respond(out, status, headers, "responded");
+            }
+            "/after" => {
+                let to = param(query, "to").unwrap_or_default();
+                let status = param(query, "status")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(200);
+                let len = param(query, "len").is_some();
+                let fields = Fields::new();
+                if len {
+                    fields.append("content-length", b"4").unwrap();
+                }
+                let response = OutgoingResponse::new(fields);
+                let _ = response.set_status_code(status);
+                let outgoing = response.body().unwrap();
+                ResponseOutparam::set(out, Ok(response));
+                let mut stream = outgoing.write().unwrap();
+                if len {
+                    let _ = stream.write_all(b"body");
+                    let _ = stream.flush();
+                }
+                drop(stream);
+                let call = || {
+                    sleep_ms(300);
+                    let request = actors::Request {
+                        method: "POST".into(),
+                        path: "/durable".into(),
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    };
+                    let _ = actors::call(&to, &request);
+                };
+                if len {
+                    call();
+                    let _ = OutgoingBody::finish(outgoing, None);
+                } else {
+                    let _ = OutgoingBody::finish(outgoing, None);
+                    call();
+                }
             }
             "/self" => {
                 let me = actors::self_address();
@@ -212,18 +304,16 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
                 respond(out, 200, &[], &text);
             }
             "/trailers-out" => {
-                let fields = Fields::new();
-                let _ = fields.append("trailer", b"x-wasmkeep-node, x-other");
+                let (fields, refused) = fields_of(&[("trailer", "x-wasmkeep-node, x-other")]);
+                let (trailers, refused_trailers) =
+                    fields_of(&[("x-wasmkeep-node", "forged"), ("x-other", "kept")]);
                 let response = OutgoingResponse::new(fields);
                 let outgoing = response.body().unwrap();
                 ResponseOutparam::set(out, Ok(response));
                 let mut stream = outgoing.write().unwrap();
-                let _ = stream.write_all(b"body");
+                let _ = stream.write_all(format!("body{refused}{refused_trailers}").as_bytes());
                 let _ = stream.flush();
                 drop(stream);
-                let trailers = Fields::new();
-                let _ = trailers.append("x-wasmkeep-node", b"forged");
-                let _ = trailers.append("x-other", b"kept");
                 let _ = OutgoingBody::finish(outgoing, Some(trailers));
             }
             "/stream-spin" => {

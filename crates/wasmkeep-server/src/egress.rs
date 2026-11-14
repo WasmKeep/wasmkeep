@@ -332,9 +332,6 @@ pub(crate) fn guest_wasi_builder() -> wasmtime_wasi::WasiCtxBuilder {
 pub struct EgressHooks {
     policy: Arc<EgressPolicy>,
     requests: Arc<tokio::sync::Semaphore>,
-    /// Also forbid the host's `x-wasmkeep-` range at the guest boundary,
-    /// headers and trailers both ways (the front, ADR 0023).
-    forbid_wasmkeep: bool,
 }
 
 impl Default for EgressHooks {
@@ -349,19 +346,7 @@ impl EgressHooks {
         Self {
             policy,
             requests: Arc::new(tokio::sync::Semaphore::new(PER_ACTOR_REQUESTS)),
-            forbid_wasmkeep: false,
         }
-    }
-
-    /// These hooks, with every header and trailer of the `x-wasmkeep-`
-    /// range forbidden where fields cross the guest boundary, both ways:
-    /// what the client sends never reaches the guest, and what the guest
-    /// sets never leaves it (wasmtime-wasi-http applies the filter to
-    /// headers and trailers alike).
-    #[must_use]
-    pub(crate) fn forbidding_wasmkeep_headers(mut self) -> Self {
-        self.forbid_wasmkeep = true;
-        self
     }
 }
 
@@ -371,25 +356,6 @@ type SendResult = wasmtime_wasi_http::Result<(
 )>;
 
 impl WasiHttpHooks for EgressHooks {
-    fn forbidden_header_filter(&mut self) -> wasmtime_wasi_http::ForbiddenHeaderFilter {
-        static DEFAULT: std::sync::LazyLock<wasmtime_wasi_http::ForbiddenHeaderFilter> =
-            std::sync::LazyLock::new(|| {
-                Arc::new(|name| wasmtime_wasi_http::DEFAULT_FORBIDDEN_HEADERS.contains(name))
-            });
-        static WITH_RANGE: std::sync::LazyLock<wasmtime_wasi_http::ForbiddenHeaderFilter> =
-            std::sync::LazyLock::new(|| {
-                Arc::new(|name| {
-                    wasmtime_wasi_http::DEFAULT_FORBIDDEN_HEADERS.contains(name)
-                        || crate::actor::is_wasmkeep_header(name.as_str())
-                })
-            });
-        if self.forbid_wasmkeep {
-            WITH_RANGE.clone()
-        } else {
-            DEFAULT.clone()
-        }
-    }
-
     fn send_request(
         &mut self,
         request: ::http::Request<WasiBody>,

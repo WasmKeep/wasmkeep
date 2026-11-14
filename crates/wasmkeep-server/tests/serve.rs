@@ -143,8 +143,7 @@ async fn actor_paths_answer_404_on_a_node_without_actors() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_requests_each_get_an_instance() {
-    // As many front slots as requests (by default a tenth of the pool).
-    let (addr, _stop) = start(hello_component().with_max_requests(50)).await;
+    let (addr, _stop) = start(hello_component()).await;
     let tasks: Vec<_> = (0..50)
         .map(|i| tokio::spawn(async move { request(addr, "GET", &format!("/n/{i}")).await }))
         .collect();

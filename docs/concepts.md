@@ -89,7 +89,8 @@ node's actors with `actors.call`:
   up with `timeout` while 5 s of that wall remain, or after the actors'
   call limit, whichever comes first, so the front can still answer. At most
   `--max-front-requests` front requests run at once (by default a tenth of
-  `--max-instances`; resident actors get the rest of the pool); past it the
+  `--max-instances` beside actors, resident actors getting the rest of the
+  pool, and the whole pool on a node without actors); past it the
   node answers 503 with `Retry-After: 1` without running the front. At most
   a quarter of those may wait on one actor at once; past it the call fails
   with `failed("front busy: ...")`. The front's CPU time per request is

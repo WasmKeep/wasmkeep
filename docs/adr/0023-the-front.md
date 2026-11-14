@@ -195,6 +195,26 @@ front's paths (see "The WebSocket hand-off").
   header from the front's response before the client gets it. This
   reserves the range for the host's own answers, including the 0.4.1
   hand-off's control header, from the first release with a front.
+- **Trailers** follow the same rule both ways, and the removal is
+  silent: the front may set any name, an `x-wasmkeep-` one included
+  (wasmtime's `fields` calls never refuse it), and the host drops it on
+  the way out. A front that copies the headers of an answer it received
+  therefore never fails on a name in the range.
+  - Note (2026-11-14, review): the first build forbade the range at the
+    guest boundary instead, so `fields.append`, `set` and `from-list`
+    returned `forbidden`. A call answered by another node carries the
+    host-set `x-wasmkeep-node`, so a front copying its callee's headers
+    trapped on a cluster only. The host now removes the range at the
+    front's edges, and from what `actors.call` returns to any guest (with
+    the hop's framing headers, as the body is whole): no SDK reads a name
+    of the range from an answer. The front's own outbound HTTP is the
+    guest's, as an actor's.
+- **Requests to actors from outside**: an unsigned request to
+  `/actor/...` (a client's, or one a node forwarded) loses the whole
+  range too, but the forwarded mark the host reads to forward a request
+  only once; the host then sets `x-wasmkeep-actor` itself. Before, only
+  the names the host reads were removed, so a client could send the SDKs'
+  key-value and queue names to an open actor that relays its headers.
 
 ### Host and scheme
 
@@ -367,7 +387,9 @@ front answers the same 503.
 - **Slots**: `--max-front-requests N` bounds the front requests running
   at once on a node. The default is the part of the instance pool kept
   from actors today, `max_instances.div_ceil(10)` (100 for the default
-  pool of 1,000). Past it the host answers `503` with `Retry-After: 1`,
+  pool of 1,000) on a node that serves actors; a node that serves only a
+  front gives it the whole pool, as before it had slots of its own
+  (amended 2026-11-14). Past it the host answers `503` with `Retry-After: 1`,
   without instantiating. The resident actor limit becomes
   `max_instances - max_front_requests` (at least 1) instead of
   `resident_pool_limit(max_instances)`, so the slots are always there in
@@ -477,9 +499,18 @@ it.
 - **Behaviour changes**, for the 0.4.0 notes:
   - with `--app`, a component on the `serve` command line is refused;
   - without `--app`, that component gets `actors` and `env`;
-  - a client's `x-wasmkeep-*` headers no longer reach the stateless
-    component, and its own `x-wasmkeep-*` response headers no longer
-    reach the client;
+  - a client's `x-wasmkeep-*` headers and trailers no longer reach the
+    stateless component, and its own `x-wasmkeep-*` response headers and
+    trailers no longer reach the client;
+  - a client's `x-wasmkeep-*` headers no longer reach an actor (but the
+    forwarded mark), and `actors.call` no longer returns any, nor the
+    hop's framing headers;
+  - a client leaving before the end of its answer stops the front's
+    instance (a whole answer is not a client gone);
+  - no free instance for the front answers 503 with `Retry-After: 1`
+    instead of 500;
+  - `--app` with `--max-instances 1` is refused at start: an `--app`
+    node keeps front slots for the deployed front;
   - the front's CPU budget is its own flag;
   - a guest's own `x-wasmkeep-*` headers on `actors.call` no longer
     reach the callee, for actors too;

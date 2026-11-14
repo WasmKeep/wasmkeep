@@ -85,7 +85,8 @@ comes later.
 - **`serve --front-env FILE`** gives the front its values (`env.get`), as
   `--env CLASS=FILE` does for a class; `--env _front=FILE` is refused.
 - **Its own limits.** `--max-front-requests N` front requests at once (by
-  default a tenth of `--max-instances`, rounded up): past it, 503 with
+  default a tenth of `--max-instances`, rounded up, beside actors, and the
+  whole pool on a node that serves only a component): past it, 503 with
   `Retry-After: 1`, without running the front; resident actors get the
   rest of the pool. A quarter of those slots may wait on one actor at
   once: past it the call fails with `failed("front busy: ...")`. A call
@@ -95,7 +96,8 @@ comes later.
 - **Metrics**: `wasmkeep_front_requests_total{tenant,app,outcome}`,
   `wasmkeep_front_request_seconds`, `wasmkeep_front_slots_in_use` and
   `wasmkeep_front_calls_total{tenant,app,outcome}`
-  ([metrics](docs/monitoring.md#metrics)).
+  ([metrics](docs/monitoring.md#metrics)); a client that leaves before
+  the end of its answer counts as `outcome="client_gone"`.
 
 Behaviour changes:
 
@@ -103,9 +105,26 @@ Behaviour changes:
   start; such a node answers 404 outside `/actor/` until its deploy brings
   a front.
 - Without `--app`, the component gets `actors` and `env`.
-- A client's `x-wasmkeep-*` headers no longer reach the stateless
-  component, and its own `x-wasmkeep-*` response headers no longer reach
-  the client.
+- A client's `x-wasmkeep-*` headers and trailers no longer reach the
+  stateless component, and its own `x-wasmkeep-*` response headers and
+  trailers no longer reach the client. The host removes them silently:
+  the component may set them without an error.
+- A client's `x-wasmkeep-*` headers no longer reach an actor at
+  `/actor/...`, the SDKs' key-value and queue names included (before,
+  only the names the host reads were removed); the forwarded mark still
+  does.
+- An answer to `actors.call` no longer carries any `x-wasmkeep-*` header
+  (such as `x-wasmkeep-node` when another node answered), nor the hop's
+  framing headers (`transfer-encoding`, `connection` and the like; the
+  body is whole, and `content-length` stays), for actors too.
+- A client that leaves before the end of its answer stops the stateless
+  component's instance and frees its slot; a whole answer (its declared
+  length sent, its trailers, or no body: `HEAD`, 204, 304) lets it run
+  on, up to its wall.
+- No free instance for the stateless component answers 503 with
+  `Retry-After: 1`, no longer 500.
+- `serve --app --max-instances 1` is refused at start: an `--app` node
+  keeps slots for the front its deploy brings, beside an actor.
 - The stateless component's CPU budget is `--front-cpu-budget-ms`, no
   longer `--cpu-budget-ms`.
 - A guest's own `x-wasmkeep-*` headers on `actors.call` no longer reach
