@@ -1,0 +1,12 @@
+{
+  "name": "wasmkeep-example-ts-db",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wasmkeep-ts build src/database.ts -o database.wasm && wasmkeep-ts build src/app.ts -o app.wasm",
+    "build:starlingmonkey": "wasmkeep-ts build src/database.ts -o database-starlingmonkey.wasm --engine starlingmonkey && wasmkeep-ts build src/app.ts -o app-starlingmonkey.wasm --engine starlingmonkey"
+  },
+  "dependencies": {
+    "@wasmkeep/sdk": "file:../../sdks/typescript"
+  }
+}

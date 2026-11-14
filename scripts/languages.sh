@@ -8,10 +8,10 @@
 #   3. every example in another language built (TypeScript on both engines,
 #      C, Zig, Python, Go on TinyGo and standard Go, D,
 #      MoonBit, C#);
-#   4. the counter contract, the chat suite, jobs, workflows and outbound
-#      fetch against every language, the todo front in Rust and
-#      TypeScript, and every project `wasmkeep new` writes, with
-#      WASMKEEP_REQUIRE_LANGS=1: a component that is
+#   4. the counter contract, the chat suite, jobs, workflows, outbound
+#      fetch and the database pattern against every language, the todo
+#      front in Rust and TypeScript, and every project `wasmkeep new`
+#      writes, with WASMKEEP_REQUIRE_LANGS=1: a component that is
 #      missing fails instead of being skipped.
 # It installs no toolchain (see `scripts/doctor.sh --full`), except that it
 # runs `npm ci` where a TypeScript package has no node_modules yet.
@@ -48,6 +48,8 @@ rust_examples=(
   'workflows/orders|workflows_orders|actor'
   'workflows/ledger|workflows_ledger|actor'
   'workflows/app|workflows_app|actor'
+  'db/database|db_database|actor'
+  'db/app|db_app|actor'
   'todo-front/todos|todo_todos|actor'
   'todo-front/front|todo_front|front'
 )
@@ -125,6 +127,6 @@ done
 
 echo '-- every language against the same tests'
 WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked -E "$tests" \
-  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs
+  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --test db_langs
 echo '-- the todo front, in Rust and in TypeScript, and the projects wasmkeep new writes'
 WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-cli --locked --test todo_front --test new_project

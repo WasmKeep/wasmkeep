@@ -102,6 +102,22 @@ open together. The helpers are new in `0.4.1`.
 | Python | No outbound HTTP in the SDK yet; on componentize-py's own bindings, start each request with `outgoing_handler.handle` and wait on their futures together with `poll.poll` (tried by hand; not part of the shared tests) |
 | C, Zig, D, MoonBit | No outbound HTTP in the SDK yet |
 
+### A database kept by one actor
+
+The database pattern ([guide](database.md),
+[ADR 0029](adr/0029-a-database-client-as-an-sdk-pattern.md)) has a
+handler (the class that owns the tables, with its migrations) and a
+client. Both speak one JSON format, byte for byte the same in every SDK
+that has it, and `db_langs` runs every client against every handler, on
+both TypeScript engines. Coming in `0.4.2`, the release after `0.4.1`
+(in no release yet).
+
+| Language | Database handler | Database client |
+| --- | --- | --- |
+| Rust | `db::handle`, `db::migrate` | `db::Client` |
+| TypeScript (both engines) | `db.define`, `db.handle`, `db.migrate` | `db.Client` |
+| Python, Go (TinyGo), C, Zig, D, MoonBit | Later | Later; until then, `actors.call` with the [format](adr/0029-a-database-client-as-an-sdk-pattern.md#the-wire-format) |
+
 ### Next, in order
 
 Each is experimental once a counter passes the shared tests; numbers

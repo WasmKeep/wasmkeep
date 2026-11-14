@@ -21,6 +21,7 @@
 - [When a node dies, and how it scales](failover-and-scaling.md)
 - [Key-value and queues](kv-and-queues.md)
 - [Workflows](workflows.md)
+- [A database kept by one actor](database.md)
 
 # Deploying
 
@@ -73,3 +74,4 @@
 - [0025 Calling several actors at once](adr/0025-calling-several-actors-at-once.md)
 - [0026 The project file](adr/0026-the-project-file.md)
 - [0027 Sockets through the front](adr/0027-sockets-through-the-front.md)
+- [0029 A database client as an SDK pattern](adr/0029-a-database-client-as-an-sdk-pattern.md)

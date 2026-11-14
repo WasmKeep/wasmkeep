@@ -77,6 +77,9 @@ goes from an empty directory to an actor whose state survives a restart.
   each built from actors
   ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/v0.4.1/docs/kv-and-queues.md),
   [workflows](https://github.com/WasmKeep/wasmkeep/blob/v0.4.1/docs/workflows.md)).
+- `db`: a database kept by one actor, like a Cloudflare D1 database: the
+  class's handler and migrations, and the client the app's other actors
+  use ([below](#a-database-kept-by-one-actor)).
 - `wasi`: the WASI 0.2 bindings (the `wasip2` crate).
 
 The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.4.1/docs/reference/api.md)
@@ -109,6 +112,58 @@ come, so the batch takes about as long as its slowest request.
 sends more than a GET; bodies are written one after the other. The host
 lets an actor have 16 requests open at once: past 16, the rest start as
 earlier ones finish.
+
+## A database kept by one actor
+
+`db` makes one actor the owner of an app's shared tables
+(the guide is `docs/database.md` in the repository, the design ADR 0029;
+coming in the release after `0.4.1`).
+The class mounts the handler and lists its schema; deploy it `internal`:
+
+```rust
+use wasmkeep_sdk::{db, http};
+
+const MIGRATIONS: &[&str] = &["CREATE TABLE todos (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"];
+
+struct Db;
+
+impl wasmkeep_sdk::Actor for Db {
+    fn on_init() -> Result<(), String> {
+        db::migrate(MIGRATIONS).map(drop).map_err(|e| e.to_string())
+    }
+}
+
+impl http::Guest for Db {
+    fn handle(request: http::IncomingRequest, out: http::ResponseOutparam) {
+        db::handle(request, out); // 403 for anyone but the app's actors and front
+    }
+}
+
+wasmkeep_sdk::export!(Db);
+```
+
+Any other actor of the app sends it SQL, with every value bound:
+
+```rust
+use wasmkeep_sdk::db::{self, Statement};
+use wasmkeep_sdk::params;
+
+let main = db::Client::new("db/main");
+main.exec("INSERT INTO todos (text) VALUES (?1)", &params!["buy milk"])?;   // rows changed, durable
+let rows = main.query("SELECT id, text FROM todos ORDER BY id", &[])?;     // columns and values
+main.batch(&[                                                               // all kept, or none
+    Statement::exec("DELETE FROM todos WHERE id = ?1", &params![1]),
+    Statement::query("SELECT COUNT(*) FROM todos", &[]),
+])?;
+```
+
+**Never pass SQL text from a request to the client**: write it in code
+and bind values as parameters. Each request is one transaction (a read is
+always rolled back, a write commits durably), statements that control the
+transaction are refused, and requests are capped (`db::Limits`). The
+TypeScript SDK has the same handler and client, with the same wire
+format: either talks to the other
+(`examples/db` in the repository).
 
 ## Writing a front
 
@@ -201,7 +256,7 @@ class that checks `caller()`.
 
 Without the `actor` feature the crate has `front`, `actors`, `env`,
 `caller`, `http` and `wasi`; `storage`, `alarms`, `websockets`, `Actor`,
-`export!`, `params!`, `kv`, `queue` and `workflow` need it.
+`export!`, `params!`, `db`, `kv`, `queue` and `workflow` need it.
 
 ## Versions
 

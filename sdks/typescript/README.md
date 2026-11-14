@@ -83,6 +83,7 @@ after `npm ci` in `sdks/typescript`).
 | `queue.isDelivery(req)`, `queue.handleDelivery(req, handle)` | answer a queue's push delivery, one outcome per message |
 | `http.fetch(url, { method, headers, body, timeoutMs, limit })` | outbound HTTP, synchronously: `{ status, headers, body, text(), json() }`; throws `http.FetchError` when there is no response, or when its body breaks before its end (`incomplete body`; a body longer than `limit`, 16 MiB by default, is cut to it without an error). Works on both engines (QuickJS has no `fetch`, and StarlingMonkey's is asynchronous) |
 | `http.fetchAll([{ url, ...options }, ...])` | several outbound requests at once, waited for together: one `{ ok: true, response }` or `{ ok: false, error }` per request, in input order ([below](#several-outbound-requests-at-once)) |
+| `db.define({ migrations })`, `new db.Client(address)` | a database kept by one actor: the class's handler and the client (`query`, `exec`, `batch`, `read`) ([below](#a-database-kept-by-one-actor)) |
 | `workflow.define(fn, config)`, `new workflow.Client(class)` | durable workflows: `wf.step`, `wf.sleep`, `wf.waitForEvent` ([guide](https://github.com/WasmKeep/wasmkeep/blob/v0.4.1/docs/workflows.md#typescript)) |
 
 SQL errors throw `SqlError` (with `kind`), failed calls throw `CallError`.
@@ -245,6 +246,50 @@ Versions, ids and times are `number`s; failures throw `kv.KvError` or
 `refused`, ...). [`examples/ts-jobs`](https://github.com/WasmKeep/wasmkeep/tree/v0.4.1/examples/ts-jobs) runs against
 the Rust classes; the differences from the Rust API are listed in the
 [guide](https://github.com/WasmKeep/wasmkeep/blob/v0.4.1/docs/kv-and-queues.md#typescript).
+
+## A database kept by one actor
+
+`db` makes one actor the owner of an app's shared tables, like a
+Cloudflare D1 database
+(the guide is `docs/database.md` in the repository, the design ADR 0029;
+coming in the release after `0.4.1`).
+The class is one call; deploy it `internal`:
+
+```ts
+import { db } from "@wasmkeep/sdk";
+
+export default db.define({
+  migrations: ["CREATE TABLE todos (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"],
+});
+```
+
+Any other actor of the app sends it SQL, with every value bound:
+
+```ts
+import { db } from "@wasmkeep/sdk";
+
+const main = new db.Client("db/main");
+main.exec("INSERT INTO todos (text) VALUES (?1)", ["buy milk"]);         // rows changed, durable
+const { columns, rows } = main.query("SELECT id, text FROM todos");      // rows: arrays of values
+db.objects({ columns, rows });                                           // [{ id, text }, ...]
+main.batch([                                                             // all kept, or none
+  { sql: "DELETE FROM todos WHERE id = ?1", params: [1] },
+  { sql: "SELECT COUNT(*) FROM todos", rows: true },
+]);
+```
+
+**Never pass SQL text from a request to the client**: write it in code
+and bind values as parameters. Each request is one transaction (a read is
+always rolled back, a write commits durably), statements that control the
+transaction are refused, and requests are capped (`limits`). Failures
+throw `db.DbError` with a `kind` (`sql`, `not-allowed`, `too-large`,
+`call`, `refused`). A safe integer binds as an integer, any other number
+as a real (`{ tag: "real", val: 2 }` for a whole one); integers past 2^53
+come back as `bigint`. The wire format is the Rust SDK's byte for byte:
+either talks to the other
+(`examples/ts-db` in the repository).
+A TypeScript database spends more of the event's CPU budget encoding
+answers than a Rust one; prefer the Rust class for large answers.
 
 ## How it works
 

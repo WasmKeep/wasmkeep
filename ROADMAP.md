@@ -24,9 +24,9 @@ and the front in the app's part of the bucket, with links a browser
 uploads to and downloads from directly; static assets shipped with
 `wasmkeep deploy`, served by every node without waking any code, with a
 rule for paths that match no file (pass to the front, a single-page app's
-`index.html`, or a 404 page); and a database client in the SDKs, for a
-database kept by one actor. Redirects and routes stay in the front's own
-code, with SDK helpers.
+`index.html`, or a 404 page); and the database client in the SDKs
+beyond Rust and TypeScript (built there, below). Redirects and routes
+stay in the front's own code, with SDK helpers.
 
 Then **starting a project**: `wasmkeep new`, templates that write an app
 with its `wasmkeep.toml`
@@ -229,6 +229,9 @@ Started alongside M3; what is left of it is under [Now](#now) and
 - Durable workflows as an SDK pattern ([guide](docs/workflows.md),
   [ADR 0019](docs/adr/0019-workflows-as-an-sdk-pattern.md)): runners in
   Rust and TypeScript, clients in the Go, Python, C and Zig SDKs.
+- A database kept by one actor, as an SDK pattern ([guide](docs/database.md),
+  [ADR 0029](docs/adr/0029-a-database-client-as-an-sdk-pattern.md)): the
+  handler, the client and migrations in Rust and TypeScript.
 - In `0.3.0`, reliable enough to leave running: a request for a dead
   node's actor waits for the takeover instead of being refused; a
   snapshot upload and a restore are bounded, tried again and counted; a

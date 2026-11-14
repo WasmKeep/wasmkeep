@@ -99,8 +99,9 @@ on disk, unless tmpfs is named.
   ([WasmKeep and Workers](compared-with-workers.md#where-workers-is-the-better-choice)).
 - **More of the platform built in.** celld comes with key-value, queues,
   D1-style SQL and R2-style object storage. WasmKeep offers key-value,
-  queues and workflows as SDK patterns on actors
-  ([key-value and queues](kv-and-queues.md), [workflows](workflows.md)).
+  queues, workflows and a database kept by one actor as SDK patterns on
+  actors ([key-value and queues](kv-and-queues.md),
+  [workflows](workflows.md), [database](database.md)).
 
 ## Not measured yet
 

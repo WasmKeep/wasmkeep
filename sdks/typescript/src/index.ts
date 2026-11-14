@@ -35,6 +35,9 @@ import type { IncomingRequest, ResponseOutparam } from "wasi:http/types@0.2.12";
 import { respond, toRequest } from "./handler";
 import type { ActorRequest, ActorResponse } from "./request";
 
+/** A database kept by one actor (`db.define({ migrations })`,
+ * `new db.Client("db/main")`); see ./db.ts. */
+export * as db from "./db";
 /** Key-value storage over shard actors (`new kv.Client("kv", 8)`); see ./kv.ts. */
 export * as kv from "./kv";
 /** Queues over queue actors (`new queue.Client("queue/jobs")`,
