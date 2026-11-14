@@ -41,16 +41,16 @@ different target, and does not make a language usable here.
 ### Getting an SDK
 
 Each SDK has the version of the server it is released with
-([versions](#versions)); here for `0.4.1`.
+([versions](#versions)); here for `0.4.2`.
 
 | Language | Get it | Build an actor |
 | --- | --- | --- |
 | Rust | `cargo add wasmkeep-sdk` (crates.io) | `cargo build --release --target wasm32-wasip2` ([tutorial](tutorials/first-actor.md)) |
 | TypeScript / JavaScript | `npm install @wasmkeep/sdk` (npm) | `npx wasmkeep-ts build src/index.ts -o actor.wasm` ([README](../sdks/typescript/README.md)) |
 | Python | `pip install wasmkeep` (PyPI) | `python -m wasmkeep build app -o actor.wasm` ([README](../sdks/python/README.md)) |
-| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.4.1` (a module of this repository) | `tinygo build -target=wasip2`, with the WIT the module ships ([README](../sdks/go/README.md#install)) |
-| C / C++ | `wasmkeep-c-sdk-0.4.1.tar.gz`, a file of the [release](https://github.com/WasmKeep/wasmkeep/releases) | The build command in the archive's README ([C SDK](../sdks/c/README.md)) |
-| Zig | `wasmkeep-zig-sdk-0.4.1.tar.gz`, a file of the release | The build command in the archive's README ([Zig SDK](../sdks/zig/README.md)) |
+| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.4.2` (a module of this repository) | `tinygo build -target=wasip2`, with the WIT the module ships ([README](../sdks/go/README.md#install)) |
+| C / C++ | `wasmkeep-c-sdk-0.4.2.tar.gz`, a file of the [release](https://github.com/WasmKeep/wasmkeep/releases) | The build command in the archive's README ([C SDK](../sdks/c/README.md)) |
+| Zig | `wasmkeep-zig-sdk-0.4.2.tar.gz`, a file of the release | The build command in the archive's README ([Zig SDK](../sdks/zig/README.md)) |
 | D, MoonBit, C#, standard Go | The repository's source at the release's tag | Each example's `build.sh` |
 
 **Fronts** (an app's stateless `wasi:http` component, the
@@ -109,8 +109,7 @@ The database pattern ([guide](database.md),
 handler (the class that owns the tables, with its migrations) and a
 client. Both speak one JSON format, byte for byte the same in every SDK
 that has it, and `db_langs` runs every client against every handler, on
-both TypeScript engines. Coming in `0.4.2`, the release after `0.4.1`
-(in no release yet).
+both TypeScript engines. New in `0.4.2`.
 
 | Language | Database handler | Database client |
 | --- | --- | --- |
@@ -237,7 +236,7 @@ needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
 provides them inert (no directories).
 
 An app adds the module with `go get
-github.com/wasmkeep/wasmkeep/sdks/go@v0.4.1`: the module carries the
+github.com/wasmkeep/wasmkeep/sdks/go@v0.4.2`: the module carries the
 server's version number. The `wasmkeep` package starts at `v0.2.0`
 (`v0.1.0` has only the clients); see the SDK's
 [Install](../sdks/go/README.md#install).
@@ -391,6 +390,7 @@ tested.
 
 | SDK | Server | WIT package |
 | --- | --- | --- |
+| 0.4.2 | 0.4.2 | `wasmkeep:actor@0.2.0` |
 | 0.4.1 | 0.4.1 | `wasmkeep:actor@0.2.0` |
 | 0.4.0 | 0.4.0 | `wasmkeep:actor@0.2.0` |
 | 0.3.0 | 0.3.0 | `wasmkeep:actor@0.2.0` |
@@ -406,11 +406,16 @@ interface between a component and the host
 ([`actor.wit`](../crates/wasmkeep-wit/wit/actor.wit)), and changes only when
 what it already has changes. An addition keeps it: `0.4.0` added the
 worlds `front` and `front-core` and the interface `calls` under
-`wasmkeep:actor@0.2.0`, and a component built before links as it did
+`wasmkeep:actor@0.2.0`, and `0.4.2` the function
+`storage.delete-self-durable`; a component built before links as it did
 ([ADR 0023](adr/0023-the-front.md),
-[ADR 0025](adr/0025-calling-several-actors-at-once.md)).
+[ADR 0025](adr/0025-calling-several-actors-at-once.md),
+[ADR 0028](adr/0028-actors-that-end.md)). A component that imports an
+addition needs a host that has it: TypeScript and Python components
+import the whole `storage` interface, so those built with the `0.4.2`
+SDK need a `0.4.2` node even when they never call the new function.
 
-`wasmkeep new` (from the release after `0.4.1`) writes Rust and TypeScript
+`wasmkeep new` (from `0.4.2` on) writes Rust and TypeScript
 projects, pinned to its own version
 ([Starting a project](tutorials/first-actor.md#starting-a-project-with-wasmkeep-new));
 the other languages are to come, and start from their examples until then.

@@ -6,38 +6,33 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0` and `0.4.1`, are pre-releases for trying it, side
-projects and staging.
+`0.3.0`, `0.4.0`, `0.4.1` and `0.4.2`, are pre-releases for trying it,
+side projects and staging.
 
 ## Now
 
-**Actors that end**
-([ADR 0028](docs/adr/0028-actors-that-end.md)). Until now an actor ended
-only when its own code called `storage.delete-self`, a delete replicated
-like a plain write. Built: an operator can delete an actor (`wasmkeep
-actor delete`), `storage.delete-self-durable` returns once the delete
-is in the bucket, a class can expire actors left idle for a stated time
-(`expire-after-idle`: sessions, carts, temporary rooms), and an app can
-be deleted as a whole (`wasmkeep app delete`).
+**Data access**: an actor's data out of the cluster, and back in, while
+it runs (ADR 0033, being written). Export one actor's database as a
+plain SQLite file, at a point in time (`wasmkeep actor export`); query
+it read-only with `wasmkeep actor sql`; back up a cluster's bucket while
+the cluster runs, and restore an actor or an app to a point in time.
 
-Then **files and databases**, each with its design first: files for actors
-and the front in the app's part of the bucket, with links a browser
-uploads to and downloads from directly; static assets shipped with
-`wasmkeep deploy`, served by every node without waking any code, with a
-rule for paths that match no file (pass to the front, a single-page app's
-`index.html`, or a 404 page); and the database client in the SDKs
-beyond Rust and TypeScript (built there, below). Redirects and routes
-stay in the front's own code, with SDK helpers.
+Then **files and static assets**
+([ADR 0030](docs/adr/0030-files-and-static-assets.md), proposed): files
+for actors and the front in the app's part of the bucket, with links a
+browser uploads to and downloads from directly; static assets shipped
+with `wasmkeep deploy`, served by every node without waking any code,
+with a rule for paths that match no file (pass to the front, a
+single-page app's `index.html`, or a 404 page). Redirects and routes
+stay in the front's own code, with SDK helpers. The database client
+comes to the SDKs beyond Rust and TypeScript alongside.
 
-Then **starting a project**: `wasmkeep new`, templates that write an app
-with its `wasmkeep.toml`
-([ADR 0026](docs/adr/0026-the-project-file.md)), and a toolchain image
-that builds any SDK's components without installing each language's
-tools.
+Then **a change feed**: the changes to actors' databases, in order, to
+DuckDB, Parquet files or PostgreSQL, for analytics across many actors.
 
 Each release's notes say whether its upgrade is rolling (one node at a
 time) or stops the cluster; `0.4.0` stopped it, once, for its migration,
-and `0.4.1` rolls from `0.4.0`.
+`0.4.1` rolls from `0.4.0`, and `0.4.2` from `0.4.1`.
 
 ## Next
 
@@ -61,7 +56,8 @@ neighbour, not isolation from a hostile one
    placement at wake-up is not enough. Until then an operator moves an
    actor or drains a node ([how](docs/cluster.md)).
 6. **More buckets**: Google Cloud Storage and Azure Blob storage beside
-   S3-compatible stores, each checked by `cluster diagnose`.
+   S3-compatible stores, each checked by `cluster diagnose` (ADR 0031,
+   proposed).
 
 An actor runs on one node at a time, by design: a single actor that is too
 busy is split into more actors by its application, not by the platform.
@@ -71,11 +67,10 @@ busy is split into more actors by its application, not by the platform.
 Not before the releases above.
 
 - **Operating without the author**: mixed versions during an upgrade
-  (today every node is upgraded together, `0.4.0` to `0.4.1` aside,
-  [how](docs/cluster.md#upgrading-wasmkeep)); inspect or export one actor;
-  verify a bucket; back a cluster's bucket up to another and restore it;
-  traces; a write acknowledged once another node holds it, if measuring
-  shows it is worth its design; asynchronous handlers once WebAssembly's
+  (today every node is upgraded together, `0.4.0` to `0.4.1` and
+  `0.4.1` to `0.4.2` aside, [how](docs/cluster.md#upgrading-wasmkeep));
+  verify a bucket; traces; a write acknowledged once another node holds
+  it, if measuring shows it is worth its design; asynchronous handlers once WebAssembly's
   next system interface (WASI 0.3) is ready in Wasmtime and the SDK tools,
   keeping one event at a time per actor by default. Required before a stable `1.0`: within `1.x`,
   every upgrade is rolling, one node at a time, with no stop of the whole
@@ -96,7 +91,7 @@ Not before the releases above.
 - **Client libraries** for calling actors from existing native apps (Go,
   Java, Python, Node, Rust).
 - Ideas, each needing a design first: encrypting actor state in the
-  bucket, exporting many actors' data for analytics, composing components
+  bucket, composing components
   at deploy time, and loading a component at run time (a user's plugin,
   a tenant's script, generated code) with only the capabilities its
   caller grants; a bucket per app, so that an app's data can stay in its
@@ -113,6 +108,9 @@ Each waits for a user who needs it.
 - **Native key-value and queue interfaces**, if the SDK patterns fall
   short.
 - **Vector search** in an actor's SQLite database.
+- **External databases and brokers**: connectors from actors and fronts
+  to PostgreSQL, Redis or Valkey, MySQL and NATS servers the operator
+  runs, beyond what outbound HTTP reaches (ADR 0032, proposed).
 - **Cron triggers** (alarms cover them today) and optional built-ins: TLS
   termination, a Helm chart. Until static assets ship, serve them from
   the [front door](docs/deploy/front-door.md#static-files).
@@ -230,9 +228,6 @@ Started alongside M3; what is left of it is under [Now](#now) and
 - Durable workflows as an SDK pattern ([guide](docs/workflows.md),
   [ADR 0019](docs/adr/0019-workflows-as-an-sdk-pattern.md)): runners in
   Rust and TypeScript, clients in the Go, Python, C and Zig SDKs.
-- A database kept by one actor, as an SDK pattern ([guide](docs/database.md),
-  [ADR 0029](docs/adr/0029-a-database-client-as-an-sdk-pattern.md)): the
-  handler, the client and migrations in Rust and TypeScript.
 - In `0.3.0`, reliable enough to leave running: a request for a dead
   node's actor waits for the takeover instead of being refused; a
   snapshot upload and a restore are bounded, tried again and counted; a
@@ -264,6 +259,24 @@ Started alongside M3; what is left of it is under [Now](#now) and
   ([ADR 0027](docs/adr/0027-sockets-through-the-front.md)); several
   outbound HTTP requests at once in the Rust, TypeScript and Go SDKs
   ([languages](docs/languages.md#several-outbound-requests-at-once)).
+- In `0.4.2`, actors that end
+  ([ADR 0028](docs/adr/0028-actors-that-end.md)): an operator deletes an
+  actor (`wasmkeep actor delete`) or an app (`wasmkeep app delete`), a
+  class expires actors left idle (`expire-after-idle`), and
+  `storage.delete-self-durable` returns once the delete is in the bucket.
+- In `0.4.2`, a database kept by one actor, as an SDK pattern
+  ([guide](docs/database.md),
+  [ADR 0029](docs/adr/0029-a-database-client-as-an-sdk-pattern.md)): the
+  handler, the client and migrations in Rust and TypeScript.
+- In `0.4.2`, starting a project: `wasmkeep new` writes a Rust or
+  TypeScript app with its `wasmkeep.toml`
+  ([ADR 0026](docs/adr/0026-the-project-file.md),
+  [starting a project](docs/tutorials/first-actor.md#starting-a-project-with-wasmkeep-new)),
+  a toolchain image builds every Recommended and Supported SDK's
+  components ([the toolchain image](docs/deploy/toolchain.md)), and the
+  release carries the counter prebuilt in each of those languages.
+- In `0.4.2`, an idle node lists the bucket about 13 times less
+  ([what an idle cluster asks of the bucket](docs/cluster.md#what-an-idle-cluster-asks-of-the-bucket)).
 
 ## Stretch goal: the benchmark showdown
 

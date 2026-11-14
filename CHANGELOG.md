@@ -9,7 +9,66 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
-Since 0.4.1, in no release yet.
+Since 0.4.2, in no release yet.
+
+## 0.4.2
+
+**Actors that end, and a database kept by one actor.** An operator
+deletes one actor (`wasmkeep actor delete`) or a whole app (`wasmkeep
+app delete`); a class can expire actors left idle for a stated time
+(`expire-after-idle`); and `storage.delete-self-durable` returns only
+once the delete is in the bucket. The Rust and TypeScript SDKs make one
+actor the owner of an app's shared tables, which the app's other actors
+and its front query with bound SQL. `wasmkeep new` writes a Rust or
+TypeScript project that builds and runs the first time, and a toolchain
+image, `ghcr.io/wasmkeep/toolchain`, builds any Recommended or Supported
+SDK's components with only Podman or Docker installed. The release
+carries the counter prebuilt in each of those languages. An idle node
+lists the bucket about 13 times less (on R2 and S3 a LIST costs what a
+PUT costs). Still a **pre-alpha pre-release**. The interface between a
+component and the host stays `wasmkeep:actor@0.2.0`, with one function
+added: components built for 0.4.1 run as they are.
+
+**Upgrade: rolling**, from 0.4.1, one node at a time
+([upgrading WasmKeep](docs/cluster.md#upgrading-wasmkeep)). 0.4.2 changes
+no format 0.4.1 reads in the bucket (layout, ownership records, history,
+alarm index, intents), and signs calls between nodes as 0.4.1 does. What
+it adds, 0.4.1 never reads: delete requests (`state/<t>/<a>/deletes/`),
+`control/changed`, an app's tombstone and its `recreated` marker, and
+manifest format 4, written only for a version with an idle limit. Its
+heartbeat adds the word `ends`, which 0.4.1 ignores; its hello to peers
+gets a 404 from 0.4.1, which lists every period anyway. While both
+versions run, `cluster status` warns of mixed versions, and:
+
+- A deploy with `expire-after-idle` and `app delete` are refused while a
+  live node of the app runs 0.4.1; `actor delete` requests wait until a
+  0.4.2 node holds the actor or finds it free.
+- A 0.4.1 node cannot load a component that imports
+  `storage.delete-self-durable`, and the deploy does not check for it:
+  that node stays not ready on the version. Every TypeScript and Python
+  component built with the 0.4.2 SDK imports it, called or not (the
+  release's `counter-typescript.wasm` and `counter-python.wasm` too), as
+  do Rust, Go, C and Zig components that call it. Deploy them once every
+  node runs 0.4.2.
+- Upgrade the CLI with the nodes: a drain, an undrain or a move from the
+  0.4.1 CLI is read within a minute instead of 3 s, and the 0.4.1 CLI
+  knows nothing of idle limits or tombstones.
+- A 0.4.1 node that starts is seen by 0.4.2 peers within 30 s (sooner
+  over TLS).
+
+Going back to 0.4.1 rolls the same way while no version with an idle
+limit is current and no component that needs 0.4.2 is deployed. From
+0.4.0, upgrade to 0.4.1 first.
+
+TODO-TRIAL: the mixed-version trial (0.4.1 and 0.4.2 nodes on the three VPS, kills of either version, roll forward) goes here.
+
+Soaked on three nodes against a real bucket, a node killed every three
+minutes, for two hours on this release's code (commit `563cb94`; later
+commits change documentation, these notes and versions only):
+
+TODO-SOAK: kills, acknowledged durable writes (none lost or duplicated), failover p50/p99/max, alarms missed, stale reads, restart-to-ready, and the CSV path (bench/results/...-563cb94-soak-ovh-bhs-3vps-2h-0.4.2-rc.csv) go here.
+
+### What changed
 
 - **The counter in every Recommended and Supported language, prebuilt**:
   besides `counter.wasm` (Rust), the release carries
@@ -100,12 +159,76 @@ Since 0.4.1, in no release yet.
   leaves. Fencing, failover timings for known nodes and pin revocation are
   unchanged ([ADR 0009, 0011, 0014, 0017 and 0020](docs/adr/0020-one-lease-per-node.md),
   amendments of 2026-11-14). New metric: `wasmkeep_node_hellos_total`.
-  Upgrading from 0.4.1 is rolling, and nothing in the bucket changes
-  format. Upgrade the CLI with the nodes: `cluster drain`, `undrain` and
+  These listings change no format in the bucket. Upgrade the CLI with
+  the nodes: `cluster drain`, `undrain` and
   `actor move` of 0.4.1 do not write `control/changed`, so nodes of 0.4.2
   read their requests within a minute instead of 3 s. While both versions
   run, 0.4.1 nodes answer the hello 404 and keep listing every period, and
   0.4.2 nodes see a 0.4.1 node that starts within 30 s (sooner over TLS).
+- `wasmkeep_bucket_requests_total` counts the node's read of the app's
+  secrets every heartbeat period (`serve --app`), a GET it missed
+  before: an idle node's counted GETs go up by one a period, with no new
+  request ([three nodes at rest](docs/benchmarks.md)).
+
+- **The toolchain image**, `ghcr.io/wasmkeep/toolchain:<version>` for
+  linux/amd64 and linux/arm64: `wasmkeep` and the build tools of the Rust,
+  TypeScript, Python, Go (TinyGo), C and Zig SDKs at the versions CI uses
+  (`scripts/check-toolchain.py` keeps them equal), so a project builds with
+  only Podman or Docker installed. The release workflow builds it, tests the
+  pushed image on both platforms (`deploy/toolchain/test.sh`), and signs it
+  like the server image; the nightly workflow builds and tests it too. About
+  880 MB to download. [The toolchain image](docs/deploy/toolchain.md).
+- `wasmkeep_releases_after_lapse_total` counts every release that landed
+  while the node's lease was not valid, not only those before its lease
+  task saw the lapse: also one sent between the lease task's seeing the
+  lapse and its ending the holds (the WebSockets the lapse closes), and
+  one of a hold whose acquisition landed after the lapse. Its warning is
+  logged once per lapse, for the first such release, with the count
+  logged once the lease is valid again, instead of one line per actor.
+
+### Known limits
+
+The limits listed for 0.4.1 still hold. Also:
+
+- The database pattern and `delete-self-durable` are in the Rust and
+  TypeScript SDKs only, and `wasmkeep new` writes Rust and TypeScript
+  projects only; the other languages come later.
+- Idle expiry needs a cluster (a single node keeps no ownership
+  records, so nothing expires there), and never expires an actor whose
+  encoded name was shortened with a hash.
+- A component that imports `delete-self-durable` (every TypeScript and
+  Python component built with this SDK) needs a 0.4.2 node: during an
+  upgrade from 0.4.1, deploy it once every node runs 0.4.2.
+- An `actor delete` or an `app delete` cannot be undone, except from a
+  bucket that keeps old versions
+  ([backup and restore](docs/deploy/backup-and-restore.md)).
+- The toolchain image is about 880 MB to download; the Experimental
+  languages (standard Go, D, MoonBit, C#) are neither in it nor
+  prebuilt in the release.
+
+### Install and verify
+
+[Install](README.md#install) downloads a binary or runs the image.
+[Single node](docs/deploy/single-node.md#1-install-the-binary) shows the
+cosign check, the same for every file of the release: 36 assets, 17
+files and `SHA256SUMS`, each with its Sigstore bundle. The prebuilt
+counters `counter-typescript.wasm`, `counter-python.wasm`,
+`counter-go.wasm`, `counter-c.wasm` and `counter-zig.wasm` are checked
+the same way, for example:
+
+```bash
+f=counter-typescript.wasm
+for file in "$f" "$f.sigstore.json"; do
+  curl -fsSLO "https://github.com/WasmKeep/wasmkeep/releases/download/v0.4.2/$file"
+done
+cosign verify-blob --bundle "$f.sigstore.json" \
+  --certificate-identity https://github.com/WasmKeep/wasmkeep/.github/workflows/release.yml@refs/tags/v0.4.2 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"
+wasmkeep serve --actor counter="$f"
+```
+
+[Compose](deploy/compose/README.md) checks the server image, and
+[the toolchain image](docs/deploy/toolchain.md) its own.
 
 ## 0.4.1
 
@@ -147,15 +270,6 @@ killed was taken over by a node of the other with every write kept, and
 the last node was then rolled forward.
 
 ### What changed
-
-- **The toolchain image**, `ghcr.io/wasmkeep/toolchain:<version>` for
-  linux/amd64 and linux/arm64: `wasmkeep` and the build tools of the Rust,
-  TypeScript, Python, Go (TinyGo), C and Zig SDKs at the versions CI uses
-  (`scripts/check-toolchain.py` keeps them equal), so a project builds with
-  only Podman or Docker installed. The release workflow builds it, tests the
-  pushed image on both platforms (`deploy/toolchain/test.sh`), and signs it
-  like the server image; the nightly workflow builds and tests it too. About
-  880 MB to download. [The toolchain image](docs/deploy/toolchain.md).
 
 - **Sockets through the front**
   ([ADR 0027](docs/adr/0027-sockets-through-the-front.md)). The front
@@ -211,13 +325,6 @@ the last node was then rolled forward.
   reply was lost is not counted) with a warning in its log
   ([monitoring](docs/monitoring.md#failovers)), and pinned by a cluster
   test and a simulation (`madsim_early_release`).
-- `wasmkeep_releases_after_lapse_total` counts every release that landed
-  while the node's lease was not valid, not only those before its lease
-  task saw the lapse: also one sent between the lease task's seeing the
-  lapse and its ending the holds (the WebSockets the lapse closes), and
-  one of a hold whose acquisition landed after the lapse. Its warning is
-  logged once per lapse, for the first such release, with the count
-  logged once the lease is valid again, instead of one line per actor.
 
 ### Known limits
 

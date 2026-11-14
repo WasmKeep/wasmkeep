@@ -11,7 +11,7 @@ This follows [Your first actor](first-actor.md). Applies to: WasmKeep
 `0.4.0` and later. The front, the project file (`wasmkeep.toml`),
 `wasmkeep dev` without crate directories and `secrets set --front` are
 all new in `0.4.0`: `0.3.0` has none of them.
-From the release after `0.4.1`, `wasmkeep new todo --lang rust --front`
+From `0.4.2` on, `wasmkeep new todo --lang rust --front`
 writes an app of the same shape to start your own from: a front and an
 internal class, its project file and a README
 ([Starting a project](first-actor.md#starting-a-project-with-wasmkeep-new)).

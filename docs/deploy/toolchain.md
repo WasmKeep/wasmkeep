@@ -6,13 +6,13 @@ tools of every Recommended and Supported language
 with. With it, a project builds with nothing installed but Podman or
 Docker: no rustup, Node.js, Python or TinyGo on your machine.
 
-It is published from the release after `0.4.1` on, for linux/amd64 and
+It is published from `0.4.2` on, for linux/amd64 and
 linux/arm64, signed like the server image, and tagged with the release's
 version: use the image of the version your nodes run. The examples below
 set it once:
 
 ```bash
-v=X.Y.Z   # a release from the one after 0.4.1 on
+v=0.4.2   # the version your nodes run, 0.4.2 or later
 ```
 
 ## What is in it
@@ -103,7 +103,7 @@ in single quotes, keeps the double quotes as they are):
 ```toml
 [classes.counter]
 component = "counter/target/wasm32-wasip2/release/counter.wasm"
-build = 'podman run --rm -v "$PWD:/src" -w /src/counter ghcr.io/wasmkeep/toolchain:X.Y.Z cargo build --release --target wasm32-wasip2'
+build = 'podman run --rm -v "$PWD:/src" -w /src/counter ghcr.io/wasmkeep/toolchain:0.4.2 cargo build --release --target wasm32-wasip2'
 watch = ["counter/src", "counter/Cargo.toml"]
 ```
 
