@@ -945,6 +945,28 @@ From [`…-0f2986f-soak-r2.csv`](../bench/results/2026-11-07-0f2986f-soak-r2.csv
   [ADR 0020](adr/0020-one-lease-per-node.md) replaced them with one lease
   per node; request counts since are not measured.
 
+### Bucket requests at rest
+
+The same three VPS and bucket, on `0bf0547` (the 0.4.1 code), with no
+requests for ten minutes (602 s), read from
+`wasmkeep_bucket_requests_total` on each node
+([`…-0bf0547-idle-bucket-requests-ovh-bhs-3vps-10min.csv`](../bench/results/2026-11-14-0bf0547-idle-bucket-requests-ovh-bhs-3vps-10min.csv)).
+Per node and second: 0.334 PUT (the node lease), 1.10 LIST and 1.33 GET.
+One node also ran an alarm every 15 s, which added about 0.27 PUT and
+0.07 DELETE per second there.
+
+They follow from fixed periods in the code: the heartbeat lists `nodes/`
+and reads each node's record, and lists the drain and move intents, every
+3 s (1.0 LIST, 1.0 GET); the alarm sweep lists due alarms every 10 s
+(0.1 LIST); the deploy and secrets pointers are read every 3 s (0.67 GET).
+The secrets read was not counted when this was measured, so the GETs
+requested were about 1.67 per second; it is counted since.
+
+Three nodes at rest therefore make about 2.6 million PUTs, 8.6 million
+LISTs and 13 million GETs in a 30-day month. A bucket that bills per
+request bills a LIST like a PUT, so this is a floor under the bill before
+any traffic; a bucket that does not bill requests charges nothing for it.
+
 ## The allocator: system against mimalloc
 
 The same suite on the same workstation, twice in a row: `main` as it is
