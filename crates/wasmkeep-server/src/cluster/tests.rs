@@ -3143,3 +3143,165 @@ async fn a_landed_unresolved_wake_supersedes_the_parked_hold() {
     assert!(!a.is_parked(&x), "the superseded parked hold was kept");
     assert!(a.nothing_pending());
 }
+
+/// A gate over a fresh in-memory bucket, every fault off.
+fn quiet_gate() -> Arc<HangOneLeaseWrite> {
+    Arc::new(HangOneLeaseWrite {
+        inner: Arc::new(object_store::memory::InMemory::new()),
+        hang: std::sync::atomic::AtomicBool::new(false),
+        slow_owner_reads_ms: std::sync::atomic::AtomicU64::new(0),
+        fail_releases: std::sync::atomic::AtomicU32::new(0),
+        lose_release_replies: std::sync::atomic::AtomicU32::new(0),
+        slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
+        owner_writes: std::sync::atomic::AtomicU64::new(0),
+    })
+}
+
+/// A node with a hold on `x`, its lease task's next write hanging for its
+/// attempt: nothing publishes a validity for a while, whatever the test
+/// sets.
+async fn held_with_lease_writes_hanging(
+    gate: &Arc<HangOneLeaseWrite>,
+) -> (Arc<Cluster>, ActorAddress, LeaseHold) {
+    let store: Arc<dyn ObjectStore> = Arc::clone(gate) as Arc<dyn ObjectStore>;
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    gate.hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    (a, x, hold)
+}
+
+/// Whether `x`'s record names nobody, within a second.
+async fn released_soon(a: &Cluster, store: &Arc<HangOneLeaseWrite>, x: &ActorAddress) -> bool {
+    let key = StorePath::from(a.owner_key(x));
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(1) {
+        let body = store.inner.get(&key).await.unwrap().bytes().await.unwrap();
+        if wasmkeep_cluster::node_lease::OwnerRecord::decode(&body)
+            .unwrap()
+            .holder
+            .is_none()
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+/// ADR 0020, section 1 (amended 2026-11-14): a hold dropped after the
+/// lease task saw the lapse and before it ended the holds (the lapse hook
+/// closing sockets runs in between) is released at once, while the lease
+/// is not valid: counted, as one dropped before the lapse was seen is.
+#[tokio::test]
+async fn a_release_between_the_lapse_and_the_end_of_the_holds_is_counted() {
+    let gate = quiet_gate();
+    let (a, x, hold) = held_with_lease_writes_hanging(&gate).await;
+    let before = a.invalid_releases.total();
+    // The lease ran out, and the lease task published it: no validity,
+    // a new epoch. `end_all` has not run yet.
+    a.validity.set_until(Some(now_ms().saturating_sub(1)));
+    assert!(a.validity.publish(None), "a lapse");
+    assert_eq!(a.validity.until(), None);
+    assert!(hold.generation().is_some(), "still in its cell");
+    drop(hold);
+    assert!(released_soon(&a, &gate, &x).await, "released at once");
+    assert_eq!(a.invalid_releases.total(), before + 1);
+}
+
+/// ADR 0020, section 1: a hold registered after the lapse was seen and
+/// every hold ended (its acquisition was asked before, its write landed
+/// after) is invalid from the start; its actor drops it, and its release
+/// is sent at once, while the lease is not valid: counted.
+#[tokio::test]
+async fn a_hold_registered_after_the_lapse_is_counted_when_released() {
+    let gate = quiet_gate();
+    let (a, _, first) = held_with_lease_writes_hanging(&gate).await;
+    drop(first);
+    let y = ActorAddress::new("t", "c", "y").unwrap();
+    gate.slow_owner_writes_ms
+        .store(60, std::sync::atomic::Ordering::SeqCst);
+    let acquiring = tokio::spawn({
+        let (a, y) = (Arc::clone(&a), y.clone());
+        async move { LeaseHold::acquire(&a, &y).await }
+    });
+    // In its write (asked while the lease was valid): the lapse is seen,
+    // and every hold ends.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let before = a.invalid_releases.total();
+    a.validity.set_until(Some(now_ms().saturating_sub(1)));
+    assert!(a.validity.publish(None), "a lapse");
+    a.pending.end_all(true);
+    let late = acquiring.await.unwrap().unwrap();
+    assert!(!late.is_valid(), "valid after the lapse");
+    gate.slow_owner_writes_ms
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    drop(late);
+    assert!(released_soon(&a, &gate, &y).await, "released at once");
+    assert_eq!(a.invalid_releases.total(), before + 1);
+}
+
+/// One release while the lease is valid is not counted; one before the
+/// lapse was seen is, once.
+#[tokio::test]
+async fn a_release_is_counted_only_while_the_lease_is_not_valid() {
+    let gate = quiet_gate();
+    let (a, x, hold) = held_with_lease_writes_hanging(&gate).await;
+    let y = ActorAddress::new("t", "c", "y").unwrap();
+    let other = LeaseHold::acquire(&a, &y).await.unwrap();
+    let before = a.invalid_releases.total();
+    assert_eq!(other.release().await, LeaseReturn::Released);
+    assert_eq!(a.invalid_releases.total(), before, "counted while valid");
+    // Run out, not seen yet.
+    a.validity.set_until(Some(now_ms().saturating_sub(1)));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    assert!(released_soon(&a, &gate, &x).await);
+    assert_eq!(a.invalid_releases.total(), before + 1);
+}
+
+/// The warning for releases while the lease is not valid is logged once
+/// per lapse: for the first one since the lease was last valid, and the
+/// count of all of them once it is valid again.
+#[test]
+fn releases_while_the_lease_is_not_valid_are_logged_once_per_lapse() {
+    let r = InvalidReleases::default();
+    assert!(r.count(), "the first is logged");
+    assert!(!r.count());
+    assert!(!r.count());
+    assert_eq!(r.valid_again(), 3, "how many, once valid again");
+    assert_eq!(r.valid_again(), 0, "logged once");
+    assert!(r.count(), "the next lapse's first is logged");
+    assert_eq!(r.total(), 4);
+}
+
+/// A lapse that drops many holds at once (its WebSockets close) counts
+/// each release, and logs the first alone until the lease is valid again.
+#[tokio::test]
+async fn many_releases_in_one_lapse_are_each_counted_and_logged_once() {
+    let gate = quiet_gate();
+    let (a, _, first) = held_with_lease_writes_hanging(&gate).await;
+    let mut holds = vec![first];
+    for i in 0..4 {
+        let y = ActorAddress::new("t", "c", format!("y{i}")).unwrap();
+        holds.push(LeaseHold::acquire(&a, &y).await.unwrap());
+    }
+    let before = a.invalid_releases.total();
+    // Run out, not seen yet.
+    a.validity.set_until(Some(now_ms().saturating_sub(1)));
+    drop(holds);
+    let started = std::time::Instant::now();
+    while a.invalid_releases.total() < before + 5 {
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{} of 5 counted",
+            a.invalid_releases.total() - before
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !a.invalid_releases.count(),
+        "a sixth would be logged again before the lease is valid"
+    );
+}

@@ -808,9 +808,13 @@ async fn the_heartbeat_carries_the_nodes_load() {
 /// event that reaches its actor before its lease task sees the lapse gives
 /// the hold up, and the release lands: another node takes the actor at
 /// once, without a fence. What is checked: the release is seen only once
-/// the lease ran out, nothing is acknowledged on the node after it, and
-/// the next owner takes the actor at the next generation with every write
-/// the node acknowledged, while the node's lease object was never fenced.
+/// the lease ran out; the bucket answers it 250 ms after it landed, and
+/// no write sent to the node meanwhile is acknowledged there (the node
+/// stops acting before it sends the release, not once it is answered);
+/// and the next owner takes the actor at the next generation with every
+/// write the node acknowledged, while the node's lease object was never
+/// fenced. The count of such releases is checked by the server's unit
+/// tests, per node.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_out() {
     use object_store::ObjectStoreExt as _;
@@ -861,7 +865,9 @@ async fn a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_
         let body = String::from_utf8(body.to_vec()).unwrap();
         body.lines().nth(2).unwrap().parse::<u64>().unwrap()
     };
-    let before = wasmkeep_server_releases_after_lapse().await;
+    // b's releases land at once and are answered 250 ms later: within
+    // its release attempt (a third of ttl - safety, 266 ms).
+    flaky_b.hold_release_replies_ms.store(250, Ordering::SeqCst);
 
     // The lease task can see the lapse before any event does (the case is
     // then not exercised: the hold ends into the pending releases, which
@@ -895,11 +901,15 @@ async fn a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_
         // lapse first), so b's lease is back before a may fence it (ttl
         // plus grace, 1.2 s after its last write, and a watch).
         let mut last_ack_ms = 0;
+        let held_before = flaky_b.releases_held.load(Ordering::SeqCst);
         let released_ms = loop {
             let r = send(b.addr, "POST", &path, "").await;
             if r.status == 200 {
                 acked = r.body.trim().parse().unwrap();
                 last_ack_ms = now_ms();
+            }
+            if flaky_b.releases_held.load(Ordering::SeqCst) > held_before {
+                break Some(now_ms());
             }
             match owner_record(&store, &name).await {
                 Some((Some(holder), g)) if holder == "b" && g == generation => {}
@@ -945,12 +955,36 @@ async fn a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_
             "{name}: {}",
             String::from_utf8_lossy(&body)
         );
+        let (_, g) = owner_record(&store, &name).await.unwrap();
+        assert_eq!(g, generation, "{name}: released at another generation");
         // Seen once b's lease had run out (the time it was seen bounds the
-        // release from above only), and nothing acknowledged on b after it.
+        // release from above only).
         assert!(
             released_ms >= ran_out,
             "{name}: release seen at {released_ms}, before b's lease ran out at {ran_out}"
         );
+        // While b still waits for the release's answer, writes sent to b,
+        // one after another: none is acknowledged there.
+        while flaky_b.releases_held.load(Ordering::SeqCst) == held_before {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let held_until = flaky_b.release_held_until_ms.load(Ordering::SeqCst);
+        let mut sent_meanwhile = 0;
+        while now_ms() + 20 < held_until {
+            let r = send(b.addr, "POST", &path, "").await;
+            assert!(
+                !(r.status == 200 && r.node.as_deref() == Some("b")),
+                "{name}: b acknowledged a write while its release waited for its answer: {}",
+                r.body
+            );
+            sent_meanwhile += 1;
+        }
+        assert!(
+            sent_meanwhile >= 3,
+            "{name}: only {sent_meanwhile} writes sent while the release's answer was held"
+        );
+        // And after it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let r = send(b.addr, "POST", &path, "").await;
         assert!(
             !(r.status == 200 && r.node.as_deref() == Some("b")),
@@ -975,20 +1009,13 @@ async fn a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_
             owner_record(&store, &name).await,
             Some((Some("a".to_owned()), generation + 1))
         );
-        // Counted (the counter is the process's: other tests that cut a
-        // node's lease writes may add to it, never take from it).
-        assert!(wasmkeep_server_releases_after_lapse().await > before);
         eprintln!(
             "try {attempt}: released {} ms after b's last lease write, last acknowledgement \
-             {} ms before that",
+             {} ms before that; {sent_meanwhile} writes refused while its answer was held",
             released_ms - last_write,
             released_ms - last_ack_ms
         );
         return;
     }
     panic!("the lease task saw the lapse first three times: the case was never exercised");
-}
-
-async fn wasmkeep_server_releases_after_lapse() -> u64 {
-    super::snapshots::counter("wasmkeep_releases_after_lapse_total").await
 }

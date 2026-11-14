@@ -153,7 +153,7 @@ its first request.
 | `wasmkeep_alarm_admission_retries_total` | counter | Alarm deliveries rescheduled because resident capacity or an actor queue was full; no actor labels. |
 | `wasmkeep_node_lease_writes_total`, `wasmkeep_node_lease_failures_total` | counters | Writes of this node's lease (its heartbeat, [ADR 0020](adr/0020-one-lease-per-node.md)) that reached the bucket, and that failed or timed out. With the defaults (a write every 3 s, valid for 8 s), two failing in a row and the lease runs out: the node reports not ready. A write that hangs is counted when it times out (2.7 s), so alert on the first increment. |
 | `wasmkeep_node_fences_total` | counter | Fences this node wrote over a node that stopped renewing its lease (crashed, or cut off from the bucket). |
-| `wasmkeep_releases_after_lapse_total` | counter | Actors this node released after its own lease ran out, before its lease task saw the lapse: an event reached the actor, found its hold no longer valid and gave it up, and the release landed although the lease writes did not. Another node may take those actors at once, without a fence. Counted on the node that released them, with a warning in its log, when the release was answered: one that landed with its reply lost is not, so read it as a lower bound. See Failovers below. |
+| `wasmkeep_releases_after_lapse_total` | counter | Actors this node released while its own lease was not valid, the release landing although the lease writes did not: mostly after the lease ran out and before the lease task saw it (an event reached the actor, found its hold no longer valid and gave it up), also between the lease task's seeing the lapse and its ending the holds, and for a hold whose acquisition landed after the lapse. Another node may take those actors at once, without a fence. Counted on the node that released them, when the release was answered: one that landed with its reply lost is not, so read it as a lower bound. Its log warns at the first since the lease was last valid, and gives the count once the lease is valid again. See Failovers below. |
 | `wasmkeep_bucket_requests_total{operation,status}` | counter | Requests this node made to the bucket: cost and errors. See below. |
 | `wasmkeep_failovers_total` | counter | Actors this node took over whose ownership record still named another node, freed because that node was fenced, released or replaced by a new process. See below. |
 | `wasmkeep_history_collected_total` | counter | Objects of actors' history deleted from the bucket by garbage collection ([ADR 0012](adr/0012-bucket-garbage-collection.md)). |
@@ -214,8 +214,9 @@ gives the hold up, and that release can land ([ADR
 0020](adr/0020-one-lease-per-node.md), section 1). The node that takes the
 actor then sees an ordinary released actor and counts no failover; the
 node that released it counts it in `wasmkeep_releases_after_lapse_total`
-and logs `released an actor after this node's lease ran out` (a lower
-bound: a release whose reply was lost is not counted). With the
+(a lower bound: a release whose reply was lost is not counted) and logs
+`released an actor after this node's lease ran out` for the first one,
+then how many there were once its lease is valid again. With the
 defaults it can happen from 8 s after the send of the node's last
 acknowledged lease write: by then `wasmkeep_node_lease_failures_total`
 has counted at least one failure, though the rule on it below may not

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,11 +72,40 @@ pub(crate) fn delay_next(key: &str, ms: u64) {
     DELAYED.with(|d| d.borrow_mut().push((key.to_owned(), ms)));
 }
 
-/// Forgets every aimed delay not taken yet: a simulation calls it first,
-/// so a delay whose request was never sent cannot reach the next seed.
+thread_local! {
+    /// Requests (command, key) whose next one the bucket applies at once
+    /// and answers only that many ms later: a fault a simulation aims at
+    /// one request. See [`late_reply_next`].
+    static LATE_REPLIES: std::cell::RefCell<Vec<(String, String, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The bucket applies the next `cmd` request for `key` (`REPLACE`,
+/// `CREATE`, ...) at once, and answers it only `ms` later (once): a write
+/// that landed while its sender still waits for the answer.
+#[allow(dead_code, reason = "not every simulation aims a late reply")]
+pub(crate) fn late_reply_next(cmd: &str, key: &str, ms: u64) {
+    LATE_REPLIES.with(|d| d.borrow_mut().push((cmd.to_owned(), key.to_owned(), ms)));
+}
+
+/// Forgets every aimed delay and late reply not taken yet: a simulation
+/// calls it first, so one whose request was never sent cannot reach the
+/// next seed.
 #[allow(dead_code, reason = "not every simulation aims a delay")]
 pub(crate) fn clear_delays() {
     DELAYED.with(|d| d.borrow_mut().clear());
+    LATE_REPLIES.with(|d| d.borrow_mut().clear());
+}
+
+/// An aimed late reply for this request's command and key, taken.
+fn aimed_late_reply(request: &[u8]) -> Option<u64> {
+    let (h, _) = split_lines(request, 4);
+    let (cmd, key) = (h.get(1)?, h.get(2)?);
+    LATE_REPLIES.with(|d| {
+        let mut d = d.borrow_mut();
+        let i = d.iter().position(|(c, k, _)| c == cmd && k == key)?;
+        Some(d.remove(i).2)
+    })
 }
 
 /// An aimed delay for this request's key, taken.
@@ -110,9 +139,12 @@ pub(crate) async fn bucket_node_with(store: Store, faults: Faults) {
                 && madsim::rand::random::<u64>().is_multiple_of(faults.slow_one_in))
             .then(|| 300 + madsim::rand::random::<u64>() % 2_200)
         });
-        let late = (faults.late_reply_one_in > 0
+        let random_late = (faults.late_reply_one_in > 0
             && madsim::rand::random::<u64>().is_multiple_of(faults.late_reply_one_in))
         .then(|| 300 + madsim::rand::random::<u64>() % 1_000);
+        // After the random draws, so a simulation that aims none keeps its
+        // fault schedule.
+        let late = aimed_late_reply(&request).or(random_late);
         let (ep, store, next) = (Arc::clone(&ep), Arc::clone(&store), Arc::clone(&next));
         let serve = async move {
             if let Some(ms) = delay {
@@ -288,5 +320,55 @@ impl Bucket for EpBucket {
     ) -> Result<Version, BucketError> {
         let (_, version, _) = self.call("REPLACE", key, &expected.0, &body).await?;
         Ok(Version(version.unwrap_or_default()))
+    }
+}
+
+/// A client whose writes are refused while `cut` is set (reads still
+/// answer): a node's lease client, cut while its other clients' writes
+/// still land (a slow or throttled bucket timing the lease write out, an
+/// error on that one key).
+pub(crate) struct CutWrites {
+    pub(crate) inner: EpBucket,
+    pub(crate) cut: Arc<AtomicBool>,
+}
+
+impl CutWrites {
+    /// `inner`, never cut.
+    pub(crate) fn uncut(inner: EpBucket) -> Self {
+        Self {
+            inner,
+            cut: Arc::default(),
+        }
+    }
+
+    fn refused(&self) -> Option<BucketError> {
+        self.cut
+            .load(Ordering::SeqCst)
+            .then(|| BucketError::Unavailable("lease write refused".into()))
+    }
+}
+
+impl Bucket for CutWrites {
+    async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+        self.inner.get(key).await
+    }
+
+    async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
+        if let Some(e) = self.refused() {
+            return Err(e);
+        }
+        self.inner.create(key, body).await
+    }
+
+    async fn replace(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        expected: &Version,
+    ) -> Result<Version, BucketError> {
+        if let Some(e) = self.refused() {
+            return Err(e);
+        }
+        self.inner.replace(key, body, expected).await
     }
 }

@@ -26,7 +26,8 @@
   lapse is seen"). This was the behaviour since the first release; the
   text said every such hold went into the pending releases. It is safe
   by ordering, not by clocks, and is now counted
-  (`wasmkeep_releases_after_lapse_total`).
+  (`wasmkeep_releases_after_lapse_total`: every release that landed
+  while the node's lease was not valid, logged once per lapse).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 - Amends: [ADR 0007](0007-replication-protocol.md),
@@ -208,21 +209,33 @@ reads only the three lease lines.
   actor therefore moves 8 to about 11.7 s after that send (at 8 s for
   one with sockets open), where a fence frees it only after ttl plus
   grace (15 s) and the watch. The node that takes it sees a released
-  record and counts no failover; the node that released it counts the
-  release in `wasmkeep_releases_after_lapse_total` and logs it
-  (`released an actor after this node's lease ran out`), when the
-  release was answered: one that landed with its reply lost ends later
-  as superseded, uncounted, so the count is a lower bound. Gating the
-  first send on a valid lease, as the retries are, was weighed and not
-  taken: it would slow these hand-overs to the fence's time and buy no
-  safety. The cluster test
+  record and counts no failover. The node that released it counts, in
+  `wasmkeep_releases_after_lapse_total`, every release it sent while its
+  lease was not valid, with a hold in hand, that landed: in the window
+  above, and also once the lease task published the lapse and before it
+  ended the holds (the lapse hook closing the WebSockets runs in
+  between), and for a hold registered after that (an acquisition asked
+  before the lapse whose write landed after: invalid from the start, its
+  actor drops it, and its release is sent at once). It logs the first
+  since its lease was last valid (`released an actor after this node's
+  lease ran out`), and how many there were once the lease is valid
+  again, not a line per actor. A release counts when it was answered:
+  one that landed with its reply lost ends later as superseded,
+  uncounted, so the count is a lower bound. Gating the first send on a
+  valid lease, as the retries are, was weighed and not taken: it would
+  slow these hand-overs to the fence's time and buy no safety. The
+  cluster test
   `a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_out`
-  and the simulation `madsim_early_release` (lease writes refused for a
-  while, other writes landing, replies lost after their write landed)
-  pin it. The simulation catches a hold that keeps acting until its
-  release is answered, on a hibernation's release; on a release after a
-  lapse only with holds also acting on their cell alone, since the
-  node's own clock already stops them there.
+  (the release's answer held for 250 ms, writes to the node refused
+  meanwhile) and the simulations pin it: `madsim_early_release` (lease
+  writes refused for a while, other writes landing, replies lost after
+  their write landed, each release after a lapse answered late) and
+  `madsim_replication` with lease cuts (real uploads, late ones
+  included, checked by the final restore). They catch a hold that keeps
+  acting until its release is answered on many seeds (about a fifth to a
+  third of them in the first, a tenth in the second): on a hibernation's
+  release, and on a release after a lapse with holds also acting on
+  their cell alone, since the node's own clock already stops them there.
 - **Twins** (two processes with one id) are caught by the condition
   itself: the second writer's condition fails and its re-read shows the
   other instance.

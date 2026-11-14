@@ -364,6 +364,10 @@ pub(crate) struct Cluster {
     /// When the peers skipped for having no cluster listener were last
     /// logged (ms).
     plain_peers_logged_ms: std::sync::atomic::AtomicU64,
+    /// Releases that landed while this node's lease was not valid (ADR
+    /// 0020, section 1, amendment of 2026-11-14): counted, logged once per
+    /// lapse.
+    pub(crate) invalid_releases: lease_hold::InvalidReleases,
     /// Shared by all nodes through the bucket; fetched (or created) once.
     secret: tokio::sync::OnceCell<String>,
     pub(crate) ttl: Duration,
@@ -620,6 +624,7 @@ impl Cluster {
             conflict_logged_ms: std::sync::atomic::AtomicU64::new(0),
             refuse_plaintext,
             plain_peers_logged_ms: std::sync::atomic::AtomicU64::new(0),
+            invalid_releases: lease_hold::InvalidReleases::default(),
             tls,
             published_ms: std::sync::atomic::AtomicU64::new(0),
             secret: tokio::sync::OnceCell::new(),
