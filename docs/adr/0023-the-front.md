@@ -108,14 +108,20 @@ world front {
 3. Every other path: the front of the version the node runs. Without a
    front: `404 not found`, as today without a stateless component.
 
+`/actor/` never reaches the front. Today, on a node with no actor service
+(`serve COMPONENT` alone), `App::route` hands `/actor/...` to the
+stateless component; from 0.4.0 it answers `404 not found` there.
+
 The front is served on the public port only. It is never forwarded: a
 front request runs on the node that received it. The cluster port keeps
 serving `/actor/` and the health paths only.
 
 An upgrade request outside `/actor/` reaches the front as it reaches the
-stateless component today: a GET without `upgrade`, whose answer is never
-a `101`. 0.4.0 has no WebSocket at the front's paths (see "The WebSocket
-hand-off").
+stateless component today: a GET without `upgrade`. The host enforces
+that its answer is never an upgrade: wasmtime-wasi-http lets a guest set
+any status, `101` included, so a `1xx` status from the front is replaced
+by `500` and counted as `guest_error`. 0.4.0 has no WebSocket at the
+front's paths (see "The WebSocket hand-off").
 
 ### The front calls actors as an inside caller
 
@@ -167,9 +173,14 @@ hand-off").
   host adds to that range later. `upgrade_headers`
   (`cluster/forwarding.rs`) already strips this range from relayed
   upgrades.
-- **Requests from the front**: in `actors.call`, the host drops every
-  `x-wasmkeep-` header the front set, then sets `x-wasmkeep-actor` and
-  `x-wasmkeep-caller` itself.
+- **Requests from any guest**: `build_request` (`actor/routing.rs`),
+  shared by actors and the front, drops every `x-wasmkeep-` header the
+  guest set, then sets `x-wasmkeep-actor` and `x-wasmkeep-caller` itself.
+  Today it drops only hop-by-hop headers, `x-wasmkeep-alarm-handoff`,
+  `x-wasmkeep-take` and `x-wasmkeep-app`, and a local call reaches the
+  callee without the stripping `requests.rs` does for requests from the
+  port, so a guest-set `x-wasmkeep-forwarded` or `x-wasmkeep-node`
+  reaches the callee unchanged. One rule for every caller.
 - **Responses from the front**: the host removes every `x-wasmkeep-`
   header from the front's response before the client gets it. This
   reserves the range for the host's own answers, including the 0.5.0
@@ -212,8 +223,16 @@ wasmkeep deploy --app acme/shop --bucket s3://b/p --no-front
   the previous version's front with its classes.
 - The deploy validates the front before writing anything: it must
   instantiate against the front linker and export the incoming handler.
-  A component that imports `storage`, `alarms` or `websockets` is
-  refused.
+  A component that imports `storage`, `alarms` or `websockets`, or
+  exports any of `actor-core`'s `on-*` functions (an actor given as a
+  front by mistake), is refused.
+- A first deploy may give a front and no class (`--front` alone): the
+  app then serves its front, and its calls fail with `invalid-address`.
+  Today `write` refuses a first deploy without `--actor`; it accepts one
+  with `--front`.
+- `current` does not change: on 0.4.0 every app's `current` carries
+  token `3` (ADR 0022), which implies ADR 0013's marker, so `serve --app`
+  already takes rules from the deploys.
 - The output says `front: added`, `changed`, `removed` or `unchanged`,
   and lists each class whose rule is `open` with "reachable at
   /actor/<class>/<name>, past the front".
@@ -222,6 +241,10 @@ wasmkeep deploy --app acme/shop --bucket s3://b/p --no-front
 derived from whether the app has a front. A version deployed with flags
 keeps today's default, `open`, front or no front; `--access` sets
 another. In every manifest format, an absent `access` line means `open`.
+Format 3 also accepts an explicit `access <class> open` (formats 1 and 2
+refuse it, `Manifest::parse`), so that the project file, which writes
+every class's rule (ADR 0021), needs no further format. Deploys with
+flags keep writing `open` as absence.
 
 **Bucket.** In the version directory, beside the classes:
 
@@ -255,9 +278,11 @@ requires _front SESSION_KEY
   same bytes), so existing version ids do not change.
 - Parsing format 3: the check that every `access`, `config` and
   `requires` key is a class of the version accepts `_front` for `config`
-  and `requires` only, and only when a `front` line is present. The
-  deploy's `retain` calls on the class table keep the `_front` entries,
-  and a deploy that removes the front removes them.
+  and `requires` only, and only when a `front` line is present. Where a
+  deploy keeps the current values for the classes still there (the
+  `retain` on access and configuration, the filter that carries
+  requires over), it keeps the `_front` entries while the version keeps
+  a front, and a deploy that removes the front removes them.
 - A node or CLI that cannot parse a manifest treats the version as
   corrupt, as today (`Manifest::parse` returns `None`): such a node stays
   not ready. Hence the capability word below.
@@ -273,9 +298,13 @@ built under the same lock, from the same three layers as a class
 front it started with; the next request takes the new one.
 
 **Required values.** While a name in `--front-requires` is not set, the
-front is not instantiated: the host answers `503 <NAME> is not set`, as
-it refuses an actor's event (ADR 0016). While the node cannot open the
-app's secrets, the front answers 503 too.
+front is not instantiated: the host answers a generic `503` with
+`Retry-After: 1` ("this node cannot serve the app now; retry"), as an
+actor's outside request gets when its event is refused
+(`actor/requests.rs`). The missing name goes to the log, once (ADR
+0016), and to the `unconfigured` outcome, never to the client: the port
+faces the public. While the node cannot open the app's secrets, the
+front answers the same 503.
 
 ### Secrets
 
@@ -290,8 +319,11 @@ app's secrets, the front answers 503 too.
   older version would stop opening every secret of the app, refuse events
   and drain. So a secrets write whose resulting set has any `_front`
   entry is refused while a live node of the app does not announce the
-  capability word `front`, without `--force`. This is the same check
-  `set` makes for the word `secrets` today (`nodes_without_secrets`).
+  capability word `front`. This is the check `set` makes for the word
+  `secrets` today (`nodes_without_secrets`), with one difference: no
+  `--force`. Forcing the `secrets` check only makes older nodes serve
+  new values as unset; here every such node would stop opening all of
+  the app's secrets, refuse every event and drain.
 - **The first deploy with a front** is refused the same way, for format
   3: every deploy that writes a format 3 manifest checks the heartbeats
   first. It has no `--force`: such a node could not read the version at
@@ -301,13 +333,17 @@ app's secrets, the front answers 503 too.
 
 - **With `--app`, a positional component is refused at start.** The
   front comes from the deploy only. The error names the command:
-  `wasmkeep deploy --app T/A --front PATH`. This is the rule `--access`
-  already follows on a deployed app (`serve_app_rules`).
+  `wasmkeep deploy --app T/A --front PATH`. This is stricter than the
+  rule `--access` follows (`serve_app_rules` refuses it once the app's
+  rules come with its deploys): the refusal does not depend on what is
+  deployed.
 - **Without `--app`** (`serve COMPONENT [--actor ...]`, the implicit app
   `default/default`), the component is linked as a front: its calls reach
-  the `--actor` classes, its caller value is `default/_front/main`, and
-  `--front-env FILE` gives its values as `--env` does for a class. With
-  no `--actor`, its calls fail with `invalid-address`.
+  the `--actor` classes and its caller value is `default/_front/main`.
+  With no `--actor`, its calls fail with `invalid-address`.
+- **`--front-env FILE`**, with or without `--app`, gives the front's node
+  values, as `--env CLASS=FILE` does for a class (the third layer).
+  `--env _front=FILE` is refused: `--env` takes classes.
 
 ### Limits
 
@@ -320,9 +356,15 @@ app's secrets, the front answers 503 too.
   its own timeout.
 - **Slots**: `--max-front-requests N` bounds the front requests running
   at once on a node. The default is the part of the instance pool kept
-  from actors, `max_instances.div_ceil(10)` (100 for the default pool of
-  1,000). Past it the host answers `503` with `Retry-After: 1`, without
-  instantiating.
+  from actors today, `max_instances.div_ceil(10)` (100 for the default
+  pool of 1,000). Past it the host answers `503` with `Retry-After: 1`,
+  without instantiating. The resident actor limit becomes
+  `max_instances - max_front_requests` (at least 1) instead of
+  `resident_pool_limit(max_instances)`, so the slots are always there in
+  the pool: a larger `--max-front-requests` takes room from actors, never
+  from itself. `serve` refuses a value that leaves actors no room. The
+  front is the only short-lived instance left once the stateless
+  component becomes the front.
 - **Per actor**: at most a quarter of the slots (at least 1) may wait at
   once on calls to one actor address. Past it the call fails at once with
   `failed("front busy: too many front requests waiting on this actor")`.
@@ -403,12 +445,19 @@ it.
   `x-wasmkeep-caller`, so they now admit the app's front, which is
   intended. Their `allow(caller)` callbacks may receive
   `<tenant>/_front/main`, which is not an actor address; their docs say
-  so. An older build's code cannot tell the front from an actor without
+  so, as does the queue's delivery handler, which documents the caller as
+  the sending queue's address. The doc comment of `actors.call` in the
+  WIT (all five copies and the generated Go bindings) gains the front's
+  value. An older build's code cannot tell the front from an actor without
   the new `caller()` helper.
 - **Built stateless components** are valid fronts as they are.
 - **Old binaries.** Format 3 and the `_front` scope ship with the
-  heartbeat capability word `front` (line 11, beside `take`; unknown
-  words are ignored) and the CLI refusals above. With every node of a
+  heartbeat capability word `front` and the CLI refusals above. The word
+  goes on the capability line beside `take`: the last line of the
+  payload nodes write (`NodeInfo::payload`), line 11 of the older
+  encoding. `payload()` writes the words as a list rather than the fixed
+  `take`, `NodeInfo` gains a field beside `can_take`, and unknown words
+  stay ignored (`NodeInfo::words`). With every node of a
   cluster upgraded together, no 0.4.0 node lacks it; the word makes the
   rule checked rather than assumed, as the roadmap asks of new formats
   for 1.x.
@@ -419,7 +468,13 @@ it.
   - a client's `x-wasmkeep-*` headers no longer reach the stateless
     component, and its own `x-wasmkeep-*` response headers no longer
     reach the client;
-  - the front's CPU budget is its own flag.
+  - the front's CPU budget is its own flag;
+  - a guest's own `x-wasmkeep-*` headers on `actors.call` no longer
+    reach the callee, for actors too;
+  - `/actor/...` no longer reaches a stateless component on a node
+    without actors;
+  - the guest log names the front `actor=_front` instead of
+    `actor=stateless`.
 
 ## Consequences
 
@@ -461,8 +516,7 @@ it.
 ## Not decided here
 
 - The project file (`wasmkeep.toml`), its `[front]` section, its default
-  of `internal`, and how `deploy` and `dev` read it. Whether writing
-  `access <class> open` explicitly needs its own manifest format.
+  of `internal`, and how `deploy` and `dev` read it.
 - `wasmkeep dev` with a front.
 - Where an actor with open sockets wakes (its own ADR, a gate for
   clustered use).
