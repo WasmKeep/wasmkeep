@@ -1,0 +1,12 @@
+date,commit,host,cpu,cores,rustc,bench,median_ns,median_low_ns,median_high_ns,mean_ns,unit,thp
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/window",602,,,,"s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/put_per_node_per_s_node_a",0.334,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/put_per_node_per_s_node_b",0.334,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/put_per_node_per_s_node_c_with_alarm",0.6,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/list_per_node_per_s_node_a",1.101,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/list_per_node_per_s_node_b",1.096,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/list_per_node_per_s_node_c_with_alarm",1.158,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/get_counted_per_node_per_s_node_a",1.334,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/get_counted_per_node_per_s_node_b",1.312,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/get_counted_per_node_per_s_node_c_with_alarm",1.432,,,,"per_s","always"
+"2026-11-14","0bf0547","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","idle/delete_per_node_per_s_node_c_with_alarm",0.066,,,,"per_s","always"
