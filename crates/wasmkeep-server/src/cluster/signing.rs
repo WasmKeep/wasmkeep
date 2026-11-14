@@ -214,7 +214,9 @@ pub(super) fn valid_secret(secret: &str) -> bool {
 /// The signature of a call between nodes: HMAC-SHA256 with the cluster
 /// secret over version, timestamp, nonce, target node, method, path, the
 /// body's SHA-256, then caller, chain, the node-call markers and the app
-/// (ADR 0022), one header per line.
+/// (ADR 0022), one header per line. Header values are signed as their
+/// bytes (they cannot hold a line break), so two different values never
+/// sign alike; valid UTF-8 signs as its text did.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn signature(
     secret: &str,
@@ -228,20 +230,21 @@ pub(super) fn signature(
 ) -> String {
     use std::fmt::Write as _;
     let mut msg =
-        format!("wasmkeep-call v4\n{ts}\n{nonce}\n{to}\n{method}\n{path}\n{body_sha256}\n");
+        format!("wasmkeep-call v4\n{ts}\n{nonce}\n{to}\n{method}\n{path}\n{body_sha256}\n")
+            .into_bytes();
     // The alarm hand-off marker is signed too, when present (ADR 0014):
     // calls without it keep the same signature as before. So is the app
     // (ADR 0022): a call without it signs as an older node's did, and the
     // receiver refuses it for the missing header, not the signature.
     for name in [CALLER, CHAIN, ALARM_HANDOFF, TAKE, APP] {
         for v in headers.get_all(name) {
-            msg.push_str(name);
-            msg.push(':');
-            msg.push_str(&String::from_utf8_lossy(v.as_bytes()));
-            msg.push('\n');
+            msg.extend_from_slice(name.as_bytes());
+            msg.push(b':');
+            msg.extend_from_slice(v.as_bytes());
+            msg.push(b'\n');
         }
     }
-    let mac = hmac_sha256(secret.as_bytes(), msg.as_bytes());
+    let mac = hmac_sha256(secret.as_bytes(), &msg);
     let mut hex = String::with_capacity(64);
     for b in mac {
         let _ = write!(hex, "{b:02x}");

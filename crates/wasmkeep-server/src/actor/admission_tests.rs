@@ -364,3 +364,144 @@ async fn an_actor_of_another_tenant_never_starts() {
         .unwrap();
     assert_eq!(storage.state().tenant, "default");
 }
+
+/// A service running the test actor as class `test`, each actor's queue
+/// holding `queue_capacity` events, the class requiring `requires`.
+fn call_service(data: &std::path::Path, queue_capacity: usize, requires: &[&str]) -> ActorService {
+    use std::sync::OnceLock;
+    use wasmkeep_runtime::{Runtime, RuntimeConfig};
+    static WASM: OnceLock<Vec<u8>> = OnceLock::new();
+    let wasm = WASM.get_or_init(|| guests::build_guest("tests/guests/test-actor", "test_actor"));
+    let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
+    let component = runtime.compile(wasm).unwrap();
+    let mut config = ActorConfig::new(data);
+    config.mailbox.queue_capacity = queue_capacity;
+    if !requires.is_empty() {
+        config.requires.insert(
+            "test".into(),
+            requires.iter().map(|r| (*r).to_owned()).collect(),
+        );
+    }
+    ActorService::new(
+        runtime,
+        config,
+        vec![("test".into(), component, wasm.clone())],
+    )
+    .unwrap()
+}
+
+/// `actors.call` from `<tenant>/test/caller` to `test/<callee>`, `GET
+/// /fired`.
+async fn call_from(
+    service: &ActorService,
+    tenant: &str,
+    callee: &str,
+) -> Result<super::CallResponse, super::CallError> {
+    let ctx = super::CallContext {
+        service: None,
+        me: ActorAddress::new(tenant, "test", "caller").unwrap(),
+        chain: Arc::from(Vec::new()),
+    };
+    let request = super::CallRequest {
+        method: "GET".into(),
+        path: "/fired".into(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    within(Arc::clone(&service.inner).call(&ctx, &format!("test/{callee}"), request)).await
+}
+
+/// `wasmkeep_admission_refused_total{reason}` (this process's: nextest
+/// runs each test alone).
+fn refusals(reason: &str) -> u64 {
+    let page = crate::metrics::render(crate::metrics::Gauges::default());
+    let series = format!("wasmkeep_admission_refused_total{{reason=\"{reason}\"}} ");
+    page.lines()
+        .find_map(|l| l.strip_prefix(&series))
+        .unwrap_or_else(|| panic!("no {series}in:\n{page}"))
+        .parse()
+        .unwrap()
+}
+
+/// A call to an actor whose queue is full fails as `callee overloaded`,
+/// counted as such, and the callee serves the next call once its queue
+/// drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_to_a_full_queue_fails_as_overloaded() {
+    let data = tempfile::tempdir().unwrap();
+    let service = call_service(data.path(), 2, &[]);
+    let callee = ActorAddress::new("default", "test", "callee").unwrap();
+    // One event holds the callee; two more fill its queue.
+    let (started, running) = oneshot::channel();
+    let (release, released) = oneshot::channel::<()>();
+    let blocker = tokio::spawn(service.inner.mailboxes.submit(&callee, move |_state| {
+        Box::pin(async move {
+            let _ = started.send(());
+            let _ = released.await;
+        })
+    }));
+    within(running).await.unwrap();
+    let queued: Vec<_> = (0..2)
+        .map(|_| {
+            tokio::spawn(
+                service
+                    .inner
+                    .mailboxes
+                    .submit(&callee, |_state| Box::pin(async {})),
+            )
+        })
+        .collect();
+    let before = refusals("overloaded");
+    match call_from(&service, "default", "callee").await {
+        Err(super::CallError::Failed(e)) => assert_eq!(e, "callee overloaded"),
+        other => panic!("{:?}", other.map(|r| r.status)),
+    }
+    assert_eq!(refusals("overloaded") - before, 1);
+    assert_eq!(refusals("unavailable"), 0);
+    release.send(()).unwrap();
+    within(blocker).await.unwrap().unwrap();
+    for q in queued {
+        within(q).await.unwrap().unwrap();
+    }
+    let served = call_from(&service, "default", "callee").await.unwrap();
+    assert_eq!((served.status, served.body.as_slice()), (200, &b"0\n"[..]));
+}
+
+/// A call to an actor that cannot run now (here its class requires a
+/// value not set, ADR 0016) fails with why, counted as unavailable; the
+/// callee runs once the value is set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_to_an_actor_that_cannot_run_now_fails_as_unavailable() {
+    let data = tempfile::tempdir().unwrap();
+    let service = call_service(data.path(), 16, &["TOKEN"]);
+    let before = refusals("unavailable");
+    match call_from(&service, "default", "callee").await {
+        Err(super::CallError::Failed(e)) => assert_eq!(e, "TOKEN is not set"),
+        other => panic!("{:?}", other.map(|r| r.status)),
+    }
+    assert_eq!(refusals("unavailable") - before, 1);
+    assert_eq!(refusals("overloaded"), 0);
+    let mut secrets = crate::secrets::SecretSet::default();
+    secrets.set("test", "TOKEN", "set now").unwrap();
+    service.apply_secrets(secrets);
+    let served = call_from(&service, "default", "callee").await.unwrap();
+    assert_eq!((served.status, served.body.as_slice()), (200, &b"0\n"[..]));
+}
+
+/// A call whose callee's mailbox cannot start it fails with why, counted
+/// as unavailable. A factory refusal reaches that: here the callee would be
+/// another tenant's (ADR 0022), as the caller is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_to_an_actor_whose_state_cannot_start_fails_as_unavailable() {
+    let data = tempfile::tempdir().unwrap();
+    let service = call_service(data.path(), 16, &[]);
+    let before = refusals("unavailable");
+    match call_from(&service, "other", "callee").await {
+        Err(super::CallError::Failed(e)) => {
+            assert_eq!(e, "actor other/test/callee failed to start");
+        }
+        other => panic!("{:?}", other.map(|r| r.status)),
+    }
+    assert_eq!(refusals("unavailable") - before, 1);
+    assert_eq!(refusals("overloaded"), 0);
+}
