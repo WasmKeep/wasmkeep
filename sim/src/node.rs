@@ -349,6 +349,19 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         .await
     }
 
+    /// An idle expiry's acquisition (ADR 0028, section 4): the server's
+    /// [`Owners::acquire_unchanged`], with the record's version as listed
+    /// `listed`, through [`Self::acquire_via`].
+    pub async fn acquire_unchanged(&self, key: &str, listed: &str) -> Result<Held, AcquireError> {
+        let owners = &self.owners;
+        self.acquire_via(key, async |valid: &dyn Fn() -> bool| {
+            owners
+                .acquire_unchanged(key, |v: &Version| v.0 == listed, valid)
+                .await
+        })
+        .await
+    }
+
     /// [`Self::acquire`] with the record's read and write done by `write`
     /// (given the question to ask right before writing): for broken
     /// variants of the acquisition; the lock, the epoch and the pending

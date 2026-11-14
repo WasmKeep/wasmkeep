@@ -262,7 +262,8 @@ impl<T> Parked<T> {
                 AcquireError::Unresolved { .. }
                 | AcquireError::Unavailable
                 | AcquireError::LeaseInvalid
-                | AcquireError::Corrupt,
+                | AcquireError::Corrupt
+                | AcquireError::Changed,
             ) => None,
         }
     }
