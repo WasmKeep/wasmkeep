@@ -319,10 +319,7 @@ async fn a_node_cut_off_through_the_delete_never_writes_again() {
     .await
     .unwrap();
     assert!(done.starts_with("Deleted"), "{done}");
-    assert!(
-        said.iter().any(|l| l.contains("fenced node a")),
-        "{said:?}"
-    );
+    assert!(said.iter().any(|l| l.contains("fenced node a")), "{said:?}");
     // Back: its lease is fenced, so it never acts again; nothing of the app
     // comes back, whatever it is sent.
     down.store(false, Ordering::SeqCst);
@@ -331,5 +328,8 @@ async fn a_node_cut_off_through_the_delete_never_writes_again() {
         assert_ne!(r.status, 200, "a fenced node ran an event: {}", r.body);
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    assert_eq!(app_ref(&shared).app_keys().await.unwrap(), Vec::<String>::new());
+    assert_eq!(
+        app_ref(&shared).app_keys().await.unwrap(),
+        Vec::<String>::new()
+    );
 }
