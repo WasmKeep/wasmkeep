@@ -161,6 +161,7 @@ Since 0.3.0, in no release yet.
   (`status="error"` included), `wasmkeep_event_cuts_total`,
   `wasmkeep_forwards_total`, `wasmkeep_signatures_refused_full_total`,
   `wasmkeep_websocket_owner_closes_total`,
+  `wasmkeep_websocket_sweep_unreadable_total`,
   `wasmkeep_parked_releases_total` and the front's two counters, so
   `increase()` counts the first event. `wasmkeep_not_ready` has one series
   per reason, 1 for the reason the node is not ready and 0 for the others,
@@ -242,7 +243,10 @@ Since 0.3.0, in no release yet.
   release**: one whose release did not land was reported done, its
   request deleted, while the room stayed. Once it lands and the target
   takes the room, the sockets left on the old node close with 1012 at
-  once, not at the next owner sweep. A lapse or a clean stop no
+  once, not at the next owner sweep. An ownership record that cannot be
+  decoded no longer stops every owner sweep pass at that room: it is
+  passed over, logged once and counted in the new
+  `wasmkeep_websocket_sweep_unreadable_total{read}`. A lapse or a clean stop no
   longer writes a second release for each parked room whose sockets it
   closed ([ADR 0024](docs/adr/0024-socket-home.md)).
 - **A drain or a move no longer waits until the node stops for an actor

@@ -1605,6 +1605,59 @@ mod tests {
     /// client retry meeting the landed write: S3's 409 then 412) is read
     /// back: the record names this process at the generation tried, so
     /// the acquisition holds it, with a version that works (it releases).
+    /// Whether a record names this process, at any generation (a move of a
+    /// parked room asks after a release found the record moved on), and
+    /// the parked re-read: an undecodable record is an error for both,
+    /// never an answer.
+    #[test]
+    fn a_record_names_this_process_at_any_generation() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let record = |holder: Option<(&str, &str)>, generation| {
+            OwnerRecord {
+                holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
+                generation,
+            }
+            .encode()
+        };
+        assert_eq!(run(a.names_this_instance("owners/x")), Ok(false));
+        for (holder, names) in [
+            (Some(("a", "i1")), true),
+            (Some(("a", "i0")), false),
+            (Some(("b", "i2")), false),
+            (None, false),
+        ] {
+            mem.overwrite("owners/x", Some(&record(holder, 7)));
+            assert_eq!(
+                run(a.names_this_instance("owners/x")),
+                Ok(names),
+                "{holder:?}"
+            );
+        }
+        // At another generation than the one asked: still this process,
+        // but not the parked hold.
+        mem.overwrite("owners/x", Some(&record(Some(("a", "i1")), 7)));
+        assert_eq!(run(a.still_names_this("owners/x", 7)), Ok(true));
+        assert_eq!(run(a.still_names_this("owners/x", 6)), Ok(false));
+        assert_eq!(run(a.still_names_this("owners/y", 6)), Ok(false));
+        mem.overwrite("owners/x", Some(b"junk"));
+        assert_eq!(
+            run(a.names_this_instance("owners/x")),
+            Err(AcquireError::Corrupt)
+        );
+        assert_eq!(
+            run(a.still_names_this("owners/x", 7)),
+            Err(AcquireError::Corrupt)
+        );
+        assert_eq!(
+            run(a.other_owner("owners/x", |_, _| true)),
+            Err(AcquireError::Corrupt)
+        );
+    }
+
     #[test]
     fn an_acquire_whose_write_landed_unanswered_holds_it() {
         use crate::lease::tests::{At, Mem, run};

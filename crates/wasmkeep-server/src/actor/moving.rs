@@ -45,7 +45,22 @@ pub(super) type Active = Arc<Mutex<HashMap<String, u64>>>;
 /// 1012. By actor, with when to stop looking (ms). Looked at on every move
 /// pass, whether or not the request is still listed: the target deletes
 /// it as soon as it takes the room.
-pub(super) type Awaiting = Arc<Mutex<HashMap<ActorAddress, u64>>>;
+pub(super) type Awaiting = Arc<AwaitingRooms>;
+
+/// The rooms of [`Awaiting`], and whether a look at them is under way.
+#[derive(Default)]
+pub(super) struct AwaitingRooms {
+    rooms: Mutex<HashMap<ActorAddress, u64>>,
+    /// A look runs in its own task, one at a time: a slow bucket never
+    /// holds up the drain loop.
+    looking: std::sync::atomic::AtomicBool,
+}
+
+impl AwaitingRooms {
+    fn rooms(&self) -> std::sync::MutexGuard<'_, HashMap<ActorAddress, u64>> {
+        self.rooms.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
 
 /// A fresh token per attempt.
 static ATTEMPTS: AtomicU64 = AtomicU64::new(1);
@@ -315,7 +330,14 @@ pub(super) async fn moves_pass(
     active: &Active,
     awaiting: &Awaiting,
 ) {
-    look_at_awaiting(inner, cluster, awaiting).await;
+    if !awaiting.rooms().is_empty() && !awaiting.looking.swap(true, Ordering::AcqRel) {
+        let (inner, cluster, awaiting) =
+            (Arc::clone(inner), Arc::clone(cluster), Arc::clone(awaiting));
+        tokio::spawn(async move {
+            look_at_awaiting(&inner, &cluster, &awaiting).await;
+            awaiting.looking.store(false, Ordering::Release);
+        });
+    }
     // One move per actor: the newest key counts, the others are deleted.
     let mut newest: BTreeMap<(String, String), MoveIntent> = BTreeMap::new();
     // Only this app's moves are listed (under its root, ADR 0022).
@@ -415,11 +437,7 @@ async fn move_one(
             {
                 cluster.delete_move(intent).await;
             }
-        } else if !awaiting
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(&address)
-        {
+        } else if !awaiting.rooms().contains_key(&address) {
             // Neither resident nor parked, and not looked at by the pass
             // already: sockets left here after a parked record's release
             // are closed once another node holds the room.
@@ -486,10 +504,7 @@ async fn move_parked(
         end_move();
         let until =
             now_ms().saturating_add(u64::try_from(AWAITING_LIMIT.as_millis()).unwrap_or(u64::MAX));
-        awaiting
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(address.clone(), until);
+        awaiting.rooms().insert(address.clone(), until);
     };
     match cluster.release_parked(address, "move").await {
         Some(LeaseReturn::Released) => {}
@@ -540,7 +555,7 @@ async fn move_parked(
 #[derive(Debug, PartialEq, Eq)]
 enum Look {
     /// Nothing more to do here: its sockets are gone or closed now, or
-    /// the room is this node's again (resident, parked or held).
+    /// the room is this node's again (parked or held).
     Finished,
     /// The record names nobody or this node, or could not be read: look
     /// again on the next pass.
@@ -556,11 +571,9 @@ async fn look_after_release(
     cluster: &Cluster,
     address: &ActorAddress,
 ) -> Look {
-    let ours = |address| {
-        inner.mailboxes.contains(address)
-            || cluster.is_parked(address)
-            || cluster.holds_here(address)
-    };
+    // As the owner sweep: a mailbox here without the hold (a request
+    // forwarded, waiting) does not make the room this node's.
+    let ours = |address| cluster.is_parked(address) || cluster.holds_here(address);
     if !inner.sockets.has_open(address) || ours(address) || !cluster.node_lease_valid() {
         return Look::Finished;
     }
@@ -587,8 +600,7 @@ async fn look_after_release(
 /// once, and forgets those finished or past their limit.
 async fn look_at_awaiting(inner: &ServiceInner, cluster: &Cluster, awaiting: &Awaiting) {
     let rooms: Vec<(ActorAddress, u64)> = awaiting
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .rooms()
         .iter()
         .map(|(a, until)| (a.clone(), *until))
         .collect();
@@ -601,7 +613,7 @@ async fn look_at_awaiting(inner: &ServiceInner, cluster: &Cluster, awaiting: &Aw
             {
                 return;
             }
-            let mut awaiting = awaiting.lock().unwrap_or_else(|p| p.into_inner());
+            let mut awaiting = awaiting.rooms();
             // Unless a later move put it back meanwhile.
             if awaiting.get(&address) == Some(&until) {
                 awaiting.remove(&address);
