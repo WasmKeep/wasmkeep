@@ -40,12 +40,13 @@ impl http::Guest for Front {
             (Method::Get, "/") => page(out, "text/html; charset=utf-8", PAGE),
             (Method::Get, "/app.js") => page(out, "text/javascript; charset=utf-8", SCRIPT),
             (Method::Get, "/api") => {
+                // The client chooses Host: escape it like any input.
                 let base = format!(
-                    "{}://{}",
+                    "{}://{}/api/todos",
                     front::scheme(&request),
                     front::host(&request).unwrap_or_else(|| "localhost".into())
                 );
-                let body = format!("{{\"todos\":\"{base}/api/todos\"}}\n");
+                let body = format!("{{\"todos\":{}}}\n", json_string(&base));
                 http::respond(out, 200, "application/json", body.as_bytes());
             }
             (_, p) if p == "/api/todos" || p.starts_with("/api/todos/") => {
@@ -158,6 +159,24 @@ fn valid_user(user: &str) -> bool {
         && user
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 || c == '<' || c == '>' || c == '&' => {
+                out.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Equal, in time that depends on the lengths only.

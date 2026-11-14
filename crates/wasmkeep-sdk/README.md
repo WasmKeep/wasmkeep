@@ -136,7 +136,8 @@ The `front` module has:
   `if wasmkeep_sdk::caller(&request) != Caller::Front { /* 403 */ }`,
   which keeps a sensitive class closed if it is ever deployed `open`.
 - `host(&request)`: the request's authority, the client's `Host` (behind a
-  proxy, only if the proxy passes it).
+  proxy, only if the proxy passes it). The client chooses it, unvalidated:
+  escape it where it goes (HTML, JSON).
 - `scheme(&request)`: `"https"` when the first `X-Forwarded-Proto` value is
   `https`, else `"http"`. A client can send that header too, so it is only
   as good as the proxy in front of the node, which must replace it: use it

@@ -538,6 +538,8 @@ jobs:
           cp "$RUNNER_TEMP/python-package/counter.wasm" examples/py-counter/counter.wasm
       - name: the counter contract and the chat suite, against every language
         run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
+      - name: the todo front, in Rust and in TypeScript, with its actor
+        run: cargo nextest run -p wasmkeep-cli --test todo_front --locked
 
   docs:
     name: docs site

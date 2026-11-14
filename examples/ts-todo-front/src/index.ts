@@ -30,7 +30,8 @@ function same(a: string, b: string): boolean {
 /** The user whose token the request carries, if any. Every entry is
  * compared, whatever matches. */
 function signedIn(req: ActorRequest): string | undefined {
-  const auth = req.headers["authorization"] ?? "";
+  // The first Authorization header, as the Rust front reads it.
+  const auth = req.headerList?.find(([n]) => n === "authorization")?.[1] ?? req.headers["authorization"] ?? "";
   if (!auth.startsWith("Bearer ")) return undefined;
   const token = auth.slice("Bearer ".length).trim();
   const tokens = env.get("TOKENS");
@@ -53,6 +54,7 @@ export default defineFront({
       return "todo-front in TypeScript: the API is at /api\n";
     }
     if (req.method === "GET" && path === "/api") {
+      // The client chooses Host: JSON.stringify escapes it like any input.
       return { headers: { "content-type": "application/json" }, body: JSON.stringify({ todos: `${scheme(req)}://${host(req) ?? "localhost"}/api/todos` }) + "\n" };
     }
     if (path !== "/api/todos" && !path.startsWith("/api/todos/")) return { status: 404, body: "not found\n" };
@@ -64,6 +66,9 @@ export default defineFront({
     let call: { method: string; path: string; body?: Uint8Array };
     if (req.method === "GET" && rest === "") call = { method: "GET", path: "/" };
     else if (req.method === "POST" && rest === "") {
+      // `bytes()` reads the whole body (up to the host's 16 MiB limit):
+      // refuse a declared length past ours before reading.
+      if (Number(req.headers["content-length"] ?? 0) > MAX_BODY) return { status: 413, body: "at most 1000 bytes\n" };
       const body = req.bytes();
       if (body.length > MAX_BODY) return { status: 413, body: "at most 1000 bytes\n" };
       call = { method: "POST", path: "/", body };

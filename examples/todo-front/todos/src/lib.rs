@@ -75,7 +75,7 @@ fn list(out: ResponseOutparam) {
             let body = format!("[{}]\n", items.join(","));
             http::respond(out, 200, "application/json", body.as_bytes());
         }
-        Err(e) => http::respond(out, 500, "text/plain", format!("{e}\n").as_bytes()),
+        Err(e) => failed(out, &e),
     }
 }
 
@@ -92,7 +92,7 @@ fn add(out: ResponseOutparam, text: &str) {
                 format!("{{\"id\":{id}}}\n").as_bytes(),
             );
         }
-        Err(e) => http::respond(out, 500, "text/plain", format!("{e}\n").as_bytes()),
+        Err(e) => failed(out, &e),
     }
 }
 
@@ -100,8 +100,15 @@ fn remove(out: ResponseOutparam, id: i64) {
     match storage::exec("DELETE FROM todos WHERE id = ?1", &params![id]) {
         Ok(0) => http::respond(out, 404, "text/plain", b"not found\n"),
         Ok(_) => http::respond(out, 204, "text/plain", b""),
-        Err(e) => http::respond(out, 500, "text/plain", format!("{e}\n").as_bytes()),
+        Err(e) => failed(out, &e),
     }
+}
+
+/// A storage error: the detail to the log, a generic answer to the caller
+/// (which the front passes on to the client).
+fn failed(out: ResponseOutparam, e: &wasmkeep_sdk::SqlError) {
+    eprintln!("storage: {e}");
+    http::respond(out, 500, "text/plain", b"internal error\n");
 }
 
 /// `s` as a JSON string literal.

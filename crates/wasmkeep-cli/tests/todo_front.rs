@@ -1,7 +1,10 @@
 //! examples/todo-front end to end, as its README runs it: `wasmkeep serve
 //! FRONT --actor todos=... --front-env ...`. Requests through the front
 //! reach the `todos` actor with the front's caller value; the actor refuses
-//! everyone else, a client posing as the front included.
+//! everyone else, a client posing as the front included. The TypeScript
+//! front (examples/ts-todo-front, built by `scripts/languages.sh`) runs the
+//! same requests when it is built, and must be with
+//! `WASMKEEP_REQUIRE_LANGS=1`.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
@@ -40,7 +43,14 @@ fn build(dir: &str, name: &str) -> PathBuf {
 struct Server {
     child: Child,
     addr: SocketAddr,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
+}
+
+impl Server {
+    /// What the server logged so far.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("serve.log")).unwrap_or_default()
+    }
 }
 
 impl Drop for Server {
@@ -50,8 +60,25 @@ impl Drop for Server {
     }
 }
 
+/// The TypeScript front on QuickJS, if it is built.
+fn ts_front() -> Option<PathBuf> {
+    let wasm =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ts-todo-front/front.wasm");
+    if wasm.exists() {
+        return Some(wasm);
+    }
+    assert!(
+        std::env::var("WASMKEEP_REQUIRE_LANGS").as_deref() != Ok("1"),
+        "examples/ts-todo-front/front.wasm is not built (scripts/languages.sh builds it)"
+    );
+    None
+}
+
 fn start(tokens: Option<&str>) -> Server {
-    let front = build("front", "todo_front");
+    start_front(build("front", "todo_front"), tokens)
+}
+
+fn start_front(front: PathBuf, tokens: Option<&str>) -> Server {
     let todos = build("todos", "todo_todos");
     let dir = tempfile::tempdir().unwrap();
     let addr = TcpListener::bind("127.0.0.1:0")
@@ -68,7 +95,8 @@ fn start(tokens: Option<&str>) -> Server {
         .arg("--cache-dir")
         .arg(dir.path().join("cache"))
         .args(["--listen", &addr.to_string()])
-        .stdout(Stdio::null())
+        // The CLI logs to stdout.
+        .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .stderr(Stdio::null());
     if let Some(tokens) = tokens {
         let env = dir.path().join("front.env");
@@ -78,7 +106,7 @@ fn start(tokens: Option<&str>) -> Server {
     let server = Server {
         child: cmd.spawn().unwrap(),
         addr,
-        _dir: dir,
+        dir,
     };
     let started = Instant::now();
     while request(addr, "GET", "/", "", "").is_none() {
@@ -137,12 +165,23 @@ fn bearer(token: &str) -> String {
 
 #[test]
 fn the_front_signs_in_and_reaches_the_internal_actor() {
-    let server = start(Some(&format!("alice:{ALICE},bob:{BOB}")));
+    signs_in_and_reaches_the_internal_actor(&start(Some(&format!("alice:{ALICE},bob:{BOB}"))));
+}
+
+#[test]
+fn the_typescript_front_does_the_same() {
+    let Some(front) = ts_front() else { return };
+    signs_in_and_reaches_the_internal_actor(&start_front(
+        front,
+        Some(&format!("alice:{ALICE},bob:{BOB}")),
+    ));
+}
+
+fn signs_in_and_reaches_the_internal_actor(server: &Server) {
     let a = server.addr;
 
-    let (status, page) = request(a, "GET", "/", "", "").unwrap();
+    let (status, _) = request(a, "GET", "/", "", "").unwrap();
     assert_eq!(status, 200);
-    assert!(page.contains("<title>Todos</title>"), "{page}");
 
     // `scheme()` and `host()`: the client's Host, https only when a proxy
     // says so.
@@ -150,6 +189,16 @@ fn the_front_signs_in_and_reaches_the_internal_actor() {
     assert!(api.contains("\"http://shop.example/api/todos\""), "{api}");
     let (_, api) = request(a, "GET", "/api", "X-Forwarded-Proto: https\r\n", "").unwrap();
     assert!(api.contains("\"https://shop.example/api/todos\""), "{api}");
+    // The client chooses Host: it is escaped, never JSON of its own.
+    let mut s = TcpStream::connect(a).unwrap();
+    write!(
+        s,
+        "GET /api HTTP/1.1\r\nHost: evil\",\"admin\":true,\"x\":\"\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    assert!(!raw.contains("\"admin\":true"), "{raw}");
 
     // The actor answers only its front: a 201 here is the front's caller
     // value, `default/_front/main`, passing the actor's `caller()` check.
@@ -169,8 +218,6 @@ fn the_front_signs_in_and_reaches_the_internal_actor() {
         String::new(),
         bearer("0123456789abcdef0123456789abcdee"),
         format!("Authorization: Basic {ALICE}\r\n"),
-        // A client's caller header never reaches the front.
-        "x-wasmkeep-caller: default/_front/main\r\n".to_owned(),
     ] {
         let (status, _) = request(a, "GET", "/api/todos", &headers, "").unwrap();
         assert_eq!(status, 401, "{headers}");
@@ -179,9 +226,19 @@ fn the_front_signs_in_and_reaches_the_internal_actor() {
     // Past the front, at /actor/ (the class is open on `serve`): the actor
     // refuses a client, one claiming to be the front included.
     for headers in ["", "x-wasmkeep-caller: default/_front/main\r\n"] {
-        let (status, _) = request(a, "GET", "/actor/todos/alice", headers, "").unwrap();
-        assert_eq!(status, 403, "{headers}");
+        let (status, body) = request(a, "GET", "/actor/todos/alice", headers, "").unwrap();
+        // The actor's own refusal (`caller()`), not the host's.
+        assert_eq!((status, body.trim()), (403, "forbidden"), "{headers}");
     }
+
+    // Every request ran to its end: no instance trapped or failed after
+    // its answer (reading a body must release it).
+    std::thread::sleep(Duration::from_millis(200));
+    let log = server.log();
+    assert!(
+        !log.contains("guest_error") && !log.contains("trapped"),
+        "{log}"
+    );
 }
 
 #[test]

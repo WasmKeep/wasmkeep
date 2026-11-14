@@ -67,8 +67,10 @@ of the front (`wasmkeep secrets set --front TOKENS`).
 - **Failed calls answer 503, without the detail.** `front::unavailable`
   turns `failed` and `timeout` into `503` with `Retry-After: 1`; the
   error itself goes to the log (`eprintln!`), not to the client.
+- **Errors stay in the log.** The actor answers a storage error with a
+  generic 500 and logs the detail, since the front passes its body on.
 - **`scheme()` and `host()` are for links.** `GET /api` builds its URL
-  from them. `X-Forwarded-Proto` comes from whoever sent the request:
+  from them, and escapes it: the client chooses `Host`. `X-Forwarded-Proto` comes from whoever sent the request:
   behind a proxy that sets it ([the front door](../../docs/deploy/front-door.md))
   it is the client's scheme, without one a client chooses it. Never base
   a security decision on it.

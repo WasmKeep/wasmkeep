@@ -4,6 +4,7 @@
 
 import {
   Fields,
+  IncomingBody,
   OutgoingBody,
   OutgoingResponse,
   ResponseOutparam,
@@ -29,6 +30,12 @@ function readAll(request: IncomingRequest): Uint8Array {
     chunks.push(chunk);
     total += chunk.length;
   }
+  // Release the stream, then the body (its parent): a resource left open
+  // past the response makes the host fail the request once it ends
+  // ("resource has children"), and discard the instance.
+  (stream as unknown as Disposable)[Symbol.dispose]?.();
+  const trailers = IncomingBody.finish(body);
+  (trailers as unknown as Disposable)[Symbol.dispose]?.();
   const out = new Uint8Array(total);
   let at = 0;
   for (const c of chunks) {

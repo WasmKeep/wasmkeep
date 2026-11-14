@@ -128,7 +128,8 @@ and the request helpers, which `@wasmkeep/sdk` exports too, for actors:
   `if (caller(req).kind !== "front") return { status: 403, body: "forbidden\n" }`,
   which keeps a sensitive class closed if it is ever deployed `open`.
 - `host(req)`: the request's authority (`req.authority`), the client's
-  `Host`; behind a proxy, only if the proxy passes it.
+  `Host`; behind a proxy, only if the proxy passes it. The client chooses
+  it, unvalidated: escape it where it goes (HTML, JSON).
 - `scheme(req)`: `"https"` when the first `X-Forwarded-Proto` value is
   `https`, else `"http"`. A client can send that header too, so it is only
   as good as the proxy in front of the node, which must replace it: use it

@@ -132,7 +132,9 @@ pub fn caller(request: &IncomingRequest) -> Caller {
 
 /// The request's authority: the client's `Host`, or the authority of an
 /// absolute URI. Behind a proxy, the client's only if the proxy passes it
-/// (nginx: `proxy_set_header Host $host`).
+/// (nginx: `proxy_set_header Host $host`). The client chooses it and the
+/// host does not validate it: escape it where it goes (HTML, JSON), and
+/// check it against the names you serve before trusting it.
 pub fn host(request: &IncomingRequest) -> Option<String> {
     request.authority()
 }
