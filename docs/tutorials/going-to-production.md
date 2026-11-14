@@ -399,7 +399,7 @@ until wasmkeep cluster status --bucket "$BUCKET" | grep -q '^a .* drained '; do 
 ```
 
 ```text
-Asked a to drain; it reports `draining` within a few seconds (wasmkeep cluster status).
+Asked a to drain; it reports `draining`, then `drained` once its actors are handed over (a node with few actors may go straight to `drained`; see `wasmkeep cluster status`).
 ```
 
 Once it reports `drained`, stop it (`sudo systemctl stop wasmkeep` on
