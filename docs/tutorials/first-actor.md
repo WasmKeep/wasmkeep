@@ -168,6 +168,9 @@ The count survived because it lives in the actor's database, not in memory.
 
 ## Next
 
+- [Your first app](first-app.md) (**main only**): a front that
+  serves a page and an API over an internal class, run with `wasmkeep
+  dev`, deployed to a local bucket and rolled back.
 - [From one node to three](one-node-to-three.md): run three nodes on
   your machine, kill one and watch its actors carry on.
 - `wasmkeep dev .` rebuilds and reloads your actor every time you save,
