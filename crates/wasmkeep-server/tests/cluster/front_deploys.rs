@@ -485,7 +485,17 @@ async fn every_node_switches_fronts_with_the_version() {
     for node in [&a, &b] {
         runs_deploy(&node.service, v5.current.seq).await;
         serves(node.addr, "/self", 404, "not found").await;
-        assert_eq!(node.service.not_ready(), None);
+        // Ready again within a few heartbeats: over TLS a node can still be
+        // in its first heartbeat period ("cluster identity not published").
+        let started = std::time::Instant::now();
+        while node.service.not_ready().is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "readiness stayed {:?}",
+                node.service.not_ready()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     let r = send_reachable(b.addr, "POST", "/actor/t/x/durable", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
