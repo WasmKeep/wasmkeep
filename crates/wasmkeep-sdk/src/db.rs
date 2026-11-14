@@ -104,7 +104,8 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     /// A statement failed in the database (statement `statement`, from 0;
-    /// `None` when the commit failed). Nothing of the request was kept.
+    /// `None` when the transaction around them failed to begin or commit).
+    /// Nothing of the request was kept.
     Sql {
         /// The kind of failure, as the host reports it.
         kind: SqlErrorKind,
@@ -125,8 +126,9 @@ pub enum Error {
     },
     /// The request or its answer is over a [`Limits`] value.
     TooLarge(String),
-    /// The call to the database failed: the outcome of a write is then not
-    /// known (it may have been committed).
+    /// The call to the database failed, or its commit was kept locally but
+    /// could not be made durable: the outcome of a write is then not known
+    /// (it may have been committed).
     Call(String),
     /// The database answered something else: another status (`403` for a
     /// refused caller), or a malformed answer (status `200`).
@@ -142,7 +144,7 @@ impl fmt::Display for Error {
                 message,
             } => write!(f, "statement {i}: {} error: {message}", kind_name(*kind)),
             Error::Sql { kind, message, .. } => {
-                write!(f, "commit: {} error: {message}", kind_name(*kind))
+                write!(f, "transaction: {} error: {message}", kind_name(*kind))
             }
             Error::NotAllowed { statement, message } => {
                 write!(f, "statement {statement}: {message}")
@@ -296,6 +298,7 @@ fn decode_error(status: u16, j: &Json) -> Option<Error> {
             message,
         },
         "too-large" => Error::TooLarge(message),
+        "unknown-outcome" => Error::Call(message),
         _ => Error::Refused(status, message),
     })
 }
@@ -607,8 +610,9 @@ pub fn handle(request: IncomingRequest, out: ResponseOutparam) {
 }
 
 /// Like [`handle`], also refusing (`403`) callers for which `allow`
-/// returns `false`; it gets the caller's `tenant/class/name` (the front
-/// is `tenant/_front/main`).
+/// returns `false`; it gets the caller's `tenant/class/name` as the host
+/// sends it, the name percent-encoded (`room%201`; the front is
+/// `tenant/_front/main`).
 pub fn handle_allowing(
     request: IncomingRequest,
     out: ResponseOutparam,
@@ -712,7 +716,21 @@ fn run(limits: &Limits, write: bool, statements: &[Statement]) -> (u16, String) 
     out.push_str("]}");
     if write {
         if let Err(e) = storage::exec_durable("COMMIT", &[]) {
-            return rollback(sql_error(&e, None));
+            // A transaction still open was not committed: undo it. If none
+            // is, the commit happened locally and only its durability
+            // failed: the write may be kept, so say that, not "nothing".
+            return match storage::exec("ROLLBACK", &[]) {
+                Ok(_) => sql_error(&e, None),
+                Err(_) => (
+                    500,
+                    error_body(
+                        "unknown-outcome",
+                        None,
+                        None,
+                        &format!("the commit may have been kept: {}", e.message),
+                    ),
+                ),
+            };
         }
     } else if let Err(e) = storage::exec("ROLLBACK", &[]) {
         return sql_error(&e, None);
@@ -957,6 +975,11 @@ mod tests {
                 statement: 0,
                 message: "no".into()
             })
+        );
+        let unknown = error_body("unknown-outcome", None, None, "may be kept");
+        assert_eq!(
+            decode_reply(500, unknown.as_bytes(), &[]),
+            Err(Error::Call("may be kept".into()))
         );
         let big = error_body("too-large", None, None, "big");
         assert_eq!(

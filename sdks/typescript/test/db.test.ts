@@ -16,6 +16,7 @@ import {
   decodeRequest,
   encodeRequest,
   errorBody,
+  limitsOf,
   rowsBody,
   valueFrom,
   wireValue,
@@ -54,6 +55,15 @@ test("requests are written byte for byte as the Rust client writes them", () => 
   ]);
   assert.equal(decoded[0].rows, true);
   assert.deepEqual(decoded[1], { sql: "DELETE FROM t WHERE a = ?1", params: [{ tag: "null" }], rows: false });
+});
+
+test("bytes of any typed array bind as a blob", () => {
+  const view = new Uint8Array([9, 0, 255, 16, 9]).subarray(1, 4);
+  const other = new DataView(view.buffer, 1, 3);
+  assert.equal(
+    encodeRequest([{ sql: "x", params: [view, other as unknown as Uint8Array] }]),
+    '{"statements":[{"sql":"x","params":[{"blob":"00ff10"},{"blob":"00ff10"}],"rows":false}]}',
+  );
 });
 
 test("a safe integer binds as an integer unless tagged real; booleans as 1 or 0", () => {
@@ -164,11 +174,15 @@ test("errors are written and read as the Rust SDK does", () => {
   const commit = errorBody("sql", "FOREIGN KEY constraint failed", "constraint");
   assert.throws(
     () => decodeReply(400, enc.encode(commit), []),
-    (e: unknown) => e instanceof DbError && e.statement === undefined && e.message.startsWith("commit: "),
+    (e: unknown) => e instanceof DbError && e.statement === undefined && e.message.startsWith("transaction: "),
   );
   assert.throws(
     () => decodeReply(400, enc.encode(errorBody("not-allowed", "no", undefined, 0)), []),
     (e: unknown) => e instanceof DbError && e.kind === "not-allowed" && e.statement === 0,
+  );
+  assert.throws(
+    () => decodeReply(500, enc.encode(errorBody("unknown-outcome", "may be kept")), []),
+    (e: unknown) => e instanceof DbError && e.kind === "call" && e.message === "may be kept",
   );
   assert.throws(
     () => decodeReply(413, enc.encode(errorBody("too-large", "big")), []),
@@ -210,6 +224,14 @@ test("requests are checked against the limits", () => {
   }
   const bare = decodeRequest(enc.encode('{"statements":[{"sql":"x"}]}'), DEFAULT_LIMITS);
   assert.deepEqual(bare, [{ sql: "x", params: [], rows: false }], "params and rows may be left out");
+});
+
+test("a limit left undefined keeps its default; a bad one throws", () => {
+  assert.deepEqual(limitsOf(undefined), DEFAULT_LIMITS);
+  assert.deepEqual(limitsOf({ maxStatements: undefined, maxParams: 3 }), { ...DEFAULT_LIMITS, maxParams: 3 });
+  for (const bad of [NaN, -1, "5" as unknown as number]) {
+    assert.throws(() => limitsOf({ maxRequestBytes: bad }), RangeError);
+  }
 });
 
 test("transaction control is spotted however it is written", () => {

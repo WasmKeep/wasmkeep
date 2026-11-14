@@ -68,7 +68,7 @@ log and every SDK can speak it with what it already has.
   `{"integer":"-42"}` (decimal, `-?(0|[1-9][0-9]*)`, 64 bits),
   `{"real":"1.5"}` (as JavaScript's `String` writes a number, so the same
   bytes from Rust; also `-0`, `NaN`, `Infinity`, `-Infinity`), and
-  `{"blob":"00ff"}` (lowercase hex). Strings because a JSON number cannot
+  `{"blob":"00ff"}` (hex, written in lowercase; either case is read). Strings because a JSON number cannot
   carry a 64-bit integer to JavaScript, nor tell the real `2.0` from the
   integer `2`. Text is valid Unicode: a lone surrogate is refused.
 - **Answer** (200): `{"results":[R,...]}`, one per statement, in order:
@@ -86,11 +86,12 @@ log and every SDK can speak it with what it already has.
   | 403 | `forbidden` | The caller is outside, or `allow` refused it |
   | 404, 405 | `not-found`, `method` | Another path, or not `POST` |
   | 413 | `too-large` | The request or its answer is over a limit |
+  | 500 | `unknown-outcome` | The commit happened locally but could not be made durable (the bucket upload or the fsync failed): the write may be kept |
 
   The clients turn these into errors (`db::Error`, `DbError`): `Sql`
   with the kind and statement, `NotAllowed`, `TooLarge`, `Call` (the call
-  failed: a write may have been committed), `Refused` (anything else,
-  `403` included).
+  failed, or `unknown-outcome`: a write may have been committed),
+  `Refused` (anything else, `403` included).
 
 ### Transactions
 
@@ -100,7 +101,10 @@ statement's error, so a batch is kept whole or not at all. A write
 request ends with a durable `COMMIT` (`exec-durable`: in the bucket in a
 cluster, fsynced on one node), so an answered write survives the loss of
 the node; a commit that fails (a deferred foreign key, say) rolls back
-too. A **read** request ends with `ROLLBACK`: it can never change the
+too. One failure is different: a commit that SQLite made but whose
+upload or fsync then failed. The transaction is no longer open, so the
+handler cannot undo it, and answers `unknown-outcome` rather than an
+error that would claim nothing was kept. A **read** request ends with `ROLLBACK`: it can never change the
 database, whatever its SQL does (a `DELETE ... RETURNING` sent as a read
 is undone). That is how read-only is enforced; no guess is made from the
 SQL text.
@@ -134,7 +138,8 @@ record in `wasmkeep_db_migrations (version, sql, applied_at)`. The list
 is append-only: a recorded migration whose text changed, or more records
 than the list holds (an older component deployed over a newer database),
 fails init, and nothing is applied. A migration may not control the
-transaction either.
+transaction either. The table is an ordinary one, so callers' SQL can
+reach it: leave it alone (a deleted record fails the next init).
 
 ### Security: SQL from your code, never from a client
 
@@ -144,7 +149,9 @@ because its callers are the app's own code:
 - **Inside callers only.** The handler answers only requests carrying
   `x-wasmkeep-caller`, which the host sets on `actors.call` (from an
   actor or the app's front) and strips from every outside request; anyone
-  else gets `403`. Serve the class `internal` as well (the project file's
+  else gets `403`. `allow` sees the caller as the host sends it,
+  `tenant/class/name` with the name percent-encoded (`room%201`). Serve
+  the class `internal` as well (the project file's
   default; `--access db=internal`), so an outside request never creates
   an actor. `handle_allowing` narrows the callers further (only the
   front, only one class).
@@ -197,3 +204,6 @@ because its callers are the app's own code:
   budget on every request.
 - The format is JSON with tagged values, a little larger than KV's binary
   framing, in exchange for exact values in every SDK and readable logs.
+  Reals are written as ECMAScript's `Number::toString` writes them (the
+  closest of the shortest strings that read back), which the Rust SDK
+  reproduces (compared with node on two million doubles).

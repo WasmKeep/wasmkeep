@@ -59,6 +59,19 @@ export const DEFAULT_LIMITS: Limits = {
   maxResponseBytes: 8 * 1024 * 1024,
 };
 
+/** The limits, each left out (or `undefined`) at its default. A value that
+ * is not a non-negative number throws: a limit must never turn into none. */
+export function limitsOf(given: Partial<Limits> | undefined): Limits {
+  const limits: Limits = { ...DEFAULT_LIMITS };
+  for (const key of Object.keys(DEFAULT_LIMITS) as (keyof Limits)[]) {
+    const v = given?.[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || Number.isNaN(v) || v < 0) throw new RangeError(`limit ${key} must be a number >= 0`);
+    limits[key] = v;
+  }
+  return limits;
+}
+
 export type SqlErrorKind =
   | "syntax"
   | "constraint"
@@ -81,12 +94,13 @@ const KINDS: readonly string[] = [
 /** Why a database request failed, as `kind`:
  *
  * - `sql`: a statement failed in the database (`statement`, from 0;
- *   undefined when the commit failed), with the host's `sqlKind`. Nothing
- *   of the request was kept;
+ *   undefined when the transaction failed to begin or commit), with the
+ *   host's `sqlKind`. Nothing of the request was kept;
  * - `not-allowed`: statement `statement` controls the transaction
  *   (`BEGIN`, `COMMIT`, ...), refused before anything ran;
  * - `too-large`: the request or its answer is over a limit;
- * - `call`: the call failed. A write may then have been committed;
+ * - `call`: the call failed, or the commit was kept locally but could not
+ *   be made durable. A write may then have been committed;
  * - `refused`: any other answer (`status`: 403 for a refused caller, 200
  *   for a malformed answer). */
 export class DbError extends Error {
@@ -104,7 +118,7 @@ export class DbError extends Error {
     super(
       kind === "sql"
         ? extra.statement === undefined
-          ? `commit: ${extra.sqlKind} error: ${detail}`
+          ? `transaction: ${extra.sqlKind} error: ${detail}`
           : `statement ${extra.statement}: ${extra.sqlKind} error: ${detail}`
         : kind === "not-allowed"
           ? `statement ${extra.statement}: ${detail}`
@@ -146,7 +160,7 @@ export function wellFormed(s: string): boolean {
 }
 
 function isTagged(v: unknown): v is Value {
-  return typeof v === "object" && v !== null && !(v instanceof Uint8Array) && typeof (v as Value).tag === "string";
+  return typeof v === "object" && v !== null && !ArrayBuffer.isView(v) && typeof (v as Value).tag === "string";
 }
 
 /** A parameter as a SQL value: a safe integer (up to 2^53 - 1) is an
@@ -158,7 +172,9 @@ export function toValue(v: Param | undefined): Value {
   if (typeof v === "bigint") return { tag: "integer", val: v };
   if (typeof v === "number") return Number.isSafeInteger(v) ? { tag: "integer", val: BigInt(v) } : { tag: "real", val: v };
   if (typeof v === "string") return { tag: "text", val: v };
-  if (v instanceof Uint8Array) return { tag: "blob", val: v };
+  // Any realm's bytes: on StarlingMonkey, blobs read from `storage` are
+  // Uint8Arrays of another realm, which `instanceof` does not recognize.
+  if (ArrayBuffer.isView(v)) return { tag: "blob", val: new Uint8Array(v.buffer, v.byteOffset, v.byteLength) };
   throw new TypeError(`not a SQL value: ${typeof v}`);
 }
 
@@ -431,6 +447,8 @@ function decodeError(status: number, j: unknown): DbError | undefined {
       return new DbError("not-allowed", message, { statement });
     case "too-large":
       return new DbError("too-large", message);
+    case "unknown-outcome":
+      return new DbError("call", message);
     default:
       return new DbError("refused", message, { status });
   }

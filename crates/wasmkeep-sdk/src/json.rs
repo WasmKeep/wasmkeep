@@ -7,12 +7,16 @@
 //! Reading follows `JSON.parse` where the two could differ: a repeated
 //! key keeps its last value, and numbers are read as `f64`. Unlike it, a
 //! `\u` escape of a lone surrogate is refused (a Rust string cannot hold
-//! one), and nesting is capped at [`MAX_DEPTH`].
+//! one), nesting is capped at [`MAX_DEPTH`] and an object's members at
+//! [`MAX_MEMBERS`].
 
 use std::fmt::Write as _;
 
 /// How deep arrays and objects may nest. The db protocol needs four.
 pub(crate) const MAX_DEPTH: usize = 16;
+
+/// Members one object may have. The db protocol's have at most four.
+pub(crate) const MAX_MEMBERS: usize = 64;
 
 /// A parsed JSON value. Object members keep their order; a repeated key
 /// keeps its last value (as `JSON.parse`).
@@ -161,7 +165,12 @@ impl Parser<'_> {
                     self.eat(b":")?;
                     let value = self.value(depth + 1)?;
                     // As `JSON.parse`: the last of a repeated key wins.
+                    // The protocol's objects are small: a cap keeps this
+                    // linear search from going quadratic.
                     members.retain(|(k, _)| *k != key);
+                    if members.len() >= MAX_MEMBERS {
+                        return None;
+                    }
                     members.push((key, value));
                     self.ws();
                     match self.peek()? {
@@ -322,12 +331,22 @@ pub(crate) fn number_to_string(v: f64) -> String {
     if v == 0.0 {
         return if v.is_sign_negative() { "-0" } else { "0" }.into();
     }
-    // Rust's `{:e}` is the shortest round-trip digits: `d[.ddd]e<exp>`.
-    let sci = format!("{:e}", v.abs());
+    // Rust's `{:e}` gives the fewest digits that read back as `v`. When
+    // several strings of that length do, ECMAScript takes the one closest
+    // to `v`: the value correctly rounded to that many digits, which
+    // `{:.N$e}` computes exactly (and which reads back too, being closer).
+    let shortest = format!("{:e}", v.abs());
+    let len = shortest
+        .split_once('e')
+        .map_or(1, |(m, _)| m.bytes().filter(u8::is_ascii_digit).count());
+    let sci = format!("{:.*e}", len.saturating_sub(1), v.abs());
     let Some((mantissa, exp)) = sci.split_once('e') else {
         return sci;
     };
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let mut digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
     let Ok(exp) = exp.parse::<i32>() else {
         return sci;
     };
@@ -435,6 +454,16 @@ mod tests {
         assert!(parse(&deep).is_some());
         let deeper = "[".repeat(MAX_DEPTH + 1) + &"]".repeat(MAX_DEPTH + 1);
         assert_eq!(parse(&deeper), None);
+        let object = |n: usize| {
+            let members: Vec<String> = (0..n).map(|i| format!("\"k{i}\":0")).collect();
+            format!("{{{}}}", members.join(","))
+        };
+        assert!(parse(&object(MAX_MEMBERS)).is_some());
+        assert_eq!(parse(&object(MAX_MEMBERS + 1)), None, "too many members");
+        assert!(
+            parse(r#"{"a":1,"a":2,"a":3}"#).is_some(),
+            "repeats do not count"
+        );
     }
 
     #[test]
@@ -493,6 +522,8 @@ mod tests {
             (-0.0, "-0"),
             (f64::INFINITY, "Infinity"),
             (f64::NEG_INFINITY, "-Infinity"),
+            // Two shortest strings read back; JavaScript takes the closer.
+            (f64::from_bits(0x42d8_ffff_f2f9_52c8), "109951159362891.12"),
         ];
         for (v, s) in cases {
             assert_eq!(number_to_string(*v), *s, "{v:e}");

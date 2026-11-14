@@ -67,11 +67,11 @@ export default db.define({
   transaction, recorded in the table `wasmkeep_db_migrations`. Only ever
   append to the list: an edited entry, or a component listing fewer
   migrations than the database has applied, fails init and applies
-  nothing.
+  nothing. Leave that table alone in your own SQL.
 - **Who may call**: `db::handle_allowing(request, out, |caller| ...)`
   (TypeScript: `allow` in `db.define` or `db.handle`) refuses callers
-  you do not list; it gets `tenant/class/name`, the front being
-  `tenant/_front/main`.
+  you do not list; it gets `tenant/class/name` as the host sends it, the
+  name percent-encoded (`room%201`), the front being `tenant/_front/main`.
 - **Limits**: `db::handle_with(&limits, ...)` (TypeScript: `limits`)
   changes the caps below.
 
@@ -135,8 +135,9 @@ main.read([{ sql: "SELECT COUNT(*) FROM todos", rows: true }]);
 - **Errors**: `db::Error` / `DbError` with a kind: `Sql` / `"sql"`
   (which statement, or the commit, and the host's kind: `constraint`,
   `syntax`, ...), `NotAllowed` (a statement controls the transaction),
-  `TooLarge`, `Call` (the call failed: a write may have been committed,
-  so re-read before retrying one that is not idempotent) and `Refused`
+  `TooLarge`, `Call` (the call failed, or the commit was kept locally but
+  could not be made durable: a write may have been committed, so re-read
+  before retrying one that is not idempotent) and `Refused`
   (`403` from a caller the database refuses, or a malformed answer).
 - **Names**: a database is named by its actor address. If the name comes
   from a request (one database per tenant), check it against the names
@@ -153,7 +154,9 @@ of them).
   sees every write answered before it.
 - **Each request is one transaction.** A batch is kept whole or not at
   all; the first failing statement rolls everything back, and so does a
-  failing commit (a deferred foreign key, say). Statements that control
+  failing commit (a deferred foreign key, say). The exception is a commit
+  SQLite made whose upload or fsync then failed: the client gets `Call`
+  (outcome unknown), never an error saying nothing was kept. Statements that control
   the transaction (`BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`,
   `RELEASE`) are refused before anything runs.
 - **Reads never write.** A read request runs in a transaction that is

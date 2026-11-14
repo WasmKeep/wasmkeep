@@ -43,6 +43,7 @@ import {
   WRITE,
   controlsTransaction,
   decodeRequest,
+  limitsOf,
   errorBody,
   rowsBody,
   utf8Length,
@@ -68,7 +69,8 @@ export interface HandlerOptions {
   /** Caps on each request; the rest stay at `DEFAULT_LIMITS`. */
   limits?: Partial<Limits>;
   /** Refuses (403) callers for which this returns false. It gets the
-   * caller's `tenant/class/name` (the front is `tenant/_front/main`). */
+   * caller's `tenant/class/name` as the host sends it, the name
+   * percent-encoded (`room%201`; the front is `tenant/_front/main`). */
   allow?: (caller: string) => boolean;
 }
 
@@ -152,7 +154,15 @@ function run(limits: Limits, write: boolean, statements: Decoded[]): ActorRespon
     if (write) wkStorage.execDurable("COMMIT", []);
     else wkStorage.exec("ROLLBACK", []);
   } catch (e) {
-    if (write) rollback();
+    if (!write) return sqlError(failure(e));
+    // A transaction still open was not committed: undo it. If none is, the
+    // commit happened locally and only its durability failed: the write may
+    // be kept, so say that, not "nothing".
+    try {
+      wkStorage.exec("ROLLBACK", []);
+    } catch {
+      return answer(500, errorBody("unknown-outcome", `the commit may have been kept: ${failure(e).message}`));
+    }
     return sqlError(failure(e));
   }
   return answer(200, parts.join(""));
@@ -162,7 +172,7 @@ function run(limits: Limits, write: boolean, statements: Decoded[]): ActorRespon
  * outside clients (without `x-wasmkeep-caller`) get 403: only the app's
  * actors and its front may use the database. */
 export function handle(req: ActorRequest, options: HandlerOptions = {}): ActorResponse {
-  const limits: Limits = { ...DEFAULT_LIMITS, ...options.limits };
+  const limits = limitsOf(options.limits);
   const caller = header(req.headers, "x-wasmkeep-caller");
   if (caller === undefined || (options.allow !== undefined && !options.allow(caller))) {
     return answer(403, errorBody("forbidden", "only the app's actors and its front may use this database"));
