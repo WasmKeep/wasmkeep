@@ -17,6 +17,10 @@
 #   Grafana import: they need the real machines and a Prometheus.
 # - Backups, the restore drill and upgrades: they stop a real cluster and
 #   copy a real bucket with tools of the reader's choice.
+# - The series the page says appear only once they count
+#   (wasmkeep_failover_waits_total, wasmkeep_not_ready,
+#   wasmkeep_bucket_requests_total{status="error"}): the practice cluster
+#   loses no node and no bucket request.
 # - Stopping the drained node with systemctl: the practice nodes are not
 #   services; the page's undrain block runs on the drained node instead.
 
@@ -135,18 +139,16 @@ done
 run drain
 expect_status 0
 expect '^Asked a to drain'
-status_shows_a_serving() {
-  wasmkeep cluster status --bucket "$BUCKET" | grep -Eq '^a +yes +[0-9.]+m?s +serving '
-}
+# The page: a drained node still reports ready.
+[ "$(curl -s localhost:8081/_wasmkeep/ready)" = ready ] || fail "drained a does not report ready"
+echo "  ok: drained a reports ready"
 run undrain
 expect_status 0
 expect '^Withdrew the drain request for a\.$'
-start=$SECONDS
-until status_shows_a_serving; do
-  [ $((SECONDS - start)) -lt 30 ] || fail "a is not serving 30 s after the undrain"
-  sleep 1
-done
-echo "  ok: a serving again"
+status_shows_a_serving() {
+  printf '%s\n' "$OUT" | grep -Eq '^a +yes +[0-9.]+m?s +serving '
+}
+run_until 30 status status_shows_a_serving
 
 # 11. Clean up.
 run cleanup

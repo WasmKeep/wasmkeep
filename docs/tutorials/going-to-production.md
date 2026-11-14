@@ -39,7 +39,7 @@ wasmkeep deploy --app "$APP" --bucket "$BUCKET" --actor counter=counter.wasm
 ```
 
 Start the three nodes with the two flags a production node also gets: a
-metrics page and the secrets key (steps 6 and 8 say why):
+metrics page and the secrets key (steps 5 and 7 say why):
 
 <!-- test: practice-nodes -->
 ```bash
@@ -332,13 +332,17 @@ wasmkeep_admission_refused_total{reason="wrong_app"} 0
 | Failover waits: `wasmkeep_failover_waits_total{outcome}` | Requests kept while a node died; `expired` and `over_cap` are callers who got a 503 ([what each outcome means](../monitoring.md#metrics)) | Not yet: add a rule on `increase(wasmkeep_failover_waits_total{outcome=~"expired\|over_cap"}[15m]) > 0` |
 | Refused admissions: `wasmkeep_admission_refused_total{reason}` | Requests refused before they ran: `capacity` and `overloaded` (the node is full), `unavailable` (a required value not set, secrets the node cannot open), `wrong_app` (**main only**) | Not yet: add a rule on `increase(wasmkeep_admission_refused_total{reason!="access"}[15m]) > 0` |
 
-  The rules also fire on fences and failovers (`WasmKeepNodeFenced`,
+  The two added expressions are starting points, not tested rules:
+  `unavailable` can count a few refusals while nodes catch up with a
+  deploy or a secrets change, so give such a rule a `for:` or a
+  threshold that fits your traffic. The rules also fire on fences and failovers (`WasmKeepNodeFenced`,
   `WasmKeepFailover`), slow durable writes and failing events. The
   dashboard does not chart the last two rows yet: query them in
   Prometheus.
-- [ ] **Each alert seen once**: stop one node (`systemctl stop
-  wasmkeep`) at a quiet hour and check that the not-ready alert reaches
-  whoever is paged, then start it again.
+- [ ] **An alert seen once**: stop one node (`systemctl stop
+  wasmkeep`) at a quiet hour, check that `WasmKeepNodeDown` reaches
+  whoever is paged after a minute (a stopped node exports nothing, so
+  this is the rule that sees it), then start it again.
 
 ## 8. Backups
 
