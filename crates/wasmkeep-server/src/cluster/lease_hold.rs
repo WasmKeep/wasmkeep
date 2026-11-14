@@ -19,7 +19,7 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) use wasmkeep_cluster::holds::PendingEntry;
-use wasmkeep_cluster::holds::{Parked, Validity};
+use wasmkeep_cluster::holds::{Parked, Retried, Validity};
 use wasmkeep_cluster::node_lease::{AcquireError, Hold, Released};
 
 use super::*;
@@ -130,11 +130,13 @@ fn parked_moved(before: usize, after: usize) {
 }
 
 impl Pending {
+    /// Adds an entry; an unresolved acquire of the same write already
+    /// there is kept once ([`wasmkeep_cluster::holds::add`]).
     pub(super) fn push(&self, entry: PendingEntry) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(entry);
+        wasmkeep_cluster::holds::add(
+            &mut self.entries.lock().unwrap_or_else(|p| p.into_inner()),
+            entry,
+        );
     }
 
     /// Whether no release or acquire waits for its outcome, none is in
@@ -147,6 +149,22 @@ impl Pending {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
+            && self.parked().is_empty()
+    }
+
+    /// Whether no release waits for its outcome or is in flight, and no
+    /// record is parked: what a clean stop waits for before it writes the
+    /// node lease `released`. Unresolved acquires are not waited for: that
+    /// write frees a record one of them left naming this node, landed or
+    /// still to land, as it frees one whose release did not land.
+    fn releases_empty(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0
+            && self
+                .entries
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .all(|e| matches!(e, PendingEntry::Unresolved { .. }))
             && self.parked().is_empty()
     }
 
@@ -414,10 +432,10 @@ impl LeaseHold {
                 owner: node,
                 until_ms: now_ms().saturating_add(cluster.lease_config.ttl_ms()),
             }),
-            Err(AcquireError::Unresolved { generation }) => {
-                cluster
-                    .pending
-                    .push(PendingEntry::Unresolved { key, generation });
+            Err(e @ AcquireError::Unresolved { .. }) => {
+                if let Some(entry) = PendingEntry::unresolved(&cluster.owners, &key, &e) {
+                    cluster.pending.push(entry);
+                }
                 Err(OwnershipError::Unavailable(
                     "the ownership record's write has no answer; retry".into(),
                 ))
@@ -560,6 +578,26 @@ const RELEASE_TRIES: Duration = Duration::from_secs(1);
 /// Pending entries a pass tries at once.
 const PENDING_CONCURRENCY: usize = 32;
 
+/// What one try of a pending entry in a pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tried {
+    Ended,
+    /// Refused, unanswered, or not tried (the lease invalid, the pass
+    /// throttled).
+    Refused,
+    /// An unresolved acquire still waiting for its unchanged record.
+    Waiting,
+}
+
+/// What a pass over the pending set did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Pass {
+    /// Some entry ended.
+    pub(super) ended: bool,
+    /// Some entry was refused, unanswered, or not tried.
+    pub(super) refused: bool,
+}
+
 impl LeaseHold {
     /// Releases the hold now, trying for up to a second, then leaving it
     /// pending. Unlike dropping the hold, the caller knows when another
@@ -584,12 +622,16 @@ impl LeaseHold {
             match sent {
                 Released::Released => return LeaseReturn::Released,
                 Released::Superseded => return LeaseReturn::Superseded,
-                Released::Pending if tokio::time::Instant::now() >= deadline => {
+                Released::Pending | Released::Unchanged
+                    if tokio::time::Instant::now() >= deadline =>
+                {
                     tracing::warn!(key = %hold.key, "releasing an actor failed; retried in the background");
                     cluster.pending.push(PendingEntry::Release(hold));
                     return LeaseReturn::Pending;
                 }
-                Released::Pending => tokio::time::sleep(Duration::from_millis(250)).await,
+                Released::Pending | Released::Unchanged => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
         }
     }
@@ -638,14 +680,14 @@ impl Cluster {
         &self,
         entry: PendingEntry,
         held_here: impl Fn(&str, u64) -> bool,
-    ) -> Option<PendingEntry> {
+    ) -> Retried {
         let again = entry.clone();
         tokio::time::timeout(
             self.lease_attempt,
             wasmkeep_cluster::holds::retry(&self.owners, entry, held_here),
         )
         .await
-        .unwrap_or(Some(again))
+        .unwrap_or(Retried::Pending(again))
     }
 
     /// How long a release made in the foreground (hibernation, a
@@ -802,10 +844,12 @@ impl Cluster {
 
     /// Waits until no release is pending or in flight, or `limit` passes.
     /// A node shutting down calls it after its actors stopped, so the
-    /// releases reach the bucket before it writes `released`.
+    /// releases reach the bucket before it writes `released` (which frees
+    /// what an unresolved acquire may have left: those are not waited for,
+    /// [`Pending::releases_empty`]).
     pub(crate) async fn releases_done(&self, limit: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + limit;
-        while !self.pending.is_empty() {
+        while !self.pending.releases_empty() {
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
@@ -816,10 +860,12 @@ impl Cluster {
 
     /// One pass over the pending set: each release sent again, each
     /// unresolved acquire read (under its actor's lock) and released if it
-    /// landed and no hold of it exists here. Nothing while this node's
-    /// lease is not valid.
-    /// `true` if some entry ended (landed, or found superseded).
-    pub(super) async fn retry_pending(&self) -> bool {
+    /// landed and no hold of it exists here, kept while its record is
+    /// unchanged and its wait lasts. Nothing while this node's lease is
+    /// not valid.
+    /// Whether some entry ended (landed, or found superseded), and whether
+    /// some was refused or not tried.
+    pub(super) async fn retry_pending(&self) -> Pass {
         if !self.node_lease_valid()
             || self
                 .pending
@@ -828,7 +874,10 @@ impl Cluster {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
         {
-            return false;
+            return Pass {
+                ended: false,
+                refused: true,
+            };
         }
         // For the whole pass: the entries are out of the set while they are
         // tried, and the set must not read as empty meanwhile (a drain
@@ -854,15 +903,15 @@ impl Cluster {
         use futures_util::StreamExt as _;
         let refused_in_a_row = AtomicUsize::new(0);
         let refused_in_a_row = &refused_in_a_row;
-        let outcomes: Vec<bool> = futures_util::stream::iter(entries)
+        let outcomes: Vec<Tried> = futures_util::stream::iter(entries)
             .map(|entry| async move {
                 if !self.node_lease_valid()
                     || refused_in_a_row.load(Ordering::SeqCst) >= PENDING_CONCURRENCY
                 {
                     self.pending.push(entry);
-                    return false;
+                    return Tried::Refused;
                 }
-                let still = match entry {
+                let retried = match entry {
                     entry @ PendingEntry::Release(_) => {
                         self.retry_bounded(entry, |_, _| false).await
                     }
@@ -870,46 +919,61 @@ impl Cluster {
                         let lock = self.pending.lock_of(entry.key());
                         let _locked = lock.lock().await;
                         let (key, tried) = match &entry {
-                            PendingEntry::Unresolved { key, generation } => {
-                                (key.clone(), *generation)
-                            }
+                            PendingEntry::Unresolved {
+                                key, generation, ..
+                            } => (key.clone(), *generation),
                             PendingEntry::Release(_) => unreachable!("matched above"),
                         };
-                        let still = self
+                        let retried = self
                             .retry_bounded(entry, |key, generation| {
                                 self.pending.held_at(key, generation)
                             })
                             .await;
-                        if still.is_none() {
+                        if retried == Retried::Ended {
                             self.forget_parked_behind(&key, tried).await;
                         }
-                        still
+                        retried
                     }
                 };
-                match still {
-                    Some(entry) => {
+                match retried {
+                    Retried::Pending(entry) => {
                         self.pending.push(entry);
                         refused_in_a_row.fetch_add(1, Ordering::SeqCst);
-                        false
+                        Tried::Refused
                     }
-                    None => {
+                    // The bucket answered a read: not a refusal, though the
+                    // entry stays (its record unchanged, its wait not
+                    // over). Nor proof that writes go through: the count of
+                    // refusals in a row is left as it is.
+                    Retried::Waiting(entry) => {
+                        self.pending.push(entry);
+                        Tried::Waiting
+                    }
+                    Retried::Ended => {
                         refused_in_a_row.store(0, Ordering::SeqCst);
-                        true
+                        Tried::Ended
                     }
                 }
             })
             .buffer_unordered(PENDING_CONCURRENCY)
             .collect()
             .await;
-        outcomes.into_iter().any(|ended| ended)
+        Pass {
+            ended: outcomes.contains(&Tried::Ended),
+            refused: outcomes.contains(&Tried::Refused),
+        }
     }
 }
 
 /// Retries the pending set every quarter second, backing off to every 4 s
-/// while passes end nothing (the bucket refusing, ADR 0020 section 3),
-/// until the cluster is dropped.
+/// while passes end nothing and some entry is refused (the bucket
+/// refusing, ADR 0020 section 3), until the cluster is dropped. A pass
+/// whose entries only wait (unresolved acquires whose record has not
+/// changed) runs again a second later: they are read again often enough,
+/// and a release added meanwhile waits a second at most.
 pub(super) async fn pending_loop(cluster: Weak<Cluster>) {
     const FIRST: Duration = Duration::from_millis(250);
+    const WAITING: Duration = Duration::from_secs(1);
     const MOST: Duration = Duration::from_secs(4);
     let mut wait = FIRST;
     loop {
@@ -917,11 +981,13 @@ pub(super) async fn pending_loop(cluster: Weak<Cluster>) {
         let Some(c) = cluster.upgrade() else {
             return;
         };
-        let ended = c.retry_pending().await;
+        let pass = c.retry_pending().await;
         // Parked records are not entries to retry: a node with one parked
         // for days must still try a new entry within a quarter second.
-        wait = if ended || !c.pending.has_entries() {
+        wait = if pass.ended || !c.pending.has_entries() {
             FIRST
+        } else if !pass.refused {
+            WAITING
         } else {
             (wait * 2).min(MOST)
         };

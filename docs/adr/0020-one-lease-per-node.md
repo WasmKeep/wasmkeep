@@ -11,6 +11,14 @@
   once (section 6).
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): ownership records and lease markers move under the app's root; `nodes/` stays shared.
 - Amended by [ADR 0024](0024-socket-home.md) (planned, 0.4.0): a hibernation with sockets open keeps the record (parked) instead of releasing it; every wake still acquires at a new generation.
+- Amended 2026-11-14, from the socket home simulation (ADR 0024,
+  Verification): the resolver of an unresolved acquire keeps the entry
+  while the record is still the one the write was conditioned on, for a
+  bounded wait (section 3). It ended the entry on its first read of an
+  unchanged record, so a write landing after that read left the record
+  naming this node with nothing here to release it: harmless while the
+  node served the actor (its next event took it back), but a drain or a
+  move of that actor waited until the node stopped.
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 - Amends: [ADR 0007](0007-replication-protocol.md),
@@ -267,14 +275,41 @@ names nobody (released), keeping the generation.
   request goes there. Otherwise (the record unchanged above all: the
   write may still be in flight, and land), or when a read fails, it is
   kept in the same set as an unresolved
-  acquire (actor, this instance, the generation tried). The background
+  acquire (actor, this instance, the generation tried, the record the
+  write was conditioned on, and a deadline). The background
   task reads the record until it can decide: if it names this instance at
   that generation and no hold for the actor exists here, it releases it
   (`If-Match` on that read's version: only this node could have written
   this instance at that generation); if that release fails or its outcome
   is unknown, it becomes an ordinary pending release keyed on that read's
-  version. If the record names
-  anything else, or a hold for it exists here, the entry ends.
+  version. If a hold for it exists here, or the record names anything
+  else, the entry ends, except a record still the one the write was
+  conditioned on (or still absent, for a create): that write may still
+  land, so the entry stays, read again, until the deadline. Past it, a
+  read sent after the deadline that finds the record unchanged ends the
+  entry. The record is compared by its content (holder and generation),
+  never by version token: a record's content never comes back once it
+  changed (every acquisition raises the generation, a release keeps it
+  and names nobody). The deadline is set when the entry is made: 30 s
+  later, `object_store`'s own request timeout (its default, which the
+  server does not change), so a write the client gave up on has as long
+  again to land. The deadline is on the node's wall clock, like every
+  time in this record: a clock step moves it, which changes only how
+  long a drain may wait. It bounds liveness only: a write
+  landing later still is the case this rule narrows, harmless while the
+  node serves the actor (its next event takes the record back as its
+  own) and freed when the node stops or is fenced. Nothing in it rests on
+  the node lease's validity: the entry acts only by releasing a record
+  naming this instance with no hold here, and retries pause while the
+  lease is invalid as for every entry; a deadline passed meanwhile ends
+  the entry only on a fresh read. Two acquisitions of one actor that
+  read the same record and both went unanswered keep one entry. A drain
+  reports drained only once such an entry ends, so it may wait up to the
+  deadline (plus a second: a pass whose entries only wait runs again a
+  second later, and a waiting entry is not counted as a refusal by the
+  pass's throttle); a clean stop does not
+  wait for one, since its `released` write frees a record such a write
+  left, landed or still to land.
   The drain and move outcomes that today say "the lease expires on its
   own" (`HandOver::Expiring`, `MoveOut::Expiring`, ADR 0014 and 0017)
   become "the release is pending": the actor is freed when it lands, or
@@ -459,7 +494,10 @@ one slow bucket from holding everything up:
    frees nothing; `wasmkeep cluster fence` makes the fenced node exit; a
    lost acquire followed by a second one landing at the same generation is
    never released by the resolver while its hold lives (also a `sim/`
-   case); the
+   case); an unresolved acquire whose write lands after the resolver's
+   first read, the record unchanged then, is released (also a `sim/`
+   case, `madsim_socket_home`'s `ResolverEndsUnchanged` variant: the
+   resolver ending the entry on that first read is caught as a leak); the
    upgrade seeds generations above every existing segment, marks
    `leases/` for found and new actors, and refuses a live old record that
    names the starting node's own id.
@@ -551,7 +589,9 @@ Recorded runs:
   it was acquired; a lapse ends every hold at once into the pending
   releases, a lost lease or a twin drops them; pending releases and
   unresolved acquires are retried in the background while the lease is
-  valid, under a lock per actor; drains report drained only with nothing
+  valid, under a lock per actor, an unresolved acquire kept while its
+  record is unchanged until its deadline (`holds::retry`,
+  `Owners::resolve`, 2026-11-14); drains report drained only with nothing
   pending; a clean stop releases, then makes the lease locally invalid,
   then writes `released`; routing reads the record and trusts a holder
   only if the view shows its named process live. The per-actor renewal

@@ -30,8 +30,12 @@
 //!
 //! Broken variants each caught on some seed: a wake that takes the parked
 //! hold back without writing (ADR 0020's rejected first draft), a lapse
-//! that forgets parked holds, and releasing on hibernation (the behaviour
-//! before ADR 0024, which loses the sockets).
+//! that forgets parked holds, releasing on hibernation (the behaviour
+//! before ADR 0024, which loses the sockets), and a resolver that ends an
+//! unresolved acquire on its first read of an unchanged record (ADR 0020
+//! before its amendment: a write landing after that read is a leak), or
+//! that waits for one without a bound (an unresolved acquire kept past its
+//! deadline, which would hold a drain forever).
 //!
 //! The scenario (`a_room_wakes_where_its_sockets_are`): without faults, a
 //! room with a socket on n1 is called through n2 and n3 and wakes on n1
@@ -94,6 +98,11 @@ enum Variant {
     ResolverIgnoresGeneration,
     /// A wake with an unknown outcome drops the parked hold.
     UnknownWakeDropsParked,
+    /// The resolver ends an unresolved acquire on its first read of an
+    /// unchanged record (ADR 0020 before its 2026-11-14 amendment).
+    ResolverEndsUnchanged,
+    /// The resolver waits for an unchanged record without a bound.
+    ResolverNeverEnds,
 }
 
 #[derive(Clone, Copy)]
@@ -158,9 +167,6 @@ struct Shared {
     drains_with_parked: u64,
     /// Acquisitions while another node held sockets, as allowed (exposed).
     exposed_takeovers: u64,
-    /// Records left naming a process by an unresolved acquire that landed
-    /// late (see `run_node`).
-    late_unresolved: u64,
     two_homes: Vec<String>,
     lost_sockets: Vec<String>,
     leaks: Vec<String>,
@@ -229,6 +235,8 @@ async fn run_node(
         lapse_forgets_parked: variant == Variant::LapseForgetsParked,
         resolver_ignores_parked_generation: variant == Variant::ResolverIgnoresGeneration,
         unknown_wake_drops_parked: variant == Variant::UnknownWakeDropsParked,
+        resolver_ends_unchanged: variant == Variant::ResolverEndsUnchanged,
+        resolver_never_ends: variant == Variant::ResolverNeverEnds,
         ..Breaks::default()
     };
     loop {
@@ -285,13 +293,7 @@ async fn run_node(
         let mut held_since = 0u64;
         let mut drain_until: Option<u64> = None;
         let mut leak_suspect: Option<u64> = None;
-        // Generations this process's acquisitions left unresolved: one
-        // that lands after the resolver gave up on it (ADR 0020's resolver
-        // ends an entry on a record its write has not reached yet) names
-        // this process with nothing here to release it. Not this record's
-        // to fix: counted apart, not as a leak.
-        let mut unresolved: HashSet<u64> = HashSet::new();
-        let mut counted: HashSet<u64> = HashSet::new();
+        let mut overdue_seen = false;
         let mut next_leak_check = 0u64;
         let gone = |s: &mut Shared| {
             s.running.remove(&i);
@@ -494,15 +496,10 @@ async fn run_node(
                                 held_since = t;
                                 hold = Some(h.clone());
                             }
-                            Err(
-                                e @ (AcquireError::Unresolved { .. } | AcquireError::Held { .. }),
-                            ) => {
-                                if let AcquireError::Unresolved { generation } = e {
-                                    unresolved.insert(*generation);
-                                }
-                                if had_sockets {
-                                    shared.lock().unwrap().exposed.insert(i);
-                                }
+                            Err(AcquireError::Unresolved { .. } | AcquireError::Held { .. })
+                                if had_sockets =>
+                            {
+                                shared.lock().unwrap().exposed.insert(i);
                             }
                             _ => {}
                         }
@@ -514,6 +511,19 @@ async fn run_node(
             // seen twice at one generation while the lease is valid.
             if hold.is_none() && env.now() >= next_leak_check {
                 next_leak_check = env.now() + 500;
+                // An unresolved acquire still pending well past its
+                // deadline, seen twice while the lease is valid: the
+                // resolver's wait has no bound, and a drain never ends.
+                if node.overdue_unresolved(1_500) {
+                    if overdue_seen {
+                        shared.lock().unwrap().leaks.push(format!(
+                            "at {t}: n{i} keeps an unresolved acquire past its deadline"
+                        ));
+                    }
+                    overdue_seen = true;
+                } else {
+                    overdue_seen = false;
+                }
                 let idle = !node.is_parked(ACTOR) && node.nothing_pending() && node.lease_valid();
                 let mine = match record(&bucket).await {
                     Some((Some((n, inst)), g)) if n == id && inst == instance => Some(g),
@@ -522,14 +532,6 @@ async fn run_node(
                 let still_idle =
                     !node.is_parked(ACTOR) && node.nothing_pending() && node.lease_valid();
                 match (idle && still_idle && hold.is_none(), mine) {
-                    (true, Some(g))
-                        if unresolved.contains(&g) && !node.resolver_skipped(ACTOR, g) =>
-                    {
-                        if leak_suspect == Some(g) && counted.insert(g) {
-                            shared.lock().unwrap().late_unresolved += 1;
-                        }
-                        leak_suspect = Some(g);
-                    }
                     (true, Some(g)) if leak_suspect == Some(g) => {
                         shared
                             .lock()
@@ -574,7 +576,6 @@ struct Outcome {
     last_socket_releases: u64,
     drains_with_parked: u64,
     exposed_takeovers: u64,
-    late_unresolved: u64,
     two_homes: Vec<String>,
     lost_sockets: Vec<String>,
     leaks: Vec<String>,
@@ -719,7 +720,6 @@ fn simulate(seed: u64, variant: Variant, scenario: bool) -> Outcome {
         last_socket_releases: s.last_socket_releases,
         drains_with_parked: s.drains_with_parked,
         exposed_takeovers: s.exposed_takeovers,
-        late_unresolved: s.late_unresolved,
         two_homes: s.two_homes.clone(),
         lost_sockets: s.lost_sockets.clone(),
         leaks: s.leaks.clone(),
@@ -753,7 +753,7 @@ fn seeds() -> u64 {
 
 #[test]
 fn a_room_keeps_one_home_and_releases_it() {
-    let mut totals = [0u64; 8];
+    let mut totals = [0u64; 7];
     for seed in 0..seeds() {
         let o = simulate(seed, Variant::Correct, false);
         if let Some(v) = o.violation() {
@@ -767,16 +767,15 @@ fn a_room_keeps_one_home_and_releases_it() {
             o.last_socket_releases,
             o.drains_with_parked,
             o.exposed_takeovers,
-            o.late_unresolved,
         ]) {
             *t += n;
         }
     }
-    let [acquired, parks, wakes, relays, last, drains, exposed, late] = totals;
+    let [acquired, parks, wakes, relays, last, drains, exposed] = totals;
     eprintln!(
         "{} seeds: {acquired} acquisitions, {parks} parks, {wakes} wakes at home, \
          {relays} relays, {last} releases at the last socket, {drains} drains of a parked \
-         room, {exposed} exposed takeovers, {late} unresolved acquires that landed late",
+         room, {exposed} exposed takeovers",
         seeds()
     );
     // The runs reach what they claim to.
@@ -801,6 +800,8 @@ fn each_broken_variant_is_caught() {
         Variant::ReleaseOnHibernate,
         Variant::ResolverIgnoresGeneration,
         Variant::UnknownWakeDropsParked,
+        Variant::ResolverEndsUnchanged,
+        Variant::ResolverNeverEnds,
     ] {
         // The two resolver variants need an unknown wake of a parked room,
         // rarer: up to 20 times the seeds.

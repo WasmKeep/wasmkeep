@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use crate::lease::{Bucket, Clock};
-use crate::node_lease::{AcquireError, Hold, Owners, Released};
+use crate::node_lease::{AcquireError, Hold, OwnerRecord, Owners, Released};
 
 /// This node's lease validity, as its holds see it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,6 +85,13 @@ pub enum PendingEntry {
         key: String,
         /// The generation it tried.
         generation: u64,
+        /// The record its write was conditioned on (`None`: there was
+        /// none): while the record is still that one, the write may land.
+        before: Option<OwnerRecord>,
+        /// Until when (this node's clock, ms) the resolver waits for a
+        /// record still at `before`; past it, a read that finds it so ends
+        /// the entry ([ADR 0020], section 3).
+        until_ms: u64,
     },
 }
 
@@ -94,6 +101,79 @@ impl PendingEntry {
         match self {
             Self::Release(hold) => &hold.key,
             Self::Unresolved { key, .. } => key,
+        }
+    }
+
+    /// The unresolved acquire of `key` that `error` reports, if it is one,
+    /// waiting for an unchanged record from now until `owners`' wait has
+    /// passed.
+    pub fn unresolved<B: Bucket, C: Clock>(
+        owners: &Owners<B, C>,
+        key: &str,
+        error: &AcquireError,
+    ) -> Option<Self> {
+        match error {
+            AcquireError::Unresolved { generation, before } => Some(Self::Unresolved {
+                key: key.to_owned(),
+                generation: *generation,
+                before: before.clone(),
+                until_ms: owners.unresolved_until_ms(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Adds `entry` to `entries`. An unresolved acquire already there for the
+/// same write (key, generation and record conditioned on: a second
+/// acquisition that read the same record and also went unanswered) is
+/// kept once, waiting until the later of the two deadlines.
+pub fn add(entries: &mut Vec<PendingEntry>, entry: PendingEntry) {
+    if let PendingEntry::Unresolved {
+        key,
+        generation,
+        before,
+        until_ms,
+    } = &entry
+    {
+        for e in entries.iter_mut() {
+            if let PendingEntry::Unresolved {
+                key: k,
+                generation: g,
+                before: b,
+                until_ms: u,
+            } = e
+                && k == key
+                && g == generation
+                && b == before
+            {
+                *u = (*u).max(*until_ms);
+                return;
+            }
+        }
+    }
+    entries.push(entry);
+}
+
+/// What one more try of a pending entry did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retried {
+    /// It ended: landed, superseded, or behind a live hold here.
+    Ended,
+    /// No answer, or not known yet: still pending.
+    Pending(PendingEntry),
+    /// An unresolved acquire whose record is still the one its write was
+    /// conditioned on: still pending, though the bucket answered (not a
+    /// refusal, for a caller that backs off on those).
+    Waiting(PendingEntry),
+}
+
+impl Retried {
+    /// The entry, if it is still pending.
+    pub fn still(self) -> Option<PendingEntry> {
+        match self {
+            Self::Ended => None,
+            Self::Pending(entry) | Self::Waiting(entry) => Some(entry),
         }
     }
 }
@@ -215,26 +295,50 @@ impl<T> Parked<T> {
 /// generation)` says a hold of that actor lives on this node (a later
 /// acquisition, possibly at the very generation the unresolved one tried;
 /// or a parked hold at that generation, ADR 0024). The caller holds the
-/// actor's lock across this call for an unresolved acquire. `Some(entry)`
-/// if it is still pending; `None` once it ended (landed, superseded, or
-/// behind a live hold).
+/// actor's lock across this call for an unresolved acquire.
+///
+/// An unresolved acquire whose record is still the one its write was
+/// conditioned on stays ([`Retried::Waiting`]) until its `until_ms`: the
+/// write may still land, and ending the entry then would leave the record
+/// naming this node with nothing here to release it. Past that time, a
+/// read issued after it that finds the record unchanged ends the entry.
 pub async fn retry<B: Bucket, C: Clock>(
     owners: &Owners<B, C>,
     entry: PendingEntry,
     held_here: impl Fn(&str, u64) -> bool,
-) -> Option<PendingEntry> {
+) -> Retried {
     match entry {
         PendingEntry::Release(hold) => match owners.release(&hold).await {
-            Released::Pending => Some(PendingEntry::Release(hold)),
-            Released::Released | Released::Superseded => None,
-        },
-        PendingEntry::Unresolved { key, generation } => {
-            if held_here(&key, generation) {
-                return None;
+            Released::Pending | Released::Unchanged => {
+                Retried::Pending(PendingEntry::Release(hold))
             }
-            match owners.resolve(&key, generation).await {
-                Released::Pending => Some(PendingEntry::Unresolved { key, generation }),
-                Released::Released | Released::Superseded => None,
+            Released::Released | Released::Superseded => Retried::Ended,
+        },
+        PendingEntry::Unresolved {
+            key,
+            generation,
+            before,
+            until_ms,
+        } => {
+            if held_here(&key, generation) {
+                return Retried::Ended;
+            }
+            // Asked before the read is sent: a read that ends the entry
+            // for its time being up was issued after that time.
+            let wait = owners.now_ms() < until_ms;
+            let resolved = owners
+                .resolve(&key, generation, before.as_ref(), wait)
+                .await;
+            let entry = PendingEntry::Unresolved {
+                key,
+                generation,
+                before,
+                until_ms,
+            };
+            match resolved {
+                Released::Pending => Retried::Pending(entry),
+                Released::Unchanged => Retried::Waiting(entry),
+                Released::Released | Released::Superseded => Retried::Ended,
             }
         }
     }
@@ -321,7 +425,10 @@ mod tests {
             assert!(!parked.contains("owners/x"));
         }
         for outcome in [
-            AcquireError::Unresolved { generation: 5 },
+            AcquireError::Unresolved {
+                generation: 5,
+                before: None,
+            },
             AcquireError::Unavailable,
             AcquireError::LeaseInvalid,
             AcquireError::Corrupt,
@@ -354,7 +461,7 @@ mod tests {
         let hold = run(owners.acquire("owners/x", || true, async || Ok(1))).unwrap();
         assert_eq!(
             run(retry(&owners, PendingEntry::Release(hold), |_, _| false)),
-            None
+            Retried::Ended
         );
         assert_eq!(read("owners/x").holder, None);
         // An unresolved acquire that landed, with no hold here: released.
@@ -362,20 +469,149 @@ mod tests {
         let entry = PendingEntry::Unresolved {
             key: "owners/x".into(),
             generation: landed.generation,
+            before: None,
+            until_ms: owners.unresolved_until_ms(),
         };
-        assert_eq!(run(retry(&owners, entry, |_, _| false)), None);
+        assert_eq!(run(retry(&owners, entry, |_, _| false)), Retried::Ended);
         assert_eq!(read("owners/x").holder, None);
         // With a hold of the actor here: left alone, the entry ends.
         let live = run(owners.acquire("owners/x", || true, async || Ok(1))).unwrap();
         let entry = PendingEntry::Unresolved {
             key: "owners/x".into(),
             generation: live.generation,
+            before: None,
+            until_ms: owners.unresolved_until_ms(),
         };
         assert_eq!(entry.key(), "owners/x");
-        assert_eq!(run(retry(&owners, entry, |k, _| k == "owners/x")), None);
+        assert_eq!(
+            run(retry(&owners, entry, |k, _| k == "owners/x")),
+            Retried::Ended
+        );
         assert!(
             read("owners/x").holder.is_some(),
             "a live hold was released"
         );
+    }
+
+    /// An unresolved acquire whose record is unchanged waits for its
+    /// write until its time is up (ADR 0020, section 3): a write landing
+    /// meanwhile is released; past the time, an unchanged record ends the
+    /// entry; a record changed otherwise ends it at once.
+    #[test]
+    fn an_unresolved_acquire_waits_for_an_unchanged_record() {
+        let cfg = LeaseConfig::default_safe();
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let mut lease = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg);
+        run(lease.start(None)).unwrap();
+        let owners =
+            Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg).with_unresolved_wait_ms(5_000);
+        let nobody = |generation| OwnerRecord {
+            holder: None,
+            generation,
+        };
+        let mine = |generation| OwnerRecord {
+            holder: Some(("a".into(), "i1".into())),
+            generation,
+        };
+        let read = |key: &str| {
+            let (body, _) = run((&mem).get(key)).unwrap().unwrap();
+            OwnerRecord::decode(&body).unwrap()
+        };
+        for absent in [false, true] {
+            let key = if absent { "owners/c" } else { "owners/r" };
+            if !absent {
+                mem.overwrite(key, Some(&nobody(4).encode()));
+            }
+            let before = (!absent).then(|| nobody(4));
+            let generation = if absent { 1 } else { 5 };
+            let entry = PendingEntry::Unresolved {
+                key: key.into(),
+                generation,
+                before,
+                until_ms: owners.unresolved_until_ms(),
+            };
+            // Unchanged: it waits, however often it is read.
+            let Retried::Waiting(entry) = run(retry(&owners, entry, |_, _| false)) else {
+                panic!("an unchanged record ended the entry");
+            };
+            t.set(t.get() + 4_999);
+            let Retried::Waiting(entry) = run(retry(&owners, entry, |_, _| false)) else {
+                panic!("ended before its time");
+            };
+            // The write lands late: released, and the entry ends.
+            mem.overwrite(key, Some(&mine(generation).encode()));
+            assert_eq!(run(retry(&owners, entry, |_, _| false)), Retried::Ended);
+            assert_eq!(read(key), nobody(generation));
+            t.set(t.get() - 4_999);
+        }
+        // Past its time, unchanged: the entry ends.
+        mem.overwrite("owners/p", Some(&nobody(4).encode()));
+        let entry = PendingEntry::Unresolved {
+            key: "owners/p".into(),
+            generation: 5,
+            before: Some(nobody(4)),
+            until_ms: owners.unresolved_until_ms(),
+        };
+        t.set(t.get() + 5_000);
+        assert_eq!(run(retry(&owners, entry, |_, _| false)), Retried::Ended);
+        t.set(t.get() - 5_000);
+        // Changed otherwise (here released by its holder at the same
+        // generation; then another holder at the next): ends at once, and
+        // the record is left alone.
+        for (before, current) in [
+            (
+                OwnerRecord {
+                    holder: Some(("b".into(), "i2".into())),
+                    generation: 4,
+                },
+                nobody(4),
+            ),
+            (
+                nobody(4),
+                OwnerRecord {
+                    holder: Some(("b".into(), "i2".into())),
+                    generation: 5,
+                },
+            ),
+        ] {
+            mem.overwrite("owners/o", Some(&current.encode()));
+            let entry = PendingEntry::Unresolved {
+                key: "owners/o".into(),
+                generation: 5,
+                before: Some(before),
+                until_ms: owners.unresolved_until_ms(),
+            };
+            assert_eq!(run(retry(&owners, entry, |_, _| false)), Retried::Ended);
+            assert_eq!(read("owners/o"), current);
+        }
+        // A record removed after a write conditioned on one: ends.
+        mem.overwrite("owners/o", None);
+        let entry = PendingEntry::Unresolved {
+            key: "owners/o".into(),
+            generation: 5,
+            before: Some(nobody(4)),
+            until_ms: owners.unresolved_until_ms(),
+        };
+        assert_eq!(run(retry(&owners, entry, |_, _| false)), Retried::Ended);
+    }
+
+    #[test]
+    fn one_unresolved_write_is_kept_once() {
+        let entry = |generation, until_ms| PendingEntry::Unresolved {
+            key: "owners/x".into(),
+            generation,
+            before: None,
+            until_ms,
+        };
+        let mut entries = Vec::new();
+        add(&mut entries, entry(5, 100));
+        add(&mut entries, entry(5, 300));
+        add(&mut entries, entry(5, 200));
+        add(&mut entries, entry(6, 100));
+        add(&mut entries, PendingEntry::Release(hold("owners/x", 4)));
+        add(&mut entries, PendingEntry::Release(hold("owners/x", 4)));
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        assert_eq!(entries[0], entry(5, 300));
     }
 }
