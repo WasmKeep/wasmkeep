@@ -342,6 +342,7 @@ async fn run_node(
         unknown_wake_drops_parked: false,
         resolver_ends_unchanged: false,
         resolver_never_ends: false,
+        release_before_stop: false,
     };
     loop {
         let instance = format!("{:08x}", madsim::rand::random::<u32>());

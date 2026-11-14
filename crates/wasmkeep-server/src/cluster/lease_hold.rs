@@ -628,9 +628,13 @@ impl LeaseHold {
             let bound = cluster
                 .release_attempt()
                 .min(left.max(Duration::from_millis(50)));
+            let lapsed = cluster.lease_ran_out_unnoticed();
             let sent = tokio::time::timeout(bound, cluster.owners.release(&hold))
                 .await
                 .unwrap_or(Released::Pending);
+            if lapsed && sent == Released::Released {
+                cluster.released_after_lapse(&hold.key);
+            }
             match sent {
                 Released::Released => return LeaseReturn::Released,
                 Released::Superseded => return LeaseReturn::Superseded,
@@ -712,9 +716,37 @@ impl Cluster {
 
     /// One release, bounded by [`Self::release_attempt`].
     async fn send_release(&self, hold: &Hold) -> Released {
-        tokio::time::timeout(self.release_attempt(), self.owners.release(hold))
+        let lapsed = self.lease_ran_out_unnoticed();
+        let sent = tokio::time::timeout(self.release_attempt(), self.owners.release(hold))
             .await
-            .unwrap_or(Released::Pending)
+            .unwrap_or(Released::Pending);
+        if lapsed && sent == Released::Released {
+            self.released_after_lapse(&hold.key);
+        }
+        sent
+    }
+
+    /// Whether this node's lease ran out and the lease task has not yet
+    /// seen it: it does at the end of its next attempt, and then ends
+    /// every hold into the pending releases, which wait for a valid lease.
+    /// Until then a hold dropped by its actor (an event that found it no
+    /// longer valid, a parked record's last socket) is released at once
+    /// (ADR 0020, section 1, amendment of 2026-11-14). Not after a clean
+    /// stop or a lost lease: those make the lease invalid outright.
+    fn lease_ran_out_unnoticed(&self) -> bool {
+        self.validity.until().is_some_and(|until| now_ms() >= until)
+    }
+
+    /// A release that landed while this node's lease had run out: another
+    /// node may take the actor at once, without the fence. Counted and
+    /// logged here, since the record it leaves names nobody, and the node
+    /// that takes it sees an ordinary released actor.
+    fn released_after_lapse(&self, key: &str) {
+        crate::metrics::inc(&crate::metrics::METRICS.releases_after_lapse);
+        tracing::warn!(
+            key,
+            "released an actor after this node's lease ran out: another node may take it now"
+        );
     }
 
     /// Sends a release once; if it did not land, it waits in the pending

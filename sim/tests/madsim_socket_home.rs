@@ -237,6 +237,7 @@ async fn run_node(
         unknown_wake_drops_parked: variant == Variant::UnknownWakeDropsParked,
         resolver_ends_unchanged: variant == Variant::ResolverEndsUnchanged,
         resolver_never_ends: variant == Variant::ResolverNeverEnds,
+        release_before_stop: false,
         ..Breaks::default()
     };
     loop {

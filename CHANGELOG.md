@@ -49,6 +49,19 @@ Since 0.4.0, in no release yet.
   [Languages](docs/languages.md#several-outbound-requests-at-once) says what
   each SDK does, Python, C, Zig, D and MoonBit included (no outbound HTTP
   helper yet).
+- **A node whose lease writes fail while its other writes land** hands an
+  actor over as soon as an event reaches it after its lease ran out (8 s
+  after its last acknowledged lease write, with the defaults), before
+  the node sees the lapse: the release of the hold its actor dropped can
+  land, and another node takes the actor at once, without a fence. That
+  was already so, and is safe by ordering (the node stops acting before
+  it sends the release, and the next owner acquires only after the
+  release landed), but ADR 0020 said otherwise and nothing showed it. It
+  is now documented ([ADR 0020](docs/adr/0020-one-lease-per-node.md),
+  section 1), counted on the releasing node in
+  `wasmkeep_releases_after_lapse_total` with a warning in its log
+  ([monitoring](docs/monitoring.md#failovers)), and pinned by a cluster
+  test and a simulation (`madsim_early_release`).
 
 ## 0.4.0
 

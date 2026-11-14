@@ -87,6 +87,10 @@ pub struct Breaks {
     /// without a bound: an entry whose write never lands stays, and a
     /// drain never ends.
     pub resolver_never_ends: bool,
+    /// A hold given up keeps acting until its release is answered: the
+    /// release is sent before the hold leaves the live set (the server
+    /// empties the hold's cell first, ADR 0020 section 1's amendment).
+    pub release_before_stop: bool,
 }
 
 /// How long the resolver waits for an unresolved acquire's unchanged record
@@ -527,26 +531,40 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
 
     /// Gives `held` up: it stops acting at once; the release is sent, and
     /// kept pending if it does not land. `true` if it landed (or was
-    /// superseded) now.
+    /// superseded) now. Whether the lease is valid or not, as the server
+    /// sends the release of a hold its actor dropped: after a lapse its
+    /// lease task has not seen yet, that release lands at once if the
+    /// bucket takes it ([`Self::release_outcome`]).
     pub async fn release(&self, held: &Held) -> bool {
+        self.release_outcome(held)
+            .await
+            .is_none_or(|r| matches!(r, Released::Released | Released::Superseded))
+    }
+
+    /// [`Self::release`], with what the release did (`None`: nothing was
+    /// held).
+    pub async fn release_outcome(&self, held: &Held) -> Option<Released> {
         let hold = {
             let mut s = lock(&self.shared);
-            let Some(hold) = s.holds.remove(&held.key) else {
-                return true;
+            let hold = if self.setup.breaks.release_before_stop {
+                s.holds.get(&held.key).cloned()
+            } else {
+                s.holds.remove(&held.key)
             };
+            let hold = hold?;
             s.in_flight += 1;
             hold
         };
         let released = self.owners.release(&hold).await;
         let mut s = lock(&self.shared);
-        s.in_flight -= 1;
-        match released {
-            Released::Pending | Released::Unchanged => {
-                s.pending.push(PendingEntry::Release(hold));
-                false
-            }
-            Released::Released | Released::Superseded => true,
+        if self.setup.breaks.release_before_stop && s.holds.get(&held.key) == Some(&hold) {
+            s.holds.remove(&held.key);
         }
+        s.in_flight -= 1;
+        if matches!(released, Released::Pending | Released::Unchanged) {
+            s.pending.push(PendingEntry::Release(hold));
+        }
+        Some(released)
     }
 
     /// A clean stop: every hold released, then the lease task makes the
