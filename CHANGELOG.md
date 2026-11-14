@@ -39,12 +39,15 @@ the bucket layout ([upgrading to 0.4.0](docs/deploy/upgrading-to-0.4.md));
 no rolling upgrade from 0.3.x.
 
 Soaked on three nodes against a real bucket, on a bucket prefix migrated
-to the new layout, a node killed every three minutes: two hours on the
-code of app-owned state and the migration (commit `7e03c05`; the front
-and the later changes came after it). 39 kills, 393,063 acknowledged
-durable writes, none lost or duplicated; failover p50 17.3 s, p99
-22.3 s, max 24.9 s; no alarm missed; no stale read after a takeover; a
-restarted node ready again within 0.2 s
+to the new layout, a node killed every three minutes, for two hours on
+this release's code (commit `e55c152`; later commits change tests and
+these notes only): 39 kills, 443,092 acknowledged durable writes, none
+lost or duplicated; failover p50 17.1 s, p99 21.0 s, max 22.7 s; no
+alarm missed; no stale read after a takeover; a restarted node ready
+again within 0.3 s
+(`bench/results/2026-11-14-e55c152-soak-ovh-bhs-3vps-2h-0.4.0-rc.csv`).
+An earlier two-hour soak on the code of app-owned state and the
+migration (commit `7e03c05`) gave the same picture
 (`bench/results/2026-11-14-7e03c05-soak-ovh-bhs-3vps-2h-0.4.csv`).
 
 ### What changed
