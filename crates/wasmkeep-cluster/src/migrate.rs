@@ -87,6 +87,22 @@ pub const COPIED: [Family; 4] = [
     Family::Leases,
     Family::Alarms,
 ];
+
+/// Keys a bucket listing returns a page: S3 and the stores in front of it
+/// page at 1,000.
+const LIST_PAGE: usize = 1000;
+
+/// The requests listing every family in [`COPIED`] took, given the keys
+/// each returned: one a page, and one for a family with none.
+fn listing_requests(counts: &BTreeMap<Family, usize>) -> u64 {
+    COPIED
+        .iter()
+        .map(|f| {
+            let n = counts.get(f).copied().unwrap_or(0);
+            u64::try_from(n.div_ceil(LIST_PAGE).max(1)).unwrap_or(u64::MAX)
+        })
+        .sum()
+}
 /// The third line of a tombstone written where no ownership record
 /// existed (an actor from before records, ADR 0020 §6): a rollback deletes
 /// it rather than putting a record back.
@@ -1139,7 +1155,6 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             };
             if !t.committed {
                 let (source, refusals) = self.source(&tenant).await?;
-                requests += u64::try_from(COPIED.len()).unwrap_or(4);
                 plan.refusals.extend(refusals);
                 for m in &source.moves {
                     *t.counts.entry(m.family).or_default() += 1;
@@ -1156,6 +1171,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                         t.heirs.insert(class.to_owned(), heir.to_owned());
                     }
                 }
+                requests += listing_requests(&t.counts);
                 for class in t.heirs.keys() {
                     let deploying: Vec<String> = self
                         .apps_of(&tenant)
@@ -2530,6 +2546,20 @@ mod tests {
             app: name.into(),
             classes: classes.iter().map(|c| (*c).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn a_long_listing_counts_one_request_a_page() {
+        // One family listing returns every key, paged by the store: the
+        // latency a request is the listing's time over its pages.
+        let counts = BTreeMap::from([
+            (Family::History, 654_614),
+            (Family::Owners, 177),
+            (Family::Leases, 177),
+            (Family::Alarms, 4),
+        ]);
+        assert_eq!(listing_requests(&counts), 655 + 1 + 1 + 1);
+        assert_eq!(listing_requests(&BTreeMap::new()), 4);
     }
 
     #[test]
