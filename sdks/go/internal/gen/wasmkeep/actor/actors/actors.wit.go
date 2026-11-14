@@ -157,7 +157,9 @@ type ActorAddress struct {
 //
 // The callee sees `x-wasmkeep-caller: <tenant>/<class>/<name>`, the name
 // percent-encoded (every byte but ASCII letters, digits and `-._~`), so
-// `room 1` arrives as `room%201`. The host removes that header from
+// `room 1` arrives as `room%201`. A call from the app's front arrives
+// with `x-wasmkeep-caller: <tenant>/_front/main`, which is never an
+// actor (`_front` is not a class). The host removes that header from
 // requests coming from outside, so the callee can trust it.
 //
 //	call: func(address: string, request: request) -> result<response, call-error>

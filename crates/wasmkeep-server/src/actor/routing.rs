@@ -72,18 +72,14 @@ impl ServiceInner {
         self.owner_hints().remove(address);
     }
 
-    /// `actors.call`: delivers `request` to `class/name` in the caller's
-    /// tenant and returns its buffered response.
-    ///
-    /// A call to an actor already waiting in this chain (including the
-    /// caller) fails with `reentrant`. A cycle across two independent chains
-    /// cannot be seen here and ends in `timeout` after the wall-clock limit.
-    pub(super) async fn call(
-        self: Arc<Self>,
-        ctx: &CallContext,
+    /// The actor `address` (`class/name`) names in `tenant` (the caller's),
+    /// for `actors.call`: `invalid-address` if it is malformed or its class
+    /// is not served. `_front` is never a class (ADR 0023).
+    pub(super) fn call_target(
+        &self,
+        tenant: &str,
         address: &str,
-        request: CallRequest,
-    ) -> Result<CallResponse, CallError> {
+    ) -> Result<ActorAddress, CallError> {
         let invalid = |m: &str| CallError::InvalidAddress(m.to_owned());
         let (class, name) = address
             .split_once('/')
@@ -91,18 +87,41 @@ impl ServiceInner {
         if !read(&self.classes).contains_key(class) {
             return Err(invalid("no such actor class"));
         }
-        let target = ActorAddress::new(ctx.me.tenant(), class, name)
-            .map_err(|e| CallError::InvalidAddress(e.to_string()))?;
-        if target == ctx.me || ctx.chain.contains(&target) {
+        ActorAddress::new(tenant, class, name).map_err(|e| CallError::InvalidAddress(e.to_string()))
+    }
+
+    /// `actors.call`: delivers `request` to `target` (from
+    /// [`call_target`](Self::call_target)) and returns its buffered response,
+    /// or `timeout` after `limit`.
+    ///
+    /// A call to an actor already waiting in this chain (including the
+    /// caller) fails with `reentrant`. A cycle across two independent chains
+    /// cannot be seen here and ends in `timeout` after the wall-clock limit.
+    /// The front is never in a chain: it cannot be called back.
+    pub(super) async fn call(
+        self: Arc<Self>,
+        caller: &Caller,
+        chain: &Chain,
+        target: ActorAddress,
+        request: CallRequest,
+        limit: Duration,
+    ) -> Result<CallResponse, CallError> {
+        let me = match caller {
+            Caller::Actor(me) => Some(me),
+            Caller::Front => None,
+        };
+        if me == Some(&target) || chain.contains(&target) {
             return Err(CallError::Reentrant);
         }
         if request.body.len() > MAX_CALL_BODY {
             return Err(CallError::TooLarge);
         }
 
-        let req = build_request(&ctx.me, &target, request).map_err(CallError::Failed)?;
-        let mut chain = ctx.chain.to_vec();
-        chain.push(ctx.me.clone());
+        let req = build_request(caller, &target, request).map_err(CallError::Failed)?;
+        let mut chain = chain.to_vec();
+        if let Some(me) = me {
+            chain.push(me.clone());
+        }
         let chain: Chain = Arc::from(chain);
         let waiting = Arc::clone(&chain);
 
@@ -191,7 +210,7 @@ impl ServiceInner {
                 },
             }
         };
-        tokio::time::timeout(self.wall, call)
+        tokio::time::timeout(limit, call)
             .await
             .unwrap_or(Err(CallError::Timeout))
     }
@@ -204,7 +223,7 @@ pub(super) use crate::cluster::HOP_BY_HOP;
 pub(super) const SIGNED_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn build_request(
-    from: &ActorAddress,
+    from: &Caller,
     to: &ActorAddress,
     request: CallRequest,
 ) -> Result<Request<http_body_util::Full<bytes::Bytes>>, String> {
@@ -221,12 +240,13 @@ pub(super) fn build_request(
         if HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h)) {
             continue;
         }
-        // Only the host hands alarms off, asks a node to take an actor, or
-        // names the app between nodes (ADR 0014, ADR 0017, ADR 0022).
-        if name.eq_ignore_ascii_case(crate::cluster::ALARM_HANDOFF)
-            || name.eq_ignore_ascii_case(crate::cluster::TAKE)
-            || name.eq_ignore_ascii_case(crate::cluster::APP)
-        {
+        // The `x-wasmkeep-` range is the host's, for every caller (ADR
+        // 0023): who is calling, the chain, the forwarded mark, the node
+        // markers, hand-offs, takes, the app, and any name added later. A
+        // local call reaches the callee without the stripping requests from
+        // the port get, so nothing of it may come from a guest, but for
+        // the SDKs' own protocol between actors.
+        if is_wasmkeep_header(name) && !SDK_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
             continue;
         }
         builder = builder.header(name.as_str(), value.as_str());
@@ -236,13 +256,36 @@ pub(super) fn build_request(
         .map_err(|e| format!("invalid request: {e}"))?;
     // The same encoding as calls arriving from another node: the name
     // percent-encoded, so the value is unambiguous and plain ASCII.
-    for (header, address) in [("x-wasmkeep-actor", to), ("x-wasmkeep-caller", from)] {
-        if let Ok(value) = hyper::header::HeaderValue::from_str(&encode_address(address)) {
+    for (header, value) in [
+        ("x-wasmkeep-actor", encode_address(to)),
+        ("x-wasmkeep-caller", from.value(to.tenant())),
+    ] {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
             req.headers_mut().insert(header, value);
         }
     }
     Ok(req)
 }
+
+/// Whether `name` is in the host's `x-wasmkeep-` range (any case).
+pub(crate) fn is_wasmkeep_header(name: &str) -> bool {
+    name.get(..WASMKEEP_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(WASMKEEP_PREFIX))
+}
+
+/// The names in the `x-wasmkeep-` range that guests send each other on
+/// `actors.call`: the SDKs' key-value and queue protocol, in every SDK
+/// since 0.1.0 (ADR 0023, a note under "Header hygiene"). The host gives
+/// them no meaning. Exact names: any other name in the range is dropped.
+const SDK_HEADERS: [&str; 4] = [
+    "x-wasmkeep-kv-expect",
+    "x-wasmkeep-kv-ttl-ms",
+    "x-wasmkeep-kv-durable",
+    "x-wasmkeep-queue-delay-ms",
+];
+
+/// The prefix of every header the host sets or reads itself.
+const WASMKEEP_PREFIX: &str = "x-wasmkeep-";
 
 pub(super) async fn collect_response(
     response: Response<HyperOutgoingBody>,

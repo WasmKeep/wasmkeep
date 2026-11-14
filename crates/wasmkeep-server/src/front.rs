@@ -1,0 +1,678 @@
+//! The front (ADR 0023): an app's stateless `wasi:http` component, run in
+//! a fresh instance per request, for every path outside `/actor/` and
+//! `/_wasmkeep/`. It is linked with all of WASI 0.2 (inert), `wasi:http`
+//! under the node's egress policy, and `actors` and `env`: it calls the
+//! node's actors as an inside caller, `<tenant>/_front/main`, and reads its
+//! own values.
+//!
+//! What is per node (the slots, the calls waiting on each actor, the
+//! limits, the egress policy, the log, the node's values) is kept apart
+//! from what is per version (the linked component and the values it reads,
+//! [`FrontVersion`]), so that a version can be swapped under it without
+//! resetting the slots.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use hyper::{Request, Response, StatusCode};
+use wasmkeep_runtime::{ActorAddress, CpuBudgetExceeded, Runtime};
+use wasmkeep_wit::FrontCore;
+use wasmkeep_wit::wasmkeep::actor::actors::{
+    self, CallError, Request as CallRequest, Response as CallResponse,
+};
+use wasmkeep_wit::wasmkeep::actor::env;
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi_http::p2::bindings::ProxyPre;
+use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
+use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
+
+use crate::actor::{FRONT_CLASS, FRONT_NAME};
+use crate::http::{CappedBody, text_response};
+use crate::metrics::{METRICS, inc};
+use crate::{ActorService, Error};
+
+/// What the front keeps of its wall for itself: a call gives up while this
+/// much of the request's wall remains, so the front can still answer.
+pub(crate) const CALL_MARGIN: Duration = Duration::from_secs(5);
+
+/// The front's CPU budget per request by default (`--front-cpu-budget-ms`).
+pub const DEFAULT_CPU_BUDGET: Duration = Duration::from_millis(50);
+
+/// The failure a call from the front gets past the per-actor bound.
+const BUSY: &str = "front busy: too many front requests waiting on this actor";
+
+/// Per-request host state stored in the Wasmtime `Store`.
+///
+/// Guests get no stdio, environment, arguments or preopened directories:
+/// capabilities are granted explicitly, never inherited from the host.
+struct FrontHost {
+    wasi: WasiCtx,
+    http: WasiHttpCtx,
+    table: ResourceTable,
+    /// Outbound HTTP under the egress policy.
+    egress: crate::egress::EgressHooks,
+    /// The node's actors, which the front's calls reach; `None` on a node
+    /// without actors (every call fails `invalid-address`).
+    actors: Option<ActorService>,
+    /// The tenant of the front's caller value and `self-address`.
+    tenant: String,
+    /// The front's values (`env.get`).
+    env: Arc<crate::env::Vars>,
+    /// When the request's wall runs out.
+    deadline: tokio::time::Instant,
+    /// Calls from the node's fronts waiting on each actor.
+    waits: Arc<Waits>,
+    /// How many of them one actor may have.
+    per_actor: usize,
+}
+
+impl WasiView for FrontHost {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl WasiHttpView for FrontHost {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.egress,
+        }
+    }
+}
+
+impl FrontHost {
+    async fn call_inner(
+        &mut self,
+        address: String,
+        request: CallRequest,
+    ) -> Result<CallResponse, CallError> {
+        let Some(service) = self.actors.clone() else {
+            return Err(CallError::InvalidAddress("no such actor class".into()));
+        };
+        let target = service.front_target(&address)?;
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        // A call started with less than the margin left fails at once.
+        let Some(limit) = left.checked_sub(CALL_MARGIN).filter(|l| !l.is_zero()) else {
+            return Err(CallError::Timeout);
+        };
+        let limit = limit.min(service.call_wall());
+        let Some(_waiting) = Waits::enter(&self.waits, &target, self.per_actor) else {
+            return Err(CallError::Failed(BUSY.into()));
+        };
+        service.front_call(target, request, limit).await
+    }
+}
+
+impl actors::Host for FrontHost {
+    async fn call(
+        &mut self,
+        address: String,
+        request: CallRequest,
+    ) -> wasmtime::Result<Result<CallResponse, CallError>> {
+        let result = self.call_inner(address, request).await;
+        // Every other failure (invalid-address, reentrant, too-large) is
+        // `failed`.
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(CallError::Timeout) => "timeout",
+            Err(CallError::Failed(m)) if m == BUSY => "busy",
+            Err(_) => "failed",
+        };
+        inc(&METRICS.front_calls.get(&[("outcome", outcome)]));
+        Ok(result)
+    }
+
+    async fn self_address(&mut self) -> wasmtime::Result<actors::ActorAddress> {
+        Ok(actors::ActorAddress {
+            tenant: self.tenant.clone(),
+            class: FRONT_CLASS.to_owned(),
+            name: FRONT_NAME.to_owned(),
+        })
+    }
+}
+
+impl env::Host for FrontHost {
+    async fn get(&mut self, name: String) -> wasmtime::Result<Option<String>> {
+        Ok(self.env.get(&name).cloned())
+    }
+}
+
+/// Calls from the fronts of a node waiting on each actor, for the
+/// per-actor bound. An entry goes at zero: names come from URLs.
+#[derive(Debug, Default)]
+struct Waits(Mutex<HashMap<ActorAddress, usize>>);
+
+impl Waits {
+    /// One more call waiting on `target`, unless `bound` already are.
+    fn enter(waits: &Arc<Self>, target: &ActorAddress, bound: usize) -> Option<Waiting> {
+        let mut map = waits.0.lock().unwrap_or_else(|p| p.into_inner());
+        let n = map.entry(target.clone()).or_default();
+        if *n >= bound {
+            if *n == 0 {
+                map.remove(target);
+            }
+            return None;
+        }
+        *n += 1;
+        Some(Waiting {
+            waits: Arc::clone(waits),
+            target: target.clone(),
+        })
+    }
+}
+
+/// A call counted in [`Waits`] until dropped.
+struct Waiting {
+    waits: Arc<Waits>,
+    target: ActorAddress,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut map = self.waits.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = map.get_mut(&self.target) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.target);
+            }
+        }
+    }
+}
+
+/// A slot held while one front instance lives; the gauge counts them.
+struct Slot(#[allow(dead_code, reason = "held for its drop")] tokio::sync::OwnedSemaphorePermit);
+
+impl Slot {
+    fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        METRICS
+            .front_slots_in_use
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(permit)
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        METRICS
+            .front_slots_in_use
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One version of a front: its component, linked and pre-instantiated, and
+/// the values it reads. Built with no lock held ([`FrontVersion::link`]),
+/// then put in place with [`HttpComponent::set_version`].
+pub(crate) struct FrontVersion {
+    pre: ProxyPre<FrontHost>,
+    env: Arc<crate::env::Vars>,
+}
+
+impl FrontVersion {
+    /// Links `component` against the front linker: WASI 0.2 (inert),
+    /// `wasi:http`, `actors` and `env`; checks that it exports the incoming
+    /// handler. A component importing anything else (an actor's `storage`,
+    /// say) does not link.
+    pub(crate) fn link(
+        runtime: &Runtime,
+        component: &Component,
+        env: Arc<crate::env::Vars>,
+    ) -> Result<Self, Error> {
+        let mut linker = Linker::<FrontHost>::new(runtime.engine());
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(Error::linker)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
+            .map_err(Error::linker)?;
+        FrontCore::add_to_linker::<FrontHost, HasSelf<FrontHost>>(&mut linker, |h| h)
+            .map_err(Error::linker)?;
+        let instance_pre = runtime
+            .instantiate_pre(&linker, component)
+            .map_err(Error::not_http)?;
+        let pre =
+            ProxyPre::new(instance_pre).map_err(|e| Error::not_http(e.into_boxed_dyn_error()))?;
+        Ok(Self { pre, env })
+    }
+}
+
+/// The front: a `wasi:http/proxy` component (any plain one is a valid
+/// front), with the node's limits. Each request gets a fresh instance.
+/// Cheap to clone; clones share the slots and the version.
+#[derive(Clone)]
+pub struct HttpComponent {
+    runtime: Runtime,
+    /// The version requests start on; one in flight keeps its own.
+    version: Arc<RwLock<Arc<FrontVersion>>>,
+    egress: Arc<crate::egress::EgressPolicy>,
+    /// Where instances' stdout and stderr go.
+    guest_log: crate::guest_log::GuestLog,
+    /// Wall-clock limit per request, including streaming the response
+    /// and waiting on I/O (a slow client must not hold an instance).
+    pub(crate) wall: Duration,
+    /// CPU time per request (`--front-cpu-budget-ms`).
+    cpu_budget: Duration,
+    /// Requests running at once (`--max-front-requests`).
+    slots: Arc<tokio::sync::Semaphore>,
+    max_requests: usize,
+    /// Calls waiting on each actor, for the per-actor bound.
+    waits: Arc<Waits>,
+}
+
+impl std::fmt::Debug for HttpComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpComponent")
+            .field("max_requests", &self.max_requests)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpComponent {
+    /// Links `component` as a front (see [`FrontVersion::link`]): WASI
+    /// 0.2 and `wasi:http`, plus `actors` and `env`.
+    pub fn new(runtime: Runtime, component: &Component) -> Result<Self, Error> {
+        let version = FrontVersion::link(&runtime, component, Arc::default())?;
+        let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
+        let max_requests = crate::fds::default_front_requests(pool).max(1);
+        Ok(Self {
+            runtime,
+            version: Arc::new(RwLock::new(Arc::new(version))),
+            egress: Arc::default(),
+            guest_log: crate::guest_log::GuestLog::default(),
+            wall: Duration::from_secs(30),
+            cpu_budget: DEFAULT_CPU_BUDGET,
+            slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
+            max_requests,
+            waits: Arc::default(),
+        })
+    }
+
+    /// Lets the component's outbound HTTP reach what `policy` allows (by
+    /// default: public addresses only).
+    #[must_use]
+    pub fn with_egress(mut self, policy: crate::egress::EgressPolicy) -> Self {
+        self.egress = Arc::new(policy);
+        self
+    }
+
+    /// Logs what the component prints within `log`'s limits (by default
+    /// [`crate::guest_log::DEFAULT_RATE`] lines a second per instance).
+    #[must_use]
+    pub fn with_guest_log(mut self, log: crate::guest_log::GuestLog) -> Self {
+        self.guest_log = log;
+        self
+    }
+
+    /// The front's CPU time per request (by default
+    /// [`DEFAULT_CPU_BUDGET`]), apart from the actors' budget.
+    #[must_use]
+    pub fn with_cpu_budget(mut self, budget: Duration) -> Self {
+        self.cpu_budget = budget;
+        self
+    }
+
+    /// Front requests running at once on this node (at least 1; by default
+    /// a tenth of the instance pool, rounded up). Past it a request gets
+    /// 503 with `Retry-After: 1`, without an instance. Give the actor
+    /// service the same number ([`crate::ActorConfig::max_front_requests`]),
+    /// so the slots are always free in the pool.
+    #[must_use]
+    pub fn with_max_requests(mut self, n: usize) -> Self {
+        let n = n.max(1);
+        self.max_requests = n;
+        self.slots = Arc::new(tokio::sync::Semaphore::new(n));
+        self
+    }
+
+    /// The front's values from this node (`--front-env`), read with
+    /// `env.get`.
+    #[must_use]
+    pub fn with_env(self, vars: crate::env::Vars) -> Self {
+        {
+            let mut version = self.version.write().unwrap_or_else(|p| p.into_inner());
+            *version = Arc::new(FrontVersion {
+                pre: version.pre.clone(),
+                env: Arc::new(vars),
+            });
+        }
+        self
+    }
+
+    /// Puts `version` in place: the next request takes it, one in flight
+    /// finishes on the one it started with. The slots stay.
+    #[allow(dead_code, reason = "for versions loaded from a deploy")]
+    pub(crate) fn set_version(&self, version: FrontVersion) {
+        *self.version.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(version);
+    }
+
+    /// Front requests running at once at most.
+    pub fn max_requests(&self) -> usize {
+        self.max_requests
+    }
+
+    fn current(&self) -> Arc<FrontVersion> {
+        Arc::clone(&self.version.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn host(&self, actors: Option<&ActorService>, env: Arc<crate::env::Vars>) -> FrontHost {
+        FrontHost {
+            wasi: self.guest_log.wasi(FRONT_CLASS.to_owned()),
+            http: WasiHttpCtx::new(),
+            table: ResourceTable::new(),
+            egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress))
+                .forbidding_wasmkeep_headers(),
+            tenant: actors.map_or_else(|| "default".to_owned(), |a| a.tenant().to_owned()),
+            actors: actors.cloned(),
+            env,
+            deadline: tokio::time::Instant::now() + self.wall,
+            waits: Arc::clone(&self.waits),
+            per_actor: (self.max_requests / 4).max(1),
+        }
+    }
+
+    /// Creates and drops one instance without calling it: proves the
+    /// component instantiates (start functions, pool capacity) and is the
+    /// per-request instantiation cost, minus the request itself.
+    pub async fn instantiate_once(&self) -> Result<(), Error> {
+        let version = self.current();
+        let mut store = self.runtime.new_async_store_with_budget(
+            self.host(None, Arc::clone(&version.env)),
+            self.cpu_budget,
+        );
+        version
+            .pre
+            .instantiate_async(&mut store)
+            .await
+            .map(drop)
+            .map_err(|e| Error::not_http(e.into_boxed_dyn_error()))
+    }
+
+    /// Handles one request in a fresh instance, without the node's actors.
+    /// Guest failures (traps, no response set) become a 500 response,
+    /// never an error for the caller.
+    pub async fn handle(&self, req: Request<Incoming>) -> Response<HyperOutgoingBody> {
+        self.serve(req, None).await
+    }
+
+    /// Handles one request, its calls reaching `actors`.
+    pub(crate) async fn serve(
+        &self,
+        mut req: Request<Incoming>,
+        actors: Option<&ActorService>,
+    ) -> Response<HyperOutgoingBody> {
+        let started = Instant::now();
+        // Past its slots, the front is not instantiated.
+        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
+            outcome("busy");
+            return busy();
+        };
+        let slot = Slot::new(permit);
+        strip_wasmkeep_headers(req.headers_mut());
+        let observe = move || METRICS.front_request_seconds.observe(started.elapsed());
+        match self.try_handle(req, actors, slot).await {
+            Ok((mut response, running)) => {
+                // wasmtime-wasi-http lets a guest set any status: never an
+                // upgrade, nor any other informational answer. Dropping
+                // `running` stops the instance.
+                if response.status().is_informational() {
+                    tracing::warn!(
+                        status = response.status().as_u16(),
+                        "front answered with an informational status"
+                    );
+                    drop(running);
+                    outcome("guest_error");
+                    observe();
+                    return internal_error();
+                }
+                strip_wasmkeep_headers(response.headers_mut());
+                // From here the instance's own end says how the request
+                // went: a cut while the body streams is not `ok`.
+                let Running { abort, sent } = running;
+                let _ = sent.send(());
+                response.map(|body| {
+                    Timed {
+                        inner: body,
+                        observe: Some(Box::new(observe)),
+                        abort,
+                    }
+                    .boxed_unsync()
+                })
+            }
+            Err(e) => {
+                // The pool had no instance (it keeps the front's slots, so
+                // this is brief): as busy as no slot.
+                if e.downcast_ref::<wasmtime::PoolConcurrencyLimitError>()
+                    .is_some()
+                {
+                    outcome("busy");
+                    observe();
+                    tracing::warn!(error = %format!("{e:#}"), "front request: no instance free");
+                    return busy();
+                }
+                let reason = reason(&e);
+                outcome(reason);
+                observe();
+                tracing::warn!(reason, error = %format!("{e:#}"), "front request failed");
+                internal_error()
+            }
+        }
+    }
+
+    async fn try_handle(
+        &self,
+        req: Request<Incoming>,
+        actors: Option<&ActorService>,
+        slot: Slot,
+    ) -> wasmtime::Result<(Response<HyperOutgoingBody>, Running)> {
+        let version = self.current();
+        let mut store = self.runtime.new_async_store_with_budget(
+            self.host(actors, Arc::clone(&version.env)),
+            self.cpu_budget,
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let req = store
+            .data_mut()
+            .http()
+            .new_incoming_request(Scheme::Http, CappedBody::of(req))?;
+        let out = store.data_mut().http().new_response_outparam(sender)?;
+        let pre = version.pre.clone();
+        // Said once the response went to the client: the instance's end is
+        // then the request's outcome. Dropped otherwise.
+        let (sent, was_sent) = tokio::sync::oneshot::channel::<()>();
+
+        // The guest may keep streaming the body after it has set the
+        // response, so it runs in its own task, which holds the slot for as
+        // long as the instance lives.
+        let wall = self.wall;
+        let task = tokio::task::spawn(async move {
+            let _slot = slot;
+            let run = async move {
+                let proxy = pre.instantiate_async(&mut store).await?;
+                proxy
+                    .wasi_http_incoming_handler()
+                    .call_handle(store, req, out)
+                    .await
+            };
+            // Past the wall the instance is dropped, which also ends a
+            // response still streaming.
+            let result = tokio::time::timeout(wall, run)
+                .await
+                .unwrap_or_else(|_| Err(WallExceeded(wall).into()));
+            if was_sent.await.is_ok() {
+                match &result {
+                    Ok(()) => outcome("ok"),
+                    Err(e) => {
+                        let reason = reason(e);
+                        outcome(reason);
+                        tracing::warn!(
+                            reason,
+                            error = %format!("{e:#}"),
+                            "front request failed after its response began"
+                        );
+                    }
+                }
+            }
+            result
+        });
+        // A client that leaves before the answer stops the instance, and
+        // frees its slot.
+        let abort = AbortOnDrop(Some(task.abort_handle()));
+
+        let Ok(received) = tokio::time::timeout(wall, receiver).await else {
+            return Err(WallExceeded(wall).into());
+        };
+        match received {
+            Ok(Ok(response)) => Ok((response, Running { abort, sent })),
+            Ok(Err(code)) => Err(code.into()),
+            // The sender was dropped with the store: the guest returned or
+            // trapped without setting a response.
+            Err(_) => {
+                drop(sent);
+                let cause = match task.await {
+                    Ok(Ok(())) => wasmtime::format_err!("guest returned without a response"),
+                    Ok(Err(e)) => e,
+                    Err(join) => join.into(),
+                };
+                Err(cause.context("guest did not set a response"))
+            }
+        }
+    }
+}
+
+/// Counts one front request ([`crate::metrics::Metrics::front_requests`]).
+fn outcome(o: &str) {
+    inc(&METRICS.front_requests.get(&[("outcome", o)]));
+}
+
+/// Why an instance failed, as an outcome.
+fn reason(e: &wasmtime::Error) -> &'static str {
+    if e.downcast_ref::<CpuBudgetExceeded>().is_some() {
+        "cpu_budget"
+    } else if e.downcast_ref::<WallExceeded>().is_some() {
+        "wall"
+    } else {
+        "guest_error"
+    }
+}
+
+/// 503, `Retry-After: 1`: no slot or no instance for the front.
+fn busy() -> Response<HyperOutgoingBody> {
+    let mut r = text_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "this node is busy; retry\n",
+    );
+    r.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    r
+}
+
+/// A front instance whose response is on its way: stopped when this is
+/// dropped before the response ends.
+struct Running {
+    abort: AbortOnDrop,
+    sent: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Aborts a task when dropped, unless disarmed.
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+/// A front request ran past its wall.
+#[derive(Debug)]
+struct WallExceeded(Duration);
+
+impl std::fmt::Display for WallExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request ran past {:?}", self.0)
+    }
+}
+
+impl std::error::Error for WallExceeded {}
+
+/// Removes every header of the host's `x-wasmkeep-` range (ADR 0023).
+fn strip_wasmkeep_headers(headers: &mut hyper::HeaderMap) {
+    let names: Vec<hyper::header::HeaderName> = headers
+        .keys()
+        .filter(|n| crate::actor::is_wasmkeep_header(n.as_str()))
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+}
+
+fn internal_error() -> Response<HyperOutgoingBody> {
+    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error\n")
+}
+
+/// A response body that records the request's duration once its last
+/// byte went out (or the client left), and stops the instance if the
+/// client leaves before the end.
+struct Timed {
+    inner: HyperOutgoingBody,
+    observe: Option<Box<dyn FnOnce() + Send>>,
+    abort: AbortOnDrop,
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        if hyper::body::Body::is_end_stream(&self.inner) {
+            self.abort.disarm();
+        }
+        if let Some(observe) = self.observe.take() {
+            observe();
+        }
+    }
+}
+
+impl hyper::body::Body for Timed {
+    type Data = Bytes;
+    type Error = <HyperOutgoingBody as hyper::body::Body>::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            // Whole: the instance may finish on its own, up to its wall.
+            self.abort.disarm();
+            if let Some(observe) = self.observe.take() {
+                observe();
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}

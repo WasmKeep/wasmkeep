@@ -59,6 +59,8 @@ mod durable_writes;
 mod failover;
 #[path = "failover_wait.rs"]
 mod failover_wait;
+#[path = "front.rs"]
+mod front;
 #[path = "migrate.rs"]
 mod migrate;
 #[path = "node_leases.rs"]

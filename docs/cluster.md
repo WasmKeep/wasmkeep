@@ -668,18 +668,24 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
 ### Updating the stateless component
 
 A deploy carries actor classes, with their access rules, configuration
-and required names. It does not carry the stateless component, the
-positional argument of `wasmkeep serve` that answers every path outside
-`/actor/` and `/_wasmkeep/`: that one is a file on each node, read once
-when the node starts, also with `--app`:
+and required names. The stateless component, the front
+([ADR 0023](adr/0023-the-front.md)) that answers every path outside
+`/actor/` and `/_wasmkeep/`, is the positional argument of `wasmkeep
+serve`, a file on each node read once when the node starts, for nodes that
+serve classes given with `--actor`:
 
 ```bash
-wasmkeep serve site.wasm --app acme/shop --bucket s3://wasmkeep-demo --node-id a ...
+wasmkeep serve site.wasm --actor cart=cart.wasm --bucket s3://wasmkeep-demo --node-id a ...
 ```
 
-Nothing in the bucket names it, so `wasmkeep deploy` does not change it,
-`--rollback` does not bring an older one back, and `cluster status` does
-not show which one a node runs. To update it today:
+With `--app`, a component on the command line is refused at start: an
+app's front is to ship with its deploy, so that a deploy and a rollback
+move it with the classes (planned, ADR 0023). Until then a node serving
+`--app` has no front and answers 404 outside `/actor/`.
+
+Nothing in the bucket names the file, so `wasmkeep deploy` does not change
+it, `--rollback` does not bring an older one back, and `cluster status`
+does not show which one a node runs. To update it:
 
 1. Copy the new file to every node, at the path its `serve` command names.
 2. Restart the nodes one at a time (`systemctl restart wasmkeep`), waiting
@@ -704,10 +710,13 @@ What happens meanwhile:
   the previous file.
 - **Going back** is the same procedure with the previous file.
 
-The stateless component has no `actors.call`: it is linked against WASI
-and `wasi:http` only. It reaches actors as any client does, over HTTP,
-under the same outbound rules as actors (public addresses only, unless
-the node allows a range with `--allow-outbound`).
+The front calls the node's `--actor` classes with `actors.call`, as an
+inside caller: the callee sees `x-wasmkeep-caller: default/_front/main`,
+and a call to an actor on another node is a signed hop, as an actor's
+([the front](concepts.md#the-front)). It runs on the node that received
+the request and is never forwarded. Its outbound HTTP follows the same
+rules as actors' (public addresses only, unless the node allows a range
+with `--allow-outbound`).
 
 ### Access rules and configuration
 

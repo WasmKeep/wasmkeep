@@ -408,7 +408,18 @@ async fn call_from(
         headers: Vec::new(),
         body: Vec::new(),
     };
-    within(Arc::clone(&service.inner).call(&ctx, &format!("test/{callee}"), request)).await
+    let target = service
+        .inner
+        .call_target(ctx.me.tenant(), &format!("test/{callee}"))?;
+    let wall = service.inner.wall;
+    within(Arc::clone(&service.inner).call(
+        &super::Caller::Actor(ctx.me.clone()),
+        &ctx.chain,
+        target,
+        request,
+        wall,
+    ))
+    .await
 }
 
 /// `wasmkeep_admission_refused_total{reason}` (this process's: nextest

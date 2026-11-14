@@ -115,6 +115,20 @@ impl Runtime {
         self.store(data, Execution::Async)
     }
 
+    /// Like [`new_async_store`](Self::new_async_store), with its own CPU
+    /// budget instead of the runtime's: for instances that run under
+    /// another limit than actors (a front's request).
+    pub fn new_async_store_with_budget<T: 'static>(&self, data: T, budget: Duration) -> Store<T> {
+        let mut store = Store::new(&self.engine, data);
+        let _meter = cpu::install(&mut store, budget, self.epoch_tick, Execution::Async);
+        store
+    }
+
+    /// The CPU budget stores get by default.
+    pub fn cpu_budget(&self) -> Duration {
+        self.cpu_budget
+    }
+
     /// Like [`new_async_store`](Self::new_async_store), for a store reused
     /// across events (an actor's): call [`CpuMeter::reset`] at the start of
     /// each event so every event gets the full budget.

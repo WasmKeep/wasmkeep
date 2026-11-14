@@ -337,7 +337,20 @@ impl actors::Host for ActorHost {
         let Some(service) = ctx.service.as_ref().and_then(std::sync::Weak::upgrade) else {
             return Ok(Err(CallError::Failed("node is shutting down".into())));
         };
-        Ok(service.call(&ctx, &address, request).await)
+        let target = match service.call_target(ctx.me.tenant(), &address) {
+            Ok(target) => target,
+            Err(e) => return Ok(Err(e)),
+        };
+        let wall = service.wall;
+        Ok(service
+            .call(
+                &Caller::Actor(ctx.me.clone()),
+                &ctx.chain,
+                target,
+                request,
+                wall,
+            )
+            .await)
     }
 
     async fn self_address(&mut self) -> wasmtime::Result<actors::ActorAddress> {

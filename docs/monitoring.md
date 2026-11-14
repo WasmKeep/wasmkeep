@@ -105,7 +105,8 @@ curl 127.0.0.1:9100/metrics
 Off by default. The page names classes and counts events, so bind it to
 loopback or a private address that only your Prometheus reaches. Labels are
 the node's tenant and app, class names, event kinds and fixed reasons, never
-actor names. Every series with a `class` label also has `tenant` and `app`:
+actor names. Every series with a `class` label, and the front's counters
+and histogram, also have `tenant` and `app`:
 the app the node serves (`serve --app tenant/app`), or the implicit app
 `default/default` for classes given on the command line.
 
@@ -131,6 +132,10 @@ the app the node serves (`serve --app tenant/app`), or the implicit app
 | `wasmkeep_listing_seconds` | histogram | One listing of the cluster's heartbeats, with the view and the peers' pins it refreshes (every heartbeat period, and early when an unknown pin knocks). Near the heartbeat horizon (10 s by default), peers' pins expire before the next listing renews them and handshakes between nodes are refused; fences run on a task of their own and are not counted. |
 | `wasmkeep_guest_log_lines_total`, `wasmkeep_guest_log_dropped_total` | counters | Lines actors printed that reached the log, and that were dropped over the rate ([what actors print](#what-actors-print)). |
 | `wasmkeep_admission_refused_total{reason}` | counter | Requests, WebSocket upgrades and actor calls this node refused before their event ran, by `reason`: `access` (the class's access rule: an internal class reached from outside, 403, or a name an `existing` class does not let an outside request create, 404), `capacity` (no resident capacity, 503 with `Retry-After`, or a WebSocket over the socket limits), `overloaded` (the actor's queue was full: 429 for requests and calls, 503 for a WebSocket upgrade), `unavailable` (the node cannot run the actor now, 503: a required value not set, the deployed version or the app's secrets not applied, the bucket not answering for the actor's ownership; on a WebSocket upgrade, an ownership record that cannot be read also answers 503 and is counted here, where a request gets a 500 and is not counted) and `wrong_app` (a hop from another node, or a forwarded request, that names another app than this node's, 503 "not this app's node", or no app at all, as a node of an older version sends; [ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md)). A 503 while an actor's ownership changes hands between nodes is not a refusal and is not counted. All five series are always on the page. Each refusal is counted once, by the node that answered it: one forwarded to the actor's node is counted there. Alarms are not counted here (`wasmkeep_alarm_admission_retries_total`). `capacity` rising: more actors awake at once than the node holds (see [open files](#open-files) and [memory](#memory)); `access` rising: clients or links aimed at actors they may not reach; `wrong_app` rising: nodes of two apps (or of two versions) on one cluster port, or a front door sending one app's traffic to another app's nodes. |
+| `wasmkeep_front_requests_total{tenant,app,outcome}` | counter | Requests the front ([ADR 0023](adr/0023-the-front.md)) received, by `outcome`: `ok` (it answered), `busy` (every front slot was taken, or, briefly, the instance pool had none free: 503 with `Retry-After: 1`, and the front did not run), `unconfigured` (a value the front requires is not set, from the deploy's `--front-requires`), `cpu_budget` (past `--front-cpu-budget-ms`, 500), `wall` (past its 30 s wall, 500) and `guest_error` (it trapped, answered nothing, or answered with a `1xx` status, all 500). A request is counted when its instance ends: one stopped while its response was streaming counts as `cpu_budget`, `wall` or `guest_error`, not `ok`, though the client already had a 200. A request whose client left before the answer is not counted. `busy` rising: raise `--max-front-requests`, or find what keeps front requests waiting (their calls). |
+| `wasmkeep_front_request_seconds{tenant,app}` | histogram | How long front requests took, to the response's last byte. |
+| `wasmkeep_front_slots_in_use` | gauge | Front requests running now, out of `--max-front-requests`. |
+| `wasmkeep_front_calls_total{tenant,app,outcome}` | counter | `actors.call` from the front, by `outcome`: `ok` (the callee answered, whatever its status), `busy` (a quarter of the front's slots already waited on that actor: `failed("front busy: ...")`), `timeout` (5 s of the front's wall were left, or the actors' call limit passed) and `failed` (every other error: an invalid address, a callee that failed or was overloaded, a body too large). A call to another node is also counted in `wasmkeep_forwards_total{kind="call"}`. |
 | `wasmkeep_alarm_admission_retries_total` | counter | Alarm deliveries rescheduled because resident capacity or an actor queue was full; no actor labels. |
 | `wasmkeep_node_lease_writes_total`, `wasmkeep_node_lease_failures_total` | counters | Writes of this node's lease (its heartbeat, [ADR 0020](adr/0020-one-lease-per-node.md)) that reached the bucket, and that failed or timed out. With the defaults (a write every 3 s, valid for 8 s), two failing in a row and the lease runs out: the node reports not ready. A write that hangs is counted when it times out (2.7 s), so alert on the first increment. |
 | `wasmkeep_node_fences_total` | counter | Fences this node wrote over a node that stopped renewing its lease (crashed, or cut off from the bucket). |
@@ -248,8 +253,8 @@ fails if a rule names a metric the page does not have.
 What an actor writes to stdout or stderr (Rust's `println!` and
 `eprintln!`, `console.log` in TypeScript, `print` in Python, `printf` in C)
 reaches the node's log, one entry per line, as target `wasmkeep::guest` with
-the actor's address and the stream; a stateless component's says
-`actor=stateless`:
+the actor's address and the stream; the front's (the stateless component)
+says `actor=_front`:
 
 ```text
 INFO wasmkeep::guest: order 42 shipped actor=acme/orders/42 stream="stdout"

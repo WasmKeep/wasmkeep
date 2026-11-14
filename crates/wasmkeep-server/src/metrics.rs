@@ -245,6 +245,18 @@ pub(crate) struct Metrics {
     pub(crate) websocket_owner_closes: Family<AtomicU64>,
     /// Ownership records the WebSocket owner sweep read.
     pub(crate) websocket_sweep_reads: AtomicU64,
+    /// Front requests (ADR 0023), by outcome (`ok`, `busy`,
+    /// `unconfigured`, `cpu_budget`, `wall`, `guest_error`); rendered with
+    /// the node's tenant and app.
+    pub(crate) front_requests: Family<AtomicU64>,
+    /// How long front requests took, to the response's last byte; rendered
+    /// with the node's tenant and app.
+    pub(crate) front_request_seconds: Histogram,
+    /// Front requests running now (a gauge).
+    pub(crate) front_slots_in_use: AtomicU64,
+    /// `actors.call` from the front, by outcome (`ok`, `busy`, `timeout`,
+    /// `failed`); rendered with the node's tenant and app.
+    pub(crate) front_calls: Family<AtomicU64>,
     /// Requests, WebSocket upgrades and actor calls refused before their
     /// event ran, by [`Refusal`].
     pub(crate) admission_refused: [AtomicU64; Refusal::ALL.len()],
@@ -614,6 +626,50 @@ pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
         "Ownership records the WebSocket owner sweep read.",
         m.websocket_sweep_reads.load(Ordering::Relaxed),
     );
+    let app_family = |out: &mut String, name: &str, help: &str, f: &Family<AtomicU64>| {
+        head(out, name, "counter", help);
+        f.each(|labels, v| {
+            let _ = writeln!(
+                out,
+                "{name}{{{}}} {}",
+                join_labels(&app, labels),
+                v.load(Ordering::Relaxed)
+            );
+        });
+    };
+    app_family(
+        &mut out,
+        "wasmkeep_front_requests_total",
+        "Front requests, by tenant, app and outcome.",
+        &m.front_requests,
+    );
+    head(
+        &mut out,
+        "wasmkeep_front_request_seconds",
+        "histogram",
+        "How long front requests took, to the response's last byte, by tenant and app.",
+    );
+    if m.front_request_seconds.count.load(Ordering::Relaxed) > 0 {
+        m.front_request_seconds
+            .render(&mut out, "wasmkeep_front_request_seconds", &app);
+    }
+    head(
+        &mut out,
+        "wasmkeep_front_slots_in_use",
+        "gauge",
+        "Front requests running now.",
+    );
+    let _ = writeln!(
+        out,
+        "wasmkeep_front_slots_in_use {}",
+        m.front_slots_in_use.load(Ordering::Relaxed)
+    );
+    app_family(
+        &mut out,
+        "wasmkeep_front_calls_total",
+        "actors.call from the front, by tenant, app and outcome.",
+        &m.front_calls,
+    );
     head(
         &mut out,
         "wasmkeep_admission_refused_total",
@@ -758,10 +814,13 @@ mod tests {
             page.contains("wasmkeep_events_total{tenant=\"default\",app=\"default\",class=\"c\",kind=\"request\",outcome=\"ok\"} 1\n"),
             "{page}"
         );
-        // Every series with a class has them; the others are as they were,
+        // Every series with a class has them, and so do the front's
+        // counters and histogram (ADR 0023); the others are as they were,
         // and gauges of the process stay unlabelled.
         for l in page.lines().filter(|l| !l.starts_with('#')) {
-            if l.contains("class=\"") {
+            if l.contains("class=\"")
+                || (l.starts_with("wasmkeep_front_") && !l.starts_with("wasmkeep_front_slots"))
+            {
                 assert!(l.contains("{tenant=\"default\",app=\"default\","), "{l}");
             } else if !l.starts_with("wasmkeep_info{") {
                 assert!(!l.contains("tenant=") && !l.contains("app="), "{l}");
