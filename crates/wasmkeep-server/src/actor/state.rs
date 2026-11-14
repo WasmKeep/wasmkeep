@@ -159,6 +159,45 @@ impl Drop for Live {
     }
 }
 
+/// The state leaving memory (hibernation, eviction, shutdown): its hold is
+/// released, unless the actor still has a socket open on this node, in
+/// which case the hold is parked (ADR 0024): the record keeps naming this
+/// node, so the next event for the actor, wherever it lands, wakes it
+/// here, where its sockets are. Never while this node drains, moves the
+/// actor or cannot open the app's secrets: those give the actor up. Every
+/// other end of a hold (`self.lease = None`) releases it as before.
+impl Drop for ActorState {
+    fn drop(&mut self) {
+        let Some(hold) = self.lease.take() else {
+            return;
+        };
+        let parkable = hold.is_valid()
+            && self.cluster.as_ref().is_some_and(|c| !c.draining())
+            && !self
+                .secrets_blocked
+                .load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .moves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&self.address)
+            && self.sockets.has_open(&self.address);
+        if parkable {
+            hold.park(&self.address);
+            // The last socket's slot may have gone between the check above
+            // and the park, its nudge finding nothing parked yet.
+            if !self.sockets.has_open(&self.address)
+                && let Some(cluster) = self.cluster.clone()
+            {
+                let address = self.address.clone();
+                tokio::spawn(async move {
+                    cluster.release_parked(&address, "last_socket").await;
+                });
+            }
+        }
+    }
+}
+
 impl ActorState {
     /// A request event: runs it if this node owns the actor, otherwise hands
     /// the request back with the owner's id.
@@ -346,6 +385,12 @@ impl ActorState {
         if cluster.draining()
             && let Some(peer) = cluster.chosen_peer(&self.address)
         {
+            // Parked here (ADR 0024): released now, so the peer can take it
+            // instead of finding it held by this node until the drain's
+            // next pass.
+            if cluster.is_parked(&self.address) {
+                cluster.release_parked(&self.address, "drain").await;
+            }
             return Err(OwnershipError::Elsewhere { peer });
         }
         // A drain claims when no peer can take the actor; a node that

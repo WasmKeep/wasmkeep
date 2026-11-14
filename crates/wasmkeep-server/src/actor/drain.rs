@@ -9,9 +9,10 @@
 //! and releases the lease, waiting for the release to be written. The
 //! actor is then dropped from memory; events queued behind the job find no
 //! lease and go to the chosen peer, which claims. Its alarm, if any, is
-//! handed to that peer, which arms it in its own timer. Sockets of rooms
-//! that hibernated with them open (not resident, so not handed over) are
-//! closed too; their close events are lost.
+//! handed to that peer, which arms it in its own timer. Rooms that
+//! hibernated with sockets open (not resident, so not handed over) have
+//! their parked records released (ADR 0024) and their sockets closed;
+//! their close events are lost.
 
 use std::collections::HashMap;
 
@@ -200,6 +201,12 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
         let addresses = inner.mailboxes.addresses();
         let any_peer = cluster.has_eligible_peer();
         if any_peer {
+            // Parked records first (ADR 0024; on every pass, since a park
+            // may land just after the drain began): until released, their
+            // rooms' events come here and find a node that claims nothing,
+            // while the peer finds them held here. The hand-overs below
+            // can take a while.
+            cluster.release_all_parked("drain").await;
             futures_util::StreamExt::for_each_concurrent(
                 futures_util::stream::iter(addresses),
                 DRAIN_PARALLEL,
@@ -212,9 +219,10 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
                 }
             }
             // Rooms that hibernated with sockets open are not resident, so
-            // no hand-over closes them: close them here, and their clients
-            // reconnect to the peer. Their close events find no hold on
-            // this draining node and are lost.
+            // no hand-over closes them: their records were released above;
+            // close their sockets, and their clients reconnect to the peer.
+            // Their close events find no hold on this draining node and
+            // are lost.
             for address in inner.sockets.owners() {
                 if !inner.mailboxes.contains(&address) {
                     let closed =

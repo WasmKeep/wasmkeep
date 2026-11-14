@@ -11,6 +11,8 @@
   a front), [ADR 0010](0010-who-may-create-an-actor.md) (one more inside
   caller), [ADR 0016](0016-secrets-in-the-bucket.md) (a secrets scope for
   the front).
+- Amended by: [ADR 0024](0024-socket-home.md) (the socket home gate is
+  lifted).
 
 ## Context
 
@@ -455,6 +457,12 @@ one second (`HINT_MS`). This is a stated cost, watched with
 anything is tuned. With a round-robin balancer a new node fills by itself.
 
 ### Socket home: a gate for clustered use
+
+> Lifted by [ADR 0024](0024-socket-home.md) (0.4.0): a room with open
+> sockets keeps its ownership record while it hibernates, so a call from
+> any node's front wakes it on the node that holds its sockets. Socket
+> classes can use the front on a cluster. The text below is the gate as
+> decided.
 
 Sockets stay on their node when the actor hibernates and its ownership
 is released. When another node then takes the actor, its sockets are

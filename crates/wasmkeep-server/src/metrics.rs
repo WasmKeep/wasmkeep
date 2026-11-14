@@ -241,10 +241,18 @@ pub(crate) struct Metrics {
     pub(crate) signatures_refused_full: Family<AtomicU64>,
     /// WebSockets this node closed with 1012 because it no longer owned
     /// their actor, by how it found out (`event`, `sweep`, `lease_lapse`,
-    /// `drain`).
+    /// `drain`, `move`).
     pub(crate) websocket_owner_closes: Family<AtomicU64>,
     /// Ownership records the WebSocket owner sweep read.
     pub(crate) websocket_sweep_reads: AtomicU64,
+    /// Records kept for actors that hibernated with sockets open (a gauge,
+    /// ADR 0024).
+    pub(crate) parked_records: AtomicU64,
+    /// Wakes of a parked actor on its node (ADR 0024).
+    pub(crate) parked_wakes: AtomicU64,
+    /// Parked records released, by `reason` (`last_socket`, `drain`,
+    /// `move`, `lapse`, `stop`).
+    pub(crate) parked_releases: Family<AtomicU64>,
     /// Front requests (ADR 0023), by outcome (`ok`, `busy`,
     /// `unconfigured`, `cpu_budget`, `wall`, `guest_error`); rendered with
     /// the node's tenant and app.
@@ -315,6 +323,17 @@ pub(crate) fn owner_closes(reason: &str, n: usize) {
     if n > 0 {
         METRICS
             .websocket_owner_closes
+            .get(&[("reason", reason)])
+            .fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+/// Counts `n` parked records released for `reason`
+/// ([`Metrics::parked_releases`]).
+pub(crate) fn parked_released(reason: &str, n: usize) {
+    if n > 0 {
+        METRICS
+            .parked_releases
             .get(&[("reason", reason)])
             .fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
@@ -625,6 +644,29 @@ pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_websocket_sweep_reads_total",
         "Ownership records the WebSocket owner sweep read.",
         m.websocket_sweep_reads.load(Ordering::Relaxed),
+    );
+    head(
+        &mut out,
+        "wasmkeep_parked_records",
+        "gauge",
+        "Ownership records kept for actors that hibernated with sockets open on this node.",
+    );
+    let _ = writeln!(
+        out,
+        "wasmkeep_parked_records {}",
+        m.parked_records.load(Ordering::Relaxed)
+    );
+    counter(
+        &mut out,
+        "wasmkeep_parked_wakes_total",
+        "Wakes of an actor whose record was parked here, on this node.",
+        m.parked_wakes.load(Ordering::Relaxed),
+    );
+    family(
+        &mut out,
+        "wasmkeep_parked_releases_total",
+        "Parked ownership records released, by reason.",
+        &m.parked_releases,
     );
     let app_family = |out: &mut String, name: &str, help: &str, f: &Family<AtomicU64>| {
         head(out, name, "counter", help);

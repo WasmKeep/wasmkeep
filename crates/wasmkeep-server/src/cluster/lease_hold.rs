@@ -9,12 +9,17 @@
 //! ([`Pending`]), retried in the background while the node lease is valid.
 //! One lock per actor orders an acquisition and the resolution of an
 //! unresolved acquire of the same actor.
+//!
+//! A hold whose actor hibernates with sockets open on this node is parked
+//! instead (ADR 0024): it stops acting, and its record keeps naming this
+//! node until a wake acquires it again (at a new generation) or the last
+//! socket, a drain, a move, a lapse or a clean stop releases it.
 
 use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) use wasmkeep_cluster::holds::PendingEntry;
-use wasmkeep_cluster::holds::Validity;
+use wasmkeep_cluster::holds::{Parked, Validity};
 use wasmkeep_cluster::node_lease::{AcquireError, Hold, Released};
 
 use super::*;
@@ -102,6 +107,26 @@ pub(crate) struct Pending {
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Releases sent and not answered yet.
     in_flight: Arc<AtomicUsize>,
+    /// Holds parked by hibernations with sockets open (ADR 0024), each
+    /// with its actor's address. Locked after `holds`, never before.
+    parked: Mutex<Parked<ActorAddress>>,
+}
+
+/// Records the parked set's size moving from `before` to `after` in the
+/// `wasmkeep_parked_records` gauge (shared by every node of a process).
+fn parked_moved(before: usize, after: usize) {
+    let m = &crate::metrics::METRICS.parked_records;
+    if after > before {
+        m.fetch_add(
+            u64::try_from(after - before).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    } else if before > after {
+        m.fetch_sub(
+            u64::try_from(before - after).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 impl Pending {
@@ -112,8 +137,9 @@ impl Pending {
             .push(entry);
     }
 
-    /// Whether no release or acquire waits for its outcome, and none is in
-    /// flight.
+    /// Whether no release or acquire waits for its outcome, none is in
+    /// flight, and no record is parked (ADR 0024: a drain is drained, and a
+    /// clean stop's releases done, only with none left).
     pub(crate) fn is_empty(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) == 0
             && self
@@ -121,6 +147,80 @@ impl Pending {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
+            && self.parked().is_empty()
+    }
+
+    /// Whether a release or an unresolved acquire waits in the set.
+    fn has_entries(&self) -> bool {
+        !self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
+    fn parked(&self) -> std::sync::MutexGuard<'_, Parked<ActorAddress>> {
+        self.parked.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Moves the hold in `cell` from the live set to the parked set in one
+    /// step, under the live set's lock, if `valid` says it may still act
+    /// (ADR 0024, section 1): the key is never in neither set, so a lapse
+    /// ending every hold, or the resolver, cannot miss it. Returns what to
+    /// release instead: the hold, if it may not act any more, or a hold
+    /// parked earlier for the same key.
+    fn park(
+        &self,
+        key: &str,
+        cell: &Cell,
+        address: ActorAddress,
+        valid: impl Fn() -> bool,
+    ) -> Option<Hold> {
+        let mut holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        let hold = cell.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if holds.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
+            holds.remove(key);
+        }
+        let hold = hold?;
+        if !valid() {
+            return Some(hold);
+        }
+        let mut parked = self.parked();
+        let before = parked.len();
+        let earlier = parked.park(hold, address);
+        parked_moved(before, parked.len());
+        earlier
+    }
+
+    /// A wake's outcome for `key` (ADR 0024, section 2): drops the parked
+    /// hold if the acquisition may have moved the record. Whether one was
+    /// dropped.
+    fn after_wake(&self, key: &str, acquired: &Result<Hold, AcquireError>) -> bool {
+        let mut parked = self.parked();
+        let before = parked.len();
+        let dropped = parked.after_wake(key, acquired).is_some();
+        parked_moved(before, parked.len());
+        dropped
+    }
+
+    /// Takes the parked hold of `key` out (at `generation`, if given).
+    fn take_parked(&self, key: &str, generation: Option<u64>) -> Option<Hold> {
+        let mut parked = self.parked();
+        let before = parked.len();
+        let taken = match generation {
+            Some(g) => parked.take_at(key, g),
+            None => parked.take(key),
+        };
+        parked_moved(before, parked.len());
+        taken.map(|(hold, _)| hold)
+    }
+
+    /// Whether a hold of `key` is held here at `generation`, live or
+    /// parked: what the resolver of an unresolved acquire asks. A live hold
+    /// counts at any generation (ADR 0020); a parked one only at its own
+    /// (ADR 0024, section 3).
+    fn held_at(&self, key: &str, generation: u64) -> bool {
+        self.holds(key) || self.parked().holds_at(key, generation)
     }
 
     /// Actors whose lock has a handle somewhere (tests).
@@ -182,6 +282,25 @@ impl Pending {
             if let Some(hold) = hold
                 && release
             {
+                self.push(PendingEntry::Release(hold));
+            }
+        }
+        // Parked records too (ADR 0024, section 3), under the live set's
+        // lock as parking takes it: a park cannot land after this.
+        let holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        let parked = {
+            let mut parked = self.parked();
+            let before = parked.len();
+            let all = parked.take_all();
+            parked_moved(before, 0);
+            all
+        };
+        drop(holds);
+        if release && !parked.is_empty() {
+            crate::metrics::parked_released("lapse", parked.len());
+        }
+        for (hold, _) in parked {
+            if release {
                 self.push(PendingEntry::Release(hold));
             }
         }
@@ -271,6 +390,11 @@ impl LeaseHold {
                 async || cluster.seed_generation(address).await,
             )
             .await;
+        // A parked hold of this actor (ADR 0024): dropped if this write may
+        // have moved the record.
+        if cluster.pending.after_wake(&key, &acquired) && acquired.is_ok() {
+            crate::metrics::inc(&crate::metrics::METRICS.parked_wakes);
+        }
         match acquired {
             Ok(hold) => {
                 if let Some(previous) = &hold.previous {
@@ -366,6 +490,32 @@ impl LeaseHold {
                 _ = cluster.identity_lost() => {}
             }
         }
+    }
+
+    /// Parks the hold (ADR 0024): its actor hibernates with sockets open
+    /// on this node. It stops acting at once, and its record keeps naming
+    /// this node, unwritten. A hold that may no longer act is released as
+    /// a drop would.
+    pub(crate) fn park(self, address: &ActorAddress) {
+        let validity = Arc::clone(&self.cluster.validity);
+        let epoch = self.epoch;
+        // In flight from before the hold leaves the live set: the node never
+        // reads as having nothing pending while a release is still due.
+        let in_flight = InFlight::start(&self.cluster.pending.in_flight);
+        let release = self
+            .cluster
+            .pending
+            .park(&self.key, &self.cell, address.clone(), || {
+                validity.valid_in(epoch)
+            });
+        if let Some(hold) = release {
+            let cluster = Arc::clone(&self.cluster);
+            tokio::spawn(async move {
+                let _in_flight = in_flight;
+                cluster.release_or_park(hold).await;
+            });
+        }
+        // Dropped with an empty cell: sends nothing.
     }
 
     /// Takes the hold out: this node stops acting as owner before any
@@ -487,7 +637,7 @@ impl Cluster {
     async fn retry_bounded(
         &self,
         entry: PendingEntry,
-        held_here: impl Fn(&str) -> bool,
+        held_here: impl Fn(&str, u64) -> bool,
     ) -> Option<PendingEntry> {
         let again = entry.clone();
         tokio::time::timeout(
@@ -544,6 +694,105 @@ impl Cluster {
     /// resident actor that acquired it. One that hibernated released it.
     pub(crate) fn holds_here(&self, address: &ActorAddress) -> bool {
         self.node_lease_valid() && self.pending.holds(&self.owner_key(address))
+    }
+
+    /// Whether this node keeps `address`'s record parked (ADR 0024).
+    pub(crate) fn is_parked(&self, address: &ActorAddress) -> bool {
+        self.pending.parked().contains(&self.owner_key(address))
+    }
+
+    /// The actors whose record this node keeps parked, each with the
+    /// parked generation.
+    pub(crate) fn parked(&self) -> Vec<(ActorAddress, u64)> {
+        self.pending
+            .parked()
+            .iter()
+            .map(|(hold, address)| (address.clone(), hold.generation))
+            .collect()
+    }
+
+    /// Releases `address`'s parked record, if it has one, under its
+    /// actor's lock (a wake takes it too), and counts it for `reason`; a
+    /// release that does not land waits in the pending set. Counted as in
+    /// flight from before the parked set is touched: the node never reads
+    /// as having nothing pending in between.
+    pub(crate) async fn release_parked(&self, address: &ActorAddress, reason: &str) {
+        let key = self.owner_key(address);
+        let _in_flight = InFlight::start(&self.pending.in_flight);
+        let lock = self.pending.lock_of(&key);
+        let _locked = lock.lock().await;
+        let Some(hold) = self.pending.take_parked(&key, None) else {
+            return;
+        };
+        crate::metrics::parked_released(reason, 1);
+        tracing::debug!(actor = %address, reason, "released a parked record");
+        self.release_or_park(hold).await;
+    }
+
+    /// Releases every parked record (a drain, a clean stop).
+    pub(crate) async fn release_all_parked(&self, reason: &str) {
+        let all = self.parked();
+        futures_util::StreamExt::for_each_concurrent(
+            futures_util::stream::iter(all),
+            PENDING_CONCURRENCY,
+            |(address, _)| async move { self.release_parked(&address, reason).await },
+        )
+        .await;
+    }
+
+    /// The safeguard re-read of a parked record (ADR 0024, section 5):
+    /// `true` if the record no longer names this instance at the parked
+    /// generation, and the entry was dropped (nothing to release: the
+    /// record is not this hold's any more). A failed read drops nothing.
+    pub(crate) async fn drop_parked_if_stale(
+        &self,
+        address: &ActorAddress,
+        generation: u64,
+    ) -> bool {
+        let key = self.owner_key(address);
+        let lock = self.pending.lock_of(&key);
+        let _locked = lock.lock().await;
+        if !self.pending.parked().holds_at(&key, generation) {
+            return false;
+        }
+        match self.owners.still_names_this(&key, generation).await {
+            Ok(false) => {
+                let dropped = self.pending.take_parked(&key, Some(generation)).is_some();
+                if dropped {
+                    tracing::warn!(actor = %address, generation, "a parked record no longer names this node; forgotten");
+                }
+                dropped
+            }
+            Ok(true) | Err(_) => false,
+        }
+    }
+
+    /// After an unresolved acquire of `key` at `tried` ended (the caller
+    /// holds the actor's lock): a hold parked at an earlier generation is
+    /// forgotten if the record no longer names it (the unresolved wake
+    /// landed, and the resolver released it, ADR 0024 section 3). Kept if
+    /// it still does (the write never landed) or the read fails: the
+    /// safeguard re-read and the last socket's release handle the rest.
+    async fn forget_parked_behind(&self, key: &str, tried: u64) {
+        let Some(parked) = self.pending.parked().generation(key) else {
+            return;
+        };
+        if parked >= tried {
+            return;
+        }
+        let read = tokio::time::timeout(
+            self.lease_attempt,
+            self.owners.still_names_this(key, parked),
+        )
+        .await;
+        if matches!(read, Ok(Ok(false))) {
+            let _ = self.pending.take_parked(key, Some(parked));
+            tracing::info!(
+                key,
+                parked,
+                "a parked record was superseded by a wake that landed unanswered; forgotten"
+            );
+        }
     }
 
     /// Whether no release or acquire of this node waits for its outcome.
@@ -614,12 +863,27 @@ impl Cluster {
                     return false;
                 }
                 let still = match entry {
-                    entry @ PendingEntry::Release(_) => self.retry_bounded(entry, |_| false).await,
+                    entry @ PendingEntry::Release(_) => {
+                        self.retry_bounded(entry, |_, _| false).await
+                    }
                     entry @ PendingEntry::Unresolved { .. } => {
                         let lock = self.pending.lock_of(entry.key());
                         let _locked = lock.lock().await;
-                        self.retry_bounded(entry, |key| self.pending.holds(key))
-                            .await
+                        let (key, tried) = match &entry {
+                            PendingEntry::Unresolved { key, generation } => {
+                                (key.clone(), *generation)
+                            }
+                            PendingEntry::Release(_) => unreachable!("matched above"),
+                        };
+                        let still = self
+                            .retry_bounded(entry, |key, generation| {
+                                self.pending.held_at(key, generation)
+                            })
+                            .await;
+                        if still.is_none() {
+                            self.forget_parked_behind(&key, tried).await;
+                        }
+                        still
                     }
                 };
                 match still {
@@ -654,7 +918,9 @@ pub(super) async fn pending_loop(cluster: Weak<Cluster>) {
             return;
         };
         let ended = c.retry_pending().await;
-        wait = if ended || c.pending.is_empty() {
+        // Parked records are not entries to retry: a node with one parked
+        // for days must still try a new entry within a quarter second.
+        wait = if ended || !c.pending.has_entries() {
             FIRST
         } else {
             (wait * 2).min(MOST)

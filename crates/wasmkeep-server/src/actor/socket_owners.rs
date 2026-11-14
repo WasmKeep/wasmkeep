@@ -1,8 +1,9 @@
-//! Closing the sockets of actors this node does not own any more. A socket
-//! outlives its actor's stay in memory (it hibernates with sockets open,
-//! releasing its ownership record), so another node may take the actor
-//! while its sockets stay here, or this node's lease may run out under
-//! them. Two background tasks close such sockets with 1012, so their
+//! Closing the sockets of actors this node does not own any more, and
+//! releasing the records of parked ones (ADR 0024). A socket outlives its
+//! actor's stay in memory: an actor that hibernates with sockets open
+//! parks its ownership record, so it wakes here, where they are. Another
+//! node takes it only if the record stopped naming this node (a fault, or
+//! a node that does not park), or this node's lease ran out under them. Two background tasks close such sockets with 1012, so their
 //! clients reconnect to the owner: the owner sweep, and the close at the
 //! end of the node lease's validity. An event on such a socket closes all
 //! of them too ([`ActorState::ws_prepare`]).
@@ -21,10 +22,94 @@ const SWEEP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Most records one sweep pass reads; the next pass goes on where it
 /// stopped, so every room is read in turn, at a bounded bucket cost.
 const SWEEP_MAX_READS: usize = 5_000;
+/// One sweep pass in this many also reads every parked record, as a
+/// safeguard (ADR 0024, section 5); the others read none of them.
+const PARKED_RECHECK_EVERY: u64 = 10;
 
-/// Every [`Cluster::socket_sweep`]: for each actor with sockets on this
-/// node (not closing) and no hold here (it hibernated with them open),
-/// reads its ownership record once, and closes its sockets with 1012 if
+/// Releases the parked record of each actor whose last socket slot was
+/// freed (ADR 0024, section 3), unless it has a socket open again. The
+/// sweep does the same for any it missed.
+pub(super) async fn release_vacated(
+    service: std::sync::Weak<ServiceInner>,
+    mut vacated: tokio::sync::mpsc::UnboundedReceiver<ActorAddress>,
+) {
+    while let Some(address) = vacated.recv().await {
+        let Some(inner) = service.upgrade() else {
+            return;
+        };
+        let Some(cluster) = inner.cluster.clone() else {
+            return;
+        };
+        if cluster.is_parked(&address) && !inner.sockets.has_open(&address) {
+            let sockets = Arc::clone(&inner.sockets);
+            drop(inner);
+            tokio::spawn(async move {
+                // Asked again under the lock's wait: a socket opened
+                // meanwhile woke the room, which dropped the parked entry.
+                if !sockets.has_open(&address) {
+                    cluster.release_parked(&address, "last_socket").await;
+                }
+            });
+        }
+    }
+}
+
+/// Every sweep pass, before the reads: releases the parked records of
+/// actors with no socket open here any more (the nudge of
+/// [`release_vacated`] missed, or a socket closed without its slot being
+/// freed yet counts as gone).
+async fn release_unsocketed(inner: &ServiceInner, cluster: &Cluster) {
+    for (address, _) in cluster.parked() {
+        if !inner.sockets.has_open(&address) {
+            cluster.release_parked(&address, "last_socket").await;
+        }
+    }
+}
+
+/// The safeguard re-read (ADR 0024, section 5): each parked record read
+/// once; one that no longer names this node at the parked generation is
+/// forgotten, and its room's sockets are swept as any other's. A failed
+/// read stops the re-read until next time.
+async fn recheck_parked(inner: &ServiceInner, cluster: &Cluster, cursor: &mut usize) {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    // In a stable order, from where the last re-read stopped: every parked
+    // record is read in turn, [`SWEEP_MAX_READS`] at a time.
+    let mut all = cluster.parked();
+    all.sort_unstable();
+    let parked = window(&all, cursor, SWEEP_MAX_READS);
+    futures_util::StreamExt::for_each_concurrent(
+        futures_util::stream::iter(parked),
+        SWEEP_PARALLEL,
+        |(address, generation)| {
+            let stop = &stop;
+            async move {
+                use std::sync::atomic::Ordering::Relaxed;
+                if stop.load(Relaxed) || inner.mailboxes.is_closed() || !cluster.node_lease_valid()
+                {
+                    return;
+                }
+                crate::metrics::inc(&crate::metrics::METRICS.websocket_sweep_reads);
+                if tokio::time::timeout(
+                    SWEEP_READ_TIMEOUT,
+                    cluster.drop_parked_if_stale(&address, generation),
+                )
+                .await
+                .is_err()
+                {
+                    stop.store(true, Relaxed);
+                }
+            }
+        },
+    )
+    .await;
+}
+
+/// Every [`Cluster::socket_sweep`]: releases parked records whose sockets
+/// are gone, re-reads every parked record on one pass in
+/// [`PARKED_RECHECK_EVERY`], then, for each actor with sockets on this
+/// node (not closing), no hold here and no parked record (its record named
+/// nobody when it hibernated: it does not park then), reads its ownership
+/// record once, and closes its sockets with 1012 if
 /// another live node holds it. Events check ownership, but pings do not:
 /// without this, a client that only listens would stay connected to a
 /// room another node now runs, and miss every broadcast without a close.
@@ -37,8 +122,11 @@ const SWEEP_MAX_READS: usize = 5_000;
 pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every: Duration) {
     // Where the next pass starts, in the sorted list of rooms to read.
     let mut cursor = 0_usize;
+    let mut pass = 0_u64;
+    let mut recheck_cursor = 0_usize;
     loop {
         tokio::time::sleep(every).await;
+        pass = pass.wrapping_add(1);
         let Some(inner) = service.upgrade() else {
             return;
         };
@@ -51,11 +139,16 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
         if !cluster.node_lease_valid() {
             continue;
         }
+        release_unsocketed(&inner, &cluster).await;
+        if pass.is_multiple_of(PARKED_RECHECK_EVERY) {
+            recheck_parked(&inner, &cluster, &mut recheck_cursor).await;
+        }
+        // A parked room is this node's own: no read (ADR 0024).
         let mut unheld: Vec<ActorAddress> = inner
             .sockets
             .open_owners()
             .into_iter()
-            .filter(|address| !cluster.holds_here(address))
+            .filter(|address| !cluster.holds_here(address) && !cluster.is_parked(address))
             .collect();
         unheld.sort_unstable();
         let batch = window(&unheld, &mut cursor, SWEEP_MAX_READS);

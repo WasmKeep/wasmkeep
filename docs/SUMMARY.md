@@ -63,3 +63,4 @@
 - [0021 The app model](adr/0021-the-app-model.md)
 - [0022 App-owned state and the one-time migration](adr/0022-app-owned-state-and-the-one-time-migration.md)
 - [0023 The front](adr/0023-the-front.md)
+- [0024 Socket home](adr/0024-socket-home.md)

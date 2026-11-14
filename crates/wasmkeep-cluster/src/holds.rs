@@ -8,7 +8,9 @@
 //! the node acquires afresh, at new generations, once its lease is valid
 //! again. [`Validity`] carries both facts in one value, so one read gives a
 //! consistent answer. Releases and acquisitions whose outcome is unknown wait
-//! as [`PendingEntry`]s; [`retry`] tries one again.
+//! as [`PendingEntry`]s; [`retry`] tries one again. Holds of actors that
+//! hibernated with sockets open wait, unreleased, in [`Parked`]
+//! ([ADR 0024]).
 //!
 //! No runtime here: the caller keeps the value where its tasks can share it
 //! (the server: a watch channel) and orders an acquisition and the
@@ -16,9 +18,12 @@
 //! per actor).
 //!
 //! [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+//! [ADR 0024]: ../../../docs/adr/0024-socket-home.md
+
+use std::collections::HashMap;
 
 use crate::lease::{Bucket, Clock};
-use crate::node_lease::{Hold, Owners, Released};
+use crate::node_lease::{AcquireError, Hold, Owners, Released};
 
 /// This node's lease validity, as its holds see it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -93,17 +98,130 @@ impl PendingEntry {
     }
 }
 
+/// Holds parked by hibernations with sockets open ([ADR 0024], section 1):
+/// releases deferred, never authority to act. Each keeps the hold (its
+/// key, generation and version) and `T`, what the caller needs to find
+/// the actor again (the server: its address). No runtime and no lock: the
+/// caller keeps it beside its live holds, and moves a hold from one to the
+/// other in one step.
+///
+/// [ADR 0024]: ../../../docs/adr/0024-socket-home.md
+#[derive(Debug, Clone)]
+pub struct Parked<T> {
+    by_key: HashMap<String, (Hold, T)>,
+}
+
+impl<T> Default for Parked<T> {
+    fn default() -> Self {
+        Self {
+            by_key: HashMap::new(),
+        }
+    }
+}
+
+impl<T> Parked<T> {
+    /// Parks `hold`; a hold parked earlier for the same key is returned,
+    /// to release (it cannot be the record's version any more).
+    pub fn park(&mut self, hold: Hold, tag: T) -> Option<Hold> {
+        let key = hold.key.clone();
+        self.by_key.insert(key, (hold, tag)).map(|(h, _)| h)
+    }
+
+    /// Whether a hold of `key` is parked.
+    pub fn contains(&self, key: &str) -> bool {
+        self.by_key.contains_key(key)
+    }
+
+    /// Whether a hold of `key` is parked at `generation`: what the resolver
+    /// of an unresolved acquire at that generation counts as held here
+    /// (ADR 0024, section 3). Never at another generation: an unresolved
+    /// wake at a later one is resolved as usual.
+    pub fn holds_at(&self, key: &str, generation: u64) -> bool {
+        self.by_key
+            .get(key)
+            .is_some_and(|(h, _)| h.generation == generation)
+    }
+
+    /// The generation `key` is parked at, if it is.
+    pub fn generation(&self, key: &str) -> Option<u64> {
+        self.by_key.get(key).map(|(h, _)| h.generation)
+    }
+
+    /// Takes the parked hold of `key` out, to release it.
+    pub fn take(&mut self, key: &str) -> Option<(Hold, T)> {
+        self.by_key.remove(key)
+    }
+
+    /// Takes the parked hold of `key` out if it is still at `generation`.
+    pub fn take_at(&mut self, key: &str, generation: u64) -> Option<(Hold, T)> {
+        if self.holds_at(key, generation) {
+            self.by_key.remove(key)
+        } else {
+            None
+        }
+    }
+
+    /// After an acquisition of `key` by this node (a wake) with outcome
+    /// `acquired`: the parked hold is dropped, and returned, when the
+    /// record is known to have moved (the acquisition succeeded: the new
+    /// hold replaces it; or another holder was found). It is kept
+    /// otherwise: when nothing was written (the bucket did not answer the
+    /// read, the lease is not valid, an unreadable record), and when the
+    /// outcome is unknown. Then the write may not have landed, and the
+    /// record still names this hold; if it did land, the resolver releases
+    /// it (a parked hold counts as held only at its own generation), and
+    /// the parked hold's own release then finds a moved version and ends.
+    pub fn after_wake(
+        &mut self,
+        key: &str,
+        acquired: &Result<Hold, AcquireError>,
+    ) -> Option<(Hold, T)> {
+        match acquired {
+            Ok(_) | Err(AcquireError::Held { .. }) => self.by_key.remove(key),
+            Err(
+                AcquireError::Unresolved { .. }
+                | AcquireError::Unavailable
+                | AcquireError::LeaseInvalid
+                | AcquireError::Corrupt,
+            ) => None,
+        }
+    }
+
+    /// Takes every parked hold out: a lapse (each becomes a pending
+    /// release), a lost lease (dropped), a clean stop or a drain (each
+    /// released).
+    pub fn take_all(&mut self) -> Vec<(Hold, T)> {
+        self.by_key.drain().map(|(_, v)| v).collect()
+    }
+
+    /// The parked holds, by key.
+    pub fn iter(&self) -> impl Iterator<Item = (&Hold, &T)> {
+        self.by_key.values().map(|(h, t)| (h, t))
+    }
+
+    /// How many holds are parked.
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// Whether none is parked.
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+}
+
 /// Tries one pending entry again: a release is sent again; an unresolved
-/// acquire is read and released if it landed, unless `held_here` says a
-/// hold of that actor lives on this node (a later acquisition, possibly at
-/// the very generation the unresolved one tried). The caller holds the
+/// acquire is read and released if it landed, unless `held_here(key,
+/// generation)` says a hold of that actor lives on this node (a later
+/// acquisition, possibly at the very generation the unresolved one tried;
+/// or a parked hold at that generation, ADR 0024). The caller holds the
 /// actor's lock across this call for an unresolved acquire. `Some(entry)`
 /// if it is still pending; `None` once it ended (landed, superseded, or
 /// behind a live hold).
 pub async fn retry<B: Bucket, C: Clock>(
     owners: &Owners<B, C>,
     entry: PendingEntry,
-    held_here: impl Fn(&str) -> bool,
+    held_here: impl Fn(&str, u64) -> bool,
 ) -> Option<PendingEntry> {
     match entry {
         PendingEntry::Release(hold) => match owners.release(&hold).await {
@@ -111,7 +229,7 @@ pub async fn retry<B: Bucket, C: Clock>(
             Released::Released | Released::Superseded => None,
         },
         PendingEntry::Unresolved { key, generation } => {
-            if held_here(&key) {
+            if held_here(&key, generation) {
                 return None;
             }
             match owners.resolve(&key, generation).await {
@@ -159,6 +277,67 @@ mod tests {
         assert!(!v.valid_in(before, 16_000));
     }
 
+    fn hold(key: &str, generation: u64) -> Hold {
+        Hold {
+            key: key.into(),
+            generation,
+            version: crate::lease::Version(format!("v{generation}")),
+            previous: None,
+        }
+    }
+
+    #[test]
+    fn a_parked_hold_counts_only_at_its_generation() {
+        let mut parked = Parked::default();
+        assert!(parked.park(hold("owners/x", 4), "x").is_none());
+        assert!(parked.contains("owners/x"));
+        assert!(parked.holds_at("owners/x", 4));
+        assert_eq!(parked.generation("owners/x"), Some(4));
+        // An unresolved wake at the next generation is not held here.
+        assert!(!parked.holds_at("owners/x", 5));
+        assert!(parked.take_at("owners/x", 5).is_none());
+        // Parked again (a later hold): the earlier one comes back.
+        assert_eq!(parked.park(hold("owners/x", 6), "x").unwrap().generation, 4);
+        assert_eq!(parked.take_at("owners/x", 6).unwrap().0.generation, 6);
+        assert!(parked.is_empty());
+    }
+
+    #[test]
+    fn a_wake_drops_the_parked_hold_only_once_the_record_moved() {
+        let mut parked = Parked::default();
+        let wrote: [Result<Hold, AcquireError>; 2] = [
+            Ok(hold("owners/x", 5)),
+            Err(AcquireError::Held {
+                node: "b".into(),
+                instance: "i".into(),
+            }),
+        ];
+        for outcome in &wrote {
+            parked.park(hold("owners/x", 4), ());
+            assert!(
+                parked.after_wake("owners/x", outcome).is_some(),
+                "{outcome:?}"
+            );
+            assert!(!parked.contains("owners/x"));
+        }
+        for outcome in [
+            AcquireError::Unresolved { generation: 5 },
+            AcquireError::Unavailable,
+            AcquireError::LeaseInvalid,
+            AcquireError::Corrupt,
+        ] {
+            parked.park(hold("owners/x", 4), ());
+            assert!(
+                parked
+                    .after_wake("owners/x", &Err(outcome.clone()))
+                    .is_none()
+            );
+            assert!(parked.holds_at("owners/x", 4), "{outcome:?}");
+        }
+        assert_eq!(parked.take_all().len(), 1);
+        assert_eq!(parked.len(), 0);
+    }
+
     #[test]
     fn a_pending_entry_ends_when_it_lands_or_a_hold_lives_here() {
         let cfg = LeaseConfig::default_safe();
@@ -174,7 +353,7 @@ mod tests {
         // A release goes through: the entry ends, the record names nobody.
         let hold = run(owners.acquire("owners/x", || true, async || Ok(1))).unwrap();
         assert_eq!(
-            run(retry(&owners, PendingEntry::Release(hold), |_| false)),
+            run(retry(&owners, PendingEntry::Release(hold), |_, _| false)),
             None
         );
         assert_eq!(read("owners/x").holder, None);
@@ -184,7 +363,7 @@ mod tests {
             key: "owners/x".into(),
             generation: landed.generation,
         };
-        assert_eq!(run(retry(&owners, entry, |_| false)), None);
+        assert_eq!(run(retry(&owners, entry, |_, _| false)), None);
         assert_eq!(read("owners/x").holder, None);
         // With a hold of the actor here: left alone, the entry ends.
         let live = run(owners.acquire("owners/x", || true, async || Ok(1))).unwrap();
@@ -193,7 +372,7 @@ mod tests {
             generation: live.generation,
         };
         assert_eq!(entry.key(), "owners/x");
-        assert_eq!(run(retry(&owners, entry, |k| k == "owners/x")), None);
+        assert_eq!(run(retry(&owners, entry, |k, _| k == "owners/x")), None);
         assert!(
             read("owners/x").holder.is_some(),
             "a live hold was released"

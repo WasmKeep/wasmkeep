@@ -13,6 +13,22 @@ Since 0.3.0, in no release yet.
 
 ### What changed
 
+- **A WebSocket room wakes where its sockets are**
+  ([ADR 0024](docs/adr/0024-socket-home.md)). A room that hibernates with
+  sockets open keeps its ownership record, so an event reaching it through
+  another node (a front's `actors.call`, a request, an upgrade) is relayed
+  to the node holding its sockets and wakes it there, at a new generation:
+  its clients stay connected. Before, the room woke wherever the event
+  landed and its sockets closed with 1012. The record is released when the
+  room's last socket goes, and by a drain, a move, a lapse of the node
+  lease or a clean stop. Socket classes may now be reached through the
+  front on a cluster. A room parked this way is free about 15 to 20 s
+  after its node dies, as a resident actor, instead of at once. New
+  metrics: `wasmkeep_parked_records`, `wasmkeep_parked_wakes_total` and
+  `wasmkeep_parked_releases_total{reason}`; the owner sweep no longer
+  reads the record of a parked room each minute (one pass in ten, as a
+  safeguard). No format changes: a node of an earlier version beside one
+  of this version keeps closing its own sockets as before.
 - **Fronts in Rust and TypeScript.** The Rust SDK has a `front` module
   (from world `front-core`): `actors` and `env` as in an actor,
   `export_front!`, and `http::respond_with`. A front crate depends on
