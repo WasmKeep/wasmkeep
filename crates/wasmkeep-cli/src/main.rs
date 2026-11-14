@@ -227,7 +227,7 @@ struct DeployArgs {
 
     /// Plain configuration for a class, as CLASS=FILE (`NAME=value` lines,
     /// read with `env.get`). Stored in the bucket in the clear: never
-    /// secrets (keep those in `serve --env` files). Replaces the class's
+    /// secrets (keep those with `wasmkeep secrets set`). Replaces the class's
     /// configuration; classes not named keep theirs; CLASS= removes it.
     /// Repeatable.
     #[arg(long = "config", value_name = "CLASS=FILE", value_parser = parse_actor)]
@@ -818,17 +818,21 @@ pub(crate) fn secret_looking(class: &str, vars: &wasmkeep_server::env::Vars) -> 
         if by_name || by_value {
             out.push(format!(
                 "--config {class}: {name} looks like a secret; configuration is stored in the \
-                 bucket in the clear (keep secrets in `serve --env` files on each node)"
+                 bucket in the clear (keep secrets with `wasmkeep secrets set`)"
             ));
         }
     }
     out
 }
 
-/// Warnings about a deploy's changes: a class removed with a rule, and a
-/// class added without one at the same time (a rename leaves the new class
-/// open).
-pub(crate) fn deploy_warnings(diff: &wasmkeep_server::apps::Diff) -> Vec<String> {
+/// Warnings about a deploy's changes: a class removed with a rule, or
+/// with required names, while a class without them is added (a rename
+/// leaves the new class open, or without its names). `file`: a deploy from
+/// that project file, told what to set in it rather than flags it refuses.
+pub(crate) fn deploy_warnings(
+    diff: &wasmkeep_server::apps::Diff,
+    file: Option<&str>,
+) -> Vec<String> {
     let mut out = Vec::new();
     // A renamed class loses its required values (ADR 0016) as it loses
     // its rule.
@@ -840,12 +844,31 @@ pub(crate) fn deploy_warnings(diff: &wasmkeep_server::apps::Diff) -> Vec<String>
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    if !dropped.is_empty() && !diff.added.is_empty() {
+    let without_names: Vec<&str> = diff
+        .added
+        .iter()
+        .map(String::as_str)
+        .filter(|c| {
+            !diff
+                .requires
+                .iter()
+                .any(|l| l.starts_with(&format!("{c}: ")) && l.ends_with(" now required"))
+        })
+        .collect();
+    if !dropped.is_empty() && !without_names.is_empty() {
+        let fix = match file {
+            Some(file) => without_names
+                .iter()
+                .map(|c| format!("set requires in [classes.{c}] of {file}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => "give the new class its --requires".to_owned(),
+        };
         out.push(format!(
             "{} had required values and was removed while {} was added: if it was \
-             renamed, give the new class its --requires",
+             renamed, {fix}",
             dropped.join(", "),
-            diff.added.join(", ")
+            without_names.join(", ")
         ));
     }
     let restricted: Vec<&(String, Option<String>)> =
@@ -853,12 +876,15 @@ pub(crate) fn deploy_warnings(diff: &wasmkeep_server::apps::Diff) -> Vec<String>
     if restricted.is_empty() {
         return out;
     }
-    let ruled: Vec<&str> = diff.rules.iter().map(|(c, _, _)| c.as_str()).collect();
     for added in &diff.added {
-        if !ruled.contains(&added.as_str()) {
+        if diff.added_rule(added) == "open" {
+            let fix = match file {
+                Some(file) => format!("set access in [classes.{added}] of {file}"),
+                None => format!("give the new class its rule (--access {added}=...)"),
+            };
             out.push(format!(
                 "class {added} was added and is open, while {} was removed with a rule: \
-                 if it was renamed, give the new class its rule (--access {added}=...)",
+                 if it was renamed, {fix}",
                 restricted
                     .iter()
                     .map(|(c, _)| c.as_str())
@@ -868,6 +894,25 @@ pub(crate) fn deploy_warnings(diff: &wasmkeep_server::apps::Diff) -> Vec<String>
         }
     }
     out
+}
+
+/// What a deploy prints after it switches: the changes of a flag deploy
+/// or rollback (a deploy from the file printed its plan before the
+/// switch), and nothing for one that changed nothing (its last line says
+/// so).
+pub(crate) fn change_lines(
+    deployed: &wasmkeep_server::apps::Deployed,
+    from_file: bool,
+) -> Vec<String> {
+    if from_file || deployed.unchanged {
+        return Vec::new();
+    }
+    deployed
+        .diff
+        .lines()
+        .into_iter()
+        .map(|l| format!("  {l}"))
+        .collect()
 }
 
 /// The rules a node following an app starts with (ADR 0013): the deployed
@@ -1843,12 +1888,10 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         rt.block_on(app_ref.deploy_changes(&runtime, changes))
             .map_err(named)?
     };
-    // From the file, the plan was printed before the switch (and a deploy
-    // that changes nothing says so on its last line).
-    if !from_file {
-        for line in deployed.diff.lines() {
-            println!("  {line}");
-        }
+    // From the file, the plan (and its warnings) was printed before the
+    // switch; a deploy that changes nothing says so on its last line.
+    for line in change_lines(&deployed, from_file) {
+        println!("{line}");
     }
     if args.rollback
         && let Some(p) = &project
@@ -1859,8 +1902,10 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             p.path.display()
         );
     }
-    for warning in deploy_warnings(&deployed.diff) {
-        eprintln!("warning: {warning}");
+    if !from_file {
+        for warning in deploy_warnings(&deployed.diff, None) {
+            eprintln!("warning: {warning}");
+        }
     }
     if deployed.diff.front == Some("removed") {
         let secrets = wasmkeep_server::secret_store::SecretStore::new(store, &prefix, tenant, name);
@@ -2847,19 +2892,19 @@ mod tests {
             removed: vec![("monitor".into(), Some("existing".into()))],
             ..Default::default()
         };
-        let w = super::deploy_warnings(&diff);
+        let w = super::deploy_warnings(&diff, None);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("--access monitors="), "{}", w[0]);
         let ruled = wasmkeep_server::apps::Diff {
-            rules: vec![("monitors".into(), "open".into(), "existing".into())],
+            added_rules: [("monitors".into(), "existing".into())].into(),
             ..diff.clone()
         };
-        assert!(super::deploy_warnings(&ruled).is_empty());
+        assert!(super::deploy_warnings(&ruled, None).is_empty());
         let open_removed = wasmkeep_server::apps::Diff {
             removed: vec![("old".into(), None)],
             ..diff
         };
-        assert!(super::deploy_warnings(&open_removed).is_empty());
+        assert!(super::deploy_warnings(&open_removed, None).is_empty());
     }
 
     #[test]
@@ -2882,9 +2927,91 @@ mod tests {
             ],
             ..Default::default()
         };
-        let w = super::deploy_warnings(&diff);
+        let w = super::deploy_warnings(&diff, None);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].starts_with("hub had required values"), "{}", w[0]);
+        assert!(w[0].contains("--requires"), "{}", w[0]);
+        // From the file: what to set in it, never a flag it refuses.
+        let w = super::deploy_warnings(&diff, Some("wasmkeep.toml"));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("set requires in [classes.hub2] of wasmkeep.toml"),
+            "{}",
+            w[0]
+        );
+        assert!(!w[0].contains("--"), "{}", w[0]);
+        // The added class has required names of its own: no warning.
+        let given = wasmkeep_server::apps::Diff {
+            requires: [
+                diff.requires.clone(),
+                vec!["hub2: TOKEN now required".into()],
+            ]
+            .concat(),
+            ..diff.clone()
+        };
+        assert!(super::deploy_warnings(&given, None).is_empty());
+        assert!(super::deploy_warnings(&given, Some("wasmkeep.toml")).is_empty());
+        // Two added, one with names: the warning names the other.
+        let one = wasmkeep_server::apps::Diff {
+            added: vec!["hub2".into(), "other".into()],
+            ..given
+        };
+        let w = super::deploy_warnings(&one, None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("while other was added"), "{}", w[0]);
+    }
+
+    #[test]
+    fn a_rename_from_the_file_says_what_to_set_in_it() {
+        let diff = wasmkeep_server::apps::Diff {
+            added: vec!["monitors".into()],
+            added_rules: [("monitors".into(), "open".into())].into(),
+            removed: vec![("monitor".into(), Some("existing".into()))],
+            ..Default::default()
+        };
+        let w = super::deploy_warnings(&diff, Some("app/wasmkeep.toml"));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("set access in [classes.monitors] of app/wasmkeep.toml"),
+            "{}",
+            w[0]
+        );
+        assert!(!w[0].contains("--access"), "{}", w[0]);
+    }
+
+    /// A deploy that changes nothing prints no change lines, from the
+    /// file or with flags: its last line says nothing changed.
+    #[test]
+    fn a_no_op_deploy_prints_no_changes() {
+        let diff = wasmkeep_server::apps::Diff {
+            front: Some("unchanged"),
+            open_past_front: vec!["c".into()],
+            ..Default::default()
+        };
+        let deployed = |unchanged| wasmkeep_server::apps::Deployed {
+            current: wasmkeep_server::apps::Current {
+                version: "8447609efdefe311".into(),
+                seq: 2,
+                marked: true,
+                rooted: true,
+            },
+            previous: Some("8447609efdefe311".into()),
+            unchanged,
+            diff: diff.clone(),
+            newly_marked: false,
+        };
+        for from_file in [false, true] {
+            assert!(super::change_lines(&deployed(true), from_file).is_empty());
+        }
+        // A change with flags prints its lines; from the file, the plan did.
+        assert_eq!(
+            super::change_lines(&deployed(false), false),
+            [
+                "  front: unchanged",
+                "  class c: open, reachable at /actor/c/<name>, past the front"
+            ]
+        );
+        assert!(super::change_lines(&deployed(false), true).is_empty());
     }
 
     #[test]

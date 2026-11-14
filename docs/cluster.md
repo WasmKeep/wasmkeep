@@ -834,9 +834,10 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo \
   names of configuration values) and warns when a class removed with a
   rule leaves an added one open (a rename).
 - **`--config` is stored in the clear**, as parsed (no comments). Keep
-  secrets in `serve --env` files on each node: they win over the
-  deployed configuration by name (each overlap is logged by name, never
-  value). `deploy` warns about names that look like secrets (`TOKEN`,
+  secrets in the bucket with `wasmkeep secrets set`
+  ([Secrets in the bucket](#secrets-in-the-bucket)) or in `serve --env`
+  files on each node: both win over the deployed configuration by name
+  (each overlap is logged by name, never value). `deploy` warns about names that look like secrets (`TOKEN`,
   `KEY`, `PASSWORD`...) and URLs with a password, without printing them.
 - **Rollback** brings back the previous version's rules too. One that
   would make a class more open (`existing` to `open`, say) is refused

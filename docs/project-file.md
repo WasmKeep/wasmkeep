@@ -74,7 +74,7 @@ least one class.
 | `config` | optional | a file of `NAME=value` lines, plain configuration (stored in the bucket in the clear: never secrets) |
 | `requires` | optional | names that must be set (by the configuration, the app's secrets or a node's `--env`) before the class or front runs |
 | `build` | optional | a command for the system shell (`sh -c`, `cmd.exe` on Windows), run in the file's directory before `component` is read |
-| `watch` | optional | files or directories; `wasmkeep dev` runs `build` again when one changes |
+| `watch` | optional | files or directories of sources; `wasmkeep dev` runs `build` again when one changes (name sources, not what the build writes) |
 
 ### `[dev]` (optional, `wasmkeep dev` only)
 
@@ -88,7 +88,7 @@ There is no key for a value, a secret or a bucket. Configuration goes in
 the files `config` names; secrets go in the bucket with `wasmkeep secrets
 set` ([Secrets in the bucket](cluster.md#secrets-in-the-bucket)); local
 values go in `.env.local`, which belongs in `.gitignore` (a `config` that
-names the `[dev] env` file is refused). The bucket is
+names the `[dev] env` file, by any path or link, is refused). The bucket is
 `deploy --bucket`, so one file deploys to staging and production alike.
 
 ## `wasmkeep deploy`
@@ -99,7 +99,12 @@ wasmkeep deploy --bucket s3://my-bucket/prod
 
 1. Runs every `build` (the front's first, then the classes' in name
    order). A failed build stops the deploy before the bucket is opened.
-   `--no-build` skips them. `--bucket` is checked first.
+   `--no-build` skips them. `--bucket`, and that every `config` file is
+   there, are checked first. A build's output goes to stderr (stdout is
+   the plan), and it runs without `AWS_ACCESS_KEY_ID`,
+   `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`: the deploy's bucket
+   credentials are not the build's. A build that needs credentials of
+   its own (an S3 build cache, say) takes them from a profile or a file.
 2. Reads every component and configuration file, and warns about
    configuration names that look like secrets.
 3. Prints what changes against the deployed version, before anything is
@@ -136,8 +141,12 @@ another directory): such a deploy keeps every class's rule, and a class
 it adds without `--access` is `open`, the default of flags. The next
 deploy from the file makes the version the file's again.
 
-**Rollback.** `wasmkeep deploy --rollback` reads only `[app]` (a typo
-elsewhere in the file does not block it) and runs no build: it restores the previous version as the bucket holds it. The file
+**Rollback.** `wasmkeep deploy --rollback` reads only `[app]` (an
+unknown key or wrong value elsewhere in the file does not block it) and
+runs no build: it restores the previous version as the bucket holds it.
+The file must still be TOML: if it does not parse, fix it, or roll back
+without it with `wasmkeep deploy --no-project --app TENANT/APP
+--rollback`. The file
 may then describe another version; the next deploy from it deploys the
 file. A rollback that would make a class more open (from a file's
 `internal` back to a flag deploy's `open`, say) is refused without
@@ -163,11 +172,13 @@ from `.env.local`, whose values reach the front and every class.
 While it runs, it polls each item's `watch` paths, components and
 configuration files:
 
-- a change under `watch` runs that item's `build`;
+- a change under `watch` runs that item's `build`; a change saved while
+  it runs runs it again;
 - a changed component or configuration file (after a build, or one run
   in another terminal) reloads the whole app, front and classes together;
 - a failed build, or a component that does not link, keeps the previous
-  version serving.
+  version serving; after a failed build, nothing reloads until that item
+  builds again, so a mix of new and old parts is never served.
 
 Changes to `wasmkeep.toml` or `.env.local` need a restart. Beside a file,
 crate directories, `--access` and `--env` are refused; `wasmkeep dev

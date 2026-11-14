@@ -99,7 +99,7 @@ wasmkeep deploy --app demo/shop --bucket s3://demo \
 You should see the class added and the new version (its id differs):
 
 ```text
-  class counter: added
+  class counter: added (open)
 demo/shop: version 469fcd8d39aa32f2 is current (deploy 1)
 ```
 

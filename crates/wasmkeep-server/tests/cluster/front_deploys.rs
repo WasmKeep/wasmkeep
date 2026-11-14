@@ -11,7 +11,7 @@ use wasmkeep_server::secrets::SecretsKey;
 
 use super::*;
 
-fn front_wasm() -> &'static [u8] {
+pub(super) fn front_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     WASM.get_or_init(|| guests::build_guest("tests/guests/test-front", "test_front"))
 }
@@ -222,7 +222,7 @@ async fn deploys_carry_the_front_and_rollbacks_restore_it() {
     let lines = v2.diff.lines();
     for want in [
         "front: unchanged",
-        "class c: added",
+        "class c: added (existing)",
         "config _front: GREETING added",
         "requires _front: SESSION_KEY now required",
     ] {

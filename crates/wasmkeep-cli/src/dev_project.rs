@@ -173,9 +173,12 @@ pub(crate) fn run(project: Project, options: Options) -> anyhow::Result<()> {
     })
 }
 
+/// Latest modification time and file count under some paths.
+type Fingerprint = (Option<SystemTime>, usize);
+
 /// Latest modification time and file count under `paths` (files or
 /// directories, recursively): a cheap change detector.
-fn fingerprint<'a>(paths: impl IntoIterator<Item = &'a Path>) -> (Option<SystemTime>, usize) {
+fn fingerprint<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Fingerprint {
     let mut latest = None;
     let mut count = 0;
     let mut stack: Vec<PathBuf> = paths.into_iter().map(Path::to_path_buf).collect();
@@ -204,6 +207,65 @@ fn inputs(project: &Project) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Each item's `watch` fingerprint.
+fn watched(project: &Project) -> Vec<Fingerprint> {
+    project::items(project)
+        .into_iter()
+        .map(|(_, item)| fingerprint(item.watch.iter().map(PathBuf::as_path)))
+        .collect()
+}
+
+/// What the watcher keeps between polls: each item's `watch` fingerprint
+/// as it was when its build started, and the items whose last build
+/// failed.
+struct Builds {
+    seen: Vec<Fingerprint>,
+    failed: std::collections::BTreeSet<usize>,
+}
+
+impl Builds {
+    fn new(project: &Project) -> Self {
+        Self {
+            seen: watched(project),
+            failed: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Runs `build` for each item whose `watch` paths changed since its
+    /// last build started: an edit saved while a build runs is a change
+    /// for the next poll, so it is built too (a build must not write under
+    /// its own `watch` paths). Returns whether every item's last build
+    /// succeeded: a failure holds the reload until that item builds, so a
+    /// mix of old and new parts never loads.
+    fn poll(
+        &mut self,
+        project: &Project,
+        mut build: impl FnMut(&str, &str) -> anyhow::Result<()>,
+    ) -> bool {
+        let now = watched(project);
+        for (i, (what, item)) in project::items(project).into_iter().enumerate() {
+            if item.watch.is_empty() || now[i] == self.seen[i] {
+                continue;
+            }
+            self.seen[i] = now[i];
+            let Some(cmd) = &item.build else {
+                continue;
+            };
+            tracing::info!("change detected in {what}, rebuilding");
+            match build(&what, cmd) {
+                Ok(()) => {
+                    self.failed.remove(&i);
+                }
+                Err(e) => {
+                    self.failed.insert(i);
+                    tracing::warn!(error = %format!("{e:#}"), "build failed; still serving the previous version");
+                }
+            }
+        }
+        self.failed.is_empty()
+    }
+}
+
 /// Polls each item's `watch` paths (a change runs its build) and the
 /// inputs (a change reloads the app). A failed build or reload keeps the
 /// previous version serving.
@@ -213,44 +275,21 @@ async fn watch(
     rules: wasmkeep_server::AccessRules,
     poll: Duration,
 ) {
-    let watched = |project: &Project| -> Vec<_> {
-        project::items(project)
-            .into_iter()
-            .map(|(_, item)| fingerprint(item.watch.iter().map(PathBuf::as_path)))
-            .collect()
-    };
-    let mut seen_sources = watched(&project);
+    let mut builds = Builds::new(&project);
     let mut seen_inputs = fingerprint(inputs(&project).iter().map(PathBuf::as_path));
     let requires = requires(&project);
     let mut seq = 1;
     loop {
         tokio::time::sleep(poll).await;
-        let now = watched(&project);
-        let mut build_failed = false;
-        for (i, (what, item)) in project::items(&project).into_iter().enumerate() {
-            if item.watch.is_empty() || now[i] == seen_sources[i] {
-                continue;
-            }
-            let Some(cmd) = item.build.clone() else {
-                continue;
-            };
-            tracing::info!("change detected in {what}, rebuilding");
-            let dir = project.dir.clone();
-            let built =
-                tokio::task::spawn_blocking(move || project::run_build(&dir, &what, &cmd)).await;
-            match built {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    build_failed = true;
-                    tracing::warn!(error = %format!("{e:#}"), "build failed; still serving the previous version");
-                }
-                Err(e) => tracing::warn!(error = %e, "build task failed"),
-            }
-        }
-        // After the builds, so their own writes are not seen as changes.
-        seen_sources = watched(&project);
+        let built = tokio::task::block_in_place(|| {
+            builds.poll(&project, |what, cmd| {
+                project::run_build(&project.dir, what, cmd)
+            })
+        });
+        // Not seen while a build has failed: the reload comes once every
+        // changed item builds.
         let inputs_now = fingerprint(inputs(&project).iter().map(PathBuf::as_path));
-        if inputs_now == seen_inputs || build_failed {
+        if inputs_now == seen_inputs || !built {
             continue;
         }
         seen_inputs = inputs_now;
@@ -282,5 +321,96 @@ async fn watch(
                 tracing::warn!(class = %name, error = %format!("{e:#}"), "rejected; still serving the previous version");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two items watching `a/` and `b/`, each with a build.
+    fn two_items(dir: &Path) -> Project {
+        for part in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(part)).unwrap();
+            std::fs::write(dir.join(part).join("src"), "1").unwrap();
+        }
+        let text = "[app]\ntenant='t'\nname='n'\n\
+                    [classes.a]\ncomponent='a.wasm'\nbuild='make a'\nwatch=['a']\n\
+                    [classes.b]\ncomponent='b.wasm'\nbuild='make b'\nwatch=['b']\n";
+        project::parse(text, &dir.join(project::FILE_NAME)).unwrap()
+    }
+
+    /// A later modification time than any before (coarse clocks too).
+    fn touch(path: &Path, n: u64) {
+        std::fs::write(path, n.to_string()).unwrap();
+        let t = SystemTime::now() + Duration::from_secs(10 * n);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_change_under_watch_builds_and_an_edit_during_the_build_builds_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = two_items(dir.path());
+        let mut builds = Builds::new(&p);
+        let mut ran = Vec::new();
+        assert!(builds.poll(&p, |w, _| {
+            ran.push(w.to_owned());
+            Ok(())
+        }));
+        assert!(ran.is_empty(), "nothing changed: {ran:?}");
+
+        // An edit, and another saved while its build runs.
+        touch(&dir.path().join("a/src"), 1);
+        let src = dir.path().join("a/src");
+        assert!(builds.poll(&p, |w, _| {
+            ran.push(w.to_owned());
+            touch(&src, 2);
+            Ok(())
+        }));
+        assert_eq!(ran, ["class a"]);
+        assert!(builds.poll(&p, |w, _| {
+            ran.push(w.to_owned());
+            Ok(())
+        }));
+        assert_eq!(ran, ["class a", "class a"], "the edit during the build");
+        assert!(builds.poll(&p, |w, _| {
+            ran.push(w.to_owned());
+            Ok(())
+        }));
+        assert_eq!(ran.len(), 2, "nothing more changed: {ran:?}");
+    }
+
+    #[test]
+    fn a_failed_build_holds_the_reload_until_it_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = two_items(dir.path());
+        let mut builds = Builds::new(&p);
+        touch(&dir.path().join("a/src"), 1);
+        touch(&dir.path().join("b/src"), 1);
+        let ok = builds.poll(&p, |w, _| {
+            if w == "class a" {
+                anyhow::bail!("broken")
+            }
+            Ok(())
+        });
+        assert!(!ok, "a failed");
+        // Nothing else changes: still held (b alone would load a mix).
+        assert!(!builds.poll(&p, |_, _| Ok(())));
+        // b changes and builds: still held, a has not built.
+        touch(&dir.path().join("b/src"), 2);
+        assert!(!builds.poll(&p, |_, _| Ok(())));
+        // a fixed: the reload may go.
+        touch(&dir.path().join("a/src"), 2);
+        let mut ran = Vec::new();
+        assert!(builds.poll(&p, |w, _| {
+            ran.push(w.to_owned());
+            Ok(())
+        }));
+        assert_eq!(ran, ["class a"]);
     }
 }
