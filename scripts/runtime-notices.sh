@@ -10,15 +10,21 @@
 # The texts come from the installed tools where they ship one (Zig and the
 # libc it bundles, wasi-libc's Debian copyright file, the Go standard
 # library and the Go modules go-counter links, componentize-py,
-# componentize-qjs) and from deploy/notices/
-# where they do not (QuickJS-ng, CPython, TinyGo, the WASI adapter). Those
-# files name the tool version they were taken for: a tool at another
-# version fails here, so a pin is not moved without its text.
+# componentize-qjs) and from deploy/notices/ where they do not (QuickJS-ng,
+# CPython and the C libraries it links, TinyGo, the WASI adapter, and the
+# Rust crates of the runtimes componentize-qjs and componentize-py embed;
+# deploy/notices/README.md says how each was made). Those files name the
+# tool version they were taken for: a tool at another version fails here,
+# so a pin is not moved without its text. The TypeScript counter also
+# carries the record of the crates its runtime was built from (cargo
+# auditable, a `.dep-v0` section): every crate in it must be listed, or
+# this fails.
 #
 # Environment: PYTHON (default python3: the one with componentize-py and
 # ziglang), GO (default go: the Go TinyGo builds with), TINYGO (default
 # tinygo), WASI_LIBC_COPYRIGHT (default Debian's
-# /usr/share/doc/wasi-libc/copyright).
+# /usr/share/doc/wasi-libc/copyright), TS_COUNTER (default
+# examples/ts-counter/counter.wasm).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 out=${1:?usage: scripts/runtime-notices.sh OUT}
@@ -26,6 +32,7 @@ PYTHON=${PYTHON:-python3}
 GO=${GO:-go}
 TINYGO=${TINYGO:-tinygo}
 wasi_libc=${WASI_LIBC_COPYRIGHT:-/usr/share/doc/wasi-libc/copyright}
+ts_counter=${TS_COUNTER:-examples/ts-counter/counter.wasm}
 
 fail() { echo "runtime-notices: $*" >&2; exit 1; }
 # A vendored text names, in its first line, the version it is for.
@@ -65,21 +72,66 @@ quickjs=$(vendored quickjs-ng.txt "componentize-qjs $qjs_version")
 cpython=$(vendored cpython.txt "componentize-py $cpy_version")
 tinygo=$(vendored tinygo.txt "TinyGo $tinygo_version")
 wasi_adapter=$(vendored wasi-adapter.txt "Wasmtime $adapter")
+qjs_crates=$(vendored componentize-qjs-crates.txt "componentize-qjs $qjs_version")
+cpy_crates=$(vendored componentize-py-crates.txt "componentize-py $cpy_version")
+wasm_tools=deploy/notices/wasm-tools.txt
+[ -f "$wasm_tools" ] || fail "$wasm_tools is missing"
+
+# Every crate the TypeScript counter's runtime records is in its list: a
+# crate from crates.io by name and version, the two others by name. No
+# record, or one that cannot be read, fails too.
+"$PYTHON" -I - "$ts_counter" "$qjs_crates" <<'PY' || fail "$ts_counter: its crates are not all in $qjs_crates"
+import json, re, sys, zlib
+data = open(sys.argv[1], 'rb').read()
+listed = set(re.findall(r'^- (\S+) (\S+)', open(sys.argv[2]).read(), re.M))
+others = {'componentize-qjs-runtime', 'wit-dylib-ffi'}  # its LICENSE; wasm-tools.txt
+records, at = [], data.find(b'.dep-v0')
+while at >= 0:
+    for start in range(at + 7, at + 24):
+        try:
+            records.append(json.loads(zlib.decompressobj().decompress(data[start:]))['packages'])
+            break
+        except Exception:
+            pass
+    at = data.find(b'.dep-v0', at + 7)
+if not records:
+    sys.exit('no readable .dep-v0 record')
+bad = []
+for packages in records:
+    for p in packages:
+        if p.get('kind') == 'build':
+            continue  # run while building, not compiled into the runtime
+        if p.get('source') == 'crates.io':
+            if (p['name'], p['version']) not in listed:
+                bad.append(f"{p['name']} {p['version']}")
+        elif p['name'] not in others:
+            bad.append(f"{p['name']} {p['version']} ({p.get('source')})")
+if bad:
+    sys.exit('not listed: ' + ', '.join(bad))
+print(f'{sys.argv[1]}: the {sum(map(len, records))} crates it records are listed')
+PY
 
 # Section title, then its files.
 sections=(
-  "TypeScript (counter-typescript.wasm): componentize-qjs $qjs_version, QuickJS-ng"
+  "TypeScript (counter-typescript.wasm): componentize-qjs $qjs_version, QuickJS-ng, the Rust crates of its runtime, wasi-libc"
   "$qjs_dir/LICENSE"
   "$quickjs"
+  "$qjs_crates"
+  "$wasm_tools"
+  "$wasi_libc"
   --
-  "Python (counter-python.wasm): componentize-py $cpy_version, CPython"
+  "Python (counter-python.wasm): componentize-py $cpy_version, CPython and the C libraries it links, the Rust crates of its runtime, wasi-libc"
   "$cpy_license"
   "$cpython"
+  "$cpy_crates"
+  "$wasm_tools"
+  "$wasi_libc"
   --
-  "Go (counter-go.wasm): TinyGo $tinygo_version, the Go standard library ($go_version), go.bytecodealliance.org/cm $cm_version"
+  "Go (counter-go.wasm): TinyGo $tinygo_version, the Go standard library ($go_version), go.bytecodealliance.org/cm $cm_version, wasi-libc"
   "$tinygo"
   "$goroot/LICENSE"
   "$cm_dir/LICENSE"
+  "$wasi_libc"
   --
   "C (counter-c.wasm): wasi-libc, the WASI adapter"
   "$wasi_libc"
@@ -108,6 +160,10 @@ trap 'rm -f "$section"' EXIT
   echo 'each contain their language'"'"'s runtime or standard library and a libc. Their'
   echo 'licenses follow, per component. compiler-rt (Apache-2.0 WITH LLVM-exception),'
   echo 'which clang links into the C component, needs no notice in compiled form.'
+  echo 'wasi-libc appears as Debian packages it (the copyright file of the version'
+  echo 'the C component links); the TypeScript, Python and Go components link'
+  echo 'other versions of it (wasi-sdk 33, the one TinyGo bundles), under the same'
+  echo 'licenses.'
   echo
   for item in "${sections[@]}"; do
     if [ "$item" = -- ]; then

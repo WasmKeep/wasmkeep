@@ -17,9 +17,10 @@ Since 0.4.1, in no release yet.
   (TinyGo), `counter-c.wasm` and `counter-zig.wasm`, built with the tool
   versions CI tests, each in `SHA256SUMS` with its own Sigstore bundle
   (36 files in the release, from 26). The license texts of the runtimes
-  they embed (QuickJS-ng, CPython, TinyGo and the Go standard library,
-  wasi-libc, Zig's library, the WASI adapter) are added to
-  `THIRD_PARTY_NOTICES-components.txt`. The Experimental languages
+  they embed (QuickJS-ng, CPython and the C libraries it links, the Rust
+  crates of the componentize-qjs and componentize-py runtimes, TinyGo and
+  the Go standard library, wasi-libc, Zig's library, the WASI adapter) are
+  added to `THIRD_PARTY_NOTICES-components.txt`. The Experimental languages
   (standard Go, D, MoonBit, C#) are not released.
   [Verifying a download](docs/deploy/single-node.md#1-install-the-binary).
 
