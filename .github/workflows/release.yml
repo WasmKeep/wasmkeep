@@ -29,6 +29,16 @@ name: release
 # with keyless cosign: tagged X.Y.Z for a tag, `dev` for a run by hand. A
 # pull request builds it without pushing. deploy/compose/README.md says how
 # to verify.
+#
+# The toolchain image (deploy/toolchain/Dockerfile: `wasmkeep` and the
+# build tools of every Recommended and Supported SDK) goes the same way, to
+# ghcr.io/wasmkeep/toolchain: built on native runners for both platforms,
+# pushed by digest, then that pushed image runs deploy/toolchain/test.sh
+# (examples/todo-front through `wasmkeep dev`, a counter in each language),
+# joined into one index once the binaries are signed, and signed: X.Y.Z
+# for a tag, written once, `dev` for a run by hand. A pull request builds
+# it and runs the test on it, without pushing. docs/deploy/toolchain.md
+# says how to verify and use it.
 
 on:
   push:
@@ -45,6 +55,7 @@ on:
       - Cargo.lock
       - scripts/release-notes.sh
       - deploy/Dockerfile
+      - deploy/toolchain/**
       - .dockerignore
       - deploy/tarball/README.md
       - scripts/package-c-sdk.sh
@@ -506,4 +517,117 @@ jobs:
           cosign verify "$image@$digest" --certificate-identity "$IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
           echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$image:$tag\` = \`$image@$digest\` (signed)" >> "$GITHUB_STEP_SUMMARY"
+
+  # The toolchain image, per platform: like image-build, but the image a
+  # release pushes is the image tested: built and pushed by digest, then
+  # pulled by that digest and run on deploy/toolchain/test.sh. A pull
+  # request tests the image it built, and pushes nothing. Its digests go
+  # in artifacts of their own (`toolchain-digest-*`): the `image` job
+  # counts the `image-digest-*` ones.
+  toolchain-build:
+    name: toolchain image (${{ matrix.platform }})
+    needs: ci
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write   # push by digest (not on pull requests)
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      PUSH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-about@0.9.3
+      - name: Third-party notices for the image
+        run: ./scripts/notices.sh
+      - name: The pins are the ones CI builds the examples with
+        run: python3 -I scripts/check-toolchain.py
+      - name: BuildKit builder
+        run: docker buildx create --use --name wasmkeep --driver docker-container
+      - name: Build, push by digest (not on pull requests), and test the image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/toolchain
+          build=(docker buildx build -f deploy/toolchain/Dockerfile --platform "$PLATFORM"
+            --build-context notices=target/notices --provenance=false --sbom=false)
+          if [ "$PUSH" = true ]; then
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+            "${build[@]}" --metadata-file meta.json \
+              --output "type=image,name=$image,push-by-digest=true,name-canonical=true,push=true" .
+            digest=$(jq -r '."containerimage.digest"' meta.json)
+            echo "pushed $image@$digest"
+            mkdir -p digests && touch "digests/${digest#sha256:}"
+            tested=$image@$digest
+          else
+            "${build[@]}" --load -t wasmkeep-toolchain:test .
+            tested=wasmkeep-toolchain:test
+          fi
+          docker run --rm --platform "$PLATFORM" -v "$PWD:/src:ro" "$tested" deploy/toolchain/test.sh
+          size=$(docker image inspect "$tested" --format '{{.Size}}')
+          echo "### Toolchain image ($PLATFORM)" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$tested\`: $((size / 1000000)) MB uncompressed, tested" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: env.PUSH == 'true'
+        with:
+          name: toolchain-digest-${{ matrix.runner }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  toolchain:
+    name: toolchain image index and signature
+    # After the binaries are signed, as the server image.
+    needs: [toolchain-build, sign]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: write   # the index and its signature
+      id-token: write   # keyless signing: the workflow's OIDC identity
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: toolchain-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: One index for both platforms, signed and verified
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/toolchain
+          if [ "$REF_TYPE" = tag ]; then tag=${REF_NAME#v}; else tag=dev; fi
+          [ "$(ls digests | wc -l)" = 2 ] || { echo "::error::expected two platform digests"; ls digests; exit 1; }
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          # Written once, as the server image's version tag.
+          if [ "$REF_TYPE" = tag ] && docker buildx imagetools inspect "$image:$tag" > /dev/null 2>&1; then
+            echo "::error::$image:$tag exists already: a published version's image is not replaced (delete the tag by hand if it never was released)"
+            exit 1
+          fi
+          docker buildx imagetools create -t "$image:$tag" $(printf "$image@sha256:%s " $(ls digests))
+          digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+          docker buildx imagetools inspect "$image@$digest"
+          cosign sign --yes "$image@$digest"
+          cosign verify "$image@$digest" --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          echo "### Toolchain image" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$image:$tag\` = \`$image@$digest\` (signed)" >> "$GITHUB_STEP_SUMMARY"

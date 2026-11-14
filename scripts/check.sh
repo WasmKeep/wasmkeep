@@ -77,6 +77,9 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 # would be released under another number than the binary's.
 step 'one version'
 python3 -I scripts/check-versions.py
+# The toolchain image pins the tools CI builds the examples with.
+step 'toolchain image pins'
+python3 -I scripts/check-toolchain.py
 
 rust=false; everything=false; simulation=false; scripts=false; preflight=false
 workflows=false

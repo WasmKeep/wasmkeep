@@ -64,3 +64,20 @@ jobs:
       # instead when the runner has it).
       - run: pip install --quiet "moto[server]==5.2.5"
       - run: ./scripts/test-tutorials.sh
+
+  # The toolchain image built and tested (deploy/toolchain/test.sh) on
+  # linux/amd64, nothing pushed: release.yml does that for both platforms
+  # on a tag or a pull request that changes it. This catches what moves
+  # under its pins (Debian's packages, the registries the examples
+  # download from).
+  toolchain-image:
+    name: toolchain image (linux/amd64, built and tested)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: python3 -I scripts/check-toolchain.py
+      - run: docker buildx build -f deploy/toolchain/Dockerfile --load -t wasmkeep-toolchain:test .
+      - run: docker run --rm -v "$PWD:/src:ro" wasmkeep-toolchain:test deploy/toolchain/test.sh
