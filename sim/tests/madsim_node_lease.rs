@@ -259,12 +259,12 @@ async fn acquire_broken<B: Bucket, C: Clock>(
         .get(ACTOR)
         .await
         .map_err(|_| AcquireError::Unavailable)?;
-    let (generation, written) = match read {
+    let (generation, before, written) = match read {
         None => {
             if !valid() {
                 return Err(AcquireError::LeaseInvalid);
             }
-            (1, bucket.create(ACTOR, mine(1)).await)
+            (1, None, bucket.create(ACTOR, mine(1)).await)
         }
         Some((body, version)) => {
             let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
@@ -296,10 +296,8 @@ async fn acquire_broken<B: Bucket, C: Clock>(
             if !valid() {
                 return Err(AcquireError::LeaseInvalid);
             }
-            (
-                generation,
-                bucket.replace(ACTOR, mine(generation), &version).await,
-            )
+            let written = bucket.replace(ACTOR, mine(generation), &version).await;
+            (generation, Some(record), written)
         }
     };
     written
@@ -309,7 +307,7 @@ async fn acquire_broken<B: Bucket, C: Clock>(
             version,
             previous: None,
         })
-        .map_err(|_| AcquireError::Unresolved { generation })
+        .map_err(|_| AcquireError::Unresolved { generation, before })
 }
 
 /// One process slot's lives: a process (its own instance) starts through
@@ -342,6 +340,7 @@ async fn run_node(
         lapse_forgets_parked: false,
         resolver_ignores_parked_generation: false,
         unknown_wake_drops_parked: false,
+        resolver_ends_unchanged: false,
     };
     loop {
         let instance = format!("{:08x}", madsim::rand::random::<u32>());

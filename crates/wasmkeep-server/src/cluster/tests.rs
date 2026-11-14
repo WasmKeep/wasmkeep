@@ -2028,6 +2028,11 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
     a.pending.push(PendingEntry::Unresolved {
         key: key.clone(),
         generation: 5,
+        before: Some(OwnerRecord {
+            holder: None,
+            generation: 4,
+        }),
+        until_ms: now_ms() + 30_000,
     });
     assert!(!a.nothing_pending());
     a.retry_pending().await;
@@ -2046,6 +2051,11 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
     a.pending.push(PendingEntry::Unresolved {
         key: key.clone(),
         generation: 6,
+        before: Some(OwnerRecord {
+            holder: None,
+            generation: 5,
+        }),
+        until_ms: now_ms() + 30_000,
     });
     let hold = LeaseHold::acquire(&a, &x).await.unwrap();
     assert_eq!(hold.generation(), Some(6));
@@ -2059,6 +2069,81 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
     );
     assert!(hold.is_valid());
     assert!(a.nothing_pending());
+}
+
+/// ADR 0020, section 3: an unresolved acquire whose record has not changed
+/// stays pending while its wait lasts (a drain is not drained), and a
+/// write that lands after the resolver's first read is released; past its
+/// wait, an unchanged record ends it. A clean stop does not wait for it.
+#[tokio::test]
+async fn the_resolver_waits_for_a_write_that_lands_late() {
+    use wasmkeep_cluster::node_lease::OwnerRecord;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let instance = a.membership.instance().unwrap().to_owned();
+    let put = async |key: &str, record: OwnerRecord| {
+        store
+            .put(&StorePath::from(key), record.encode().into())
+            .await
+            .unwrap();
+    };
+    let read = async |key: &str| {
+        let body = store
+            .get(&StorePath::from(key))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        OwnerRecord::decode(&body).unwrap()
+    };
+    let nobody = |generation| OwnerRecord {
+        holder: None,
+        generation,
+    };
+    let key = a.owner_key(&ActorAddress::new("t", "c", "late").unwrap());
+    put(&key, nobody(4)).await;
+    a.pending.push(PendingEntry::Unresolved {
+        key: key.clone(),
+        generation: 5,
+        before: Some(nobody(4)),
+        until_ms: now_ms() + 30_000,
+    });
+    a.retry_pending().await;
+    assert!(!a.nothing_pending(), "ended on an unchanged record");
+    assert!(
+        a.releases_done(Duration::from_millis(100)).await,
+        "a clean stop waits for an unresolved acquire"
+    );
+    // The write lands now, after that read.
+    put(
+        &key,
+        OwnerRecord {
+            holder: Some(("a".to_owned(), instance.clone())),
+            generation: 5,
+        },
+    )
+    .await;
+    a.retry_pending().await;
+    assert_eq!(
+        read(&key).await,
+        nobody(5),
+        "the late write was not released"
+    );
+    assert!(a.nothing_pending());
+
+    // Unchanged past its wait: ended, the record left alone.
+    a.pending.push(PendingEntry::Unresolved {
+        key: key.clone(),
+        generation: 6,
+        before: Some(nobody(5)),
+        until_ms: now_ms(),
+    });
+    a.retry_pending().await;
+    assert!(a.nothing_pending());
+    assert_eq!(read(&key).await, nobody(5));
 }
 
 /// ADR 0020, section 1: a lease that ran out ends every hold at once,
@@ -2096,9 +2181,12 @@ async fn the_pending_set_is_not_empty_while_an_entry_is_being_resolved() {
     wait_lease_valid(&a).await;
     let x = ActorAddress::new("t", "c", "x").unwrap();
     let key = a.owner_key(&x);
+    // Its wait is over: the next read that finds no record ends it.
     a.pending.push(PendingEntry::Unresolved {
         key: key.clone(),
         generation: 1,
+        before: None,
+        until_ms: now_ms(),
     });
     // The resolver waits for the actor's lock, held here.
     let lock = a.pending.lock_of(&key);

@@ -800,6 +800,9 @@ pub enum AcquireError {
     Unresolved {
         /// The generation tried.
         generation: u64,
+        /// The record the write was conditioned on (`None`: there was
+        /// none). While the record is still that one, the write may land.
+        before: Option<OwnerRecord>,
     },
     /// The record or a node lease is unreadable.
     Corrupt,
@@ -817,7 +820,19 @@ pub enum Released {
     Superseded,
     /// Not known: keep it pending and retry.
     Pending,
+    /// A resolution only, asked to wait: the record is still the one the
+    /// unresolved acquire's write was conditioned on, so that write may
+    /// still land. Read it again later.
+    Unchanged,
 }
+
+/// How long the resolver of an unresolved acquire waits for a record that
+/// has not changed, by default (ms): `object_store`'s own request timeout
+/// (30 s), so a write the client gave up on has as long again to land
+/// before the resolver stops reading for it ([ADR 0020], section 3).
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+pub const UNRESOLVED_WAIT_MS: u64 = 30_000;
 
 /// Ownership records for one node.
 #[derive(Debug)]
@@ -828,6 +843,7 @@ pub struct Owners<B, C> {
     instance: String,
     nodes_prefix: String,
     config: LeaseConfig,
+    unresolved_wait_ms: u64,
 }
 
 impl<B: Bucket, C: Clock> Owners<B, C> {
@@ -848,7 +864,28 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             instance: instance.into(),
             nodes_prefix: nodes_prefix.into(),
             config,
+            unresolved_wait_ms: UNRESOLVED_WAIT_MS,
         }
+    }
+
+    /// How long an unresolved acquire waits for a record that has not
+    /// changed ([`UNRESOLVED_WAIT_MS`] by default): at least as long as a
+    /// write the bucket client gave up on may still take to land.
+    #[must_use]
+    pub fn with_unresolved_wait_ms(mut self, ms: u64) -> Self {
+        self.unresolved_wait_ms = ms;
+        self
+    }
+
+    /// Until when (this node's clock, ms) an unresolved acquire made now
+    /// waits for a record that has not changed.
+    pub fn unresolved_until_ms(&self) -> u64 {
+        self.clock.now_ms().saturating_add(self.unresolved_wait_ms)
+    }
+
+    /// This node's clock (ms).
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
     }
 
     fn mine(&self, generation: u64) -> Vec<u8> {
@@ -882,7 +919,8 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                (first, None, self.bucket.create(key, self.mine(first)).await)
+                let written = self.bucket.create(key, self.mine(first)).await;
+                (first, None, written)
             }
             Some((body, version)) => {
                 let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
@@ -917,12 +955,12 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                     .bucket
                     .replace(key, self.mine(generation), &version)
                     .await;
-                (generation, Some(version), written)
+                (generation, Some((version, record)), written)
             }
         };
         let version = match written {
             Ok(version) => version,
-            Err(_) => self.read_back(key, generation, before.as_ref()).await?,
+            Err(_) => self.read_back(key, generation, before).await?,
         };
         Ok(Hold {
             key: key.to_owned(),
@@ -941,18 +979,20 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     /// (`before`: its version, `None` for an absent record) by another
     /// live holder, the race is lost: `Held`. Anything else stays
     /// unresolved, the record unchanged above all: the write may still be
-    /// in flight, and land.
+    /// in flight, and land. The unresolved acquire carries the record the
+    /// write was conditioned on, for the resolver.
     async fn read_back(
         &self,
         key: &str,
         generation: u64,
-        before: Option<&Version>,
+        before: Option<(Version, OwnerRecord)>,
     ) -> Result<Version, AcquireError> {
-        let unresolved = AcquireError::Unresolved { generation };
+        let (before_version, before) = before.unzip();
+        let unresolved = AcquireError::Unresolved { generation, before };
         let Ok(Some((body, version))) = self.bucket.get(key).await else {
             return Err(unresolved);
         };
-        if before == Some(&version) {
+        if before_version.as_ref() == Some(&version) {
             return Err(unresolved);
         }
         match OwnerRecord::decode(&body).and_then(|r| r.holder.map(|h| (h, r.generation))) {
@@ -1070,7 +1110,22 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     /// `Pending` means call it again: it reads the record afresh, which is
     /// equivalent to retrying with the version it read (only this instance
     /// writes this instance at that generation).
-    pub async fn resolve(&self, key: &str, generation: u64) -> Released {
+    ///
+    /// With `wait`, a record that is still `before` (the one the write was
+    /// conditioned on; `None`: still absent) gives `Unchanged`: the write
+    /// may still land, so the entry stays. Without it (its time is up, and
+    /// this read was issued after), that record ends the entry, as does
+    /// any other. A record's content never comes back once it changed
+    /// (every acquisition raises the generation, a release keeps it and
+    /// names nobody), so an equal record is the same state; a version token
+    /// is never compared.
+    pub async fn resolve(
+        &self,
+        key: &str,
+        generation: u64,
+        before: Option<&OwnerRecord>,
+        wait: bool,
+    ) -> Released {
         match self.bucket.get(key).await {
             Ok(Some((body, version))) => match OwnerRecord::decode(&body) {
                 Some(r)
@@ -1087,8 +1142,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                     };
                     self.release(&hold).await
                 }
+                Some(r) if wait && before == Some(&r) => Released::Unchanged,
                 _ => Released::Superseded,
             },
+            Ok(None) if wait && before.is_none() => Released::Unchanged,
             Ok(None) => Released::Superseded,
             Err(_) => Released::Pending,
         }
@@ -1593,7 +1650,13 @@ mod tests {
             *mem.steal_next.borrow_mut() = Some(("owners/n".into(), other));
             assert_eq!(
                 run(a.acquire("owners/n", || true, async || Ok(1))),
-                Err(AcquireError::Unresolved { generation: 5 })
+                Err(AcquireError::Unresolved {
+                    generation: 5,
+                    before: Some(OwnerRecord {
+                        holder: None,
+                        generation: 4
+                    }),
+                })
             );
         }
     }
@@ -1621,7 +1684,16 @@ mod tests {
             }
             .encode()
         };
-        let unresolved = Err(AcquireError::Unresolved { generation: 5 });
+        // Each carries the record its write was conditioned on.
+        let unresolved = |holder: Option<(&str, &str)>| {
+            Err(AcquireError::Unresolved {
+                generation: 5,
+                before: Some(OwnerRecord {
+                    holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
+                    generation: 4,
+                }),
+            })
+        };
         // b's older instance i1 holds it (freed by b's live lease as i2);
         // the write does not land, and b's lease is rewritten released
         // meanwhile: the same record no longer reads as free, yet it is
@@ -1637,7 +1709,7 @@ mod tests {
         *mem.steal_next.borrow_mut() = Some(("nodes/b".into(), released));
         assert_eq!(
             run(a.acquire("owners/u", || true, async || Ok(1))),
-            unresolved
+            unresolved(Some(("b", "i1")))
         );
         // A rival its own lease frees (b restarted as i3; the rival is i2).
         let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "i3", cfg());
@@ -1656,7 +1728,7 @@ mod tests {
         *mem.steal_next.borrow_mut() = Some(("owners/f".into(), record(("b", "i2"), 5)));
         assert_eq!(
             run(a.acquire("owners/f", || true, async || Ok(1))),
-            unresolved
+            unresolved(None)
         );
         // A failed read of the record (the second read), then of the
         // rival's lease (the third).
@@ -1676,7 +1748,7 @@ mod tests {
             mem.fail_get_after.set(Some(after));
             assert_eq!(
                 run(a.acquire(&key, || true, async || Ok(1))),
-                unresolved,
+                unresolved(None),
                 "{after}"
             );
             assert_eq!(mem.fail_get_after.get(), None, "the read failed");

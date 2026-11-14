@@ -213,6 +213,11 @@ Since 0.3.0, in no release yet.
   - A command whose output goes to a closed pipe (`wasmkeep cluster
     status --json | head`) exits quietly with status 141 instead of
     panicking with "failed printing to stdout: Broken pipe".
+- **A drain or a move no longer waits until the node stops for an actor
+  whose ownership write went unanswered and landed late**: the node now
+  watches such a record for 30 s and releases it if the write lands
+  ([ADR 0020](docs/adr/0020-one-lease-per-node.md#3-the-ownership-record),
+  amended 2026-11-14).
 
 ### The front, host side (for 0.4.0)
 

@@ -349,8 +349,12 @@ resolver read the record (unchanged then) and ended the entry, leaves a
 record naming its node with nothing there to release it (487 times in
 the 20,000 seeds). The node takes it back at the actor's next event, as its
 own; a drain or a move of that actor waits until the node stops. The
-simulation counts it apart; fixing it (the resolver keeping the entry
+simulation counted it apart; fixing it (the resolver keeping the entry
 while the record is unchanged, for a bounded time) belongs to ADR 0020.
+Fixed there on 2026-11-14 (ADR 0020, section 3, amended): the
+simulation now counts such a record as a leak, and a broken variant
+(`ResolverEndsUnchanged`, the resolver ending the entry on its first read
+of an unchanged record) is caught, first at seed 34.
 
 ## Alternatives
 

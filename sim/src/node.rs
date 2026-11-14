@@ -78,7 +78,19 @@ pub struct Breaks {
     pub resolver_ignores_parked_generation: bool,
     /// A wake whose outcome is unknown drops the parked hold.
     pub unknown_wake_drops_parked: bool,
+    /// The resolver ends an unresolved acquire on its first read of an
+    /// unchanged record (no wait, ADR 0020 before its amendment): a write
+    /// landing after that read leaves the record naming this node with
+    /// nothing here to release it.
+    pub resolver_ends_unchanged: bool,
 }
+
+/// How long the resolver waits for an unresolved acquire's unchanged record
+/// (ms; the server waits [`wasmkeep_cluster::node_lease::UNRESOLVED_WAIT_MS`]):
+/// the simulated bucket applies a slow request up to 2.5 s after it
+/// arrives (`Faults::slow_one_in`), and the entry is made only after the
+/// write's own timeout and a read back; half a second more for margin.
+pub const UNRESOLVED_WAIT_MS: u64 = 3_000;
 
 /// A hold an actor workload keeps: what [`LeaseNode::may_act`] checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,10 +111,6 @@ struct Shared {
     holds: HashMap<String, Hold>,
     /// Holds parked by hibernations with sockets open (ADR 0024).
     parked: Parked<()>,
-    /// Unresolved acquires (key, generation) the resolver ended because a
-    /// hold of the actor counted as held here: see
-    /// [`LeaseNode::resolver_skipped`].
-    skipped: HashSet<(String, u64)>,
     pending: Vec<PendingEntry>,
     /// Releases sent and retry passes under way: their entries are in
     /// neither `holds` nor `pending` meanwhile, and the set must not read
@@ -213,7 +221,15 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
                 break;
             }
         }
-        let owners = |b| Owners::new(b, clock, &setup.id, instance, &setup.nodes_prefix, cfg);
+        let wait = if setup.breaks.resolver_ends_unchanged {
+            0
+        } else {
+            UNRESOLVED_WAIT_MS
+        };
+        let owners = |b| {
+            Owners::new(b, clock, &setup.id, instance, &setup.nodes_prefix, cfg)
+                .with_unresolved_wait_ms(wait)
+        };
         let mut shared = Shared::default();
         let _ = shared
             .validity
@@ -370,11 +386,8 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
                 Ok(held)
             }
             Err(e) => {
-                if let AcquireError::Unresolved { generation } = e {
-                    s.pending.push(PendingEntry::Unresolved {
-                        key: key.to_owned(),
-                        generation,
-                    });
+                if let Some(entry) = PendingEntry::unresolved(&self.owners, key, &e) {
+                    holds::add(&mut s.pending, entry);
                 }
                 Err(e)
             }
@@ -421,17 +434,6 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         }
         self.release(held).await;
         false
-    }
-
-    /// Whether the resolver ended this process's unresolved acquire of
-    /// `key` at `generation` because a hold counted as held here (rather
-    /// than reading the record and finding it not landed): a record left
-    /// naming this process at that generation is then a leak, not a write
-    /// that landed after the resolver gave up on it.
-    pub fn resolver_skipped(&self, key: &str, generation: u64) -> bool {
-        lock(&self.shared)
-            .skipped
-            .contains(&(key.to_owned(), generation))
     }
 
     /// Whether the record at `key` is parked here.
@@ -505,7 +507,7 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         let mut s = lock(&self.shared);
         s.in_flight -= 1;
         match released {
-            Released::Pending => {
+            Released::Pending | Released::Unchanged => {
                 s.pending.push(PendingEntry::Release(hold));
                 false
             }
@@ -712,19 +714,16 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
             let held_here = !self.setup.breaks.resolve_while_held;
             let any_generation = self.setup.breaks.resolver_ignores_parked_generation;
             let still = holds::retry(&self.owners, entry, |k, generation| {
-                let mut s = lock(shared);
+                let s = lock(shared);
                 let parked = if any_generation {
                     s.parked.contains(k)
                 } else {
                     s.parked.holds_at(k, generation)
                 };
-                let held = held_here && (s.holds.contains_key(k) || parked);
-                if held {
-                    s.skipped.insert((k.to_owned(), generation));
-                }
-                held
+                held_here && (s.holds.contains_key(k) || parked)
             })
-            .await;
+            .await
+            .still();
             // An unresolved acquire that ended: a hold parked at an
             // earlier generation is forgotten if the record no longer names
             // it (the server's `forget_parked_behind`).
@@ -741,7 +740,7 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
                 s.acquiring.remove(&key);
             }
             if let Some(entry) = still {
-                s.pending.push(entry);
+                holds::add(&mut s.pending, entry);
             }
         }
         if !self.setup.breaks.pending_uncounted {

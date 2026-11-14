@@ -122,10 +122,11 @@ async fn lease_object(bucket: &ObjectStoreBucket, key: &str) -> NodeLeaseObject 
 }
 
 /// What one race of eight acquires left: the winner (node, its records
-/// client, its hold) and the unresolved acquires (client, generation).
+/// client, its hold) and the unresolved acquires (client, generation, the
+/// record its write was conditioned on).
 type Race = (
     (usize, Owners<ObjectStoreBucket, Wall>, Hold),
-    Vec<(Owners<ObjectStoreBucket, Wall>, u64)>,
+    Vec<(Owners<ObjectStoreBucket, Wall>, u64, Option<OwnerRecord>)>,
 );
 
 /// Eight nodes acquire `key` at once; exactly one must win.
@@ -155,8 +156,8 @@ async fn race(bucket: &ObjectStoreBucket, key: &str, config: LeaseConfig, round:
             (_, _, Err(AcquireError::Held { node, instance })) => named.push((node, instance)),
             // A conflict on the write: it may have landed, as far as that
             // node knows.
-            (_, owners, Err(AcquireError::Unresolved { generation })) => {
-                unresolved.push((owners, generation));
+            (_, owners, Err(AcquireError::Unresolved { generation, before })) => {
+                unresolved.push((owners, generation, before));
             }
             (node, _, Err(e)) => panic!("{round}: n{node}: unexpected error: {e:?}"),
         }
@@ -214,9 +215,11 @@ async fn concurrent_acquires_have_one_winner() {
                 assert_eq!(hold.generation, previous + 1, "{label}: generation + 1");
             }
             unresolved_seen += unresolved.len();
-            for (loser, generation) in unresolved {
+            // Even while still waiting for an unchanged record: the
+            // record changed, to the winner's.
+            for (loser, generation, before) in unresolved {
                 assert_eq!(
-                    loser.resolve(&key, generation).await,
+                    loser.resolve(&key, generation, before.as_ref(), true).await,
                     Released::Superseded,
                     "{label}: a loser's resolution"
                 );
