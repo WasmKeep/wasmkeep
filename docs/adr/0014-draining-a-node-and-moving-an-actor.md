@@ -444,7 +444,9 @@ period, `control/drain/` and its app's `state/<tenant>/<app>/moves/`, not
 the one this record's Consequences counted ("one more LIST per node per
 period" was one LIST until 0.4.0, two since). At the default 3 s period
 that is 0.67 LIST/s per node, about 1.7 million a month, for intents an
-operator writes a few times a month.
+operator writes a few times a month. [ADR 0028](0028-actors-that-end.md)
+then added a third prefix, the app's `deletes/`, listed the same way:
+1.0 LIST/s per node.
 
 ### What changes
 
@@ -452,11 +454,14 @@ operator writes a few times a month.
   before (a time with sub-millisecond digits and the writer's process,
   or the node's random seed and a counter). Every writer of an intent
   rewrites it after its own write or delete was acknowledged: `cluster
-  drain`, `cluster undrain`, `actor move`, and a node that deletes a move
-  request it acted on (`delete_move`, which also forgets the request in
-  its own copy at once).
+  drain`, `cluster undrain`, `actor move`, `actor delete` (ADR 0028), and
+  a node that deletes a move request it acted on (`delete_move`) or ends
+  a delete request (`end_delete_request`, after its outcome is written);
+  either also forgets the request in its own copy at once, and keeps it
+  out of that copy until it expires, so a listing in flight cannot bring
+  it back.
 - **Nodes read it, and list on a change.** Every heartbeat period a node
-  GETs `control/changed`. It lists both prefixes, as before, at its first
+  GETs `control/changed`. It lists the prefixes, as before, at its first
   period; when the body differs from the one it read before its last
   successful listing; and every 20 periods anyway
   (`control::LISTING_FALLBACK_EVERY`, 60 s at the default 3 s), whatever
@@ -488,20 +493,21 @@ operator writes a few times a month.
 | Drain, undrain or move from a CLI of 0.4.2 on | 3 s (the next period) | 3 s (the next period's read of the marker) |
 | The same from a CLI of 0.4.1 or before (it does not write the marker), or when the marker write failed (the CLI warns) | 3 s | 60 s (the fallback) |
 | A completed move, as other nodes see it | 3 s | 3 s (the node that deleted it writes the marker) |
+| An operator delete from `actor delete` of 0.4.2 (ADR 0028) | 3 s | 3 s; the request is ended by the node that carried it out, which writes the marker, so the others stop acting on it (each would otherwise restore the actor to find it carried out) within a period |
 | An expired move key (5 minutes) | ignored from the next listing on (3 s) | ignored at once: a node checks the expiry of the requests it keeps from its last listing every time it acts on them (`Cluster::moves`), as a listing does; the key itself is deleted at the next listing, within 60 s |
 
 ### Cost after
 
-Per node and period: one GET; two LISTs every 20 periods. At 3 s: 0.033
-LIST/s and 0.33 GET/s per node, from 0.67 LIST/s. Measured in
-`tests/cluster/listings.rs`
-(`an_idle_node_lists_and_reads_what_its_cadences_say`: 12 listings of
+Per node and period: one GET; three LISTs (drains, the app's moves and
+deletes) every 20 periods. At 3 s: 0.05 LIST/s and 0.33 GET/s per node,
+from 1.0 LIST/s. Measured in `tests/cluster/listings.rs`
+(`an_idle_node_lists_and_reads_what_its_cadences_say`: 18 listings of
 the intents in 120 periods per node).
 
 ### Rolling upgrades
 
-A node of 0.4.1 ignores `control/changed` and lists both prefixes every
-period, as before; a node of 0.4.2 reads intents written by either CLI,
+A node of 0.4.1 ignores `control/changed` and lists its prefixes every
+period, as before (it has no `deletes/`, and ignores delete requests); a node of 0.4.2 reads intents written by either CLI,
 those of an old CLI within the 60 s fallback. Nothing is refused in
 either direction. Upgrading the CLI with the nodes brings the reaction
 back to a period.

@@ -221,12 +221,14 @@ the bucket, per heartbeat period (3 s by default), since 0.4.2
 | --- | --- | --- |
 | Its node lease | 1 PUT a period | 0.33 PUT/s |
 | The other nodes' heartbeats | 1 GET per node a period; a LIST of `nodes/` every ten periods (30 s), and at once when a node that just started says hello | 1.0 GET/s, 0.033 LIST/s |
-| The operator's intents (drains, moves) | 1 GET of `control/changed` a period; the two LISTs of the intents when it changed, or every minute | 0.33 GET/s, 0.033 LIST/s |
+| The operator's intents (drains, moves, actor deletes) | 1 GET of `control/changed` a period; the three LISTs of the intents when it changed, or every minute | 0.33 GET/s, 0.05 LIST/s |
 | The alarm index | 1 LIST when an entry is due for the sweep, at most every 10 s and at least every minute | 0.017 LIST/s with no alarms |
-| The deployed version, and the secrets (`--app`) | 1 GET each a period | 0.67 GET/s |
+| The deployed version, its tombstone, and the secrets (`--app`) | 1 GET each a period | 1.0 GET/s |
+| Idle expiry, on one node, for an app whose classes expire | 2 LISTs (`owners/`, `alarms/`) every 10 minutes | 0.003 LIST/s on that node |
 
-About 0.08 LIST/s per node, down from 1.1 in 0.4.1, so about 650,000
-LISTs a month for the three nodes instead of 8.6 million. What got
+About 0.1 LIST/s per node, down from 1.43 (1.1 in 0.4.1, before the
+app's delete requests were listed too), so about 780,000 LISTs a month
+for the three nodes instead of 11 million. What got
 slower: a drain, an undrain or a move requested by a CLI of 0.4.1 or
 before is read within a minute instead of 3 s (one from the 0.4.2 CLI
 still within 3 s); a node of 0.4.1 that starts is seen by 0.4.2 peers

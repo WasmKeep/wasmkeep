@@ -207,7 +207,11 @@ fn rates(id: &str, entries: &[Logged]) -> Rates {
     for l in entries {
         match l.op {
             Op::List if l.key.starts_with("nodes") => r.list_nodes += 1,
-            Op::List if l.key.starts_with("control") || l.key.contains("/moves") => {
+            Op::List
+                if l.key.starts_with("control")
+                    || l.key.contains("/moves")
+                    || l.key.contains("/deletes") =>
+            {
                 r.list_control += 1;
             }
             Op::List if l.key.contains("alarms") => r.list_alarms += 1,
@@ -239,7 +243,8 @@ async fn counted_node(
 
 /// The idle cost of three nodes, per node and heartbeat period: a
 /// regression in any of the cadences shows here. Before the amendment it
-/// was 3 listings (`nodes/`, `control/drain/`, the app's moves) a period,
+/// was 4 listings (`nodes/`, `control/drain/`, the app's moves and
+/// deletes) a period,
 /// plus the alarm index every sweep period; 3 reads of heartbeats.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_node_lists_and_reads_what_its_cadences_say() {
@@ -274,15 +279,15 @@ async fn an_idle_node_lists_and_reads_what_its_cadences_say() {
             "{id} read {} heartbeats in {periods} periods",
             r.get_nodes
         );
-        // `control/changed` once a period; the intents (two prefixes)
-        // every 20 periods.
+        // `control/changed` once a period; the intents (three prefixes:
+        // drains, the app's moves and deletes) every 20 periods.
         assert!(
             (0.9..=1.1).contains(&per(r.get_marker)),
             "{id} read control/changed {} times in {periods} periods",
             r.get_marker
         );
         assert!(
-            (0.05..=0.2).contains(&per(r.list_control)),
+            (0.1..=0.2).contains(&per(r.list_control)),
             "{id} listed the intents {} times in {periods} periods",
             r.list_control
         );

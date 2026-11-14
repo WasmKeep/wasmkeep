@@ -3071,7 +3071,17 @@ mod tests {
         rt.block_on(store.put(&segment, PutPayload::from("x")))
             .unwrap();
         super::actor_delete_on(&delete_args(&["--no-wait"]), open, poll).unwrap();
-        let keys = keys_of(&store);
+        // The request, and `control/changed` rewritten after it, so nodes
+        // list it within a period (ADR 0014, amendment of 2026-11-14).
+        let all = keys_of(&store);
+        assert!(all.contains(&"wk/control/changed".to_owned()), "{all:?}");
+        let requests = |store: &std::sync::Arc<dyn ObjectStore>| -> Vec<String> {
+            keys_of(store)
+                .into_iter()
+                .filter(|k| k != "wk/control/changed")
+                .collect()
+        };
+        let keys = requests(&store);
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert_eq!(keys[0], segment.to_string());
         let request = keys[1].clone();
@@ -3085,7 +3095,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("not deleted yet"), "{e}");
-        assert_eq!(keys_of(&store).len(), 3);
+        assert_eq!(requests(&store).len(), 3);
         // Requests carried out as a node does: the outcome written, then
         // the request deleted.
         let carry_out = |store: &std::sync::Arc<dyn ObjectStore>, outcome: &str| {
@@ -3124,7 +3134,7 @@ mod tests {
         assert!(e.contains("no such actor"), "{e}");
         // Carried out: done, and the outcome read is removed.
         run_with(".done").unwrap();
-        assert_eq!(keys_of(&store), [segment.to_string()], "left behind");
+        assert_eq!(requests(&store), [segment.to_string()], "left behind");
         assert!(
             super::Cli::try_parse_from([
                 "wasmkeep",

@@ -271,7 +271,7 @@ the delete and forgets the request at once.
   asked for. The node that deleted the request keeps it out of its own
   copy until it expires, so a listing in flight during the delete does
   not bring it back there.
-- **Cost:** see ADR 0014's amendment (the two prefixes are listed
+- **Cost:** see ADR 0014's amendment (the prefixes are listed
   together).
 - **Tests:** the move tests in `tests/cluster/draining.rs` write the
   marker as the CLI does (`request_move_of`).

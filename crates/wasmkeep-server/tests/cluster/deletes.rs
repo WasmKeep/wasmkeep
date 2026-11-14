@@ -280,3 +280,42 @@ async fn storage_is_refused_after_a_durable_delete_in_the_same_event() {
     assert_eq!(read(b.addr, "then").await, "0");
     assert_eq!(read(a.addr, "then").await, "0");
 }
+
+/// ADR 0014 and 0028, amendments of 2026-11-14: the node that ends a delete
+/// request rewrites `control/changed`, so the other nodes list the requests
+/// again within a period and stop acting on their copy of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_a_delete_request_tells_the_other_nodes() {
+    use object_store::ObjectStoreExt as _;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node_with(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    let _b = node_with(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    settle().await;
+    write(a.addr, "gone", 2).await;
+    let marker = object_store::path::Path::from(wasmkeep_cluster::control::CHANGED);
+    let key = request_delete(&store, "gone").await;
+    let announced = store.get(&marker).await.unwrap().bytes().await.unwrap();
+    done_within(&store, &key, Duration::from_secs(20)).await;
+    eventually(
+        "the node that ended it rewrote control/changed",
+        async || store.get(&marker).await.unwrap().bytes().await.unwrap() != announced,
+    )
+    .await;
+}

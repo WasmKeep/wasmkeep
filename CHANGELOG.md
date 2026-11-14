@@ -91,8 +91,8 @@ Since 0.4.1, in no release yet.
     `ends`, which earlier versions ignore.
 
 - **Fewer listings of the bucket.** An idle node lists the bucket about
-  0.08 times a second instead of 1.1 (on R2 and S3 a LIST costs what a PUT
-  costs): `nodes/` every 30 s, the nodes it knows read one by one every
+  0.1 times a second instead of 1.43 (1.1 in 0.4.1; on R2 and S3 a LIST
+  costs what a PUT costs): `nodes/` every 30 s, the nodes it knows read one by one every
   heartbeat in between, and a node that starts says hello so its peers list
   at once; the drain, move and delete requests when `control/changed` says
   they changed, or every minute; the alarm index when an entry is due for
