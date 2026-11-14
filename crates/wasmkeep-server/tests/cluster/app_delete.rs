@@ -64,6 +64,7 @@ async fn app_node_following(
     cluster.heartbeat = Duration::from_millis(100);
     cluster.failover_wait = Some(Duration::ZERO);
     cluster.app = format!("{TENANT}/{APP}");
+    cluster.follows_app = true;
     config.cluster = Some(cluster);
     let cluster_port = cluster_listener(&mut config).await;
     let service = ActorService::new(runtime, config, classes).unwrap();
@@ -97,6 +98,7 @@ fn ask() -> DeleteApp {
         wait: Duration::from_secs(30),
         force: false,
         who: "test".into(),
+        late: Duration::from_secs(1),
     }
 }
 
@@ -195,9 +197,18 @@ async fn deleting_an_app_stops_its_nodes_removes_its_data_and_refuses_it() {
     // --recreate: the tombstone goes once nothing else is left; the name
     // deploys anew. c, whose files are from before the delete, removes them
     // before it serves: y starts empty.
-    assert!(app.recreate().await.unwrap());
+    let too_soon = app.recreate(Duration::from_secs(600)).await;
+    assert!(
+        matches!(&too_soon, Err(DeployError::Refused(m)) if m.contains("may still land")),
+        "{too_soon:?}"
+    );
+    let late = Duration::from_millis(500);
+    assert!(app.recreate(late).await.unwrap());
     assert!(app.tombstone().await.unwrap().is_none());
-    assert!(!app.recreate().await.unwrap(), "nothing to recreate twice");
+    assert!(
+        !app.recreate(late).await.unwrap(),
+        "nothing to recreate twice"
+    );
     deploy(&store).await.unwrap();
     assert!(wasmkeep_server::local_app_dir(dirs[2].path(), TENANT, APP).exists());
     let c = app_node("c", dirs[2].path(), &store).await.unwrap();
@@ -218,7 +229,7 @@ async fn recreate_is_refused_while_data_is_left() {
     assert!(app.write_tombstone("x").await.unwrap());
     assert!(!app.write_tombstone("y").await.unwrap(), "created twice");
     // A tombstone with the versions still there: not recreated.
-    assert!(app.recreate().await.is_err());
+    assert!(app.recreate(Duration::ZERO).await.is_err());
     assert!(app.tombstone().await.unwrap().is_some());
     // No such app: nothing written.
     let none = AppRef::new(Arc::clone(&store), "", TENANT, "none");
@@ -277,4 +288,48 @@ async fn recreate_is_refused_while_data_is_left() {
         "{refused:?}"
     );
     assert!(other.tombstone().await.unwrap().is_none());
+}
+
+/// A node cut off from the bucket while its app is deleted (paused, say),
+/// past the horizon at which it no longer counts as live: the command
+/// fences its node lease before it removes anything, so once the node is
+/// back it can never renew, and it writes nothing into the deleted app.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_cut_off_through_the_delete_never_writes_again() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&shared).await.unwrap();
+    let down = Arc::new(AtomicBool::new(false));
+    let flaky: Arc<dyn ObjectStore> = Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let dir = tempfile::tempdir().unwrap();
+    let a = app_node("a", dir.path(), &flaky).await.unwrap();
+    assert_eq!(read(a.addr, "x").await, "0");
+    write(a.addr, "x", 2).await;
+    down.store(true, Ordering::SeqCst);
+    let mut said = Vec::new();
+    let done = wasmkeep_server::apps::delete_app(
+        Arc::clone(&shared),
+        "",
+        TENANT,
+        APP,
+        &ask(),
+        &mut |l| said.push(l),
+        Duration::from_millis(200),
+        Duration::from_millis(300),
+    )
+    .await
+    .unwrap();
+    assert!(done.starts_with("Deleted"), "{done}");
+    assert!(
+        said.iter().any(|l| l.contains("fenced node a")),
+        "{said:?}"
+    );
+    // Back: its lease is fenced, so it never acts again; nothing of the app
+    // comes back, whatever it is sent.
+    down.store(false, Ordering::SeqCst);
+    for _ in 0..10 {
+        let r = send(a.addr, "POST", "/actor/t/x/durable", "").await;
+        assert_ne!(r.status, 200, "a fenced node ran an event: {}", r.body);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(app_ref(&shared).app_keys().await.unwrap(), Vec::<String>::new());
 }

@@ -276,7 +276,9 @@ async fn expire_one(
         Expired::Changed | Expired::Kept(_) => {}
     }
     // Released (or never acquired): the next event, wherever it lands,
-    // restores the actor.
-    inner.mailboxes.hibernate(&address);
+    // restores the actor. One found in use is left as it is.
+    if !matches!(outcome, Expired::Kept("active")) {
+        inner.mailboxes.hibernate(&address);
+    }
     outcome
 }

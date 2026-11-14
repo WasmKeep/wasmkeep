@@ -1520,6 +1520,9 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             cluster.failover_wait = args.failover_wait_secs.map(std::time::Duration::from_secs);
             // Three quarters of the connections stay for everything else.
             cluster.failover_wait_max = max_connections / 4;
+            // Follows its app: no actor before a check for its tombstone
+            // (ADR 0028).
+            cluster.follows_app = args.app.is_some();
             cluster.reads_secrets = !args.no_secrets;
             if let Some((tenant, name)) = &args.app {
                 cluster.app = format!("{tenant}/{name}");
@@ -1967,7 +1970,11 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         anyhow::anyhow!(e.to_string().replace("<this bucket>", &args.bucket))
     };
     let from_file = file_changes.is_some();
-    if args.recreate && rt.block_on(app_ref.recreate()).map_err(named)? {
+    if args.recreate
+        && rt
+            .block_on(app_ref.recreate(wasmkeep_server::apps::LATE_WRITES))
+            .map_err(named)?
+    {
         println!("{tenant}/{name}: the deleted app's tombstone is removed; deploying it anew");
     }
     let deployed = if args.rollback {
@@ -2357,6 +2364,7 @@ fn actor_move_on(
     let (store, prefix) = open()?;
     check_layout(&args.bucket, &store, &prefix, tenant)?;
     refuse_deleted(&store, &prefix, tenant, &app)?;
+    let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2375,6 +2383,11 @@ fn actor_move_on(
         }
     }
     rt.block_on(keys.put_empty(&key))?;
+    // Deleted meanwhile (ADR 0028): the request is taken back.
+    if let Err(e) = refuse_deleted(&app_store, &app_prefix, tenant, &app) {
+        let _ = rt.block_on(keys.delete(&key));
+        return Err(e);
+    }
     println!(
         "Asked the owner of {tenant}/{class}/{name} to move it to {} (expires in 5 minutes).",
         args.to
@@ -2411,6 +2424,7 @@ fn actor_delete_on(
     let (store, prefix) = open()?;
     check_layout(&args.bucket, &store, &prefix, &tenant)?;
     refuse_deleted(&store, &prefix, &tenant, &app)?;
+    let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2428,6 +2442,11 @@ fn actor_delete_on(
         rt.block_on(keys.list_keys(&folder))
     };
     rt.block_on(keys.put_empty(&key))?;
+    // Deleted meanwhile (ADR 0028): the request is taken back.
+    if let Err(e) = refuse_deleted(&app_store, &app_prefix, &tenant, &app) {
+        let _ = rt.block_on(keys.delete(&key));
+        return Err(e);
+    }
     let written = listed(&keys)?
         .into_iter()
         .find(|(k, _)| *k == key)
@@ -3642,6 +3661,7 @@ mod tests {
             wait: std::time::Duration::from_secs(1),
             force: false,
             who: "test".into(),
+            late: std::time::Duration::from_millis(10),
         };
         let run = |tenant: &str, app: &str| {
             let mut said = Vec::new();

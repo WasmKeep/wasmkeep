@@ -199,6 +199,18 @@ fn store_for(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<SecretStor
     Ok(SecretStore::new(store, &prefix, tenant, app))
 }
 
+/// After a write: the app deleted meanwhile (ADR 0028) leaves what was
+/// written in the bucket until `app delete` runs again; say so.
+fn deleted_meanwhile(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<()> {
+    let (store, prefix) = crate::open_bucket(bucket)?;
+    crate::refuse_deleted(&store, &prefix, tenant, app).map_err(|e| {
+        anyhow::anyhow!(
+            "{e} (it was deleted while this wrote: run `wasmkeep app delete --app \
+             {tenant}/{app}` again to remove what was written)"
+        )
+    })
+}
+
 /// Live nodes serving `tenant/app` that do not read secrets from the
 /// bucket (older versions, which say nothing on heartbeat line 10).
 fn nodes_without_secrets(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<Vec<String>> {
@@ -356,6 +368,7 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                 tidy(&store).await;
                 anyhow::Ok(seq)
             })?;
+            deleted_meanwhile(&args.app.bucket, tenant, app)?;
             let count: usize = changes.names().iter().map(|(_, n)| n.len()).sum();
             println!("Set {count} secret(s) for {tenant}/{app}: seq {seq}.");
             Ok(())
@@ -384,6 +397,7 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                 tidy(&store).await;
                 anyhow::Ok((seq, removed))
             })?;
+            deleted_meanwhile(&args.app.bucket, tenant, app)?;
             println!(
                 "Removed {removed} of {} name(s) from {scope}: seq {seq}.",
                 args.names.len(),

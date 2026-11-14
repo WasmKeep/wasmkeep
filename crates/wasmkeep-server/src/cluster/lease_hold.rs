@@ -449,12 +449,6 @@ impl LeaseHold {
         listed: Option<&str>,
     ) -> Result<Self, OwnershipError> {
         cluster.identity().await.map_err(OwnershipError::Refused)?;
-        // An app deleted (its tombstone seen), or not yet checked for one
-        // since this node's lease was first valid: no actor is acquired
-        // (ADR 0028, section 5).
-        if let Some(why) = cluster.app_refusal() {
-            return Err(OwnershipError::Refused(why.into()));
-        }
         let key = cluster.owner_key(address);
         let lock = cluster.pending.lock_of(&key);
         // From the read until the hold is registered (or the failure
@@ -464,6 +458,14 @@ impl LeaseHold {
         // hold invalid from the start, and the write is not sent (the
         // question right before it is asked in this epoch).
         let epoch = cluster.validity.epoch();
+        // An app deleted (its tombstone seen), or not checked for one since
+        // this node's lease was last valid: no actor is acquired (ADR 0028,
+        // section 5). Asked after the epoch is read: a lapse re-arms the
+        // check before it publishes the new epoch, so an acquisition either
+        // sees the check due or holds an epoch that is no longer valid.
+        if let Some(why) = cluster.app_refusal() {
+            return Err(OwnershipError::Refused(why.into()));
+        }
         let acquired = match listed {
             None => {
                 cluster

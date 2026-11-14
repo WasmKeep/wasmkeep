@@ -403,16 +403,27 @@ wasmkeep app delete --app acme/legacy --bucket s3://b/p
   released, so `app delete` sees it gone. It then removes its local files
   of the app (`<data_dir>/state/<t>/<a>/`), and `serve` exits with an
   error. A node refusing to start on a tombstone removes them too.
-- **The start race.** A node following its app acquires no actor until
-  a check for the tombstone, sent while its lease was valid, found none.
-  Either the node's lease was written before the command read the live
-  nodes (the command waits for it), or its check came after the tombstone
-  (it stops).
+- **The start race, and lapses.** A node following its app acquires no
+  actor until a check for the tombstone, sent while its lease was valid,
+  found none: from the moment its cluster is built, and again after
+  every lapse of its lease (a node paused or cut off). Either the node's
+  lease was written before the command read the live nodes (the command
+  waits for it), or its check came after the tombstone (it stops). The
+  check after a lapse also compares the `recreated` marker below: a node
+  that was away through a delete and a `--recreate` stops.
+- **Fencing.** Before it removes anything (and after every round), the
+  command fences each node lease of the app still written live, as
+  `cluster fence` does: a node past its horizon but not stopped (paused,
+  cut off) can then never renew, and never acts again.
 - **Late writes.** The command lists and deletes until a listing comes
-  back empty, waiting a few seconds after each round and for any node
-  that turned live meanwhile. A deploy re-reads the tombstone after its
-  switch and reports the app deleted; what it wrote goes in the next
-  round.
+  back empty at least 40 s (a bucket client's wait for a write, 30 s,
+  plus a lease's ttl) after the tombstone and after any node of the app
+  last wrote its heartbeat; it also waits for any node that turned live
+  meanwhile and refuses one without `ends` that started. `--recreate` is
+  refused within that same window. A deploy re-reads the tombstone after
+  its switch, and `secrets`, `actor move` and `actor delete` after their
+  write (the two requests are taken back): each reports the app deleted
+  meanwhile, and what they wrote goes when `app delete` runs again.
 - **Local files after `--recreate`.** A node down throughout a delete
   keeps its local databases, and an actor with no history in the bucket
   takes its local file as its first snapshot. `--recreate` leaves

@@ -26,6 +26,7 @@ pub(crate) fn run(args: &AppDeleteArgs) -> anyhow::Result<()> {
         wait: Duration::from_secs(args.wait),
         force: args.force,
         who: std::env::var("USER").unwrap_or_else(|_| "-".into()),
+        late: apps::LATE_WRITES,
     };
     let done = rt
         .block_on(apps::delete_app(

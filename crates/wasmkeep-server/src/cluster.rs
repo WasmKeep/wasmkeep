@@ -176,6 +176,10 @@ pub struct ClusterConfig {
     /// How often the collecting node runs an idle-expiry pass (ADR 0028,
     /// section 4): ten minutes; tests shorten it.
     pub expiry_every: Duration,
+    /// The node follows its app's deploys (`serve --app`): it acquires no
+    /// actor until it has checked for the app's tombstone with its lease
+    /// valid, at start and after every lapse (ADR 0028, section 5).
+    pub follows_app: bool,
 }
 
 /// Plain HTTP between nodes, for a node with a cluster listener (ADR 0011).
@@ -236,6 +240,7 @@ impl ClusterConfig {
             failover_wait: None,
             failover_wait_max: crate::http::ServeLimits::default().max_connections / 4,
             expiry_every: Duration::from_millis(wasmkeep_cluster::expiry::PASS_EVERY_MS),
+            follows_app: false,
         }
     }
 }
@@ -453,6 +458,8 @@ pub(crate) struct Cluster {
     /// The app's tombstone (ADR 0028, section 5): [`APP_OPEN`],
     /// [`APP_UNCHECKED`] or [`APP_DELETED`].
     app_gate: std::sync::atomic::AtomicU8,
+    /// [`ClusterConfig::follows_app`].
+    follows_app: bool,
 }
 
 /// No tombstone: actors are acquired.
@@ -689,7 +696,12 @@ impl Cluster {
             fences_due,
             failover: FailoverWait::new(config),
             expiry_every: config.expiry_every,
-            app_gate: std::sync::atomic::AtomicU8::new(APP_OPEN),
+            app_gate: std::sync::atomic::AtomicU8::new(if config.follows_app {
+                APP_UNCHECKED
+            } else {
+                APP_OPEN
+            }),
+            follows_app: config.follows_app,
         });
         if refuse_plaintext {
             tracing::info!(
@@ -1627,6 +1639,19 @@ impl Cluster {
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
         );
+    }
+
+    /// The lease was not valid (a lapse): a node following its app checks
+    /// for the tombstone again before it acquires.
+    pub(crate) fn rearm_app_check(&self) {
+        if self.follows_app {
+            self.expect_app_check();
+        }
+    }
+
+    /// Whether acquisitions wait for a tombstone check.
+    pub(crate) fn app_unchecked(&self) -> bool {
+        self.app_gate.load(std::sync::atomic::Ordering::SeqCst) == APP_UNCHECKED
     }
 
     /// A check for the tombstone found none: acquisitions may proceed

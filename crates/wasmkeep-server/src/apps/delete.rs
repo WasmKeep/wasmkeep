@@ -24,7 +24,16 @@ pub struct DeleteApp {
     pub force: bool,
     /// Who asks, written in the tombstone.
     pub who: String,
+    /// How long after the app's nodes last wrote (and after the tombstone)
+    /// a listing must come back empty before the app is reported deleted:
+    /// a write a node sent before it stopped can land that late
+    /// ([`LATE_WRITES`]).
+    pub late: Duration,
 }
+
+/// [`DeleteApp::late`] for `wasmkeep app delete`: as long as a bucket
+/// client waits for a write (30 s) plus a lease's ttl with the defaults.
+pub const LATE_WRITES: Duration = Duration::from_secs(40);
 
 macro_rules! ensure {
     ($cond:expr, $($fmt:tt)+) => {
@@ -66,24 +75,31 @@ pub async fn delete_app(
     let app = super::AppRef::new(Arc::clone(&store), prefix, tenant, name);
     let shown = app.name();
     let existed = app.tombstone().await?;
+    // A node of a version before ADR 0028 ignores a tombstone: it would
+    // keep serving the app, and writing, while its data is removed. Asked
+    // before the tombstone, and again on a run that resumes.
+    let old = super::nodes_without_ends(Arc::clone(&store), prefix, tenant, name).await?;
+    ensure!(
+        old.is_empty() || args.force,
+        "live nodes of {shown} run a version that ignores an app's tombstone ({}): upgrade \
+         or stop them first{}",
+        old.join(", "),
+        if existed.is_none() {
+            " (nothing was written)"
+        } else {
+            ""
+        }
+    );
+    let mut since_ms = now();
     if existed.is_none() {
         ensure!(
             !app.app_keys().await?.is_empty(),
             "no such app: nothing of {shown} is in the bucket"
         );
-        // A node of a version before ADR 0028 ignores a tombstone: it would
-        // keep serving the app, and writing, while its data is removed.
-        let old = super::nodes_without_ends(Arc::clone(&store), prefix, tenant, name).await?;
-        ensure!(
-            old.is_empty() || args.force,
-            "live nodes of {shown} run a version that ignores an app's tombstone ({}): upgrade \
-             or stop them first (nothing was written)",
-            old.join(", ")
-        );
         let body = format!(
             "wasmkeep-app-deleted 1\nby {}\nat {}\nid {}\n",
             args.who,
-            u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0),
+            since_ms,
             wasmkeep_cluster::control::new_request_id()
         );
         if app.write_tombstone(&body).await? {
@@ -124,22 +140,48 @@ pub async fn delete_app(
         }
         tokio::time::sleep(poll).await;
     }
+    // Every node lease of the app still marked live (a node paused, or cut
+    // off from the bucket, past its horizon) is fenced: it can never renew,
+    // so it never acts again on what is removed below.
+    since_ms = since_ms.max(fence_app_nodes(&store, prefix, tenant, name, say).await?);
     let mut removed = 0;
-    for _ in 0..ROUNDS {
+    let mut rounds = 0;
+    loop {
         let keys = app.app_keys().await?;
         if keys.is_empty() {
-            return Ok(format!(
-                "Deleted {shown}: {removed} object(s) removed. The tombstone stays; \
-                 `wasmkeep deploy --recreate` uses the name again. Destroy the app's \
-                 secrets key yourself if it had one."
-            ));
+            // A write sent before a node stopped can land until its
+            // client gives it up: nothing is declared gone before then.
+            let quiet_at =
+                since_ms.saturating_add(u64::try_from(args.late.as_millis()).unwrap_or(u64::MAX));
+            let now = now();
+            if now >= quiet_at {
+                return Ok(format!(
+                    "Deleted {shown}: {removed} object(s) removed. The tombstone stays; \
+                     `wasmkeep deploy --recreate` uses the name again. Destroy the app's \
+                     secrets key yourself if it had one."
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(quiet_at - now)).await;
+            continue;
         }
+        rounds += 1;
+        ensure!(
+            rounds <= ROUNDS,
+            "{shown}: objects keep appearing under its prefixes; run the command again"
+        );
         app.delete_keys(&keys).await?;
         removed += keys.len();
         tokio::time::sleep(settle).await;
         // A node started while the command waited: it stops on the
         // tombstone; whatever it wrote goes in the next round.
         if !args.force {
+            let old = super::nodes_without_ends(Arc::clone(&store), prefix, tenant, name).await?;
+            ensure!(
+                old.is_empty(),
+                "{shown}: nodes that ignore a tombstone started during the delete ({}): stop \
+                 them, then run the command again",
+                old.join(", ")
+            );
             while !live_ids(&store, prefix, tenant, name).await?.is_empty() {
                 tokio::time::sleep(poll).await;
                 ensure!(
@@ -148,9 +190,61 @@ pub async fn delete_app(
                      run the command again"
                 );
             }
+            since_ms = since_ms.max(fence_app_nodes(&store, prefix, tenant, name, say).await?);
         }
     }
-    bail!("{shown}: objects keep appearing under its prefixes; run the command again")
+}
+
+fn now() -> u64 {
+    u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0)
+}
+
+/// Fences every node lease of `tenant/app` still written live (ADR 0020,
+/// as `cluster fence` does), and returns the latest time any of the app's
+/// nodes wrote its heartbeat (ms, its clock), or 0.
+async fn fence_app_nodes(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    name: &str,
+    say: &mut (dyn FnMut(String) + Send),
+) -> Result<u64, DeployError> {
+    use wasmkeep_cluster::membership::NODES_PREFIX;
+    use wasmkeep_cluster::node_lease::{NodeState, OperatorFence, operator_fence};
+    struct Wall;
+    impl wasmkeep_cluster::lease::Clock for Wall {
+        fn now_ms(&self) -> u64 {
+            now()
+        }
+    }
+    let prefix = if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}/")
+    };
+    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(store), prefix);
+    let served = format!("{tenant}/{name}");
+    let nodes = wasmkeep_cluster::membership::all_heartbeats(&bucket)
+        .await
+        .map_err(super::bucket)?;
+    let mut last = 0;
+    for node in nodes.into_iter().filter(|n| n.app == served) {
+        last = last.max(node.written_at_ms);
+        if node.lease != Some(NodeState::Live) {
+            continue;
+        }
+        let key = format!("{NODES_PREFIX}{}", node.id);
+        if let OperatorFence::Fenced { .. } = operator_fence(&bucket, &Wall, &key)
+            .await
+            .map_err(super::bucket)?
+        {
+            say(format!(
+                "fenced node {} (its lease was still written live)",
+                node.id
+            ));
+        }
+    }
+    Ok(last)
 }
 
 async fn live_ids(

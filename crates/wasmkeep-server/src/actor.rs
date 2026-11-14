@@ -540,6 +540,20 @@ impl ActorService {
         }
     }
 
+    /// Whether acquisitions wait for a tombstone check (at start, and after
+    /// a lapse of the node lease).
+    pub fn app_unchecked(&self) -> bool {
+        self.inner
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.app_unchecked())
+    }
+
+    /// The app's folder under the data directory.
+    pub fn local_app_dir(&self) -> &std::path::Path {
+        &self.inner.local_app_dir
+    }
+
     /// A check for the tombstone made while the lease was valid found none.
     pub fn app_checked(&self) {
         if let Some(c) = &self.inner.cluster {

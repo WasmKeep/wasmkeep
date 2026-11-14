@@ -35,7 +35,7 @@ use crate::access::AccessRules;
 use crate::actor::FRONT_CLASS as FRONT;
 use crate::env::Vars;
 pub use collect::KEEP_PREVIOUS;
-pub use delete::{DeleteApp, delete_app};
+pub use delete::{DeleteApp, LATE_WRITES, delete_app};
 
 /// Why a deploy, rollback or update failed.
 #[derive(Debug, thiserror::Error)]
@@ -368,14 +368,44 @@ impl AppRef {
     /// nothing else is left under the app's two prefixes, and leaves the
     /// marker nodes compare their local files with
     /// (`apps/<t>/<a>/recreated`, the tombstone's body). `false` if the
-    /// app has no tombstone (nothing to do).
+    /// app has no tombstone (nothing to do). Refused until `late` has
+    /// passed since the tombstone and since any of the app's nodes last
+    /// wrote its heartbeat ([`LATE_WRITES`]): a write sent before then may
+    /// still land.
     ///
     /// # Errors
-    /// Something is left (run `app delete` again), or the bucket.
-    pub async fn recreate(&self) -> Result<bool, DeployError> {
+    /// Something is left (run `app delete` again), too soon, or the bucket.
+    pub async fn recreate(&self, late: Duration) -> Result<bool, DeployError> {
         let Some(body) = self.tombstone().await? else {
             return Ok(false);
         };
+        let written = body
+            .lines()
+            .find_map(|l| l.strip_prefix("at ")?.parse::<u64>().ok())
+            .unwrap_or(0);
+        let heartbeats = wasmkeep_cluster::membership::all_heartbeats(
+            &wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+                Arc::clone(&self.store),
+                self.prefix.clone(),
+            ),
+        )
+        .await
+        .map_err(bucket)?;
+        let served = self.name();
+        let last = heartbeats
+            .iter()
+            .filter(|n| n.app == served)
+            .map(|n| n.written_at_ms)
+            .fold(written, u64::max);
+        let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
+        let ready = last.saturating_add(u64::try_from(late.as_millis()).unwrap_or(u64::MAX));
+        if now < ready {
+            return Err(DeployError::Refused(format!(
+                "{served} was deleted moments ago: a write its nodes sent may still land; \
+                 --recreate in {}s",
+                (ready - now).div_ceil(1000)
+            )));
+        }
         let left = self.app_keys().await?;
         if !left.is_empty() {
             return Err(DeployError::Nothing(
@@ -1031,7 +1061,13 @@ impl AppRef {
             .await?;
         // Deleted while this deployed (ADR 0028): what it wrote is left to
         // `app delete`, which removes everything but the tombstone.
-        self.check_not_deleted().await?;
+        if self.tombstone().await?.is_some() {
+            return Err(DeployError::Refused(format!(
+                "{} was deleted while this deployed: what the deploy wrote stays in the \
+                 bucket until `wasmkeep app delete` is run again",
+                self.name()
+            )));
+        }
         Ok(Deployed {
             current: Current {
                 version,
@@ -1101,26 +1137,11 @@ impl AppRef {
         // while this node's lease was valid finds none (ADR 0028, section
         // 5): a node whose lease is written after `app delete` read the
         // live nodes sees the tombstone, one written before is seen live.
+        // The same after every lapse of the lease (a node paused or cut off
+        // while the app was deleted, and maybe created again).
         service.expect_app_check();
-        loop {
-            if !service.lease_valid_now() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            match self.tombstone().await {
-                Ok(None) => {
-                    service.app_checked();
-                    break;
-                }
-                Ok(Some(_)) => {
-                    service.stop_for_deleted_app().await;
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "checking whether the app was deleted failed; retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
+        if !self.app_check(&service).await {
+            return;
         }
         let wake = service.deploy_wakeup();
         // After a failure (a version this node cannot build, a bucket
@@ -1134,6 +1155,9 @@ impl AppRef {
                     () = tokio::time::sleep(every) => {}
                     () = wake.notified() => {}
                 },
+            }
+            if service.app_unchecked() && !self.app_check(&service).await {
+                return;
             }
             match self.update(&service).await {
                 Ok(_) => {
@@ -1160,6 +1184,46 @@ impl AppRef {
                 }
             }
         }
+    }
+
+    /// Until a check sent while the lease is valid settles it: `true` once
+    /// the app has no tombstone and was not created again since this node
+    /// prepared its local files (acquisitions may go on); `false` once this
+    /// node stopped serving it.
+    async fn app_check(&self, service: &ActorService) -> bool {
+        loop {
+            if !service.lease_valid_now() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            match self.still_ours(service.local_app_dir()).await {
+                Ok(true) => {
+                    service.app_checked();
+                    return true;
+                }
+                Ok(false) => {
+                    service.stop_for_deleted_app().await;
+                    return false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "checking whether the app was deleted failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Whether this node may go on serving the app with the local files in
+    /// `local`: no tombstone, and no `--recreate` since it prepared them
+    /// ([`Self::prepare_local`] wrote the marker it compares).
+    async fn still_ours(&self, local: &std::path::Path) -> Result<bool, DeployError> {
+        if self.tombstone().await?.is_some() {
+            return Ok(false);
+        }
+        let Some((marker, _)) = self.get(RECREATED).await? else {
+            return Ok(true);
+        };
+        Ok(std::fs::read(local.join(RECREATED_LOCAL)).ok().as_deref() == Some(marker.as_slice()))
     }
 
     /// One check of `current`; swaps classes in if it changed.

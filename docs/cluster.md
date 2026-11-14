@@ -1248,13 +1248,16 @@ wasmkeep app delete --app acme/legacy --bucket s3://acme-wasmkeep/prod
    waits up to `--wait SECS` (60) for them, then removes every key under
    `state/<tenant>/<app>/` and `apps/<tenant>/<app>/` but the tombstone:
    every actor's history, the ownership records, the alarm index, the
-   requests, every deployed version and the sealed secrets. It lists
-   again until a listing finds nothing (a write sent before a node
-   stopped may land late). The secrets key, kept outside the bucket, is
-   yours to destroy.
+   requests, every deployed version and the sealed secrets. First it
+   fences any node lease of the app still written live (a node paused or
+   cut off past its horizon), so that node can never act again. It lists
+   again until a listing finds nothing at least 40 s after the app's
+   nodes last wrote (a write sent before a node stopped may land late).
+   The secrets key, kept outside the bucket, is yours to destroy.
 3. **The tombstone stays.** `wasmkeep deploy --app acme/legacy --recreate
    ...` uses the name again: it removes the tombstone only once nothing
-   else is left under the two prefixes. A node whose data directory still
+   else is left under the two prefixes, and not within 40 s of the
+   delete. A node whose data directory still
    holds files of the app from before the delete (it was down throughout)
    removes them before it serves the new app.
 
