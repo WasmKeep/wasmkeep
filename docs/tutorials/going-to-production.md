@@ -306,7 +306,11 @@ curl -s 127.0.0.1:9100/metrics | grep -E '^wasmkeep_(ready|admission_refused_tot
 
 ```text
 wasmkeep_ready 1
+...
 wasmkeep_bucket_requests_total{operation="get",status="ok"} 13
+wasmkeep_bucket_requests_total{operation="get",status="not_found"} 4
+wasmkeep_bucket_requests_total{operation="get",status="precondition"} 0
+wasmkeep_bucket_requests_total{operation="get",status="error"} 0
 ...
 wasmkeep_admission_refused_total{reason="access"} 0
 wasmkeep_admission_refused_total{reason="capacity"} 0
