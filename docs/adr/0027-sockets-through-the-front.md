@@ -115,6 +115,14 @@ opener is **the front, an inside caller** (ADR 0010).
   actor of an `internal` or `existing` class closes every socket, as
   today (`delete-self`), and since socket events never create the actor,
 neither their close events nor a later message create it again.
+  - Note (2026-11-14): in a cluster the existence check alone did not
+    hold this: a deleted actor keeps its lease, and the bucket its prefix
+    (ADR 0010, Consequences), so the close events of the sockets the
+    delete closed ran on a new, empty instance. The host now marks those
+    sockets in its registry when it closes them for the delete (closing
+    ones included), and their close events are not delivered, whoever
+    opened them (`tests/cluster/front_sockets.rs`,
+    `a_deleted_rooms_sockets_do_not_bring_it_back`).
 
 ### What `on-websocket-open` sees
 
@@ -223,7 +231,9 @@ answers it as any relayed upgrade (the client reconnects).
 - **Behaviour changes**, for the 0.4.1 notes:
   - the front sees `x-wasmkeep-upgrade: websocket` on WebSocket upgrades;
   - a front's answer to an upgrade with the three hand-off headers opens a
-    socket instead of reaching the client.
+    socket instead of reaching the client;
+  - outbound HTTP answers (actors' and fronts') lose the `x-wasmkeep-`
+    range, headers and trailers (added 2026-11-14).
 
 ## Consequences
 
@@ -235,6 +245,12 @@ answers it as any relayed upgrade (the client reconnects).
   `actors.call` answers lose the range, so an actor cannot; outbound HTTP
   answers keep their headers, and the SDK docs say to copy only names the
   front knows.
+  - Note (2026-11-14): outbound HTTP answers lose the range too,
+    headers and trailers, in the host's sender (`egress.rs`) for actors
+    and fronts alike, so no upstream can hand a socket off through a front
+    that passes its answer on (`tests/front.rs`,
+    `an_upstreams_hand_off_headers_do_not_hand_off`). The SDK docs say so
+    instead of warning against copying.
 - An actor of a class reachable both ways cannot tell a handed-off socket
   from an outside one; the docs say to make it `internal`.
 - A hand-off costs one front instance (until its answer's head) per
@@ -261,4 +277,5 @@ answers it as any relayed upgrade (the client reconnects).
 
 - One socket for several actors, each a channel (0.5.0, its own ADR).
 - A caller per socket readable by the actor.
-- Stripping the range from a front's outbound HTTP answers.
+- Stripping the range from a front's outbound HTTP answers: since
+  decided (2026-11-14), stripped for every guest (see Consequences).

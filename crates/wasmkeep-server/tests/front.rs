@@ -40,6 +40,8 @@ struct Setup {
     /// The front's CPU budget, and the actors'.
     front_cpu: Option<Duration>,
     actor_cpu: Duration,
+    /// Outbound HTTP to 127.0.0.1 allowed, for the front and the actors.
+    local_egress: bool,
 }
 
 impl Default for Setup {
@@ -51,6 +53,7 @@ impl Default for Setup {
             env: Vec::new(),
             front_cpu: None,
             actor_cpu: Duration::from_millis(50),
+            local_egress: false,
         }
     }
 }
@@ -83,6 +86,11 @@ async fn start(setup: Setup) -> Running {
     if let Some(budget) = setup.front_cpu {
         front = front.with_cpu_budget(budget);
     }
+    let mut egress = wasmkeep_server::EgressPolicy::default();
+    if setup.local_egress {
+        egress.allow.push("127.0.0.1/32".parse().unwrap());
+        front = front.with_egress(egress.clone());
+    }
     if !setup.env.is_empty() {
         front = front.with_env(
             setup
@@ -96,6 +104,7 @@ async fn start(setup: Setup) -> Running {
         let component = guests::compile(&runtime, actor_wasm());
         let mut config = ActorConfig::new(data.path());
         config.max_front_requests = setup.max_front_requests;
+        config.egress = egress;
         // `r`, the same actor, is a room reachable only from inside.
         let mut access = wasmkeep_server::AccessRules::default();
         access.set("r", wasmkeep_server::Access::Internal);
@@ -1129,12 +1138,30 @@ async fn a_failed_hand_off_is_an_http_error_never_a_socket() {
             404,
             "no such actor class",
         ),
-        (handoff("r", "bad\u{1}", "/", ""), 400, ""),
+        // Percent-encoded in the query (a raw control byte would not pass
+        // the HTTP parser): the front names `bad\u{1}`.
+        (
+            "/handoff?class=r&name=bad%01&path=%2F".to_owned(),
+            400,
+            "name must not contain / or control characters",
+        ),
         (handoff("r", "x", "/refuse", ""), 403, "go away"),
-        (handoff("r", "x", "/", "&dup"), 500, ""),
-        (handoff("r", "x", "/", "&partial"), 500, ""),
-        (handoff("r", "x", "no-slash", ""), 500, ""),
-        (handoff("r", "%zz", "/", "&raw"), 500, ""),
+        (handoff("r", "x", "/", "&dup"), 500, "internal server error"),
+        (
+            handoff("r", "x", "/", "&partial"),
+            500,
+            "internal server error",
+        ),
+        (
+            handoff("r", "x", "no-slash", ""),
+            500,
+            "internal server error",
+        ),
+        (
+            handoff("r", "%zz", "/", "&raw"),
+            500,
+            "internal server error",
+        ),
     ];
     for (path, status, body) in cases {
         let r = get(node.addr, path, UPGRADE).await;
@@ -1232,4 +1259,116 @@ async fn a_deleted_rooms_sockets_do_not_bring_it_back() {
     // A close event that ran would have created it again and counted 1.
     let r = get(node.addr, &call("r/gone", "POST", "/ws-closed"), "").await;
     assert_eq!(r.body, "200:0");
+}
+
+/// A server answering every request as an upstream that tries to hand
+/// the front's socket off: 426 with the three hand-off headers and
+/// another name of the range, chunked, with trailers in and out of the
+/// range.
+async fn handing_off_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 426 Upgrade Required\r\n\
+                          x-wasmkeep-handoff-class: r\r\n\
+                          x-wasmkeep-handoff-name: stolen\r\n\
+                          x-wasmkeep-handoff-path: /ws?from=upstream\r\n\
+                          X-WasmKeep-Node: forged\r\n\
+                          x-other: kept\r\n\
+                          Trailer: x-wasmkeep-node, x-other-trailer\r\n\
+                          Transfer-Encoding: chunked\r\n\
+                          Connection: close\r\n\r\n\
+                          11\r\nupstream says no\n\r\n\
+                          0\r\nx-wasmkeep-node: forged\r\nx-other-trailer: kept\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// The host strips its range from every outbound answer a guest gets, as
+/// from `actors.call` answers: a front that passes an upstream's answer on
+/// to a client's upgrade cannot let that upstream hand the socket to an
+/// actor (here an `internal` room), and the client gets the upstream's
+/// own error instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstreams_hand_off_headers_do_not_hand_off() {
+    let node = start(Setup {
+        local_egress: true,
+        ..Setup::default()
+    })
+    .await;
+    let upstream = handing_off_upstream().await;
+    let proxy = format!("/proxy?url=http%3A%2F%2F{upstream}%2F");
+    for extra in [UPGRADE, ""] {
+        let r = get(node.addr, &proxy, extra).await;
+        assert_eq!(r.status, 426, "{extra:?}: {} {}", r.head, r.body);
+        assert_eq!(r.body, "upstream says no\n", "{extra:?}");
+        // The front saw none of the upstream's range.
+        assert_eq!(r.header("x-upstream-range").as_deref(), Some(""));
+        assert_eq!(r.header("x-other").as_deref(), Some("kept"));
+        assert!(
+            !r.head
+                .to_ascii_lowercase()
+                .lines()
+                .any(|l| l.starts_with("x-wasmkeep-")),
+            "{}",
+            r.head
+        );
+    }
+    // No socket was handed to the room, nor was it created.
+    let r = get(node.addr, &call("r/stolen", "GET", "/opened"), "").await;
+    assert_eq!(r.body, "200:none");
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    assert!(
+        page.contains(
+            "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"handoff\"} 0\n"
+        ),
+        "{page}"
+    );
+}
+
+/// An actor's outbound answers lose the range too, headers and trailers.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_actors_outbound_answer_has_none_of_the_range() {
+    let node = start(Setup {
+        local_egress: true,
+        ..Setup::default()
+    })
+    .await;
+    let upstream = handing_off_upstream().await;
+    let r = get(
+        node.addr,
+        &format!("/actor/t/fetcher/fetch-raw?url=http%3A%2F%2F{upstream}%2F"),
+        "",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let mut lines = r.body.lines();
+    assert_eq!(lines.next(), Some("426"), "{}", r.body);
+    let headers = lines.next().unwrap();
+    assert!(headers.contains("x-other"), "{headers}");
+    assert!(!headers.contains("x-wasmkeep-"), "{headers}");
+    let trailers = lines.next().unwrap();
+    assert!(trailers.contains("x-other-trailer"), "{trailers}");
+    assert!(!trailers.contains("x-wasmkeep-"), "{trailers}");
+    assert_eq!(lines.next(), Some("body: upstream says no"));
 }

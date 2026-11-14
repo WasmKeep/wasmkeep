@@ -183,7 +183,9 @@ Sockets through the front (ADR 0027,
   socket on actor `cls/name` as an inside caller, so the class can be
   `internal`; its `websocket.open` receives `path`. Check the client's
   token and the name first: an `internal` room trusts what the path says.
-  If the room refuses, the client gets a 403 with the room's error.
+  If the room refuses, the client gets a 403 with the room's error. The
+  host strips the `x-wasmkeep-` range from every outbound `fetch` answer,
+  so an upstream's answer passed on cannot hand a socket off.
 
 ```ts
 if (req.path.startsWith("/rooms/") && isWebSocket(req)) {

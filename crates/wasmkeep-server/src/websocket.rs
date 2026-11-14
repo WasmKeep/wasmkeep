@@ -79,6 +79,9 @@ struct Conn {
     /// Notified when the server closes it, so its reader stops delivering
     /// frames and waits for the client's close for a bounded time only.
     closing: Arc<tokio::sync::Notify>,
+    /// Its actor was deleted while it was accepted or closing: its close
+    /// event is not delivered, so it cannot create the actor again.
+    deleted: bool,
 }
 
 /// Why `send` failed.
@@ -185,6 +188,7 @@ impl Sockets {
                 queued: Arc::clone(&queued),
                 accepted: false,
                 closing: Arc::clone(&closing),
+                deleted: false,
             },
         );
         Ok(Opened {
@@ -320,6 +324,31 @@ impl Sockets {
             }
         }
         closed
+    }
+
+    /// `owner` was deleted (`delete-self`): closes its accepted sockets
+    /// with `code` and `reason`, and marks them, closing ones included, so
+    /// that none of their close events runs. In a cluster the deleted
+    /// actor's lease outlives the delete, so a close event would pass the
+    /// existence check and run on a new, empty instance (ADR 0010, ADR
+    /// 0027). A socket still being opened is left alone: its open runs
+    /// after the delete, and decides on its own.
+    pub(crate) fn close_deleted(&self, owner: &ActorAddress, code: u16, reason: &str) {
+        let mut registry = self.lock();
+        let Registry { conns, by_owner } = &mut *registry;
+        for id in by_owner.get(owner).into_iter().flatten() {
+            if let Some(conn) = conns.get_mut(id)
+                && (conn.accepted || conn.tx.is_none())
+            {
+                Self::close_conn(conn, code, reason);
+                conn.deleted = true;
+            }
+        }
+    }
+
+    /// Whether `id`'s actor was deleted under it ([`Self::close_deleted`]).
+    pub(crate) fn deleted(&self, id: u64) -> bool {
+        self.lock().conns.get(&id).is_some_and(|c| c.deleted)
     }
 
     /// Asks the writer to close `conn` and hides it; false if it was
@@ -528,6 +557,37 @@ mod tests {
         ));
         sockets.remove(first.id);
         assert!(sockets.can_open(&a).is_ok());
+    }
+
+    #[test]
+    fn a_delete_marks_its_actors_sockets_but_not_one_being_opened() {
+        let sockets = Sockets::default();
+        let (a, b) = (actor("a"), actor("b"));
+        let mut open = sockets.open(a.clone()).unwrap();
+        sockets.accept(open.id);
+        // The client closed it; its close event has not run yet.
+        let closing = sockets.open(a.clone()).unwrap();
+        sockets.accept(closing.id);
+        sockets.begin_close(closing.id);
+        let mut pending = sockets.open(a.clone()).unwrap();
+        let other = sockets.open(b.clone()).unwrap();
+        sockets.accept(other.id);
+        sockets.close_deleted(&a, 1000, "actor deleted");
+        assert!(matches!(
+            open.outgoing.try_recv(),
+            Ok(Outgoing::Close(1000, _))
+        ));
+        assert!(sockets.deleted(open.id));
+        assert!(sockets.deleted(closing.id));
+        assert!(!sockets.deleted(pending.id), "its open decides");
+        assert!(matches!(
+            pending.outgoing.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!sockets.deleted(other.id));
+        // Gone from the registry: nothing to skip.
+        sockets.remove(open.id);
+        assert!(!sockets.deleted(open.id));
     }
 
     #[test]

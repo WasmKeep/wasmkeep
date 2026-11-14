@@ -1107,7 +1107,9 @@ impl std::error::Error for WallExceeded {}
 
 /// A body frame with the host's `x-wasmkeep-` range removed from its
 /// trailers (ADR 0023).
-fn strip_wasmkeep_trailers(mut frame: hyper::body::Frame<Bytes>) -> hyper::body::Frame<Bytes> {
+pub(crate) fn strip_wasmkeep_trailers(
+    mut frame: hyper::body::Frame<Bytes>,
+) -> hyper::body::Frame<Bytes> {
     if let Some(trailers) = frame.trailers_mut() {
         strip_wasmkeep_headers(trailers);
     }
@@ -1115,7 +1117,7 @@ fn strip_wasmkeep_trailers(mut frame: hyper::body::Frame<Bytes>) -> hyper::body:
 }
 
 /// Removes every header of the host's `x-wasmkeep-` range (ADR 0023).
-fn strip_wasmkeep_headers(headers: &mut hyper::HeaderMap) {
+pub(crate) fn strip_wasmkeep_headers(headers: &mut hyper::HeaderMap) {
     let names: Vec<hyper::header::HeaderName> = headers
         .keys()
         .filter(|n| crate::actor::is_wasmkeep_header(n.as_str()))

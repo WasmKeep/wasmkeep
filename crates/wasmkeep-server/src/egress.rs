@@ -525,10 +525,15 @@ async fn send(
         .map_err(|_| Error::HttpRequestUriInvalid)?;
 
     let send = async move {
-        let res = tokio::time::timeout(first_byte_timeout, sender.send_request(req))
+        let mut res = tokio::time::timeout(first_byte_timeout, sender.send_request(req))
             .await
             .map_err(|_| Error::ConnectionReadTimeout)?
             .map_err(Error::from)?;
+        // The host's range never reaches a guest from outside, as from
+        // `actors.call` answers: an upstream cannot speak for the host
+        // (a front passing its answer on to an upgrade would otherwise
+        // let it hand the socket off, ADR 0027). Trailers too, below.
+        crate::front::strip_wasmkeep_headers(res.headers_mut());
         let mut timeout = tokio::time::interval(between_bytes_timeout);
         timeout.reset();
         Ok::<_, Error>(res.map(|incoming| ResponseBody { incoming, timeout }))
@@ -566,7 +571,7 @@ async fn send(
 }
 
 /// A response body that fails when the server pauses longer than the
-/// between-bytes timeout.
+/// between-bytes timeout, its trailers without the host's range.
 struct ResponseBody {
     incoming: hyper::body::Incoming,
     timeout: tokio::time::Interval,
@@ -589,7 +594,7 @@ impl http_body::Body for ResponseBody {
             }))),
             Poll::Ready(Some(Ok(frame))) => {
                 self.timeout.reset();
-                Poll::Ready(Some(Ok(frame)))
+                Poll::Ready(Some(Ok(crate::front::strip_wasmkeep_trailers(frame))))
             }
             Poll::Pending => {
                 ready!(self.timeout.poll_tick(cx));

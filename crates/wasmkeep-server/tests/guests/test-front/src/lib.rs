@@ -38,6 +38,11 @@
 //!   waits MS, then answers 426 with the three hand-off headers (ADR 0027):
 //!   N percent-encoded (as given with `raw`), the class header twice with
 //!   `dup`, without the path header with `partial`
+//! - `/proxy?url=U`: an outbound GET of U, answered as it came, as a
+//!   front passing an upstream's answer on would: its status, every
+//!   header it may set (the others skipped) and the body, plus
+//!   `x-upstream-range: NAMES`, the names of the upstream's headers in
+//!   the `x-wasmkeep-` range, comma-separated; or 502 and the error
 //! - anything else: `front ok`
 
 use std::io::Write as _;
@@ -172,6 +177,53 @@ fn method_name(method: &Method) -> String {
         Method::Patch => "PATCH".into(),
         Method::Other(other) => other.clone(),
     }
+}
+
+/// An upstream's answer to a GET of `url`: status, headers, body.
+type Upstream = (u16, Vec<(String, Vec<u8>)>, Vec<u8>);
+
+fn proxy(url: &str) -> Result<Upstream, String> {
+    use wasip2::http::{outgoing_handler, types};
+    let (scheme, rest) = url.split_once("://").ok_or("no scheme")?;
+    let (authority, path) = rest.find('/').map_or((rest, "/"), |i| rest.split_at(i));
+    let request = types::OutgoingRequest::new(Fields::new());
+    let scheme = if scheme == "https" {
+        types::Scheme::Https
+    } else {
+        types::Scheme::Http
+    };
+    request.set_scheme(Some(&scheme)).map_err(|()| "scheme")?;
+    request
+        .set_authority(Some(authority))
+        .map_err(|()| "authority")?;
+    request
+        .set_path_with_query(Some(path))
+        .map_err(|()| "path")?;
+    let body = request.body().map_err(|()| "body")?;
+    OutgoingBody::finish(body, None).map_err(|e| format!("{e:?}"))?;
+    let pending = outgoing_handler::handle(request, None).map_err(|e| format!("{e:?}"))?;
+    pending.subscribe().block();
+    let response = pending
+        .get()
+        .ok_or("no answer")?
+        .map_err(|()| "taken")?
+        .map_err(|e| format!("{e:?}"))?;
+    let headers = response.headers().entries();
+    let status = response.status();
+    let incoming = response.consume().map_err(|()| "consume")?;
+    let mut bytes = Vec::new();
+    {
+        let stream = incoming.stream().map_err(|()| "stream")?;
+        loop {
+            match stream.blocking_read(65536) {
+                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Err(wasip2::io::streams::StreamError::Closed) => break,
+                Err(e) => return Err(format!("{e:?}")),
+            }
+        }
+    }
+    drop(IncomingBody::finish(incoming));
+    Ok((status, headers, bytes))
 }
 
 impl wasip2::exports::http::incoming_handler::Guest for Front {
@@ -411,6 +463,35 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
                     headers.push(("x-wasmkeep-handoff-class", "other"));
                 }
                 respond(out, 426, &headers, "websocket upgrade required\n");
+            }
+            "/proxy" => {
+                let url = param(query, "url").unwrap_or_default();
+                match proxy(&url) {
+                    Ok((status, headers, body)) => {
+                        let range: Vec<&str> = headers
+                            .iter()
+                            .map(|(k, _)| k.as_str())
+                            .filter(|k| k.to_ascii_lowercase().starts_with("x-wasmkeep-"))
+                            .collect();
+                        let fields = Fields::new();
+                        for (k, v) in &headers {
+                            let _ = fields.append(k, v);
+                        }
+                        fields
+                            .append("x-upstream-range", range.join(",").as_bytes())
+                            .unwrap();
+                        let response = OutgoingResponse::new(fields);
+                        let _ = response.set_status_code(status);
+                        let outgoing = response.body().unwrap();
+                        ResponseOutparam::set(out, Ok(response));
+                        let mut stream = outgoing.write().unwrap();
+                        let _ = stream.write_all(&body);
+                        let _ = stream.flush();
+                        drop(stream);
+                        let _ = OutgoingBody::finish(outgoing, None);
+                    }
+                    Err(e) => respond(out, 502, &[], &format!("proxy: {e}")),
+                }
             }
             _ => respond(out, 200, &[], "front ok"),
         }

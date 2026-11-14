@@ -32,8 +32,14 @@ Since 0.4.0, in no release yet.
   WebSocket upgrades; a front's answer to an upgrade with the three
   hand-off headers opens a socket instead of reaching the client; a
   WebSocket upgrade refused because its actor is unavailable (or a value
-  it requires is not set) now carries `Retry-After: 1`. Actors and built
-  fronts are unchanged.
+  it requires is not set) now carries `Retry-After: 1`; outbound HTTP
+  answers, to actors and fronts alike, lose the host's `x-wasmkeep-`
+  range (headers and trailers), as `actors.call` answers have since
+  0.4.0, so no upstream can hand a socket off through a front that passes
+  its answer on. Actors and built fronts are unchanged.
+- In a cluster, the close events of the sockets a `delete-self` closed
+  (under an `existing` or `internal` class) no longer run on a new, empty
+  instance of the deleted actor.
 - **Several outbound HTTP requests at once** from the Rust, TypeScript and
   Go SDKs: `http::fetch_all`, `http.fetchAll` (QuickJS and StarlingMonkey)
   and `FetchAll` send a batch together and wait for all of it, one result

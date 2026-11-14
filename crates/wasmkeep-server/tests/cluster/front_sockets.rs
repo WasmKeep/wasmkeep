@@ -14,8 +14,9 @@ fn front_wasm() -> &'static [u8] {
 type Client =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// A node serving the test front and class `r` (the test actor),
-/// `internal`, hibernating after `idle`, in the cluster sharing `store`.
+/// A node serving the test front, class `r` (the test actor), `internal`,
+/// and class `e` (the same actor), `existing`, hibernating after `idle`,
+/// in the cluster sharing `store`.
 async fn room_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>, idle: Duration) -> Node {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -29,6 +30,7 @@ async fn room_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>, idle: Du
     config.mailbox.idle_timeout = idle;
     let mut rules = wasmkeep_server::AccessRules::default();
     rules.set("r", wasmkeep_server::Access::Internal);
+    rules.set("e", wasmkeep_server::Access::Existing);
     config.access = rules;
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
@@ -40,7 +42,10 @@ async fn room_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>, idle: Du
     let service = ActorService::new(
         runtime.clone(),
         config,
-        vec![("r".into(), component, test_actor_wasm().to_vec())],
+        vec![
+            ("r".into(), component.clone(), test_actor_wasm().to_vec()),
+            ("e".into(), component, test_actor_wasm().to_vec()),
+        ],
     )
     .unwrap();
     let front = {
@@ -91,8 +96,14 @@ async fn room_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String>
 /// `/call` on the test front: `method path` on `r/<name>`, sent again
 /// while the owner was briefly out of the caller's view.
 async fn front_call(addr: SocketAddr, name: &str, method: &str, path: &str) -> String {
+    front_call_to(addr, &format!("r/{name}"), method, path).await
+}
+
+/// `/call` on the test front: `method path` on actor `to`, as
+/// [`front_call`].
+async fn front_call_to(addr: SocketAddr, to: &str, method: &str, path: &str) -> String {
     let path = format!(
-        "/call?to=r/{name}&method={method}&path={}",
+        "/call?to={to}&method={method}&path={}",
         path.replace('%', "%25")
             .replace('?', "%3F")
             .replace('=', "%3D")
@@ -267,9 +278,12 @@ async fn only_a_signed_hand_off_opens_an_internal_room_from_another_node() {
     // A node's signature without the mark: not a hand-off.
     let (status, body) = upgrade_status(a.addr, path, &relay(path, false, now())).await;
     assert_eq!(status, 403, "{body}");
+    assert_eq!(body, "a node's upgrade must be the front's hand-off\n");
     // Signed for another path: not believed, so outside.
-    let (status, _) = upgrade_status(a.addr, path, &relay("/actor/r/other/ws", true, now())).await;
+    let (status, body) =
+        upgrade_status(a.addr, path, &relay("/actor/r/other/ws", true, now())).await;
     assert_eq!(status, 403);
+    assert_eq!(body, "not reachable from outside\n");
     // The real thing opens it, once.
     let headers = relay(path, true, now() + 1);
     let mut stream = TcpStream::connect(a.addr).await.unwrap();
@@ -293,4 +307,145 @@ async fn only_a_signed_hand_off_opens_an_internal_room_from_another_node() {
     let r = send(a.addr, "GET", path, &relay(path, true, now() + 2)).await;
     assert_eq!(r.status, 403, "{}", r.body);
     drop(stream);
+}
+
+/// The close code of the next close frame `ws` receives (within 5 s).
+async fn closed_with(ws: &mut Client) -> Option<u16> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if let Message::Close(frame) = msg {
+                return frame.map(|f| u16::from(f.code));
+            }
+        }
+        None
+    })
+    .await
+    .expect("closed in time")
+}
+
+/// A deleted room stays deleted in a cluster too (ADR 0027), where its
+/// lease outlives the delete and the bucket keeps its prefix, so the
+/// existence check alone would pass: the sockets the delete closed do not
+/// deliver their close events to a new, empty instance. The room's
+/// handed-off socket and an `existing` actor's outside socket (ADR 0010),
+/// both opened through b and living on a, are closed by their actor's
+/// delete, and neither close event runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_rooms_sockets_do_not_bring_it_back() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = room_node("a", da.path(), &store, Duration::from_secs(30)).await;
+    let b = room_node("b", db.path(), &store, Duration::from_secs(30)).await;
+    settle().await;
+
+    // Both actors are created on a, by a's front.
+    assert_eq!(
+        front_call(a.addr, "gone", "GET", "/opened").await,
+        "200:none"
+    );
+    assert_eq!(
+        front_call_to(a.addr, "e/gone", "GET", "/opened").await,
+        "200:none"
+    );
+    let mut room = hand_off(b.addr, "gone", "/ws").await;
+    assert_eq!(echo(&mut room, "hi").await, "hi");
+    let url = format!("ws://{}/actor/e/gone/ws", b.addr);
+    let (mut outside, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    assert_eq!(echo(&mut outside, "hi").await, "hi");
+    assert_eq!(a.service.websockets(), 2);
+    assert_eq!(b.service.websockets(), 0);
+
+    for to in ["r/gone", "e/gone"] {
+        let r = front_call_to(b.addr, to, "POST", "/delete").await;
+        assert!(r.starts_with("200:"), "{to}: {r}");
+    }
+    assert_eq!(closed_with(&mut room).await, Some(1000));
+    assert_eq!(closed_with(&mut outside).await, Some(1000));
+    drop((room, outside));
+    // Every close event delivered or dropped.
+    eventually("the deleted actors' sockets are gone from a", async || {
+        a.service.websockets() == 0
+    })
+    .await;
+    // A close event that ran would have created them again and counted 1.
+    for to in ["r/gone", "e/gone"] {
+        assert_eq!(
+            front_call_to(b.addr, to, "POST", "/ws-closed").await,
+            "200:0",
+            "{to}"
+        );
+    }
+}
+
+/// ADR 0027, compatibility: a hand-off is relayed only to a node that
+/// announces `handoff` on its heartbeat. To an older one (`take front`
+/// only) it is not sent: 503 with `Retry-After: 1`, and that peer is not
+/// counted as failing, since it was sent nothing. Both ways a relay goes:
+/// to the room's owner, and to the peer a draining node chose for a new
+/// room; that peer is then still chosen for the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_off_is_not_relayed_to_a_node_that_does_not_announce_it() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let older = Flaky::new(Arc::clone(&store), Arc::default());
+    older.no_handoff_word.store(true, Ordering::SeqCst);
+    let older: Arc<dyn ObjectStore> = Arc::new(older);
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = room_node("a", da.path(), &older, Duration::from_secs(30)).await;
+    let b = room_node("b", db.path(), &store, Duration::from_secs(30)).await;
+    settle().await;
+    {
+        use object_store::ObjectStoreExt as _;
+        let key = object_store::path::Path::from("nodes/a");
+        let got = store.get(&key).await.unwrap().bytes().await.unwrap();
+        let body = String::from_utf8(got.to_vec()).unwrap();
+        assert!(body.lines().any(|l| l.starts_with("take front")), "{body}");
+        assert!(!body.contains("handoff"), "{body}");
+    }
+    let refused = |r: &Reply, what: &str| {
+        assert_eq!(r.status, 503, "{what}: {} {}", r.head, r.body);
+        assert_eq!(r.retry_after.as_deref(), Some("1"), "{what}: {}", r.head);
+        assert_eq!(
+            r.body, "the actor's node runs an older version; retry\n",
+            "{what}"
+        );
+    };
+    let upgrade = "Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Version: 13\r\n";
+
+    // The room's owner is a: b's front does not relay to it.
+    assert_eq!(
+        front_call(a.addr, "lobby", "GET", "/opened").await,
+        "200:none"
+    );
+    let r = send_reachable(
+        b.addr,
+        "GET",
+        "/handoff?class=r&name=lobby&path=%2Fws",
+        upgrade,
+    )
+    .await;
+    refused(&r, "to the owner");
+    assert_eq!(a.service.websockets(), 0);
+
+    // b drains: a new room goes to the peer it chooses, a, which does
+    // not read hand-offs either.
+    drain(&store, "b").await;
+    let r = send_reachable(
+        b.addr,
+        "GET",
+        "/handoff?class=r&name=fresh&path=%2Fws",
+        upgrade,
+    )
+    .await;
+    refused(&r, "to the chosen peer");
+    assert_eq!(a.service.websockets(), 0);
+    // Not suspected: a is still b's choice. A suspected peer would leave
+    // b no eligible one, and b would claim the room itself.
+    assert_eq!(
+        front_call(b.addr, "after", "GET", "/opened").await,
+        "200:none"
+    );
+    assert_eq!(room_holder(&store, "after").await.as_deref(), Some("a"));
 }
