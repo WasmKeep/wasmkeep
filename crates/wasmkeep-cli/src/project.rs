@@ -961,6 +961,20 @@ env = ".env.dev"
     }
 
     #[test]
+    fn the_examples_files_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        for example in ["todo-front", "ts-todo-front"] {
+            let p = load_with(&root.join(example).join(FILE_NAME), false).unwrap();
+            assert_eq!(p.classes["todos"].access, "internal", "{example}");
+            assert!(
+                p.front.as_ref().unwrap().requires.contains("TOKENS"),
+                "{example}"
+            );
+            assert!(p.front.as_ref().unwrap().build.is_some(), "{example}");
+        }
+    }
+
+    #[test]
     fn a_rollback_reads_only_the_app() {
         let text = "[app]\ntenant='acme'\nname='todo'\n[classes.a]\ncomponent='a'\nacess='open'\n[nonsense]\n";
         assert!(parse(text, Path::new("wasmkeep.toml")).is_err());
