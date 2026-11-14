@@ -4,6 +4,8 @@
 //! ```text
 //! apps/<tenant>/<app>/<version>/<class>.wasm   as uploaded, immutable
 //! apps/<tenant>/<app>/<version>/<class>.config plain configuration, immutable
+//! apps/<tenant>/<app>/<version>/_front.wasm    the front (ADR 0023), immutable
+//! apps/<tenant>/<app>/<version>/_front.config  its plain configuration, immutable
 //! apps/<tenant>/<app>/<version>/manifest       previous, classes, rules, config digests
 //! apps/<tenant>/<app>/current                  "<version> <seq>"; If-Match only
 //! ```
@@ -29,6 +31,7 @@ use crate::ActorService;
 
 mod collect;
 use crate::access::AccessRules;
+use crate::actor::FRONT_CLASS as FRONT;
 use crate::env::Vars;
 pub use collect::KEEP_PREVIOUS;
 
@@ -54,6 +57,23 @@ pub enum DeployError {
     /// A stored object is not what this version of WasmKeep writes.
     #[error("unreadable {0}")]
     Corrupt(String),
+    /// The front given is not one (nothing was uploaded), or front values
+    /// were given for a version without a front (ADR 0023).
+    #[error("front: {0}")]
+    Front(String),
+    /// Live nodes of the app do not announce the capability word `front`
+    /// (ADR 0023): they could not read a version with a front. There is no
+    /// `--force`.
+    #[error(
+        "live nodes of {app} cannot read a version with a front ({nodes}): upgrade them first \
+         (this check has no --force: such a node could not read the version at all)"
+    )]
+    NodesWithoutFront {
+        /// `tenant/app`.
+        app: String,
+        /// Their ids, comma separated.
+        nodes: String,
+    },
     /// A rollback would make these classes more open (ADR 0013).
     #[error("rolling back would reopen {0}; pass --allow-reopen to do it anyway")]
     Reopens(String),
@@ -139,6 +159,39 @@ impl AppRef {
                 wasmkeep_cluster::migrate::StartRefusal::Bucket(e) => bucket(e),
                 e => DeployError::Layout(e.to_string()),
             })
+    }
+
+    /// Live nodes of this app whose heartbeat does not announce the
+    /// capability word `front` (ADR 0023): they cannot read a manifest of
+    /// format 3, nor a secrets set with a `_front` entry. Live as `cluster
+    /// status` counts it (the default horizon, this machine's clock).
+    ///
+    /// # Errors
+    /// The bucket did not answer.
+    pub async fn nodes_without_front(&self) -> Result<Vec<String>, DeployError> {
+        nodes_without_front(
+            Arc::clone(&self.store),
+            &self.prefix,
+            &self.tenant,
+            &self.app,
+        )
+        .await
+    }
+
+    /// Refuses `manifest` while a live node could not read it.
+    async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        if manifest.format_number() < 3 {
+            return Ok(());
+        }
+        let nodes = self.nodes_without_front().await?;
+        if nodes.is_empty() {
+            Ok(())
+        } else {
+            Err(DeployError::NodesWithoutFront {
+                app: format!("{}/{}", self.tenant, self.app),
+                nodes: nodes.join(", "),
+            })
+        }
     }
 
     fn path(&self, key: &str) -> StorePath {
@@ -263,12 +316,32 @@ impl AppRef {
             }
             classes.push((class.clone(), bytes));
         }
-        let (access, config) = self.settings(version, &manifest).await?;
+        let (access, mut config) = self.settings(version, &manifest).await?;
+        let mut requires = manifest.requires.clone();
+        let front = match &manifest.front {
+            Some(digest) => {
+                let key = format!("{version}/{FRONT}.wasm");
+                let (bytes, _) = self
+                    .get(&key)
+                    .await?
+                    .ok_or_else(|| DeployError::Corrupt(format!("{key} (missing)")))?;
+                if hex(&Sha256::digest(&bytes)) != *digest {
+                    return Err(DeployError::Corrupt(format!("{key} (digest)")));
+                }
+                Some(VersionFront {
+                    wasm: bytes,
+                    config: config.remove(FRONT).unwrap_or_default(),
+                    requires: requires.remove(FRONT).unwrap_or_default(),
+                })
+            }
+            None => None,
+        };
         Ok(Version {
             classes,
             access,
             config,
-            requires: manifest.requires.clone(),
+            requires,
+            front,
         })
     }
 
@@ -326,11 +399,11 @@ impl AppRef {
         access: &AccessRules,
         config: BTreeMap<String, Vars>,
     ) -> Result<Current, DeployError> {
+        // Exactly this version: no front either.
         let changes = Changes {
             classes: Some(classes),
-            access: Vec::new(),
-            config: Vec::new(),
-            requires: Vec::new(),
+            front: FrontChange::Remove,
+            ..Changes::default()
         };
         let set = Settings {
             access: access.clone(),
@@ -372,6 +445,14 @@ impl AppRef {
             ActorService::validate(runtime, &compiled)
                 .map_err(|(name, e)| DeployError::Invalid(name, e))?;
         }
+        // The front is checked before anything is written too (ADR 0023).
+        if let FrontChange::Set(bytes) = &changes.front {
+            let component = runtime
+                .compile(bytes)
+                .map_err(|e| DeployError::Front(format!("{e:#}")))?;
+            crate::front::validate(runtime, &component)
+                .map_err(|e| DeployError::Front(error_chain(&e)))?;
+        }
 
         let read = self.read_current().await?;
         if read.is_none() {
@@ -392,9 +473,49 @@ impl AppRef {
             None => None,
         };
 
-        // The class table, and what to write for it.
+        // The front, and what to write for it: given, kept (copied inside
+        // the bucket, as classes are), or removed.
         let mut uploads = Vec::new();
         let mut copies = Vec::new();
+        let front: Option<String> = match changes.front {
+            FrontChange::Set(bytes) => {
+                let digest = hex(&Sha256::digest(&bytes));
+                uploads.push((format!("{FRONT}.wasm"), bytes));
+                Some(digest)
+            }
+            FrontChange::Keep => match &base {
+                Some((current, manifest, _)) => manifest.front.clone().inspect(|_| {
+                    copies.push((current.version.clone(), format!("{FRONT}.wasm")));
+                }),
+                None => None,
+            },
+            FrontChange::Remove => None,
+        };
+        let has_front = front.is_some();
+        // Front values for a version without a front: a mistake, not a no-op.
+        let gives_values = changes
+            .front_config
+            .as_ref()
+            .is_some_and(|c| c.as_ref().is_some_and(|v| !v.is_empty()))
+            || changes
+                .front_requires
+                .as_ref()
+                .is_some_and(|n| !n.is_empty());
+        if gives_values && !has_front {
+            return Err(DeployError::Front(
+                "front configuration or required names for a version without a front: \
+                 give the front (--front PATH)"
+                    .into(),
+            ));
+        }
+        // Removing them without a front: nothing to remove.
+        let (front_config, front_requires) = if has_front {
+            (changes.front_config, changes.front_requires)
+        } else {
+            (None, None)
+        };
+
+        // The class table, and what to write for it.
         let table: BTreeMap<String, String> = match changes.classes {
             Some(classes) => classes
                 .into_iter()
@@ -404,28 +525,44 @@ impl AppRef {
                     (name, digest)
                 })
                 .collect(),
-            None => {
-                let Some((current, manifest, _)) = &base else {
-                    return Err(DeployError::Nothing(
-                        "nothing is deployed yet: give the classes (--actor)",
-                    ));
-                };
-                for class in manifest.classes.keys() {
-                    copies.push((current.version.clone(), format!("{class}.wasm")));
+            None => match &base {
+                Some((current, manifest, _)) => {
+                    for class in manifest.classes.keys() {
+                        copies.push((current.version.clone(), format!("{class}.wasm")));
+                    }
+                    manifest.classes.clone()
                 }
-                manifest.classes.clone()
-            }
+                // A first deploy may give a front alone (ADR 0023).
+                None if has_front => BTreeMap::new(),
+                None => {
+                    return Err(DeployError::Nothing(
+                        "nothing is deployed yet: give the classes (--actor) or a front (--front)",
+                    ));
+                }
+            },
         };
+        if table.is_empty()
+            && !has_front
+            && base.as_ref().is_some_and(|(_, m, _)| m.front.is_some())
+        {
+            return Err(DeployError::Nothing(
+                "removing the front would leave a version with no class and no front",
+            ));
+        }
+        // What may hold values: the classes, and the front's scope while
+        // the version has a front.
+        let scoped = |c: &str| table.contains_key(c) || (has_front && c == FRONT);
 
         // Rules and values: the whole set given, or the current ones kept
-        // for the classes still there, with the changes applied.
+        // for the classes still there (and the front's while it stays),
+        // with the changes applied.
         let keep_requires = exact.is_none();
         let mut set = match exact {
             Some(set) => set,
             None => {
                 let mut set = base.as_ref().map(|(_, _, s)| s.clone()).unwrap_or_default();
                 set.access.retain(|c| table.contains_key(c));
-                set.config.retain(|c, _| table.contains_key(c));
+                set.config.retain(|c, _| scoped(c));
                 set
             }
         };
@@ -440,8 +577,9 @@ impl AppRef {
                 .replace(class, spec)
                 .map_err(|e| DeployError::Invalid(class.clone(), e))?;
         }
-        for (class, vars) in changes.config {
-            if !table.contains_key(&class) {
+        let front_config = front_config.map(|v| (FRONT.to_owned(), v));
+        for (class, vars) in changes.config.into_iter().chain(front_config) {
+            if !scoped(&class) {
                 return Err(DeployError::Invalid(
                     class,
                     "configuration for a class this version does not have".into(),
@@ -458,19 +596,21 @@ impl AppRef {
         }
 
         // Required names: the current ones kept for the classes still
-        // there (unless the whole set is given), with the changes applied.
+        // there and the front while it stays (unless the whole set is
+        // given), with the changes applied.
         let mut requires: BTreeMap<String, std::collections::BTreeSet<String>> =
             match (keep_requires, &base) {
                 (true, Some((_, m, _))) => m
                     .requires
                     .iter()
-                    .filter(|(c, _)| table.contains_key(*c))
+                    .filter(|(c, _)| scoped(c))
                     .map(|(c, n)| (c.clone(), n.clone()))
                     .collect(),
                 _ => BTreeMap::new(),
             };
-        for (class, names) in changes.requires {
-            if !table.contains_key(&class) {
+        let front_requires = front_requires.map(|n| (FRONT.to_owned(), n));
+        for (class, names) in changes.requires.into_iter().chain(front_requires) {
+            if !scoped(&class) {
                 return Err(DeployError::Invalid(
                     class,
                     "required names for a class this version does not have".into(),
@@ -488,6 +628,7 @@ impl AppRef {
         let mut manifest = Manifest {
             previous: None,
             classes: table,
+            front,
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires,
@@ -506,7 +647,7 @@ impl AppRef {
         // Stored as parsed, not as given: no comment (or commented-out
         // secret) is uploaded, and reformatting makes no new version.
         for (class, vars) in &set.config {
-            if !manifest.classes.contains_key(class) {
+            if !manifest.classes.contains_key(class) && !(has_front && class == FRONT) {
                 return Err(DeployError::Invalid(
                     class.clone(),
                     "configuration for a class this version does not have".into(),
@@ -540,6 +681,9 @@ impl AppRef {
             }
             manifest.previous = Some(current.version.clone());
         }
+        // A node that cannot read format 3 would stay not ready on it: no
+        // such node may be live (ADR 0023). Checked before any write.
+        self.check_readers(&manifest).await?;
         let version = manifest.version_id();
         let was_marked = read.as_ref().is_some_and(|(c, _)| c.marked);
         // Every deploy of this version writes token 3 (ADR 0022), which
@@ -613,6 +757,9 @@ impl AppRef {
         if !allow_reopen && !diff.reopened.is_empty() {
             return Err(DeployError::Reopens(diff.reopened.join(", ")));
         }
+        // Back to a version with a front: its readers are checked as a
+        // deploy writing it checks them.
+        self.check_readers(&back).await?;
         // Rooted, so marked (ADR 0022).
         let marked = true;
         let seq = current.seq + 1;
@@ -657,7 +804,10 @@ impl AppRef {
                     // Read but not applicable: this node would decide under
                     // rules the app no longer has. A bucket outage is every
                     // node's, and keeps them ready.
-                    if matches!(e, DeployError::Invalid(..) | DeployError::Corrupt(_)) {
+                    if matches!(
+                        e,
+                        DeployError::Invalid(..) | DeployError::Front(_) | DeployError::Corrupt(_)
+                    ) {
                         service.set_deploy_behind(true);
                     }
                     let wait = backoff.map_or(every, |w| (w * 2).min(FOLLOW_BACKOFF_MAX));
@@ -681,6 +831,7 @@ impl AppRef {
             access,
             config,
             requires,
+            front,
         } = self.version(&current.version).await?;
         // Everything compiled first, then swapped in at once with the
         // sequence, the rules and the values: a node that cannot build a
@@ -694,15 +845,32 @@ impl AppRef {
                 .map_err(|e| DeployError::Invalid(name.clone(), format!("{e:#}")))?;
             compiled.push((name, component, bytes));
         }
+        let front = match front {
+            Some(f) => Some(crate::front::DeployedFront {
+                component: runtime
+                    .compile(&f.wasm)
+                    .map_err(|e| DeployError::Front(format!("{e:#}")))?,
+                config: f.config,
+                requires: f.requires,
+            }),
+            None => None,
+        };
         service
-            .apply_version_with(
+            .apply_deployed(
                 current.seq,
                 &compiled,
                 &service.effective_rules(current.marked, &access),
                 &config,
                 &requires,
+                front.as_ref(),
             )
-            .map_err(|(name, e)| DeployError::Invalid(name, e.to_string()))?;
+            .map_err(|(name, e)| {
+                if name == FRONT {
+                    DeployError::Front(error_chain(&e))
+                } else {
+                    DeployError::Invalid(name, e.to_string())
+                }
+            })?;
         tracing::info!(version = %current.version, seq = current.seq, "now running the deployed version");
         Ok(true)
     }
@@ -791,6 +959,36 @@ pub struct Changes {
     /// `(class, names)`: replaces the names the class requires among its
     /// values (ADR 0016); empty removes them.
     pub requires: Vec<(String, std::collections::BTreeSet<String>)>,
+    /// The front (ADR 0023): kept by default.
+    pub front: FrontChange,
+    /// The front's configuration (`--front-config`): `None` keeps it,
+    /// `Some(None)` (or no values) removes it.
+    pub front_config: Option<Option<Vars>>,
+    /// The names the front requires (`--front-requires`): `None` keeps
+    /// them, an empty set removes them.
+    pub front_requires: Option<std::collections::BTreeSet<String>>,
+}
+
+/// What a deploy does with the front (ADR 0023).
+#[derive(Default)]
+pub enum FrontChange {
+    /// The current front, if any, copied inside the bucket.
+    #[default]
+    Keep,
+    /// This component (`--front PATH`).
+    Set(Vec<u8>),
+    /// None (`--no-front`): its configuration and required names go too.
+    Remove,
+}
+
+impl std::fmt::Debug for FrontChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => f.write_str("Keep"),
+            Self::Set(bytes) => write!(f, "Set({} bytes)", bytes.len()),
+            Self::Remove => f.write_str("Remove"),
+        }
+    }
 }
 
 impl std::fmt::Debug for Changes {
@@ -813,7 +1011,8 @@ impl std::fmt::Debug for Changes {
             .field("classes", &classes)
             .field("access", &self.access)
             .field("config", &config)
-            .finish()
+            .field("front", &self.front)
+            .finish_non_exhaustive()
     }
 }
 
@@ -855,6 +1054,12 @@ pub struct Diff {
     pub reopened: Vec<String>,
     /// `"class: NAME now required"` and the like (ADR 0016).
     pub requires: Vec<String>,
+    /// What happens to the front (ADR 0023): `added`, `changed`,
+    /// `removed` or `unchanged`; `None` when neither version has one.
+    pub front: Option<&'static str>,
+    /// With a front after the change: the classes whose rule is `open`,
+    /// reachable from outside past it.
+    pub open_past_front: Vec<String>,
 }
 
 impl Diff {
@@ -862,6 +1067,7 @@ impl Diff {
         let empty_manifest = Manifest {
             previous: None,
             classes: BTreeMap::new(),
+            front: None,
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
@@ -887,10 +1093,28 @@ impl Diff {
                 }
             }
         }
+        diff.front = match (&bm.front, &am.front) {
+            (None, None) => None,
+            (None, Some(_)) => Some("added"),
+            (Some(_), None) => Some("removed"),
+            (Some(b), Some(a)) if a != b => Some("changed"),
+            (Some(_), Some(_)) => Some("unchanged"),
+        };
+        if am.front.is_some() {
+            diff.open_past_front = am
+                .classes
+                .keys()
+                .filter(|c| as_.access.of(c) == crate::access::Access::Open)
+                .cloned()
+                .collect();
+        }
         let open = || "open".to_owned();
-        for class in am.classes.keys() {
+        // The classes, and the front's scope when either version has a
+        // front: it has values and required names, never a rule.
+        let front_scope = (am.front.is_some() || bm.front.is_some()).then(|| FRONT.to_owned());
+        for class in am.classes.keys().chain(front_scope.as_ref()) {
             let (b, a) = (bs.access.spec(class), as_.access.spec(class));
-            if b != a {
+            if b != a && class != FRONT {
                 let (b, a) = (b.unwrap_or_else(open), a.unwrap_or_else(open));
                 if bm.classes.contains_key(class) && more_open(&bs.access, &as_.access, class) {
                     diff.reopened.push(format!("{class} ({b} -> {a})"));
@@ -934,6 +1158,7 @@ impl Diff {
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
+        out.extend(self.front.map(|f| format!("front: {f}")));
         out.extend(self.added.iter().map(|c| format!("class {c}: added")));
         out.extend(self.changed.iter().map(|c| format!("class {c}: new code")));
         out.extend(self.removed.iter().map(|(c, rule)| match rule {
@@ -947,6 +1172,11 @@ impl Diff {
         );
         out.extend(self.config.iter().map(|l| format!("config {l}")));
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
+        out.extend(
+            self.open_past_front.iter().map(|c| {
+                format!("class {c}: open, reachable at /actor/{c}/<name>, past the front")
+            }),
+        );
         out
     }
 }
@@ -993,6 +1223,21 @@ pub struct Version {
     /// Each class's required names (ADR 0016; classes not listed require
     /// none).
     pub requires: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The version's front (ADR 0023), if it has one. Its values are not
+    /// in `config` and `requires`, which hold classes only.
+    pub front: Option<VersionFront>,
+}
+
+/// A version's front as the bucket holds it. Its `Debug` shows sizes and
+/// names, never a value.
+#[derive(Clone)]
+pub struct VersionFront {
+    /// The component bytes, checked against the manifest's digest.
+    pub wasm: Vec<u8>,
+    /// Its plain configuration (`_front.config`).
+    pub config: Vars,
+    /// The names it requires among its values.
+    pub requires: std::collections::BTreeSet<String>,
 }
 
 impl std::fmt::Debug for Version {
@@ -1011,6 +1256,25 @@ impl std::fmt::Debug for Version {
             .field("classes", &classes)
             .field("access", &self.access)
             .field("config", &config)
+            .field(
+                "front",
+                &self.front.as_ref().map(|f| {
+                    (
+                        f.wasm.len(),
+                        f.config.keys().map(String::as_str).collect::<Vec<_>>(),
+                    )
+                }),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for VersionFront {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VersionFront")
+            .field("wasm", &self.wasm.len())
+            .field("config", &self.config.keys().collect::<Vec<_>>())
+            .field("requires", &self.requires)
             .finish()
     }
 }
@@ -1042,12 +1306,17 @@ pub struct Manifest {
     pub previous: Option<String>,
     /// Class name -> SHA-256 of its component.
     pub classes: BTreeMap<String, String>,
+    /// SHA-256 of the front's component (`front main <sha256>`, ADR 0023):
+    /// written in format 3 only, so a version without a front keeps its
+    /// bytes and id.
+    pub front: Option<String>,
     /// Class name -> its access rule in canonical form
     /// ([`AccessRules::spec`]); open classes are not listed.
     pub access: BTreeMap<String, String>,
-    /// Class name -> SHA-256 of its `.config` object.
+    /// Class name (or `_front`, with a front) -> SHA-256 of its `.config`
+    /// object.
     pub config: BTreeMap<String, String>,
-    /// Class name -> the names it requires among its values (ADR 0016):
+    /// Class name (or `_front`, with a front) -> the names it requires among its values (ADR 0016):
     /// a class missing one refuses its events.
     pub requires: BTreeMap<String, std::collections::BTreeSet<String>>,
 }
@@ -1065,6 +1334,9 @@ impl Manifest {
     /// class table, so versions deployed before ADR 0013 keep their id.
     fn identity(&self) -> String {
         let mut out = Self::table(&self.classes);
+        if let Some(digest) = &self.front {
+            out.push_str(&format!("front main {digest}\n"));
+        }
         for (class, spec) in &self.access {
             out.push_str(&format!("access {class} {spec}\n"));
         }
@@ -1090,11 +1362,14 @@ impl Manifest {
         hex(&Sha256::digest(text.as_bytes()))[..16].to_owned()
     }
 
-    /// 1 when there are neither rules nor configuration (the form from
-    /// before ADR 0013, kept as the minimal one), else 2.
+    /// 3 with a front, or an explicit `open` rule (ADR 0023); else 1 when
+    /// there are neither rules nor configuration (the form from before ADR
+    /// 0013, kept as the minimal one), else 2.
     #[must_use]
     pub fn format_number(&self) -> u8 {
-        if self.access.is_empty() && self.config.is_empty() && self.requires.is_empty() {
+        if self.front.is_some() || self.access.values().any(|s| s == "open") {
+            3
+        } else if self.access.is_empty() && self.config.is_empty() && self.requires.is_empty() {
             1
         } else {
             2
@@ -1115,11 +1390,13 @@ impl Manifest {
         let format = match lines.next()? {
             "wasmkeep-manifest 1" => 1,
             "wasmkeep-manifest 2" => 2,
+            "wasmkeep-manifest 3" => 3,
             _ => return None,
         };
         let mut manifest = Self {
             previous: None,
             classes: BTreeMap::new(),
+            front: None,
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
@@ -1130,6 +1407,12 @@ impl Manifest {
                 && let Some(rest) = line.strip_prefix("access ")
             {
                 let (class, spec) = rest.split_once(' ')?;
+                // Format 3 also says `open` (ADR 0023), which earlier
+                // formats write as absence.
+                if format >= 3 && spec == "open" && !class.is_empty() {
+                    manifest.access.insert(class.to_owned(), spec.to_owned());
+                    continue;
+                }
                 let mut check = AccessRules::default();
                 check.replace(class, spec).ok()?;
                 if class.is_empty() || check.spec(class).as_deref() != Some(spec) {
@@ -1141,8 +1424,16 @@ impl Manifest {
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
                 (Some("previous"), Some(v), None, None) => manifest.previous = Some(v.to_owned()),
-                (Some("class"), Some(n), Some(d), None) => {
+                // `_front` is never a class (no class of that name ever
+                // linked, in any format): it names the front.
+                (Some("class"), Some(n), Some(d), None) if n != FRONT => {
                     manifest.classes.insert(n.to_owned(), d.to_owned());
+                }
+                // At most one front, named `main`.
+                (Some("front"), Some("main"), Some(d), None)
+                    if format >= 3 && manifest.front.is_none() =>
+                {
+                    manifest.front = Some(d.to_owned());
                 }
                 (Some("config"), Some(n), Some(d), None) if format >= 2 => {
                     manifest.config.insert(n.to_owned(), d.to_owned());
@@ -1160,14 +1451,89 @@ impl Manifest {
             }
         }
         let known = |c: &String| manifest.classes.contains_key(c);
+        // The front's scope holds values and required names, never a rule,
+        // and only beside a `front` line.
+        let scoped = |c: &String| known(c) || (manifest.front.is_some() && c == FRONT);
         if !manifest.access.keys().all(known)
-            || !manifest.config.keys().all(known)
-            || !manifest.requires.keys().all(known)
+            || !manifest.config.keys().all(scoped)
+            || !manifest.requires.keys().all(scoped)
         {
             return None;
         }
         Some(manifest)
     }
+}
+
+/// Live nodes of `tenant/app` whose heartbeat does not announce `front`
+/// (ADR 0023), under the bucket key `prefix`: what a deploy writing format
+/// 3, and a secrets write leaving a `_front` entry, are refused for.
+///
+/// # Errors
+/// The bucket did not answer.
+pub async fn nodes_without_front(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> Result<Vec<String>, DeployError> {
+    without_front(store, prefix, tenant, app, false).await
+}
+
+/// [`nodes_without_front`], among the nodes that read the app's secrets
+/// from the bucket (heartbeat line 10): a node run with `--no-secrets`
+/// never opens the set.
+///
+/// # Errors
+/// The bucket did not answer.
+pub async fn secrets_readers_without_front(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> Result<Vec<String>, DeployError> {
+    without_front(store, prefix, tenant, app, true).await
+}
+
+async fn without_front(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+    reading_secrets: bool,
+) -> Result<Vec<String>, DeployError> {
+    let prefix = if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}/")
+    };
+    let heartbeats = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
+    let horizon = crate::heartbeat_horizon_ms(
+        crate::DEFAULT_HEARTBEAT,
+        &crate::LeaseConfig::default_safe(),
+    );
+    let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
+    let served = format!("{tenant}/{app}");
+    let nodes = wasmkeep_cluster::membership::all_heartbeats(&heartbeats)
+        .await
+        .map_err(bucket)?;
+    Ok(nodes
+        .into_iter()
+        .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon))
+        .filter(|n| n.app == served && !n.can_front && (n.reads_secrets || !reading_secrets))
+        .map(|n| n.id)
+        .collect())
+}
+
+/// An error with its causes, for a message.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1187,6 +1553,7 @@ mod tests {
                 ("chat".into(), "11".into()),
                 ("counter".into(), "22".into()),
             ]),
+            front: None,
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
@@ -1318,6 +1685,7 @@ mod tests {
                 Vars::from([("URL".to_owned(), "https://hidden.test".to_owned())]),
             )]),
             requires: BTreeMap::new(),
+            front: None,
         };
         let shown = format!("{v:?}");
         assert!(
@@ -1351,7 +1719,7 @@ mod tests {
     fn manifests_with_unknown_or_inconsistent_lines_are_refused() {
         let base = "wasmkeep-manifest 2\nclass chat 11\n";
         for bad in [
-            "wasmkeep-manifest 3\nclass chat 11\n".to_owned(),
+            "wasmkeep-manifest 4\nclass chat 11\n".to_owned(),
             format!("{base}secret chat 11\n"),
             format!("{base}access other existing\n"),
             format!("{base}config other 33\n"),
@@ -1366,6 +1734,123 @@ mod tests {
         ] {
             assert_eq!(Manifest::parse(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_version_with_rules_but_no_front_is_written_as_before() {
+        // Format 2, byte for byte and id for id, as before ADR 0023
+        // (the id computed independently: `printf ... | sha256sum`).
+        let mut m = two_classes();
+        m.access
+            .insert("chat".into(), "existing:main,room 1".into());
+        m.config.insert("counter".into(), "33".into());
+        m.requires.insert(
+            "chat".into(),
+            std::collections::BTreeSet::from(["TOKEN".into()]),
+        );
+        assert_eq!(
+            m.format(),
+            "wasmkeep-manifest 2\nprevious abc\nclass chat 11\nclass counter 22\n\
+             access chat existing:main,room 1\nconfig counter 33\nrequires chat TOKEN\n"
+        );
+        assert_eq!(m.version_id(), "f6d159f826d96085");
+    }
+
+    fn with_front() -> Manifest {
+        let mut m = two_classes();
+        m.front = Some("44".into());
+        m.access.insert("chat".into(), "existing".into());
+        m.config.insert(FRONT.into(), "55".into());
+        m.config.insert("counter".into(), "33".into());
+        m.requires.insert(
+            FRONT.into(),
+            std::collections::BTreeSet::from(["SESSION_KEY".into()]),
+        );
+        m
+    }
+
+    #[test]
+    fn a_front_makes_format_3_and_a_new_version() {
+        let m = with_front();
+        let text = m.format();
+        assert_eq!(
+            text,
+            "wasmkeep-manifest 3\nprevious abc\nclass chat 11\nclass counter 22\n\
+             front main 44\naccess chat existing\nconfig _front 55\nconfig counter 33\n\
+             requires _front SESSION_KEY\n"
+        );
+        assert_eq!(Manifest::parse(&text), Some(m.clone()));
+        // The front line is part of the identity: a deploy changing only
+        // the front gets a new id.
+        let other = Manifest {
+            front: Some("45".into()),
+            ..m.clone()
+        };
+        assert_ne!(other.version_id(), m.version_id());
+        let mut none = m.clone();
+        none.front = None;
+        none.config.remove(FRONT);
+        none.requires.clear();
+        assert_eq!(none.format_number(), 2);
+        assert_ne!(none.version_id(), m.version_id());
+        // A front alone, no class.
+        let alone = Manifest {
+            previous: None,
+            classes: BTreeMap::new(),
+            front: Some("44".into()),
+            access: BTreeMap::new(),
+            config: BTreeMap::new(),
+            requires: BTreeMap::new(),
+        };
+        assert_eq!(alone.format(), "wasmkeep-manifest 3\nfront main 44\n");
+        assert_eq!(Manifest::parse(&alone.format()), Some(alone));
+    }
+
+    #[test]
+    fn format_3_says_open_and_earlier_formats_do_not() {
+        // The project file writes every class's rule (ADR 0021).
+        let text = "wasmkeep-manifest 3\nclass chat 11\naccess chat open\n";
+        let m = Manifest::parse(text).unwrap();
+        assert_eq!(m.access.get("chat").map(String::as_str), Some("open"));
+        assert_eq!(m.format(), text, "read back as written");
+        for format in [1, 2] {
+            let old = format!("wasmkeep-manifest {format}\nclass chat 11\naccess chat open\n");
+            assert_eq!(Manifest::parse(&old), None, "{old}");
+        }
+    }
+
+    #[test]
+    fn front_lines_are_refused_where_they_do_not_belong() {
+        let v3 = "wasmkeep-manifest 3\nclass chat 11\n";
+        let front = format!("{v3}front main 44\n");
+        for bad in [
+            // Not before format 3.
+            "wasmkeep-manifest 2\nclass chat 11\nfront main 44\n".to_owned(),
+            "wasmkeep-manifest 1\nclass chat 11\nfront main 44\n".to_owned(),
+            // One front, named main.
+            format!("{front}front main 45\n"),
+            format!("{v3}front other 44\n"),
+            format!("{v3}front main\n"),
+            format!("{v3}front main 44 extra\n"),
+            // The front's scope only beside a front line.
+            format!("{v3}config _front 55\n"),
+            format!("{v3}requires _front KEY\n"),
+            "wasmkeep-manifest 2\nclass chat 11\nconfig _front 55\n".to_owned(),
+            // No rule for the front, ever.
+            format!("{front}access _front existing\n"),
+            format!("{front}access _front open\n"),
+            // `_front` is never a class.
+            format!("{v3}class _front 66\n"),
+            "wasmkeep-manifest 1\nclass _front 66\n".to_owned(),
+            "wasmkeep-manifest 2\nclass _front 66\nconfig _front 55\n".to_owned(),
+            // Open for a class the version does not have.
+            format!("{v3}access other open\n"),
+        ] {
+            assert_eq!(Manifest::parse(&bad), None, "{bad}");
+        }
+        assert!(
+            Manifest::parse(&format!("{front}config _front 55\nrequires _front KEY\n")).is_some()
+        );
     }
 
     #[test]

@@ -61,6 +61,8 @@ mod failover;
 mod failover_wait;
 #[path = "front.rs"]
 mod front;
+#[path = "front_deploys.rs"]
+mod front_deploys;
 #[path = "migrate.rs"]
 mod migrate;
 #[path = "node_leases.rs"]

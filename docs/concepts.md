@@ -116,8 +116,10 @@ node's actors with `actors.call`:
   actor's.
 
 With `serve --app`, a component on the command line is refused: the front
-is to come with the app's deploy, so that a rollback reaches it too
-(planned, ADR 0023).
+comes with the app's deploy (`wasmkeep deploy --front PATH`), with its
+classes, so that a rollback reaches it too, and its values come from the
+same three layers as a class's (`--front-config`, the `_front` secrets,
+`serve --front-env`; see [Deploying the front](cluster.md#deploying-the-front)).
 
 ## Events
 

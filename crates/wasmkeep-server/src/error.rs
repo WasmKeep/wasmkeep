@@ -11,6 +11,12 @@ pub enum Error {
     #[error("component is not a valid wasi:http proxy component")]
     NotAnHttpComponent(#[source] BoxError),
 
+    /// A component given as a front is an actor (it exports one of the
+    /// actor world's `on-*` functions), or does not fit the front world
+    /// (ADR 0023).
+    #[error("component is not a valid front: {0}")]
+    NotAFront(String),
+
     /// An actor class name is not a valid identifier.
     #[error("invalid actor class {0:?}: {1}")]
     InvalidClass(String, String),

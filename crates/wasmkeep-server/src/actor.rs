@@ -146,6 +146,9 @@ pub struct ActorConfig {
     /// front a deployed version brings (ADR 0023); they win, by name, over
     /// its deployed configuration and secrets.
     pub front_env: crate::env::Vars,
+    /// The front of the deployed version the node starts with, if it has
+    /// one (ADR 0023): linked at start, then swapped with each version.
+    pub front: Option<crate::front::DeployedFront>,
     /// Join a cluster: actors run only on the node holding their lease, and
     /// requests reaching another node are forwarded. `None` runs alone.
     pub cluster: Option<ClusterConfig>,
@@ -182,6 +185,7 @@ impl ActorConfig {
             deploy_seq: 0,
             max_front_requests: None,
             front_env: crate::env::Vars::new(),
+            front: None,
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,
         }
@@ -215,6 +219,12 @@ struct ServiceInner {
     deploy_wakeup: Arc<tokio::sync::Notify>,
     /// This node's `--env` values, merged over each version's configuration.
     node_env: crate::env::ActorEnv,
+    /// This node's `--front-env` values, merged over the front's
+    /// configuration and secrets (ADR 0023).
+    front_env: Arc<crate::env::Vars>,
+    /// The deployed version's front, swapped with its classes under the
+    /// classes' lock; `None` while it has none.
+    front: crate::front::FrontSlot,
     /// The rules given at start, for classes `replace_class` adds.
     start_rules: Arc<crate::access::AccessRules>,
     /// `--access` during the migration of ADR 0013 (`ActorConfig::flag_access`).

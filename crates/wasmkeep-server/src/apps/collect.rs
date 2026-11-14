@@ -174,6 +174,7 @@ mod tests {
             let manifest = Manifest {
                 previous: (i > 0).then(|| format!("v{}", i - 1)),
                 classes: BTreeMap::from([("counter".into(), format!("{i:02}"))]),
+                front: None,
                 access: BTreeMap::new(),
                 config: BTreeMap::new(),
                 requires: BTreeMap::new(),
@@ -326,6 +327,7 @@ mod tests {
         let manifest = Manifest {
             previous: Some("/".into()),
             classes: BTreeMap::from([("counter".into(), "01".into())]),
+            front: None,
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),

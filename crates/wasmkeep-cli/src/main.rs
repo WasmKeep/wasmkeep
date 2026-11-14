@@ -213,9 +213,38 @@ struct DeployArgs {
     #[arg(long = "requires", value_name = "CLASS=NAMES", value_parser = parse_requires)]
     requires: Vec<(String, std::collections::BTreeSet<String>)>,
 
+    /// The app's front (ADR 0023): a stateless `wasi:http` component
+    /// (.wasm exporting wasi:http/incoming-handler) that receives every
+    /// request outside /actor/ and calls the app's actors. Without --front
+    /// or --no-front, the current front is kept.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_front")]
+    front: Option<PathBuf>,
+
+    /// Remove the front (with its configuration and required names):
+    /// requests outside /actor/ then answer 404.
+    #[arg(long)]
+    no_front: bool,
+
+    /// The front's plain configuration, as --config is a class's (stored in
+    /// the clear: never secrets). An empty FILE ('') removes it.
+    #[arg(long, value_name = "FILE", value_parser = parse_path)]
+    front_config: Option<PathBuf>,
+
+    /// Names the front requires among its values, as --requires is a
+    /// class's: while one is not set, the front answers 503. An empty list
+    /// ('') removes them.
+    #[arg(long, value_name = "NAMES", value_parser = parse_names)]
+    front_requires: Option<std::collections::BTreeSet<String>>,
+
     /// Go back to the version deployed before the current one, with its
-    /// access rules and configuration.
-    #[arg(long, conflicts_with_all = ["actors", "access", "config", "requires"])]
+    /// access rules, configuration and front.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "actors", "access", "config", "requires",
+            "front", "no_front", "front_config", "front_requires",
+        ]
+    )]
     rollback: bool,
 
     /// Let a rollback make a class more open (refused otherwise).
@@ -850,6 +879,9 @@ pub(crate) fn serve_app_rules(
     access_rules(flags, served)
 }
 
+/// The front's scope in secrets and messages (ADR 0023).
+pub(crate) const FRONT_SCOPE: &str = "_front";
+
 fn parse_actor(s: &str) -> Result<(String, PathBuf), String> {
     let (class, path) = s
         .split_once('=')
@@ -1071,6 +1103,17 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             deployed_rules = Some((current.marked, deployed.access));
             config.config = deployed.config;
             config.requires = deployed.requires;
+            // The version's front (ADR 0023), compiled like its classes.
+            if let Some(front) = deployed.front {
+                let component = cache
+                    .get_or_compile(&front.wasm)
+                    .context("compiling the deployed front")?;
+                config.front = Some(wasmkeep_server::DeployedFront {
+                    component,
+                    config: front.config,
+                    requires: front.requires,
+                });
+            }
             // The app's secrets, opened before the service starts so no
             // event runs without them (ADR 0016).
             if !args.no_secrets {
@@ -1221,6 +1264,17 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 wasmkeep_server::secret_store::STALE_AFTER,
             ));
         }
+        // With --app the front is the deployed version's, swapped with its
+        // classes: none until a version brings one (ADR 0023).
+        if args.app.is_some() {
+            app.front = Some(
+                HttpComponent::deployed(&service)
+                    .with_egress(egress.clone())
+                    .with_guest_log(guest_log.clone())
+                    .with_cpu_budget(std::time::Duration::from_millis(args.front_cpu_budget_ms))
+                    .with_max_requests(front_requests),
+            );
+        }
         app.actors = Some(service);
         tracing::info!(data_dir = %args.data_dir.display(), "actors enabled");
     }
@@ -1233,9 +1287,21 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding {}", args.listen))?;
         if let Some(http) = &app.front {
-            http.instantiate_once()
-                .await
-                .context("test instantiation of the component failed")?;
+            match http.instantiate_once().await {
+                Ok(()) => {}
+                // A deployed front that links but does not instantiate:
+                // the nodes already running serve it (with 500s), so this
+                // one starts too, with its actors, rather than exit (ADR
+                // 0023). The next deploy replaces it.
+                Err(e) if args.app.is_some() => tracing::error!(
+                    error = %format!("{:#}", anyhow::Error::from(e)),
+                    "the deployed front does not instantiate: its requests will fail until a deploy replaces it"
+                ),
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context("test instantiation of the component failed"));
+                }
+            }
         }
         tracing::info!("listening on http://{}", listener.local_addr()?);
         if let Some(addr) = args.metrics_listen {
@@ -1367,8 +1433,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             !(args.actors.is_empty()
                 && args.access.is_empty()
                 && args.config.is_empty()
-                && args.requires.is_empty()),
-            "nothing to deploy: give --actor, --access, --config or --requires (or --rollback)"
+                && args.requires.is_empty()
+                && args.front.is_none()
+                && !args.no_front
+                && args.front_config.is_none()
+                && args.front_requires.is_none()),
+            "nothing to deploy: give --actor, --access, --config, --requires or a front flag \
+             (--front, --no-front, --front-config, --front-requires), or --rollback"
         );
         let runtime = Runtime::new(&RuntimeConfig::default())?;
         let mut classes = Vec::new();
@@ -1390,7 +1461,31 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             }
             config.push((class.clone(), Some(vars)));
         }
+        let front = match (&args.front, args.no_front) {
+            (Some(path), _) => wasmkeep_server::apps::FrontChange::Set(
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+            ),
+            (None, true) => wasmkeep_server::apps::FrontChange::Remove,
+            (None, false) => wasmkeep_server::apps::FrontChange::Keep,
+        };
+        let front_config = match &args.front_config {
+            None => None,
+            Some(path) if path.as_os_str().is_empty() => Some(None),
+            Some(path) => {
+                let (vars, _) = wasmkeep_server::env::read_file(path)
+                    .map_err(|e| anyhow::anyhow!("--front-config: {e}"))?;
+                for warning in secret_looking(FRONT_SCOPE, &vars) {
+                    let warning =
+                        warning.replacen(&format!("--config {FRONT_SCOPE}:"), "--front-config:", 1);
+                    eprintln!("warning: {warning}");
+                }
+                Some(Some(vars))
+            }
+        };
         let changes = wasmkeep_server::apps::Changes {
+            front,
+            front_config,
+            front_requires: args.front_requires.clone(),
             classes: (!classes.is_empty()).then_some(classes),
             access: args.access.clone(),
             config,
@@ -1801,6 +1896,26 @@ fn cluster_status(args: StatusArgs) -> anyhow::Result<()> {
 }
 
 /// `CLASS=NAME,NAME...` (empty after `=` removes the class's names).
+/// A path that may be empty (`--front-config ''` removes the front's
+/// configuration).
+fn parse_path(s: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(s))
+}
+
+/// `--front-requires NAMES`: comma-separated names, empty for none.
+fn parse_names(s: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut names = std::collections::BTreeSet::new();
+    for name in s.split(',').filter(|n| !n.is_empty()) {
+        if !wasmkeep_server::env::valid_name(name) {
+            return Err(format!("invalid name {name:?}"));
+        }
+        if !names.insert(name.to_owned()) {
+            return Err(format!("{name} is named twice"));
+        }
+    }
+    Ok(names)
+}
+
 fn parse_requires(s: &str) -> Result<(String, std::collections::BTreeSet<String>), String> {
     let (class, names) = s
         .split_once('=')
@@ -2125,6 +2240,7 @@ mod tests {
             drain,
             reads_secrets: true,
             can_take,
+            can_front: true,
             instance: None,
             lease: None,
             load: None,
@@ -2271,6 +2387,36 @@ mod tests {
         assert!(parse(&["--rollback", "--access", "c=open"]).is_err());
         assert!(parse(&["--rollback", "--config", "c=f"]).is_err());
         assert!(parse(&["--access", "c=closed"]).is_err());
+        // The front's flags (ADR 0023).
+        assert!(parse(&["--front", "front.wasm"]).is_ok());
+        assert!(parse(&["--no-front"]).is_ok());
+        assert!(parse(&["--front", "f.wasm", "--no-front"]).is_err());
+        assert!(parse(&["--front-config", "front.env", "--front-requires", "A,B"]).is_ok());
+        assert!(parse(&["--front-config", "", "--front-requires", ""]).is_ok());
+        assert!(parse(&["--front-requires", "1BAD"]).is_err());
+        assert!(parse(&["--front-requires", "A,A"]).is_err());
+        for flag in [
+            &["--front", "f.wasm"][..],
+            &["--no-front"],
+            &["--front-config", "f.env"],
+            &["--front-requires", "A"],
+        ] {
+            let mut args = vec!["--rollback"];
+            args.extend_from_slice(flag);
+            assert!(parse(&args).is_err(), "{flag:?}");
+        }
+        let requires = |args: &[&str]| match parse(args).unwrap().command {
+            super::Command::Deploy(d) => d.front_requires,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            requires(&["--front-requires", "B,A"]),
+            Some(["A".to_owned(), "B".to_owned()].into())
+        );
+        assert_eq!(
+            requires(&["--front-requires", ""]),
+            Some(Default::default())
+        );
         let retention = |args: &[&str]| match parse(args).unwrap().command {
             super::Command::Deploy(d) => d.version_retention_secs,
             _ => unreachable!(),

@@ -728,6 +728,7 @@ mod tests {
             drain: None,
             reads_secrets: false,
             can_take: false,
+            can_front: false,
             instance: None,
             lease: None,
             load: None,
