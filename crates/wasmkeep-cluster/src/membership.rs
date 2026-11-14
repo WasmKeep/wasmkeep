@@ -83,7 +83,7 @@ pub struct NodeInfo {
 }
 
 /// Payload line 10 (format 3): how much a node runs, as of its last
-/// heartbeat. Advisory, like every heartbeat field: it drives nothing.
+/// heartbeat. Shown, never acted on: no placement or routing reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Load {
     /// Actors resident in memory.
@@ -109,8 +109,9 @@ impl Load {
 
     /// Reads the line: the word `load`, then `key=value` words in any
     /// order. `actors` and `sockets` are required; `events_per_min` may
-    /// be `-` or absent (unknown); unknown keys are ignored, for later
-    /// versions. Anything else, a repeated key included, is `None`.
+    /// be `-` or absent (unknown). Unknown keys and words without `=` are
+    /// skipped, for later versions; a known key repeated or with a value
+    /// that is not a count is `None`.
     fn parse(line: &str) -> Option<Self> {
         let mut words = line.split_whitespace();
         if words.next()? != "load" {
@@ -118,7 +119,9 @@ impl Load {
         }
         let (mut actors, mut sockets, mut events) = (None, None, None);
         for word in words {
-            let (key, value) = word.split_once('=')?;
+            let Some((key, value)) = word.split_once('=') else {
+                continue;
+            };
             let slot = match key {
                 "actors" => &mut actors,
                 "sockets" => &mut sockets,
@@ -1333,7 +1336,6 @@ mod tests {
             "load actors=1 sockets=2 events_per_min=lots",
             "load actors=1 sockets=2 events_per_min=",
             "load actors=1 actors=2 sockets=2",
-            "load actors=1 sockets=2 stray",
             "load actors=99999999999999999999 sockets=2",
             "actors=1 sockets=2",
         ] {
@@ -1351,9 +1353,9 @@ mod tests {
             read("load sockets=2 actors=1 events_per_min=7"),
             ok(1, 2, Some(7))
         );
-        // A later version's keys are skipped.
+        // A later version's keys and words are skipped.
         assert_eq!(
-            read("load actors=1 sockets=2 events_per_min=- queued=4"),
+            read("load actors=1 sockets=2 events_per_min=- queued=4 busy"),
             ok(1, 2, None)
         );
     }

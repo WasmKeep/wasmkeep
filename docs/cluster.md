@@ -846,8 +846,8 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
-a     yes   979ms  serving  12      3        -       0.4.0    acme/shop  http://a:8080  https://a:7443   pinned
-b     yes   2.2s   serving  4       0        -       0.4.0    acme/shop  http://b:8080  -                plain
+a     yes   979ms  serving  12      3        840     0.4.0    acme/shop  http://a:8080  https://a:7443   pinned
+b     yes   2.2s   serving  4       0        95      0.4.0    acme/shop  http://b:8080  -                plain
 c     no    14m    serving  -       -        -       0.4.0    acme/shop  http://c:8080  https://c:7443   pinned
 
 APP        DEPLOYED VERSION  SEQ  ACTORS
@@ -875,18 +875,21 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
 - **Load** is what each live node says with every heartbeat: **actors**
   resident in memory, open **WebSockets** (`SOCKETS`), and **events per
   minute** (`EV/MIN`) over the last minute or more, `-` for its first
-  minute. It is as of the node's last heartbeat, a few seconds old at
-  most, and advisory: nothing places actors by it. A node not live shows
-  `-` (a fenced or released heartbeat keeps the last load it wrote, which
-  no longer holds), and so does a node of a version before 0.4.0. In
+  minute. It is as of the node's last heartbeat (up to two heartbeat
+  periods old; a node that crashed keeps showing its last load until its
+  heartbeat is older than the horizon), and nothing places actors by it.
+  A node not live shows `-` (a fenced or released heartbeat keeps the
+  last load it wrote, which no longer holds), and so does a node of a
+  version before 0.4.0. In
   `--json`: `actors`, `sockets` and `events_per_min`, `null` when unknown.
   Events are counted per process, so nodes sharing one process (tests)
   share one count.
 - **Apps** come from `apps/<tenant>/<app>/current`: the deployed version and
   its `seq`. **Actors** is the sum over the app's live nodes that say
-  their load (`-` if none does; `actors` in `--json`). Which version each
-  node has picked up is not in the bucket (nodes follow within a few
-  seconds).
+  their load (`-` if none does; `actors` in `--json`): while some of its
+  live nodes do not say it (an older version, or a node just started),
+  the sum leaves them out. Which version each node has picked up is not
+  in the bucket (nodes follow within a few seconds).
 - **Warnings**: no live node; live nodes still plain while others use the
   cluster listener (the state [ADR 0011](adr/0011-node-to-node-mtls.md)
   says not to stay in, and not to refuse plain HTTP from); live nodes on
