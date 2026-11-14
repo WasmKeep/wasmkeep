@@ -1,4 +1,4 @@
-//! The wasmkeep command-line tool: serve, dev, deploy, cluster, actor, secrets.
+//! The wasmkeep command-line tool: serve, dev, deploy, cluster, actor, secrets, new.
 
 #![forbid(unsafe_code)]
 
@@ -6,6 +6,7 @@ mod dev;
 mod dev_project;
 mod diagnose;
 mod migrate_cmd;
+mod new_cmd;
 mod project;
 mod secrets_cmd;
 mod status;
@@ -56,6 +57,10 @@ enum Command {
     /// app with `--secrets-key` read them within a few seconds.
     #[command(subcommand)]
     Secrets(secrets_cmd::SecretsCommand),
+    /// Write a new project into an empty directory: a class (a counter),
+    /// optionally a front, its wasmkeep.toml, a README, .gitignore and an
+    /// .env.local example. It builds and runs with `wasmkeep dev`.
+    New(new_cmd::NewArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1046,6 +1051,7 @@ fn main() -> anyhow::Result<()> {
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
         Command::Dev(args) => dev(args),
+        Command::New(args) => new_cmd::run(&args),
     }
 }
 

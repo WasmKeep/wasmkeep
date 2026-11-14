@@ -1,0 +1,11 @@
+{
+  "name": "{{app}}",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:counter": "wasmkeep-ts build src/counter.ts -o counter.wasm"
+  },
+  "dependencies": {
+    "@wasmkeep/sdk": "{{version}}"
+  }
+}

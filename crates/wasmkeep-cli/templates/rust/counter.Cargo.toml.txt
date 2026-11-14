@@ -1,0 +1,24 @@
+[package]
+name = "counter"
+description = "Class counter: each actor is a durable counter in its own SQLite database."
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Built for wasm32-wasip2: its own workspace, outside any other.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The SDK at the version of the wasmkeep that wrote this project: keep the
+# two the same when you upgrade.
+wasmkeep-sdk = "{{version}}"
+
+# Keeps the component small.
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1

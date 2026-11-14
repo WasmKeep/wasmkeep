@@ -12,9 +12,10 @@
 
 #![allow(dead_code, unreachable_pub)] // each test crate uses part of it
 
-use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
-use std::process::Child;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// A port free a moment ago, for a flag that cannot take port 0 (a
@@ -58,6 +59,123 @@ fn logged_address(log: &str) -> Option<SocketAddr> {
         .find(|c: char| c.is_whitespace() || c == '\u{1b}')
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+/// A `wasmkeep dev` process, killed when dropped, with the temporary
+/// directory it runs in.
+pub struct Dev {
+    pub child: Child,
+    pub addr: SocketAddr,
+    /// The directory `dev` runs in (the project file's).
+    pub dir: PathBuf,
+    /// Where its stdout and stderr go.
+    pub log_path: PathBuf,
+    _temp: tempfile::TempDir,
+}
+
+impl Dev {
+    /// What it logged so far.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+}
+
+impl Drop for Dev {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Starts `wasmkeep dev` in `dir` (inside `temp`, which the returned
+/// [`Dev`] keeps), logging to `temp/dev.log`, polling every `poll_ms`, and
+/// waits up to `limit` for it to listen (its builds run first) and answer.
+pub fn start_dev(temp: tempfile::TempDir, dir: PathBuf, poll_ms: u64, limit: Duration) -> Dev {
+    let log_path = temp.path().join("dev.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let poll = poll_ms.to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+        .current_dir(&dir)
+        .args(["dev", "--listen", "127.0.0.1:0", "--poll-ms", &poll])
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let addr = listening_on(&mut child, &log_path, limit);
+    let dev = Dev {
+        child,
+        addr,
+        dir,
+        log_path,
+        _temp: temp,
+    };
+    let started = Instant::now();
+    while request(addr, "GET", "/", "", "").is_none() {
+        assert!(
+            started.elapsed() < limit,
+            "dev never answered: {}",
+            dev.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    dev
+}
+
+/// The status and body of one HTTP/1.1 request (`headers` are whole
+/// lines, each ending in CRLF), or `None` if nothing answered.
+pub fn request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> Option<(u16, String)> {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: todo.example\r\nConnection: close\r\n\
+         {headers}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok()?;
+    let status = raw.split_whitespace().nth(1)?.parse().ok()?;
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    let chunked = head
+        .lines()
+        .any(|l| l.eq_ignore_ascii_case("transfer-encoding: chunked"));
+    Some((
+        status,
+        if chunked {
+            dechunk(body)
+        } else {
+            body.to_owned()
+        },
+    ))
+}
+
+/// A chunked body's bytes (as text), or the body as it came if it is not
+/// well formed.
+fn dechunk(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let Ok(n) = usize::from_str_radix(size.trim(), 16) else {
+            return body.to_owned();
+        };
+        if n == 0 {
+            break;
+        }
+        let (Some(chunk), Some(next)) = (after.get(..n), after.get(n + 2..)) else {
+            return body.to_owned();
+        };
+        out.push_str(chunk);
+        rest = next;
+    }
+    out
 }
 
 #[test]

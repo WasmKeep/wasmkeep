@@ -7,6 +7,11 @@ has another version fails the check. Add a manifest as one line.
 
 Formats: JSON and TOML (a path of keys), a C header (`#define NAME "x.y.z"`)
 and a Zig file (`pub const name = "x.y.z";`), both by the constant's name.
+
+Not listed: the templates of `wasmkeep new` (crates/wasmkeep-cli/templates),
+which name the SDK as `{{version}}`, filled with the CLI's own version when
+a project is written; a unit test in crates/wasmkeep-cli/src/new_cmd.rs
+keeps them free of a version of their own.
 """
 import json
 import pathlib
