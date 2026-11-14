@@ -342,6 +342,8 @@ async fn run_node(
         unknown_wake_drops_parked: false,
         resolver_ends_unchanged: false,
         resolver_never_ends: false,
+        release_before_stop: false,
+        act_on_cell_only: false,
     };
     loop {
         let instance = format!("{:08x}", madsim::rand::random::<u32>());
@@ -669,7 +671,15 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
             .init({
                 let store = Store::default();
                 let slow_one_in = if scenario { 0 } else { 25 };
-                move || bucket_node_with(Arc::clone(&store), bucket::Faults { slow_one_in })
+                move || {
+                    bucket_node_with(
+                        Arc::clone(&store),
+                        bucket::Faults {
+                            slow_one_in,
+                            late_reply_one_in: 0,
+                        },
+                    )
+                }
             })
             .build();
         let max_skew = config().max_skew_ms();

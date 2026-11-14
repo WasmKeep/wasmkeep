@@ -68,15 +68,22 @@ const SLACK: Duration = Duration::from_millis(1_500);
 const SLOW_CALL_MS: u64 = 2_500;
 
 /// One node's view of the shared bucket, with switches the tests flip:
-/// its own heartbeat writes, and its listings of the heartbeats.
+/// its writes (a node that stops heartbeating is cut off from the bucket),
+/// and its listings of the heartbeats.
 ///
-/// A node never writes another node's `nodes/<id>` through it: that is a
-/// fence (ADR 0020), which `a` may write once the lease ttl plus grace
-/// (1.2 s here, well past the 400 ms trust horizon) passed after `b`'s
-/// last write, and then take `b`'s actors.
-/// These tests are about trust: a call to one of `b`'s actors answered by
-/// `a`'s own copy of it would say nothing about whether `a` still trusts
-/// `b`.
+/// These tests are about trust, so `b`'s actors must stay `b`'s: a call to
+/// one of them answered by `a`'s own copy would say nothing about whether
+/// `a` still trusts `b`. Two things would move them (ADR 0020), and the
+/// gate stops both:
+/// - a fence: `a` may write one over `b`'s `nodes/b` once the lease ttl
+///   plus grace (1.2 s here, well past the 400 ms trust horizon) passed
+///   after `b`'s last write. A node never writes another node's lease
+///   object through the gate.
+/// - `b`'s own release: once `b`'s lease ran out (ttl - safety, 800 ms
+///   after its last write), an event reaching one of its actors drops the
+///   hold, and the release it sends would free the record at once. While
+///   `b` does not beat, none of its writes goes through, as for a node cut
+///   off from the bucket.
 #[derive(Debug)]
 struct Gate {
     inner: Arc<dyn ObjectStore>,
@@ -96,16 +103,15 @@ impl Gate {
         })
     }
 
-    /// Whether a write to `location` goes through: never to another node's
-    /// heartbeat (a fence), and to this node's own only while it beats.
+    /// Whether a write to `location` goes through: none while this node
+    /// does not beat, and never to another node's lease object (a fence).
     /// Every write path asks, conditional or not.
     fn may_write(&self, location: &StorePath) -> object_store::Result<()> {
         let key = location.as_ref();
-        if key == self.heartbeat {
-            if !self.beats.load(Ordering::SeqCst) {
-                return Err(Self::refused("heartbeat"));
-            }
-        } else if key.starts_with("nodes/") {
+        if !self.beats.load(Ordering::SeqCst) {
+            return Err(Self::refused("write while cut off"));
+        }
+        if key != self.heartbeat && key.starts_with("nodes/") {
             return Err(Self::refused("another node's lease (a fence)"));
         }
         Ok(())
@@ -500,6 +506,19 @@ async fn lease_of(store: &Arc<dyn ObjectStore>, id: &str) -> (String, u64) {
     (state, written_at)
 }
 
+/// The node `name`'s ownership record names (ADR 0020, section 3), if any.
+async fn owner_of(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String> {
+    let key = StorePath::from(format!("state/default/default/owners/t/{name}"));
+    let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let holder = body.lines().nth(1).unwrap_or_default();
+    holder
+        .split_whitespace()
+        .next()
+        .filter(|node| *node != "-")
+        .map(str::to_owned)
+}
+
 /// When `id`'s last heartbeat was written, on this process's clock (the
 /// nodes share it).
 async fn last_written(store: &Arc<dyn ObjectStore>, id: &str) -> Instant {
@@ -678,9 +697,10 @@ async fn a_stops_trusting_b(how: Revoke) {
     .await;
     assert!(
         r.body.starts_with("failed:"),
-        "a called b: {} ({:?} after the event)",
+        "a called b: {} ({:?} after the event; on-b's record names {:?})",
         r.body,
-        since.elapsed()
+        since.elapsed(),
+        owner_of(&store, "on-b").await
     );
     let r = send(
         b.addr,
@@ -690,6 +710,14 @@ async fn a_stops_trusting_b(how: Revoke) {
     .await;
     assert!(!r.body.starts_with("200:"), "b called a: {}", r.body);
 
+    // b's actors stayed b's to the end: nothing answered for them but b.
+    for name in ["on-b", "slow-b", "caller-b"] {
+        assert_eq!(
+            owner_of(&store, name).await.as_deref(),
+            Some("b"),
+            "{name}'s record moved"
+        );
+    }
     if let Some(silenced) = silenced {
         // Silent to the end: no write of b's reached the bucket past the
         // gate (the times above count from its last one), and a fenced

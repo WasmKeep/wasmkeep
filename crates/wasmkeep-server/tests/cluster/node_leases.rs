@@ -802,3 +802,193 @@ async fn the_heartbeat_carries_the_nodes_load() {
     drop(ws);
     drop(a);
 }
+
+/// ADR 0020, section 1 (amended 2026-11-14): a node whose lease writes
+/// fail while its other writes still land. Once its lease ran out, an
+/// event that reaches its actor before its lease task sees the lapse gives
+/// the hold up, and the release lands: another node takes the actor at
+/// once, without a fence. What is checked: the release is seen only once
+/// the lease ran out, nothing is acknowledged on the node after it, and
+/// the next owner takes the actor at the next generation with every write
+/// the node acknowledged, while the node's lease object was never fenced.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_out() {
+    use object_store::ObjectStoreExt as _;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_b = Arc::new(Flaky::new(
+        Arc::clone(&store),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let b_store: Arc<dyn ObjectStore> = flaky_b.clone();
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", da.path(), &store, idle, "t", test_actor_wasm()).await;
+    // A lease write every 330 ms (the most a 1 s ttl allows): the lease
+    // task sees the lapse up to a period after it, the window this case
+    // needs an event in.
+    let b = node_configured(
+        "b",
+        db.path(),
+        &b_store,
+        idle,
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |config: &mut ActorConfig| {
+            config.cluster.as_mut().unwrap().heartbeat = Duration::from_millis(330);
+        },
+    )
+    .await;
+    settle().await;
+    let now_ms = || {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    let written_at = async || {
+        let body = store
+            .get(&object_store::path::Path::from("nodes/b"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        body.lines().nth(2).unwrap().parse::<u64>().unwrap()
+    };
+    let before = wasmkeep_server_releases_after_lapse().await;
+
+    // The lease task can see the lapse before any event does (the case is
+    // then not exercised: the hold ends into the pending releases, which
+    // wait for a valid lease): a few actors, until one is.
+    for attempt in 0..3 {
+        let name = format!("x{attempt}");
+        let path = format!("/actor/t/{name}/durable");
+        let mut acked = 0;
+        for expected in 1..=3 {
+            let r = send_runnable(b.addr, "POST", &path, "").await;
+            assert_eq!(
+                (r.status, r.body.trim(), r.node.as_deref()),
+                (200, expected.to_string().as_str(), Some("b")),
+                "{name}"
+            );
+            acked = expected;
+        }
+        let (_, generation) = owner_record(&store, &name).await.unwrap();
+
+        // b's lease writes fail from now on; its other writes still land.
+        *flaky_b.fail_puts_of.lock().unwrap() = Some("nodes/b".to_owned());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let last_write = written_at().await;
+        // b's lease is valid until the send of its last acknowledged
+        // write plus ttl - safety: after this on any clock of this machine.
+        let ran_out = last_write + 800;
+
+        // Writes to the actor on b, one after another, until its record
+        // changes. Given up 100 ms after b's lease ran out (an event comes
+        // every few ms: missing the window means the lease task saw the
+        // lapse first), so b's lease is back before a may fence it (ttl
+        // plus grace, 1.2 s after its last write, and a watch).
+        let mut last_ack_ms = 0;
+        let released_ms = loop {
+            let r = send(b.addr, "POST", &path, "").await;
+            if r.status == 200 {
+                acked = r.body.trim().parse().unwrap();
+                last_ack_ms = now_ms();
+            }
+            match owner_record(&store, &name).await {
+                Some((Some(holder), g)) if holder == "b" && g == generation => {}
+                Some((None, g)) => {
+                    assert_eq!(g, generation, "{name}: released at another generation");
+                    break Some(now_ms());
+                }
+                other => panic!("{name}: the record moved to {other:?} before any release"),
+            }
+            if now_ms() > ran_out + 100 {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let Some(released_ms) = released_ms else {
+            // Not exercised: let b's lease (and its pending release) back.
+            *flaky_b.fail_puts_of.lock().unwrap() = None;
+            let started = std::time::Instant::now();
+            while owner_record(&store, &name).await.unwrap().0.is_some() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "{name}: b's pending release never landed once its lease was back"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            eprintln!("try {attempt}: the lease task saw the lapse first; again");
+            settle().await;
+            continue;
+        };
+
+        // b's lease object, read at once: a fence comes no earlier than
+        // 1.2 s after b's last write, so a live object here says the record
+        // was freed by b's release alone.
+        let body = store
+            .get(&object_store::path::Path::from("nodes/b"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("\nlive "),
+            "{name}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        // Seen once b's lease had run out (the time it was seen bounds the
+        // release from above only), and nothing acknowledged on b after it.
+        assert!(
+            released_ms >= ran_out,
+            "{name}: release seen at {released_ms}, before b's lease ran out at {ran_out}"
+        );
+        let r = send(b.addr, "POST", &path, "").await;
+        assert!(
+            !(r.status == 200 && r.node.as_deref() == Some("b")),
+            "{name}: b acknowledged a write after its release: {}",
+            r.body
+        );
+        // a takes the released actor at the next generation, with every
+        // write b acknowledged.
+        let r = send_runnable(a.addr, "GET", &path, "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("a")),
+            "{name}: {}",
+            r.body
+        );
+        let restored: u32 = r.body.trim().parse().unwrap();
+        assert!(
+            restored >= acked,
+            "{name}: a restored {restored} writes, b acknowledged {acked}"
+        );
+        assert_eq!(
+            owner_record(&store, &name).await,
+            Some((Some("a".to_owned()), generation + 1))
+        );
+        // Counted (the counter is the process's: other tests that cut a
+        // node's lease writes may add to it, never take from it).
+        assert!(wasmkeep_server_releases_after_lapse().await > before);
+        eprintln!(
+            "try {attempt}: released {} ms after b's last lease write, last acknowledgement \
+             {} ms before that",
+            released_ms - last_write,
+            released_ms - last_ack_ms
+        );
+        return;
+    }
+    panic!("the lease task saw the lapse first three times: the case was never exercised");
+}
+
+async fn wasmkeep_server_releases_after_lapse() -> u64 {
+    super::snapshots::counter("wasmkeep_releases_after_lapse_total").await
+}

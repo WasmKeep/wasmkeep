@@ -213,6 +213,10 @@ pub(crate) struct Metrics {
     /// Fences this node wrote over another node's lease (ADR 0020): that
     /// node stopped writing it for longer than its ttl plus grace.
     pub(crate) node_fences: AtomicU64,
+    /// Ownership records this node released after its own lease ran out,
+    /// before its lease task saw the lapse (ADR 0020, section 1): another
+    /// node may take those actors at once, without a fence.
+    pub(crate) releases_after_lapse: AtomicU64,
     /// Alarm deliveries rescheduled after mailbox capacity or queue refusal.
     pub(crate) alarm_admission_retries: AtomicU64,
     /// Requests to the bucket, by operation (`get`, `head`, `put`, `delete`,
@@ -736,6 +740,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_node_fences_total",
         "Fences this node wrote over a node that stopped renewing its lease.",
         m.node_fences.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_releases_after_lapse_total",
+        "Actors this node released after its lease ran out, before it saw the lapse.",
+        m.releases_after_lapse.load(Ordering::Relaxed),
     );
     counter(
         &mut out,

@@ -51,6 +51,10 @@ pub(crate) struct Faults {
     /// One request in `slow_one_in` is applied only after a random delay of
     /// 300..2_500 ms (0: never), like a slow S3 PUT that still succeeds.
     pub(crate) slow_one_in: u64,
+    /// One request in `late_reply_one_in` is applied at once and answered
+    /// only after 300..1_300 ms (0: never), past the client's timeout: a
+    /// write that landed with its reply lost.
+    pub(crate) late_reply_one_in: u64,
 }
 
 thread_local! {
@@ -106,15 +110,21 @@ pub(crate) async fn bucket_node_with(store: Store, faults: Faults) {
                 && madsim::rand::random::<u64>().is_multiple_of(faults.slow_one_in))
             .then(|| 300 + madsim::rand::random::<u64>() % 2_200)
         });
+        let late = (faults.late_reply_one_in > 0
+            && madsim::rand::random::<u64>().is_multiple_of(faults.late_reply_one_in))
+        .then(|| 300 + madsim::rand::random::<u64>() % 1_000);
         let (ep, store, next) = (Arc::clone(&ep), Arc::clone(&store), Arc::clone(&next));
         let serve = async move {
             if let Some(ms) = delay {
                 madsim::time::sleep(Duration::from_millis(ms)).await;
             }
             let (tag, reply) = apply(&store, &next, &request);
+            if let Some(ms) = late {
+                madsim::time::sleep(Duration::from_millis(ms)).await;
+            }
             let _ = ep.send_to(from, tag, &reply).await;
         };
-        if delay.is_some() {
+        if delay.is_some() || late.is_some() {
             madsim::task::spawn(serve);
         } else {
             serve.await;

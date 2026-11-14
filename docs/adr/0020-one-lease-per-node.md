@@ -19,6 +19,14 @@
   naming this node with nothing here to release it: harmless while the
   node served the actor (its next event took it back), but a drain or a
   move of that actor waited until the node stopped.
+- Amended 2026-11-14, from a revocation test that failed now and then:
+  a hold its actor drops after the node's lease ran out, before
+  the lease task saw the lapse, is released at once, and that release can
+  land while the lease writes do not (section 1, "A release before the
+  lapse is seen"). This was the behaviour since the first release; the
+  text said every such hold went into the pending releases. It is safe
+  by ordering, not by clocks, and is now counted
+  (`wasmkeep_releases_after_lapse_total`).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 - Amends: [ADR 0007](0007-replication-protocol.md),
@@ -157,6 +165,64 @@ reads only the three lease lines.
   (section 2 frees only on a change of that object): the lease is valid
   again and the node acquires afresh, at new generations. A conflict then
   is handled as above. A bucket blip therefore never restarts a cluster.
+- **A release before the lapse is seen** (amended 2026-11-14). The node
+  learns that its lease ran out when a lease attempt ends after the
+  validity it last published: the first attempt to end past it, whether
+  it failed, timed out or landed, ends every hold into the pending
+  releases above. Until then each hold is still in its actor's hands,
+  invalid (it may not act: its lease ran out on its own clock). An event
+  that reaches the actor then (a request, a call, an alarm, a drain's or
+  a move's hand-over, a WebSocket closing) finds the hold no longer valid
+  and drops it, and a dropped hold sends its release at once, as it does
+  while the lease is valid; so does an idle actor's eviction. The lapse
+  itself closes every WebSocket when the validity ends, without waiting
+  for a lease attempt, and each close is such an event: every actor with
+  sockets open is given up then. A parked record (ADR 0024) is released
+  in the window only by a drain, or by a last socket's release whose
+  check passed before the lapse: the sweeps and the last-socket release
+  skip while the lease is invalid. If the bucket takes that write while
+  it refuses or times out the lease's own (a slow or throttled bucket,
+  an error on that one key; a whole outage refuses both, and the release
+  waits as a pending one), the record names nobody and any node acquires
+  it at once, without a fence.
+
+  That is safe by ordering, with no clock compared between nodes.
+  Dropping the hold empties its cell before the release is sent, and
+  everything the owner does (acknowledging a write once its upload
+  landed, alarm delivery, the alarm index rules, garbage collection,
+  `exec-durable`) asks `LeaseView::is_valid`, which needs the cell; the
+  node's own clock has passed the validity by then anyway, and either
+  alone stops it. The next owner acquires only once the release landed,
+  so after this node stopped acting, and restores what it lists then,
+  which holds every acknowledged write. An unacknowledged upload of this
+  node still in flight can land after that restore and before the new
+  owner's first write, a late commit ADR 0007 allows: as likely as after
+  any release while the lease is valid (a hibernation, an abandoned
+  upload), and likelier than after a fence, which leaves at least the
+  grace between the lapse and the takeover.
+
+  With the defaults the window lasts from `ttl - safety` (8 s) after the
+  send of the last acknowledged lease write until the next attempt ends
+  past it: up to about 3.7 s (a write failing at once at 6 s, the next
+  hanging for its 2.67 s from 9 s), less when the writes hang. Such an
+  actor therefore moves 8 to about 11.7 s after that send (at 8 s for
+  one with sockets open), where a fence frees it only after ttl plus
+  grace (15 s) and the watch. The node that takes it sees a released
+  record and counts no failover; the node that released it counts the
+  release in `wasmkeep_releases_after_lapse_total` and logs it
+  (`released an actor after this node's lease ran out`), when the
+  release was answered: one that landed with its reply lost ends later
+  as superseded, uncounted, so the count is a lower bound. Gating the
+  first send on a valid lease, as the retries are, was weighed and not
+  taken: it would slow these hand-overs to the fence's time and buy no
+  safety. The cluster test
+  `a_node_whose_lease_writes_fail_hands_its_actor_over_once_its_lease_ran_out`
+  and the simulation `madsim_early_release` (lease writes refused for a
+  while, other writes landing, replies lost after their write landed)
+  pin it. The simulation catches a hold that keeps acting until its
+  release is answered, on a hibernation's release; on a release after a
+  lapse only with holds also acting on their cell alone, since the
+  node's own clock already stops them there.
 - **Twins** (two processes with one id) are caught by the condition
   itself: the second writer's condition fails and its re-read shows the
   other instance.
@@ -264,7 +330,9 @@ names nobody (released), keeping the generation.
   does not cancel it: if the acquisition lands, its write moved the
   version past *v*, so the release can never apply, and the next read
   shows generation *g* + 1, which ends it. Retries back off, and pause
-  while the node lease is invalid.
+  while the node lease is invalid. (The first send of a dropped hold's
+  release does not wait for a valid lease: section 1, "A release before
+  the lapse is seen".)
 - **An acquire that did not succeed** (no reply, a timeout, a cancelled
   write, and a conflict too, since the client retries internally and a
   first attempt may have landed) first reads the record back once, still

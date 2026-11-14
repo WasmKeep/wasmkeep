@@ -153,6 +153,7 @@ its first request.
 | `wasmkeep_alarm_admission_retries_total` | counter | Alarm deliveries rescheduled because resident capacity or an actor queue was full; no actor labels. |
 | `wasmkeep_node_lease_writes_total`, `wasmkeep_node_lease_failures_total` | counters | Writes of this node's lease (its heartbeat, [ADR 0020](adr/0020-one-lease-per-node.md)) that reached the bucket, and that failed or timed out. With the defaults (a write every 3 s, valid for 8 s), two failing in a row and the lease runs out: the node reports not ready. A write that hangs is counted when it times out (2.7 s), so alert on the first increment. |
 | `wasmkeep_node_fences_total` | counter | Fences this node wrote over a node that stopped renewing its lease (crashed, or cut off from the bucket). |
+| `wasmkeep_releases_after_lapse_total` | counter | Actors this node released after its own lease ran out, before its lease task saw the lapse: an event reached the actor, found its hold no longer valid and gave it up, and the release landed although the lease writes did not. Another node may take those actors at once, without a fence. Counted on the node that released them, with a warning in its log, when the release was answered: one that landed with its reply lost is not, so read it as a lower bound. See Failovers below. |
 | `wasmkeep_bucket_requests_total{operation,status}` | counter | Requests this node made to the bucket: cost and errors. See below. |
 | `wasmkeep_failovers_total` | counter | Actors this node took over whose ownership record still named another node, freed because that node was fenced, released or replaced by a new process. See below. |
 | `wasmkeep_history_collected_total` | counter | Objects of actors' history deleted from the bucket by garbage collection ([ADR 0012](adr/0012-bucket-garbage-collection.md)). |
@@ -205,6 +206,23 @@ after a restart. Sum
 it over nodes for the cluster; outside rolling restarts of crashed nodes it
 should stay near zero.
 
+A node whose lease writes fail while its other writes still land (a slow
+or throttled bucket that times the lease write out, an error on that one
+key) can also hand actors over without a fence: once its lease ran out, an
+event that reaches one of its actors before its lease task sees the lapse
+gives the hold up, and that release can land ([ADR
+0020](adr/0020-one-lease-per-node.md), section 1). The node that takes the
+actor then sees an ordinary released actor and counts no failover; the
+node that released it counts it in `wasmkeep_releases_after_lapse_total`
+and logs `released an actor after this node's lease ran out` (a lower
+bound: a release whose reply was lost is not counted). With the
+defaults it can happen from 8 s after the send of the node's last
+acknowledged lease write: by then `wasmkeep_node_lease_failures_total`
+has counted at least one failure, though the rule on it below may not
+have fired yet. A node with WebSockets open hands over every actor that
+has them at that moment: the lapse closes the sockets, and each close is
+an event that gives the hold up.
+
 ### Grafana dashboard
 
 [`deploy/grafana/wasmkeep.json`](../deploy/grafana/wasmkeep.json) shows
@@ -219,7 +237,7 @@ the history collection counters (`wasmkeep_history_collected_total`,
 `wasmkeep_websocket_sweep_unreadable_total`, the parked record metrics
 (`wasmkeep_parked_records`, `wasmkeep_parked_wakes_total`,
 `wasmkeep_parked_releases_total`),
-`wasmkeep_restore_failures_total`, the listing and restore-read
+`wasmkeep_restore_failures_total`, `wasmkeep_releases_after_lapse_total`, the listing and restore-read
 histograms (`wasmkeep_listing_seconds`, `wasmkeep_restore_read_seconds`),
 the node lease write and fence counters (`wasmkeep_node_lease_writes_total`,
 `wasmkeep_node_fences_total`) and `wasmkeep_requests_abandoned_total`. To
