@@ -821,7 +821,12 @@ async fn each_entry_of_a_batch_has_its_own_result() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_has_at_most_sixteen_calls() {
-    let node = start(Setup::default()).await;
+    // Sixteen slots: the node's fronts may wait on sixteen calls.
+    let node = start(Setup {
+        max_front_requests: Some(16),
+        ..Setup::default()
+    })
+    .await;
     let names: Vec<String> = (0..17).map(|i| format!("t/n{i}")).collect();
     let to: Vec<&str> = names.iter().map(String::as_str).collect();
     let r = get(node.addr, &call_many(&to, "POST", "/sleep?ms=0"), "").await;
@@ -963,4 +968,36 @@ async fn each_entry_counts_against_the_per_actor_bound() {
     // The bound is free again once the batch ended.
     let r = get(node.addr, &call("t/hot", "GET", "/slept"), "").await;
     assert_eq!(r.body, "200:1");
+}
+
+/// The node's fronts together wait on at most as many calls as they have
+/// slots (ADR 0025), as with one call per request: batches cannot hold
+/// more of the actors' instances than single calls could.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nodes_fronts_wait_on_at_most_their_slots_in_calls() {
+    let node = start(Setup {
+        max_front_requests: Some(4),
+        ..Setup::default()
+    })
+    .await;
+    let to = ["t/n1", "t/n2", "t/n3", "t/n4", "t/n5", "t/n6"];
+    let r = get(node.addr, &call_many(&to, "POST", "/sleep?ms=300"), "").await;
+    let parts: Vec<&str> = r.body.split(" | ").collect();
+    assert_eq!(parts.len(), 6, "{}", r.body);
+    let busy = "err:failed:front busy: too many front calls waiting on this node";
+    assert_eq!(
+        parts.iter().filter(|p| **p == "200:slept").count(),
+        4,
+        "{}",
+        r.body
+    );
+    assert_eq!(
+        parts.iter().filter(|p| **p == busy).count(),
+        2,
+        "{}",
+        r.body
+    );
+    // Freed once the batch ended.
+    let r = get(node.addr, &call_many(&to[4..], "GET", "/slept"), "").await;
+    assert_eq!(r.body, "200:0 | 200:0");
 }

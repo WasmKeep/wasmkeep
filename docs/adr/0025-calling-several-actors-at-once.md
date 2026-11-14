@@ -92,9 +92,16 @@ world front-core {
   batch together are at most 16 MiB (else every entry is `too-large`
   and none is started), and the responses together at most 16 MiB: an
   entry whose answer would take the batch past it is `too-large`, while
-  the others keep theirs. One instance thus buffers what one
+  the others keep theirs. One instance thus buffers the bodies one
   `actors.call` buffers today, not sixteen times that, and the answers
-  fit in the guest's 128 MiB memory.
+  fit in the guest's 128 MiB memory (headers are not counted, as they
+  are not for one call).
+  - Note (2026-11-14, review): an answer is counted as its bytes arrive,
+    so which entry fails depends on arrival order: an answer still
+    arriving holds what it has taken, and can make a sibling that would
+    fit alone `too-large`. An answer whose `Content-Length` is larger
+    than what is left fails before taking anything. A partial answer
+    that then fails gives its bytes back.
 - **Order.** The calls run concurrently; no order between entries is
   promised, not even between two entries to the same callee. Each callee
   still runs its events one at a time, so two entries to one actor are
@@ -116,7 +123,8 @@ One deadline for the batch, fixed when `call-many` is entered:
 - In a front: the front's call deadline (ADR 0023): 5 s before the
   request's wall ends, or the actors' call limit, whichever is first. A
   batch started with less than 5 s left fails every entry with `timeout`
-  at once.
+  at once (but one with an invalid address, which is `invalid-address`,
+  as for a single call).
 
 Every entry starts at once and waits at most until that deadline. An
 entry still waiting then is `timeout`; the entries that answered keep
@@ -154,16 +162,32 @@ than one `actors.call` could wait.
   waits, as a single call does: an entry past the bound fails at once
   with `failed("front busy: ...")`, the others run. Two entries to one
   actor count twice.
-- **What a batch adds.** A front request can now wait on up to 16 actors
-  at once instead of one, so the node's fronts can hold at most 16 times
-  their slots in waits (1,600 with the default 100 slots), each until its
-  deadline. The per-actor bound still caps each actor; the per-node bound
-  ADR 0023 left open ("Not decided here") matters more and stays open,
-  to be measured. A callee's own limits are unchanged: its mailbox's
-  queue (`callee overloaded`), the node's instance pool (the capacity
-  503, returned as a response), and its admission.
+- **Per node (front).** The calls the node's fronts have waiting at once,
+  entries and single calls alike, are at most the front's slots (100 by
+  default): an entry past it fails at once with `failed("front busy: too
+  many front calls waiting on this node")`, counted `busy`, and the
+  others run. With one call per request this bound could never be
+  reached; with batches it keeps the fronts from holding more of the
+  node's actor instances than single calls could (ADR 0023 sized the
+  slots as the part of the pool kept from actors), and from filling the
+  resident pool with slow callees so that every other cold actor gets
+  the capacity 503. A batch of 16 thus needs 16 free of the slots' worth
+  of waits: on a node with few slots, fewer entries run at once.
+  - Note (2026-11-14, review): added after review; the first build
+    bounded entries per actor only.
+- A callee's own limits are unchanged: its mailbox's queue (`callee
+  overloaded`), the node's instance pool (the capacity 503, returned as
+  a response), and its admission.
+- **Actors fanning out.** An actor's batch has no bound but its 16
+  entries, and a callee may batch in turn: a chain of batches can open
+  16 events per level where sequential calls opened one. Each level is
+  bounded by the node's instance pool and admission (a capacity refusal
+  after the admission wait), and each call by its deadline, so nothing
+  hangs; but one event can take the pool for that long. A bound per
+  event or per chain is not decided here.
 - **Metrics.** `wasmkeep_front_calls_total{outcome}` counts each entry of
-  a front's batch, as a call. Calls to other nodes are counted per entry
+  a front's batch, as a call; a batch refused as a whole (too many
+  entries, requests too large) counts once, however long its list. Calls to other nodes are counted per entry
   by `wasmkeep_forwards_total{kind="call"}`.
 
 ### Between nodes
@@ -190,9 +214,9 @@ call. Entries to different nodes run in parallel.
 - A front gathering N actors pays about one round trip, not N.
 - An actor fanning out holds its event open for the slowest callee, as
   it would for one call.
-- A front request can hold up to 16 waits; a node's waits on an
-  unreachable node's actors grow by the same factor until their
-  deadline.
+- A front request can hold up to 16 waits, within the node's bound of
+  one wait per slot; one front request can thus take waits other front
+  requests would have used.
 - Sibling cycles, impossible with sequential calls, are possible and end
   in `timeout`.
 
@@ -219,6 +243,6 @@ call. Entries to different nodes run in parallel.
 ## Not decided here
 
 - Streaming calls, and async calls (WASI 0.3).
-- A bound per node (or per target node) on the calls a node's fronts
-  have waiting, which a batch makes larger.
+- A bound per target node on the calls a node's fronts have waiting
+  (ADR 0023), and a bound on an actor's fan-out per event or per chain.
 - A batch larger than 16, should measurements ask for it.

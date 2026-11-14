@@ -40,6 +40,11 @@ impl BodyBudget {
         }
     }
 
+    /// The bytes left.
+    fn left(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Gives back `n` bytes taken by a response that was dropped.
     fn give(&self, n: usize) {
         self.0.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
@@ -356,8 +361,18 @@ pub(super) async fn collect_response(
 ) -> Result<CallResponse, CallError> {
     use http_body_util::BodyExt;
     let (parts, mut body) = response.into_parts();
+    // An answer that says it is larger than what is left fails before
+    // taking anything, so it cannot push a sibling's answer out.
+    let declared = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > budget.left() as u64) {
+        return Err(CallError::TooLarge);
+    }
     // Counted as it arrives, so that the entries of a batch together
-    // never hold more than the budget.
+    // never hold more than the budget. Without a length, which entry of a
+    // batch fails depends on arrival order (ADR 0025).
     let mut taken = 0usize;
     let mut bytes = Vec::new();
     let read = async {
@@ -399,4 +414,61 @@ pub(super) async fn collect_response(
         headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod budget_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
+
+    use super::*;
+
+    fn answer(len: usize, declared: Option<usize>) -> Response<HyperOutgoingBody> {
+        let text = "x".repeat(len);
+        let mut response = text_response(StatusCode::OK, &text);
+        if let Some(n) = declared {
+            response
+                .headers_mut()
+                .insert(hyper::header::CONTENT_LENGTH, n.into());
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn a_batch_shares_one_response_budget() {
+        let budget = BodyBudget::one();
+        let nine = 9 << 20;
+        assert_eq!(
+            collect_response(answer(nine, None), &budget)
+                .await
+                .unwrap()
+                .body
+                .len(),
+            nine
+        );
+        // The second 9 MiB answer passes the batch's 16 MiB: refused, and
+        // what it had taken is given back.
+        assert!(matches!(
+            collect_response(answer(nine, None), &budget).await,
+            Err(CallError::TooLarge)
+        ));
+        assert_eq!(budget.left(), MAX_CALL_BODY - nine);
+        assert!(
+            collect_response(answer(1 << 20, None), &budget)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_declared_too_large_takes_nothing() {
+        let budget = BodyBudget::one();
+        assert!(matches!(
+            collect_response(answer(10, Some(MAX_CALL_BODY + 1)), &budget).await,
+            Err(CallError::TooLarge)
+        ));
+        assert_eq!(budget.left(), MAX_CALL_BODY);
+        // A single call still takes its whole 16 MiB.
+        let r = collect_response(answer(MAX_CALL_BODY, Some(MAX_CALL_BODY)), &budget).await;
+        assert_eq!(r.unwrap().body.len(), MAX_CALL_BODY);
+    }
 }

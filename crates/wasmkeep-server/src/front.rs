@@ -47,6 +47,9 @@ pub const DEFAULT_CPU_BUDGET: Duration = Duration::from_millis(50);
 /// The failure a call from the front gets past the per-actor bound.
 const BUSY: &str = "front busy: too many front requests waiting on this actor";
 
+/// The failure a call from the front gets past the node's bound (ADR 0025).
+const BUSY_NODE: &str = "front busy: too many front calls waiting on this node";
+
 /// Per-request host state stored in the Wasmtime `Store`.
 ///
 /// Guests get no stdio, environment, arguments or preopened directories:
@@ -68,8 +71,8 @@ struct FrontHost {
     deadline: tokio::time::Instant,
     /// Calls from the node's fronts waiting on each actor.
     waits: Arc<Waits>,
-    /// How many of them one actor may have.
-    per_actor: usize,
+    /// How many of them one actor, and the node, may have.
+    bounds: Bounds,
 }
 
 impl WasiView for FrontHost {
@@ -109,7 +112,7 @@ impl FrontHost {
     async fn entry(
         service: &ActorService,
         waits: &Arc<Waits>,
-        per_actor: usize,
+        bounds: Bounds,
         address: String,
         request: CallRequest,
         deadline: Option<tokio::time::Instant>,
@@ -123,9 +126,8 @@ impl FrontHost {
         if limit.is_zero() {
             return Err(CallError::Timeout);
         }
-        let Some(_waiting) = Waits::enter(waits, &target, per_actor) else {
-            return Err(CallError::Failed(BUSY.into()));
-        };
+        let _waiting =
+            Waits::enter(waits, &target, bounds).map_err(|busy| CallError::Failed(busy.into()))?;
         service.front_call(target, request, limit, budget).await
     }
 }
@@ -136,7 +138,7 @@ fn count(result: &Result<CallResponse, CallError>) {
     let outcome = match result {
         Ok(_) => "ok",
         Err(CallError::Timeout) => "timeout",
-        Err(CallError::Failed(m)) if m == BUSY => "busy",
+        Err(CallError::Failed(m)) if m == BUSY || m == BUSY_NODE => "busy",
         Err(_) => "failed",
     };
     inc(&METRICS.front_calls.get(&[("outcome", outcome)]));
@@ -156,7 +158,7 @@ impl actors::Host for FrontHost {
                 Self::entry(
                     &service,
                     &self.waits,
-                    self.per_actor,
+                    self.bounds,
                     address,
                     request,
                     deadline,
@@ -187,16 +189,20 @@ impl calls::Host for FrontHost {
         &mut self,
         calls: Vec<(String, CallRequest)>,
     ) -> wasmtime::Result<Vec<Result<CallResponse, CallError>>> {
-        let results = if let Some(refused) = refuse_batch(&calls) {
-            refused
-        } else if let Some(service) = self.actors.clone() {
+        if let Some(refused) = refuse_batch(&calls) {
+            // Refused as a whole, before any call: counted once, however
+            // long the list a guest sent.
+            if let Some(first) = refused.first() {
+                count(first);
+            }
+            return Ok(refused);
+        }
+        let results = if let Some(service) = self.actors.clone() {
             let deadline = self.call_deadline(&service);
             let budget = BodyBudget::one();
-            let (waits, per_actor) = (&self.waits, self.per_actor);
+            let (waits, bounds) = (&self.waits, self.bounds);
             let entries = calls.into_iter().map(|(address, request)| {
-                Self::entry(
-                    &service, waits, per_actor, address, request, deadline, &budget,
-                )
+                Self::entry(&service, waits, bounds, address, request, deadline, &budget)
             });
             futures_util::future::join_all(entries).await
         } else {
@@ -217,23 +223,50 @@ impl env::Host for FrontHost {
 }
 
 /// Calls from the fronts of a node waiting on each actor, for the
-/// per-actor bound. An entry goes at zero: names come from URLs.
+/// per-actor bound, and in all, for the node's bound (ADR 0025). An entry
+/// goes at zero: names come from URLs.
 #[derive(Debug, Default)]
-struct Waits(Mutex<HashMap<ActorAddress, usize>>);
+struct Waits(Mutex<WaitCounts>);
+
+#[derive(Debug, Default)]
+struct WaitCounts {
+    per_actor: HashMap<ActorAddress, usize>,
+    total: usize,
+}
+
+/// The bounds a front's call waits under.
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    /// Calls waiting on one actor (a quarter of the slots, ADR 0023).
+    per_actor: usize,
+    /// Calls waiting from the node's fronts in all: the slots, as many as
+    /// one call per request allows, so that batches (ADR 0025) hold no
+    /// more of the actors' instances than single calls could.
+    per_node: usize,
+}
 
 impl Waits {
-    /// One more call waiting on `target`, unless `bound` already are.
-    fn enter(waits: &Arc<Self>, target: &ActorAddress, bound: usize) -> Option<Waiting> {
-        let mut map = waits.0.lock().unwrap_or_else(|p| p.into_inner());
-        let n = map.entry(target.clone()).or_default();
-        if *n >= bound {
+    /// One more call waiting on `target`, unless a bound is reached: then
+    /// the failure the call gets.
+    fn enter(
+        waits: &Arc<Self>,
+        target: &ActorAddress,
+        bounds: Bounds,
+    ) -> Result<Waiting, &'static str> {
+        let mut counts = waits.0.lock().unwrap_or_else(|p| p.into_inner());
+        if counts.total >= bounds.per_node {
+            return Err(BUSY_NODE);
+        }
+        let n = counts.per_actor.entry(target.clone()).or_default();
+        if *n >= bounds.per_actor {
             if *n == 0 {
-                map.remove(target);
+                counts.per_actor.remove(target);
             }
-            return None;
+            return Err(BUSY);
         }
         *n += 1;
-        Some(Waiting {
+        counts.total += 1;
+        Ok(Waiting {
             waits: Arc::clone(waits),
             target: target.clone(),
         })
@@ -248,12 +281,13 @@ struct Waiting {
 
 impl Drop for Waiting {
     fn drop(&mut self) {
-        let mut map = self.waits.0.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(n) = map.get_mut(&self.target) {
+        let mut counts = self.waits.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = counts.per_actor.get_mut(&self.target) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                map.remove(&self.target);
+                counts.per_actor.remove(&self.target);
             }
+            counts.total = counts.total.saturating_sub(1);
         }
     }
 }
@@ -604,7 +638,10 @@ impl HttpComponent {
             env,
             deadline: tokio::time::Instant::now() + self.wall,
             waits: Arc::clone(&self.waits),
-            per_actor: (self.max_requests / 4).max(1),
+            bounds: Bounds {
+                per_actor: (self.max_requests / 4).max(1),
+                per_node: self.max_requests,
+            },
         }
     }
 

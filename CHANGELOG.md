@@ -60,7 +60,10 @@ Since 0.3.0, in no release yet.
   Each entry is an `actors.call` in every other respect: caller value,
   chain (an entry naming the caller is `reentrant`), routing and signed
   hops between nodes, and from a front, its count against the per-actor
-  bound and in `wasmkeep_front_calls_total`. A batch of more than 16
+  bound and in `wasmkeep_front_calls_total`. The calls a node's fronts
+  have waiting at once are now at most their slots (`front busy: too
+  many front calls waiting on this node`), so batches hold no more actor
+  instances than single calls could. A batch of more than 16
   starts nothing and fails every entry with `failed("too many calls:
   ...")`; its requests together, and its responses together, are capped
   at 16 MiB (`too-large`). Two callees of one batch that call each other

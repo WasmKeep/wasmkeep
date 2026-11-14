@@ -271,7 +271,10 @@ actor of the same tenant and waits for the answer.
   front's call deadline): a front gathering four actors pays about one
   round trip, not four. Each entry is a call in every other respect: its
   caller value, its chain (an entry naming the caller is `reentrant`), its
-  own error, and, from a front, its count against the per-actor bound.
+  own error, and, from a front, its count against the per-actor bound and
+  against the node's bound: the node's fronts have at most as many calls
+  waiting as they have slots (`front busy: too many front calls waiting
+  on this node`).
   The requests of a batch together, and its responses together, are capped
   at 16 MB. A batch's callees are not in each other's chain: two of them
   calling each other wait on each other until the deadline, so do not
