@@ -102,7 +102,7 @@ have not been checked this way yet.
 | Provider | Date | WasmKeep | Verdict |
 | --- | --- | --- | --- |
 | moto 5.2.5 (the S3 server of the test suites, in memory) | 2026-11-14 | `main` after 0.3.0 | safe for WasmKeep |
-| OVHcloud Object Storage (S3 API), from a VPS in the same region | 2026-11-14 | `main` after 0.3.0 | safe for WasmKeep: listings within 14 ms, 16 MiB written in 0.7 s and read in 0.2 s, whole-second last-modified times |
+| OVHcloud Object Storage (S3 API), from a VPS in the same region | 2026-11-14 | `main` after 0.3.0 | safe for WasmKeep (two runs): listings within 14 ms, 16 MiB written in 0.7 to 1.7 s and read in 0.2 s, whole-second last-modified times |
 | Cloudflare R2 | | | not checked yet |
 | AWS S3 | | | not checked yet |
 | MinIO | | | not checked yet |
