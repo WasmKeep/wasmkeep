@@ -367,6 +367,15 @@ fn a_deploy_from_the_file_is_the_file() {
         "built\n"
     );
     let first = current(&bucket, &url_prefix(&url), "acme/shop");
+    // Every rule written in the version, `open` included.
+    let rules = written_rules(&bucket, &url_prefix(&url));
+    assert_eq!(
+        rules,
+        [
+            ("c".to_owned(), "open".to_owned()),
+            ("d".to_owned(), "internal".to_owned())
+        ]
+    );
 
     // The same file again: the same version.
     let (ok, out, err) = from_file(&[]);
@@ -395,7 +404,7 @@ fn a_deploy_from_the_file_is_the_file() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert_ne!(status(addr, "/actor/c/x"), Some(403));
+    assert_eq!(status(addr, "/actor/c/x"), Some(200));
     assert_eq!(status(addr, "/actor/old/x"), Some(404));
 
     // A rollback runs no build and is refused: it would reopen d.
@@ -407,6 +416,26 @@ fn a_deploy_from_the_file_is_the_file() {
         "built\nbuilt\n",
         "a rollback ran a build"
     );
+}
+
+/// The rules the current version of `acme/shop` writes, as `(class, rule)`.
+fn written_rules(bucket: &str, prefix: &str) -> Vec<(String, String)> {
+    let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(
+        object_store::aws::AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .build()
+            .unwrap(),
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let app = wasmkeep_server::apps::AppRef::new(store, prefix, "acme", "shop");
+            let current = app.current().await.unwrap().unwrap();
+            let manifest = app.manifest(&current.version).await.unwrap();
+            manifest.access.into_iter().collect()
+        })
 }
 
 /// The prefix of `s3://bucket/prefix`.

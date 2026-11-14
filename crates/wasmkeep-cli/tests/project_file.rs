@@ -42,6 +42,12 @@ fn wasmkeep(dir: &Path, args: &[&str]) -> (bool, String) {
     )
 }
 
+/// Whether the command got as far as the bucket (and failed there: no
+/// bucket answers for [`NO_BUCKET`]).
+fn reached_the_bucket(out: &str) -> bool {
+    out.contains(&format!("Error: bucket {NO_BUCKET}: "))
+}
+
 fn project(text: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("wasmkeep.toml"), text).unwrap();
@@ -138,6 +144,7 @@ fn a_failed_build_stops_before_the_bucket_and_a_rollback_builds_nothing() {
     // there), without building.
     let (ok, out) = wasmkeep(dir.path(), &["deploy", "--bucket", NO_BUCKET, "--rollback"]);
     assert!(!ok, "{out}");
+    assert!(reached_the_bucket(&out), "{out}");
     assert!(
         !dir.path().join("built").exists(),
         "a rollback ran a build: {out}"
@@ -163,11 +170,26 @@ fn a_failed_build_stops_before_the_bucket_and_a_rollback_builds_nothing() {
     .unwrap();
     let (ok, out) = wasmkeep(dir.path(), &["deploy", "--bucket", NO_BUCKET, "--rollback"]);
     assert!(!ok, "{out}");
+    assert!(reached_the_bucket(&out), "{out}");
     assert!(
         !out.contains("acess"),
         "the rest of the file was read: {out}"
     );
     assert!(!dir.path().join("built").exists(), "{out}");
+    // Not TOML: refused before the bucket, saying how to roll back
+    // without the file.
+    std::fs::write(
+        dir.path().join("wasmkeep.toml"),
+        format!("{APP}[classes.c\n"),
+    )
+    .unwrap();
+    let (ok, out) = wasmkeep(dir.path(), &["deploy", "--bucket", NO_BUCKET, "--rollback"]);
+    assert!(!ok, "{out}");
+    assert!(!reached_the_bucket(&out), "{out}");
+    assert!(
+        out.contains("or pass --no-project --app TENANT/APP --rollback"),
+        "{out}"
+    );
     std::fs::write(
         dir.path().join("wasmkeep.toml"),
         format!("{APP}[classes.c]\ncomponent = \"c.wasm\"\nbuild = \"touch built && exit 7\"\n"),
@@ -195,6 +217,48 @@ fn a_failed_build_stops_before_the_bucket_and_a_rollback_builds_nothing() {
     assert!(!ok, "{out}");
     assert!(!dir.path().join("built").exists(), "{out}");
     assert!(out.contains("c.wasm"), "{out}");
+}
+
+/// A build's output goes to stderr (stdout is the plan), without the
+/// deploy's AWS credentials; a missing configuration file stops the deploy
+/// before any build runs.
+#[test]
+fn builds_print_to_stderr_without_the_bucket_credentials() {
+    let dir = project(&format!(
+        "{APP}[classes.c]\ncomponent = \"c.wasm\"\n\
+         build = \"echo out-$AWS_ACCESS_KEY_ID-$AWS_SECRET_ACCESS_KEY-$AWS_SESSION_TOKEN-$AWS_REGION; exit 7\"\n"
+    ));
+    let out = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+        .current_dir(dir.path())
+        .args(["deploy", "--bucket", NO_BUCKET])
+        .env("AWS_ACCESS_KEY_ID", "key-id")
+        .env("AWS_SECRET_ACCESS_KEY", "hunter2")
+        .env("AWS_SESSION_TOKEN", "session")
+        .env("AWS_REGION", "us-east-1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !stdout.contains("out-"),
+        "the build wrote to stdout: {stdout}"
+    );
+    assert!(stderr.contains("out----us-east-1"), "{stderr}");
+    assert!(stderr.contains("the build of class c failed"), "{stderr}");
+
+    // A configuration file that is not there: before the build.
+    let dir = project(&format!(
+        "{APP}[classes.c]\ncomponent = \"c.wasm\"\nconfig = \"missing.env\"\n\
+         build = \"touch built\"\n"
+    ));
+    let (ok, out) = wasmkeep(dir.path(), &["deploy", "--bucket", NO_BUCKET]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("missing.env"), "{out}");
+    assert!(!dir.path().join("built").exists(), "built first: {out}");
+    assert!(!out.contains("unreachable.invalid"), "{out}");
 }
 
 // `wasmkeep dev` on examples/todo-front's wasmkeep.toml.
@@ -330,4 +394,110 @@ fn dev_runs_the_example_file_with_its_front_rules_and_local_values() {
     let (status, body) = request(dev.addr, "GET", "/api/todos", &auth, "").unwrap();
     assert_eq!(status, 200);
     assert!(body.contains("buy milk"), "{body}");
+}
+
+fn counter_wasm() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(cargo)
+        .current_dir(&root)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--target",
+            "wasm32-wasip2",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "building examples/counter failed");
+    root.join("target/wasm32-wasip2/release/counter.wasm")
+}
+
+/// Waits until `done` holds for `dev`'s directory and log.
+fn wait_for(dev: &Dev, what: &str, done: impl Fn(&Path, &str) -> bool) {
+    let started = Instant::now();
+    while !done(dev.dir.path(), &dev.log()) {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{what}: {}",
+            dev.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `wasmkeep dev` runs an item's build again when its `watch` paths
+/// change and reloads; a failed build keeps the previous version serving
+/// and holds the reload until the item builds again.
+#[test]
+fn dev_rebuilds_on_watch_and_a_failed_build_keeps_the_previous_version() {
+    let wasm = counter_wasm();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib"), "1").unwrap();
+    std::fs::write(
+        dir.path().join("wasmkeep.toml"),
+        format!(
+            "{APP}[classes.c]\ncomponent = \"c.wasm\"\naccess = \"open\"\nwatch = [\"src\"]\n\
+             build = \"test ! -e fail || exit 7; cp '{}' c.wasm; echo b >> builds.txt\"\n",
+            wasm.display()
+        ),
+    )
+    .unwrap();
+    let log_path = dir.path().join("dev.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+        .current_dir(dir.path())
+        .args(["dev", "--listen", "127.0.0.1:0", "--poll-ms", "50"])
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let addr = support::listening_on(&mut child, &log_path, Duration::from_secs(60));
+    let dev = Dev { child, addr, dir };
+    let builds = |d: &Path| {
+        std::fs::read_to_string(d.join("builds.txt"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let reloads = |log: &str| log.matches("reloaded").count();
+    let edit = |n: u64| {
+        let path = dev.dir.path().join("src/lib");
+        std::fs::write(&path, n.to_string()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(10 * n))
+            .unwrap();
+    };
+    assert_eq!(builds(dev.dir.path()), 1, "{}", dev.log());
+    assert_eq!(request(addr, "GET", "/actor/c/x", "", "").unwrap().0, 200);
+
+    // An edit under watch: built again, reloaded.
+    edit(1);
+    wait_for(&dev, "a rebuild and reload", |d, log| {
+        builds(d) == 2 && reloads(log) == 1
+    });
+
+    // A failed build: the previous version keeps serving.
+    std::fs::write(dev.dir.path().join("fail"), "").unwrap();
+    edit(2);
+    wait_for(&dev, "the build failing", |_, log| {
+        log.contains("build failed")
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(reloads(&dev.log()), 1, "{}", dev.log());
+    assert_eq!(request(addr, "GET", "/actor/c/x", "", "").unwrap().0, 200);
+
+    // Fixed: it builds and reloads.
+    std::fs::remove_file(dev.dir.path().join("fail")).unwrap();
+    edit(3);
+    wait_for(&dev, "the fixed build and reload", |d, log| {
+        builds(d) == 3 && reloads(log) == 2
+    });
+    assert_eq!(request(addr, "GET", "/actor/c/x", "", "").unwrap().0, 200);
 }

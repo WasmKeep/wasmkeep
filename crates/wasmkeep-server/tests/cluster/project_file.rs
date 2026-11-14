@@ -5,9 +5,9 @@
 
 use std::collections::BTreeSet;
 
-use wasmkeep_server::apps::{Changes, DeployError, Diff, FrontChange};
+use wasmkeep_server::apps::{Changes, DeployError, Diff, Part};
 
-use super::front_deploys::front_app_node;
+use super::front_deploys::{front_app_node, front_wasm};
 use super::*;
 
 fn vars(text: &str) -> Option<wasmkeep_server::env::Vars> {
@@ -16,27 +16,22 @@ fn vars(text: &str) -> Option<wasmkeep_server::env::Vars> {
 
 /// What a deploy from a file with classes `c` (`open`) and `d` (default:
 /// `internal`), no configuration, no required names and no front asks of
-/// the bucket, as `wasmkeep deploy` builds it.
+/// the bucket, as `wasmkeep deploy` builds it (`Changes::whole`).
 fn file_changes(with_d: bool) -> Changes {
-    let mut classes = vec![("c".to_owned(), counter_wasm().to_vec())];
-    let mut access = vec![("c".to_owned(), "open".to_owned())];
-    let mut config = vec![("c".to_owned(), None)];
-    let mut requires = vec![("c".to_owned(), BTreeSet::new())];
+    let part = |wasm: &[u8]| Part {
+        wasm: wasm.to_vec(),
+        config: None,
+        requires: BTreeSet::new(),
+    };
+    let mut classes = vec![("c".to_owned(), "open".to_owned(), part(counter_wasm()))];
     if with_d {
-        classes.push(("d".to_owned(), test_actor_wasm().to_vec()));
-        access.push(("d".to_owned(), "internal".to_owned()));
-        config.push(("d".to_owned(), None));
-        requires.push(("d".to_owned(), BTreeSet::new()));
+        classes.push((
+            "d".to_owned(),
+            "internal".to_owned(),
+            part(test_actor_wasm()),
+        ));
     }
-    Changes {
-        classes: Some(classes),
-        access,
-        config,
-        requires,
-        front: FrontChange::Remove,
-        every_rule: true,
-        ..Changes::default()
-    }
+    Changes::whole(None, classes)
 }
 
 async fn status_of(addr: SocketAddr, path: &str, want: u16) {
@@ -131,7 +126,7 @@ async fn a_file_deploy_is_the_whole_version_and_writes_every_rule() {
     let node = front_app_node("n1", dir.path(), &store, None).await;
     status_of(node.addr, "/actor/d/x", 403).await;
     let r = send_runnable(node.addr, "GET", "/actor/c/x", "").await;
-    assert_ne!(r.status, 403, "{:?}", r.body);
+    assert_eq!(r.status, 200, "{:?}", r.body);
 
     // The same file again: the same version, and no plan to print.
     let mut called = false;
@@ -231,4 +226,69 @@ async fn writing_an_open_rule_is_shown() {
         plan.unwrap(),
         vec!["access c: open, now written in the version".to_owned()]
     );
+}
+
+/// A file with a front adds the front and an `open` class: the plan says
+/// the added class's rule (never a change from one it did not have) and
+/// that it is reachable past the front; the version writes every rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_with_a_front_and_an_added_open_class() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    let v1 = app.deploy_changes(&rt, file_changes(true)).await.unwrap();
+    let lines = v1.diff.lines();
+    for want in ["class c: added (open)", "class d: added (internal)"] {
+        assert!(lines.contains(&want.to_owned()), "{want}: {lines:?}");
+    }
+    assert!(!lines.iter().any(|l| l.starts_with("access ")), "{lines:?}");
+
+    let part = |wasm: &[u8], requires: &[&str]| Part {
+        wasm: wasm.to_vec(),
+        config: None,
+        requires: requires.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    let changes = Changes::whole(
+        Some(Part {
+            config: Some(wasmkeep_server::env::parse("GREETING=hi").unwrap()),
+            ..part(front_wasm(), &[])
+        }),
+        vec![
+            ("c".into(), "open".into(), part(counter_wasm(), &[])),
+            ("d".into(), "internal".into(), part(test_actor_wasm(), &[])),
+            ("e".into(), "open".into(), part(counter_wasm(), &["TOKEN"])),
+        ],
+    );
+    let mut planned = None;
+    let v2 = app
+        .deploy_changes_with(&rt, changes, |d| {
+            planned = Some(d.lines());
+            true
+        })
+        .await
+        .unwrap();
+    let lines = planned.expect("a plan before the switch");
+    assert_eq!(lines, v2.diff.lines());
+    for want in [
+        "front: added",
+        "class e: added (open)",
+        "config _front: GREETING added",
+        "requires e: TOKEN now required",
+        "class c: open, reachable at /actor/c/<name>, past the front",
+        "class e: open, reachable at /actor/e/<name>, past the front",
+    ] {
+        assert!(lines.contains(&want.to_owned()), "{want}: {lines:?}");
+    }
+    assert!(!lines.iter().any(|l| l.starts_with("access ")), "{lines:?}");
+    // Every rule written, the front's values with it.
+    let m = app.manifest(&v2.current.version).await.unwrap();
+    assert!(m.front.is_some());
+    let rules: Vec<(&str, &str)> = m
+        .access
+        .iter()
+        .map(|(c, r)| (c.as_str(), r.as_str()))
+        .collect();
+    assert_eq!(rules, [("c", "open"), ("d", "internal"), ("e", "open")]);
+    assert!(m.config.contains_key("_front"), "{m:?}");
+    assert_eq!(m.requires["e"], ["TOKEN".to_owned()].into());
 }

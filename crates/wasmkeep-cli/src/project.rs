@@ -217,6 +217,64 @@ fn resolve(dir: &Path, path: &str) -> PathBuf {
     dir.join(path)
 }
 
+/// `path` made absolute (against the current directory) with `.` and `..`
+/// resolved lexically: two spellings of one path compare equal without
+/// touching the disk.
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Whether `a` and `b` are one file: the same device and inode (links
+/// included) or canonical path when both exist, else the same path
+/// lexically.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (ma, mb);
+            if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+                return ca == cb;
+            }
+        }
+    }
+    lexical(a) == lexical(b)
+}
+
+/// Refuses a configuration file that is the `[dev] env` file of local
+/// values: configuration is uploaded in the clear.
+fn not_local_values(project: &Project, what: &str, config: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !same_file(config, &project.dev.env),
+        "{}: {what} config is {}, the [dev] env file of local values ({}): configuration is \
+         stored in the bucket in the clear; give it a file of its own",
+        project.path.display(),
+        config.display(),
+        project.dev.env.display()
+    );
+    Ok(())
+}
+
 fn item(
     src: &Source<'_>,
     dir: &Path,
@@ -259,7 +317,7 @@ fn item(
 /// Parses the file at `path` (its `text`): every key checked, errors with
 /// the file, line, column and key.
 #[cfg(test)]
-fn parse(text: &str, path: &Path) -> Result<Project, String> {
+pub(crate) fn parse(text: &str, path: &Path) -> Result<Project, String> {
     parse_with(text, path, false)
 }
 
@@ -267,6 +325,19 @@ fn parse(text: &str, path: &Path) -> Result<Project, String> {
 /// rest of the file may describe a version not deployed yet, typos
 /// included); the rest is then left empty.
 fn parse_with(text: &str, path: &Path, app_only: bool) -> Result<Project, String> {
+    parse_inner(text, path, app_only).map_err(|e| {
+        if app_only {
+            format!(
+                "{e}; a rollback reads only [app], from a file that is still TOML: fix the \
+                 file, or pass --no-project --app TENANT/APP --rollback"
+            )
+        } else {
+            e
+        }
+    })
+}
+
+fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, String> {
     let src = Source { text, path };
     let root = DeTable::parse(text).map_err(|e| match e.span() {
         Some(span) => format!("{}: {}", src.at(span), e.message().trim()),
@@ -285,17 +356,14 @@ fn parse_with(text: &str, path: &Path, app_only: bool) -> Result<Project, String
         known_keys(&src, root, "the file", TOP)?;
     }
 
-    let app = table(&src, root, "app")?.ok_or_else(|| {
-        format!(
-            "{}: [app] is required, with tenant and name",
-            path.display()
-        )
-    })?;
+    let app = table(&src, root, "app")?
+        .ok_or_else(|| format!("{}: [app] is required, with tenant and name", src.at(0..0)))?;
+    let app_at = get(root, "app").map_or(0..0, |(k, _)| k.span());
     known_keys(&src, app, "[app]", APP)?;
     let mut names = Vec::new();
     for key in APP {
         let value = string(&src, app, key, "[app]")?
-            .ok_or_else(|| format!("{}: [app] {key} is required", path.display()))?;
+            .ok_or_else(|| format!("{}: [app] {key} is required", src.at(app_at.clone())))?;
         if !wasmkeep_runtime::is_identifier(&value) {
             let span = get(app, key).map(|(_, v)| v.span()).unwrap_or(0..0);
             return src.err(
@@ -387,7 +455,7 @@ fn parse_with(text: &str, path: &Path, app_only: bool) -> Result<Project, String
     if front.is_none() && classes.is_empty() {
         return Err(format!(
             "{}: nothing to deploy: give [front] or at least one [classes.<name>]",
-            path.display()
+            src.at(0..0)
         ));
     }
 
@@ -429,7 +497,7 @@ fn parse_with(text: &str, path: &Path, app_only: bool) -> Result<Project, String
             .iter()
             .map(|(n, c)| (format!("[classes.{n}]"), &c.item)),
     ) {
-        if item.config.as_ref() == Some(&dev.env) {
+        if item.config.as_deref().map(lexical) == Some(lexical(&dev.env)) {
             return Err(format!(
                 "{}: {what} config is {}, the [dev] env file of local values: configuration is \
                  stored in the bucket in the clear; give it a file of its own",
@@ -523,22 +591,43 @@ pub(crate) fn app(
     Ok((project.tenant.clone(), project.name.clone()))
 }
 
-/// Runs `command` with the system shell in `dir`, its output on the
-/// terminal.
+/// The deploy's bucket credentials, which a build never sees: it runs
+/// commands from the file, and needs no bucket.
+const HIDDEN_FROM_BUILDS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+
+/// Runs `command` with the system shell in `dir`, its output on stderr
+/// (stdout is the deploy's plan), without the bucket credentials.
 pub(crate) fn run_build(dir: &Path, what: &str, command: &str) -> anyhow::Result<()> {
     eprintln!("building {what}: {command}");
     #[cfg(unix)]
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(dir)
-        .status();
-    #[cfg(not(unix))]
-    let status = std::process::Command::new("cmd")
-        .arg("/C")
-        .arg(command)
-        .current_dir(dir)
-        .status();
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt as _;
+        // As typed: `cmd.exe` parses its own command line, so Rust's
+        // quoting of an argument would reach the command.
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/C").raw_arg(command);
+        cmd
+    };
+    #[cfg(not(any(unix, windows)))]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    };
+    for name in HIDDEN_FROM_BUILDS {
+        cmd.env_remove(name);
+    }
+    let status = cmd.current_dir(dir).stdout(std::io::stderr()).status();
     let status = status.with_context(|| format!("running the build of {what}"))?;
     anyhow::ensure!(
         status.success(),
@@ -560,8 +649,19 @@ pub(crate) fn items(project: &Project) -> Vec<(String, &Item)> {
     out
 }
 
-/// Runs every `build`, the front's first.
+/// Runs every `build`, the front's first, once every configuration file
+/// the project names is there (a missing one fails before any build).
 pub(crate) fn run_builds(project: &Project) -> anyhow::Result<()> {
+    for (what, item) in items(project) {
+        if let Some(config) = &item.config {
+            anyhow::ensure!(
+                config.is_file(),
+                "{what}'s config: {} is not there (named in {})",
+                config.display(),
+                project.path.display()
+            );
+        }
+    }
     for (what, item) in items(project) {
         if let Some(cmd) = &item.build {
             run_build(&project.dir, &what, cmd)?;
@@ -589,6 +689,7 @@ pub(crate) fn read_parts(project: &Project, warn: &mut dyn FnMut(String)) -> any
     let mut config = BTreeMap::new();
     let mut read_config = |scope: &str, item: &Item, what: &str| -> anyhow::Result<()> {
         if let Some(path) = &item.config {
+            not_local_values(project, what, path)?;
             let (vars, _) = wasmkeep_server::env::read_file(path)
                 .map_err(|e| anyhow::anyhow!("{what}'s config: {e}"))?;
             for w in crate::secret_looking(scope, &vars) {
@@ -626,33 +727,33 @@ pub(crate) fn read_parts(project: &Project, warn: &mut dyn FnMut(String)) -> any
 /// rule written, values and required names removed where the file has
 /// none, the front set or removed (ADR 0026).
 pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::apps::Changes {
-    use wasmkeep_server::apps::{Changes, FrontChange};
+    use wasmkeep_server::apps::{Changes, Part};
     let Parts {
         front,
         classes,
         mut config,
     } = parts;
-    let mut changes = Changes {
-        classes: Some(classes),
-        every_rule: true,
-        ..Changes::default()
+    let classes = classes
+        .into_iter()
+        .filter_map(|(name, wasm)| {
+            let class = project.classes.get(&name)?;
+            let part = Part {
+                wasm,
+                config: config.remove(&name),
+                requires: class.item.requires.clone(),
+            };
+            Some((name, class.access.clone(), part))
+        })
+        .collect();
+    let front = match (front, &project.front) {
+        (Some(wasm), Some(item)) => Some(Part {
+            wasm,
+            config: config.remove(crate::FRONT_SCOPE),
+            requires: item.requires.clone(),
+        }),
+        _ => None,
     };
-    for (name, class) in &project.classes {
-        changes.access.push((name.clone(), class.access.clone()));
-        changes.config.push((name.clone(), config.remove(name)));
-        changes
-            .requires
-            .push((name.clone(), class.item.requires.clone()));
-    }
-    match (front, &project.front) {
-        (Some(bytes), Some(item)) => {
-            changes.front = FrontChange::Set(bytes);
-            changes.front_config = Some(config.remove(crate::FRONT_SCOPE));
-            changes.front_requires = Some(item.requires.clone());
-        }
-        _ => changes.front = FrontChange::Remove,
-    }
-    changes
+    Changes::whole(front, classes)
 }
 
 /// What a deploy from the file changes, printed before it switches
@@ -872,11 +973,16 @@ env = ".env.dev"
             assert!(err.contains(want), "{rest:?}: {err}");
             assert!(!err.contains("hunter2"), "a value leaked: {err}");
         }
-        // [app] itself.
+        // [app] itself: at the file's start, or at the table.
         let err = parse_err("[classes.t]\ncomponent='t'\n");
+        assert!(err.starts_with("wasmkeep.toml:1:1: "), "{err}");
         assert!(err.contains("[app] is required"), "{err}");
         let err = parse_err("[app]\ntenant='acme'\n[classes.t]\ncomponent='t'\n");
+        assert!(err.starts_with("wasmkeep.toml:1:2: "), "{err}");
         assert!(err.contains("[app] name is required"), "{err}");
+        let err = parse_err("[app]\ntenant='acme'\nname='x'\n");
+        assert!(err.starts_with("wasmkeep.toml:1:1: "), "{err}");
+        assert!(err.contains("nothing to deploy"), "{err}");
         let err = parse_err("[app]\ntenant='Acme'\nname='x'\n[classes.t]\ncomponent='t'\n");
         assert!(err.starts_with("wasmkeep.toml:2:8"), "{err}");
         let err =
@@ -986,6 +1092,26 @@ env = ".env.dev"
         let err =
             parse_with("[app]\ntenant='acme'\nnmae='todo'\n", Path::new("w"), true).unwrap_err();
         assert!(err.contains("unknown key \"nmae\""), "{err}");
+        // Only the rest's schema is not read: the file must still be
+        // TOML, and the error says how to roll back without it.
+        let err = parse_with(
+            "[app]\ntenant='acme'\nname='todo'\n[classes.a\n",
+            Path::new("w"),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("w:4:"), "{err}");
+        assert!(
+            err.ends_with("or pass --no-project --app TENANT/APP --rollback"),
+            "{err}"
+        );
+        // A normal deploy has no such hint.
+        let err = parse(
+            "[app]\ntenant='acme'\nname='todo'\n[classes.a\n",
+            Path::new("w"),
+        )
+        .unwrap_err();
+        assert!(!err.contains("--rollback"), "{err}");
     }
 
     #[test]
@@ -999,6 +1125,56 @@ env = ".env.dev"
             "{base}[front]\ncomponent='f'\nconfig='local.env'\n[dev]\nenv='local.env'\n"
         ));
         assert!(err.contains("[front] config is"), "{err}");
+        // The same file however it is spelled.
+        let abs = std::env::current_dir().unwrap().join("app/.env.local");
+        for spelled in [
+            "x/../.env.local",
+            "./.env.local",
+            "sub/./../.env.local",
+            abs.to_str().unwrap(),
+        ] {
+            let err = parse(
+                &format!("{base}[classes.c]\ncomponent='c'\nconfig='{spelled}'\n"),
+                Path::new("app/wasmkeep.toml"),
+            )
+            .unwrap_err();
+            assert!(err.contains("[classes.c] config is"), "{spelled}: {err}");
+        }
+        // Another file of the same name elsewhere is not it.
+        assert!(
+            parse(
+                &format!("{base}[classes.c]\ncomponent='c'\nconfig='sub/.env.local'\n"),
+                Path::new("app/wasmkeep.toml"),
+            )
+            .is_ok()
+        );
+    }
+
+    /// Where the configuration is read, a link to the local values file
+    /// (or another spelling the file check cannot see) is refused too.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_the_local_values_file_is_not_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("c.wasm"), b"c").unwrap();
+        std::fs::write(dir.path().join(".env.local"), "TOKEN=hunter2\n").unwrap();
+        std::os::unix::fs::symlink(".env.local", dir.path().join("sym.env")).unwrap();
+        std::fs::hard_link(dir.path().join(".env.local"), dir.path().join("hard.env")).unwrap();
+        for config in ["sym.env", "hard.env"] {
+            let text = format!(
+                "[app]\ntenant='a'\nname='b'\n[classes.c]\ncomponent='c.wasm'\nconfig='{config}'\n"
+            );
+            let p = parse(&text, &dir.path().join(FILE_NAME)).unwrap();
+            let err = read_parts(&p, &mut |_| {}).err().unwrap().to_string();
+            assert!(err.contains("the [dev] env file"), "{config}: {err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+        // A file of its own is read.
+        std::fs::write(dir.path().join("own.env"), "MODE=x\n").unwrap();
+        let text =
+            "[app]\ntenant='a'\nname='b'\n[classes.c]\ncomponent='c.wasm'\nconfig='own.env'\n";
+        let p = parse(text, &dir.path().join(FILE_NAME)).unwrap();
+        assert!(read_parts(&p, &mut |_| {}).is_ok());
     }
 
     #[test]

@@ -853,9 +853,8 @@ pub(crate) fn deploy_warnings(diff: &wasmkeep_server::apps::Diff) -> Vec<String>
     if restricted.is_empty() {
         return out;
     }
-    let ruled: Vec<&str> = diff.rules.iter().map(|(c, _, _)| c.as_str()).collect();
     for added in &diff.added {
-        if !ruled.contains(&added.as_str()) {
+        if diff.added_rule(added) == "open" {
             out.push(format!(
                 "class {added} was added and is open, while {} was removed with a rule: \
                  if it was renamed, give the new class its rule (--access {added}=...)",
@@ -2851,7 +2850,7 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("--access monitors="), "{}", w[0]);
         let ruled = wasmkeep_server::apps::Diff {
-            rules: vec![("monitors".into(), "open".into(), "existing".into())],
+            added_rules: [("monitors".into(), "existing".into())].into(),
             ..diff.clone()
         };
         assert!(super::deploy_warnings(&ruled).is_empty());

@@ -113,7 +113,10 @@ env = ".env.local"              # local values, never committed
   secrets set` (ADR 0016). `[dev] env` is read by `dev` only, never by
   `deploy`, and its default, `.env.local`, is meant for `.gitignore`. A
   `config` naming the `[dev] env` file is refused: it would upload local
-  values in the clear.
+  values in the clear. It is the same file however it is reached: the
+  check compares the files themselves (device and inode, or canonical
+  paths) where the configuration is read, and paths with `.` and `..`
+  resolved when the env file does not exist.
 - **No bucket in the file.** The bucket is where an app is deployed
   (staging, production), not part of the app: `--bucket` stays a flag. A
   deploy names it every time, so the same file deploys anywhere.
@@ -204,7 +207,15 @@ to Rust: `npm run build`, `make`, `tinygo build` are commands like
 - **`--rollback` runs no build** and reads only `[app]` from the file: a
   rollback restores what the bucket holds, and the file may already
   describe a version not deployed yet, typos included, which must not
-  block the way back.
+  block the way back. Only the rest's keys and values go unchecked: the
+  file must still parse as TOML (finding `[app]` in a file that does not
+  parse is a guess, and a wrong guess rolls back another app), and the
+  error then says `--no-project --app TENANT/APP --rollback`.
+- Builds run without the deploy's bucket credentials
+  (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`):
+  a command from the file needs no bucket, and one that does (a build
+  cache) has its own. Their output goes to stderr, so stdout is the
+  plan.
 - Builds are commands from the file, which the person deploying runs as
   themselves, as they would run the repository's `Makefile` or `npm`
   scripts: the file is code of the app's repository, not input from
@@ -232,12 +243,16 @@ would: secrets on a laptop are not scoped (in a deploy, `secrets set
 It runs every `build` at start, then polls each item's `watch` paths
 (files or directories, recursively), its `component` and its `config`:
 
-- a change under `watch` runs the item's `build` again;
+- a change under `watch` runs the item's `build` again; what `watch`
+  names is compared with what it was when the build started, so an edit
+  saved during a build runs another (a build must not write under its
+  own `watch` paths);
 - a change to a component or configuration file (after a build, or from a
   build run elsewhere) reloads the whole app, front and classes swapped
   together as a deploy swaps them;
 - a failed build, or a component that does not link, keeps the previous
-  version serving, and says why.
+  version serving, and says why; after a failed build nothing reloads
+  until that item builds, so parts of two versions never load together.
 
 A change to `wasmkeep.toml` itself needs a restart of `dev`, which says
 so. `wasmkeep dev CRATE...` without a file is unchanged.

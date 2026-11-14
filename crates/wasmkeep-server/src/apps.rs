@@ -1019,6 +1019,61 @@ pub struct Changes {
     pub every_rule: bool,
 }
 
+/// A part of a whole version (a deploy from the project file, ADR 0026):
+/// its component, configuration and required names.
+pub struct Part {
+    pub wasm: Vec<u8>,
+    /// `None` removes the part's configuration.
+    pub config: Option<Vars>,
+    /// Empty removes them.
+    pub requires: std::collections::BTreeSet<String>,
+}
+
+impl std::fmt::Debug for Part {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Part")
+            .field("wasm", &format_args!("{} bytes", self.wasm.len()))
+            .field(
+                "config",
+                &self.config.as_ref().map(|v| v.keys().collect::<Vec<_>>()),
+            )
+            .field("requires", &self.requires)
+            .finish()
+    }
+}
+
+impl Changes {
+    /// The whole version, as a project file gives it (ADR 0026): exactly
+    /// these classes (`(name, rule, part)`, every rule written, `open`
+    /// included), values and required names removed where a part has
+    /// none, the front set or removed.
+    #[must_use]
+    pub fn whole(front: Option<Part>, classes: Vec<(String, String, Part)>) -> Self {
+        let mut changes = Self {
+            classes: Some(Vec::new()),
+            every_rule: true,
+            ..Self::default()
+        };
+        for (name, access, part) in classes {
+            changes.access.push((name.clone(), access));
+            changes.config.push((name.clone(), part.config));
+            changes.requires.push((name.clone(), part.requires));
+            if let Some(table) = changes.classes.as_mut() {
+                table.push((name, part.wasm));
+            }
+        }
+        match front {
+            Some(part) => {
+                changes.front = FrontChange::Set(part.wasm);
+                changes.front_config = Some(part.config);
+                changes.front_requires = Some(part.requires);
+            }
+            None => changes.front = FrontChange::Remove,
+        }
+        changes
+    }
+}
+
 /// What a deploy does with the front (ADR 0023).
 #[derive(Default)]
 pub enum FrontChange {
@@ -1101,12 +1156,16 @@ pub struct Deployed {
 pub struct Diff {
     /// Classes added.
     pub added: Vec<String>,
+    /// Each added class's rule (`open` when it has none): an added class
+    /// has a rule, never a change of rule.
+    pub added_rules: BTreeMap<String, String>,
     /// Classes removed, with their rule if it was not `open`.
     pub removed: Vec<(String, Option<String>)>,
     /// Classes whose code changed.
     pub changed: Vec<String>,
-    /// `(class, before, after)` for each kept or added class whose rule
-    /// changes (`open` when it has none).
+    /// `(class, before, after)` for each kept class whose rule changes
+    /// (`open` when it has none). An added class's rule is in
+    /// `added_rules`.
     pub rules: Vec<(String, String, String)>,
     /// `"class: NAME added"` and the like, names only.
     pub config: Vec<String>,
@@ -1128,6 +1187,12 @@ pub struct Diff {
 }
 
 impl Diff {
+    /// The rule of `class`, added by this change: `open` when it has none.
+    #[must_use]
+    pub fn added_rule(&self, class: &str) -> &str {
+        self.added_rules.get(class).map_or("open", String::as_str)
+    }
+
     fn between(before: Option<(&Manifest, &Settings)>, after: (&Manifest, &Settings)) -> Self {
         let empty_manifest = Manifest {
             previous: None,
@@ -1187,9 +1252,12 @@ impl Diff {
         let front_scope = (am.front.is_some() || bm.front.is_some()).then(|| FRONT.to_owned());
         for class in am.classes.keys().chain(front_scope.as_ref()) {
             let (b, a) = (bs.access.spec(class), as_.access.spec(class));
-            if b != a && class != FRONT {
+            if !bm.classes.contains_key(class) && class != FRONT {
+                diff.added_rules
+                    .insert(class.clone(), a.clone().unwrap_or_else(open));
+            } else if b != a && class != FRONT {
                 let (b, a) = (b.unwrap_or_else(open), a.unwrap_or_else(open));
-                if bm.classes.contains_key(class) && more_open(&bs.access, &as_.access, class) {
+                if more_open(&bs.access, &as_.access, class) {
                     diff.reopened.push(format!("{class} ({b} -> {a})"));
                 }
                 diff.rules.push((class.clone(), b, a));
@@ -1232,7 +1300,11 @@ impl Diff {
     pub fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
         out.extend(self.front.map(|f| format!("front: {f}")));
-        out.extend(self.added.iter().map(|c| format!("class {c}: added")));
+        out.extend(
+            self.added
+                .iter()
+                .map(|c| format!("class {c}: added ({})", self.added_rule(c))),
+        );
         out.extend(self.changed.iter().map(|c| format!("class {c}: new code")));
         out.extend(self.removed.iter().map(|(c, rule)| match rule {
             Some(rule) => format!("class {c}: removed (it was {rule})"),
@@ -1638,6 +1710,53 @@ mod tests {
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
         }
+    }
+
+    /// An added class says its rule, and never a change from a rule it
+    /// never had (`access x: open -> internal` for a class just added).
+    #[test]
+    fn an_added_class_says_its_rule() {
+        let before = two_classes();
+        let mut after = two_classes();
+        for class in ["pub", "priv", "some"] {
+            after.classes.insert(class.into(), "33".into());
+        }
+        after.access.insert("pub".into(), "open".into());
+        let mut rules = AccessRules::default();
+        rules.replace("priv", "internal").unwrap();
+        rules.replace("some", "existing:lobby").unwrap();
+        rules.replace("chat", "existing").unwrap();
+        let settings = Settings {
+            access: rules,
+            config: BTreeMap::new(),
+        };
+        let diff = Diff::between(Some((&before, &Settings::default())), (&after, &settings));
+        let lines = diff.lines();
+        for want in [
+            "class priv: added (internal)",
+            "class pub: added (open)",
+            "class some: added (existing:lobby)",
+            "access chat: open -> existing",
+        ] {
+            assert!(lines.contains(&want.to_owned()), "{want}: {lines:?}");
+        }
+        assert!(
+            !lines.iter().any(|l| l.starts_with("access priv")
+                || l.starts_with("access some")
+                || l.starts_with("access pub")),
+            "{lines:?}"
+        );
+        assert_eq!(diff.added_rule("priv"), "internal");
+        assert_eq!(diff.added_rule("pub"), "open");
+        // A first deploy: every class is added, with its rule.
+        let diff = Diff::between(None, (&after, &settings));
+        assert!(
+            diff.lines()
+                .contains(&"class chat: added (existing)".to_owned()),
+            "{:?}",
+            diff.lines()
+        );
+        assert!(diff.rules.is_empty(), "{:?}", diff.rules);
     }
 
     #[test]
