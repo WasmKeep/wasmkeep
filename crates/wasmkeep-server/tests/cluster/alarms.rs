@@ -662,7 +662,7 @@ async fn er04_a_late_commit_cannot_bring_back_an_alarm_whose_entry_was_cleared()
     let last_id = if std::ptr::eq(last, &b) { "b" } else { "c" };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let alarm = loop {
-        let r = send(last.addr, "GET", "/actor/t/x/alarm", "").await;
+        let r = poll_get(last.addr, "/actor/t/x/alarm").await;
         if r.node.as_deref() == Some(last_id) {
             break r.body.trim().to_owned();
         }

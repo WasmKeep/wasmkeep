@@ -599,6 +599,23 @@ async fn try_send(
     try_exchange(addr, &req).await
 }
 
+/// A GET polled until it is served (a takeover, a restore): [`try_send`],
+/// with no reply at all (a connection closed under load) read as status 0
+/// from no node, the reason in the body. No poll takes that for served, so
+/// it asks again, and its assertions stay what they were. Only for a read
+/// a test sends again until it matches.
+async fn poll_get(addr: SocketAddr, path: &str) -> Reply {
+    try_send(addr, "GET", path, "")
+        .await
+        .unwrap_or_else(|e| Reply {
+            status: 0,
+            node: None,
+            retry_after: None,
+            head: String::new(),
+            body: e,
+        })
+}
+
 /// Sends a raw request (which must close the connection) and reads the reply.
 async fn exchange(addr: SocketAddr, req: &str) -> Reply {
     try_exchange(addr, req).await.unwrap_or_else(|e| {
@@ -762,7 +779,7 @@ async fn durable_write_survives_failover(name: &str) {
     down.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     let r = loop {
-        let r = send(b.addr, "GET", &path, "").await;
+        let r = poll_get(b.addr, &path).await;
         if r.node.as_deref() == Some("b") || started.elapsed() > Duration::from_secs(10) {
             break r;
         }
@@ -1400,7 +1417,7 @@ async fn b_restores(p: &Pair) -> Reply {
     p.flaky.down.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     loop {
-        let r = send(p.b.addr, "GET", "/actor/t/x/durable", "").await;
+        let r = poll_get(p.b.addr, "/actor/t/x/durable").await;
         if r.node.as_deref() == Some("b") || started.elapsed() > Duration::from_secs(10) {
             return r;
         }
@@ -1597,7 +1614,7 @@ async fn never_runs_older_code(fault_first: bool) {
     // load, so allow up to 30 s.
     let started = std::time::Instant::now();
     let r = loop {
-        let r = send(b.addr, "GET", "/actor/c/x/durable", "").await;
+        let r = poll_get(b.addr, "/actor/c/x/durable").await;
         if r.status == 200 || started.elapsed() > Duration::from_secs(30) {
             break r;
         }
@@ -1960,7 +1977,7 @@ async fn trio() -> Trio {
 async fn wait_owns_x(node: &Node, id: &str) {
     let started = std::time::Instant::now();
     loop {
-        let r = send(node.addr, "GET", "/actor/t/x/durable", "").await;
+        let r = poll_get(node.addr, "/actor/t/x/durable").await;
         if r.node.as_deref() == Some(id) {
             return;
         }
