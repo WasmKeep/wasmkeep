@@ -254,7 +254,7 @@ class PublicationPaths(unittest.TestCase):
         self.stage(
             "docs/example.md",
             "crates/*/tests/\nbuild_/logs\ncache/<app>/<version>/component.cwasm\n"
-            "s3://BUCKET[/PREFIX]\n<stage>/docs\n",
+            "s3://BUCKET[/PREFIX]\ngs://BUCKET/PREFIX\naz://ACCOUNT/CONTAINER/PREFIX\n<stage>/docs\n",
         )
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
