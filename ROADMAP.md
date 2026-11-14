@@ -24,6 +24,13 @@ The next release, `0.4.0`: **an app is one thing.**
    is reachable only from inside the app unless it says otherwise.
 4. **Load you can see**: actors and work per node and per app, in the
    metrics and in `wasmkeep cluster status`.
+5. **WebSocket rooms behind a front**: a room with open sockets keeps
+   its node while it hibernates, so a call from the front through another
+   node does not close its sockets.
+
+Then `0.4.1`: **sockets through the front.** The front accepts a
+WebSocket at its own path and hands it to an actor, so a room needs no
+public `/actor/` address.
 
 ## Next
 
@@ -32,13 +39,17 @@ tenants the operator trusts: the limits are protection against a noisy
 neighbour, not isolation from a hostile one
 ([security](docs/security.md)).
 
-1. **Several apps per process**, and a table from hostname to app kept by
+1. **One socket for several actors**: a client opens one WebSocket and the
+   front subscribes it to several actors (its rooms, its notifications),
+   each a channel on that socket. Actors see ordinary sockets, and a slow
+   actor does not hold up the others.
+2. **Several apps per process**, and a table from hostname to app kept by
    the operator.
-2. **Limits per app** on each node, and suspending an app.
-3. **Placement when an actor wakes**: on a node with room, not only where
+3. **Limits per app** on each node, and suspending an app.
+4. **Placement when an actor wakes**: on a node with room, not only where
    its request arrived. Most actors sleep most of the time, so this spreads
    load without moving anything that is running.
-4. **Automatic moves of running actors**, slowly and within limits, if
+5. **Automatic moves of running actors**, slowly and within limits, if
    placement at wake-up is not enough. Until then an operator moves an
    actor or drains a node ([how](docs/cluster.md)).
 
