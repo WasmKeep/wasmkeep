@@ -109,7 +109,8 @@ The database pattern ([guide](database.md),
 handler (the class that owns the tables, with its migrations) and a
 client. Both speak one JSON format, byte for byte the same in every SDK
 that has it, and `db_langs` runs every client against every handler, on
-both TypeScript engines. Newer than `0.4.0` (in no release yet).
+both TypeScript engines. Coming in `0.4.2`, the release after `0.4.1`
+(in no release yet).
 
 | Language | Database handler | Database client |
 | --- | --- | --- |

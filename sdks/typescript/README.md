@@ -252,7 +252,7 @@ the Rust classes; the differences from the Rust API are listed in the
 `db` makes one actor the owner of an app's shared tables, like a
 Cloudflare D1 database
 (the guide is `docs/database.md` in the repository, the design ADR 0029;
-newer than `0.4.0`).
+coming in the release after `0.4.1`).
 The class is one call; deploy it `internal`:
 
 ```ts

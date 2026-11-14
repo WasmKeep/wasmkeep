@@ -117,7 +117,7 @@ earlier ones finish.
 
 `db` makes one actor the owner of an app's shared tables
 (the guide is `docs/database.md` in the repository, the design ADR 0029;
-newer than `0.4.0`).
+coming in the release after `0.4.1`).
 The class mounts the handler and lists its schema; deploy it `internal`:
 
 ```rust
