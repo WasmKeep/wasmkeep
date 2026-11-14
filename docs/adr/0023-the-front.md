@@ -1,6 +1,6 @@
 # 0023. The front
 
-- Status: proposed
+- Status: accepted (2026-11-14), planned for 0.4.0
 - Date: 2026-11-14
 - Release: [0.4.0](../../ROADMAP.md#now)
 - Follows: [ADR 0021](0021-the-app-model.md) ("Front") and
@@ -183,7 +183,7 @@ front's paths (see "The WebSocket hand-off").
   reaches the callee unchanged. One rule for every caller.
 - **Responses from the front**: the host removes every `x-wasmkeep-`
   header from the front's response before the client gets it. This
-  reserves the range for the host's own answers, including the 0.5.0
+  reserves the range for the host's own answers, including the 0.4.1
   hand-off's control header, from the first release with a front.
 
 ### Host and scheme
@@ -388,6 +388,8 @@ front answers the same 503.
 - `wasmkeep_front_request_seconds`: a histogram, to the response's last
   byte.
 - `wasmkeep_front_slots_in_use`: a gauge.
+- The counters and the histogram carry `tenant` and `app`, like the other
+  series of the app's work.
 - `wasmkeep_front_calls_total{outcome}`: `ok`, `busy` (the per-actor
   bound), `timeout`, `failed`.
 - A front's calls to another node are already counted by
@@ -413,8 +415,8 @@ any node's front may wake a hibernated room, and every client of that
 room reconnects. On one node nothing changes.
 
 So the front is not recommended for classes with sockets on a cluster
-until a separate ADR decides where an actor with open sockets wakes,
-with its simulation case and review. Until then the docs say: reach
+until a separate ADR, planned for the same release, decides where an
+actor with open sockets wakes, with its simulation case and review. Until then the docs say: reach
 socket classes at `/actor/<class>/<name>` with a hashing balancer. The
 mechanism is not chosen here; keeping ownership across hibernation is
 the alternative ADR 0020 rejected.
@@ -423,7 +425,7 @@ the alternative ADR 0020 rejected.
 
 A WebSocket at one of the front's own paths needs the host to take
 the upgrade and open the socket on an actor the front names. It is
-planned for 0.5.0, in its own ADR. 0.4.0 reserves what it needs:
+planned for 0.4.1, in its own ADR. 0.4.0 reserves what it needs:
 
 - the `x-wasmkeep-` range on requests to the front, where the host will
   mark an upgrade, and on responses from the front, where the front will
@@ -520,9 +522,9 @@ it.
 - `wasmkeep dev` with a front.
 - Where an actor with open sockets wakes (its own ADR, a gate for
   clustered use).
-- The WebSocket hand-off through the front (0.5.0, its own ADR).
+- The WebSocket hand-off through the front (0.4.1, its own ADR), and one
+  client socket for several actors (0.5.0, its own ADR).
 - Front targets for Python, Go, C, Zig, D and MoonBit.
-- Metric labels by tenant, app and class (the "load you can see" work).
 - A call that does not create the actor, streaming or concurrent calls,
   and several fronts per app.
 - The front's cost per request in interpreted languages: a fresh
