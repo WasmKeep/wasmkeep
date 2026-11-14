@@ -71,6 +71,8 @@ mod front;
 mod front_deploys;
 #[path = "front_sockets.rs"]
 mod front_sockets;
+#[path = "listings.rs"]
+mod listings;
 #[path = "migrate.rs"]
 mod migrate;
 #[path = "node_leases.rs"]
@@ -1424,6 +1426,7 @@ async fn drain(store: &Arc<dyn ObjectStore>, id: &str) {
     use object_store::ObjectStoreExt as _;
     let marker = object_store::path::Path::from(format!("control/drain/{id}"));
     store.put(&marker, Vec::new().into()).await.unwrap();
+    announce_intent(store).await;
     let key = object_store::path::Path::from(format!("nodes/{id}"));
     let started = std::time::Instant::now();
     loop {
@@ -1480,6 +1483,7 @@ async fn request_move_of(
     .unwrap();
     let path = object_store::path::Path::from(key);
     store.put(&path, Vec::new().into()).await.unwrap();
+    announce_intent(store).await;
     path
 }
 
@@ -1500,7 +1504,20 @@ async fn request_delete_of(
     .unwrap();
     let path = object_store::path::Path::from(key);
     store.put(&path, Vec::new().into()).await.unwrap();
+    announce_intent(store).await;
     path
+}
+
+/// Rewrites `control/changed` as `cluster drain`, `undrain`, `actor
+/// move` and `actor delete` do after their intent (ADR 0014, amendment of 2026-11-14): nodes
+/// list the intents at their next period.
+async fn announce_intent(store: &Arc<dyn ObjectStore>) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(store), "");
+    let token = format!("test {} {}", now_ms(), N.fetch_add(1, Ordering::Relaxed));
+    wasmkeep_cluster::control::announce(&keys, &token)
+        .await
+        .unwrap();
 }
 
 /// Waits (10 s at most) until `cond` holds.

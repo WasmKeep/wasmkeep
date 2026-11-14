@@ -5,7 +5,8 @@ use super::*;
 /// ADR 0014: the operator's drain marker reaches the node's heartbeat
 /// (`drained` at once: it holds no actors); a failed listing of `control/`
 /// keeps the node drained (it never undrains on its own); removing the
-/// marker returns it to serving.
+/// marker returns it to serving. The marker is written without
+/// `control/changed`, as a CLI of 0.4.1 does: read by the fallback.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_marker_reaches_the_heartbeat_and_a_failed_listing_keeps_it() {
     use object_store::ObjectStoreExt as _;
@@ -31,6 +32,9 @@ async fn a_drain_marker_reaches_the_heartbeat_and_a_failed_listing_keeps_it() {
 
     fail_list.store(true, Ordering::SeqCst);
     store.delete(&marker).await.unwrap();
+    // As the CLI does (ADR 0014, amendment of 2026-11-14): the node lists
+    // at its next period, and that listing fails.
+    announce_intent(&store).await;
     // Several heartbeats with the listing failing: still draining.
     tokio::time::sleep(Duration::from_millis(600)).await;
     wait_drain_line(&store, "a", "drained").await;
@@ -228,6 +232,7 @@ async fn a_drained_node_holds_no_alarm_it_was_handed() {
         .delete(&object_store::path::Path::from("control/drain/a"))
         .await
         .unwrap();
+    announce_intent(&store).await;
     wait_drain_line(&store, "a", "serving").await;
     settle().await;
     // b, holding only the alarm (not the actor), drains and is stopped.

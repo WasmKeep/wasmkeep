@@ -684,7 +684,7 @@ pub(super) const SWEEP_DELIVER: usize = 256;
 
 pub(super) const SWEEP_SCAN: usize = 2_048;
 
-/// Every `alarm_sweep`, reads the bucket's alarm index up to "now minus a
+/// Reads the bucket's alarm index up to "now minus a
 /// lease period plus grace" and delivers what it finds: by then the owner
 /// had fired those alarms (or moved them, retries included), or it is gone
 /// and the actor's lease is free. The live nodes share the work by a hash
@@ -699,6 +699,14 @@ pub(super) const SWEEP_SCAN: usize = 2_048;
 /// alarm event, which takes the actor (restoring it from the bucket) and
 /// checks its committed alarm. A time this node already has registered
 /// earlier, or within the longest backoff, keeps priority.
+///
+/// When (ADR 0009, amendment of 2026-11-14): `alarm_sweep` after a sweep
+/// that found entries due, failed or stopped at its scan cap; otherwise
+/// when the earliest entry it listed becomes the sweep's, at least
+/// `alarm_sweep` and at most [`alarm_index::IDLE_SWEEP_FACTOR`] times it
+/// later ([`alarm_index::next_sweep_wait_ms`]); and at once when the view
+/// of the nodes changes (a node joined, left, went stale, was fenced or
+/// released), at most once per `alarm_sweep`.
 pub(super) async fn sweep_alarms(
     service: std::sync::Weak<ServiceInner>,
     cluster: Arc<Cluster>,
@@ -707,8 +715,20 @@ pub(super) async fn sweep_alarms(
 ) {
     let overdue = u64::try_from(cluster.alarm_overdue.as_millis()).unwrap_or(u64::MAX);
     let mut cursor: Option<object_store::path::Path> = None;
+    let period = cluster.alarm_sweep;
+    let period_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX);
+    let mut wait = period;
     loop {
-        tokio::time::sleep(cluster.alarm_sweep).await;
+        let started = tokio::time::Instant::now();
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = cluster.view_changed.notified() => {
+                // At most one sweep a period, the cadence before the
+                // amendment.
+                tokio::time::sleep_until(started + period.min(wait)).await;
+                tracing::debug!("alarm sweep: the view of the nodes changed");
+            }
+        }
         let Some(inner) = service.upgrade() else {
             return;
         };
@@ -720,11 +740,27 @@ pub(super) async fn sweep_alarms(
             now.saturating_sub(overdue),
             now.saturating_sub(overdue.saturating_mul(3)),
         );
+        let resumed = cursor.is_some();
         match cluster
-            .alarms_due_before(before, cursor.as_ref(), SWEEP_SCAN)
+            .alarm_page(before, cursor.as_ref(), SWEEP_SCAN)
             .await
         {
-            Ok((due, next)) => {
+            Ok(crate::cluster::AlarmPage { due, next, next_at }) => {
+                // A backlog (entries due, a page cut at the cap, or one
+                // resumed after an earlier page, whose skipped entries
+                // stay due) keeps the period; otherwise wait for the
+                // earliest entry.
+                let found = if due.is_empty() && next.is_none() && !resumed {
+                    SweepFound::Idle { next_at }
+                } else {
+                    SweepFound::Backlog
+                };
+                wait = Duration::from_millis(alarm_index::next_sweep_wait_ms(
+                    found,
+                    now_ms(),
+                    period_ms,
+                    overdue,
+                ));
                 // Entries this node would deliver for nothing (in flight,
                 // backing off, registered soon) do not count against the
                 // cap: actors that cannot start stay in the index.
@@ -779,6 +815,7 @@ pub(super) async fn sweep_alarms(
             }
             Err(e) => {
                 cursor = None;
+                wait = period;
                 tracing::warn!(error = %e, "alarm sweep: listing the index failed");
             }
         }

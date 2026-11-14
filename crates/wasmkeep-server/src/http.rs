@@ -79,6 +79,12 @@ impl App {
             let get = matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
             return match req.uri().path() {
                 HEALTH_PATH if get => text_response(StatusCode::OK, "ok\n"),
+                // A peer that just started (ADR 0011, amendment of
+                // 2026-11-14).
+                crate::cluster::HELLO_PATH => match &self.actors {
+                    Some(actors) => actors.hello(req).await,
+                    None => text_response(StatusCode::NOT_FOUND, "not found\n"),
+                },
                 READY_PATH if get => match self.actors.as_ref().and_then(ActorService::not_ready) {
                     None => text_response(StatusCode::OK, "ready\n"),
                     // Why stays on the private metrics page: this port faces
@@ -487,7 +493,10 @@ pub(crate) struct ArrivedOnClusterPort(pub(crate) ClusterPeer);
 /// What the cluster port serves: actor paths, and the health and readiness
 /// checks; nothing else (no front, no metrics).
 fn cluster_serves(path: &str) -> bool {
-    path.starts_with("/actor/") || path == HEALTH_PATH || path == READY_PATH
+    path.starts_with("/actor/")
+        || path == HEALTH_PATH
+        || path == READY_PATH
+        || path == crate::cluster::HELLO_PATH
 }
 
 /// Serves the public `listener` and, if given, the cluster port, until

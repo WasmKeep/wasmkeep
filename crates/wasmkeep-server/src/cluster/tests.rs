@@ -983,13 +983,13 @@ async fn connection_pools_are_dropped_when_an_address_changes_hands() {
         }
     };
     publish(1).await;
-    a.refresh_view().await;
+    a.refresh_view(true).await;
     let first = a.clients();
     publish(1).await;
-    a.refresh_view().await;
+    a.refresh_view(true).await;
     assert!(Arc::ptr_eq(&first, &a.clients()), "same pins: pools kept");
     publish(2).await;
-    a.refresh_view().await;
+    a.refresh_view(true).await;
     assert!(!Arc::ptr_eq(&first, &a.clients()), "new pin: pools dropped");
     // And a trusted address whose heartbeat expired is not sent to,
     // even on a pooled connection.
@@ -1100,6 +1100,89 @@ async fn refuse_mode_honours_node_signatures_on_the_cluster_port_only() {
     }
     assert!(accept.is_internal(&method, path, &headers, false).is_some());
     assert!(refuse.is_internal(&method, path, &headers, false).is_none());
+}
+
+/// ADR 0011, amendment of 2026-11-14: a hello asks for a listing only as
+/// a node's signed call to this node, with an empty body, once; anything
+/// else is refused and asks for nothing.
+#[tokio::test]
+async fn only_a_nodes_signed_hello_asks_for_a_listing() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let secret = "ab".repeat(32);
+    store
+        .put(
+            &StorePath::from(SECRET_KEY),
+            secret.clone().into_bytes().into(),
+        )
+        .await
+        .unwrap();
+    let mut config = ClusterConfig::new("a", "http://a", store);
+    config.heartbeat = Duration::from_secs(3_600);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+    a.load_secret().await;
+    let wanted = |c: &Cluster| {
+        c.listing_wanted
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    };
+    wanted(&a);
+    let post = hyper::Method::POST;
+    let signed = |to: &str, nonce: &str, body: &[u8], path: &str| {
+        let ts = now_ms();
+        let hash = body_sha256(body);
+        let mut headers = hyper::HeaderMap::new();
+        let mac = signature(&secret, ts, nonce, to, &post, path, &hash, &headers);
+        headers.insert(
+            INTERNAL,
+            format!("v4 {ts} {nonce} {hash} {mac}").parse().unwrap(),
+        );
+        headers
+    };
+    // Unsigned.
+    let none = hyper::HeaderMap::new();
+    assert_eq!(
+        a.hello_received(&post, &none, b"", true),
+        StatusCode::FORBIDDEN
+    );
+    // Signed for another node, another path, or another body.
+    for (headers, body) in [
+        (signed("b", "b1", b"", HELLO_PATH), &b""[..]),
+        (signed("a", "b2", b"", "/actor/u/x/"), &b""[..]),
+        (signed("a", "b3", b"", HELLO_PATH), &b"x"[..]),
+    ] {
+        assert_eq!(
+            a.hello_received(&post, &headers, body, true),
+            StatusCode::FORBIDDEN
+        );
+    }
+    // Another method than the one signed.
+    let headers = signed("a", "b4", b"", HELLO_PATH);
+    assert_eq!(
+        a.hello_received(&hyper::Method::GET, &headers, b"", true),
+        StatusCode::FORBIDDEN
+    );
+    assert!(!wanted(&a), "a refused hello asked for a listing");
+    // A node's hello: a listing; the same again (a replay): refused.
+    let headers = signed("a", "b5", b"", HELLO_PATH);
+    assert_eq!(a.hello_received(&post, &headers, b"", true), StatusCode::OK);
+    assert!(wanted(&a));
+    assert_eq!(
+        a.hello_received(&post, &headers, b"", true),
+        StatusCode::FORBIDDEN
+    );
+    assert!(!wanted(&a));
+    // In refuse mode, never on the public port.
+    config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
+    config.cluster_plaintext = ClusterPlaintext::Refuse;
+    let refuse = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+    refuse.load_secret().await;
+    wanted(&refuse);
+    let headers = signed("a", "b6", b"", HELLO_PATH);
+    assert_eq!(
+        refuse.hello_received(&post, &headers, b"", false),
+        StatusCode::FORBIDDEN
+    );
+    assert!(!wanted(&refuse));
 }
 
 #[tokio::test]
@@ -1843,13 +1926,13 @@ async fn a_fenced_node_s_pins_are_not_trusted() {
         .put(&key, body("live").into_bytes().into())
         .await
         .unwrap();
-    a.refresh_view().await;
+    a.refresh_view(true).await;
     assert_eq!(a.check_tls_target("https://b.test:7443"), Ok(()));
     store
         .put(&key, body("fenced").into_bytes().into())
         .await
         .unwrap();
-    a.refresh_view().await;
+    a.refresh_view(true).await;
     assert!(a.check_tls_target("https://b.test:7443").is_err());
 }
 
@@ -1941,7 +2024,7 @@ async fn a_hung_fence_does_not_hold_up_the_listing() {
     a.validity.set_until(Some(now + 4 * attempt));
     // b's fence write will hang.
     gate.hang.store(true, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(1), a.refresh_view())
+    tokio::time::timeout(Duration::from_secs(1), a.refresh_view(true))
         .await
         .expect("the listing waited for the fence");
     let started = std::time::Instant::now();

@@ -9,7 +9,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
-use wasmkeep_cluster::alarm_index::{self, Entry, SweepClaim};
+use wasmkeep_cluster::alarm_index::{self, Entry, SweepClaim, SweepFound};
 use wasmkeep_runtime::{
     ActorAddress, BoxError, CpuMeter, MailboxConfig, MailboxError, Mailboxes, Residency, Runtime,
 };
@@ -680,6 +680,34 @@ impl ActorService {
         // takes no actor.
         if let Some(cluster) = &self.inner.cluster {
             cluster.failover.close();
+        }
+    }
+
+    /// A peer's hello (ADR 0011, amendment of 2026-11-14): 200 if it is a
+    /// node's signed call, 403 otherwise, 404 outside a cluster.
+    pub(crate) async fn hello(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+    ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
+        use http_body_util::BodyExt as _;
+        let Some(cluster) = self.inner.cluster.as_ref() else {
+            return crate::http::text_response(hyper::StatusCode::NOT_FOUND, "not found\n");
+        };
+        let on_cluster_port = req
+            .extensions()
+            .get::<crate::http::ArrivedOnClusterPort>()
+            .is_some();
+        let (parts, body) = req.into_parts();
+        // A hello's body is empty: anything longer is not one.
+        let body = match http_body_util::Limited::new(body, 64).collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(_) => {
+                return crate::http::text_response(hyper::StatusCode::FORBIDDEN, "not a hello\n");
+            }
+        };
+        match cluster.hello_received(&parts.method, &parts.headers, &body, on_cluster_port) {
+            hyper::StatusCode::OK => crate::http::text_response(hyper::StatusCode::OK, "hello\n"),
+            status => crate::http::text_response(status, "not a hello\n"),
         }
     }
 

@@ -28,6 +28,17 @@
 //! anyone's entries (liveness), and own entries first with no share kept
 //! for anyone's (liveness, behind actors that cannot start).
 //!
+//! The sweeps are spaced by the real rule (ADR 0009, amendment of
+//! 2026-11-14: `alarm_index::next_sweep_wait_ms`): a period after a sweep
+//! with entries due, otherwise until the earliest entry listed is the
+//! sweep's, within one to six periods; a change in the node's view (the
+//! lingering node's) wakes it, at most once a period. A light run (no
+//! backlog, agreeing views, alarms coming due over 20 s) checks the
+//! latency that rule promises: every entry delivered within a period (and
+//! the drift) and the delivery's own time of becoming the sweep's. An
+//! idle sweep that always waits its longest, ignoring the earliest entry,
+//! must be caught by that check.
+//!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --test madsim_alarm_sweep --target-dir target/madsim`
 
 #![cfg(madsim)]
@@ -39,7 +50,7 @@ use std::time::Duration;
 
 use madsim::runtime::Runtime;
 use madsim::time::{Instant, sleep};
-use wasmkeep_cluster::alarm_index::{self, SweepClaim, SweepPlan};
+use wasmkeep_cluster::alarm_index::{self, SweepClaim, SweepFound, SweepPlan};
 use wasmkeep_sim::rng::Rng;
 
 /// Most deliveries per sweep and entries read per sweep (the server's 256
@@ -75,6 +86,15 @@ enum Rule {
     NoReserve,
 }
 
+/// How the next sweep is timed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Schedule {
+    /// The production rule.
+    Adaptive,
+    /// Unsafe for latency: an idle sweep always waits the longest.
+    IdleLongest,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Views {
     /// Both survivors see each other only.
@@ -96,6 +116,8 @@ struct Outcome {
     drained_ms: u64,
     /// Deliveries that found the actor's lease held by the other node.
     not_owner: u64,
+    /// The latest an entry went after its due time (ms).
+    late_ms: u64,
 }
 
 fn fnv(actor: u64) -> u64 {
@@ -154,6 +176,7 @@ struct World {
     leases: Mutex<HashMap<u64, (usize, u64)>>,
     not_owner: Mutex<u64>,
     drained_ms: Mutex<u64>,
+    late_ms: Mutex<u64>,
     /// Actors that cannot start: their entries never leave.
     poisoned: HashSet<u64>,
 }
@@ -175,10 +198,10 @@ fn view(views: Views, node: usize, now: u64, linger_ms: u64) -> Vec<usize> {
     }
 }
 
-/// `alarms_due_before`: entries after `after` due before `before`, at most
+/// `alarm_page`: entries after `after` due before `before`, at most
 /// `SCAN`, with the key to resume from (`None` once it reached entries not
-/// yet due, or the end).
-fn list(world: &World, before: u64, after: Option<Key>) -> (Vec<Key>, Option<Key>) {
+/// yet due, or the end), and the due time of the first entry not due.
+fn list(world: &World, before: u64, after: Option<Key>) -> (Vec<Key>, Option<Key>, Option<u64>) {
     let index = world.index.lock().unwrap();
     let mut due = Vec::new();
     let range = match after {
@@ -187,14 +210,14 @@ fn list(world: &World, before: u64, after: Option<Key>) -> (Vec<Key>, Option<Key
     };
     for (&key, ()) in range {
         if key.0 >= before {
-            return (due, None);
+            return (due, None, Some(key.0));
         }
         due.push(key);
         if due.len() >= SCAN {
-            return (due, Some(key));
+            return (due, Some(key), None);
         }
     }
-    (due, None)
+    (due, None, None)
 }
 
 /// Returns whether the actor is done with (its in-flight mark can go): not
@@ -226,14 +249,18 @@ async fn deliver(world: Arc<World>, node: usize, key: Key, rng: &mut Rng) -> boo
         let now = world.now();
         let mut drained = world.drained_ms.lock().unwrap();
         *drained = (*drained).max(now);
+        let mut late = world.late_ms.lock().unwrap();
+        *late = (*late).max(now.saturating_sub(key.0));
     }
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sweeper(
     world: Arc<World>,
     node: usize,
     rule: Rule,
+    schedule: Schedule,
     views: Views,
     linger_ms: u64,
     seed: u64,
@@ -242,15 +269,36 @@ async fn sweeper(
     let in_flight: Arc<Mutex<HashSet<u64>>> = Arc::default();
     let mut cursor: Option<Key> = None;
     sleep(Duration::from_millis(rng.below(SWEEP_MS))).await;
+    let mut wait = SWEEP_MS;
     loop {
-        // Real sweeps drift a little.
-        sleep(Duration::from_millis(SWEEP_MS - 20 + rng.below(40))).await;
+        // Real sweeps drift a little. A change in this node's view (the
+        // lingering node dropping the dead one) ends the wait, at most a
+        // period after the last sweep.
+        let slept = world.now();
+        let mut until = slept + wait - 20 + rng.below(40);
+        let changes = views == Views::Lingering && node == 0 && slept < linger_ms;
+        if changes && linger_ms < until {
+            until = until.min(linger_ms.max(slept + SWEEP_MS - 20 + rng.below(40)));
+        }
+        sleep(Duration::from_millis(until.saturating_sub(slept))).await;
         let now = world.now();
         let (before, anyones) = (
             now.saturating_sub(OVERDUE_MS),
             now.saturating_sub(3 * OVERDUE_MS),
         );
-        let (due, next) = list(&world, before, cursor);
+        let resumed = cursor.is_some();
+        let (due, next, next_at) = list(&world, before, cursor);
+        let found = if due.is_empty() && next.is_none() && !resumed {
+            SweepFound::Idle {
+                next_at: match schedule {
+                    Schedule::Adaptive => next_at,
+                    Schedule::IdleLongest => None,
+                },
+            }
+        } else {
+            SweepFound::Backlog
+        };
+        wait = alarm_index::next_sweep_wait_ms(found, now, SWEEP_MS, OVERDUE_MS);
         let nodes = view(views, node, now, linger_ms);
         let me = nodes.iter().position(|&n| n == node).unwrap();
         let claims: Vec<SweepClaim> = due
@@ -305,18 +353,23 @@ async fn sweeper(
 }
 
 fn simulate(seed: u64, rule: Rule) -> Outcome {
+    simulate_with(seed, rule, Schedule::Adaptive, BACKLOG)
+}
+
+fn simulate_with(seed: u64, rule: Rule, schedule: Schedule, backlog: u64) -> Outcome {
     let runtime = Runtime::with_seed_and_config(seed, madsim::Config::default());
     runtime.block_on(async move {
         let mut rng = Rng::new(seed);
-        let views = match seed % 4 {
-            0 => Views::Agree,
-            1 => Views::Lingering,
-            2 => Views::StuckOwner,
+        let views = match (backlog, seed % 4) {
+            // The light run: agreeing views, latency checked.
+            (0, _) | (_, 0) => Views::Agree,
+            (_, 1) => Views::Lingering,
+            (_, 2) => Views::StuckOwner,
             _ => Views::Poisoned,
         };
         let linger_ms = rng.below(10_000);
         let mut index = BTreeMap::new();
-        for actor in 0..BACKLOG {
+        for actor in 0..backlog {
             index.insert((rng.below(BACKLOG_SPREAD_MS), actor), ());
         }
         for actor in BACKLOG..BACKLOG + LATER {
@@ -341,6 +394,7 @@ fn simulate(seed: u64, rule: Rule) -> Outcome {
             ),
             not_owner: Mutex::default(),
             drained_ms: Mutex::default(),
+            late_ms: Mutex::default(),
             poisoned,
         });
         let nodes: Vec<_> = (0..2)
@@ -349,6 +403,7 @@ fn simulate(seed: u64, rule: Rule) -> Outcome {
                     Arc::clone(&world),
                     node,
                     rule,
+                    schedule,
                     views,
                     linger_ms,
                     seed,
@@ -371,11 +426,13 @@ fn simulate(seed: u64, rule: Rule) -> Outcome {
         let left = left(&world);
         let drained_ms = *world.drained_ms.lock().unwrap();
         let not_owner = *world.not_owner.lock().unwrap();
+        let late_ms = *world.late_ms.lock().unwrap();
         Outcome {
             views,
             left,
             drained_ms,
             not_owner,
+            late_ms,
         }
     })
 }
@@ -455,6 +512,36 @@ fn the_unsafe_sweep_rules_are_caught() {
             .any(|seed| violation(&simulate(seed, rule)).is_some_and(|(b, _)| b == breaks));
         assert!(caught, "{rule:?} never broke {breaks:?} in {seeds} seeds");
     }
+}
+
+/// The light run's bound: an entry is the sweep's `OVERDUE_MS` after its
+/// due time; the next sweep comes at most a period (and its drift) later,
+/// then the delivery takes its time (at most 50 + 1,500 ms here).
+const LATE_BOUND_MS: u64 = OVERDUE_MS + SWEEP_MS + 20 + 1_550;
+
+#[test]
+fn an_idle_sweep_delivers_each_alarm_within_a_period_of_its_turn() {
+    for seed in 0..seeds() {
+        let outcome = simulate_with(seed, Rule::Planned, Schedule::Adaptive, 0);
+        assert_eq!(outcome.left, 0, "seed {seed}: {outcome:?}");
+        assert!(
+            outcome.late_ms <= LATE_BOUND_MS,
+            "seed {seed}: an entry went {} ms after its due time, over {LATE_BOUND_MS}",
+            outcome.late_ms
+        );
+    }
+}
+
+#[test]
+fn an_idle_sweep_that_ignores_the_earliest_entry_is_caught() {
+    let seeds = seeds().clamp(4, 24);
+    let caught = (0..seeds).any(|seed| {
+        simulate_with(seed, Rule::Planned, Schedule::IdleLongest, 0).late_ms > LATE_BOUND_MS
+    });
+    assert!(
+        caught,
+        "waiting the longest was never late in {seeds} seeds"
+    );
 }
 
 #[test]
