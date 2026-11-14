@@ -707,9 +707,14 @@ impl Cluster {
 
     /// Sends a release once; if it did not land, it waits in the pending
     /// set.
-    async fn release_or_park(&self, hold: Hold) {
-        if self.send_release(&hold).await == Released::Pending {
-            self.pending.push(PendingEntry::Release(hold));
+    async fn release_or_park(&self, hold: Hold) -> LeaseReturn {
+        match self.send_release(&hold).await {
+            Released::Released => LeaseReturn::Released,
+            Released::Superseded => LeaseReturn::Superseded,
+            Released::Pending | Released::Unchanged => {
+                self.pending.push(PendingEntry::Release(hold));
+                LeaseReturn::Pending
+            }
         }
     }
 
@@ -757,18 +762,21 @@ impl Cluster {
     /// actor's lock (a wake takes it too), and counts it for `reason`; a
     /// release that does not land waits in the pending set. Counted as in
     /// flight from before the parked set is touched: the node never reads
-    /// as having nothing pending in between.
-    pub(crate) async fn release_parked(&self, address: &ActorAddress, reason: &str) {
+    /// as having nothing pending in between. What the release did, or
+    /// `None` if nothing was parked (never parked, or a wake took it).
+    pub(crate) async fn release_parked(
+        &self,
+        address: &ActorAddress,
+        reason: &str,
+    ) -> Option<LeaseReturn> {
         let key = self.owner_key(address);
         let _in_flight = InFlight::start(&self.pending.in_flight);
         let lock = self.pending.lock_of(&key);
         let _locked = lock.lock().await;
-        let Some(hold) = self.pending.take_parked(&key, None) else {
-            return;
-        };
+        let hold = self.pending.take_parked(&key, None)?;
         crate::metrics::parked_released(reason, 1);
         tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), reason, "released a parked record");
-        self.release_or_park(hold).await;
+        Some(self.release_or_park(hold).await)
     }
 
     /// Releases every parked record (a drain, a clean stop).
@@ -777,7 +785,9 @@ impl Cluster {
         futures_util::StreamExt::for_each_concurrent(
             futures_util::stream::iter(all),
             PENDING_CONCURRENCY,
-            |(address, _)| async move { self.release_parked(&address, reason).await },
+            |(address, _)| async move {
+                let _ = self.release_parked(&address, reason).await;
+            },
         )
         .await;
     }

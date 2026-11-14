@@ -402,8 +402,17 @@ async fn move_one(
 }
 
 /// The owner's side of a move of a parked room (ADR 0024). Whether the
-/// request is finished; `false` keeps it for a later pass, the room then
-/// free (its next event claims it wherever it lands).
+/// request is finished; `false` keeps it for a later pass.
+///
+/// The move is recorded first, so every event from here on goes to the
+/// target; then the parked record is released. Only a release that landed
+/// (or found the record no longer this hold's) lets the sockets close and
+/// the target take the room. A release left pending keeps the sockets and
+/// the request: the target would find the record still naming this node,
+/// and the move would be reported done while nothing moved. Nothing parked
+/// any more (an event woke the room since the caller looked) keeps the
+/// request too: the room is resident again, and a later pass moves it as
+/// such.
 async fn move_parked(
     inner: &Arc<ServiceInner>,
     cluster: &Arc<Cluster>,
@@ -423,27 +432,44 @@ async fn move_parked(
                 until_ms,
             },
         );
-    cluster.release_parked(address, "move").await;
+    let end_move = || {
+        inner
+            .moves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(address);
+    };
+    match cluster.release_parked(address, "move").await {
+        Some(LeaseReturn::Released | LeaseReturn::Superseded) => {}
+        Some(LeaseReturn::Pending) => {
+            end_move();
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "move: the parked record's release is pending; the move waits");
+            return false;
+        }
+        None => {
+            end_move();
+            return false;
+        }
+    }
     let closed = inner
         .sockets
         .close_owner(address, 1012, "actor moving; reconnect");
     crate::metrics::owner_closes("move", closed);
     let answer = cluster.take(&intent.target, address).await;
-    inner
-        .moves
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(address);
+    end_move();
     match answer {
         TakeAnswer::Held => {
             tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "moved (parked)");
             true
         }
-        TakeAnswer::HeldBy(holder) => {
+        // Another node won the race after the release: the move is moot.
+        // This node named as holder means the release had not landed yet
+        // for the target's read, or this node took the room back: not done.
+        TakeAnswer::HeldBy(holder) if holder != cluster.node_id => {
             tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, target = %intent.target, "move: held after the release");
             true
         }
-        TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
+        TakeAnswer::HeldBy(_) | TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
     }
 }
 

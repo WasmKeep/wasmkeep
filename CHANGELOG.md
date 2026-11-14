@@ -213,6 +213,11 @@ Since 0.3.0, in no release yet.
   - A command whose output goes to a closed pipe (`wasmkeep cluster
     status --json | head`) exits quietly with status 141 instead of
     panicking with "failed printing to stdout: Broken pipe".
+- **A move of a room parked with open sockets waits for its record's
+  release**: one whose release did not land was reported done, its
+  request deleted, while the room stayed. A lapse or a clean stop no
+  longer writes a second release for each parked room whose sockets it
+  closed ([ADR 0024](docs/adr/0024-socket-home.md)).
 - **A drain or a move no longer waits until the node stops for an actor
   whose ownership write went unanswered and landed late**: the node now
   watches such a record for 30 s and releases it if the write lands

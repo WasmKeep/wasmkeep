@@ -225,7 +225,11 @@ on most passes (it is this node's own), so a room parked for days also
 stops costing the one GET a minute the sweep makes today for each
 hibernated room with sockets. As a safeguard against a parked entry that
 no longer matches the record (a fault this record did not foresee), one
-pass in ten reads every parked room's record: one that no longer names
+pass in ten re-reads parked rooms' records, at most 5,000 a pass (the
+sweep's own bound), going on where the last re-read stopped: every parked
+record is read within ten passes per 5,000 parked (100 passes at the
+50,000 bound), and a re-read cut short by a slow bucket starts the next
+at the first record it did not read. One that no longer names
 this instance at the parked generation is dropped from the set, and its
 sockets are then treated as today (closed if another live node holds the
 room).
