@@ -1178,13 +1178,24 @@ impl ActorState {
         });
         let delete = live.store.data().delete_requested;
         // `delete-self-durable` already recorded the delete (ADR 0028).
-        let durable = live.store.data_mut().deleted.take();
+        let host = live.store.data_mut();
+        // A single node's durable delete that could not remove the files:
+        // removed now, as for `delete-self`.
+        let durable = host
+            .deleted
+            .take()
+            .or_else(|| std::mem::take(&mut host.delete_retry).then_some(None));
         // The operator delete marker, carried over to the empty database.
         let carried = if delete && durable.is_none() {
-            with_db_inline(&mut live.store, |db| db.meta(OPERATOR_DELETE_KEY))
-                .ok()
-                .and_then(Result::ok)
-                .flatten()
+            match with_db_inline(&mut live.store, |db| db.meta(OPERATOR_DELETE_KEY)) {
+                Ok(Ok(v)) => v,
+                // A request whose key is still listed may then be carried
+                // out again on the new actor (ADR 0028).
+                other => {
+                    tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?other, "reading the operator delete marker failed; the delete does not carry it");
+                    None
+                }
+            }
         } else {
             None
         };

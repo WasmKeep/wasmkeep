@@ -309,6 +309,8 @@ thread_local! {
     static EARLY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Wakes of a parked hold in this run.
     static WAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Deletes acknowledged as found carried out (after the fence).
+    static READ_ACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn count_collected(n: usize) {
@@ -519,6 +521,40 @@ async fn delete_actor(
     true
 }
 
+/// A node that restored delete `resets[at]` acknowledges it as carried out
+/// (ADR 0028, a request listed again): after the fence, a one-line upload
+/// of this hold's that ends the history, acknowledged by the write rule.
+/// `false` if the fence's upload failed: the caller gives the actor up.
+async fn ack_by_read(
+    node: &Node,
+    bucket: &EpBucket,
+    o: &mut Owner,
+    acked: &Mutex<Vec<SegmentId>>,
+    resets: &Mutex<Vec<Reset>>,
+    at: usize,
+) -> bool {
+    let segment = Segment {
+        id: SegmentId {
+            generation: o.held.generation,
+            txid: o.head.txid + 1,
+        },
+        parent_generation: o.head.generation,
+    };
+    let key = format!("{PREFIX}{}", segment_key(&segment));
+    if bucket.create(&key, b"x".to_vec()).await.is_err() {
+        return false;
+    }
+    o.head = segment.id;
+    o.held_positions.insert(segment.id);
+    o.since_snapshot += 1;
+    if node.may_act(&o.held) {
+        acked.lock().unwrap().push(segment.id);
+        resets.lock().unwrap()[at].acked = true;
+        READ_ACKS.with(|r| r.set(r.get() + 1));
+    }
+    true
+}
+
 /// One process's life on node leases: until its lease is lost (fenced, or
 /// replaced by its own restart), then it exits.
 #[allow(clippy::too_many_arguments)]
@@ -594,6 +630,22 @@ async fn run_node(
                     // if enough segments were restored, at the restored
                     // head, whoever wrote it.
                     snapshot_and_collect(node, bucket, deletes, rules, &mut o).await;
+                    // A delete found carried out by the restore (its
+                    // request listed again) is acknowledged only once this
+                    // hold's own upload ends the history (the server's
+                    // fence). Acknowledging on the read alone is unsafe,
+                    // but needs an interleaving this model does not reach
+                    // within 20,000 seeds; `wasmkeep_cluster::replication`'s
+                    // unit tests script it.
+                    let restored_reset = resets.lock().unwrap().iter().position(|r| r.id == o.head);
+                    if deleting
+                        && let Some(at) = restored_reset
+                        && rng.chance(50)
+                        && !ack_by_read(node, bucket, &mut o, acked, resets, at).await
+                    {
+                        let _ = node.release(&o.held).await;
+                        continue;
+                    }
                     // Acquired (or woken) only to delete it, as an operator
                     // delete of an actor nobody holds, or of a parked room.
                     if deleting
@@ -776,6 +828,8 @@ struct Outcome {
     resets: Vec<Reset>,
     /// Wakes of a parked hold.
     wakes: u64,
+    /// Deletes acknowledged as found carried out.
+    read_acks: u64,
     /// Uploads that succeeded after the uploader's hold ended.
     late: u64,
     /// Objects garbage collection deleted (or sent deletes for).
@@ -792,6 +846,7 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
     LATE.with(|l| l.set(0));
     COLLECTED.with(|c| c.set(0));
     WAKES.with(|w| w.set(0));
+    READ_ACKS.with(|r| r.set(0));
     let _ = take_fences();
     let config = LeaseConfig::new(1_000, 500, 200, 300).unwrap();
     let max_skew_ms = 300;
@@ -1008,6 +1063,7 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
         early: EARLY.with(std::cell::Cell::get),
         resets: resets_out.lock().unwrap().clone(),
         wakes: WAKES.with(std::cell::Cell::get),
+        read_acks: READ_ACKS.with(std::cell::Cell::get),
         late: LATE.with(std::cell::Cell::get),
         collected: COLLECTED.with(std::cell::Cell::get),
         fences: take_fences(),
@@ -1333,7 +1389,7 @@ fn collecting_the_segment_under_the_snapshot_is_caught() {
 /// final chain removed them, and nothing an acknowledged delete removed
 /// comes back.
 fn deletes_hold(rules: Rules, what: &str) {
-    let (mut acked, mut deletes, mut wakes, mut generations) = (0, 0, 0, 0);
+    let (mut acked, mut deletes, mut wakes, mut generations, mut read_acks) = (0, 0, 0, 0, 0);
     for seed in 0..seeds() {
         let outcome = simulate(seed, rules, Duration::from_secs(30));
         match check(&outcome) {
@@ -1342,6 +1398,7 @@ fn deletes_hold(rules: Rules, what: &str) {
         }
         deletes += u64::try_from(outcome.resets.iter().filter(|r| r.acked).count()).unwrap();
         wakes += outcome.wakes;
+        read_acks += outcome.read_acks;
         generations += outcome
             .acked
             .iter()
@@ -1356,12 +1413,17 @@ fn deletes_hold(rules: Rules, what: &str) {
     );
     assert!(wakes > seeds() / 4, "parked holds rarely woken ({wakes})");
     assert!(
+        read_acks > seeds() / 4,
+        "deletes rarely acknowledged on a restore ({read_acks})"
+    );
+    assert!(
         generations > seeds() * 3,
         "ownership rarely changed ({generations})"
     );
     eprintln!(
         "replication {what}: {} seeds x 30 s: {acked} acknowledged writes and {deletes} \
-         acknowledged deletes, none lost, nothing deleted back; {wakes} wakes",
+         acknowledged deletes ({read_acks} found carried out by a restore), none lost, \
+         nothing deleted back; {wakes} wakes",
         seeds()
     );
 }

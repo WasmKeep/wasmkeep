@@ -19,10 +19,22 @@ async fn exists(store: &Arc<dyn ObjectStore>, key: &object_store::path::Path) ->
     }
 }
 
-/// Waits (up to `within`) until the request at `key` is done: its key gone.
+/// Waits (up to `within`) until the request at `key` is done: its key gone,
+/// its outcome `.done` written beside it.
 async fn done_within(
     store: &Arc<dyn ObjectStore>,
     key: &object_store::path::Path,
+    within: Duration,
+) {
+    ended_within(store, key, ".done", within).await;
+}
+
+/// Waits (up to `within`) until the request at `key` is gone, its outcome
+/// `outcome` beside it.
+async fn ended_within(
+    store: &Arc<dyn ObjectStore>,
+    key: &object_store::path::Path,
+    outcome: &str,
     within: Duration,
 ) {
     let started = std::time::Instant::now();
@@ -33,6 +45,11 @@ async fn done_within(
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let written = object_store::path::Path::from(format!("{key}{outcome}"));
+    assert!(
+        exists(store, &written).await,
+        "no outcome {outcome} for {key}"
+    );
 }
 
 /// `n` durable increments of actor `t/<name>` on the node at `addr`.
@@ -161,9 +178,17 @@ async fn a_delete_request_left_behind_is_not_carried_out_twice() {
     flaky.fail_request_deletes.store(true, Ordering::SeqCst);
     let key = request_delete(&shared, "again").await;
     eventually("deleted", async || read(a.addr, "again").await == "0").await;
-    // Written after the delete: the request, still listed, must not take it.
+    // Written after the delete, and a socket opened to the new actor: the
+    // request, still listed, must take neither.
     write(a.addr, "again", 2).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/actor/t/again", a.addr))
+        .await
+        .unwrap();
+    {
+        use futures_util::StreamExt as _;
+        let open = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+        assert!(open.is_err(), "the new actor's socket was closed: {open:?}");
+    }
     assert!(exists(&shared, &key).await, "the key was deleted after all");
     assert_eq!(read(a.addr, "again").await, "2", "deleted twice");
     // Hibernated and restored: the same.
@@ -189,7 +214,7 @@ async fn a_delete_request_left_behind_is_not_carried_out_twice() {
 async fn a_delete_request_for_no_such_actor_creates_nothing() {
     let (store, _a, _b, _dirs) = two_nodes(Duration::from_secs(30)).await;
     let key = request_delete(&store, "ghost").await;
-    done_within(&store, &key, Duration::from_secs(10)).await;
+    ended_within(&store, &key, ".absent", Duration::from_secs(10)).await;
     assert!(actor_keys(&store, "ghost").await.is_empty());
     assert_eq!(owner_record(&store, "ghost").await, None);
 }

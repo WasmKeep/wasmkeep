@@ -110,6 +110,53 @@ impl DeleteIntent {
     }
 }
 
+/// What became of a delete request: written by the node that carried it
+/// out, beside the request, before it deletes the request's key, and read
+/// (then deleted) by the command waiting for it. The key going away alone
+/// proves nothing (it also expires).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The delete is recorded in the bucket.
+    Done,
+    /// No such actor: nothing was deleted or created.
+    Absent,
+}
+
+impl DeleteOutcome {
+    const ALL: [Self; 2] = [Self::Done, Self::Absent];
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Done => ".done",
+            Self::Absent => ".absent",
+        }
+    }
+
+    /// The outcome's key for the request at `request_key`.
+    pub fn key(self, request_key: &str) -> String {
+        format!("{request_key}{}", self.suffix())
+    }
+
+    /// The outcome `key` records for the request at `request_key`, if any.
+    pub fn of(key: &str, request_key: &str) -> Option<Self> {
+        let suffix = key.strip_prefix(request_key)?;
+        Self::ALL.into_iter().find(|o| o.suffix() == suffix)
+    }
+}
+
+/// `<tenant>/<app>/deletes/<class>/<name hex>/<id>.<outcome>`, after
+/// `state/`.
+fn parse_outcome(rest: &str) -> bool {
+    let parts: Vec<&str> = rest.split('/').collect();
+    let [_, _, family, _, _, last] = parts.as_slice() else {
+        return false;
+    };
+    *family == Family::Deletes.folder()
+        && DeleteOutcome::ALL
+            .into_iter()
+            .any(|o| last.strip_suffix(o.suffix()).is_some_and(request_id))
+}
+
 /// A fresh id for a delete request: 16 hex digits, from the standard
 /// library's randomly seeded hasher and the clock.
 pub fn new_request_id() -> String {
@@ -270,6 +317,14 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
                 }
                 continue;
             }
+            // An outcome nobody read: the command that waited for it has
+            // gone. Deleted once as old as a request may be.
+            if parse_outcome(rest) {
+                if now_ms.saturating_sub(*modified) > DELETE_TTL_MS {
+                    expired.push(key.clone());
+                }
+                continue;
+            }
             let Some(intent) = parse_move(rest, *modified) else {
                 continue;
             };
@@ -419,7 +474,7 @@ mod tests {
         assert_eq!(control.deletes[0].key(), key);
         let (control, expired) = parse(&[(key.clone(), 1_000)], 1_001 + DELETE_TTL_MS);
         assert!(control.deletes.is_empty());
-        assert_eq!(expired, [key]);
+        assert_eq!(expired, std::slice::from_ref(&key));
         for junk in [
             "state/acme/blog/deletes/cart",
             "state/acme/blog/deletes/cart/78",
@@ -445,6 +500,14 @@ mod tests {
         assert!(
             checked_delete_key(&StateRoot::new("", "ac/me", "blog"), "cart", "x", "0a").is_err()
         );
+        // Outcomes are not requests, and expire with them.
+        let done = DeleteOutcome::Done.key(&key);
+        assert_eq!(DeleteOutcome::of(&done, &key), Some(DeleteOutcome::Done));
+        assert_eq!(DeleteOutcome::of(&key, &key), None);
+        let (control, expired) = parse(&[(done.clone(), 1_000)], 1_000 + DELETE_TTL_MS);
+        assert_eq!((control, expired), (Control::default(), Vec::new()));
+        let (_, expired) = parse(&[(done.clone(), 1_000)], 1_001 + DELETE_TTL_MS);
+        assert_eq!(expired, [done]);
         let (a, b) = (new_request_id(), new_request_id());
         assert!(request_id(&a) && a.len() == 16 && a != b, "{a} {b}");
     }

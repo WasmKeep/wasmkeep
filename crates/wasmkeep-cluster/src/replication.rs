@@ -491,6 +491,33 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_read_back_is_the_state_only_once_the_reader_uploads() {
+        // ADR 0028, a delete request listed again. Generation 1 wrote 1 to
+        // 5; generation 2's reset at 6 is in flight when its hold lapses.
+        // Generation 3 restores to (1, 5) and uploads 6 on top of it, in
+        // flight too, and lapses. 2's reset lands; generation 4 restores
+        // it and finds the delete carried out.
+        let mut segments = chain(1, 1, 5, 0);
+        segments.push((2, 6, 1));
+        let read = plan_restore(&listing(&segments, &[])).unwrap();
+        assert_eq!(read.head(), id(2, 6), "4 reads the reset");
+        // Then 3's upload lands, built on the data the reset removed: it
+        // becomes the history, the reset off the chain. Acknowledging the
+        // delete on that read alone would let the data come back.
+        let mut late = segments.clone();
+        late.push((3, 6, 1));
+        assert_eq!(plan_restore(&listing(&late, &[])).unwrap().head(), id(3, 6));
+        // With the fence, 4 first uploads on the reset: whatever lands
+        // later, the history goes through the delete.
+        let mut fenced = segments;
+        fenced.push((4, 7, 2));
+        fenced.push((3, 6, 1));
+        let plan = plan_restore(&listing(&fenced, &[])).unwrap();
+        assert_eq!(plan.head(), id(4, 7));
+        assert!(plan.segments.contains(&id(2, 6)), "{plan:?}");
+    }
+
+    #[test]
     fn a_deleted_actor_collects_down_to_its_reset_and_snapshot() {
         // A delete is a reset segment (here 11, generation 2); the owner then
         // snapshots the empty database at its position.

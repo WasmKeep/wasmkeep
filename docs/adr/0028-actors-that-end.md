@@ -3,7 +3,12 @@
 - Status: accepted (2026-11-14). Sections 1 to 3 (what a deleted actor
   is, the durable delete, the operator delete) are built with this
   record; sections 4 (idle expiry) and 5 (deleting an app) are decided
-  here and built later, each in its own change.
+  here and built later, each in its own change. Revised after an
+  adversarial review: a request's outcome written beside it (the key going
+  away proves nothing), the fence before a request found carried out is
+  reported done, sockets closed only once the delete will run, the marker
+  holding the request's id, and a single node's failed durable delete no
+  longer reported done on a retry.
 - Date: 2026-11-14
 - Release: 0.4.2 or later ([ROADMAP](../../ROADMAP.md), "Now": actors
   that end)
@@ -127,7 +132,10 @@ inside its call, so that the answer can follow it:
   scratch space) on the replica's head while the hold is valid, and
   returns `ok` only once the bucket acknowledged it. On a single node it
   closes the database, removes its files (the WAL first, then the
-  database) and fsyncs the directory.
+  database) and fsyncs the directory. If that fails it answers
+  `internal`, storage stays refused (the database is closed), a retry
+  removes the files again and answers by its own outcome, and the end of
+  the event removes them as `delete-self` does.
 - **After `ok`** the actor is deleted. Storage calls later in the same
   event are refused with `not-allowed` ("deleted in this event"),
   `get-alarm` returns none and `set-alarm` and `clear-alarm` do nothing.
@@ -137,7 +145,7 @@ inside its call, so that the answer can follow it:
   given up, so the next event restores the empty database from the bucket.
 - **`not-allowed`** inside an open transaction: nothing changes. Commit
   or roll back first.
-- **`internal`**: not known to be durable. The upload may still land
+- **`internal`** (in a cluster): not known to be durable. The upload may still land
   (a request the client gave up on), so the actor may or may not be
   deleted. Replication stops for the actor as after a failed
   `exec-durable`, the event's local writes are not kept, and the next
@@ -180,9 +188,8 @@ in its own task:
 
 1. **The owner**: the node that holds the actor (resident, with a valid
    hold), keeps its record parked (ADR 0024), or has its sockets. It
-   closes the actor's sockets with **1000 "actor deleted"**, waits up to
-   5 s for their close events to run, then queues the delete job in the
-   actor's mailbox, after the events already queued.
+   queues the delete job in the actor's mailbox, after the events already
+   queued.
 2. **Nobody**: the record names nobody, or a node that is not live in
    this node's view. Any node serving the class queues the job; its
    acquire is the ordinary conditional one, so one node wins and the
@@ -205,28 +212,46 @@ instance, no `on-init`):
    Refused (another node holds it, this node is draining or moving it, the
    bucket did not answer, the secrets cannot be opened): the request
    stays for a later pass.
-3. A socket still open or closing: the request stays (the next pass
-   closes it again), as a move's `Busy`.
-4. **Replays.** If the database's host meta `operator_delete` is *T* or
-   later, this request, or one written after it, was already carried out
-   (its key could not be deleted, or two nodes listed it): done.
-5. The delete routine of section 1, with `operator_delete = T` in the
-   empty database the reset carries. A `delete-self` later carries the
-   value over to its own empty database, so a request left behind never
-   deletes an actor created after it was carried out.
-6. **Done** once the reset is acknowledged: the node deletes the key,
-   then hibernates the stub (the hold is released). The snapshot and the
-   erase follow; a failure there leaves old history objects in the bucket,
-   which no restore uses, until the actor writes again
-   (`wasmkeep_history_collect_failures_total`).
+3. **Replays.** The database's host meta `operator_delete` holds the
+   time and id of the last request carried out, `<T> <id>`. If it is
+   later than this request's *T*, or this very request (same *T* and id;
+   a bucket with second precision gives two requests the same *T*), the
+   request was already carried out (its key could not be deleted, or two
+   nodes listed it). It is reported done only after the **fence**: an
+   upload of this hold's that ends the history (`ActorState::fence`, as
+   before removing stale alarm entries). What a restore read is the state
+   only once that upload is in: until then a reset that landed late, never
+   acknowledged, could be read here while an earlier holder's upload,
+   landing later still, becomes the history without it
+   (`a_delete_read_back_is_the_state_only_once_the_reader_uploads`).
+4. **Sockets**, only now that the delete will run: any still open or
+   closing are closed with **1000 "actor deleted"** and the job answers
+   `Busy`. Their close events run in the mailbox; the pass waits up to
+   5 s for them and queues the job once more. A request already carried
+   out never touches the sockets of the actor created since.
+5. The delete routine of section 1, with `operator_delete = <T> <id>` in
+   the empty database the reset carries. A `delete-self` later carries
+   the value over to its own empty database, so a request left behind
+   never deletes an actor created after it was carried out. (A node from
+   before this record does not carry it: during a rolling upgrade, a
+   request whose key could not be deleted can run again on an actor that
+   such a node deleted and recreated.)
+6. **Done** once the reset is acknowledged: the node writes the
+   request's **outcome** beside it, `<id>.done` (`<id>.absent` for no such
+   actor), then deletes the request, then hibernates the stub (the hold is
+   released). If the outcome cannot be written, the request stays for the
+   next pass. The snapshot and the erase follow; a failure there leaves
+   old history objects in the bucket, which no restore uses, until the
+   actor writes again (`wasmkeep_history_collect_failures_total`).
+   Outcomes nobody read expire with requests (one hour).
 
 **By the actor's state:**
 
 | State | What happens |
 | --- | --- |
-| Resident here | Sockets closed, then the job after the queued events. |
+| Resident here | The job after the queued events; it closes the sockets, their close events run, then it deletes. |
 | Hibernated (record released) | Any serving node acquires and restores, then deletes. |
-| Parked with sockets (ADR 0024) | The parking node closes the sockets (their close events wake it here) and deletes. |
+| Parked with sockets (ADR 0024) | The parking node's job wakes it, closes the sockets (their close events run here) and deletes. |
 | Resident on another live node | That node acts. |
 | Being moved (ADR 0017) | The old owner forwards to the target (`Elsewhere`), so the job is refused there and runs on the target once it holds the actor. |
 | Being taken over (owner died) | The record is not free until ADR 0020 says so; then one node acquires and deletes. |
@@ -240,12 +265,16 @@ actor, open classes included: the operator asked for it to end.
 **The command** checks the request before writing it: the actor must
 have a history in the bucket (otherwise "no such actor", nothing is
 written), and the tenant's layout must be the one of 0.4.0 (as `actor
-move`). It then writes the key and waits for it to be gone: by default
-up to 60 s (`--wait SECS`; `--no-wait` returns at once). Gone within the
-wait, it prints "Deleted"; still there, it exits non-zero with "requested;
-the cluster keeps trying until <T + 1 h>". A request is acknowledged
-only when a node deleted its key after the reset was recorded, so a
-"Deleted" is never followed by the data coming back.
+move`). It then writes the key and waits for its outcome: by default up
+to 60 s (`--wait SECS`, at most 3000, below the request's expiry;
+`--no-wait` returns at once). `.done` within the wait: it prints
+"Deleted" and removes the outcome. `.absent`: "no such actor", non-zero.
+The request gone with no outcome (expired, by a node's clock, or not an
+actor address): "dropped", non-zero, nothing known to be deleted. Still
+there: non-zero, "requested; the cluster keeps trying until <T + 1 h>".
+A request is acknowledged only by its outcome, written after the reset
+was recorded, so a "Deleted" is never followed by the data coming back;
+the key going away alone acknowledges nothing.
 
 **Mixed versions.** A node from before this record never lists `deletes/`.
 During a rolling upgrade the request waits until an upgraded node holds
@@ -380,18 +409,27 @@ wasmkeep app delete --app acme/legacy --bucket s3://b/p
   - `a_delete_acked_after_its_hold_ended_can_bring_data_back` and
     `erasing_before_the_delete_is_acked_loses_writes` (unsafe variants
     that must be caught).
+  Nodes that restore a delete also acknowledge it as found carried out,
+  after the fence. Acknowledging it on the read alone needs an
+  interleaving the model does not reach within 20,000 seeds, so the unit
+  test above scripts it instead.
 - **Cluster** (`tests/cluster/deletes.rs`, plain and TLS): an operator
   delete of a resident actor (done only once recorded, the history erased
   to the reset and its snapshot), of a hibernated one, and of one whose
   owner node lost the bucket for good; an alarm cleared and never fired;
   a request whose key cannot be deleted is not carried out twice (data
-  written after it stays, across a restore); a mistyped name creates
+  written after it stays, across a restore, and a socket opened to the new
+  actor stays open); a mistyped name creates
   nothing; a durable delete answered only once the reset is in the bucket
   (the node cut off right after the answer, another node restores it
   empty), an error with the data kept when the upload fails, and storage
   refused after it in the same event. `tests/cluster/websockets.rs`: a
   parked room's sockets closed with 1000. `tests/alarms.rs`: the durable
-  delete on a single node.
+  delete on a single node, and its retry after the files could not be
+  removed.
+- **Unit**: `replication::a_delete_read_back_is_the_state_only_once_the_reader_uploads`
+  (why the fence), the marker's comparison (`carried_out`), the request
+  and outcome keys.
 - **CLI**: parsing, the existence check, the key, the wait and its exit
   codes.
 

@@ -375,9 +375,10 @@ const OWNER_FENCE_KEY: &str = "owner_fence";
 const DEPLOY_SEQ_KEY: &str = "deploy_seq";
 
 /// Meta key holding the last operator delete carried out on this actor:
-/// its request's time (ms, the bucket's clock; ADR 0028). Written into
-/// the empty database a delete leaves, and carried over by later deletes,
-/// so a request listed again is never carried out twice.
+/// its request's time (ms, the bucket's clock) and id, `<ms> <id>` (ADR
+/// 0028). Written into the empty database a delete leaves, and carried
+/// over by later deletes, so a request listed again is never carried out
+/// twice.
 const OPERATOR_DELETE_KEY: &str = "operator_delete";
 
 /// `refresh_class`: the actor's class was removed by a deploy.
@@ -634,6 +635,9 @@ struct ActorHost {
     /// empty database its reset carried, for the snapshot at it once the
     /// event ends.
     deleted: Option<Option<wasmkeep_storage::wal::Changes>>,
+    /// On one node: a `delete-self-durable` closed the database and could
+    /// not remove its files; a retry removes them, storage stays refused.
+    delete_retry: bool,
     /// Where the actor's files are, for `delete-self-durable`.
     deleter: Option<(Storage, ActorAddress)>,
     call: Option<CallContext>,

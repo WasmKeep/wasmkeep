@@ -190,6 +190,7 @@ impl ActorHost {
             pending_db: None,
             delete_requested: false,
             deleted: None,
+            delete_retry: false,
             deleter: None,
             call: None,
             sockets,
@@ -278,6 +279,9 @@ impl ActorHost {
         if self.deleted.is_some() {
             return Ok(Ok(()));
         }
+        if self.delete_retry {
+            return Ok(self.remove_files_durably().await);
+        }
         let (in_tx, carried) = self
             .with_db(|db| (db.in_transaction(), db.meta(OPERATOR_DELETE_KEY)))
             .await?;
@@ -288,52 +292,49 @@ impl ActorHost {
                     .into(),
             }));
         }
-        let carried = match carried {
-            Ok(v) => v,
-            Err(e) => return Ok(Err(not_durable(e.message))),
-        };
-        let Some((storage, address)) = self.deleter.clone() else {
-            return Ok(Err(not_durable("no database to delete")));
-        };
         let Some(slot) = self.replica.clone() else {
             // One node: the files go now. The database is closed first; if
-            // removing them fails it stays closed, and the end of the event
-            // deletes the actor as `delete-self` would.
+            // removing them fails it stays closed (storage refused), a
+            // retry removes them, and the end of the event deletes the
+            // actor as `delete-self` would.
             self.drain_db().await?;
             self.db = None;
             self.delete_requested = true;
-            self.deleted = Some(None);
-            let removed = tokio::task::spawn_blocking(move || {
-                storage.delete_durably(address.class(), address.name())
-            })
-            .await;
-            return Ok(match removed {
-                Ok(Ok(())) => {
-                    crate::metrics::deleted("self_durable");
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    crate::metrics::delete_failed("self_durable");
-                    Err(not_durable(format!("{e:#}")))
-                }
-                Err(e) => {
-                    crate::metrics::delete_failed("self_durable");
-                    Err(not_durable(e))
-                }
-            });
+            self.delete_retry = true;
+            return Ok(self.remove_files_durably().await);
         };
         let mut replica = slot.lock().await;
         if let Some(reason) = replica.failed() {
             return Ok(Err(not_durable(format!("replication stopped ({reason})"))));
         }
+        // Not known durable from here on: replication stops, as after a
+        // failed `exec-durable`, and the actor is restored by its next
+        // event.
+        let carried = match carried {
+            Ok(v) => v,
+            Err(e) => {
+                replica.fail(format!("delete-self-durable: {}", e.message));
+                return Ok(Err(not_durable(e.message)));
+            }
+        };
+        let Some((storage, address)) = self.deleter.clone() else {
+            replica.fail("delete-self-durable: no database to delete");
+            return Ok(Err(not_durable("no database to delete")));
+        };
         let built = tokio::task::spawn_blocking(move || {
             empty_database_snapshot(&storage, &address, carried.as_deref())
         })
         .await;
         let all = match built {
             Ok(Ok(all)) => all,
-            Ok(Err(e)) => return Ok(Err(not_durable(e))),
-            Err(e) => return Ok(Err(not_durable(e))),
+            Ok(Err(e)) => {
+                replica.fail(format!("delete-self-durable: {e}"));
+                return Ok(Err(not_durable(e)));
+            }
+            Err(e) => {
+                replica.fail(format!("delete-self-durable: {e}"));
+                return Ok(Err(not_durable(e)));
+            }
         };
         // On failure the replica is marked failed: the event's end gives
         // the actor up, and its next event restores what the bucket has.
@@ -346,6 +347,30 @@ impl ActorHost {
         self.deleted = Some(Some(all));
         Ok(Ok(()))
     }
+
+    /// One node: removes the closed database's files and fsyncs their
+    /// directory. Only once that worked is the actor deleted.
+    async fn remove_files_durably(&mut self) -> Result<(), SqlError> {
+        let Some((storage, address)) = self.deleter.clone() else {
+            return Err(not_durable("no database to delete"));
+        };
+        let removed = tokio::task::spawn_blocking(move || {
+            storage.delete_durably(address.class(), address.name())
+        })
+        .await;
+        let failed = match removed {
+            Ok(Ok(())) => {
+                crate::metrics::deleted("self_durable");
+                self.delete_retry = false;
+                self.deleted = Some(None);
+                return Ok(());
+            }
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(e) => e.to_string(),
+        };
+        crate::metrics::delete_failed("self_durable");
+        Err(not_durable(failed))
+    }
 }
 
 impl storage::Host for ActorHost {
@@ -354,7 +379,7 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<u64, SqlError>> {
-        if self.deleted.is_some() {
+        if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
         let params = params.into_iter().map(to_db).collect::<Vec<_>>();
@@ -367,7 +392,7 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<u64, SqlError>> {
-        if self.deleted.is_some() {
+        if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
         let started = std::time::Instant::now();
@@ -385,7 +410,7 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<Rows, SqlError>> {
-        if self.deleted.is_some() {
+        if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
         let params = params.into_iter().map(to_db).collect::<Vec<_>>();
@@ -413,7 +438,7 @@ impl storage::Host for ActorHost {
 
 impl alarms::Host for ActorHost {
     async fn set_alarm(&mut self, at: u64) -> wasmtime::Result<()> {
-        if self.deleted.is_some() {
+        if self.deleted.is_some() || self.delete_retry {
             return Ok(()); // the actor was deleted in this event
         }
         self.with_db(move |db| {
@@ -425,7 +450,7 @@ impl alarms::Host for ActorHost {
     }
 
     async fn get_alarm(&mut self) -> wasmtime::Result<Option<u64>> {
-        if self.deleted.is_some() {
+        if self.deleted.is_some() || self.delete_retry {
             return Ok(None);
         }
         self.with_db(|db| db.alarm())
@@ -434,7 +459,7 @@ impl alarms::Host for ActorHost {
     }
 
     async fn clear_alarm(&mut self) -> wasmtime::Result<()> {
-        if self.deleted.is_some() {
+        if self.deleted.is_some() || self.delete_retry {
             return Ok(());
         }
         self.with_db(|db| {

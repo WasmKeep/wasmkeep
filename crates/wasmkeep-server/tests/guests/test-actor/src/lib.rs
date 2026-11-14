@@ -9,7 +9,8 @@
 //! - `POST /trap`: panics; `POST /delete`: `delete-self`
 //! - `POST /delete-durable`: `delete-self-durable`; answers `deleted`, or
 //!   503 with the error (then `?then=sql` runs a `query` after it and
-//!   answers `ok` or `err:KIND`)
+//!   answers `ok` or `err:KIND`; `?retry=1` calls it twice and answers
+//!   `first=ok|err second=ok|err`)
 //! - `POST /delete-on-alarm`: the next `on-alarm` run calls `delete-self`
 //! - `POST /call?to=CLASS/NAME&path=P` (P percent-encoded): `actors.call`
 //!   with GET P; answers `STATUS:BODY` or the call error (`&times=N`: the
@@ -608,6 +609,12 @@ impl http::Guest for TestActor {
                     Some(v) => format!("{v} wasi={wasi}"),
                     None => format!("(none) wasi={wasi}"),
                 }
+            }
+            (Method::Post, "/delete-durable") if query_param(&full, "retry").is_some() => {
+                let tag = |r: Result<(), storage::SqlError>| if r.is_ok() { "ok" } else { "err" };
+                let first = tag(storage::delete_self_durable());
+                let second = tag(storage::delete_self_durable());
+                format!("first={first} second={second}")
             }
             (Method::Post, "/delete-durable") => match storage::delete_self_durable() {
                 Ok(()) if query_param(&full, "then").as_deref() == Some("sql") => {

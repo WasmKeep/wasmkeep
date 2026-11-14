@@ -257,6 +257,23 @@ async fn delete_self_durable_without_a_bucket_removes_the_files_in_the_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_durable_delete_that_could_not_remove_the_files_is_not_ok_on_a_retry() {
+    // One node: removing the files fails twice. The retry in the same
+    // event must try again, and say so, rather than report the first
+    // attempt's delete done. The end of the event removes them.
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    ok(addr, "POST", "/durable").await;
+    wasmkeep_storage::faults::fail_next("delete");
+    wasmkeep_storage::faults::fail_next("delete");
+    assert_eq!(
+        call(addr, "POST", "/delete-durable?retry=1").await,
+        (200, "first=err second=err".to_owned())
+    );
+    assert_eq!(number(addr, "/durable").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_new_alarm_starts_its_backoff_afresh() {
     // An alarm fails five times (backoff 50, 100, 200, 400 ms ...); then a
     // new alarm is set and fails once. Its retry comes after 50 ms, not

@@ -96,8 +96,14 @@ struct DeleteArgs {
     #[arg(long)]
     bucket: String,
 
-    /// How long to wait for the delete to be recorded, in seconds.
-    #[arg(long, default_value_t = 60, conflicts_with = "no_wait")]
+    /// How long to wait for the delete to be recorded, in seconds (at most
+    /// 3000: the request expires after an hour).
+    #[arg(
+        long,
+        default_value_t = 60,
+        conflicts_with = "no_wait",
+        value_parser = clap::value_parser!(u64).range(0..=3000)
+    )]
     wait: u64,
 
     /// Write the request and return at once.
@@ -2304,10 +2310,12 @@ fn actor_delete_on(
     let folder = format!("{}/", key.rsplit_once('/').map_or("", |(f, _)| f));
     let listed = |keys: &wasmkeep_cluster::object_store::ObjectStoreBucket| {
         rt.block_on(keys.list_keys(&folder))
-            .map(|l| l.into_iter().find(|(k, _)| *k == key).map(|(_, at)| at))
     };
     rt.block_on(keys.put_empty(&key))?;
-    let written = listed(&keys)?;
+    let written = listed(&keys)?
+        .into_iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, at)| at);
     let until = written.map_or_else(
         || "an hour from now".to_owned(),
         |at| {
@@ -2323,15 +2331,36 @@ fn actor_delete_on(
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.wait);
     loop {
-        if listed(&keys)?.is_none() {
-            println!("Deleted {actor}: the delete is recorded in the bucket.");
-            return Ok(());
+        // The node that carried the request out writes its outcome beside
+        // it before deleting it: the key going away alone (it expires)
+        // says nothing.
+        let now = listed(&keys)?;
+        let outcome = now
+            .iter()
+            .find_map(|(k, _)| control::DeleteOutcome::of(k, &key).map(|o| (k.clone(), o)));
+        if let Some((outcome_key, outcome)) = outcome {
+            let _ = rt.block_on(keys.delete(&outcome_key));
+            match outcome {
+                control::DeleteOutcome::Done => {
+                    println!("Deleted {actor}: the delete is recorded in the bucket.");
+                    return Ok(());
+                }
+                control::DeleteOutcome::Absent => anyhow::bail!(
+                    "no such actor: the node found nothing for {actor}; nothing was deleted"
+                ),
+            }
+        }
+        if !now.iter().any(|(k, _)| *k == key) {
+            anyhow::bail!(
+                "the request to delete {actor} was dropped without an outcome (expired by a \
+                 node's clock, or not an actor address): nothing is known to be deleted"
+            );
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "requested; {actor} is not deleted yet after {} s. The cluster keeps trying \
-                 until {until}: run this again to wait (a node of the app must serve class \
-                 {class} and be able to hold the actor)",
+                 until {until}; running this again writes a new request and waits for it (a \
+                 node of the app must serve class {class} and be able to hold the actor)",
                 args.wait
             );
         }
@@ -2878,27 +2907,61 @@ mod tests {
             .to_string();
         assert!(e.contains("not deleted yet"), "{e}");
         assert_eq!(keys_of(&store).len(), 3);
-        // Requests carried out: their keys deleted, as a node does.
-        let clear = |store: &std::sync::Arc<dyn ObjectStore>| {
+        // Requests carried out as a node does: the outcome written, then
+        // the request deleted.
+        let carry_out = |store: &std::sync::Arc<dyn ObjectStore>, outcome: &str| {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            for k in keys_of(store)
-                .into_iter()
-                .filter(|k| k.contains("/deletes/"))
-            {
+            for k in keys_of(store).into_iter().filter(|k| {
+                k.contains("/deletes/") && !k.ends_with(".done") && !k.ends_with(".absent")
+            }) {
+                if !outcome.is_empty() {
+                    rt.block_on(store.put(
+                        &object_store::path::Path::from(format!("{k}{outcome}")),
+                        PutPayload::new(),
+                    ))
+                    .unwrap();
+                }
                 rt.block_on(store.delete(&object_store::path::Path::from(k)))
                     .unwrap();
             }
         };
-        clear(&store);
-        // A node carries it out (deletes the key): done.
-        let remover = std::sync::Arc::clone(&store);
-        let node = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            clear(&remover);
-        });
-        super::actor_delete_on(&delete_args(&["--wait", "10"]), open, poll).unwrap();
-        node.join().unwrap();
-        assert_eq!(keys_of(&store), [segment.to_string()]);
+        carry_out(&store, "");
+        let run_with = |outcome: &'static str| {
+            let remover = std::sync::Arc::clone(&store);
+            let node = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                carry_out(&remover, outcome);
+            });
+            let r = super::actor_delete_on(&delete_args(&["--wait", "10"]), open, poll)
+                .map_err(|e| e.to_string());
+            node.join().unwrap();
+            r
+        };
+        // Dropped without an outcome (expired): not reported as deleted.
+        let e = run_with("").unwrap_err();
+        assert!(e.contains("dropped without an outcome"), "{e}");
+        // No such actor, by the node's look.
+        let e = run_with(".absent").unwrap_err();
+        assert!(e.contains("no such actor"), "{e}");
+        // Carried out: done, and the outcome read is removed.
+        run_with(".done").unwrap();
+        assert_eq!(keys_of(&store), [segment.to_string()], "left behind");
+        assert!(
+            super::Cli::try_parse_from([
+                "wasmkeep",
+                "actor",
+                "delete",
+                "room/x",
+                "--app",
+                "acme/shop",
+                "--bucket",
+                "s3://b",
+                "--wait",
+                "3601",
+            ])
+            .is_err(),
+            "a wait past the request's expiry"
+        );
         assert!(
             super::Cli::try_parse_from([
                 "wasmkeep",

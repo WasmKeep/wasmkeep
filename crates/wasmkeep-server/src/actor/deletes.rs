@@ -8,15 +8,17 @@
 //! nobody holds it, any node serving the class queues the job, and the
 //! ordinary conditional acquire picks one. The job runs no guest code: it
 //! acquires and restores, then writes the delete as `delete-self` does,
-//! with the request's time as a marker in the empty database, so that a
-//! request listed again is never carried out twice. The request's key is
-//! deleted only once the reset is acknowledged.
+//! with the request's time and id as a marker in the empty database, so
+//! that a request listed again is never carried out twice. The node writes
+//! the request's outcome beside it, then deletes it, only once the reset
+//! is acknowledged (or, for a request found carried out, once this hold's
+//! own upload ends the history).
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 use super::*;
-use wasmkeep_cluster::control::DeleteIntent;
+use wasmkeep_cluster::control::{DeleteIntent, DeleteOutcome};
 
 /// Requests acted on at once per node.
 const DELETES_PARALLEL: usize = 16;
@@ -50,11 +52,27 @@ pub(super) enum Deleted {
     Refused(String),
 }
 
+/// Whether the marker an actor's database holds (`<ms> <id>`, or `<ms>`
+/// alone) says request `id`, written at `at_ms`, is already carried out:
+/// by itself, or by a request written after it.
+fn carried_out(marker: Option<&str>, at_ms: u64, id: &str) -> bool {
+    let Some(marker) = marker else {
+        return false;
+    };
+    let (ms, done_id) = marker.split_once(' ').unwrap_or((marker, ""));
+    match ms.parse::<u64>() {
+        Ok(ms) => ms > at_ms || (ms == at_ms && done_id == id),
+        Err(_) => false,
+    }
+}
+
 impl ActorState {
     /// The delete job: forget learned owners, check the actor exists,
     /// acquire and restore, then delete it unless this request (or a later
-    /// one) already did. `at_ms` is the request's time, the bucket's clock.
-    pub(super) async fn operator_delete(&mut self, at_ms: u64) -> Deleted {
+    /// one) already did. `at_ms` is the request's time, the bucket's clock,
+    /// and `id` its own id. Sockets are closed (and the job answers
+    /// `Busy`) only once the delete is known to be needed.
+    pub(super) async fn operator_delete(&mut self, at_ms: u64, id: String) -> Deleted {
         self.owner_hint = None;
         match self.exists().await {
             Ok(true) => {}
@@ -78,6 +96,20 @@ impl ActorState {
         if self.cluster.is_some() && self.replica.is_none() {
             return Deleted::Refused("no replication for the actor".into());
         }
+        let (marker, stale) = match self.delete_marks().await {
+            Ok(read) => read,
+            Err(e) => return Deleted::Refused(format!("reading the database: {e}")),
+        };
+        if carried_out(marker.as_deref(), at_ms, &id) {
+            // What was restored is the state only once this hold's own
+            // upload ends the history: until then an earlier holder's
+            // upload landing late could still become it (ADR 0007), and
+            // the delete read here would be off the chain.
+            if self.cluster.is_some() && !self.fence().await {
+                return Deleted::Refused("the restored delete is not this hold's yet".into());
+            }
+            return Deleted::Done;
+        }
         if self.sockets.reserved_by(&self.address) > 0 {
             for conn in self.sockets.of(&self.address, None) {
                 self.sockets
@@ -85,16 +117,9 @@ impl ActorState {
             }
             return Deleted::Busy;
         }
-        let (marker, stale) = match self.delete_marks().await {
-            Ok(read) => read,
-            Err(e) => return Deleted::Refused(format!("reading the database: {e}")),
-        };
-        if marker.is_some_and(|done| done >= at_ms) {
-            return Deleted::Done;
-        }
         self.alarms.clear(self.address.clone());
         match self
-            .delete_recorded(stale, Some(at_ms.to_string()), true)
+            .delete_recorded(stale, Some(format!("{at_ms} {id}")), true)
             .await
         {
             Ok(()) => {
@@ -111,7 +136,7 @@ impl ActorState {
     /// The operator delete marker and the alarm index entry the actor's
     /// database holds, read from the open instance or the restored database
     /// (opened without instantiating the component).
-    async fn delete_marks(&mut self) -> Result<(Option<u64>, Option<Entry>), String> {
+    async fn delete_marks(&mut self) -> Result<(Option<String>, Option<Entry>), String> {
         let read = |db: &mut ActorDb| -> Result<(Option<String>, Option<String>), String> {
             let marker = db.meta(OPERATOR_DELETE_KEY).map_err(|e| e.to_string())?;
             let indexed = db.meta(ALARM_INDEXED_KEY).map_err(|e| e.to_string())?;
@@ -148,10 +173,7 @@ impl ActorState {
             self.db = Some(db);
             out?
         };
-        Ok((
-            marker.and_then(|v| v.parse().ok()),
-            indexed.as_deref().and_then(alarm_index::parse_meta),
-        ))
+        Ok((marker, indexed.as_deref().and_then(alarm_index::parse_meta)))
     }
 }
 
@@ -186,7 +208,8 @@ async fn delete_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: &
         return;
     }
     let Ok(address) = ActorAddress::new(&intent.tenant, &intent.class, &intent.name) else {
-        cluster.delete_request(intent).await;
+        // Not an address: dropped, with no outcome (the command says so).
+        cluster.end_delete_request(intent, None).await;
         return;
     };
     // A class this node does not serve (yet): left to the nodes that do.
@@ -206,43 +229,49 @@ async fn delete_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: &
             Ok(Some(_)) | Err(_) => return,
         }
     }
-    // Sockets first: their close events run before the delete, here.
-    let open = inner.sockets.of(&address, None);
-    if !open.is_empty() {
-        for conn in open {
+    inner.forget_owner(&address);
+    let (at, id) = (intent.written_at_ms, intent.id.clone());
+    let run = || {
+        let id = id.clone();
+        let job =
             inner
-                .sockets
-                .close(&address, conn, CLOSE_CODE, CLOSE_REASON.into());
+                .mailboxes
+                .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
+                    Box::pin(state.operator_delete(at, id))
+                });
+        async move {
+            match tokio::time::timeout(DELETE_WAIT, job).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(e)) => Deleted::Refused(e.to_string()),
+                Err(_) => Deleted::Refused("the delete job did not finish in time".into()),
+            }
         }
+    };
+    let mut outcome = run().await;
+    if matches!(outcome, Deleted::Busy) {
+        // The job closed the sockets: their close events run in the
+        // mailbox, then the job once more.
         let started = tokio::time::Instant::now();
         while inner.sockets.reserved_by(&address) > 0 && started.elapsed() < SOCKETS_CLOSE_WAIT {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        outcome = run().await;
     }
-    inner.forget_owner(&address);
-    let at = intent.written_at_ms;
-    let job =
-        inner
-            .mailboxes
-            .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
-                Box::pin(state.operator_delete(at))
-            });
-    let outcome = match tokio::time::timeout(DELETE_WAIT, job).await {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(e)) => Deleted::Refused(e.to_string()),
-        Err(_) => Deleted::Refused("the delete job did not finish in time".into()),
-    };
     match outcome {
         Deleted::Done => {
             tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), request_ms = at, "deleted on request");
-            cluster.delete_request(intent).await;
+            cluster
+                .end_delete_request(intent, Some(DeleteOutcome::Done))
+                .await;
             // Released: the next event, wherever it lands, restores the
             // empty database.
             inner.mailboxes.hibernate(&address);
         }
         Deleted::NoSuchActor => {
             tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), "delete request: no such actor; dropped");
-            cluster.delete_request(intent).await;
+            cluster
+                .end_delete_request(intent, Some(DeleteOutcome::Absent))
+                .await;
             inner.mailboxes.hibernate(&address);
         }
         Deleted::HeldBy(owner) => {
@@ -253,5 +282,23 @@ async fn delete_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: &
         Deleted::Refused(why) => {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %why, "delete request: tried again later");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::carried_out;
+
+    #[test]
+    fn a_marker_covers_its_own_request_and_older_ones_only() {
+        assert!(!carried_out(None, 5, "a"));
+        assert!(carried_out(Some("5 a"), 5, "a"));
+        assert!(carried_out(Some("6 b"), 5, "a"));
+        // The same millisecond (a bucket with second precision): only the
+        // same request.
+        assert!(!carried_out(Some("5 b"), 5, "a"));
+        assert!(!carried_out(Some("4 a"), 5, "a"));
+        assert!(!carried_out(Some("junk"), 5, "a"));
+        assert!(carried_out(Some("6"), 5, "a"));
     }
 }
