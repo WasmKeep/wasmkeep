@@ -348,8 +348,122 @@ impl Family<AtomicU64> {
     }
 }
 
+/// `kind` of `wasmkeep_failover_waits_total` ([`crate::cluster::failover_wait`]).
+pub(crate) const FAILOVER_KINDS: [&str; 2] = ["request", "websocket"];
+/// `outcome` of `wasmkeep_failover_waits_total`: how a kept request's wait
+/// ended.
+pub(crate) const FAILOVER_OUTCOMES: [&str; 9] = [
+    "served",
+    "forwarded",
+    "owner_alive",
+    "expired",
+    "shutdown",
+    "lease_lost",
+    "left",
+    "answered_other",
+    "over_cap",
+];
+/// `operation` of `wasmkeep_bucket_requests_total` ([`crate::counted_store`]).
+pub(crate) const BUCKET_OPERATIONS: [&str; 8] = [
+    "get",
+    "head",
+    "put",
+    "delete",
+    "list",
+    "copy",
+    "rename",
+    "multipart",
+];
+/// `status` of `wasmkeep_bucket_requests_total`.
+pub(crate) const BUCKET_STATUSES: [&str; 4] = ["ok", "not_found", "precondition", "error"];
+/// `reason` of `wasmkeep_event_cuts_total`.
+pub(crate) const CUT_REASONS: [&str; 2] = ["wall", "lease"];
+/// `kind` of `wasmkeep_forwards_total`.
+pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
+/// `record` of `wasmkeep_signatures_refused_full_total`.
+pub(crate) const SIGNATURE_RECORDS: [&str; 2] = ["calls", "control"];
+/// `reason` of `wasmkeep_websocket_owner_closes_total`.
+pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
+    ["event", "sweep", "lease_lapse", "drain", "move"];
+/// `reason` of `wasmkeep_parked_releases_total`.
+pub(crate) const PARKED_RELEASE_REASONS: [&str; 5] =
+    ["last_socket", "drain", "move", "lapse", "stop"];
+/// `outcome` of `wasmkeep_front_requests_total`.
+pub(crate) const FRONT_REQUEST_OUTCOMES: [&str; 7] = [
+    "ok",
+    "busy",
+    "unconfigured",
+    "cpu_budget",
+    "wall",
+    "guest_error",
+    "client_gone",
+];
+/// `outcome` of `wasmkeep_front_calls_total`.
+pub(crate) const FRONT_CALL_OUTCOMES: [&str; 4] = ["ok", "busy", "timeout", "failed"];
+
+/// Every `reason` of `wasmkeep_not_ready`: those of
+/// [`crate::ActorService::not_ready`], of the cluster's readiness and the
+/// words of a stopped node. A reason not listed here is still rendered
+/// while it holds; a test keeps the list complete.
+pub(crate) const NOT_READY_REASONS: [&str; 19] = [
+    "shutting down",
+    "checking that no other process runs with this node id",
+    "another process runs with this node id",
+    "this node was fenced",
+    "this node's lease was released by another process",
+    "this node's lease object was deleted",
+    "an older version of WasmKeep runs with this node id",
+    "a node of an older WasmKeep version runs in this cluster",
+    "this node's lease object holds something this version cannot read",
+    "this node holds no lease",
+    "the bucket does not enforce conditional writes",
+    "cluster secret not loaded",
+    "bucket unreachable (node lease not renewed)",
+    "cluster identity not published for a heartbeat period yet",
+    "disk not checked yet",
+    "disk check stalled",
+    "disk almost full",
+    "cannot apply the deployed version",
+    "cannot open the app's secrets",
+];
+
+impl Metrics {
+    /// Every series of a family whose label values are a fixed set, at 0:
+    /// on the page from the first scrape, so `increase()` sees the first
+    /// event and rules can be checked against the names. Families keyed by
+    /// class get a series at a class's first event only.
+    fn seeded() -> Self {
+        let m = Self::default();
+        for kind in FAILOVER_KINDS {
+            for outcome in FAILOVER_OUTCOMES {
+                m.failover_waits
+                    .get(&[("kind", kind), ("outcome", outcome)]);
+            }
+        }
+        for operation in BUCKET_OPERATIONS {
+            for status in BUCKET_STATUSES {
+                m.bucket_requests
+                    .get(&[("operation", operation), ("status", status)]);
+            }
+        }
+        let one = |f: &Family<AtomicU64>, label: &str, values: &[&str]| {
+            for v in values {
+                f.get(&[(label, v)]);
+            }
+        };
+        one(&m.cuts, "reason", &CUT_REASONS);
+        one(&m.forwards, "kind", &FORWARD_KINDS);
+        one(&m.signatures_refused_full, "record", &SIGNATURE_RECORDS);
+        one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
+        one(&m.parked_releases, "reason", &PARKED_RELEASE_REASONS);
+        one(&m.front_requests, "outcome", &FRONT_REQUEST_OUTCOMES);
+        one(&m.front_calls, "outcome", &FRONT_CALL_OUTCOMES);
+        m
+    }
+}
+
 /// The process's metrics.
-pub(crate) static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::default);
+pub(crate) static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::seeded);
 
 /// Adds one to a counter.
 pub(crate) fn inc(c: &AtomicU64) {
@@ -380,7 +494,11 @@ pub fn render(gauges: Gauges) -> String {
 /// far plus `gauges`, and the runtime's CPU-budget traps. Series with a
 /// class carry its tenant and app; `wasmkeep_info` its version and node.
 pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
-    let m = &*METRICS;
+    render_with(&METRICS, gauges, identity)
+}
+
+/// [`render_for`], from `m`.
+fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
     let app = identity.app_labels();
     let mut out = String::new();
     let head = |out: &mut String, name: &str, kind: &str, help: &str| {
@@ -409,7 +527,7 @@ pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
         "Always 1: the running version, and the tenant, app and node id (in a cluster) of the node, for joining with other series.",
     );
     let mut info = vec![
-        ("version", env!("CARGO_PKG_VERSION")),
+        ("version", wasmkeep_cluster::VERSION),
         ("tenant", identity.tenant.as_str()),
         ("app", identity.app.as_str()),
     ];
@@ -439,14 +557,22 @@ pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
         &mut out,
         "wasmkeep_not_ready",
         "gauge",
-        "Why the node is not ready (one series, value 1, while it is not).",
+        "Why the node is not ready: one series per reason, 1 for the reason it is not ready, 0 for the others.",
     );
-    if let Some(reason) = gauges.not_ready {
+    let not_ready = |out: &mut String, reason: &str, v: u8| {
         let _ = writeln!(
             out,
-            "wasmkeep_not_ready{{{}}} 1",
+            "wasmkeep_not_ready{{{}}} {v}",
             render_labels(&[("reason", reason)])
         );
+    };
+    for reason in NOT_READY_REASONS {
+        not_ready(&mut out, reason, u8::from(gauges.not_ready == Some(reason)));
+    }
+    if let Some(reason) = gauges.not_ready
+        && !NOT_READY_REASONS.contains(&reason)
+    {
+        not_ready(&mut out, reason, 1);
     }
     gauge(
         &mut out,
@@ -775,7 +901,12 @@ mod tests {
     fn readiness_and_its_reason_are_on_the_page() {
         let page = render(Gauges::default());
         assert!(page.contains("\nwasmkeep_ready 1\n"), "{page}");
-        assert!(!page.contains("wasmkeep_not_ready{"), "{page}");
+        assert!(
+            page.lines()
+                .filter(|l| l.starts_with("wasmkeep_not_ready{"))
+                .all(|l| l.ends_with("} 0")),
+            "{page}"
+        );
         let page = render(Gauges {
             not_ready: Some("bucket unreachable (node lease not renewed)"),
             ..Gauges::default()
@@ -880,7 +1011,7 @@ mod tests {
 
     #[test]
     fn the_info_series_names_the_version_tenant_app_and_node() {
-        let version = env!("CARGO_PKG_VERSION");
+        let version = wasmkeep_cluster::VERSION;
         let page = render_for(Gauges::default(), &shop());
         assert!(page.contains("# TYPE wasmkeep_info gauge\n"), "{page}");
         assert!(
@@ -929,15 +1060,14 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with('#'))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(exprs.matches("- alert: ").count(), 8, "{exprs}");
-        // Label families get a series when first used.
-        inc(&METRICS
+        assert_eq!(exprs.matches("- alert: ").count(), 11, "{exprs}");
+        // A fresh node's page: the rules' series are there from the start,
+        // except those keyed by class, which a class's first event adds.
+        let m = Metrics::seeded();
+        inc(&m
             .events
             .get(&[("class", "c"), ("kind", "request"), ("outcome", "failed")]));
-        inc(&METRICS
-            .bucket_requests
-            .get(&[("operation", "get"), ("status", "error")]));
-        let page = render(Gauges::default());
+        let page = render_with(&m, Gauges::default(), &Identity::default());
         let mut names = std::collections::BTreeSet::new();
         let mut rest = exprs.as_str();
         while let Some(at) = rest.find("wasmkeep_") {
@@ -963,6 +1093,12 @@ mod tests {
             ("wasmkeep_events_total", "outcome=\"failed\""),
             ("wasmkeep_events_total", "class=\""),
             ("wasmkeep_bucket_requests_total", "status=\"error\""),
+            ("wasmkeep_failover_waits_total", "outcome=\"expired\""),
+            ("wasmkeep_failover_waits_total", "outcome=\"over_cap\""),
+            ("wasmkeep_admission_refused_total", "reason=\"capacity\""),
+            ("wasmkeep_admission_refused_total", "reason=\"overloaded\""),
+            ("wasmkeep_admission_refused_total", "reason=\"wrong_app\""),
+            ("wasmkeep_admission_refused_total", "reason=\"unavailable\""),
         ] {
             assert!(
                 page.lines()
@@ -1020,6 +1156,273 @@ mod tests {
             assert!(
                 page.contains(&format!("# TYPE {base} ")),
                 "the dashboard queries {name}, which the metrics page does not have"
+            );
+        }
+    }
+
+    /// A page rendered from a fresh, seeded [`Metrics`]: what a node
+    /// serves before anything happened.
+    fn fresh_page() -> String {
+        render_with(&Metrics::seeded(), Gauges::default(), &Identity::default())
+    }
+
+    /// Families whose label values are a fixed set have every series on
+    /// the page from the start, at 0: their names can be checked and
+    /// `increase()` sees the first event.
+    #[test]
+    fn bounded_families_are_on_the_page_at_zero_from_the_start() {
+        let page = fresh_page();
+        let mut expected = Vec::new();
+        for kind in FAILOVER_KINDS {
+            for outcome in FAILOVER_OUTCOMES {
+                expected.push(format!(
+                    "wasmkeep_failover_waits_total{{kind=\"{kind}\",outcome=\"{outcome}\"}} 0"
+                ));
+            }
+        }
+        for operation in BUCKET_OPERATIONS {
+            for status in BUCKET_STATUSES {
+                expected.push(format!(
+                    "wasmkeep_bucket_requests_total{{operation=\"{operation}\",status=\"{status}\"}} 0"
+                ));
+            }
+        }
+        for (name, label, values) in [
+            ("wasmkeep_event_cuts_total", "reason", &CUT_REASONS[..]),
+            ("wasmkeep_forwards_total", "kind", &FORWARD_KINDS[..]),
+            (
+                "wasmkeep_signatures_refused_full_total",
+                "record",
+                &SIGNATURE_RECORDS[..],
+            ),
+            (
+                "wasmkeep_websocket_owner_closes_total",
+                "reason",
+                &OWNER_CLOSE_REASONS[..],
+            ),
+            (
+                "wasmkeep_parked_releases_total",
+                "reason",
+                &PARKED_RELEASE_REASONS[..],
+            ),
+        ] {
+            for v in values {
+                expected.push(format!("{name}{{{label}=\"{v}\"}} 0"));
+            }
+        }
+        for o in FRONT_REQUEST_OUTCOMES {
+            expected.push(format!(
+                "wasmkeep_front_requests_total{{tenant=\"default\",app=\"default\",outcome=\"{o}\"}} 0"
+            ));
+        }
+        for o in FRONT_CALL_OUTCOMES {
+            expected.push(format!(
+                "wasmkeep_front_calls_total{{tenant=\"default\",app=\"default\",outcome=\"{o}\"}} 0"
+            ));
+        }
+        for line in &expected {
+            assert!(page.lines().any(|l| l == line), "no {line} in\n{page}");
+        }
+        // Families keyed by class get a series at a class's first event
+        // only: no names beyond the classes that ran.
+        assert!(!page.contains("wasmkeep_events_total{"), "{page}");
+        assert!(
+            !page.contains("wasmkeep_event_duration_seconds_bucket{"),
+            "{page}"
+        );
+    }
+
+    /// Every not-ready reason is a series from the start: 0, and 1 for the
+    /// reason the node is not ready, if it is not.
+    #[test]
+    fn every_not_ready_reason_is_a_series() {
+        let reasons = |page: &str| -> Vec<(String, String)> {
+            page.lines()
+                .filter_map(|l| l.strip_prefix("wasmkeep_not_ready{reason=\""))
+                .map(|l| {
+                    let (reason, v) = l.split_once("\"} ").unwrap();
+                    (reason.to_owned(), v.to_owned())
+                })
+                .collect()
+        };
+        let ready = reasons(&fresh_page());
+        assert_eq!(ready.len(), NOT_READY_REASONS.len(), "{ready:?}");
+        assert!(ready.iter().all(|(_, v)| v == "0"), "{ready:?}");
+        let why = "bucket unreachable (node lease not renewed)";
+        let not_ready = reasons(&render_with(
+            &Metrics::seeded(),
+            Gauges {
+                not_ready: Some(why),
+                ..Gauges::default()
+            },
+            &Identity::default(),
+        ));
+        assert_eq!(not_ready.len(), NOT_READY_REASONS.len(), "{not_ready:?}");
+        let ones: Vec<_> = not_ready.iter().filter(|(_, v)| v == "1").collect();
+        assert_eq!(ones, [&(why.to_owned(), "1".to_owned())], "{not_ready:?}");
+        // A reason missing from the list is still on the page.
+        let page = render(Gauges {
+            not_ready: Some("something new"),
+            ..Gauges::default()
+        });
+        assert!(
+            page.contains("\nwasmkeep_not_ready{reason=\"something new\"} 1\n"),
+            "{page}"
+        );
+    }
+
+    /// The quoted literal after each `needle` in `src`, whitespace ignored:
+    /// the first `"..."` before the next `)` or `;`.
+    fn literals(src: &str, needle: &str) -> Vec<String> {
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let needle: String = needle.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut out = Vec::new();
+        let mut rest = compact.as_str();
+        while let Some(at) = rest.find(&needle) {
+            rest = &rest[at + needle.len()..];
+            let end = rest.find([')', ';']).unwrap_or(rest.len());
+            let call = &rest[..end];
+            if let Some(open) = call.find('"') {
+                let value = &call[open + 1..];
+                if let Some(close) = value.find('"') {
+                    out.push(value[..close].to_owned());
+                }
+            }
+        }
+        out
+    }
+
+    /// The label values seeded at 0 are the ones the code counts: a value
+    /// counted somewhere is in its list.
+    #[test]
+    fn the_seeded_label_values_are_the_ones_counted() {
+        let failover = include_str!("cluster/failover_wait.rs");
+        let check = |what: &str, found: Vec<String>, list: &[&str]| {
+            assert!(!found.is_empty(), "{what}: no call site found");
+            for v in &found {
+                assert!(
+                    list.contains(&v.as_str()),
+                    "{what}: {v} is counted but not seeded"
+                );
+            }
+        };
+        check(
+            "failover outcomes",
+            [
+                literals(failover, "self.outcome = "),
+                literals(failover, "outcome: "),
+                literals(failover, "FailoverWait::count(kind, "),
+                literals(include_str!("actor/requests.rs"), ".end("),
+                literals(include_str!("actor/upgrade.rs"), ".end("),
+            ]
+            .concat(),
+            &FAILOVER_OUTCOMES,
+        );
+        check(
+            "bucket operations",
+            literals(include_str!("counted_store.rs"), "record("),
+            &BUCKET_OPERATIONS,
+        );
+        check(
+            "event cuts",
+            literals(include_str!("actor/host.rs"), "cut("),
+            &CUT_REASONS,
+        );
+        check(
+            "forwards",
+            literals(include_str!("cluster.rs"), ".forwards.get(&[(\"kind\", "),
+            &FORWARD_KINDS,
+        );
+        check(
+            "signature records",
+            [
+                literals(include_str!("cluster.rs"), "SeenSignatures::named("),
+                literals(include_str!("cluster.rs"), "SeenSignatures::with_cap("),
+            ]
+            .concat(),
+            &SIGNATURE_RECORDS,
+        );
+        check(
+            "owner closes",
+            [
+                include_str!("actor/drain.rs"),
+                include_str!("actor/moving.rs"),
+                include_str!("actor/socket_owners.rs"),
+                include_str!("actor/sockets.rs"),
+            ]
+            .iter()
+            .flat_map(|src| literals(src, "owner_closes("))
+            .collect(),
+            &OWNER_CLOSE_REASONS,
+        );
+        check(
+            "parked releases",
+            [
+                include_str!("actor.rs"),
+                include_str!("actor/drain.rs"),
+                include_str!("actor/moving.rs"),
+                include_str!("actor/socket_owners.rs"),
+                include_str!("actor/state.rs"),
+                include_str!("cluster/lease_hold.rs"),
+            ]
+            .iter()
+            .flat_map(|src| {
+                [
+                    literals(src, "release_parked("),
+                    literals(src, "release_all_parked("),
+                    literals(src, "parked_released("),
+                ]
+                .concat()
+            })
+            .collect(),
+            &PARKED_RELEASE_REASONS,
+        );
+        check(
+            "front requests",
+            literals(include_str!("front.rs"), "outcome("),
+            &FRONT_REQUEST_OUTCOMES,
+        );
+    }
+
+    /// The not-ready reasons listed are every reason a node gives
+    /// ([`crate::ActorService::not_ready`], the cluster's, and a stopped
+    /// node's words).
+    #[test]
+    fn the_not_ready_reasons_are_every_reason_given() {
+        /// The body of the method `fn name(` (to its closing brace at four
+        /// spaces), or of a function at none.
+        fn body<'a>(src: &'a str, name: &str) -> &'a str {
+            let at = src.find(&format!("fn {name}(")).expect(name);
+            let rest = &src[at..];
+            let end = rest.find("\n    }\n").expect(name);
+            &rest[..end]
+        }
+        fn quoted(src: &str, after: &str) -> Vec<String> {
+            src.split(after)
+                .skip(1)
+                .filter_map(|s| Some(s.split_once('"')?.0.to_owned()))
+                .collect()
+        }
+        let mut given = quoted(body(include_str!("actor.rs"), "not_ready"), "Some(\"");
+        given.extend(quoted(
+            body(include_str!("cluster.rs"), "not_ready"),
+            "Some(\"",
+        ));
+        given.extend(quoted(
+            body(include_str!("cluster/identity.rs"), "words"),
+            "=> \"",
+        ));
+        assert!(given.len() > 10, "{given:?}");
+        for reason in &given {
+            assert!(
+                NOT_READY_REASONS.contains(&reason.as_str()),
+                "the not-ready reason {reason:?} is not in NOT_READY_REASONS"
+            );
+        }
+        for reason in NOT_READY_REASONS {
+            assert!(
+                given.iter().any(|g| g == reason),
+                "NOT_READY_REASONS lists {reason:?}, which no code gives"
             );
         }
     }

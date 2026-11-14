@@ -514,7 +514,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             clock,
             id: id.to_owned(),
             address: address.into(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: crate::VERSION.to_owned(),
             app: String::new(),
             cluster_address: None,
             tls_pins: Vec::new(),

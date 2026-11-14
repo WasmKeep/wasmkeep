@@ -9,9 +9,10 @@ the page that covers it in depth.
 
 This follows [From one node to three](one-node-to-three.md). Applies to:
 WasmKeep built from `main` (the release after `0.3.0`). Steps or flags
-that `0.3.0` does not have are marked **main only**. A build from source
-reports `0.3.0` as its version (`wasmkeep --version`), so the version
-alone cannot tell you which one you run.
+that `0.3.0` does not have are marked **main only**. A build from a git
+checkout of `main` reports the release it follows and its commit, such as
+`0.3.0+4f1c2a9e7b3d` (`wasmkeep --version`, and the VERSION column of
+`cluster status`); the release reports `0.3.0` alone.
 
 > **Pre-alpha.** The cluster is tested in simulation, with real processes
 > against an S3 API, and against real buckets with nodes killed under load
@@ -122,7 +123,8 @@ the systemd unit and the flags. Check each machine against them:
   ([rules that apply everywhere](../deploy/where-to-run.md#rules-that-apply-everywhere)).
 - [ ] One `--node-id` per machine, kept across restarts and reinstalls.
 - [ ] Clocks synchronised (NTP): the leases are measured on each node's
-  clock, and `cluster diagnose` reports the skew it found.
+  clock and tolerate up to 1 s of skew, and `cluster diagnose` reports
+  the skew it found.
 - [ ] A stop timeout of 30 s (`TimeoutStopSec=30`), so a clean stop can
   hand its actors over ([stop timeouts](../deploy/three-nodes.md#operating-it)).
 - [ ] A private network between the nodes: only the load balancer
@@ -148,15 +150,15 @@ wasmkeep cluster status --bucket "$BUCKET"
 ```text
 Cluster s3://demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE   STATE    ACTORS  SOCKETS  EV/MIN  VERSION  APP        ADDRESS                CLUSTER ADDRESS         TLS
-a     yes   2.0s  serving  1       0        -       0.3.0    demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
-b     yes   2.0s  serving  0       0        -       0.3.0    demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
-c     yes   2.0s  serving  0       0        -       0.3.0    demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
+NODE  LIVE  AGE   STATE    ACTORS  SOCKETS  EV/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
+a     yes   2.0s  serving  1       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
+b     yes   2.0s  serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
+c     yes   2.0s  serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
 
 APP        DEPLOYED VERSION  SEQ  ACTORS
 demo/shop  7973128b9d723db8  1    1
 
-3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0
+3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0+4f1c2a9e7b3d
 ```
 
 Each node is live, has a `CLUSTER ADDRESS` and shows `pinned` under TLS;
@@ -313,11 +315,13 @@ wasmkeep_admission_refused_total{reason="unavailable"} 0
 wasmkeep_admission_refused_total{reason="wrong_app"} 0
 ```
 
-  Some series appear only once they count something:
-  `wasmkeep_bucket_requests_total{status="error"}` after the first bucket
-  error, `wasmkeep_failover_waits_total` after the first request kept
-  while a node died, `wasmkeep_not_ready{reason}` while the node is not
-  ready.
+  Counters with a fixed set of labels are on the page from the start, at
+  0 (**main only**; `0.3.0` adds a series at its first count):
+  `wasmkeep_bucket_requests_total{status="error"}`,
+  `wasmkeep_failover_waits_total{kind,outcome}`, and
+  `wasmkeep_not_ready{reason}` with one series per reason, 1 for the
+  reason a node is not ready. Only series with a `class` label wait for
+  that class's first event.
 - [ ] **The alert rules loaded**: [`deploy/prometheus/alerts.yml`](../../deploy/prometheus/alerts.yml),
   with `rule_files:` in `prometheus.yml`, checked with `promtool check
   rules` ([alerts worth having](../monitoring.md#alerts-worth-having)).
@@ -329,16 +333,14 @@ wasmkeep_admission_refused_total{reason="wrong_app"} 0
 | --- | --- | --- |
 | Not-ready nodes: `wasmkeep_ready`, `wasmkeep_not_ready{reason}`, `up` | A node out of the load balancer: shutting down, cut off from the bucket, out of disk, or down | `WasmKeepNodeNotReady`, `WasmKeepNodeDown` |
 | Bucket errors: `wasmkeep_bucket_requests_total{status="error"}`, `wasmkeep_node_lease_failures_total` | The bucket refusing or not answering; two lease writes failing in a row and a node drops its actors | `WasmKeepBucketErrors`, `WasmKeepNodeLeaseWriteFailing` |
-| Failover waits: `wasmkeep_failover_waits_total{outcome}` | Requests kept while a node died; `expired` and `over_cap` are callers who got a 503 ([what each outcome means](../monitoring.md#metrics)) | Not yet: add a rule on `increase(wasmkeep_failover_waits_total{outcome=~"expired\|over_cap"}[15m]) > 0` |
-| Refused admissions: `wasmkeep_admission_refused_total{reason}` | Requests refused before they ran: `capacity` and `overloaded` (the node is full), `unavailable` (a required value not set, secrets the node cannot open), `wrong_app` (**main only**) | Not yet: add a rule on `increase(wasmkeep_admission_refused_total{reason!="access"}[15m]) > 0` |
+| Failover waits: `wasmkeep_failover_waits_total{outcome}` | Requests kept while a node died; `expired` and `over_cap` are callers who got a 503 ([what each outcome means](../monitoring.md#metrics)) | `WasmKeepFailoverWaitsFailed` (**main only**) |
+| Refused admissions: `wasmkeep_admission_refused_total{reason}` | Requests refused before they ran: `capacity` and `overloaded` (the node is full), `unavailable` (a required value not set, secrets the node cannot open), `wrong_app` (**main only**) | `WasmKeepAdmissionRefused` (5 minutes of `capacity`, `overloaded` or `wrong_app`), `WasmKeepAdmissionUnavailable` (15 minutes of `unavailable`, which ticks briefly while nodes catch up with a deploy or a secrets change) (**main only**) |
 
-  The two added expressions are starting points, not tested rules:
-  `unavailable` can count a few refusals while nodes catch up with a
-  deploy or a secrets change, so give such a rule a `for:` or a
-  threshold that fits your traffic. The rules also fire on fences and failovers (`WasmKeepNodeFenced`,
+  Thresholds and durations are starting points: adjust them to your
+  traffic in the file. The rules also fire on fences and failovers (`WasmKeepNodeFenced`,
   `WasmKeepFailover`), slow durable writes and failing events. The
-  dashboard does not chart the last two rows yet: query them in
-  Prometheus.
+  dashboard charts the last two rows in its "Failover waits and
+  refusals" row (**main only**).
 - [ ] **An alert seen once**: stop one node (`systemctl stop
   wasmkeep`) at a quiet hour, check that `WasmKeepNodeDown` reaches
   whoever is paged after a minute (a stopped node exports nothing, so

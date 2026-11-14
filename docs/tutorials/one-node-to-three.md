@@ -191,15 +191,15 @@ wasmkeep cluster status --bucket s3://demo
 ```text
 Cluster s3://demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  VERSION  APP        ADDRESS                CLUSTER ADDRESS         TLS
-a     yes   2.0s   serving  1       0        -       0.3.0    demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
-b     yes   2.0s   serving  0       0        -       0.3.0    demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
-c     yes   1.9s   serving  0       0        -       0.3.0    demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
+NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
+a     yes   2.0s   serving  1       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
+b     yes   2.0s   serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
+c     yes   1.9s   serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
 
 APP        DEPLOYED VERSION  SEQ  ACTORS
 demo/shop  469fcd8d39aa32f2  1    1
 
-3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0
+3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0+4f1c2a9e7b3d
 ```
 
 - **LIVE** is `yes` when the node's heartbeat in the bucket is recent;

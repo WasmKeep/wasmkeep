@@ -22,7 +22,7 @@ use wasmkeep_server::{ActorConfig, ActorService, App, ClusterConfig, HttpCompone
 #[derive(Debug, Parser)]
 #[command(
     name = "wasmkeep",
-    version,
+    version = wasmkeep_server::VERSION,
     about = "Self-hosted actor platform for Wasm components"
 )]
 struct Cli {

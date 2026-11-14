@@ -19,8 +19,8 @@ bucket refusing or not answering its writes for the lease's ttl minus its
 safety margin (8 s by default; calls and durable writes would fail); and when the
 disk holding `--data-dir` has less than 1 GiB free (or 5% of a smaller
 disk), sampled every 5 s off the request path. The public answer gives no
-reason (the port faces clients); `wasmkeep_not_ready{reason}` on the metrics
-page does.
+reason (the port faces clients); `wasmkeep_not_ready{reason}` at 1 on the
+metrics page does.
 
 A node that stops for good says why in the same words in that reason and
 at the start of `serve`'s exit line, followed there by the details:
@@ -110,13 +110,26 @@ and histogram, also have `tenant` and `app`:
 the app the node serves (`serve --app tenant/app`), or the implicit app
 `default/default` for classes given on the command line.
 
+A counter whose labels take a fixed set of values has every series on the
+page from the node's start, at 0: `wasmkeep_failover_waits_total`,
+`wasmkeep_bucket_requests_total` (every operation and status, `error`
+included), `wasmkeep_admission_refused_total`,
+`wasmkeep_event_cuts_total`, `wasmkeep_forwards_total`,
+`wasmkeep_signatures_refused_full_total`,
+`wasmkeep_websocket_owner_closes_total`,
+`wasmkeep_parked_releases_total` and the front's two counters. So a
+query or a rule can be checked against the page before anything
+happened, and `increase()` counts the first event. Series with a `class`
+label appear at that class's first event, and the front's histogram at
+its first request.
+
 | Metric | Type | What it tells you |
 | --- | --- | --- |
 | `wasmkeep_info{version,tenant,app,node}` | gauge | Always 1: the running version and the node's app, with `node` its node id in a cluster (no `node` label otherwise). Join on it to see which version each node runs, or to add the app to the series that do not carry it: `wasmkeep_actors_resident * on (instance) group_left (tenant, app, version) wasmkeep_info`. |
 | `wasmkeep_actors_resident` | gauge | Actors in memory now: capacity planning. |
 | `wasmkeep_websockets_open` | gauge | Registered WebSockets, including pending close cleanup. |
 | `wasmkeep_classes` | gauge | Classes served. |
-| `wasmkeep_ready`, `wasmkeep_not_ready{reason}` | gauges | 1 when `/_wasmkeep/ready` answers 200; otherwise one `wasmkeep_not_ready` series saying why. |
+| `wasmkeep_ready`, `wasmkeep_not_ready{reason}` | gauges | 1 when `/_wasmkeep/ready` answers 200. `wasmkeep_not_ready` has a series for every reason in the table above and the others a node gives (the cluster secret, the node lease, the disk, the deployed version, the app's secrets), always on the page: 1 for the reason the node is not ready, 0 for the others. Count not-ready nodes with `count(wasmkeep_not_ready == 1)`. |
 | `wasmkeep_events_total{tenant,app,class,kind,outcome}` | counter | Events run; `kind` is `request`, `alarm`, `websocket` or `init`, `outcome` is `ok` or `failed` (trapped, cut, or a handler that returned an error). |
 | `wasmkeep_event_duration_seconds{tenant,app,class}` | histogram | Slow handlers and hot classes. |
 | `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit) or `lease` (this node lost the actor mid-event). |
@@ -221,6 +234,7 @@ default, and filters by node and class.
 | Events | Events per second by class and outcome, the failed share by class, duration p50 and p99, events stopped by the host (wall clock, lost lease, CPU budget). |
 | Actors and placement | Wakes and hibernations, instantiation p50 and p99, forwards by kind, alarm admission retries. |
 | Bucket and leases | Bucket requests by operation and by status, durable write p50 and p99, bucket errors and node lease failures per node, failovers per node. |
+| Failover waits and refusals | Requests kept for a takeover, by how the wait ended; admissions refused, by reason. |
 
 A test (`the_grafana_dashboard_uses_only_metrics_that_exist`) fails if the
 dashboard queries a metric the page does not have.
@@ -232,8 +246,10 @@ as Prometheus rules, with one more for a node Prometheus cannot scrape
 (`up == 0` for a minute): a node that is down exports nothing, so none of
 the rules below would say so. Load the file with `rule_files:` in
 `prometheus.yml` and check it with `promtool check rules` after editing.
-It assumes a scrape job named `wasmkeep`, and the rules on durable write
-latency and on failed events wait 5 minutes before they fire. Two of the
+It assumes a scrape job named `wasmkeep`. The rules on durable write
+latency, failed events, bucket errors and refused admissions wait 5
+minutes before they fire, the one on `unavailable` refusals 15 (see
+below), and the one on readiness 2. Two of the
 rules below hold
 "when no node was lost": a rule cannot know that, so they fire on every
 fence and failover, a deliberate kill included, and their text says so.
@@ -252,6 +268,17 @@ fails if a rule names a metric the page does not have.
 - `rate(wasmkeep_bucket_requests_total{status="error"}[5m])` above 0 for
   5 minutes.
 - `increase(wasmkeep_failovers_total[15m])` above 0 when no node was lost.
+- `increase(wasmkeep_failover_waits_total{outcome=~"expired|over_cap"}[15m])`
+  above 0 (`WasmKeepFailoverWaitsFailed`): callers kept for a takeover got
+  a 503 all the same.
+- `rate(wasmkeep_admission_refused_total{reason=~"capacity|overloaded|wrong_app"}[5m])`
+  above 0 for 5 minutes (`WasmKeepAdmissionRefused`, by reason): the node
+  is full, or traffic reaches nodes of another app. `access` refusals are
+  the classes' own rules at work and are not alerted on.
+- `rate(wasmkeep_admission_refused_total{reason="unavailable"}[5m])` above
+  0 for 15 minutes (`WasmKeepAdmissionUnavailable`): a few such refusals
+  while nodes catch up with a deploy or a secrets change are expected;
+  this long, the node is stuck.
 
 ## What actors print
 

@@ -133,7 +133,10 @@ listeners) moves to this in two rounds (see Operating it below); while
 any node runs with `--cluster-plaintext accept`, keep 8080 private too.
 
 Clocks should be synchronised (NTP, as on any cloud VM). The lease timings
-tolerate a few seconds of skew between nodes.
+tolerate up to 1 s of skew between any two nodes, and between a node and
+the bucket; `wasmkeep cluster diagnose` measures the bucket's clock
+against the machine it runs on
+([Running `cluster diagnose`](buckets.md#running-cluster-diagnose)).
 
 ## 3. Deploy the application
 

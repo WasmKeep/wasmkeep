@@ -25,7 +25,7 @@ of what adding nodes does, read
   its next write when another writer replaced it, and stops. A node runs
   actors' events and is ready only while that lease is valid (10 s after
   its last write, minus a 2 s safety margin). The lease timings tolerate
-  clock skew between nodes (see `wasmkeep_cluster::node_lease`, proven in
+  up to 1 s of clock skew between nodes (see `wasmkeep_cluster::node_lease`, proven in
   simulation).
 - Each actor has an **ownership record** in the bucket at
   `state/<tenant>/<app>/owners/<class>/<name>`, under its app's state root
@@ -1112,8 +1112,10 @@ Going back to the previous binary is the same procedure, except across
 the 0.4.0 layout change: `cluster migrate --rollback` works only until
 the first node starts after the migration, and never after
 `--remove-old --apply` ([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
-source report the version of the release they follow (`0.3.0` for any
-build since it), so the version column cannot tell two of them apart:
+a git checkout report the release they follow and their commit
+(`0.3.0+4f1c2a9e7b3d`), a release's tag the release alone, so the version
+column tells two builds of `main` apart. A build without git (a source
+tarball, a container image built locally) reports the release alone:
 step 3 is what proves no old node is left.
 
 **What goes wrong if old and new nodes run together** (each is a reason

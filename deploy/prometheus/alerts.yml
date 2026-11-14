@@ -78,8 +78,8 @@ groups:
           summary: "{{ $labels.instance }} has not been ready for 2 minutes"
           description: >-
             /_wasmkeep/ready answers 503 on this node, so a load balancer
-            sends it no traffic. The wasmkeep_not_ready series of the same
-            instance carries the reason.
+            sends it no traffic. The wasmkeep_not_ready series at 1 of the
+            same instance carries the reason.
 
       - alert: WasmKeepBucketErrors
         expr: >-
@@ -106,6 +106,58 @@ groups:
             This node took actors whose node was fenced, or stopped without
             releasing them. Expected when a node was lost or killed;
             otherwise find out which node stopped, and why.
+
+      - alert: WasmKeepFailoverWaitsFailed
+        expr: >-
+          sum by (instance, outcome) (
+            increase(wasmkeep_failover_waits_total{outcome=~"expired|over_cap"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} answered 503 to requests kept for a takeover ({{ $labels.outcome }})"
+          description: >-
+            Requests for an actor whose node was dead or stopping got a 503
+            from this node. expired: the wait ran out before the actor was
+            taken over (the wait is shorter than the takeover, or no node
+            could fence the dead one). over_cap: the node already kept as
+            many requests as it may, and answered at once.
+
+      - alert: WasmKeepAdmissionRefused
+        expr: >-
+          sum by (instance, reason) (
+            rate(wasmkeep_admission_refused_total{reason=~"capacity|overloaded|wrong_app"}[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} refuses requests before they run ({{ $labels.reason }})"
+          description: >-
+            Requests, WebSocket upgrades or actor calls were refused in
+            every 5-minute window for 5 minutes. capacity: more actors awake
+            at once than the node holds; overloaded: an actor's queue is
+            full; wrong_app: nodes of two apps on one cluster port, or a
+            front door sending one app's traffic to another app's nodes.
+            access (the classes' own rules) is not counted here.
+
+      - alert: WasmKeepAdmissionUnavailable
+        expr: >-
+          sum by (instance) (
+            rate(wasmkeep_admission_refused_total{reason="unavailable"}[5m])
+          ) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} cannot run actors it is asked for"
+          description: >-
+            Refusals with reason unavailable (503) in every 5-minute window
+            for 15 minutes: a required value not set, the deployed version
+            or the app's secrets not applied, or the bucket not answering
+            for the actors' ownership. A few while nodes catch up with a
+            deploy or a secrets change are expected; this long, the node is
+            stuck. Its logs and cluster status say which.
 
       - alert: WasmKeepNodeDown
         expr: up{job="wasmkeep"} == 0
