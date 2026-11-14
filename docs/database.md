@@ -183,7 +183,9 @@ of them).
 - **Per request**, by default: a 4 MiB body, 100 statements, 100,000
   bytes of SQL and 100 parameters per statement, and an 8 MiB answer
   (blobs travel as hex, two bytes each). Over any, the request is refused
-  (`TooLarge`) and nothing is kept.
+  (`TooLarge`) and nothing is kept. A TypeScript database refuses an
+  answer whose values' lengths alone pass the cap before encoding any of
+  it, so the refusal costs next to nothing of the CPU budget below.
 - **The host's limits** bound every request too, since a request is one
   event of the database actor: its CPU budget and wall-clock time, each
   statement's time and result size, and the database's size cap. A

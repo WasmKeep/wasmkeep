@@ -428,7 +428,8 @@ async fn past_its_slots_the_front_answers_503_without_running() {
     .await;
     let addr = node.addr;
     let busy = tokio::spawn(async move { get(addr, "/sleep?ms=1500", "").await });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The sleeping request holds the one slot.
+    on_page(&["\nwasmkeep_front_slots_in_use 1\n"]).await;
     let r = get(addr, "/", "").await;
     assert_eq!(r.status, 503, "{}", r.body);
     assert_eq!(r.header("retry-after").as_deref(), Some("1"));
@@ -441,7 +442,10 @@ async fn past_its_slots_the_front_answers_503_without_running() {
         "{page}"
     );
     assert_eq!(busy.await.unwrap().body, "slept");
-    // The slot is free again once the request ended.
+    // The slot is free again once the request ended: once its instance is
+    // gone, which can be just after the client has read the whole answer
+    // (the task streaming it holds the slot until then).
+    on_page(&["\nwasmkeep_front_slots_in_use 0\n"]).await;
     let r = get(addr, "/", "").await;
     assert_eq!((r.status, r.body.as_str()), (200, "front ok"));
 }

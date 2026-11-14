@@ -384,11 +384,40 @@ export function errorBody(code: string, message: string, kind?: string, statemen
   return JSON.stringify({ error: code, kind, statement, message });
 }
 
+/** The fewest bytes `v` takes in an answer, read off its length without
+ * encoding it: a blob is `{"blob":""}` and two hex digits a byte, text its
+ * quotes and at least one byte a UTF-16 unit (escapes only add). */
+function leastLength(v: Value): number {
+  switch (v.tag) {
+    case "blob":
+      return 11 + 2 * v.val.length;
+    case "text":
+      return 2 + v.val.length;
+    default:
+      return 4;
+  }
+}
+
+/** The fewest bytes `values` take as rows: brackets, commas and each
+ * value's `leastLength`. */
+function leastRowsLength(values: Value[][]): number {
+  let n = 0;
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    n += (i > 0 ? 1 : 0) + 2 + Math.max(row.length - 1, 0);
+    for (let j = 0; j < row.length; j++) n += leastLength(row[j]);
+  }
+  return n;
+}
+
 /** One query's answer: `{"columns": [...], "rows": [[...], ...]}`, or
- * `undefined` once it passes `max` bytes on top of `used`. */
+ * `undefined` once it passes `max` bytes on top of `used`. An answer whose
+ * least size is already over `max` is refused before anything is encoded,
+ * so refusing it costs the handler next to nothing of its CPU budget. */
 export function rowsBody(columns: string[], values: Value[][], used: number, max: number): string | undefined {
   const parts: string[] = [`{"columns":${JSON.stringify(columns)},"rows":[`];
   let size = used + utf8Length(parts[0]);
+  if (size + leastRowsLength(values) > max) return undefined;
   for (let i = 0; i < values.length; i++) {
     const row = (i > 0 ? "," : "") + JSON.stringify(values[i].map(wireValue));
     size += utf8Length(row);
