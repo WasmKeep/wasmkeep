@@ -37,6 +37,12 @@
 //!   refuses a key written after the commit, and an unfinished migration;
 //!   it never touches a tenant with no commit; it keeps history younger
 //!   than the retention window and moves not yet expired for a later run.
+//! - **A `--rollback` that failed or crashed in its check under the
+//!   lock**, while a node started or a `--remove-old` that read no lock
+//!   marked and deleted: run again, it checks again and refuses, puts back
+//!   the lock it replaced, and never deletes the only copy.
+//! - **A `--remove-old` stopped by a lock after its marks**: the rollback
+//!   stays given up, and a later removal needs no acknowledgement.
 //!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --test madsim_migrate --target-dir target/madsim`
 
@@ -1455,10 +1461,12 @@ fn a_started_rollback_finishes_whatever_ran_since() {
             if first.is_ok() {
                 return;
             }
+            // Started: its lock says its check passed (a lock not checked
+            // yet checks again, and refuses).
             if !sim
                 .snapshot()
                 .get(LOCK_KEY)
-                .is_some_and(|o| o.body.windows(13).any(|w| w == b"mode rollback"))
+                .is_some_and(|o| o.body.windows(14).any(|w| w == b"mode rollback\n"))
             {
                 return;
             }
@@ -1995,4 +2003,301 @@ fn a_remove_old_with_nothing_to_delete_writes_no_mark() {
             );
         });
     }
+}
+
+/// Everything under the roots.
+fn roots(m: &Map) -> BTreeMap<String, Vec<u8>> {
+    m.iter()
+        .filter(|(k, _)| k.starts_with("state/"))
+        .map(|(k, o)| (k.clone(), o.body.clone()))
+        .collect()
+}
+
+/// A run of `--apply`, whole (`None`) or crashed after request `i` (the
+/// crash then cleared).
+async fn apply_until(sim: &Sim, i: Option<u64>) {
+    *sim.crash_after.lock().unwrap() = i;
+    let done = apply(sim).await;
+    *sim.crash_after.lock().unwrap() = None;
+    if i.is_none() {
+        done.unwrap();
+    }
+}
+
+/// The request, counted from its first, by which a clean `--rollback`
+/// after [`apply_until`] takes its lock: the one before its second
+/// listing of `nodes/` (its check under the lock). `None`: it took none.
+fn rollback_lock_request(seed: u64, i: Option<u64>) -> Option<u64> {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        apply_until(&sim, i).await;
+        let ops = *sim.ops.lock().unwrap();
+        let listings = sim.node_listings.lock().unwrap().len();
+        rollback(&sim).await.unwrap();
+        let second = sim
+            .node_listings
+            .lock()
+            .unwrap()
+            .get(listings + 1)
+            .copied()?;
+        Some(second - 1 - ops)
+    })
+}
+
+/// `--remove-old --apply --forgo-rollback` read no lock (the rollback had
+/// not taken it yet), marked both tenants and deleted their old keys,
+/// while a `--rollback` that had passed its first check, before any mark,
+/// took the lock (request `at` of it). Its check under the lock fails at
+/// request `j` of it on (a bucket error, or the process died: every later
+/// request fails), so it never saw the marks. Run again, the rollback
+/// checks again and refuses: the copies under the roots, now the only
+/// copy, stay, and nothing holds the lock.
+fn a_rollback_failed_in_its_check_under_the_lock(seed: u64, at: u64, j: u64) {
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        apply(&sim).await.unwrap();
+        let migrated = sim.snapshot();
+        let deletes: Vec<String> = Migrator::new(&sim, &SimClock, apps(), options())
+            .removal(remove_options(true))
+            .await
+            .unwrap()
+            .tenants
+            .into_values()
+            .flat_map(|t| t.delete)
+            .collect();
+        assert!(!deletes.is_empty(), "seed {seed}");
+        let ops = *sim.ops.lock().unwrap();
+        sim.hooks
+            .lock()
+            .unwrap()
+            .entry(ops + at)
+            .or_default()
+            .push(Box::new(move |m: &mut Map, now| {
+                for t in ["acme", "default"] {
+                    m.insert(
+                        format!("{REMOVED_PREFIX}{t}"),
+                        Obj {
+                            body: Vec::new(),
+                            version: 1,
+                            written: now,
+                        },
+                    );
+                }
+                for k in &deletes {
+                    m.remove(k);
+                }
+            }));
+        *sim.crash_after.lock().unwrap() = Some(ops + at - 1 + j);
+        let first = rollback(&sim).await;
+        *sim.crash_after.lock().unwrap() = None;
+        assert!(first.is_err(), "seed {seed}, j {j}: {first:?}");
+        let again = rollback(&sim).await;
+        let m = sim.snapshot();
+        assert_eq!(
+            roots(&m),
+            roots(&migrated),
+            "seed {seed}, j {j}: the rollback deleted the only copy ({again:?})"
+        );
+        match again {
+            Err(MigrateError::Refused(why)) => {
+                assert!(why.concat().contains("one-way"), "seed {seed}: {why:?}");
+            }
+            other => panic!("seed {seed}, j {j}: {other:?}"),
+        }
+        assert!(!m.contains_key(LOCK_KEY), "seed {seed}, j {j}: lock left");
+        // And the removal goes on to the end.
+        remove_old(&sim, true)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}, j {j}: {e}"));
+        check_removed(seed, &sim.snapshot(), &migrated);
+    });
+}
+
+#[test]
+fn a_rollback_that_failed_in_its_check_under_the_lock_checks_again() {
+    let at = rollback_lock_request(5, None).unwrap();
+    // The lock, every request of the check, and putting it back.
+    for j in 0..6 {
+        a_rollback_failed_in_its_check_under_the_lock(5, at, j);
+    }
+    for seed in 0..seeds() {
+        let at = rollback_lock_request(seed, None).unwrap();
+        a_rollback_failed_in_its_check_under_the_lock(seed, at, seed % 6);
+    }
+}
+
+/// An `--apply` crashed after request `i`, leaving its lock, then a
+/// `--rollback` over it: a node starts just before it takes the lock
+/// (request `at` of it), and its check under the lock fails at request
+/// `j` of it on. Run again, it checks again, refuses, and puts the
+/// `--apply`'s lock back as it was; the `--apply` then finishes. `false`:
+/// that crash left no lock.
+fn a_rollback_over_an_apply_failed_in_its_check(seed: u64, i: u64, j: u64) -> bool {
+    let Some(at) = rollback_lock_request(seed, Some(i)) else {
+        return false;
+    };
+    runtime(seed).block_on(async move {
+        start_clock();
+        let sim = Sim::new(seed, fixture());
+        let before = sim.snapshot();
+        apply_until(&sim, Some(i)).await;
+        let Some(lock) = sim.snapshot().get(LOCK_KEY).map(|o| o.body.clone()) else {
+            return false;
+        };
+        let ops = *sim.ops.lock().unwrap();
+        sim.hooks
+            .lock()
+            .unwrap()
+            .entry(ops + at)
+            .or_default()
+            .push(Box::new(|m: &mut Map, now| {
+                m.insert(
+                    "nodes/node-new".into(),
+                    Obj {
+                        body: NodeLeaseObject {
+                            state: NodeState::Released,
+                            instance: Some("nn".into()),
+                            written_at_ms: now,
+                        }
+                        .encode(),
+                        version: 1,
+                        written: now,
+                    },
+                );
+            }));
+        *sim.crash_after.lock().unwrap() = Some(ops + at - 1 + j);
+        let first = rollback(&sim).await;
+        *sim.crash_after.lock().unwrap() = None;
+        assert!(first.is_err(), "seed {seed}, i {i}, j {j}: {first:?}");
+        match rollback(&sim).await {
+            Err(MigrateError::Refused(why)) => {
+                assert!(why.concat().contains("one-way"), "seed {seed}: {why:?}");
+            }
+            other => panic!("seed {seed}, i {i}, j {j}: rolled back after a node ran: {other:?}"),
+        }
+        assert_eq!(
+            sim.snapshot().get(LOCK_KEY).map(|o| o.body.clone()),
+            Some(lock),
+            "seed {seed}, i {i}, j {j}: not the --apply's lock"
+        );
+        apply(&sim)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}, i {i}, j {j}: {e}"));
+        check_migrated(seed, &sim.snapshot(), &before, &actors());
+        true
+    })
+}
+
+#[test]
+fn a_rollback_over_an_apply_that_failed_in_its_check_puts_the_lock_back() {
+    let (ops, _) = clean(6);
+    let mut met = 0;
+    for i in (0..=ops).step_by(7) {
+        for j in 0..6 {
+            met += u64::from(a_rollback_over_an_apply_failed_in_its_check(6, i, j));
+        }
+    }
+    assert!(met > 0, "no crash left a lock");
+    for seed in 0..seeds() {
+        let (ops, _) = clean(seed);
+        let i = Rng::new(seed ^ 0x10c).below(ops + 1);
+        a_rollback_over_an_apply_failed_in_its_check(seed, i, seed % 6);
+    }
+}
+
+/// `--remove-old --apply --forgo-rollback` finds the lock of an
+/// `--apply` after marking both tenants: it stops, deleting nothing, and
+/// says the marks stay. They are the rollback given up: once that run
+/// let the lock go, `--rollback` refuses, the dry run says why, and
+/// `--remove-old --apply` deletes without `--forgo-rollback`.
+#[test]
+fn a_remove_old_stopped_by_a_lock_leaves_the_rollback_given_up() {
+    for seed in 0..seeds() {
+        runtime(seed).block_on(async move {
+            start_clock();
+            let sim = Sim::new(seed, fixture());
+            apply(&sim).await.unwrap();
+            let migrated = sim.snapshot();
+            let ops = *sim.ops.lock().unwrap();
+            Migrator::new(&sim, &SimClock, apps(), options())
+                .removal(remove_options(true))
+                .await
+                .unwrap();
+            let now = *sim.ops.lock().unwrap();
+            // The dry run's reads, the two marks, then the lock read.
+            sim.hooks.lock().unwrap().insert(
+                now + (now - ops) + 3,
+                vec![Box::new(|m: &mut Map, at| {
+                    m.insert(
+                        LOCK_KEY.into(),
+                        Obj {
+                            body: b"wasmkeep-migration 1\nmode apply\nplan 00\nat 0\n".to_vec(),
+                            version: 1,
+                            written: at,
+                        },
+                    );
+                })],
+            );
+            match remove_old(&sim, true).await {
+                Err(MigrateError::Aborted(why)) => {
+                    assert!(
+                        why.contains("nothing was deleted") && why.contains("given up"),
+                        "seed {seed}: {why}"
+                    );
+                }
+                other => panic!("seed {seed}: {other:?}"),
+            }
+            let m = sim.snapshot();
+            assert_eq!(canonical(&m), canonical(&migrated), "seed {seed}: deleted");
+            for t in ["acme", "default"] {
+                assert!(
+                    m.contains_key(&format!("{REMOVED_PREFIX}{t}")),
+                    "seed {seed}"
+                );
+            }
+            // That run finished and let the lock go.
+            sim.objects.lock().unwrap().remove(LOCK_KEY);
+            match rollback(&sim).await {
+                Err(MigrateError::Refused(why)) => {
+                    assert!(
+                        why.concat().contains("--remove-old"),
+                        "seed {seed}: {why:?}"
+                    );
+                }
+                other => panic!("seed {seed}: {other:?}"),
+            }
+            assert_eq!(canonical(&sim.snapshot()), canonical(&migrated));
+            let dry = Migrator::new(&sim, &SimClock, apps(), options())
+                .removal(remove_options(false))
+                .await
+                .unwrap();
+            assert!(dry.refusals.is_empty(), "seed {seed}: {:?}", dry.refusals);
+            assert!(
+                dry.tenants.values().all(|t| t.given_up && !t.rollback_open),
+                "seed {seed}: {dry:?}"
+            );
+            remove_old(&sim, false)
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            check_removed(seed, &sim.snapshot(), &migrated);
+        });
+    }
+}
+
+/// The plan's estimate includes the quiet window an `--apply` waits, and
+/// only while there is something to migrate.
+#[test]
+fn the_plan_counts_the_quiet_window_only_with_something_to_migrate() {
+    runtime(0).block_on(async move {
+        start_clock();
+        let sim = Sim::new(0, fixture());
+        let migrator = Migrator::new(&sim, &SimClock, apps(), options());
+        let plan = migrator.plan().await.unwrap();
+        assert_eq!(plan.wait_ms, options().lease_window_ms);
+        assert!(plan.estimate_ms(8) >= options().lease_window_ms);
+        apply(&sim).await.unwrap();
+        assert_eq!(migrator.plan().await.unwrap().wait_ms, 0);
+    });
 }

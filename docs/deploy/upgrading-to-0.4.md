@@ -69,7 +69,8 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
    - the node leases it sees, and whether each may still run (a node
      stopped cleanly is quiet at once; a crashed or fenced one once its
      lease is 16 s old, with the default timings);
-   - the objects per family, and an estimate of the time;
+   - the objects per family, and an estimate of the time (the wait
+     before copying included);
    - what refuses the run, if anything.
 
    It exits with 0 when `--apply` would run, 1 otherwise.
@@ -157,7 +158,12 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
     Before its first delete it writes `cluster/removed/<tenant>` for each
     tenant; from then on `--rollback` refuses for good. If a run of
     `--apply` or `--rollback` takes the lock in between, it stops before
-    deleting. After a crash, run it again: it goes on. Exit codes: 0
+    deleting, and says what the marks now mean: they stay (the rollback
+    is given up for those tenants, and a later `--remove-old --apply`
+    needs no `--forgo-rollback`; the dry run says "the rollback was given
+    up"), unless a `--rollback` already past its check holds the lock,
+    which puts those tenants back and removes them. After a crash, run it
+    again: it goes on. Exit codes: 0
     done, 1 refused or stopped. Storage is back to one copy of the state
     (on a versioned bucket, once the noncurrent versions expire). The
     backup from step 3 can go. A run with nothing to delete writes no
@@ -174,8 +180,11 @@ wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX --rollback
 
 puts the old ownership records and the `current` tokens back and deletes
 the copies, for the older binaries. Then reinstall the older version and
-start it. A rollback that has started finishes when run again, whatever
-ran since. If a 0.4.0 node had already put its local databases aside
+start it. A rollback that has started writing finishes when run again,
+whatever ran since. One that stopped before (a bucket error or a crash
+while it checked again under its lock) checks again when run again: it
+refuses if a node ran or `--remove-old --apply` marked a tenant
+meanwhile, and leaves the lock as it found it. If a 0.4.0 node had already put its local databases aside
 (`<data_dir>/actors.pre-0.4/`) before it failed to start, move them back
 to `<data_dir>/actors/` and remove the file left at that path before
 starting the older binary.
