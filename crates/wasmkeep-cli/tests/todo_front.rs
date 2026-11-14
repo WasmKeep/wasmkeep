@@ -143,6 +143,28 @@ fn request(
     Some((status, dechunk(body)))
 }
 
+/// The status of a POST whose body is sent in `chunks`, without a length.
+fn chunked(addr: SocketAddr, path: &str, headers: &str, chunks: &[String]) -> u16 {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut raw = format!(
+        "POST {path} HTTP/1.1\r\nHost: shop.example\r\nConnection: close\r\n\
+         {headers}Transfer-Encoding: chunked\r\n\r\n"
+    );
+    for c in chunks {
+        raw.push_str(&format!("{:x}\r\n{c}\r\n", c.len()));
+    }
+    raw.push_str("0\r\n\r\n");
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut answer = String::new();
+    let _ = s.read_to_string(&mut answer);
+    answer
+        .split_whitespace()
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no status: {answer:?}"))
+}
+
 fn dechunk(body: &str) -> String {
     let mut out = String::new();
     let mut rest = body;
@@ -204,9 +226,26 @@ fn signs_in_and_reaches_the_internal_actor(server: &Server) {
     // value, `default/_front/main`, passing the actor's `caller()` check.
     let (status, body) = request(a, "POST", "/api/todos", &bearer(ALICE), "milk").unwrap();
     assert_eq!(status, 201, "{body}");
+    // Past 1000 bytes: 413, with a declared length or chunked (no length
+    // to check first: the front stops reading past its limit), and
+    // nothing added.
+    let big = "x".repeat(1001);
+    let (status, _) = request(a, "POST", "/api/todos", &bearer(ALICE), &big).unwrap();
+    assert_eq!(status, 413);
+    assert_eq!(
+        chunked(a, "/api/todos", &bearer(ALICE), &vec!["y".repeat(600); 4]),
+        413
+    );
+    assert_eq!(
+        chunked(a, "/api/todos", &bearer(ALICE), &["bread".to_owned()]),
+        201
+    );
     let (status, body) = request(a, "GET", "/api/todos", &bearer(ALICE), "").unwrap();
     assert_eq!(status, 200);
-    assert_eq!(body.trim(), "[{\"id\":1,\"text\":\"milk\"}]");
+    assert_eq!(
+        body.trim(),
+        "[{\"id\":1,\"text\":\"milk\"},{\"id\":2,\"text\":\"bread\"}]"
+    );
     // Each user has their own actor.
     let (_, body) = request(a, "GET", "/api/todos", &bearer(BOB), "").unwrap();
     assert_eq!(body.trim(), "[]");

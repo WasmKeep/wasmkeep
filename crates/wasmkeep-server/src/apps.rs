@@ -451,6 +451,7 @@ impl AppRef {
                 .compile(bytes)
                 .map_err(|e| DeployError::Front(format!("{e:#}")))?;
             crate::front::validate(runtime, &component)
+                .await
                 .map_err(|e| DeployError::Front(error_chain(&e)))?;
         }
 

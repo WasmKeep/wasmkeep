@@ -720,3 +720,70 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
     let v4 = app.deploy_changes(&rt, with_front()).await.unwrap();
     assert_ne!(v4.current.version, v1.current.version, "another lineage");
 }
+
+/// A front that links (it exports `wasi:http/incoming-handler` and imports
+/// nothing a front lacks) but traps in its start function: it never
+/// instantiates.
+fn trapping_front_wasm() -> Vec<u8> {
+    wat::parse_str(
+        r#"(component
+            (import "wasi:http/types@0.2.0" (instance $types
+                (export "incoming-request" (type (sub resource)))
+                (export "response-outparam" (type (sub resource)))))
+            (alias export $types "incoming-request" (type $req))
+            (alias export $types "response-outparam" (type $out))
+            (core module $m
+                (func $start unreachable)
+                (start $start)
+                (func (export "handle") (param i32 i32)))
+            (core instance $i (instantiate $m))
+            (func $handle (param "request" (own $req)) (param "response-out" (own $out))
+                (canon lift (core func $i "handle")))
+            (instance $h (export "handle" (func $handle)))
+            (export "wasi:http/incoming-handler@0.2.0" (instance $h)))"#,
+    )
+    .unwrap()
+}
+
+/// ADR 0023: a front must instantiate against the front linker, not only
+/// link. One that links but cannot be instantiated (here: its start
+/// function traps) is refused before anything is written, rather than
+/// deployed to nodes that would answer 500 for every request outside
+/// /actor/.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_that_does_not_instantiate_is_refused() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    let wasm = trapping_front_wasm();
+    // It links.
+    let component = rt.compile(&wasm).unwrap();
+    assert!(wasmkeep_server::HttpComponent::new(rt.clone(), &component).is_ok());
+    // Required names do not hold the check back: it runs without values.
+    let e = app
+        .deploy_changes(
+            &rt,
+            Changes {
+                front: FrontChange::Set(wasm),
+                front_requires: Some(names(&["SESSION_KEY"])),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, DeployError::Front(_)), "{e}");
+    assert!(e.to_string().contains("does not instantiate"), "{e}");
+    assert!(bucket_keys(&store).await.is_empty());
+
+    // A front that instantiates is deployed with required names unset.
+    app.deploy_changes(
+        &rt,
+        Changes {
+            front: FrontChange::Set(front_wasm().to_vec()),
+            front_requires: Some(names(&["SESSION_KEY"])),
+            ..Changes::default()
+        },
+    )
+    .await
+    .unwrap();
+}

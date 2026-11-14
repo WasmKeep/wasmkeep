@@ -1287,8 +1287,14 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding {}", args.listen))?;
         if let Some(http) = &app.front {
-            match http.instantiate_once().await {
-                Ok(()) => {}
+            // Not while its required values are not set (it answers 503
+            // without running then): it would run without them.
+            match http.check_instantiates(app.actors.as_ref()).await {
+                Ok(true) => {}
+                Ok(false) if http.has_version() => tracing::info!(
+                    "the front is not configured yet (required values not set, or the secrets not open): its test instantiation is skipped"
+                ),
+                Ok(false) => {}
                 // A deployed front that links but does not instantiate:
                 // the nodes already running serve it (with 500s), so this
                 // one starts too, with its actors, rather than exit (ADR
@@ -1414,11 +1420,59 @@ pub(crate) async fn stop_signal() {
     }
 }
 
+/// The warning for a deploy or rollback that removes the front while the
+/// app has secrets (`has_secrets`: `None` when the bucket did not say):
+/// `_front` entries stay in the set, where a node older than the front
+/// cannot open it, and a later front would read them (ADR 0023). The set
+/// is sealed, so whether it has such entries is only known with the key.
+fn front_secrets_warning(
+    diff: &wasmkeep_server::apps::Diff,
+    has_secrets: Option<bool>,
+    tenant: &str,
+    app: &str,
+) -> Option<String> {
+    (diff.front == Some("removed") && has_secrets != Some(false)).then(|| {
+        format!(
+            "the front was removed, but not its secrets: if `wasmkeep secrets list --app \
+             {tenant}/{app}` shows `{FRONT_SCOPE}`, remove them with `wasmkeep secrets unset \
+             --front NAME...`. Left in the set, they keep nodes older than the front from \
+             opening any of the app's secrets (they refuse every event and drain), and a later \
+             front reads them"
+        )
+    })
+}
+
+/// Refuses the front's scope where a deploy flag takes classes: the
+/// front's values have their own flags, which would otherwise win over
+/// these without a word (ADR 0023).
+fn refuse_front_scope(args: &DeployArgs) -> anyhow::Result<()> {
+    fn named<T>(flags: &[(String, T)]) -> bool {
+        flags.iter().any(|(c, _)| c == FRONT_SCOPE)
+    }
+    anyhow::ensure!(
+        !named(&args.config),
+        "--config {FRONT_SCOPE}=...: --config takes classes; give the front's configuration \
+         with --front-config FILE"
+    );
+    anyhow::ensure!(
+        !named(&args.requires),
+        "--requires {FRONT_SCOPE}=...: --requires takes classes; give the front's required \
+         names with --front-requires NAMES"
+    );
+    anyhow::ensure!(
+        !named(&args.access),
+        "--access {FRONT_SCOPE}=...: --access takes classes; the front has no access rule \
+         (it receives every request outside /actor/)"
+    );
+    Ok(())
+}
+
 /// `wasmkeep deploy`: validate, upload, switch (or roll back).
 fn deploy(args: DeployArgs) -> anyhow::Result<()> {
+    refuse_front_scope(&args)?;
     let (tenant, name) = &args.app;
     let (store, prefix) = open_bucket(&args.bucket)?;
-    let app_ref = AppRef::new(store, &prefix, tenant, name);
+    let app_ref = AppRef::new(std::sync::Arc::clone(&store), &prefix, tenant, name);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1508,6 +1562,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     }
     for warning in deploy_warnings(&deployed.diff) {
         eprintln!("warning: {warning}");
+    }
+    if deployed.diff.front == Some("removed") {
+        let secrets = wasmkeep_server::secret_store::SecretStore::new(store, &prefix, tenant, name);
+        let has_secrets = rt.block_on(secrets.current()).ok().map(|c| c.is_some());
+        if let Some(warning) = front_secrets_warning(&deployed.diff, has_secrets, tenant, name) {
+            eprintln!("warning: {warning}");
+        }
     }
     if deployed.newly_marked {
         println!(
@@ -2324,6 +2385,30 @@ mod tests {
     }
 
     #[test]
+    fn a_front_removed_beside_secrets_is_warned_about() {
+        let removed = wasmkeep_server::apps::Diff {
+            front: Some("removed"),
+            ..Default::default()
+        };
+        // The set is sealed: whether it has `_front` entries is not
+        // known without the key, so any set (or one not known) warns.
+        for secrets in [Some(true), None] {
+            let w = super::front_secrets_warning(&removed, secrets, "acme", "shop").unwrap();
+            assert!(w.contains("`_front`"), "{w}");
+            assert!(w.contains("wasmkeep secrets unset --front"), "{w}");
+            assert!(w.contains("acme/shop"), "{w}");
+        }
+        assert!(super::front_secrets_warning(&removed, Some(false), "acme", "shop").is_none());
+        for front in [None, Some("added"), Some("changed"), Some("unchanged")] {
+            let diff = wasmkeep_server::apps::Diff {
+                front,
+                ..Default::default()
+            };
+            assert!(super::front_secrets_warning(&diff, Some(true), "acme", "shop").is_none());
+        }
+    }
+
+    #[test]
     fn a_rename_that_drops_a_rule_is_warned_about() {
         let diff = wasmkeep_server::apps::Diff {
             added: vec!["monitors".into()],
@@ -2417,6 +2502,33 @@ mod tests {
             requires(&["--front-requires", ""]),
             Some(Default::default())
         );
+        // The front's scope is not a class: its own flags give its values.
+        let class_flags = |args: &[&str]| match parse(args).unwrap().command {
+            super::Command::Deploy(d) => super::refuse_front_scope(&d).map_err(|e| e.to_string()),
+            _ => unreachable!(),
+        };
+        assert!(class_flags(&["--config", "c=f.env", "--requires", "c=A"]).is_ok());
+        for (args, flag, own) in [
+            (
+                &["--config", "_front=f.env"][..],
+                "--config",
+                "--front-config FILE",
+            ),
+            (&["--config", "_front="], "--config", "--front-config FILE"),
+            (
+                &["--requires", "_front=A"],
+                "--requires",
+                "--front-requires NAMES",
+            ),
+            (&["--access", "_front=open"], "--access", "no access rule"),
+        ] {
+            let e = class_flags(args).unwrap_err();
+            assert!(
+                e.starts_with(&format!("{flag} _front=...: {flag} takes classes")),
+                "{e}"
+            );
+            assert!(e.contains(own), "{e}");
+        }
         let retention = |args: &[&str]| match parse(args).unwrap().command {
             super::Command::Deploy(d) => d.version_retention_secs,
             _ => unreachable!(),

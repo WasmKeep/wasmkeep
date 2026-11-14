@@ -10,39 +10,34 @@ import {
   ResponseOutparam,
   type IncomingRequest,
 } from "wasi:http/types@0.2.12";
+import { Body, type BodySource } from "./body";
 import type { ActorRequest, ActorResponse } from "./request";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-function readAll(request: IncomingRequest): Uint8Array {
+/** `request`'s body, as {@link Body} reads it. */
+function bodyOf(request: IncomingRequest): BodySource {
   const body = request.consume();
   const stream = body.stream();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    let chunk: Uint8Array;
-    try {
-      chunk = stream.blockingRead(65536n);
-    } catch {
-      break; // closed: the body has ended
-    }
-    chunks.push(chunk);
-    total += chunk.length;
-  }
-  // Release the stream, then the body (its parent): a resource left open
-  // past the response makes the host fail the request once it ends
-  // ("resource has children"), and discard the instance.
-  (stream as unknown as Disposable)[Symbol.dispose]?.();
-  const trailers = IncomingBody.finish(body);
-  (trailers as unknown as Disposable)[Symbol.dispose]?.();
-  const out = new Uint8Array(total);
-  let at = 0;
-  for (const c of chunks) {
-    out.set(c, at);
-    at += c.length;
-  }
-  return out;
+  return {
+    read(max: number): Uint8Array | undefined {
+      try {
+        return stream.blockingRead(BigInt(max));
+      } catch {
+        return undefined; // closed: the body has ended
+      }
+    },
+    // Release the stream, then the body (its parent), whether the body was
+    // read to its end or not: a resource left open past the response makes
+    // the host fail the request once it ends ("resource has children"),
+    // and discard the instance.
+    close(): void {
+      (stream as unknown as Disposable)[Symbol.dispose]?.();
+      const trailers = IncomingBody.finish(body);
+      (trailers as unknown as Disposable)[Symbol.dispose]?.();
+    },
+  };
 }
 
 function methodName(m: ReturnType<IncomingRequest["method"]>): string {
@@ -51,7 +46,18 @@ function methodName(m: ReturnType<IncomingRequest["method"]>): string {
 
 /** `request` as handlers see it. */
 export function toRequest(request: IncomingRequest): ActorRequest {
-  let body: Uint8Array | undefined;
+  const body = new Body(() => bodyOf(request));
+  function bytes(): Uint8Array;
+  function bytes(limit: number): Uint8Array | undefined;
+  function bytes(limit?: number): Uint8Array | undefined {
+    return body.read(limit);
+  }
+  function text(): string;
+  function text(limit: number): string | undefined;
+  function text(limit?: number): string | undefined {
+    const b = body.read(limit);
+    return b === undefined ? undefined : decoder.decode(b);
+  }
   const headerList = request
     .headers()
     .entries()
@@ -63,8 +69,8 @@ export function toRequest(request: IncomingRequest): ActorRequest {
     headerList,
     // `none` is `null` on QuickJS.
     authority: request.authority() ?? undefined,
-    bytes: () => (body ??= readAll(request)),
-    text: () => decoder.decode(req.bytes()),
+    bytes,
+    text,
     json: <T>() => JSON.parse(req.text()) as T,
   };
   return req;

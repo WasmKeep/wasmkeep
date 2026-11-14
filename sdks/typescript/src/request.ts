@@ -16,9 +16,17 @@ export interface ActorRequest {
   headerList?: [string, string][];
   /** The request's authority: the client's `Host` (see `host`). */
   authority?: string;
-  /** The body, read on first use. */
+  /** The body, read on first use (up to the host's limit, 16 MiB). With
+   * `limit`, `undefined` when the body is longer than `limit` bytes: at
+   * most `limit + 1` bytes are read, whatever Content-Length says or
+   * however the client chunks it, so check a size this way rather than
+   * after reading it all. After a body found too large, `bytes()` and
+   * `text()` without a limit (or with a larger one) throw. */
   bytes(): Uint8Array;
+  bytes(limit: number): Uint8Array | undefined;
+  /** The body as UTF-8; with `limit` (in bytes), as `bytes(limit)`. */
   text(): string;
+  text(limit: number): string | undefined;
   json<T = unknown>(): T;
 }
 

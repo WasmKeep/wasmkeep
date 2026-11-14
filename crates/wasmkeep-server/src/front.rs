@@ -322,14 +322,28 @@ impl FrontVersion {
     }
 }
 
-/// Checks that `component` is a valid front (see [`FrontVersion::link`]),
-/// without serving it: what `wasmkeep deploy --front` checks before it
-/// writes anything.
+/// Checks that `component` is a valid front, without serving it: that it
+/// links (see [`FrontVersion::link`]) and instantiates once against the
+/// front linker, its start functions run (ADR 0023). What `wasmkeep
+/// deploy --front` checks before it writes anything. It runs without
+/// values: required names do not hold it back, and a front must
+/// instantiate before they are set.
 ///
 /// # Errors
 /// Why it is not one.
-pub(crate) fn validate(runtime: &Runtime, component: &Component) -> Result<(), Error> {
-    FrontVersion::link(runtime, component, Arc::default()).map(drop)
+pub(crate) async fn validate(runtime: &Runtime, component: &Component) -> Result<(), Error> {
+    let front = HttpComponent::new(runtime.clone(), component)?;
+    let Some(version) = front.current() else {
+        return Ok(());
+    };
+    front.instantiate(&version).await.map_err(|e| {
+        // The cause, without the backtrace lines around it.
+        Error::NotAFront(format!(
+            "it does not instantiate against the front linker (a start function \
+                 trapped, or it needs more than a node's limits): {}",
+            e.root_cause()
+        ))
+    })
 }
 
 /// Where a node keeps the front its deployed version brings: `None`
@@ -535,16 +549,37 @@ impl HttpComponent {
         let Some(version) = self.current() else {
             return Ok(());
         };
+        self.instantiate(&version)
+            .await
+            .map_err(|e| Error::not_http(e.into_boxed_dyn_error()))
+    }
+
+    /// The check `serve` makes at start: [`Self::instantiate_once`], unless
+    /// there is nothing to check or it would not say what requests see.
+    /// `Ok(false)`: not checked, because no version brings a front, or
+    /// because the front is unconfigured (a required value not set, or the
+    /// app's secrets, from `actors`, not open): requests do not run it
+    /// then (503), and instantiating it without its values would test
+    /// something else (ADR 0023).
+    pub async fn check_instantiates(&self, actors: Option<&ActorService>) -> Result<bool, Error> {
+        let Some(version) = self.current() else {
+            return Ok(false);
+        };
+        if version.unconfigured() || actors.is_some_and(ActorService::secrets_blocked) {
+            return Ok(false);
+        }
+        self.instantiate(&version)
+            .await
+            .map(|()| true)
+            .map_err(|e| Error::not_http(e.into_boxed_dyn_error()))
+    }
+
+    async fn instantiate(&self, version: &FrontVersion) -> wasmtime::Result<()> {
         let mut store = self.runtime.new_async_store_with_budget(
             self.host(None, Arc::clone(&version.env)),
             self.cpu_budget,
         );
-        version
-            .pre
-            .instantiate_async(&mut store)
-            .await
-            .map(drop)
-            .map_err(|e| Error::not_http(e.into_boxed_dyn_error()))
+        version.pre.instantiate_async(&mut store).await.map(drop)
     }
 
     /// Handles one request in a fresh instance, without the node's actors.
@@ -929,6 +964,56 @@ mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
     use super::*;
+
+    /// Links as a front, traps in its start function.
+    const TRAPPING_FRONT: &str = r#"(component
+        (import "wasi:http/types@0.2.0" (instance $types
+            (export "incoming-request" (type (sub resource)))
+            (export "response-outparam" (type (sub resource)))))
+        (alias export $types "incoming-request" (type $req))
+        (alias export $types "response-outparam" (type $out))
+        (core module $m
+            (func $start unreachable)
+            (start $start)
+            (func (export "handle") (param i32 i32)))
+        (core instance $i (instantiate $m))
+        (func $handle (param "request" (own $req)) (param "response-out" (own $out))
+            (canon lift (core func $i "handle")))
+        (instance $h (export "handle" (func $handle)))
+        (export "wasi:http/incoming-handler@0.2.0" (instance $h)))"#;
+
+    /// At start, a front whose required values are not set is not
+    /// instantiated to test it: it would run without them, while requests
+    /// would not run it at all (503).
+    #[tokio::test]
+    async fn the_start_check_waits_for_required_values() {
+        let runtime = Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+        let wasm = wat::parse_str(TRAPPING_FRONT).unwrap();
+        let component = runtime.compile(&wasm).unwrap();
+        let front = HttpComponent::new(runtime, &component).unwrap();
+        // Configured (nothing required): checked, and it fails.
+        assert!(front.check_instantiates(None).await.is_err());
+        // A required name not set: not checked.
+        {
+            let mut slot = front.version.write().unwrap();
+            let v = slot.as_ref().unwrap();
+            *slot = Some(Arc::new(v.with_values(
+                Arc::default(),
+                Arc::default(),
+                Arc::new(["SESSION_KEY".to_owned()].into()),
+            )));
+        }
+        assert!(!front.check_instantiates(None).await.unwrap());
+        // Set: checked again.
+        let front = front.with_env(crate::env::parse("SESSION_KEY=k").unwrap());
+        assert!(front.check_instantiates(None).await.is_err());
+        // No version: nothing to check.
+        let none = HttpComponent {
+            version: Arc::default(),
+            ..front
+        };
+        assert!(!none.check_instantiates(None).await.unwrap());
+    }
 
     /// Every name of the range goes, in any case, every value of it;
     /// names that only look alike stay.
