@@ -70,8 +70,8 @@ Since 0.3.0, in no release yet.
 ### The front, host side (for 0.4.0)
 
 The stateless component given to `serve` becomes the app's front
-([ADR 0023](docs/adr/0023-the-front.md)). Shipping a front with a deploy
-comes later.
+([ADR 0023](docs/adr/0023-the-front.md)). It ships with the app's deploy:
+see the next section.
 
 - **The front calls actors.** The component is linked with `actors` and
   `env` besides WASI and `wasi:http` (the new WIT worlds `front-core` and
@@ -138,6 +138,52 @@ Behaviour changes:
 - A `1xx` status from the stateless component becomes a 500.
 - The guest log names the stateless component `actor=_front` instead of
   `actor=stateless`.
+
+### The front in deploys (for 0.4.0)
+
+An app's front ships in its version, with the classes
+([ADR 0023](docs/adr/0023-the-front.md),
+[deploying the front](docs/cluster.md#deploying-the-front)).
+
+- **`wasmkeep deploy --front PATH`** sets the front, `--no-front` removes
+  it, and without either the current one is kept (copied inside the
+  bucket). `--front-config FILE` and `--front-requires NAMES` are its
+  `--config` and `--requires`, kept by later deploys, removed with an empty
+  value. `--rollback` conflicts with the four, and brings back the
+  previous version's front with its classes. A first deploy may give a
+  front and no class.
+- **Checked before anything is written**: the front must link against the
+  front world and export the incoming handler; one that imports
+  `storage`, `alarms` or `websockets`, or exports an actor's `on-*`
+  functions, is refused.
+- **`deploy` prints** `front: added`, `changed`, `removed` or `unchanged`,
+  the front's values by name (`config _front: NAME added`), and each open
+  class as `reachable at /actor/<class>/<name>, past the front`.
+- **Nodes following the app (`serve --app`)** load the version's
+  `_front.wasm` (digest checked), link it before taking any lock, and swap
+  it in with the classes; a front that does not link is a version the node
+  cannot apply (it keeps the previous one and reports not ready). Without
+  a front, paths outside `/actor/` answer 404.
+- **Its values** come from the same three layers as a class's: the
+  deployed `--front-config`, the app's secrets in the new scope `_front`
+  (`wasmkeep secrets set --front NAME`, `unset --front NAME`, `_front
+  <name> <length>` entries in `set --file`, shown by `secrets list`), and
+  the node's `--front-env`.
+- **Required values**: while a name in `--front-requires` is not set, or
+  the node cannot open the app's secrets, the front is not run and the
+  node answers a generic 503 with `Retry-After: 1`; the missing names go
+  to the log once and to the `unconfigured` outcome of
+  `wasmkeep_front_requests_total`, never to the client.
+- **Bucket**: a version with a front is written as manifest format 3
+  (`front main <sha256>`, `config _front`, `requires _front`; it also
+  accepts an explicit `access <class> open`), with `_front.wasm` and
+  `_front.config` beside the classes, collected with their version.
+  Versions without a front keep format 1 or 2, the same bytes and ids.
+- **Heartbeats** announce the capability word `front` beside `take`. A
+  deploy or rollback making a format 3 version current, and a secrets
+  write whose resulting set has a `_front` entry, are refused while a live
+  node of the app lacks it, with no `--force`: such a node could not read
+  the version, or any of the app's secrets.
 
 ### App-owned state (for 0.4.0)
 

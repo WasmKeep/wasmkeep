@@ -687,6 +687,7 @@ async fn a_deploy_changes_what_it_names_and_keeps_the_rest() {
                 access: vec![("c".into(), "existing".into())],
                 config: vec![("d".into(), vars("URL=one"))],
                 requires: Vec::new(),
+                ..Changes::default()
             },
         )
         .await

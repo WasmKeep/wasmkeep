@@ -45,6 +45,14 @@ impl ActorService {
             );
         }
         let classes: Classes = Arc::new(std::sync::RwLock::new(map));
+        // The deployed version's front, linked like its classes: one that
+        // does not link stops the start.
+        let front_env = Arc::new(config.front_env.clone());
+        let front_slot: crate::front::FrontSlot = Arc::default();
+        if let Some(deployed) = &config.front {
+            let version = front_version(&runtime, deployed, &front_env, &config.secrets)?;
+            *front_slot.write().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(version));
+        }
 
         // The root of this node's actor state (ADR 0022): every key and
         // database path of an actor starts from it. Its app is the one the
@@ -194,6 +202,8 @@ impl ActorService {
                 deploy_seq: std::sync::atomic::AtomicU64::new(config.deploy_seq),
                 deploy_wakeup: Arc::new(tokio::sync::Notify::new()),
                 node_env: config.env,
+                front_env,
+                front: front_slot,
                 start_rules: rules,
                 flag_access: config.flag_access,
                 deploy_behind: std::sync::atomic::AtomicBool::new(false),

@@ -264,8 +264,8 @@ wasmkeep deploy --app acme/shop --bucket s3://b/p --no-front
   token `3` (ADR 0022), which implies ADR 0013's marker, so `serve --app`
   already takes rules from the deploys.
 - The output says `front: added`, `changed`, `removed` or `unchanged`,
-  and lists each class whose rule is `open` with "reachable at
-  /actor/<class>/<name>, past the front".
+  and lists each class whose rule is `open` with
+  `reachable at /actor/<class>/<name>, past the front`.
 
 **Access rules do not change.** Per ADR 0021, a class's rule is never
 derived from whether the app has a front. A version deployed with flags
@@ -358,6 +358,9 @@ front answers the same 503.
   3: every deploy that writes a format 3 manifest checks the heartbeats
   first. It has no `--force`: such a node could not read the version at
   all.
+  - Note (while building it): `--rollback` makes a version current
+    without writing it, so a rollback to a version with a front is
+    checked the same way.
 
 ### `serve`
 
@@ -400,8 +403,10 @@ front answers the same 503.
 - **Per actor**: at most a quarter of the slots (at least 1) may wait at
   once on calls to one actor address. Past it the call fails at once with
   `failed("front busy: too many front requests waiting on this actor")`.
-  This keeps one hot actor, or the actors of an unreachable node, from
-  taking every slot.
+  This keeps one hot or stuck actor from taking every slot. The bound is
+  per address: the calls waiting on the many actors of one unreachable
+  node each count against their own actor, so together they can still
+  fill the slots, each until its call deadline (see "Not decided here").
 - **CPU**: `--front-cpu-budget-ms`, default 50 ms, separate from
   `--cpu-budget-ms` (actors). The runtime gains a store with its own
   budget. Past it the request answers 500, as today.
@@ -568,6 +573,9 @@ it.
 - Front targets for Python, Go, C, Zig, D and MoonBit.
 - A call that does not create the actor, streaming or concurrent calls,
   and several fronts per app.
+- A bound per target node on the front's calls waiting at once (the
+  actors of one unreachable node can together hold every slot under the
+  per-actor bound), to be measured before a number is chosen.
 - The front's cost per request in interpreted languages: a fresh
   instance per request starts the engine each time. To be measured before
   a number is promised.

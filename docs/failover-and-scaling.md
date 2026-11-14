@@ -177,11 +177,12 @@ traffic lands. Front requests have their own slots on each node
 (`--max-front-requests`); past them a node answers 503 with
 `Retry-After: 1`.
 
-It is a file each node is started with, not part of a deploy:
-`wasmkeep deploy` does not change it. Updating it is a restart of each
-node in turn, with two versions answering side by side until the last one
-has restarted
-([how](cluster.md#updating-the-stateless-component)).
+With `serve --app`, it is part of the app's deploy (`wasmkeep deploy
+--front PATH`): every node switches to a new front with the classes, a few
+seconds apart, and `--rollback` brings the previous one back
+([how](cluster.md#deploying-the-front)). Without `--app`, it is a file
+each node is started with, and updating it is a restart of each node in
+turn.
 
 ## Actors or a database?
 

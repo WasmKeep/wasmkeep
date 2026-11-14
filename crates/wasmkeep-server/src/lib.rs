@@ -39,6 +39,7 @@ pub use egress::{EgressPolicy, IpRange};
 pub use env::ActorEnv;
 pub use error::Error;
 pub use front::DEFAULT_CPU_BUDGET as DEFAULT_FRONT_CPU_BUDGET;
+pub use front::DeployedFront;
 pub use guest_log::GuestLog;
 pub use http::{
     App, HEALTH_PATH, HttpComponent, MAX_BODY_BYTES, READY_PATH, ServeLimits, serve, serve_metrics,

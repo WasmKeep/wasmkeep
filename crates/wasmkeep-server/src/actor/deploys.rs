@@ -104,6 +104,39 @@ impl ActorService {
         config: &std::collections::BTreeMap<String, crate::env::Vars>,
         requires: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     ) -> Result<(), (String, Error)> {
+        self.apply_deployed(seq, classes, rules, config, requires, None)
+    }
+
+    /// [`Self::apply_version_with`] with the version's front (ADR 0023),
+    /// swapped in with its classes under the same lock; `None` removes the
+    /// node's front (requests outside `/actor/` answer 404). A front that
+    /// does not link is refused like a class that does not link (as
+    /// `_front`): nothing changes.
+    ///
+    /// # Errors
+    /// The first class (or `_front`) that does not link, with why.
+    pub fn apply_deployed(
+        &self,
+        seq: u64,
+        classes: &[(String, Component, Vec<u8>)],
+        rules: &crate::access::AccessRules,
+        config: &std::collections::BTreeMap<String, crate::env::Vars>,
+        requires: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        front: Option<&crate::front::DeployedFront>,
+    ) -> Result<(), (String, Error)> {
+        // Linking is slow: done before taking the lock, the front's too.
+        let front = match front {
+            Some(deployed) => Some((
+                crate::front::FrontVersion::link(
+                    &self.inner.runtime,
+                    &deployed.component,
+                    Arc::default(),
+                )
+                .map_err(|e| (FRONT_CLASS.to_owned(), e))?,
+                deployed,
+            )),
+            None => None,
+        };
         let rules = Arc::new(rules.clone());
         // Linking is slow: done before taking the lock.
         let mut linked = Vec::with_capacity(classes.len());
@@ -152,6 +185,16 @@ impl ActorService {
             );
         }
         *map = built;
+        // The front's values from the same layers, under the same lock.
+        let front = front.map(|(linked, deployed)| {
+            Arc::new(front_values(
+                &linked,
+                deployed,
+                &self.inner.front_env,
+                &secrets,
+            ))
+        });
+        *self.inner.front.write().unwrap_or_else(|p| p.into_inner()) = front;
         *self
             .inner
             .deployed_config
@@ -200,7 +243,36 @@ impl ActorService {
                 });
             }
         }
-        tracing::info!(classes_changed = changed, "secrets applied");
+        // The front's too, from its deployed configuration.
+        let mut front = self.inner.front.write().unwrap_or_else(|p| p.into_inner());
+        let mut front_changed = false;
+        if let Some(version) = front.as_ref() {
+            let env = front_env(&self.inner.front_env, &version.config, &secrets);
+            if env != *version.env() {
+                front_changed = true;
+                *front = Some(Arc::new(version.with_values(
+                    env,
+                    Arc::clone(&version.config),
+                    Arc::clone(&version.requires),
+                )));
+            }
+        }
+        drop(front);
+        tracing::info!(classes_changed = changed, front_changed, "secrets applied");
+    }
+
+    /// Whether this node cannot open the app's current secrets (ADR
+    /// 0016): its front answers 503 meanwhile (ADR 0023).
+    pub(crate) fn secrets_blocked(&self) -> bool {
+        self.inner
+            .secrets_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Where the deployed version's front is kept, for the
+    /// [`crate::HttpComponent`] that serves it.
+    pub(crate) fn front_slot(&self) -> crate::front::FrontSlot {
+        Arc::clone(&self.inner.front)
     }
 
     /// Records whether this node can open the app's current secrets (ADR

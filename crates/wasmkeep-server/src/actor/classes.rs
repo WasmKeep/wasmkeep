@@ -106,7 +106,57 @@ pub(super) fn class_env(
     deployed: Option<&crate::env::Vars>,
     secrets: Option<&crate::env::Vars>,
 ) -> Arc<crate::env::Vars> {
-    let local = node.for_class(class);
+    merge_values(class, node.for_class(class), deployed, secrets)
+}
+
+/// The front's values (ADR 0023), from the same three layers as a class's:
+/// its deployed configuration, the app's `_front` secrets, the node's
+/// `--front-env`.
+pub(super) fn front_env(
+    node: &Arc<crate::env::Vars>,
+    deployed: &crate::env::Vars,
+    secrets: &crate::secrets::SecretSet,
+) -> Arc<crate::env::Vars> {
+    merge_values(
+        FRONT_CLASS,
+        Arc::clone(node),
+        (!deployed.is_empty()).then_some(deployed),
+        secrets.class(FRONT_CLASS),
+    )
+}
+
+/// Links a deployed version's front (no lock held) with its values.
+pub(super) fn front_version(
+    runtime: &Runtime,
+    deployed: &crate::front::DeployedFront,
+    node: &Arc<crate::env::Vars>,
+    secrets: &crate::secrets::SecretSet,
+) -> Result<crate::front::FrontVersion, Error> {
+    let linked = crate::front::FrontVersion::link(runtime, &deployed.component, Arc::default())?;
+    Ok(front_values(&linked, deployed, node, secrets))
+}
+
+/// `linked` with the values `deployed` and the node give it.
+pub(super) fn front_values(
+    linked: &crate::front::FrontVersion,
+    deployed: &crate::front::DeployedFront,
+    node: &Arc<crate::env::Vars>,
+    secrets: &crate::secrets::SecretSet,
+) -> crate::front::FrontVersion {
+    linked.with_values(
+        front_env(node, &deployed.config, secrets),
+        Arc::new(deployed.config.clone()),
+        Arc::new(deployed.requires.clone()),
+    )
+}
+
+/// `scope`'s values by name, last wins: `deployed`, `secrets`, `local`.
+fn merge_values(
+    class: &str,
+    local: Arc<crate::env::Vars>,
+    deployed: Option<&crate::env::Vars>,
+    secrets: Option<&crate::env::Vars>,
+) -> Arc<crate::env::Vars> {
     if deployed.is_none() && secrets.is_none() {
         return local;
     }

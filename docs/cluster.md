@@ -665,58 +665,84 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   versions a rollback stepped back from, and a version whose manifest
   this WasmKeep cannot read. Those stay in the bucket (they are small).
 
-### Updating the stateless component
+### Deploying the front
 
-A deploy carries actor classes, with their access rules, configuration
-and required names. The stateless component, the front
-([ADR 0023](adr/0023-the-front.md)) that answers every path outside
-`/actor/` and `/_wasmkeep/`, is the positional argument of `wasmkeep
-serve`, a file on each node read once when the node starts, for nodes that
-serve classes given with `--actor`:
+An app's front ([ADR 0023](adr/0023-the-front.md)) is the stateless
+`wasi:http` component that answers every path outside `/actor/` and
+`/_wasmkeep/`, and calls the app's actors with `actors.call`. It ships
+in the app's version, with the classes:
+
+```bash
+wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --front site.wasm
+wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo \
+  --front-config site.env --front-requires SESSION_KEY
+wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --no-front
+```
+
+- **`--front PATH` sets it, `--no-front` removes it** (with its
+  configuration and required names); with neither, the current front is
+  kept, copied inside the bucket as classes are without `--actor`. A first
+  deploy may give a front and no class: the app then serves its front,
+  and its calls fail with `invalid-address`.
+- **`--front-config FILE` and `--front-requires NAMES`** are the front's
+  `--config` and `--requires`, with the same rules: kept by later deploys,
+  `--front-config ''` and `--front-requires ''` remove them. While a
+  required name is not set, the front is not run: every request outside
+  `/actor/` gets a generic `503` with `Retry-After: 1` ("this node cannot
+  serve the app now; retry"); the missing names go to the node's log, once,
+  and to the `unconfigured` outcome of `wasmkeep_front_requests_total`,
+  never to the client. The same 503 answers while the node cannot open the
+  app's secrets.
+- **Checked before anything is written.** The front must link against
+  the front world (WASI, `wasi:http`, `actors`, `env`) and export the
+  incoming handler. A component that imports `storage`, `alarms` or
+  `websockets`, or exports an actor's `on-*` functions (an actor given
+  as a front by mistake), is refused.
+- **What `deploy` prints:** `front: added`, `changed`, `removed` or
+  `unchanged`, the front's configuration and required names by name
+  (`config _front: NAME added`), and every class whose rule is `open`
+  (`class cart: open, reachable at /actor/cart/<name>, past the front`):
+  a front does not close the `/actor/` paths, access rules do.
+- **Nodes switch with the version.** A node loads `_front.wasm` (its
+  digest checked), links it, and swaps it in with the classes, the rules
+  and the values: a request under way finishes on the front it started
+  with, the next one takes the new one. A front that does not link is a
+  version the node cannot apply: it keeps the previous version whole and
+  reports not ready, as for a class. `--rollback` brings back the previous
+  version's front with its classes; `--no-front` makes the front's paths
+  answer `404 not found`.
+- **Older nodes.** A version with a front is written as manifest format 3,
+  which a node from before 0.4.0's front cannot read (it would stay not
+  ready). `deploy` and `--rollback` refuse to make such a version current
+  while a live node of the app does not announce the capability word
+  `front` on its heartbeat; there is no `--force`. Upgrade every node
+  first. Versions without a front are written as before, with the same
+  ids.
+- **A node's own values:** `serve --front-env FILE` gives the front
+  values on that node, over the deployed configuration and the secrets
+  (`--env` takes classes only).
+
+With `--app`, a component on the `serve` command line is refused at
+start: the front comes from the deploy only. Without `--app`, the
+positional component of `serve` is the front of the implicit app
+`default/default`, a file on each node read once at start:
 
 ```bash
 wasmkeep serve site.wasm --actor cart=cart.wasm --bucket s3://wasmkeep-demo --node-id a ...
 ```
 
-With `--app`, a component on the command line is refused at start: an
-app's front is to ship with its deploy, so that a deploy and a rollback
-move it with the classes (planned, ADR 0023). Until then a node serving
-`--app` has no front and answers 404 outside `/actor/`.
+Updating that file means copying the new one to every node and restarting
+them one at a time, waiting for each to answer `/_wasmkeep/ready`; until
+the last one restarts, two versions answer side by side. Deploying the app
+(`--app`) avoids that.
 
-Nothing in the bucket names the file, so `wasmkeep deploy` does not change
-it, `--rollback` does not bring an older one back, and `cluster status`
-does not show which one a node runs. To update it:
-
-1. Copy the new file to every node, at the path its `serve` command names.
-2. Restart the nodes one at a time (`systemctl restart wasmkeep`), waiting
-   for each to be listed live by `wasmkeep cluster status` and to answer
-   `/_wasmkeep/ready` before the next.
-
-What happens meanwhile:
-
-- **The restarting node** makes a clean stop: requests under way get up
-  to 10 s to finish, its actors are given up and start on the other nodes
-  at their next request, and its WebSockets close with 1012. The load
-  balancer's check of `/_wasmkeep/ready` takes it out. At its start it
-  checks its node id first, which takes what is left of 15 s since it
-  stopped ([Flags](#flags)).
-- **The other nodes** keep answering, each with the file it was started
-  with. Until the last node has restarted, two versions of the component
-  answer side by side, and a client may get either one from one request to
-  the next. Keep two consecutive versions compatible with each other and
-  with the deployed actors.
-- **A file that does not compile or instantiate** makes `serve` exit at
-  start. Restarting one node first shows it while the others still run
-  the previous file.
-- **Going back** is the same procedure with the previous file.
-
-The front calls the node's `--actor` classes with `actors.call`, as an
-inside caller: the callee sees `x-wasmkeep-caller: default/_front/main`,
-and a call to an actor on another node is a signed hop, as an actor's
-([the front](concepts.md#the-front)). It runs on the node that received
-the request and is never forwarded. Its outbound HTTP follows the same
-rules as actors' (public addresses only, unless the node allows a range
-with `--allow-outbound`).
+The front calls the app's classes with `actors.call`, as an inside
+caller: the callee sees `x-wasmkeep-caller: <tenant>/_front/main`, and a
+call to an actor on another node is a signed hop, as an actor's ([the
+front](concepts.md#the-front)). It runs on the node that received the
+request and is never forwarded. Its outbound HTTP follows the same rules
+as actors' (public addresses only, unless the node allows a range with
+`--allow-outbound`).
 
 ### Access rules and configuration
 
@@ -788,6 +814,16 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   `<class> <name> <length>\n<value>\n`, any value, newlines included) and
   `unset --class CLASS NAME...` make one change each, so nodes never serve
   half of it.
+- **The front's secrets** are the scope `_front`: `secrets set --front
+  NAME`, `secrets unset --front NAME...`, and `_front <name> <length>`
+  entries in `set --file`. `secrets list` shows the scope as `_front (the
+  front)`. They reach the front's `env.get` over its deployed
+  configuration and under the node's `--front-env`. A write whose
+  resulting set has a `_front` entry (`set`, `unset`, `reset`,
+  `rotate-key`) is refused while a live node of the app does not announce
+  the capability word `front`, with no `--force`: such a node could open
+  none of the app's secrets, and would refuse every event. Removing the
+  last `_front` entry is always allowed.
 - **A node that cannot open the current secrets** refuses the app's
   events with 503 and `Retry-After`, hands its actors to a node that can,
   takes none, and reports not ready. It blocks at once on a set it cannot

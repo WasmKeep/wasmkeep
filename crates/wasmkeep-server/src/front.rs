@@ -214,22 +214,52 @@ impl Drop for Slot {
 
 /// One version of a front: its component, linked and pre-instantiated, and
 /// the values it reads. Built with no lock held ([`FrontVersion::link`]),
-/// then put in place with [`HttpComponent::set_version`].
+/// then put in place with [`HttpComponent::set_version`], or by the actor
+/// service with the classes of a deployed version.
 pub(crate) struct FrontVersion {
     pre: ProxyPre<FrontHost>,
+    /// What `env.get` reads: the three layers merged.
     env: Arc<crate::env::Vars>,
+    /// The version's deployed configuration, kept so a secrets change can
+    /// rebuild `env` without a deploy (ADR 0016).
+    pub(crate) config: Arc<crate::env::Vars>,
+    /// Names `env` must hold (`--front-requires`): while one is missing,
+    /// the front is not instantiated.
+    pub(crate) requires: Arc<std::collections::BTreeSet<String>>,
+    /// Whether a missing required name was already logged for these
+    /// values (once, not per request).
+    warned: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The actor world's exports, which a front never has: a component with
+/// one is an actor given as a front by mistake (ADR 0023).
+const ACTOR_EXPORTS: [&str; 5] = [
+    "on-init",
+    "on-alarm",
+    "on-websocket-open",
+    "on-websocket-message",
+    "on-websocket-close",
+];
 
 impl FrontVersion {
     /// Links `component` against the front linker: WASI 0.2 (inert),
     /// `wasi:http`, `actors` and `env`; checks that it exports the incoming
-    /// handler. A component importing anything else (an actor's `storage`,
-    /// say) does not link.
+    /// handler and none of the actor world's `on-*` functions. A component
+    /// importing anything else (an actor's `storage`, say) does not link.
     pub(crate) fn link(
         runtime: &Runtime,
         component: &Component,
         env: Arc<crate::env::Vars>,
     ) -> Result<Self, Error> {
+        let ty = component.component_type();
+        if let Some((name, _)) = ty
+            .exports(runtime.engine())
+            .find(|(name, _)| ACTOR_EXPORTS.contains(name))
+        {
+            return Err(Error::NotAFront(format!(
+                "it exports {name}, an actor's function: give actors with --actor CLASS=PATH"
+            )));
+        }
         let mut linker = Linker::<FrontHost>::new(runtime.engine());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(Error::linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
@@ -241,7 +271,92 @@ impl FrontVersion {
             .map_err(Error::not_http)?;
         let pre =
             ProxyPre::new(instance_pre).map_err(|e| Error::not_http(e.into_boxed_dyn_error()))?;
-        Ok(Self { pre, env })
+        Ok(Self {
+            pre,
+            env,
+            config: Arc::default(),
+            requires: Arc::default(),
+            warned: Arc::default(),
+        })
+    }
+
+    /// This version with these values: `env` (the three layers merged),
+    /// the deployed `config` it was built from, and the names it requires.
+    /// A missing name is logged again.
+    pub(crate) fn with_values(
+        &self,
+        env: Arc<crate::env::Vars>,
+        config: Arc<crate::env::Vars>,
+        requires: Arc<std::collections::BTreeSet<String>>,
+    ) -> Self {
+        Self {
+            pre: self.pre.clone(),
+            env,
+            config,
+            requires,
+            warned: Arc::default(),
+        }
+    }
+
+    /// What `env.get` reads.
+    pub(crate) fn env(&self) -> &Arc<crate::env::Vars> {
+        &self.env
+    }
+
+    /// Whether a required name is not set; the first time, logs which
+    /// (names only, never to the client: the port faces the public).
+    fn unconfigured(&self) -> bool {
+        let missing: Vec<&str> = self
+            .requires
+            .iter()
+            .filter(|n| !self.env.contains_key(*n))
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            return false;
+        }
+        if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!(actor = FRONT_CLASS, variables = %missing.join(", "), "required values are not set: the front answers 503 (set them with `wasmkeep secrets set --front`, or remove them with `wasmkeep deploy --front-requires ''`)");
+        }
+        true
+    }
+}
+
+/// Checks that `component` is a valid front (see [`FrontVersion::link`]),
+/// without serving it: what `wasmkeep deploy --front` checks before it
+/// writes anything.
+///
+/// # Errors
+/// Why it is not one.
+pub(crate) fn validate(runtime: &Runtime, component: &Component) -> Result<(), Error> {
+    FrontVersion::link(runtime, component, Arc::default()).map(drop)
+}
+
+/// Where a node keeps the front its deployed version brings: `None`
+/// while the version has none (requests answer 404). Shared by the actor
+/// service, which swaps it with the classes, and the [`HttpComponent`]
+/// serving it.
+pub(crate) type FrontSlot = Arc<RwLock<Option<Arc<FrontVersion>>>>;
+
+/// A deployed version's front, as a node loads it (ADR 0023): the
+/// compiled component, its deployed configuration and the names it
+/// requires. Its `Debug` shows names, never a value.
+#[derive(Clone)]
+pub struct DeployedFront {
+    /// The compiled component.
+    pub component: Component,
+    /// Its deployed plain configuration (`--front-config`).
+    pub config: crate::env::Vars,
+    /// The names it requires among its values (`--front-requires`).
+    pub requires: std::collections::BTreeSet<String>,
+}
+
+impl std::fmt::Debug for DeployedFront {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployedFront")
+            .field("config", &self.config.keys().collect::<Vec<_>>())
+            .field("requires", &self.requires)
+            .finish_non_exhaustive()
     }
 }
 
@@ -252,7 +367,8 @@ impl FrontVersion {
 pub struct HttpComponent {
     runtime: Runtime,
     /// The version requests start on; one in flight keeps its own.
-    version: Arc<RwLock<Arc<FrontVersion>>>,
+    /// `None` while the deployed version has no front: 404.
+    version: FrontSlot,
     egress: Arc<crate::egress::EgressPolicy>,
     /// Where instances' stdout and stderr go.
     guest_log: crate::guest_log::GuestLog,
@@ -287,7 +403,7 @@ impl HttpComponent {
         let max_requests = pool.max(1);
         Ok(Self {
             runtime,
-            version: Arc::new(RwLock::new(Arc::new(version))),
+            version: Arc::new(RwLock::new(Some(Arc::new(version)))),
             egress: Arc::default(),
             guest_log: crate::guest_log::GuestLog::default(),
             wall: Duration::from_secs(30),
@@ -296,6 +412,27 @@ impl HttpComponent {
             max_requests,
             waits: Arc::default(),
         })
+    }
+
+    /// The front of the version `actors` follows (`serve --app`, ADR
+    /// 0023): none until a deployed version brings one, then each version's
+    /// as the service swaps it in with the classes. The slots and the
+    /// counters stay across versions.
+    pub fn deployed(actors: &ActorService) -> Self {
+        let runtime = actors.runtime().clone();
+        let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
+        let max_requests = crate::fds::default_front_requests(pool).max(1);
+        Self {
+            runtime,
+            version: actors.front_slot(),
+            egress: Arc::default(),
+            guest_log: crate::guest_log::GuestLog::default(),
+            wall: Duration::from_secs(30),
+            cpu_budget: DEFAULT_CPU_BUDGET,
+            slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
+            max_requests,
+            waits: Arc::default(),
+        }
     }
 
     /// Lets the component's outbound HTTP reach what `policy` allows (by
@@ -338,24 +475,30 @@ impl HttpComponent {
     }
 
     /// The front's values from this node (`--front-env`), read with
-    /// `env.get`.
+    /// `env.get`, for a front given on the command line. A deployed front
+    /// takes them from [`crate::ActorConfig::front_env`] instead, merged
+    /// over its deployed configuration and secrets.
     #[must_use]
     pub fn with_env(self, vars: crate::env::Vars) -> Self {
         {
             let mut version = self.version.write().unwrap_or_else(|p| p.into_inner());
-            *version = Arc::new(FrontVersion {
-                pre: version.pre.clone(),
-                env: Arc::new(vars),
-            });
+            if let Some(v) = version.as_ref() {
+                *version = Some(Arc::new(v.with_values(
+                    Arc::new(vars),
+                    Arc::clone(&v.config),
+                    Arc::clone(&v.requires),
+                )));
+            }
         }
         self
     }
 
-    /// Puts `version` in place: the next request takes it, one in flight
-    /// finishes on the one it started with. The slots stay.
-    #[allow(dead_code, reason = "for versions loaded from a deploy")]
-    pub(crate) fn set_version(&self, version: FrontVersion) {
-        *self.version.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(version);
+    /// Whether a front is in place (a deployed version may have none).
+    pub fn has_version(&self) -> bool {
+        self.version
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     /// Front requests running at once at most.
@@ -363,8 +506,11 @@ impl HttpComponent {
         self.max_requests
     }
 
-    fn current(&self) -> Arc<FrontVersion> {
-        Arc::clone(&self.version.read().unwrap_or_else(|p| p.into_inner()))
+    fn current(&self) -> Option<Arc<FrontVersion>> {
+        self.version
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn host(&self, actors: Option<&ActorService>, env: Arc<crate::env::Vars>) -> FrontHost {
@@ -386,7 +532,9 @@ impl HttpComponent {
     /// component instantiates (start functions, pool capacity) and is the
     /// per-request instantiation cost, minus the request itself.
     pub async fn instantiate_once(&self) -> Result<(), Error> {
-        let version = self.current();
+        let Some(version) = self.current() else {
+            return Ok(());
+        };
         let mut store = self.runtime.new_async_store_with_budget(
             self.host(None, Arc::clone(&version.env)),
             self.cpu_budget,
@@ -413,6 +561,16 @@ impl HttpComponent {
         actors: Option<&ActorService>,
     ) -> Response<HyperOutgoingBody> {
         let started = Instant::now();
+        // The version this request runs on, whatever is swapped in after.
+        let Some(version) = self.current() else {
+            return text_response(StatusCode::NOT_FOUND, "not found\n");
+        };
+        // A required value not set, or the app's secrets not open: not
+        // instantiated, and nothing said to the client of why (ADR 0023).
+        if version.unconfigured() || actors.is_some_and(ActorService::secrets_blocked) {
+            outcome("unconfigured");
+            return unavailable("this node cannot serve the app now; retry\n");
+        }
         // Past its slots, the front is not instantiated.
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
             outcome("busy");
@@ -422,7 +580,7 @@ impl HttpComponent {
         strip_wasmkeep_headers(req.headers_mut());
         let head = req.method() == hyper::Method::HEAD;
         let observe = move || METRICS.front_request_seconds.observe(started.elapsed());
-        match self.try_handle(req, actors, slot).await {
+        match self.try_handle(req, actors, slot, version).await {
             Ok((mut response, running)) => {
                 // wasmtime-wasi-http lets a guest set any status: never an
                 // upgrade, nor any other informational answer. Dropping
@@ -496,8 +654,8 @@ impl HttpComponent {
         req: Request<Incoming>,
         actors: Option<&ActorService>,
         slot: Slot,
+        version: Arc<FrontVersion>,
     ) -> wasmtime::Result<(Response<HyperOutgoingBody>, Running)> {
-        let version = self.current();
         let mut store = self.runtime.new_async_store_with_budget(
             self.host(actors, Arc::clone(&version.env)),
             self.cpu_budget,
@@ -605,10 +763,12 @@ fn reason(e: &wasmtime::Error) -> &'static str {
 
 /// 503, `Retry-After: 1`: no slot or no instance for the front.
 fn busy() -> Response<HyperOutgoingBody> {
-    let mut r = text_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "this node is busy; retry\n",
-    );
+    unavailable("this node is busy; retry\n")
+}
+
+/// 503 with `Retry-After: 1` and `text`.
+fn unavailable(text: &str) -> Response<HyperOutgoingBody> {
+    let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, text);
     r.headers_mut().insert(
         hyper::header::RETRY_AFTER,
         hyper::header::HeaderValue::from_static("1"),

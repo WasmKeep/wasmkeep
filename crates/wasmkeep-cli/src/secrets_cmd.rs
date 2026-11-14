@@ -23,9 +23,10 @@ pub(crate) enum SecretsCommand {
     /// Set a secret (value from stdin, one trailing newline removed), or
     /// several from `--file`, as one change.
     Set(SetArgs),
-    /// Remove secrets from a class.
+    /// Remove secrets from a class or the front.
     Unset(UnsetArgs),
-    /// List classes and names (never values) and the current seq.
+    /// List classes (and the front's scope, `_front`) and names (never
+    /// values) and the current seq.
     List(AppArgs),
     /// Re-seal an app's secrets under a new key (`--all`: every app under
     /// the prefix). Nodes need the new key first (`--secrets-key` twice).
@@ -64,13 +65,17 @@ pub(crate) struct SetArgs {
     #[command(flatten)]
     app: AppArgs,
     /// The class, with NAME (value from stdin).
-    #[arg(long, requires = "name", conflicts_with = "file")]
+    #[arg(long, requires = "name", conflicts_with_all = ["file", "front"])]
     class: Option<String>,
+    /// The front's secret NAME (ADR 0023), read with `env.get` by the
+    /// app's front (value from stdin).
+    #[arg(long, requires = "name", conflicts_with = "file")]
+    front: bool,
     /// The secret's name (its value is read from stdin).
-    #[arg(requires = "class")]
     name: Option<String>,
     /// Several secrets at once, in the sealed format
-    /// (`<class> <name> <length>\n<value>\n` per secret).
+    /// (`<class> <name> <length>\n<value>\n` per secret; `_front` as the
+    /// class for the front's).
     #[arg(long)]
     file: Option<PathBuf>,
 }
@@ -80,8 +85,11 @@ pub(crate) struct UnsetArgs {
     #[command(flatten)]
     app: AppArgs,
     /// The class.
+    #[arg(long, required_unless_present = "front", conflicts_with = "front")]
+    class: Option<String>,
+    /// Remove the front's secrets (ADR 0023) instead of a class's.
     #[arg(long)]
-    class: String,
+    front: bool,
     /// The names to remove.
     #[arg(required = true)]
     names: Vec<String>,
@@ -209,6 +217,37 @@ fn nodes_without_secrets(bucket: &str, tenant: &str, app: &str) -> anyhow::Resul
         .collect())
 }
 
+/// Live nodes of `tenant/app` that do not announce the capability word
+/// `front` (ADR 0023).
+fn nodes_without_front(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<Vec<String>> {
+    let (store, prefix) = crate::open_bucket(bucket)?;
+    Ok(
+        runtime()?.block_on(wasmkeep_server::apps::nodes_without_front(
+            store, &prefix, tenant, app,
+        ))?,
+    )
+}
+
+/// Refuses a set with a `_front` entry while `lacking` (live nodes of the
+/// app without the word `front`) is not empty: one entry such a node cannot
+/// check makes it fail to open the whole set, refuse every event and drain
+/// (ADR 0023). Unlike [`check_nodes`], there is no `--force`.
+fn refuse_front(
+    set: &SecretSet,
+    lacking: &[String],
+    tenant: &str,
+    app: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !set.has_front() || lacking.is_empty(),
+        "live nodes of {tenant}/{app} cannot read the front's secrets ({}): with a `_front` \
+         entry in the set they could open none of the app's secrets, and would refuse every \
+         event. Upgrade them first (this check has no --force)",
+        lacking.join(", ")
+    );
+    Ok(())
+}
+
 /// Refuses a change while a node of the app would not see it, unless
 /// `--force`.
 fn check_nodes(args: &AppArgs) -> anyhow::Result<()> {
@@ -273,18 +312,27 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             Ok(())
         }
         SecretsCommand::Set(args) => {
-            let changes = match (&args.class, &args.name, &args.file) {
-                (Some(class), Some(name), None) => {
+            let scope = match (&args.class, args.front) {
+                (Some(class), false) => Some(class.as_str()),
+                (None, true) => Some(wasmkeep_server::secrets::FRONT_SCOPE),
+                _ => None,
+            };
+            let changes = match (scope, &args.name, &args.file) {
+                (Some(scope), Some(name), None) => {
                     let mut one = SecretSet::default();
-                    one.set(class, name, &value_from(std::io::stdin().lock())?)?;
+                    one.set(scope, name, &value_from(std::io::stdin().lock())?)?;
                     one
                 }
                 (None, None, Some(file)) => read_set(file)?,
-                _ => anyhow::bail!("give --class and NAME (value on stdin), or --file"),
+                _ => anyhow::bail!(
+                    "give --class CLASS NAME or --front NAME (value on stdin), or --file"
+                ),
             };
             check_nodes(&args.app)?;
             let keys = load_keys(&args.app.keys)?;
             let (tenant, app) = &args.app.app;
+            let lacking = nodes_without_front(&args.app.bucket, tenant, app)?;
+            refuse_front(&changes, &lacking, tenant, app)?;
             let store = store_for(&args.app.bucket, tenant, app)?;
             let seq = runtime()?.block_on(async {
                 first_key_is_current(&store, &keys, args.app.nodes_have_new_key).await?;
@@ -296,7 +344,7 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                                 set.set(&class, &name, &vars[&name])?;
                             }
                         }
-                        Ok::<(), wasmkeep_server::secrets::SecretsError>(())
+                        refuse_front(set, &lacking, tenant, app)
                     })
                     .await??;
                 tidy(&store).await;
@@ -310,28 +358,29 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             check_nodes(&args.app)?;
             let keys = load_keys(&args.app.keys)?;
             let (tenant, app) = &args.app.app;
+            let scope = match &args.class {
+                Some(class) => class.as_str(),
+                None => wasmkeep_server::secrets::FRONT_SCOPE,
+            };
+            // Removing the last `_front` entry is the way out: the result
+            // is what is checked.
+            let lacking = nodes_without_front(&args.app.bucket, tenant, app)?;
             let store = store_for(&args.app.bucket, tenant, app)?;
             let (seq, removed) = runtime()?.block_on(async {
                 first_key_is_current(&store, &keys, args.app.nodes_have_new_key).await?;
                 let mut removed = 0;
                 let seq = store
                     .change(&keys, &keys[0], |set| {
-                        removed = args
-                            .names
-                            .iter()
-                            .filter(|n| set.unset(&args.class, n))
-                            .count();
-                        Ok::<(), std::convert::Infallible>(())
+                        removed = args.names.iter().filter(|n| set.unset(scope, n)).count();
+                        refuse_front(set, &lacking, tenant, app)
                     })
-                    .await?
-                    .unwrap_or_else(|never| match never {});
+                    .await??;
                 tidy(&store).await;
                 anyhow::Ok((seq, removed))
             })?;
             println!(
-                "Removed {removed} of {} name(s) from {}: seq {seq}.",
+                "Removed {removed} of {} name(s) from {scope}: seq {seq}.",
                 args.names.len(),
-                args.class
             );
             Ok(())
         }
@@ -345,7 +394,12 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                 Some(seq) => {
                     println!("{tenant}/{app}: seq {seq}");
                     for (class, names) in set.names() {
-                        println!("  {class}: {}", names.join(", "));
+                        let shown = if class == wasmkeep_server::secrets::FRONT_SCOPE {
+                            format!("{class} (the front)")
+                        } else {
+                            class
+                        };
+                        println!("  {shown}: {}", names.join(", "));
                     }
                 }
             }
@@ -364,11 +418,18 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             for (tenant, app) in apps {
                 let one = SecretStore::new(Arc::clone(&store), &prefix, &tenant, &app);
                 let keys = [old.clone(), new.clone()];
+                let lacking = rt.block_on(wasmkeep_server::apps::nodes_without_front(
+                    Arc::clone(&store),
+                    &prefix,
+                    &tenant,
+                    &app,
+                ))?;
                 let seq = rt.block_on(async {
                     let seq = one
-                        .change(&keys, &new, |_| Ok::<(), std::convert::Infallible>(()))
-                        .await?
-                        .unwrap_or_else(|never| match never {});
+                        .change(&keys, &new, |set| {
+                            refuse_front(set, &lacking, &tenant, &app)
+                        })
+                        .await??;
                     tidy(&one).await;
                     anyhow::Ok(seq)
                 })?;
@@ -391,6 +452,12 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             let new = SecretsKey::load(&args.new_key)?;
             let set = read_set(&args.from)?;
             let (tenant, app) = &args.app;
+            refuse_front(
+                &set,
+                &nodes_without_front(&args.bucket, tenant, app)?,
+                tenant,
+                app,
+            )?;
             let store = store_for(&args.bucket, tenant, app)?;
             let seq = runtime()?.block_on(async {
                 let seq = store.reset(&new, &set).await?;
@@ -410,7 +477,51 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
-    use super::value_from;
+    use super::{refuse_front, value_from};
+    use wasmkeep_server::secrets::SecretSet;
+
+    #[test]
+    fn a_set_with_the_front_is_refused_while_a_node_cannot_read_it() {
+        let mut classes = SecretSet::default();
+        classes.set("api", "KEY", "v").unwrap();
+        let mut front = classes.clone();
+        front.set("_front", "SESSION_KEY", "v").unwrap();
+        let old = vec!["old-1".to_owned()];
+        // Classes only: an older node reads it, whatever is live.
+        assert!(refuse_front(&classes, &old, "acme", "shop").is_ok());
+        // A `_front` entry: refused while such a node is live, naming it.
+        let e = refuse_front(&front, &old, "acme", "shop")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("old-1") && e.contains("no --force"), "{e}");
+        assert!(refuse_front(&front, &[], "acme", "shop").is_ok());
+        // Removing the last `_front` entry is the way out.
+        let mut out = front.clone();
+        out.unset("_front", "SESSION_KEY");
+        assert!(refuse_front(&out, &old, "acme", "shop").is_ok());
+    }
+
+    #[test]
+    fn secrets_flags_take_the_front() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| {
+            crate::Cli::try_parse_from(
+                ["wasmkeep", "secrets"]
+                    .iter()
+                    .chain(args)
+                    .chain(&["--bucket", "s3://b", "--app", "t/a", "--key", "k"]),
+            )
+        };
+        assert!(parse(&["set", "--front", "SESSION_KEY"]).is_ok());
+        assert!(parse(&["set", "--class", "api", "KEY"]).is_ok());
+        assert!(parse(&["set", "--front", "--class", "api", "KEY"]).is_err());
+        assert!(parse(&["set", "--front", "--file", "f"]).is_err());
+        assert!(parse(&["set", "--front"]).is_err(), "a name is needed");
+        assert!(parse(&["unset", "--front", "SESSION_KEY"]).is_ok());
+        assert!(parse(&["unset", "--class", "api", "KEY"]).is_ok());
+        assert!(parse(&["unset", "KEY"]).is_err(), "--class or --front");
+        assert!(parse(&["unset", "--front", "--class", "api", "KEY"]).is_err());
+    }
 
     #[test]
     fn one_trailing_newline_is_removed_from_stdin() {

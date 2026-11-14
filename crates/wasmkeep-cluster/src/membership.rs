@@ -66,6 +66,11 @@ pub struct NodeInfo {
     /// It answers take calls, so it can be a move's target (heartbeat line
     /// 11, `take`, ADR 0017); `false` from nodes that predate it.
     pub can_take: bool,
+    /// It runs a version's front and reads manifest format 3 and the
+    /// `_front` secrets scope (heartbeat line 11, `front`, ADR 0023);
+    /// `false` from nodes that predate it, which cannot read such a
+    /// version or set.
+    pub can_front: bool,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which
     /// each notices in its next listing. `None` from nodes that predate it.
@@ -234,7 +239,8 @@ impl NodeInfo {
             out.push('\n');
             // Line 10 is written (empty if need be) when line 11 follows,
             // so line 11 stays line 11.
-            if self.reads_secrets || self.can_take || self.instance.is_some() {
+            if self.reads_secrets || self.capabilities().next().is_some() || self.instance.is_some()
+            {
                 out.push_str(if self.reads_secrets {
                     "secrets\n"
                 } else {
@@ -242,10 +248,7 @@ impl NodeInfo {
                 });
             }
             // Line 11: capability words, then the process's token.
-            let mut words: Vec<String> = Vec::new();
-            if self.can_take {
-                words.push("take".to_owned());
-            }
+            let mut words: Vec<String> = self.capabilities().map(str::to_owned).collect();
             if let Some(instance) = &self.instance {
                 words.push(format!("instance={instance}"));
             }
@@ -320,7 +323,7 @@ impl NodeInfo {
             pins.join(" "),
             self.drain.unwrap_or_default().as_str(),
             if self.reads_secrets { "secrets" } else { "" },
-            if self.can_take { "take" } else { "" },
+            self.capabilities().collect::<Vec<_>>().join(" "),
         );
         if let Some(load) = &self.load {
             out.push_str(&load.line());
@@ -358,6 +361,7 @@ impl NodeInfo {
             drain,
             reads_secrets,
             can_take: words.can_take,
+            can_front: words.can_front,
             instance: lease.instance,
             lease: Some(lease.state),
             load,
@@ -366,7 +370,15 @@ impl NodeInfo {
 }
 
 impl NodeInfo {
-    /// What line 11 says: capability words (`take`) and the process's
+    /// The capability words this node announces on line 11, in order
+    /// (`take`, `front`). Readers ignore words they do not know.
+    fn capabilities(&self) -> impl Iterator<Item = &'static str> {
+        [(self.can_take, "take"), (self.can_front, "front")]
+            .into_iter()
+            .filter_map(|(has, word)| has.then_some(word))
+    }
+
+    /// What line 11 says: capability words (`take`, `front`) and the process's
     /// token (`instance=<hex>`, 1 to 64 lowercase hex digits; anything else
     /// is ignored). Every other field is empty.
     fn words(line: Option<&str>) -> Self {
@@ -386,6 +398,7 @@ impl NodeInfo {
             lease: None,
             load: None,
             can_take: words.contains(&"take"),
+            can_front: words.contains(&"front"),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
                 let ok = !token.is_empty()
@@ -588,6 +601,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             drain: Some(self.drain_state()),
             reads_secrets: self.reads_secrets,
             can_take: true,
+            can_front: true,
             instance: self.instance.clone(),
             lease: None,
             load: self.load(),
@@ -769,6 +783,7 @@ mod tests {
             drain: None,
             reads_secrets: false,
             can_take: false,
+            can_front: false,
             instance: None,
             lease: None,
             load: None,
@@ -802,6 +817,7 @@ mod tests {
             drain: None,
             reads_secrets: false,
             can_take: false,
+            can_front: false,
             instance: None,
             lease: None,
             load: None,
@@ -871,6 +887,7 @@ mod tests {
             drain: None,
             reads_secrets: false,
             can_take: false,
+            can_front: false,
             instance: None,
             lease: None,
             load: None,
@@ -1015,6 +1032,7 @@ mod tests {
             drain: Some(DrainState::Serving),
             reads_secrets: false,
             can_take: true,
+            can_front: false,
             instance: None,
             ..tls_node()
         };
@@ -1034,6 +1052,7 @@ mod tests {
         assert!(NodeInfo::decode(words.as_bytes()).unwrap().can_take);
         let none = NodeInfo {
             can_take: false,
+            can_front: false,
             instance: None,
             ..node
         };
@@ -1133,6 +1152,7 @@ mod tests {
             drain: Some(DrainState::Draining),
             reads_secrets: true,
             can_take: true,
+            can_front: true,
             // Ignored by the payload: the lease line names the process.
             instance: Some("dead".into()),
             ..tls_node()
@@ -1232,6 +1252,7 @@ mod tests {
             drain,
             reads_secrets,
             can_take: words.can_take,
+            can_front: false,
             instance: lease.instance,
             lease: Some(lease.state),
             load: None,
@@ -1243,6 +1264,7 @@ mod tests {
             drain: Some(DrainState::Serving),
             reads_secrets: true,
             can_take: true,
+            can_front: false,
             load: Some(Load {
                 actors: 12,
                 sockets: 3,
@@ -1293,6 +1315,49 @@ mod tests {
             9
         );
         assert!(none.payload().ends_with(b"\nsecrets\ntake\n"));
+    }
+
+    #[test]
+    fn line_11_says_the_node_runs_fronts_and_older_readers_ignore_it() {
+        // ADR 0023: `front` beside `take`, as a list of words.
+        let node = NodeInfo {
+            can_front: true,
+            ..loaded_node()
+        };
+        let payload = String::from_utf8(node.payload()).unwrap();
+        assert_eq!(payload.lines().nth(8), Some("take front"), "{payload}");
+        let read = NodeInfo::decode(&format3(&node, NodeState::Live, "beef")).unwrap();
+        assert!(read.can_take && read.can_front);
+        assert_eq!(read.load, node.load);
+        // Format 2 (line 11) carries it too.
+        let read = NodeInfo::decode(&node.encode()).unwrap();
+        assert!(read.can_take && read.can_front);
+        // Without `take`, alone.
+        let alone = NodeInfo {
+            can_take: false,
+            ..node.clone()
+        };
+        let read = NodeInfo::decode(&format3(&alone, NodeState::Live, "beef")).unwrap();
+        assert!(!read.can_take && read.can_front);
+        // A node of the version before reads `take` among the words, and
+        // ignores `front`; one of this version ignores words it does not
+        // know, and a node without the word lacks it.
+        assert!(
+            decode_before_load(&format3(&node, NodeState::Live, "beef"))
+                .is_some_and(|n| n.can_take)
+        );
+        let body = "wasmkeep-node 3\nlive beef\n5\na\nhttp://a\n1\nacme/shop\n\n\nserving\n\nlater front take\n";
+        let read = NodeInfo::decode(body.as_bytes()).unwrap();
+        assert!(read.can_take && read.can_front);
+        let body =
+            "wasmkeep-node 3\nlive beef\n5\na\nhttp://a\n1\nacme/shop\n\n\nserving\n\ntake\n";
+        assert!(!NodeInfo::decode(body.as_bytes()).unwrap().can_front);
+        // Real heartbeats say it.
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let a = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
+        let payload = String::from_utf8(a.lease_payload()).unwrap();
+        assert_eq!(payload.lines().nth(8), Some("take front"), "{payload}");
     }
 
     #[test]

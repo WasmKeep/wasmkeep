@@ -216,11 +216,11 @@ it exits with 1 if no node is live. See
   in-flight requests, then hands its actors over: the other nodes serve
   them on their next request. WebSockets to that node close and clients
   reconnect.
-- **Updating the stateless component** (the front: the file given to
-  `serve` for paths outside `/actor/` and `/_wasmkeep/`, refused with
-  `--app`): it is not part of a deploy.
-  Copy the new file to every node and restart them one at a time (see
-  [Updating the stateless component](../cluster.md#updating-the-stateless-component)).
+- **Updating the front** (the stateless component for paths outside
+  `/actor/` and `/_wasmkeep/`): with `--app` it is part of the deploy,
+  `wasmkeep deploy --app acme/shop --bucket ... --front site.wasm`, and
+  nodes switch to it without a restart (see
+  [Deploying the front](../cluster.md#deploying-the-front)).
 - **Adding a node**: start it with a new id and add it to the load
   balancer. An actor in memory on another node stays there, and the new
   node forwards its requests; once it hibernates, its node gives it up,

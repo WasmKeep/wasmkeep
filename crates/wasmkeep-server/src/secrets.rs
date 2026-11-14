@@ -369,6 +369,13 @@ impl SecretSet {
         self.classes.get(class)
     }
 
+    /// Whether the set has an entry for the front (scope `_front`, ADR
+    /// 0023), which nodes from before it cannot read: such a node fails to
+    /// open the whole set.
+    pub fn has_front(&self) -> bool {
+        self.classes.contains_key(FRONT_SCOPE)
+    }
+
     /// Every class with secrets, and its names (no values), for listing.
     pub fn names(&self) -> Vec<(String, Vec<String>)> {
         self.classes
@@ -449,10 +456,11 @@ impl SecretSet {
 }
 
 fn check_entry(class: &str, name: &str, value: &str) -> Result<(), SecretsError> {
-    // The same rule as actor addresses' classes.
-    if wasmkeep_runtime::ActorAddress::new("t", class, "x").is_err() {
+    // The same rule as actor addresses' classes, or the front's scope
+    // (ADR 0023), which no class can be.
+    if class != FRONT_SCOPE && wasmkeep_runtime::ActorAddress::new("t", class, "x").is_err() {
         return Err(SecretsError::BadSet(format!(
-            "invalid class {class:?}: use [a-z][a-z0-9-]{{0,63}}"
+            "invalid class {class:?}: use [a-z][a-z0-9-]{{0,63}}, or {FRONT_SCOPE} for the front"
         )));
     }
     if !crate::env::valid_name(name) {
@@ -466,6 +474,9 @@ fn check_entry(class: &str, name: &str, value: &str) -> Result<(), SecretsError>
     }
     Ok(())
 }
+
+/// The front's scope (ADR 0023): `_front <name> <length>` entries.
+pub const FRONT_SCOPE: &str = "_front";
 
 fn push_field(out: &mut Vec<u8>, field: &[u8]) {
     // Every field is far below 4 GiB (names, ids, a prefix).
@@ -719,6 +730,43 @@ mod tests {
         let every: String = (1..=0x7f_u8).map(char::from).collect();
         s.set("web", "EVERY", &every).unwrap();
         assert_eq!(SecretSet::decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn the_front_has_its_own_scope_and_nothing_else_is_one() {
+        // ADR 0023: `_front <name> <length>`, beside the classes.
+        let mut s = set();
+        assert!(!s.has_front());
+        s.set("_front", "SESSION_KEY", "k").unwrap();
+        assert!(s.has_front());
+        let back = SecretSet::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.class("_front").unwrap()["SESSION_KEY"], "k");
+        assert!(
+            back.names()
+                .iter()
+                .any(|(c, n)| c == "_front" && n == &["SESSION_KEY"])
+        );
+        assert!(
+            SecretSet::decode(b"_front TOKEN 1\nx\n")
+                .unwrap()
+                .has_front()
+        );
+        // The last `_front` entry removed: no scope left.
+        assert!(s.unset("_front", "SESSION_KEY"));
+        assert!(!s.has_front());
+        // Only that name: no other underscore scope, and not a class.
+        for bad in ["_frontx", "_other", "_", "_Front", "front_"] {
+            let mut t = SecretSet::default();
+            assert!(t.set(bad, "NAME", "v").is_err(), "{bad}");
+        }
+        assert!(SecretSet::decode(b"_admin TOKEN 1\nx\n").is_err());
+        // Sealing does not change: the scope seals and opens as a class.
+        let key = SecretsKey::generate().unwrap();
+        let mut f = SecretSet::default();
+        f.set("_front", "SESSION_KEY", "k").unwrap();
+        let object = seal(&key, &place(), 3, &f).unwrap();
+        assert_eq!(open(&[key], &place(), 3, &object).unwrap(), f);
     }
 
     #[test]
