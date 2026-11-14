@@ -6,17 +6,12 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0` and `0.4.0`, are pre-releases for trying it, side projects and
-staging.
+`0.3.0`, `0.4.0` and `0.4.1`, are pre-releases for trying it, side
+projects and staging.
 
 ## Now
 
-The next release, `0.4.1`: **sockets through the front.** The front
-accepts a WebSocket at its own path and hands it to an actor, so a room
-needs no public `/actor/` address. The SDKs say how a handler makes
-several outbound HTTP requests at once.
-
-And right after: **actors that end.** Today an actor ends only when its
+**Actors that end.** Today an actor ends only when its
 own code calls `storage.delete-self`, a delete replicated like a plain
 write; otherwise it is kept for good, and only its old history and old
 app versions are collected. Next: an operator can delete an actor
@@ -33,8 +28,15 @@ rule for paths that match no file (pass to the front, a single-page app's
 database kept by one actor. Redirects and routes stay in the front's own
 code, with SDK helpers.
 
+Then **starting a project**: `wasmkeep new`, templates that write an app
+with its `wasmkeep.toml`
+([ADR 0026](docs/adr/0026-the-project-file.md)), and a toolchain image
+that builds any SDK's components without installing each language's
+tools.
+
 Each release's notes say whether its upgrade is rolling (one node at a
-time) or stops the cluster; `0.4.0` stopped it, once, for its migration.
+time) or stops the cluster; `0.4.0` stopped it, once, for its migration,
+and `0.4.1` rolls from `0.4.0`.
 
 ## Next
 
@@ -68,7 +70,7 @@ busy is split into more actors by its application, not by the platform.
 Not before the releases above.
 
 - **Operating without the author**: mixed versions during an upgrade
-  (today every node is upgraded together,
+  (today every node is upgraded together, `0.4.0` to `0.4.1` aside,
   [how](docs/cluster.md#upgrading-wasmkeep)); inspect or export one actor;
   verify a bucket; back a cluster's bucket up to another and restore it;
   traces; a write acknowledged once another node holds it, if measuring
@@ -251,6 +253,11 @@ Started alongside M3; what is left of it is under [Now](#now) and
   ([ADR 0025](docs/adr/0025-calling-several-actors-at-once.md)); and
   `wasmkeep cluster diagnose`, which checks a bucket
   ([buckets](docs/deploy/buckets.md)).
+- In `0.4.1`, sockets through the front: the front hands a client's
+  WebSocket to an actor of the app, so a room class can be `internal`
+  ([ADR 0027](docs/adr/0027-sockets-through-the-front.md)); several
+  outbound HTTP requests at once in the Rust, TypeScript and Go SDKs
+  ([languages](docs/languages.md#several-outbound-requests-at-once)).
 
 ## Stretch goal: the benchmark showdown
 

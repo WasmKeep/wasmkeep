@@ -1149,6 +1149,21 @@ support nodes of different versions in one cluster, even
 for the length of a rolling restart. The cluster serves nothing between
 the last stop and the first start, so plan a short window.
 
+**One exception: from 0.4.0 to 0.4.1, one node at a time.** 0.4.1
+changes nothing 0.4.0 reads or writes in the bucket (layout, manifests,
+ownership records, alarm index), signs calls between nodes as 0.4.0
+does, and adds one heartbeat word, `handoff`, which 0.4.0 ignores. Stop
+one node cleanly, install 0.4.1, start it, and wait until `cluster
+status` lists it live before the next. Until the last node is upgraded,
+`cluster status` warns that live nodes run different versions: expected
+during this upgrade. Sockets through the front
+([ADR 0027](adr/0027-sockets-through-the-front.md)) need 0.4.1 on both
+ends: a hand-off to a room owned by a 0.4.0 node gets a 503 with
+`Retry-After: 1`, and a front on a 0.4.0 node sees an upgrade as the
+plain `GET` it saw before. Deploy an app that hands sockets off once
+every node runs 0.4.1. Every other pair of versions follows the rule
+above.
+
 1. `wasmkeep cluster status --bucket ...`: note the nodes it lists as live.
 2. Stop every node cleanly (`systemctl stop wasmkeep`, `SIGTERM`). Each
    finishes its requests and releases its actors; a clean stop takes up to
@@ -1165,7 +1180,7 @@ the 0.4.0 layout change: `cluster migrate --rollback` works only until
 the first node starts after the migration, and never after
 `--remove-old --apply` ([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
 a git checkout report the release they follow and their commit
-(`0.4.0+4f1c2a9e7b3d`), a release's tag the release alone, so the version
+(`0.4.1+4f1c2a9e7b3d`), a release's tag the release alone, so the version
 column tells two builds of `main` apart. A build without git (a source
 tarball, a container image built locally) reports the release alone:
 step 3 is what proves no old node is left.
