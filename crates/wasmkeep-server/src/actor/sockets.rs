@@ -123,8 +123,11 @@ impl ActorState {
         // deleted under an open socket stays deleted. A class a deploy made
         // internal closes its outside sockets (ADR 0013); the front's stay,
         // by the mark the host keeps with each socket (ADR 0027).
-        let outside = self.sockets.opener(conn) == Opener::Outside;
-        match self.admit(outside).await {
+        let admitted = match self.sockets.opener(conn) {
+            Opener::Outside => self.admit(true).await,
+            Opener::Front => self.admit_socket_event().await,
+        };
+        match admitted {
             Ok(Admitted::Yes) => {}
             Ok(Admitted::Unconfigured(_)) => {
                 self.sockets.close(

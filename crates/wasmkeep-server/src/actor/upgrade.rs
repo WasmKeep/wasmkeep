@@ -217,11 +217,11 @@ impl ActorService {
                 }
                 Err(MailboxError::Full(_)) => {
                     crate::metrics::refused(crate::metrics::Refusal::Overloaded);
-                    return text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n");
+                    return crate::cluster::unavailable("actor unavailable\n");
                 }
                 _ => {
                     crate::metrics::refused(crate::metrics::Refusal::Unavailable);
-                    return text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n");
+                    return crate::cluster::unavailable("actor unavailable\n");
                 }
             }
             // In a cluster the socket must live on the actor's owner: find out
@@ -278,7 +278,10 @@ impl ActorService {
                         if let Some(ticket) = ticket.take() {
                             ticket.end("forwarded");
                         }
-                        let sent = !crate::cluster::never_forward(&req);
+                        // A hand-off this node does not send (the peer is
+                        // of an older version) says nothing of the peer.
+                        let sent = !crate::cluster::never_forward(&req)
+                            && (opener == Opener::Outside || cluster.can_handoff(&peer));
                         let response = cluster.forward_upgrade(&peer, req, opener).await;
                         if sent && response.status().is_server_error() {
                             cluster.suspect(&peer);

@@ -1,6 +1,8 @@
 # 0027. Sockets through the front
 
-- Status: accepted (2026-11-14)
+- Status: accepted (2026-11-14); revised after an adversarial review (a
+  socket event never creates the actor; a signed request with the mark is
+  never a call; a hand-off not sent says nothing of the peer)
 - Date: 2026-11-14
 - Release: [0.4.1](../../ROADMAP.md#now)
 - Follows: [ADR 0023](0023-the-front.md) ("The WebSocket hand-off: not
@@ -103,10 +105,16 @@ opener is **the front, an inside caller** (ADR 0010).
   instance's, so the mark survives the actor hibernating, waking, and
   being parked (ADR 0024): `ws_prepare` reads it instead of passing
   `admit(true)`.
+- **A socket event never creates the actor**, the front's sockets
+  included: their messages and closes admit as inside (an `internal` class
+  is not refused, required values are checked) and, under any class but
+  `open`, the actor must still exist. Only the open itself, the front's
+  decision, may create it.
 - A class a deploy makes `internal` closes its outside sockets at their
   next event (1008, ADR 0013); sockets the front opened stay. A deleted
   actor of an `internal` or `existing` class closes every socket, as
-  today (`delete-self`), so a later message cannot create it again.
+  today (`delete-self`), and since socket events never create the actor,
+neither their close events nor a later message create it again.
 
 ### What `on-websocket-open` sees
 
@@ -181,7 +189,9 @@ without the caller or the mark is refused (`403`); an invalid one, or none,
 is an outside upgrade as today, so a forged mark or caller from a client
 changes nothing (and `internal` still answers `403`). The mark is in the
 signed names so that a signed call seen on the wire cannot be replayed as
-an upgrade: an `actors.call` never carries it. On the public port in
+an upgrade: an `actors.call` never carries it, and a node refuses (`403`)
+any signed request that carries the mark without being an upgrade (a
+relay whose `Upgrade` header was removed on the way). On the public port in
 `--cluster-plaintext refuse` mode, a signed relay is outside, as every
 signed call there; relays go to the cluster port then.
 
@@ -207,7 +217,8 @@ answers it as any relayed upgrade (the client reconnects).
   to an `internal` room with `403`. The heartbeat gains the capability
   word **`handoff`** on line 11, beside `take` and `front`; a node relays
   a hand-off only to an owner that announces it, and otherwise answers
-  `503` with `Retry-After: 1`. Unknown words are ignored, so 0.4.0 nodes
+  `503` with `Retry-After: 1`, without counting that peer as failing
+  (it was never sent anything). Unknown words are ignored, so 0.4.0 nodes
   read the new heartbeat.
 - **Behaviour changes**, for the 0.4.1 notes:
   - the front sees `x-wasmkeep-upgrade: websocket` on WebSocket upgrades;

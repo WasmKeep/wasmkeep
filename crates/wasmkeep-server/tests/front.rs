@@ -1203,3 +1203,33 @@ async fn a_slow_open_does_not_hold_a_front_slot() {
     assert_eq!(busy.await.unwrap().body, "200:slept");
     assert!(socket.await.unwrap().is_ok());
 }
+
+/// A deleted room's handed-off sockets close with it, and their close
+/// events do not create it again (review of ADR 0027): an inside socket's
+/// events never create an actor, as an outside one's do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_rooms_sockets_do_not_bring_it_back() {
+    use futures_util::StreamExt;
+    let node = start(Setup::default()).await;
+    let url = format!("ws://{}{}", node.addr, handoff("r", "gone", "/ws", ""));
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let r = get(node.addr, &call("r/gone", "POST", "/delete"), "").await;
+    assert!(r.body.starts_with("200:"), "{}", r.body);
+    // Closed by the delete.
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Close(frame) = msg {
+                return frame.map(|f| u16::from(f.code));
+            }
+        }
+        None
+    })
+    .await
+    .unwrap();
+    assert_eq!(closed, Some(1000));
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A close event that ran would have created it again and counted 1.
+    let r = get(node.addr, &call("r/gone", "POST", "/ws-closed"), "").await;
+    assert_eq!(r.body, "200:0");
+}
