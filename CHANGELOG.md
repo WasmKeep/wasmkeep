@@ -49,6 +49,59 @@ Since 0.3.0, in no release yet.
   1, shows which version each node runs (`node` only in a cluster); other
   series are unchanged ([metrics](docs/monitoring.md#metrics)).
 
+### The front, host side (for 0.4.0)
+
+The stateless component given to `serve` becomes the app's front
+([ADR 0023](docs/adr/0023-the-front.md)). Shipping a front with a deploy
+comes later.
+
+- **The front calls actors.** The component is linked with `actors` and
+  `env` besides WASI and `wasi:http` (the new WIT worlds `front-core` and
+  `front`; the package stays `0.2.0` and world `actor` is unchanged, so
+  built actors and built stateless components run as they are). Its
+  `actors.call` reaches the `--actor` classes as an inside caller:
+  `internal` classes included, and the callee sees `x-wasmkeep-caller:
+  default/_front/main`. Without `--actor`, its calls fail with
+  `invalid-address`. Calls to an actor on another node are signed hops, as
+  an actor's.
+- **`serve --front-env FILE`** gives the front its values (`env.get`), as
+  `--env CLASS=FILE` does for a class; `--env _front=FILE` is refused.
+- **Its own limits.** `--max-front-requests N` front requests at once (by
+  default a tenth of `--max-instances`, rounded up): past it, 503 with
+  `Retry-After: 1`, without running the front; resident actors get the
+  rest of the pool. A quarter of those slots may wait on one actor at
+  once: past it the call fails with `failed("front busy: ...")`. A call
+  from the front gives up with `timeout` while 5 s of its 30 s wall remain.
+  The front's CPU budget is its own flag, `--front-cpu-budget-ms` (50 ms by
+  default); `--cpu-budget-ms` is the actors' only.
+- **Metrics**: `wasmkeep_front_requests_total{tenant,app,outcome}`,
+  `wasmkeep_front_request_seconds`, `wasmkeep_front_slots_in_use` and
+  `wasmkeep_front_calls_total{tenant,app,outcome}`
+  ([metrics](docs/monitoring.md#metrics)).
+
+Behaviour changes:
+
+- With `--app`, a component on the `serve` command line is refused at
+  start; such a node answers 404 outside `/actor/` until its deploy brings
+  a front.
+- Without `--app`, the component gets `actors` and `env`.
+- A client's `x-wasmkeep-*` headers no longer reach the stateless
+  component, and its own `x-wasmkeep-*` response headers no longer reach
+  the client.
+- The stateless component's CPU budget is `--front-cpu-budget-ms`, no
+  longer `--cpu-budget-ms`.
+- A guest's own `x-wasmkeep-*` headers on `actors.call` no longer reach
+  the callee, for actors too (before, a local call passed a guest-set
+  `x-wasmkeep-forwarded` or `x-wasmkeep-node` on unchanged), except the
+  four the SDKs' key-value and queue clients send
+  (`x-wasmkeep-kv-expect`, `x-wasmkeep-kv-ttl-ms`, `x-wasmkeep-kv-durable`,
+  `x-wasmkeep-queue-delay-ms`).
+- `/actor/...` no longer reaches a stateless component on a node without
+  actors: it answers 404.
+- A `1xx` status from the stateless component becomes a 500.
+- The guest log names the stateless component `actor=_front` instead of
+  `actor=stateless`.
+
 ### App-owned state (for 0.4.0)
 
 These change the layout in the bucket and on disk; they supersede the

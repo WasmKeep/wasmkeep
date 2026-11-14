@@ -150,9 +150,10 @@ a new name creates that actor. Put authentication in your actors, or in the
 proxy. In an actor: give the class a token with `--env`, and compare the
 `Authorization` header with it in `fetch` without stopping at the first
 differing byte (Watch's hub does this, `examples/watch/hub`). Calls between
-actors carry `x-wasmkeep-caller: <tenant>/<class>/<name>`, which the host sets
-and strips from outside requests, so an actor can accept some changes only
-from another class.
+actors carry `x-wasmkeep-caller: <tenant>/<class>/<name>` (calls from the
+stateless component, the app's front, carry `<tenant>/_front/main`), which
+the host sets and strips from outside requests, so an actor can accept some
+changes only from another class.
 
 Classes whose actors only other actors should create (a per-user actor
 created at sign-up, a worker the scheduler starts) take `--access

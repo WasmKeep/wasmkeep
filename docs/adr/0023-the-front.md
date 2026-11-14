@@ -181,6 +181,16 @@ front's paths (see "The WebSocket hand-off").
   callee without the stripping `requests.rs` does for requests from the
   port, so a guest-set `x-wasmkeep-forwarded` or `x-wasmkeep-node`
   reaches the callee unchanged. One rule for every caller.
+  - Note (2026-11-14, while building it): four names in the range are the
+    SDKs' own protocol between actors, sent by every SDK's key-value and
+    queue clients since 0.1.0: `x-wasmkeep-kv-expect`,
+    `x-wasmkeep-kv-ttl-ms`, `x-wasmkeep-kv-durable` and
+    `x-wasmkeep-queue-delay-ms`. Dropping them would break those clients,
+    built ones included, against "Built actors run unmodified" below. So
+    `build_request` keeps exactly these four names (the host gives them
+    no meaning) and drops every other name in the range. Moving them out
+    of the range is an SDK protocol change for a later release, after
+    which the exception goes. The front's own edges strip the whole range.
 - **Responses from the front**: the host removes every `x-wasmkeep-`
   header from the front's response before the client gets it. This
   reserves the range for the host's own answers, including the 0.4.1

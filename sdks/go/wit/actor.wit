@@ -144,7 +144,9 @@ interface actors {
     ///
     /// The callee sees `x-wasmkeep-caller: <tenant>/<class>/<name>`, the name
     /// percent-encoded (every byte but ASCII letters, digits and `-._~`), so
-    /// `room 1` arrives as `room%201`. The host removes that header from
+    /// `room 1` arrives as `room%201`. A call from the app's front arrives
+    /// with `x-wasmkeep-caller: <tenant>/_front/main`, which is never an
+    /// actor (`_front` is not a class). The host removes that header from
     /// requests coming from outside, so the callee can trust it.
     call: func(address: string, request: request) -> result<response, call-error>;
 
@@ -269,5 +271,36 @@ world actor {
     // Seeds the standard library's hash maps (Rust's `HashMap`, used by the
     // SDK's key-value client among others). The host provides it, as every
     // WASI 0.2 interface it links.
+    import wasi:random/insecure-seed@0.2.12;
+}
+
+/// What the host links for a front, besides WASI and `wasi:http`: an app's
+/// optional stateless component that receives every request outside
+/// `/actor/` and `/_wasmkeep/` (see docs/adr/0023-the-front.md). It calls
+/// the app's actors with `actors.call`, as an inside caller, and reads its
+/// own values with `env.get`. Its `self-address` is
+/// `{ tenant, class: "_front", name: "main" }`.
+world front-core {
+    import actors;
+    import env;
+}
+
+/// The world front components target: `front-core` plus the standard
+/// `wasi:http/proxy` world. A front exports only the incoming handler; it
+/// has no storage, alarms or WebSockets. Every plain `wasi:http/proxy`
+/// component is a valid front.
+world front {
+    include front-core;
+    include wasi:http/proxy@0.2.12;
+
+    // The same as world `actor`'s, for the same reason: standard libraries
+    // and ComponentizeJS import them, and the host provides them empty.
+    import wasi:cli/environment@0.2.12;
+    import wasi:cli/exit@0.2.12;
+    import wasi:cli/terminal-input@0.2.12;
+    import wasi:cli/terminal-output@0.2.12;
+    import wasi:cli/terminal-stdin@0.2.12;
+    import wasi:cli/terminal-stdout@0.2.12;
+    import wasi:cli/terminal-stderr@0.2.12;
     import wasi:random/insecure-seed@0.2.12;
 }

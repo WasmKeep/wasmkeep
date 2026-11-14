@@ -69,6 +69,8 @@ use self::{
     state::*,
 };
 
+pub(crate) use self::routing::is_wasmkeep_header;
+
 /// How long a node trusts "node X holds this actor" without asking the
 /// bucket again.
 pub(crate) const HINT_MS: u64 = 1_000;
@@ -135,6 +137,15 @@ pub struct ActorConfig {
     /// runs, so no event (an alarm at startup, say) runs deployed code
     /// unchecked.
     pub deploy_seq: u64,
+    /// Instance slots kept for the front's requests (`--max-front-requests`,
+    /// ADR 0023); resident actors get the rest of the pool, at least one.
+    /// `None`: a tenth of the pool, rounded up
+    /// ([`crate::fds::default_front_requests`]).
+    pub max_front_requests: Option<usize>,
+    /// The front's values from this node's files (`--front-env`), for the
+    /// front a deployed version brings (ADR 0023); they win, by name, over
+    /// its deployed configuration and secrets.
+    pub front_env: crate::env::Vars,
     /// Join a cluster: actors run only on the node holding their lease, and
     /// requests reaching another node are forwarded. `None` runs alone.
     pub cluster: Option<ClusterConfig>,
@@ -169,6 +180,8 @@ impl ActorConfig {
             access: crate::access::AccessRules::default(),
             flag_access: None,
             deploy_seq: 0,
+            max_front_requests: None,
+            front_env: crate::env::Vars::new(),
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,
         }
@@ -369,6 +382,36 @@ impl ActorService {
             .map_or(crate::access::Access::Open, |c| {
                 c.rules.for_actor(class, name)
             })
+    }
+
+    /// The tenant of this node's actors.
+    pub(crate) fn tenant(&self) -> &str {
+        &self.inner.tenant
+    }
+
+    /// How long an `actors.call` may wait at most: the actors' wall per
+    /// event.
+    pub(crate) fn call_wall(&self) -> Duration {
+        self.inner.wall
+    }
+
+    /// The actor `address` names, for a call from the front.
+    pub(crate) fn front_target(&self, address: &str) -> Result<ActorAddress, CallError> {
+        self.inner.call_target(address)
+    }
+
+    /// `actors.call` from the front (ADR 0023): an inside call, with an
+    /// empty chain, given up after `limit`.
+    pub(crate) async fn front_call(
+        &self,
+        target: ActorAddress,
+        request: CallRequest,
+        limit: Duration,
+    ) -> Result<CallResponse, CallError> {
+        let chain: Chain = Arc::from(Vec::new());
+        Arc::clone(&self.inner)
+            .call(&Caller::Front, &chain, target, request, limit)
+            .await
     }
 
     /// The classes this service serves.
@@ -574,6 +617,31 @@ struct ActorHost {
 
 type ServiceSlot = Arc<std::sync::OnceLock<std::sync::Weak<ServiceInner>>>;
 type Chain = Arc<[ActorAddress]>;
+
+/// The class part of the front's caller value, `<tenant>/_front/main` (ADR
+/// 0023). Never a class: class names start with a lowercase letter.
+pub(crate) const FRONT_CLASS: &str = "_front";
+/// The name part: the one front an app has.
+pub(crate) const FRONT_NAME: &str = "main";
+
+/// Who makes an `actors.call`: an actor, or the app's front (ADR 0023).
+/// The front is never in a call chain: it cannot be called back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Caller {
+    Actor(ActorAddress),
+    Front,
+}
+
+impl Caller {
+    /// The `x-wasmkeep-caller` value: the actor's address (its name
+    /// percent-encoded), or `<tenant>/_front/main`.
+    pub(crate) fn value(&self, tenant: &str) -> String {
+        match self {
+            Self::Actor(a) => encode_address(a),
+            Self::Front => format!("{tenant}/{FRONT_CLASS}/{FRONT_NAME}"),
+        }
+    }
+}
 
 /// What an instance needs to make calls during the current event.
 #[derive(Clone)]

@@ -85,7 +85,7 @@ async fn the_health_endpoint_answers_without_reaching_the_component() {
     let (status, text) = request(addr, "GET", "/_wasmkeep/other").await;
     assert_eq!(status, 404, "{text}");
 
-    // An app without a stateless component answers too.
+    // An app without a front answers too.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (_stop2, stopped) = oneshot::channel::<()>();
@@ -121,14 +121,30 @@ async fn get_root_is_served_by_the_component() {
 #[tokio::test(flavor = "multi_thread")]
 async fn method_path_and_query_reach_the_guest() {
     let (addr, _stop) = start(hello_component()).await;
-    let (status, text) = request(addr, "POST", "/actor/room-1?x=1").await;
+    let (status, text) = request(addr, "POST", "/rooms/room-1?x=1").await;
     assert_eq!(status, 200, "{text}");
-    assert!(text.contains("You sent POST /actor/room-1?x=1"), "{text}");
+    assert!(text.contains("You sent POST /rooms/room-1?x=1"), "{text}");
+}
+
+/// ADR 0023: `/actor/` never reaches the component, even on a node that
+/// serves no actors.
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_paths_answer_404_on_a_node_without_actors() {
+    let (addr, _stop) = start(hello_component()).await;
+    for path in ["/actor/room/1", "/actor/room/1/x?y=1", "/actor/"] {
+        let (status, text) = request(addr, "GET", path).await;
+        assert_eq!(status, 404, "{path}: {text}");
+        assert!(!text.contains("You sent"), "{path}: {text}");
+    }
+    // Paths that only start alike still reach it.
+    let (status, text) = request(addr, "GET", "/actors").await;
+    assert_eq!(status, 200, "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_requests_each_get_an_instance() {
-    let (addr, _stop) = start(hello_component()).await;
+    // As many front slots as requests (by default a tenth of the pool).
+    let (addr, _stop) = start(hello_component().with_max_requests(50)).await;
     let tasks: Vec<_> = (0..50)
         .map(|i| tokio::spawn(async move { request(addr, "GET", &format!("/n/{i}")).await }))
         .collect();
@@ -200,7 +216,9 @@ fn misbehave_component(cpu_budget: Duration) -> HttpComponent {
     })
     .unwrap();
     let component = runtime.compile(misbehave_wasm()).unwrap();
-    HttpComponent::new(runtime, &component).unwrap()
+    HttpComponent::new(runtime, &component)
+        .unwrap()
+        .with_cpu_budget(cpu_budget)
 }
 
 #[tokio::test(flavor = "multi_thread")]

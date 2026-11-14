@@ -54,9 +54,56 @@ See [ADR 0010](adr/0010-who-may-create-an-actor.md). An app deployed with
 `wasmkeep deploy` carries its rules in the deploy instead
 (`wasmkeep deploy --access CLASS=MODE`), so every node applies the same ones
 with the code they protect ([Running a cluster](cluster.md#access-rules-and-configuration)). Paths outside
-`/actor/` go to the optional stateless component given to `serve`, except
-`/_wasmkeep/`, which the server keeps for itself (`/_wasmkeep/health` and
-`/_wasmkeep/ready` for load balancers, see [Monitoring](monitoring.md)).
+`/actor/` go to the optional front, a stateless component given to `serve`,
+except `/_wasmkeep/`, which the server keeps for itself (`/_wasmkeep/health`
+and `/_wasmkeep/ready` for load balancers, see [Monitoring](monitoring.md)).
+`/actor/` never reaches the front, also on a node that serves no actors
+(404).
+
+## The front
+
+The front ([ADR 0023](adr/0023-the-front.md)) is a plain `wasi:http`
+component, the `wasmkeep:actor/front` world: a fresh instance per request,
+no state. It routes, signs users in and renders pages, and calls the
+node's actors with `actors.call`:
+
+- **An inside caller.** Its calls reach `internal` classes and create
+  actors of any class, as an actor's do. The callee sees
+  `x-wasmkeep-caller: <tenant>/_front/main` (`default/_front/main` for
+  `serve` without `--app`). `_front` is never a class, so nothing can call
+  the front back, and `actors.call("_front/main")` fails with
+  `invalid-address`. Validate names taken from a URL before calling: each
+  new name is a new actor and a new database.
+- **Its values.** `env.get` reads the files given with `serve --front-env
+  FILE` (`NAME=value` lines, as `--env` for a class). `self-address`
+  returns `<tenant>/_front/main`.
+- **The host's headers are the host's.** Every `x-wasmkeep-` header a
+  client sends is removed before the front sees the request, and every one
+  the front sets on its response is removed before the client gets it. On
+  `actors.call`, the host drops every `x-wasmkeep-` header a guest set
+  (actors too), but the four the SDKs' key-value and queue clients send
+  (`x-wasmkeep-kv-expect`, `-kv-ttl-ms`, `-kv-durable`,
+  `x-wasmkeep-queue-delay-ms`), and sets the actor and caller itself.
+- **Limits.** A 30 s wall per request, response included. A call gives
+  up with `timeout` while 5 s of that wall remain, or after the actors'
+  call limit, whichever comes first, so the front can still answer. At most
+  `--max-front-requests` front requests run at once (by default a tenth of
+  `--max-instances`; resident actors get the rest of the pool); past it the
+  node answers 503 with `Retry-After: 1` without running the front. At most
+  a quarter of those may wait on one actor at once; past it the call fails
+  with `failed("front busy: ...")`. The front's CPU time per request is
+  `--front-cpu-budget-ms` (50 ms), apart from the actors'. A `1xx` status
+  from the front becomes a 500.
+- **Upgrades.** A WebSocket upgrade outside `/actor/` reaches the front as
+  a plain GET; reach sockets at `/actor/<class>/<name>`.
+- **Where it runs.** On the node that received the request, on the public
+  port only: it is never forwarded, and the cluster port does not serve
+  it. Its calls to an actor on another node are signed hops, as an
+  actor's.
+
+With `serve --app`, a component on the command line is refused: the front
+is to come with the app's deploy, so that a rollback reaches it too
+(planned, ADR 0023).
 
 ## Events
 

@@ -115,15 +115,16 @@ impl ActorService {
         let factory_egress = Arc::new(config.egress.clone());
         let factory_guest_log = config.guest_log.clone();
         // Resident actors stay under the instance pool, with room for the
-        // stateless component's short-lived instances: past it, the least
+        // front's short-lived instances (ADR 0023): past it, the least
         // recently active idle actor hibernates to make room.
         let mut mailbox = config.mailbox;
         let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
-        // Subtract the rounded-up tenth: dividing first would collapse a
-        // pool smaller than ten to one actor, preventing local actor calls.
+        let front = config
+            .max_front_requests
+            .unwrap_or_else(|| crate::fds::default_front_requests(pool));
         mailbox.max_resident = mailbox
             .max_resident
-            .min(crate::fds::resident_pool_limit(pool));
+            .min(crate::fds::resident_limit(pool, front));
         let mailboxes =
             Mailboxes::new_with_residency(mailbox, move |address: ActorAddress, residency| {
                 let class = read(&factory_classes).get(address.class()).cloned();

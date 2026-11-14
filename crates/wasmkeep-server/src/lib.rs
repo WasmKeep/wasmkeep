@@ -2,8 +2,9 @@
 //!
 //! Requests under `/actor/<class>/<name>/...` go to actors (one instance per
 //! name, events serialized through its mailbox, SQLite per actor). Anything
-//! else goes to an optional stateless `wasi:http` component, instantiated per
-//! request.
+//! else, outside `/_wasmkeep/`, goes to an optional front: a stateless
+//! `wasi:http` component, instantiated per request, which calls the actors
+//! (ADR 0023).
 
 #![forbid(unsafe_code)]
 
@@ -18,6 +19,7 @@ pub mod egress;
 pub mod env;
 mod error;
 pub mod fds;
+mod front;
 pub mod guest_log;
 mod http;
 mod local_layout;
@@ -36,6 +38,7 @@ pub use cluster::{
 pub use egress::{EgressPolicy, IpRange};
 pub use env::ActorEnv;
 pub use error::Error;
+pub use front::DEFAULT_CPU_BUDGET as DEFAULT_FRONT_CPU_BUDGET;
 pub use guest_log::GuestLog;
 pub use http::{
     App, HEALTH_PATH, HttpComponent, MAX_BODY_BYTES, READY_PATH, ServeLimits, serve, serve_metrics,

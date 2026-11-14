@@ -52,7 +52,7 @@ fn endpoint() -> Option<String> {
 }
 
 /// Starts the ping on the current runtime. `service` is `None` when the node
-/// serves only a stateless component.
+/// serves only a front.
 pub(crate) fn start(service: Option<ActorService>, cluster: bool) {
     let Some(url) = endpoint() else {
         tracing::info!("usage ping enabled, but this build has no endpoint: nothing is sent");

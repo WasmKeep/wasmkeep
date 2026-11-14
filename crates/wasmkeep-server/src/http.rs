@@ -11,207 +11,14 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use wasmkeep_runtime::{CpuBudgetExceeded, Runtime};
-use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::p2::bindings::ProxyPre;
-use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::cluster_tls::pinning::PinSet;
+pub use crate::front::HttpComponent;
 use crate::{ActorService, Error};
 
 /// How long in-flight requests get to finish after shutdown is requested.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-
-/// Per-request host state stored in the Wasmtime `Store`.
-///
-/// Guests get no stdio, environment, arguments or preopened directories:
-/// capabilities are granted explicitly, never inherited from the host.
-struct HostState {
-    wasi: WasiCtx,
-    http: WasiHttpCtx,
-    table: ResourceTable,
-    /// Outbound HTTP under the egress policy.
-    egress: crate::egress::EgressHooks,
-}
-
-impl HostState {
-    fn new(egress: &Arc<crate::egress::EgressPolicy>, log: &crate::guest_log::GuestLog) -> Self {
-        Self {
-            wasi: log.wasi("stateless".to_owned()),
-            http: WasiHttpCtx::new(),
-            table: ResourceTable::new(),
-            egress: crate::egress::EgressHooks::new(Arc::clone(egress)),
-        }
-    }
-}
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-impl WasiHttpView for HostState {
-    fn http(&mut self) -> WasiHttpCtxView<'_> {
-        WasiHttpCtxView {
-            ctx: &mut self.http,
-            table: &mut self.table,
-            hooks: &mut self.egress,
-        }
-    }
-}
-
-/// A `wasi:http/proxy` component, linked and pre-instantiated, ready to
-/// handle requests. Each request gets a fresh instance. Cheap to clone.
-#[derive(Clone)]
-pub struct HttpComponent {
-    runtime: Runtime,
-    pre: ProxyPre<HostState>,
-    egress: Arc<crate::egress::EgressPolicy>,
-    /// Where instances' stdout and stderr go.
-    guest_log: crate::guest_log::GuestLog,
-    /// Wall-clock limit per request, including streaming the response
-    /// and waiting on I/O (a slow client must not hold an instance).
-    wall: Duration,
-}
-
-impl std::fmt::Debug for HttpComponent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpComponent").finish_non_exhaustive()
-    }
-}
-
-impl HttpComponent {
-    /// Links `component` against the WASI 0.2 and `wasi:http` host
-    /// interfaces and checks that it exports the incoming handler.
-    pub fn new(runtime: Runtime, component: &Component) -> Result<Self, Error> {
-        let mut linker = Linker::<HostState>::new(runtime.engine());
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(Error::linker)?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
-            .map_err(Error::linker)?;
-        let instance_pre = runtime
-            .instantiate_pre(&linker, component)
-            .map_err(Error::not_http)?;
-        let pre =
-            ProxyPre::new(instance_pre).map_err(|e| Error::not_http(e.into_boxed_dyn_error()))?;
-        Ok(Self {
-            runtime,
-            pre,
-            egress: Arc::default(),
-            guest_log: crate::guest_log::GuestLog::default(),
-            wall: Duration::from_secs(30),
-        })
-    }
-
-    /// Lets the component's outbound HTTP reach what `policy` allows (by
-    /// default: public addresses only).
-    #[must_use]
-    pub fn with_egress(mut self, policy: crate::egress::EgressPolicy) -> Self {
-        self.egress = Arc::new(policy);
-        self
-    }
-
-    /// Logs what the component prints within `log`'s limits (by default
-    /// [`crate::guest_log::DEFAULT_RATE`] lines a second per instance).
-    #[must_use]
-    pub fn with_guest_log(mut self, log: crate::guest_log::GuestLog) -> Self {
-        self.guest_log = log;
-        self
-    }
-
-    /// Creates and drops one instance without calling it: proves the
-    /// component instantiates (start functions, pool capacity) and is the
-    /// per-request instantiation cost, minus the request itself.
-    pub async fn instantiate_once(&self) -> Result<(), Error> {
-        let mut store = self
-            .runtime
-            .new_async_store(HostState::new(&self.egress, &self.guest_log));
-        self.pre
-            .instantiate_async(&mut store)
-            .await
-            .map(drop)
-            .map_err(|e| Error::not_http(e.into_boxed_dyn_error()))
-    }
-
-    /// Handles one request in a fresh instance. Guest failures (traps, no
-    /// response set) become a 500 response, never an error for the caller.
-    pub async fn handle(&self, req: Request<Incoming>) -> Response<HyperOutgoingBody> {
-        match self.try_handle(req).await {
-            Ok(response) => response,
-            Err(e) => {
-                let reason = if e.downcast_ref::<CpuBudgetExceeded>().is_some() {
-                    "cpu_budget"
-                } else {
-                    "guest_error"
-                };
-                tracing::warn!(reason, error = %format!("{e:#}"), "request failed");
-                internal_error()
-            }
-        }
-    }
-
-    async fn try_handle(
-        &self,
-        req: Request<Incoming>,
-    ) -> wasmtime::Result<Response<HyperOutgoingBody>> {
-        let mut store = self
-            .runtime
-            .new_async_store(HostState::new(&self.egress, &self.guest_log));
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let req = store
-            .data_mut()
-            .http()
-            .new_incoming_request(Scheme::Http, CappedBody::of(req))?;
-        let out = store.data_mut().http().new_response_outparam(sender)?;
-        let pre = self.pre.clone();
-
-        // The guest may keep streaming the body after it has set the
-        // response, so it runs in its own task.
-        let wall = self.wall;
-        let task = tokio::task::spawn(async move {
-            let run = async move {
-                let proxy = pre.instantiate_async(&mut store).await?;
-                proxy
-                    .wasi_http_incoming_handler()
-                    .call_handle(store, req, out)
-                    .await
-            };
-            // Past the wall the instance is dropped, which also ends a
-            // response still streaming.
-            tokio::time::timeout(wall, run)
-                .await
-                .unwrap_or_else(|_| Err(wasmtime::format_err!("request ran past {wall:?}")))
-        });
-
-        let Ok(received) = tokio::time::timeout(wall, receiver).await else {
-            return Err(wasmtime::format_err!("no response within {wall:?}"));
-        };
-        match received {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(code)) => Err(code.into()),
-            // The sender was dropped with the store: the guest returned or
-            // trapped without setting a response.
-            Err(_) => {
-                let cause = match task.await {
-                    Ok(Ok(())) => wasmtime::format_err!("guest returned without a response"),
-                    Ok(Err(e)) => e,
-                    Err(join) => join.into(),
-                };
-                Err(cause.context("guest did not set a response"))
-            }
-        }
-    }
-}
-
-fn internal_error() -> Response<HyperOutgoingBody> {
-    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error\n")
-}
 
 /// A plain-text response generated by the host.
 pub(crate) fn text_response(status: StatusCode, text: &str) -> Response<HyperOutgoingBody> {
@@ -227,12 +34,13 @@ pub(crate) fn text_response(status: StatusCode, text: &str) -> Response<HyperOut
     response
 }
 
-/// What a server serves: actors under `/actor/`, and optionally a stateless
-/// component for every other path.
+/// What a server serves: actors under `/actor/`, and optionally a front
+/// (ADR 0023) for every other path.
 #[derive(Debug, Clone, Default)]
 pub struct App {
-    /// Handles paths outside `/actor/`, one instance per request.
-    pub stateless: Option<HttpComponent>,
+    /// Handles paths outside `/actor/` and `/_wasmkeep/`, one instance per
+    /// request, on the public port only; its calls reach `actors`.
+    pub front: Option<HttpComponent>,
     /// Handles `/actor/<class>/<name>/...`.
     pub actors: Option<ActorService>,
 }
@@ -240,7 +48,7 @@ pub struct App {
 impl From<HttpComponent> for App {
     fn from(component: HttpComponent) -> Self {
         Self {
-            stateless: Some(component),
+            front: Some(component),
             actors: None,
         }
     }
@@ -249,7 +57,7 @@ impl From<HttpComponent> for App {
 impl From<ActorService> for App {
     fn from(actors: ActorService) -> Self {
         Self {
-            stateless: None,
+            front: None,
             actors: Some(actors),
         }
     }
@@ -308,8 +116,16 @@ impl App {
             }
             return actors.handle(&target.class, &target.name, req).await;
         }
-        match &self.stateless {
-            Some(component) => component.handle(req).await,
+        // `/actor/` never reaches the front, nor does anything that came in
+        // on the cluster port (ADR 0023): the front runs on the node that
+        // received the request, from a client.
+        if req.uri().path().starts_with("/actor/")
+            || req.extensions().get::<ArrivedOnClusterPort>().is_some()
+        {
+            return text_response(StatusCode::NOT_FOUND, "not found\n");
+        }
+        match &self.front {
+            Some(front) => front.serve(req, self.actors.as_ref()).await,
             None => text_response(StatusCode::NOT_FOUND, "not found\n"),
         }
     }
@@ -543,8 +359,9 @@ pub struct ServeLimits {
     /// Time a client has to send a request's headers, also between
     /// requests on a kept-alive connection (slow clients, idle sockets).
     pub header_read_timeout: Duration,
-    /// Wall-clock limit for a stateless component's request.
-    pub stateless_wall: Duration,
+    /// Wall-clock limit for a front request, including streaming its
+    /// response (ADR 0023).
+    pub front_wall: Duration,
     /// Connections the cluster port holds at once, when it is served
     /// ([`serve_with_cluster_listener`]); more wait in the kernel's backlog.
     pub cluster_connections: usize,
@@ -555,7 +372,7 @@ impl Default for ServeLimits {
         Self {
             max_connections: 10_000,
             header_read_timeout: Duration::from_secs(30),
-            stateless_wall: Duration::from_secs(30),
+            front_wall: Duration::from_secs(30),
             cluster_connections: crate::fds::CLUSTER_CONNECTIONS,
         }
     }
@@ -668,7 +485,7 @@ pub(crate) const CLUSTER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct ArrivedOnClusterPort(pub(crate) ClusterPeer);
 
 /// What the cluster port serves: actor paths, and the health and readiness
-/// checks; nothing else (no stateless component, no metrics).
+/// checks; nothing else (no front, no metrics).
 fn cluster_serves(path: &str) -> bool {
     path.starts_with("/actor/") || path == HEALTH_PATH || path == READY_PATH
 }
@@ -685,8 +502,8 @@ pub(crate) async fn serve_with_cluster(
     limits: ServeLimits,
 ) -> Result<(), Error> {
     let mut app = app.into();
-    if let Some(stateless) = app.stateless.as_mut() {
-        stateless.wall = limits.stateless_wall;
+    if let Some(front) = app.front.as_mut() {
+        front.wall = limits.front_wall;
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
     let mut accept_errors = 0u32;

@@ -37,10 +37,24 @@ pub const RESERVED: u64 = 256;
 /// Descriptors one resident actor holds.
 pub const PER_ACTOR: u64 = 3;
 
-/// Actor capacity within the instance pool, reserving roughly ten percent
-/// for short-lived stateless instances while allowing a one-instance pool.
+/// Actor capacity within the instance pool with the default front slots
+/// ([`default_front_requests`], roughly ten percent), while allowing a
+/// one-instance pool.
 pub fn resident_pool_limit(pool: usize) -> usize {
-    (pool - pool.div_ceil(10)).max(1)
+    resident_limit(pool, default_front_requests(pool))
+}
+
+/// The front requests a node runs at once by default (`--max-front-requests`,
+/// ADR 0023): the tenth of the instance pool kept from actors, rounded up.
+pub fn default_front_requests(pool: usize) -> usize {
+    pool.div_ceil(10)
+}
+
+/// Resident actors within an instance pool of `pool` that keeps
+/// `front_requests` slots for the front: the rest, at least 1. A larger
+/// front takes room from actors, never from itself.
+pub fn resident_limit(pool: usize, front_requests: usize) -> usize {
+    pool.saturating_sub(front_requests).max(1)
 }
 
 /// Connections the cluster port (ADR 0011) holds at most: nodes keep a few

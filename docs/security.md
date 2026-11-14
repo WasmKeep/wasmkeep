@@ -35,7 +35,9 @@ limits below are enforced by the code (each has a test), not aspirations.
   A socket is invisible to the actor's other events until
   `on-websocket-open` accepts it. Close reasons never carry host errors.
 - `x-wasmkeep-*` headers from clients are stripped or ignored: only the host
-  sets who is calling.
+  sets who is calling. None reaches the front, none the front sets reaches
+  the client, and none a guest sets on `actors.call` reaches the callee (but the
+  SDKs' four key-value and queue headers, which the host gives no meaning).
 
 **Who may create an actor** (ADR 0010): per class, `open` (default),
 `existing` (outside requests reach only existing actors; nothing is created
@@ -48,10 +50,13 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 - CPU: 50 ms of guest time per event, and 2 s of SQL CPU per event
   (SQLite runs in the host, so it has its own budget, measured with the
   thread's CPU clock and enforced inside a statement); wall clock 30 s per
-  event (also for a stateless component's request, response included).
+  event (also for a front request, response included). The front has
+  its own CPU budget, `--front-cpu-budget-ms` (50 ms by default), and its
+  own slots in the instance pool (`--max-front-requests`).
 - Memory: 128 MiB per linear memory, 2 memories and 32 core instances per
-  component; resident actors capped at 90% of the instance pool, the least
-  recently active idle one hibernating to make room.
+  component; resident actors capped at the instance pool less the front's
+  slots (90% by default), the least recently active idle one hibernating
+  to make room.
 - Outbound HTTP: public addresses only (the host resolves, checks and
   connects to the checked address; TLS verified against the name);
   `--allow-outbound` and `--outbound-ca` open specific internal services.

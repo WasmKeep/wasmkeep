@@ -31,8 +31,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Serve actors (/actor/<class>/<name>/...) and/or a stateless
-    /// wasi:http component (one instance per request) over HTTP/1.1.
+    /// Serve actors (/actor/<class>/<name>/...) and/or a front: a stateless
+    /// wasi:http component (one instance per request) for every other path,
+    /// which calls the actors. Over HTTP/1.1.
     Serve(Box<ServeArgs>),
     /// Build actor crates, serve them, and rebuild and hot-swap them on every
     /// source change. Each crate is served as the class named after its
@@ -293,9 +294,11 @@ struct DevArgs {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    /// Stateless component (.wasm exporting wasi:http/incoming-handler) for
-    /// every path outside /actor/ and /_wasmkeep/. Optional when --actor is
-    /// given.
+    /// The front: a stateless component (.wasm exporting
+    /// wasi:http/incoming-handler) for every path outside /actor/ and
+    /// /_wasmkeep/. It may call the --actor classes with actors.call, and
+    /// read its values (--front-env) with env.get. Optional when --actor is
+    /// given; refused with --app, whose front comes with its deploy.
     component: Option<PathBuf>,
 
     /// Actor class served at /actor/<CLASS>/<name>/..., as CLASS=PATH to a
@@ -386,8 +389,9 @@ struct ServeArgs {
     #[arg(long, default_value_t = RuntimeConfig::default().max_instances)]
     max_instances: u32,
 
-    /// Guest CPU time allowed per request, in milliseconds. Time spent
-    /// waiting on host I/O does not count.
+    /// Guest CPU time allowed per actor event, in milliseconds. Time spent
+    /// waiting on host I/O does not count. The front has its own,
+    /// --front-cpu-budget-ms.
     #[arg(long, default_value_t = 50)]
     cpu_budget_ms: u64,
 
@@ -423,7 +427,7 @@ struct ServeArgs {
     #[arg(long = "allow-outbound-port", value_name = "PORT")]
     allow_outbound_port: Vec<u16>,
 
-    /// Lines a second each actor instance (and each stateless request) may
+    /// Lines a second each actor instance (and each front request) may
     /// print to the node's log, with bursts of twice that; past it, lines
     /// are dropped and counted. What guests write to stdout and stderr is
     /// logged as target `wasmkeep::guest` (filter it with RUST_LOG). 0
@@ -454,6 +458,24 @@ struct ServeArgs {
     /// file readable only by the server's user. Repeatable; later files win.
     #[arg(long = "env", value_name = "CLASS=FILE", value_parser = parse_actor)]
     env: Vec<(String, PathBuf)>,
+
+    /// The front's configuration and secrets on this node: `NAME=value`
+    /// lines it reads with `env.get`, as --env gives a class's. Repeatable;
+    /// later files win.
+    #[arg(long = "front-env", value_name = "FILE")]
+    front_env: Vec<PathBuf>,
+
+    /// Front requests running at once on this node; past it, 503 with
+    /// `Retry-After: 1`. Their instances are kept from the pool: resident
+    /// actors get the rest of --max-instances. By default a tenth of
+    /// --max-instances, rounded up.
+    #[arg(long, value_name = "N")]
+    max_front_requests: Option<usize>,
+
+    /// The front's CPU time per request, in milliseconds (apart from
+    /// --cpu-budget-ms, the actors'). Past it, the request answers 500.
+    #[arg(long, value_name = "MS", default_value_t = 50)]
+    front_cpu_budget_ms: u64,
 
     /// The app's secrets key (`wasmkeep secrets new-key`), with `--app`:
     /// secrets set with `wasmkeep secrets` reach `env.get`, over the deployed
@@ -583,6 +605,10 @@ pub(crate) fn load_env(
 ) -> anyhow::Result<wasmkeep_server::ActorEnv> {
     let mut env = wasmkeep_server::ActorEnv::default();
     for (class, path) in files {
+        anyhow::ensure!(
+            class != "_front",
+            "--env {class}=...: --env takes classes; give the front's values with --front-env FILE"
+        );
         if !served.contains(&class.as_str()) {
             anyhow::ensure!(
                 !strict,
@@ -602,6 +628,45 @@ pub(crate) fn load_env(
         tracing::info!(%class, values = n, "env loaded");
     }
     Ok(env)
+}
+
+/// The front's values from `--front-env` files, later files winning.
+fn load_front_env(files: &[PathBuf]) -> anyhow::Result<wasmkeep_server::env::Vars> {
+    let mut vars = wasmkeep_server::env::Vars::new();
+    for path in files {
+        let (more, warnings) = wasmkeep_server::env::read_file(path)
+            .map_err(|e| anyhow::anyhow!("--front-env: {e}"))?;
+        for w in warnings {
+            tracing::warn!("{w}");
+        }
+        vars.extend(more);
+    }
+    if !files.is_empty() {
+        tracing::info!(values = vars.len(), "front env loaded");
+    }
+    Ok(vars)
+}
+
+/// `--max-front-requests`, or its default: a tenth of the pool, rounded
+/// up. A value of 0, or one that leaves actors no instance, is refused.
+fn front_requests(given: Option<usize>, pool: usize, actors: bool) -> anyhow::Result<usize> {
+    let Some(n) = given else {
+        return Ok(wasmkeep_server::fds::default_front_requests(pool).max(1));
+    };
+    anyhow::ensure!(n > 0, "--max-front-requests must be at least 1");
+    if actors {
+        anyhow::ensure!(
+            n < pool,
+            "--max-front-requests {n} leaves actors no room in --max-instances {pool}: \
+             give fewer front requests or more instances"
+        );
+    } else {
+        anyhow::ensure!(
+            n <= pool,
+            "--max-front-requests {n} is more than --max-instances {pool}"
+        );
+    }
+    Ok(n)
 }
 
 fn parse_access(s: &str) -> Result<(String, String), String> {
@@ -819,6 +884,23 @@ fn main() -> anyhow::Result<()> {
 
 fn serve(args: ServeArgs) -> anyhow::Result<()> {
     huge_pages(args.transparent_huge_pages);
+    // With --app the front comes from the deploy only (ADR 0023), whatever
+    // is deployed: refused before anything is read or compiled.
+    if let (Some((tenant, name)), Some(path)) = (&args.app, &args.component) {
+        anyhow::bail!(
+            "{}: with --app, the front comes with the app's deploy, not the command line: \
+             wasmkeep deploy --app {tenant}/{name} --front PATH",
+            path.display()
+        );
+    }
+    anyhow::ensure!(
+        args.env.iter().all(|(class, _)| class != "_front"),
+        "--env _front=...: --env takes classes; give the front's values with --front-env FILE"
+    );
+    anyhow::ensure!(
+        args.front_env.is_empty() || args.component.is_some() || args.app.is_some(),
+        "--front-env: no front is served (give a component, or --app)"
+    );
     anyhow::ensure!(
         args.component.is_some() || !args.actors.is_empty() || args.app.is_some(),
         "nothing to serve: give a component, --actor CLASS=PATH, --app, or a mix"
@@ -848,10 +930,12 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         cpu_budget: std::time::Duration::from_millis(args.cpu_budget_ms),
         ..RuntimeConfig::default()
     })?;
+    let pool = runtime.max_instances() as usize;
+    let serves_actors = !args.actors.is_empty() || args.app.is_some();
+    let front_requests = front_requests(args.max_front_requests, pool, serves_actors)?;
     // Every resident actor holds three open files: size the caps to the
     // descriptors this process may open (raising the soft limit first).
-    let wanted_resident =
-        wasmkeep_server::fds::resident_pool_limit(runtime.max_instances() as usize);
+    let wanted_resident = wasmkeep_server::fds::resident_limit(pool, front_requests);
     // The cluster port, when served, takes its share first.
     let mut cluster_connections = wasmkeep_server::fds::CLUSTER_CONNECTIONS;
     let (max_connections, resident_cap) = match wasmkeep_server::fds::raise_open_files_limit(
@@ -913,12 +997,16 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let mut app = App::default();
     // One for the node: guests share its node-wide line budget.
     let guest_log = wasmkeep_server::GuestLog::new(args.guest_log_rate);
+    let front_env = load_front_env(&args.front_env)?;
     if let Some(path) = &args.component {
         let (component, _) = load(path)?;
-        app.stateless = Some(
+        app.front = Some(
             HttpComponent::new(runtime.clone(), &component)?
                 .with_egress(egress.clone())
-                .with_guest_log(guest_log.clone()),
+                .with_guest_log(guest_log.clone())
+                .with_cpu_budget(std::time::Duration::from_millis(args.front_cpu_budget_ms))
+                .with_max_requests(front_requests)
+                .with_env(front_env.clone()),
         );
     }
     let mut follow = None;
@@ -1026,6 +1114,8 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         config.mailbox.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
         config.mailbox.max_resident = resident_cap;
+        config.max_front_requests = Some(front_requests);
+        config.front_env = front_env.clone();
         if let (Some(node_id), Some(advertise), Some(bucket)) =
             (&args.node_id, &args.advertise, &args.bucket)
         {
@@ -1116,7 +1206,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(args.listen)
             .await
             .with_context(|| format!("binding {}", args.listen))?;
-        if let Some(http) = &app.stateless {
+        if let Some(http) = &app.front {
             http.instantiate_once()
                 .await
                 .context("test instantiation of the component failed")?;

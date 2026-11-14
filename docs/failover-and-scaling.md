@@ -169,6 +169,14 @@ so any node answers and the nodes do not coordinate. It scales with the
 nodes behind the load balancer, within each node's connection and instance
 limits and a 30 s wall clock per request.
 
+It is the app's front ([ADR 0023](adr/0023-the-front.md)): its calls to
+actors (`actors.call`) reach them wherever they run, one signed hop away
+when another node holds them. A hibernated actor has no owner, so a
+front's call wakes it on the front's node: actors settle where front
+traffic lands. Front requests have their own slots on each node
+(`--max-front-requests`); past them a node answers 503 with
+`Retry-After: 1`.
+
 It is a file each node is started with, not part of a deploy:
 `wasmkeep deploy` does not change it. Updating it is a restart of each
 node in turn, with two versions answering side by side until the last one

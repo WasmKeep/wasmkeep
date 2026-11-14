@@ -84,7 +84,8 @@ type CallRequest struct {
 
 // Call sends req to the actor at address (`class/name`, same tenant) and
 // waits for its response; other events to this actor wait meanwhile. The
-// callee sees `x-wasmkeep-caller: <tenant>/<class>/<name>`. A failed call
+// callee sees `x-wasmkeep-caller: <tenant>/<class>/<name>`, or
+// `<tenant>/_front/main` for a call from the app's front. A failed call
 // (no answer) is a [*call.Error]; an answer, whatever its status, is not
 // an error.
 func Call(address string, req CallRequest) (Response, error) {

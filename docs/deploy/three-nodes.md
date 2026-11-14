@@ -216,8 +216,9 @@ it exits with 1 if no node is live. See
   in-flight requests, then hands its actors over: the other nodes serve
   them on their next request. WebSockets to that node close and clients
   reconnect.
-- **Updating the stateless component** (the file given to `serve` for
-  paths outside `/actor/` and `/_wasmkeep/`): it is not part of a deploy.
+- **Updating the stateless component** (the front: the file given to
+  `serve` for paths outside `/actor/` and `/_wasmkeep/`, refused with
+  `--app`): it is not part of a deploy.
   Copy the new file to every node and restart them one at a time (see
   [Updating the stateless component](../cluster.md#updating-the-stateless-component)).
 - **Adding a node**: start it with a new id and add it to the load
