@@ -3,8 +3,10 @@
 #![forbid(unsafe_code)]
 
 mod dev;
+mod dev_project;
 mod diagnose;
 mod migrate_cmd;
+mod project;
 mod secrets_cmd;
 mod status;
 mod usage;
@@ -184,9 +186,26 @@ struct StatusArgs {
 
 #[derive(Debug, Args)]
 struct DeployArgs {
-    /// The app, as TENANT/APP.
+    /// The app, as TENANT/APP. Required without a project file; with one,
+    /// it may be given only if it names the file's app.
     #[arg(long, value_parser = parse_app)]
-    app: (String, String),
+    app: Option<(String, String)>,
+
+    /// The project file (ADR 0026): a wasmkeep.toml, or a directory holding
+    /// one. Without it, ./wasmkeep.toml is read if there is one. The deploy
+    /// is then exactly the file: its classes (others are removed), every
+    /// class's rule (internal by default), configuration and front.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_project")]
+    project: Option<PathBuf>,
+
+    /// Ignore ./wasmkeep.toml: deploy with flags only.
+    #[arg(long)]
+    no_project: bool,
+
+    /// With a project file, do not run its build commands (components
+    /// built in an earlier step).
+    #[arg(long)]
+    no_build: bool,
 
     /// Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from
     /// the AWS_* environment variables).
@@ -270,16 +289,28 @@ struct DeployArgs {
 #[derive(Debug, Args)]
 struct DevArgs {
     /// Actor crate directories (each with a Cargo.toml using wasmkeep-sdk).
-    #[arg(required = true)]
+    /// Without any, the project file (./wasmkeep.toml, or --project) is
+    /// run: its front and classes, as deployed (ADR 0026).
     crates: Vec<PathBuf>,
 
-    /// Address to listen on.
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    listen: SocketAddr,
+    /// The project file: a wasmkeep.toml, or a directory holding one.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_project")]
+    project: Option<PathBuf>,
 
-    /// Where actor databases live while developing.
-    #[arg(long, default_value = ".wasmkeep/dev")]
-    data_dir: PathBuf,
+    /// Ignore ./wasmkeep.toml (with crate directories).
+    #[arg(long)]
+    no_project: bool,
+
+    /// Address to listen on (default 127.0.0.1:8080, or the project
+    /// file's [dev] port).
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+
+    /// Where actor databases live while developing (default
+    /// .wasmkeep/dev; with a project file, its [dev] data-dir, or
+    /// .wasmkeep/dev beside the file).
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 
     /// How often to check the sources for changes, in milliseconds.
     #[arg(long, default_value_t = 500)]
@@ -962,21 +993,87 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
-        Command::Dev(args) => dev::run(dev::DevOptions {
+        Command::Dev(args) => dev(args),
+    }
+}
+
+/// `wasmkeep dev`: the project file if there is one and no crate is given
+/// (ADR 0026), else the crates.
+fn dev(args: DevArgs) -> anyhow::Result<()> {
+    let project = if args.crates.is_empty() || args.project.is_some() {
+        project::discover(args.project.as_deref(), args.no_project)?
+    } else if !args.no_project && std::path::Path::new(project::FILE_NAME).exists() {
+        anyhow::bail!(
+            "crate directories are given beside {}: run `wasmkeep dev` alone to run the \
+             project file, or pass --no-project to run the crates",
+            project::FILE_NAME
+        );
+    } else {
+        None
+    };
+    let egress = egress_policy(
+        args.allow_outbound.clone(),
+        args.allow_outbound_port.clone(),
+        &args.outbound_ca,
+    )?;
+    if let Some(p) = project {
+        let mut given = Vec::new();
+        if !args.crates.is_empty() {
+            given.push("crate directories");
+        }
+        if !args.env.is_empty() {
+            given.push("--env");
+        }
+        if !args.access.is_empty() {
+            given.push("--access");
+        }
+        anyhow::ensure!(
+            given.is_empty(),
+            "{} given with {}: with a project file, classes, rules and values come from the \
+             file ([dev] env for local values); pass --no-project to run crates with flags",
+            given.join(", "),
+            p.path.display()
+        );
+        let listen = args
+            .listen
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], p.dev.port.unwrap_or(8080))));
+        let data_dir = args
+            .data_dir
+            .or_else(|| p.dev.data_dir.clone())
+            .unwrap_or_else(|| p.dir.join(".wasmkeep/dev"));
+        return dev_project::run(
+            p,
+            dev_project::Options {
+                listen,
+                data_dir,
+                poll: std::time::Duration::from_millis(args.poll_ms),
+                egress,
+                guest_log: wasmkeep_server::GuestLog::new(args.guest_log_rate),
+                no_huge_pages: args.transparent_huge_pages == HugePages::Off,
+            },
+        );
+    }
+    anyhow::ensure!(
+        !args.crates.is_empty(),
+        "give at least one actor crate directory, or run from a directory with a {}",
+        project::FILE_NAME
+    );
+    {
+        dev::run(dev::DevOptions {
             crates: args.crates,
-            listen: args.listen,
-            data_dir: args.data_dir,
+            listen: args
+                .listen
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
+            data_dir: args
+                .data_dir
+                .unwrap_or_else(|| PathBuf::from(".wasmkeep/dev")),
             poll: std::time::Duration::from_millis(args.poll_ms),
-            egress: egress_policy(
-                args.allow_outbound,
-                args.allow_outbound_port,
-                &args.outbound_ca,
-            )?,
+            egress,
             guest_log: wasmkeep_server::GuestLog::new(args.guest_log_rate),
             no_huge_pages: args.transparent_huge_pages == HugePages::Off,
             env: args.env,
             access: args.access,
-        }),
+        })
     }
 }
 
@@ -1513,10 +1610,52 @@ fn refuse_front_scope(args: &DeployArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The flags of `wasmkeep deploy` that say what the version is, as typed,
+/// among those given: refused beside a project file (ADR 0026).
+fn version_flags(args: &DeployArgs) -> Vec<&'static str> {
+    [
+        ("--actor", !args.actors.is_empty()),
+        ("--access", !args.access.is_empty()),
+        ("--config", !args.config.is_empty()),
+        ("--requires", !args.requires.is_empty()),
+        ("--front", args.front.is_some()),
+        ("--no-front", args.no_front),
+        ("--front-config", args.front_config.is_some()),
+        ("--front-requires", args.front_requires.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, given)| given.then_some(flag))
+    .collect()
+}
+
 /// `wasmkeep deploy`: validate, upload, switch (or roll back).
 fn deploy(args: DeployArgs) -> anyhow::Result<()> {
+    let project = project::discover(args.project.as_deref(), args.no_project)?;
+    // Builds run and files are read before the bucket is opened: a failed
+    // build writes nothing. A rollback runs no build (ADR 0026).
+    let mut file_changes = None;
+    let app = match &project {
+        Some(p) => {
+            project::refuse_flags(p, &version_flags(&args))?;
+            let app = project::app(p, args.app.as_ref())?;
+            if !args.rollback {
+                if !args.no_build {
+                    project::run_builds(p)?;
+                }
+                let parts = project::read_parts(p, &mut |w| eprintln!("warning: {w}"))?;
+                file_changes = Some(project::to_changes(p, parts));
+            }
+            app
+        }
+        None => args.app.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no project file ({} in this directory, or --project PATH): give --app TENANT/APP",
+                project::FILE_NAME
+            )
+        })?,
+    };
     refuse_front_scope(&args)?;
-    let (tenant, name) = &args.app;
+    let (tenant, name) = &app;
     let (store, prefix) = open_bucket(&args.bucket)?;
     let app_ref = AppRef::new(std::sync::Arc::clone(&store), &prefix, tenant, name);
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1525,9 +1664,18 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     let named = |e: wasmkeep_server::apps::DeployError| {
         anyhow::anyhow!(e.to_string().replace("<this bucket>", &args.bucket))
     };
+    let from_file = file_changes.is_some();
     let deployed = if args.rollback {
         rt.block_on(app_ref.rollback(args.allow_reopen))
             .map_err(named)?
+    } else if let (Some(changes), Some(p)) = (file_changes, &project) {
+        let runtime = Runtime::new(&RuntimeConfig::default())?;
+        let shown = p.path.display().to_string();
+        rt.block_on(app_ref.deploy_changes_with(&runtime, changes, |diff| {
+            project::print_plan(&shown, tenant, name, diff);
+            true
+        }))
+        .map_err(named)?
     } else {
         anyhow::ensure!(
             !(args.actors.is_empty()
@@ -1599,12 +1747,26 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 }
                 args.requires.clone()
             },
+            every_rule: false,
         };
         rt.block_on(app_ref.deploy_changes(&runtime, changes))
             .map_err(named)?
     };
-    for line in deployed.diff.lines() {
-        println!("  {line}");
+    if !from_file {
+        for line in deployed.diff.lines() {
+            println!("  {line}");
+        }
+    } else if deployed.diff.lines().is_empty() {
+        println!("  nothing changed: the deployed version is the file's");
+    }
+    if args.rollback
+        && let Some(p) = &project
+    {
+        eprintln!(
+            "note: {} may now describe another version than the one rolled back to; the next \
+             deploy from it deploys the file again",
+            p.path.display()
+        );
     }
     for warning in deploy_warnings(&deployed.diff) {
         eprintln!("warning: {warning}");

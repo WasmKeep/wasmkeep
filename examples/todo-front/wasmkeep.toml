@@ -1,0 +1,23 @@
+# The project file (docs/project-file.md, ADR 0026): `wasmkeep dev` runs
+# this app locally, `wasmkeep deploy --bucket ...` deploys exactly it.
+
+[app]
+tenant = "acme"
+name = "todo"
+
+[front]
+component = "front/target/wasm32-wasip2/release/todo_front.wasm"
+build = "cd front && cargo build --release --target wasm32-wasip2"
+# A secret: `wasmkeep secrets set --front TOKENS` in a deploy, .env.local
+# with `wasmkeep dev`. Until it is set, the front answers 503.
+requires = ["TOKENS"]
+watch = ["front/src", "front/Cargo.toml"]
+
+[classes.todos]
+component = "todos/target/wasm32-wasip2/release/todo_todos.wasm"
+# access = "internal" is the default: only the app's front reaches it.
+build = "cd todos && cargo build --release --target wasm32-wasip2"
+watch = ["todos/src", "todos/Cargo.toml"]
+
+[dev]
+port = 8080

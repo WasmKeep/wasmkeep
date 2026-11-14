@@ -67,6 +67,8 @@ mod front_deploys;
 mod migrate;
 #[path = "node_leases.rs"]
 mod node_leases;
+#[path = "project_file.rs"]
+mod project_file;
 #[path = "routing.rs"]
 mod routing;
 #[path = "signed_calls.rs"]

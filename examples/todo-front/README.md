@@ -15,24 +15,25 @@ over this `todos` class.
 
 ## Run it
 
-From the repository root:
+The app is [`wasmkeep.toml`](wasmkeep.toml) (the
+[project file](../../docs/project-file.md)): the front, the `todos`
+class (`internal`, the default), how each is built, and that the front
+requires `TOKENS`. From this directory:
 
 ```bash
-(cd examples/todo-front/todos && cargo build --release --target wasm32-wasip2)
-(cd examples/todo-front/front && cargo build --release --target wasm32-wasip2)
-printf 'TOKENS=alice:%s\n' "$(openssl rand -hex 32)" > front.env
-cargo run -p wasmkeep-cli -- serve \
-  examples/todo-front/front/target/wasm32-wasip2/release/todo_front.wasm \
-  --actor todos=examples/todo-front/todos/target/wasm32-wasip2/release/todo_todos.wasm \
-  --access todos=internal \
-  --front-env front.env
+printf 'TOKENS=alice:%s\n' "$(openssl rand -hex 32)" > .env.local
+cargo run -p wasmkeep-cli -- dev
 ```
 
+`wasmkeep dev` builds both crates, serves them as a deploy would, and
+rebuilds and reloads when a source file changes. `.env.local` holds local
+values only (it is in `.gitignore`).
+
 Open <http://localhost:8080/> and sign in with alice's token from
-`front.env`, or with curl:
+`.env.local`, or with curl:
 
 ```bash
-token=$(sed -n 's/^TOKENS=alice://p' front.env)
+token=$(sed -n 's/^TOKENS=alice://p' .env.local)
 curl -H "Authorization: Bearer $token" -d 'buy milk' localhost:8080/api/todos   # {"id":1}
 curl -H "Authorization: Bearer $token" localhost:8080/api/todos                 # [{"id":1,"text":"buy milk"}]
 curl -H "Authorization: Bearer $token" localhost:8080/api/team                  # {"alice":1}
@@ -40,10 +41,18 @@ curl -i localhost:8080/api/todos                                                
 curl -i localhost:8080/actor/todos/alice                                        # 403: internal
 ```
 
-Once deploys carry a front (ADR 0023), the front and the class ship together:
-`wasmkeep deploy --app acme/todo --front todo_front.wasm --actor
-todos=todo_todos.wasm --access todos=internal`, and `TOKENS` is a secret
-of the front (`wasmkeep secrets set --front TOKENS`).
+To deploy it, the same file, and `TOKENS` as a secret of the front:
+
+```bash
+wasmkeep deploy --bucket s3://my-bucket/prod      # builds, prints the plan, switches
+printf 'alice:%s' "$(openssl rand -hex 32)" | \
+  wasmkeep secrets set --app acme/todo --bucket s3://my-bucket/prod --key secrets.key --front TOKENS
+```
+
+Without the file, the same app is `wasmkeep serve
+front/target/wasm32-wasip2/release/todo_front.wasm --actor
+todos=todos/target/wasm32-wasip2/release/todo_todos.wasm --access
+todos=internal --front-env front.env`, after building each crate.
 
 ## What to copy, and what not
 

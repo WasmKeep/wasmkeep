@@ -30,6 +30,8 @@ reqwest.workspace = true
 futures-util.workspace = true
 # The workspace's rustix, with `thread` for prctl(PR_SET_THP_DISABLE).
 rustix = { workspace = true, features = ["thread"] }
+# wasmkeep.toml, the project file (ADR 0026).
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

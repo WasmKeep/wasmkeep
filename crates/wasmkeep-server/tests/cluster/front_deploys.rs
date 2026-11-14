@@ -34,7 +34,7 @@ fn vars(text: &str) -> Option<wasmkeep_server::env::Vars> {
 /// A node following `default/shop` as `serve --app` does: the version's
 /// classes, rules, values and front, the front served beside the actors,
 /// and, with `secrets`, the app's secrets followed every 100 ms.
-async fn front_app_node(
+pub(super) async fn front_app_node(
     id: &str,
     data: &Path,
     store: &Arc<dyn ObjectStore>,
