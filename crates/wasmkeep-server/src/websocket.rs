@@ -54,8 +54,20 @@ pub(crate) fn queued_size(msg: &WsMessage) -> usize {
     msg.len()
 }
 
+/// Who opened a socket (ADR 0027): its events admit as that caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Opener {
+    /// A client, at `/actor/<class>/<name>`: outside (ADR 0010).
+    Outside,
+    /// The app's front handed it to the actor: inside.
+    Front,
+}
+
 struct Conn {
     owner: ActorAddress,
+    /// Set once, at open: kept with the host's socket, so it survives the
+    /// actor hibernating.
+    opener: Opener,
     // Taking the sender closes and hides the socket. Its registry slot is
     // retained until run_socket finishes delivering the guest close event.
     tx: Option<mpsc::Sender<Outgoing>>,
@@ -146,7 +158,13 @@ impl Sockets {
 
     /// Registers a connection, pending until [`Self::accept`]; refused when
     /// the actor or the node has too many.
+    #[cfg(test)]
     pub(crate) fn open(&self, owner: ActorAddress) -> Result<Opened, OpenError> {
+        self.open_as(owner, Opener::Outside)
+    }
+
+    /// [`Self::open`], for a socket `opener` opened.
+    pub(crate) fn open_as(&self, owner: ActorAddress, opener: Opener) -> Result<Opened, OpenError> {
         let mut registry = self.lock();
         Self::room(&registry, &owner)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -162,6 +180,7 @@ impl Sockets {
             id,
             Conn {
                 owner,
+                opener,
                 tx: Some(tx),
                 queued: Arc::clone(&queued),
                 accepted: false,
@@ -174,6 +193,15 @@ impl Sockets {
             queued,
             closing,
         })
+    }
+
+    /// Who opened `id`: [`Opener::Outside`] for a connection this registry
+    /// does not know, so nothing unknown passes for the front.
+    pub(crate) fn opener(&self, id: u64) -> Opener {
+        self.lock()
+            .conns
+            .get(&id)
+            .map_or(Opener::Outside, |c| c.opener)
     }
 
     /// `on-websocket-open` accepted the connection: the actor's events now
@@ -387,6 +415,23 @@ mod tests {
 
     fn actor(name: &str) -> ActorAddress {
         ActorAddress::new("t", "c", name).unwrap()
+    }
+
+    #[test]
+    fn each_socket_keeps_who_opened_it_until_removed() {
+        let sockets = Sockets::default();
+        let a = actor("a");
+        let outside = sockets.open(a.clone()).unwrap();
+        let front = sockets.open_as(a.clone(), Opener::Front).unwrap();
+        sockets.accept(front.id);
+        assert_eq!(sockets.opener(outside.id), Opener::Outside);
+        assert_eq!(sockets.opener(front.id), Opener::Front);
+        // Still the front's while its close is delivered.
+        sockets.begin_close(front.id);
+        assert_eq!(sockets.opener(front.id), Opener::Front);
+        sockets.remove(front.id);
+        assert_eq!(sockets.opener(front.id), Opener::Outside);
+        assert_eq!(sockets.opener(12_345), Opener::Outside);
     }
 
     #[test]

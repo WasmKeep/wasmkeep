@@ -11,6 +11,29 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.0, in no release yet.
 
+- **Sockets through the front**
+  ([ADR 0027](docs/adr/0027-sockets-through-the-front.md)). The front
+  accepts a WebSocket at its own paths and hands it to an actor of the
+  app, so a room class can be `internal` and needs no public `/actor/`
+  address. The host marks an upgrade to the front with
+  `x-wasmkeep-upgrade: websocket`; the front answers with three
+  `x-wasmkeep-handoff-*` headers (class, name, path), built by
+  `front::hand_off(class, name, path)` in Rust and `handOff(...)` in
+  TypeScript, with `is_websocket` / `isWebSocket` to tell an upgrade. The
+  host stops the front's instance, frees its slot, and opens the socket on
+  that actor as an inside caller; each socket keeps that mark through
+  hibernation. A refused hand-off is an HTTP error (404, 400, 403 with the
+  actor's reason, 503), never a socket that opens and closes. Between
+  nodes the hand-off is relayed signed, with the front's caller and the
+  upgrade mark signed, and only to nodes that announce the new heartbeat
+  word `handoff`. `examples/todo-front` gains `/api/live`, a socket
+  handed to the signed-in user's `internal` list.
+- Behaviour changes: the front sees `x-wasmkeep-upgrade: websocket` on
+  WebSocket upgrades; a front's answer to an upgrade with the three
+  hand-off headers opens a socket instead of reaching the client; a
+  WebSocket upgrade refused because its actor is unavailable (or a value
+  it requires is not set) now carries `Retry-After: 1`. Actors and built
+  fronts are unchanged.
 - **Several outbound HTTP requests at once** from the Rust, TypeScript and
   Go SDKs: `http::fetch_all`, `http.fetchAll` (QuickJS and StarlingMonkey)
   and `FetchAll` send a batch together and wait for all of it, one result

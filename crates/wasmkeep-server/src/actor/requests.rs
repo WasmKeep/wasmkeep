@@ -61,6 +61,13 @@ impl ActorService {
             }
             None => None,
         };
+        // A node's signed request with the hand-off's upgrade mark is a
+        // relayed upgrade whose `Upgrade` header went missing (ADR 0027):
+        // never a call, whatever it signs.
+        if signed_body.is_some() && req.headers().contains_key(crate::cluster::UPGRADE_MARK) {
+            crate::metrics::refused(crate::metrics::Refusal::Access);
+            return text_response(StatusCode::FORBIDDEN, "a hand-off's relay is not a call\n");
+        }
         let internal = signed_body.is_some();
         // A hop from a node of another app (or of an older version) is
         // refused before anything else, its body unread (ADR 0022). The
@@ -126,8 +133,10 @@ impl ActorService {
         // The same for a take (ADR 0017).
         let take = internal && req.headers().contains_key(crate::cluster::TAKE);
         req.headers_mut().remove(crate::cluster::TAKE);
-        // The secret never reaches a guest.
+        // The secret never reaches a guest, nor a hand-off's mark (ADR
+        // 0027), which only relayed upgrades carry.
         req.headers_mut().remove(INTERNAL);
+        req.headers_mut().remove(crate::cluster::UPGRADE_MARK);
         req.headers_mut().remove(CHAIN);
 
         let Some(signed) = signed_body else {

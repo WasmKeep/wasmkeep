@@ -11,12 +11,14 @@ impl ActorState {
         &mut self,
         conn: u64,
         path: String,
+        opener: Opener,
     ) -> Result<Result<(), String>, String> {
         self.chain = Arc::from(Vec::new());
-        // Sockets come from outside: under `existing` the actor must exist,
+        // A socket from outside: under `existing` the actor must exist,
         // checked in this event (it may have been deleted since the
-        // upgrade's check), with the rules of the class it takes.
-        match self.admit(true).await? {
+        // upgrade's check), with the rules of the class it takes. One the
+        // front handed over is inside (ADR 0027).
+        match self.admit(opener == Opener::Outside).await? {
             Admitted::Yes => {}
             Admitted::Missing => return Err("no such actor".into()),
             Admitted::Unavailable(why) => return Err(why),
@@ -119,8 +121,13 @@ impl ActorState {
         self.chain = Arc::from(Vec::new());
         // A socket event never creates an actor of an `existing` class: one
         // deleted under an open socket stays deleted. A class a deploy made
-        // internal closes its sockets (ADR 0013).
-        match self.admit(true).await {
+        // internal closes its outside sockets (ADR 0013); the front's stay,
+        // by the mark the host keeps with each socket (ADR 0027).
+        let admitted = match self.sockets.opener(conn) {
+            Opener::Outside => self.admit(true).await,
+            Opener::Front => self.admit_socket_event().await,
+        };
+        match admitted {
             Ok(Admitted::Yes) => {}
             Ok(Admitted::Unconfigured(_)) => {
                 self.sockets.close(
@@ -246,6 +253,34 @@ pub(super) struct Accepted {
     /// The close to send instead of serving it: the guest refused it, or
     /// the open event failed.
     refusal: Option<(u16, String)>,
+    /// The refusal is the guest's own (`on-websocket-open` returned an
+    /// error), not the host's.
+    by_guest: bool,
+}
+
+/// Why a socket was refused before its 101, for a hand-off's HTTP answer
+/// (ADR 0027).
+pub(super) enum Refused {
+    /// `on-websocket-open` returned this error.
+    Guest(String),
+    /// The actor had no capacity for the event.
+    Busy,
+    /// The host could not run the event.
+    Failed,
+}
+
+impl Accepted {
+    /// Why it was refused, if it was.
+    pub(super) fn refused(&self) -> Option<Refused> {
+        let (code, reason) = self.refusal.as_ref()?;
+        Some(if self.by_guest {
+            Refused::Guest(reason.clone())
+        } else if *code == 1013 {
+            Refused::Busy
+        } else {
+            Refused::Failed
+        })
+    }
 }
 
 impl ServiceInner {
@@ -258,15 +293,17 @@ impl ServiceInner {
         &self,
         address: ActorAddress,
         path: String,
+        opener: Opener,
     ) -> Result<Accepted, crate::websocket::OpenError> {
-        let opened = self.sockets.open(address.clone())?;
+        let opened = self.sockets.open_as(address.clone(), opener)?;
         let id = opened.id;
         let result = self
             .mailboxes
             .submit_wait(&address, self.wall, move |s: &mut ActorState| {
-                Box::pin(s.ws_open(id, path))
+                Box::pin(s.ws_open(id, path, opener))
             })
             .await;
+        let by_guest = matches!(result, Ok(Ok(Err(_))));
         // Only the guest's own reason reaches the client; host failures
         // (bucket errors, traps, node names) are logged, not shown.
         let refusal = match result {
@@ -289,7 +326,15 @@ impl ServiceInner {
             queued: opened.queued,
             closing: opened.closing,
             refusal,
+            by_guest,
         })
+    }
+
+    /// A socket refused before its 101 is answered with an HTTP error
+    /// instead (a hand-off, ADR 0027): it was never accepted, so no event
+    /// sees it, and its slot is freed now.
+    pub(super) fn discard_refused(&self, accepted: Accepted) {
+        self.sockets.remove(accepted.id);
     }
 
     /// The upgrade failed after [`Self::accept_socket`]: the client is gone
@@ -329,6 +374,7 @@ impl ServiceInner {
             queued,
             closing,
             refusal,
+            ..
         } = accepted;
         let (mut sink, mut stream) = ws.split();
         let mut writer = tokio::spawn(async move {

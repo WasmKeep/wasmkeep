@@ -13,7 +13,8 @@
   the front).
 - Amended by: [ADR 0024](0024-socket-home.md) (the socket home gate is
   lifted), [ADR 0026](0026-the-project-file.md) (the project file; format
-  3 also without a front, for an explicit `open`).
+  3 also without a front, for an explicit `open`), [ADR 0027](0027-sockets-through-the-front.md)
+  (the WebSocket hand-off).
 
 ## Context
 
@@ -483,6 +484,12 @@ the alternative ADR 0020 rejected.
 
 ### The WebSocket hand-off: not now
 
+> Decided by [ADR 0027](0027-sockets-through-the-front.md) (0.4.1): the
+> host marks an upgrade to the front with `x-wasmkeep-upgrade`, the front
+> answers with three `x-wasmkeep-handoff-*` headers, and the host opens
+> the socket on that actor as an inside caller. The text below is what
+> 0.4.0 reserved.
+
 A WebSocket at one of the front's own paths needs the host to take
 the upgrade and open the socket on an actor the front names. It is
 planned for 0.4.1, in its own ADR. 0.4.0 reserves what it needs:
@@ -592,8 +599,9 @@ it.
 - `wasmkeep dev` with a front: [ADR 0026](0026-the-project-file.md).
 - Where an actor with open sockets wakes (its own ADR, a gate for
   clustered use).
-- The WebSocket hand-off through the front (0.4.1, its own ADR), and one
-  client socket for several actors (0.5.0, its own ADR).
+- The WebSocket hand-off through the front (0.4.1:
+  [ADR 0027](0027-sockets-through-the-front.md)), and one client socket
+  for several actors (0.5.0, its own ADR).
 - Front targets for Python, Go, C, Zig, D and MoonBit.
 - A call that does not create the actor, streaming or concurrent calls,
   and several fronts per app.

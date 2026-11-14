@@ -35,7 +35,9 @@ import type { ActorRequest, ActorResponse } from "./request";
 export { actors, env, CallError, type ActorAddress, type CallRequest, type CallResponse } from "./actors";
 export {
   caller,
+  handOff,
   host,
+  isWebSocket,
   json,
   parseCaller,
   scheme,

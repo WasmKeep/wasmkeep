@@ -96,10 +96,17 @@ async fn start(setup: Setup) -> Running {
         let component = guests::compile(&runtime, actor_wasm());
         let mut config = ActorConfig::new(data.path());
         config.max_front_requests = setup.max_front_requests;
+        // `r`, the same actor, is a room reachable only from inside.
+        let mut access = wasmkeep_server::AccessRules::default();
+        access.set("r", wasmkeep_server::Access::Internal);
+        config.access = access;
         ActorService::new(
             runtime.clone(),
             config,
-            vec![("t".into(), component, actor_wasm().to_vec())],
+            vec![
+                ("t".into(), component.clone(), actor_wasm().to_vec()),
+                ("r".into(), component, actor_wasm().to_vec()),
+            ],
         )
         .unwrap()
     });
@@ -385,11 +392,15 @@ async fn an_upgrade_outside_actor_paths_reaches_the_front_as_a_get() {
     .await;
     assert_eq!(r.status, 200, "{}", r.head);
     assert!(r.body.starts_with("GET\n"), "{}", r.body);
+    let lower = r.body.to_ascii_lowercase();
+    assert!(!lower.contains("\nupgrade:"), "{}", r.body);
+    // The host's mark (ADR 0027), and nothing else of its range.
     assert!(
-        !r.body.to_ascii_lowercase().contains("upgrade:"),
+        lower.contains("\nx-wasmkeep-upgrade: websocket\n"),
         "{}",
         r.body
     );
+    assert_eq!(lower.matches("x-wasmkeep-").count(), 1, "{}", r.body);
     let r = get(
         node.addr,
         "/respond?status=101",
@@ -1012,4 +1023,213 @@ async fn a_nodes_fronts_wait_on_at_most_their_slots_in_calls() {
     // Freed once the batch ended.
     let r = get(node.addr, &call_many(&to[4..], "GET", "/slept"), "").await;
     assert_eq!(r.body, "200:0 | 200:0");
+}
+
+// ---- The WebSocket hand-off (ADR 0027) ----
+
+/// The headers of a WebSocket upgrade, for [`get`].
+const UPGRADE: &str = "Upgrade: websocket\r\nConnection: Upgrade\r\n\
+    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+
+/// `/handoff` on the test front: hand the socket to `class/name` at
+/// `path` (`extra`: more query parameters).
+fn handoff(class: &str, name: &str, path: &str, extra: &str) -> String {
+    let enc = |s: &str| {
+        s.replace('%', "%25")
+            .replace('?', "%3F")
+            .replace('=', "%3D")
+            .replace('&', "%26")
+            .replace(' ', "%20")
+    };
+    format!(
+        "/handoff?class={}&name={}&path={}{extra}",
+        enc(class),
+        enc(name),
+        enc(path)
+    )
+}
+
+async fn next_text<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use futures_util::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("a message in time")
+            .expect("the socket open")
+            .expect("a frame");
+        if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+            return t.to_string();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_front_hands_a_websocket_to_an_internal_room() {
+    use futures_util::SinkExt;
+    let node = start(Setup::default()).await;
+    let url = format!(
+        "ws://{}{}",
+        node.addr,
+        handoff("r", "lobby 1", "/ws?user=alice", "")
+    );
+    let (mut ws, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    // The front's hand-off headers never reach the client.
+    assert!(
+        !response
+            .headers()
+            .keys()
+            .any(|k| k.as_str().starts_with("x-wasmkeep-")),
+        "{response:?}"
+    );
+    ws.send("hello".into()).await.unwrap();
+    assert_eq!(next_text(&mut ws).await, "hello");
+    // The room saw the path the front named.
+    let r = get(node.addr, &call("r/lobby%201", "GET", "/opened"), "").await;
+    assert_eq!(r.body, "200:/ws?user=alice");
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    assert!(
+        page.contains(
+            "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"handoff\"} 1\n"
+        ),
+        "{page}"
+    );
+}
+
+/// The room stays internal from outside: `/actor/r/...` is refused, the
+/// hand-off is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_internal_room_refuses_a_direct_upgrade_but_takes_the_hand_off() {
+    let node = start(Setup::default()).await;
+    let r = get(node.addr, "/actor/r/lobby/ws", UPGRADE).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    // Even with the host's mark and the front's caller forged.
+    let r = get(
+        node.addr,
+        "/actor/r/lobby/ws",
+        &format!(
+            "{UPGRADE}x-wasmkeep-upgrade: websocket\r\nx-wasmkeep-caller: default/_front/main\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    let url = format!("ws://{}{}", node.addr, handoff("r", "lobby", "/ws", ""));
+    assert!(tokio_tungstenite::connect_async(url).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_hand_off_is_an_http_error_never_a_socket() {
+    let node = start(Setup::default()).await;
+    let cases: &[(String, u16, &str)] = &[
+        (handoff("nope", "x", "/", ""), 404, "no such actor class"),
+        (
+            handoff("_front", "main", "/", ""),
+            404,
+            "no such actor class",
+        ),
+        (handoff("r", "bad\u{1}", "/", ""), 400, ""),
+        (handoff("r", "x", "/refuse", ""), 403, "go away"),
+        (handoff("r", "x", "/", "&dup"), 500, ""),
+        (handoff("r", "x", "/", "&partial"), 500, ""),
+        (handoff("r", "x", "no-slash", ""), 500, ""),
+        (handoff("r", "%zz", "/", "&raw"), 500, ""),
+    ];
+    for (path, status, body) in cases {
+        let r = get(node.addr, path, UPGRADE).await;
+        assert_eq!(r.status, *status, "{path}: {} {}", r.head, r.body);
+        assert!(r.body.contains(body), "{path}: {}", r.body);
+        assert!(
+            !r.head.to_ascii_lowercase().contains("x-wasmkeep-"),
+            "{path}: {}",
+            r.head
+        );
+    }
+    // The refused socket was never opened: no close event ran.
+    let r = get(node.addr, &call("r/x", "POST", "/ws-closed"), "").await;
+    assert_eq!(r.body, "200:0");
+}
+
+/// Only an upgrade the host marked is handed off: a plain request, or one
+/// whose client sent the mark itself, gets the front's own answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_off_needs_the_hosts_mark() {
+    let node = start(Setup::default()).await;
+    for extra in ["", "x-wasmkeep-upgrade: websocket\r\n"] {
+        let r = get(node.addr, &handoff("r", "x", "/", ""), extra).await;
+        assert_eq!(r.status, 426, "{}", r.head);
+        assert_eq!(r.body, "websocket upgrade required\n");
+        assert!(
+            !r.head.to_ascii_lowercase().contains("x-wasmkeep-"),
+            "{}",
+            r.head
+        );
+        let r = get(node.addr, "/headers", extra).await;
+        assert!(
+            !r.body.to_ascii_lowercase().contains("x-wasmkeep-"),
+            "{}",
+            r.body
+        );
+    }
+    // No room was opened, nor created.
+    let r = get(node.addr, &call("r/x", "GET", "/opened"), "").await;
+    assert_eq!(r.body, "200:none");
+}
+
+/// The front's slot is free as soon as it answered: a hand-off whose open
+/// waits on a busy room does not hold it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_open_does_not_hold_a_front_slot() {
+    let node = start(Setup {
+        max_front_requests: Some(2),
+        ..Setup::default()
+    })
+    .await;
+    let addr = node.addr;
+    // Holds one slot, and the room, for 2 s.
+    let busy =
+        tokio::spawn(async move { get(addr, &call("r/slow", "POST", "/sleep?ms=2000"), "").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let url = format!("ws://{addr}{}", handoff("r", "slow", "/ws", ""));
+    let socket = tokio::spawn(tokio_tungstenite::connect_async(url));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The hand-off's open waits on the room; the second slot is free.
+    let started = Instant::now();
+    let r = get(addr, "/", "").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "front ok"));
+    assert!(started.elapsed() < Duration::from_millis(1000));
+    assert!(!socket.is_finished());
+    assert_eq!(busy.await.unwrap().body, "200:slept");
+    assert!(socket.await.unwrap().is_ok());
+}
+
+/// A deleted room's handed-off sockets close with it, and their close
+/// events do not create it again (review of ADR 0027): an inside socket's
+/// events never create an actor, as an outside one's do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_rooms_sockets_do_not_bring_it_back() {
+    use futures_util::StreamExt;
+    let node = start(Setup::default()).await;
+    let url = format!("ws://{}{}", node.addr, handoff("r", "gone", "/ws", ""));
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let r = get(node.addr, &call("r/gone", "POST", "/delete"), "").await;
+    assert!(r.body.starts_with("200:"), "{}", r.body);
+    // Closed by the delete.
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Close(frame) = msg {
+                return frame.map(|f| u16::from(f.code));
+            }
+        }
+        None
+    })
+    .await
+    .unwrap();
+    assert_eq!(closed, Some(1000));
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A close event that ran would have created it again and counted 1.
+    let r = get(node.addr, &call("r/gone", "POST", "/ws-closed"), "").await;
+    assert_eq!(r.body, "200:0");
 }

@@ -307,6 +307,62 @@ fn signs_in_and_reaches_the_internal_actor(server: &Server) {
     );
 }
 
+/// The first bytes of the answer to a WebSocket upgrade of `path`, and
+/// the stream, still open.
+fn upgrade(addr: SocketAddr, path: &str, headers: &str) -> (String, TcpStream) {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: shop.example\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n{headers}\r\n"
+    )
+    .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") && s.read(&mut byte).unwrap_or(0) == 1 {
+        head.push(byte[0]);
+    }
+    (String::from_utf8_lossy(&head).into_owned(), s)
+}
+
+/// The next text frame the server sends (unmasked, under 126 bytes).
+fn text_frame(s: &mut TcpStream) -> String {
+    let mut head = [0u8; 2];
+    s.read_exact(&mut head).unwrap();
+    assert_eq!(head[0], 0x81, "a final text frame");
+    let mut text = vec![0u8; usize::from(head[1] & 0x7f)];
+    s.read_exact(&mut text).unwrap();
+    String::from_utf8(text).unwrap()
+}
+
+/// ADR 0027: the front hands `/api/live` to the signed-in user's list,
+/// which sends its size on every change; without a token, 401 and no
+/// socket.
+#[test]
+fn the_front_hands_a_live_socket_to_the_users_list() {
+    let server = start(Some(&format!("alice:{ALICE},bob:{BOB}")));
+    let a = server.addr;
+    let (head, _) = upgrade(a, "/api/live", "");
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+    let (status, _) = request(a, "GET", "/api/live", &bearer(ALICE), "").unwrap();
+    assert_eq!(status, 426);
+    let (head, mut live) = upgrade(a, "/api/live", &bearer(ALICE));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(!head.to_ascii_lowercase().contains("x-wasmkeep-"), "{head}");
+    assert_eq!(text_frame(&mut live), "{\"count\":0}");
+    let (status, _) = request(a, "POST", "/api/todos", &bearer(ALICE), "milk").unwrap();
+    assert_eq!(status, 201);
+    assert_eq!(text_frame(&mut live), "{\"count\":1}");
+    // Bob's list is another actor: alice's socket hears nothing of it.
+    let (status, _) = request(a, "POST", "/api/todos", &bearer(BOB), "tea").unwrap();
+    assert_eq!(status, 201);
+    let (status, _) = request(a, "DELETE", "/api/todos/1", &bearer(ALICE), "").unwrap();
+    assert_eq!(status, 204);
+    assert_eq!(text_frame(&mut live), "{\"count\":0}");
+}
+
 #[test]
 fn without_tokens_nobody_signs_in() {
     for tokens in [None, Some(""), Some("alice:short"), Some("alice")] {

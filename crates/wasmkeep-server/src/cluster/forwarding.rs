@@ -16,7 +16,7 @@ pub(crate) fn decode_address(s: &str) -> Option<ActorAddress> {
 }
 
 /// Percent-encodes everything but unreserved URI characters.
-pub(super) fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {

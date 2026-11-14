@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CallError } from "../src/errors";
-import { caller, host, parseCaller, scheme, unavailable, type ActorRequest } from "../src/request";
+import { caller, encodeName, handOff, host, isWebSocket, parseCaller, scheme, unavailable, type ActorRequest } from "../src/request";
 
 function request(headerList: [string, string][], authority?: string): ActorRequest {
   return {
@@ -116,4 +116,23 @@ test("unavailable is 503 for failed and timeout, without the detail", () => {
     assert.equal(r.headers?.["retry-after"], undefined);
     assert(!r.body.includes("secret"));
   }
+});
+
+test("isWebSocket reads the host's mark only", () => {
+  assert.equal(isWebSocket(request([["x-wasmkeep-upgrade", "websocket"]])), true);
+  assert.equal(isWebSocket(request([["upgrade", "websocket"]])), false);
+  assert.equal(isWebSocket(request([])), false);
+});
+
+test("handOff names the actor in three headers, the name encoded as the host decodes it", () => {
+  const r = handOff("room", "lobby 1/a%\u00e9", "/ws?user=alice") as {
+    status: number;
+    headers: Record<string, string>;
+  };
+  assert.equal(r.status, 426);
+  assert.equal(r.headers["x-wasmkeep-handoff-class"], "room");
+  // The same vector as the Rust SDK and the host's decoder (ADR 0027).
+  assert.equal(r.headers["x-wasmkeep-handoff-name"], "lobby%201%2Fa%25%C3%A9");
+  assert.equal(r.headers["x-wasmkeep-handoff-path"], "/ws?user=alice");
+  assert.equal(encodeName("Az09-._~!*'()"), "Az09-._~%21%2A%27%28%29");
 });

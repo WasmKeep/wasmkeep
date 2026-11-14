@@ -37,6 +37,17 @@
 //!
 //! [`caller`], [`host`] and [`scheme`] read the request; [`caller`] is what
 //! an actor uses to accept requests from its app's front only.
+//!
+//! A front hands a client's WebSocket to an actor (ADR 0027) by answering
+//! [`hand_off`] to a request [`is_websocket`] says is an upgrade; the class
+//! can be `internal`:
+//!
+//! ```ignore
+//! if path.starts_with("/rooms/") && front::is_websocket(&request) {
+//!     // Check the client's token first: the room trusts the path.
+//!     return http::respond_with(out, &front::hand_off("room", name, "/ws?user=alice"));
+//! }
+//! ```
 
 #[doc(hidden)]
 #[allow(
@@ -93,6 +104,61 @@ use actors::{ActorAddress, CallError, Response};
 
 /// The header in which the host tells an actor who called it.
 pub const CALLER_HEADER: &str = "x-wasmkeep-caller";
+
+/// The header the host sets on a request to the front that is a WebSocket
+/// upgrade (`websocket`); a client cannot send it (ADR 0027).
+pub const UPGRADE_HEADER: &str = "x-wasmkeep-upgrade";
+/// The front's answer naming the class a WebSocket goes to.
+pub const HANDOFF_CLASS_HEADER: &str = "x-wasmkeep-handoff-class";
+/// The name, percent-encoded.
+pub const HANDOFF_NAME_HEADER: &str = "x-wasmkeep-handoff-name";
+/// The path and query the actor's `on-websocket-open` sees.
+pub const HANDOFF_PATH_HEADER: &str = "x-wasmkeep-handoff-path";
+
+/// Whether `request`, received by the front, is a client's WebSocket
+/// upgrade, which the front may [`hand_off`] to an actor. The host says so;
+/// the client's own `Upgrade` header does not reach the front.
+pub fn is_websocket(request: &IncomingRequest) -> bool {
+    first_value(request, UPGRADE_HEADER).as_deref() == Some("websocket")
+}
+
+/// The front's answer that hands the client's WebSocket to actor
+/// `class/name` (ADR 0027): the host opens the socket on that actor of the
+/// app as an inside caller, so the class can be `internal`, and its
+/// `on-websocket-open` receives `path` (starting with `/`, query included).
+/// Answer it only when [`is_websocket`] is true; to any other request the
+/// host passes it on as a plain `426`. Check what you must (a token, the
+/// name) before: the actor trusts the path when its class is `internal`.
+/// If the actor refuses, the client gets `403` with the actor's error.
+///
+/// Never copy another server's answer headers onto this answer: a name in
+/// the `x-wasmkeep-handoff-` range would choose the actor.
+pub fn hand_off(class: &str, name: &str, path: &str) -> Response {
+    Response {
+        status: 426,
+        headers: vec![
+            ("content-type".into(), "text/plain; charset=utf-8".into()),
+            (HANDOFF_CLASS_HEADER.into(), class.into()),
+            (HANDOFF_NAME_HEADER.into(), percent_encode(name)),
+            (HANDOFF_PATH_HEADER.into(), path.into()),
+        ],
+        body: b"websocket upgrade required\n".to_vec(),
+    }
+}
+
+/// Percent-encodes every byte but ASCII letters, digits and `-._~`, as the
+/// host encodes names in `x-wasmkeep-caller`.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
 
 /// Who sent a request, as the host says in `x-wasmkeep-caller`.
 #[derive(Debug, Clone, PartialEq)]
@@ -308,6 +374,27 @@ mod tests {
         ] {
             assert_eq!(Caller::parse(Some(odd)), Caller::Outside, "{odd}");
         }
+    }
+
+    #[test]
+    fn a_hand_off_names_the_actor_in_three_headers() {
+        let r = hand_off("room", "lobby 1/a%\u{e9}", "/ws?user=alice");
+        assert_eq!(r.status, 426);
+        let header = |n: &str| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(header(HANDOFF_CLASS_HEADER), Some("room"));
+        // The vector the host's decoder reads back (ADR 0027).
+        assert_eq!(header(HANDOFF_NAME_HEADER), Some("lobby%201%2Fa%25%C3%A9"));
+        assert_eq!(header(HANDOFF_PATH_HEADER), Some("/ws?user=alice"));
+        assert_eq!(
+            percent_decode(&percent_encode("lobby 1/a%\u{e9}")).as_deref(),
+            Some("lobby 1/a%\u{e9}")
+        );
+        assert_eq!(percent_encode("Az09-._~"), "Az09-._~");
     }
 
     #[test]

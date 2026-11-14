@@ -177,6 +177,18 @@ The `front` module has:
 - `unavailable(&err)`: the answer for a failed call: `503` with
   `Retry-After: 1` for `failed` and `timeout`, `500` for the others, with
   a generic body (log the error's detail; do not send it to the client).
+- `is_websocket(&request)` and `hand_off(class, name, path)`: sockets
+  through the front (ADR 0027, `docs/adr/0027-sockets-through-the-front.md`,
+  from 0.4.1). `is_websocket` is true when the host marked the request as
+  a client's WebSocket upgrade (`x-wasmkeep-upgrade`, which a client
+  cannot send). Answering `hand_off("room", name, "/ws?user=alice")` to
+  it stops the front's instance and has the host open the socket on
+  `room/<name>` as an inside caller, so the class can be `internal`; the
+  room's `on-websocket-open` receives the path. Check the client's token
+  and the name first: an `internal` room trusts what the path says, and
+  only an `internal` room knows every socket came through the front. If
+  the room refuses, the client gets a 403 with the room's error. Never
+  copy another server's answer headers onto a hand-off.
 - `export_front!(Type)`: exports the request handler, and nothing else.
 
 Validate any name you take from a request before using it in an address:

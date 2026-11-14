@@ -78,6 +78,10 @@ pub(crate) const SERVED_BY: &str = "x-wasmkeep-node";
 pub(crate) const INTERNAL: &str = "x-wasmkeep-internal";
 /// How far a signature's timestamp may be from this node's clock.
 const SIGNATURE_WINDOW_MS: u64 = 60_000;
+/// On a request to the front: the host saw a WebSocket upgrade (ADR
+/// 0027). On a signed upgrade relayed to the actor's owner: the front
+/// handed it over; signed, so no call can be replayed as one.
+pub(crate) const UPGRADE_MARK: &str = "x-wasmkeep-upgrade";
 /// The calling actor (`actors.call`).
 pub(crate) const CALLER: &str = "x-wasmkeep-caller";
 /// Actors waiting on a cross-node call, outermost first, one per value.
@@ -451,6 +455,8 @@ pub(crate) struct Peer {
     pub(crate) drain: Option<DrainState>,
     /// It answers take calls (heartbeat line 11, ADR 0017).
     pub(crate) can_take: bool,
+    /// It opens sockets the front hands over (heartbeat line 11, ADR 0027).
+    pub(crate) can_handoff: bool,
     /// The process its heartbeat names: routing trusts a record only if
     /// it names this one (ADR 0020).
     pub(crate) instance: Option<String>,
@@ -469,6 +475,7 @@ impl Peer {
             app: node.app.clone(),
             drain: node.drain,
             can_take: node.can_take,
+            can_handoff: node.can_handoff,
             instance: node.instance.clone(),
         })
     }
@@ -892,13 +899,20 @@ impl Cluster {
     /// sent again, and the 503 comes at once: no connection could be
     /// opened, or the connection failed after the upgrade was written,
     /// when the owner may have read it.
-    pub(crate) async fn forward_upgrade(
+    pub(crate) async fn forward_upgrade<B: Send + 'static>(
         &self,
         owner: &str,
-        req: Request<Incoming>,
+        req: Request<B>,
+        opener: crate::websocket::Opener,
     ) -> Response<HyperOutgoingBody> {
         if never_forward(&req) {
             return unavailable("actor ownership is changing; retry\n");
+        }
+        // The front's hand-off travels signed (ADR 0027), to a node that
+        // reads it: an older one would take it for a client's upgrade.
+        let front = opener == crate::websocket::Opener::Front;
+        if front && !self.can_handoff(owner) {
+            return unavailable("the actor's node runs an older version; retry\n");
         }
         // Sent at most twice: the upgrade has no body, so it can be built
         // again, and it is sent again only when the owner never read it.
@@ -933,9 +947,13 @@ impl Cluster {
                 .header(FORWARDED, "1")
                 .header(APP, app)
                 .body(http_body_util::Empty::new());
-            let Ok(out) = out else {
+            let Ok(mut out) = out else {
                 return unavailable("bad advertised address\n");
             };
+            if front && let Err(e) = self.sign_hand_off(owner, &path, &mut out).await {
+                tracing::warn!(owner, error = %e, "relaying a hand-off refused");
+                return unavailable("cannot relay this socket now; retry\n");
+            }
             if let Err(e) = self.check_tls_target(&base) {
                 tracing::warn!(owner, error = %e, "forwarding an upgrade refused");
                 return unavailable("the actor's node is not reachable; retry\n");
@@ -1006,6 +1024,47 @@ impl Cluster {
         let mut switching = text_response(StatusCode::SWITCHING_PROTOCOLS, "");
         *switching.headers_mut() = headers;
         switching
+    }
+
+    /// Signs a relayed hand-off (ADR 0027) as a call is signed: the front's
+    /// caller value and the upgrade mark, over the empty body. Signed for
+    /// each send, so a second send has its own nonce.
+    async fn sign_hand_off<B>(
+        &self,
+        owner: &str,
+        path: &str,
+        out: &mut Request<B>,
+    ) -> Result<(), String> {
+        let secret = self.secret().await?.to_owned();
+        let caller = crate::actor::Caller::Front.value(self.root.tenant());
+        let headers = out.headers_mut();
+        headers.insert(
+            CALLER,
+            hyper::header::HeaderValue::from_str(&caller).map_err(|e| e.to_string())?,
+        );
+        headers.insert(
+            UPGRADE_MARK,
+            hyper::header::HeaderValue::from_static("websocket"),
+        );
+        let body_hash = body_sha256(b"");
+        let ts = now_ms();
+        let nonce = self.nonce();
+        let mac = signature(
+            &secret,
+            ts,
+            &nonce,
+            owner,
+            &hyper::Method::GET,
+            path,
+            &body_hash,
+            headers,
+        );
+        headers.insert(
+            INTERNAL,
+            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
+                .map_err(|e| e.to_string())?,
+        );
+        Ok(())
     }
 
     /// The cluster secret: created by the first node that needs it
@@ -1487,6 +1546,16 @@ impl Cluster {
             StatusCode::NOT_FOUND => TakeAnswer::NoSuchActor,
             status => TakeAnswer::Failed(format!("node {peer} answered {status}")),
         }
+    }
+
+    /// Whether `id` opens sockets the front hands over (ADR 0027): a live
+    /// peer that advertises `handoff`.
+    pub(crate) fn can_handoff(&self, id: &str) -> bool {
+        self.peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .is_some_and(|p| p.can_handoff)
     }
 
     /// Whether `id` may be a move's target (ADR 0017): an eligible peer

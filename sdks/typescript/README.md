@@ -173,6 +173,26 @@ and the request helpers, which `@wasmkeep/sdk` exports too, for actors:
   `failed` or `timeout`, `500` for anything else, with a generic body (log
   the detail; do not send it to the client).
 
+Sockets through the front (ADR 0027,
+`docs/adr/0027-sockets-through-the-front.md`, from 0.4.1), from
+`@wasmkeep/sdk/front` only:
+
+- `isWebSocket(req)`: the host marked the request as a client's WebSocket
+  upgrade (`x-wasmkeep-upgrade`, which a client cannot send).
+- `handOff(cls, name, path)`: the answer that has the host open that
+  socket on actor `cls/name` as an inside caller, so the class can be
+  `internal`; its `websocket.open` receives `path`. Check the client's
+  token and the name first: an `internal` room trusts what the path says.
+  If the room refuses, the client gets a 403 with the room's error.
+
+```ts
+if (req.path.startsWith("/rooms/") && isWebSocket(req)) {
+  const user = signedIn(req); // your own check
+  if (!user) return { status: 401 };
+  return handOff("room", roomName, `/ws?user=${encodeURIComponent(user)}`);
+}
+```
+
 A front's `fetch` that throws answers a generic 500, and the error goes to
 the log. Validate any name taken from a request before using it in an
 address: each new name is a new actor with its own database.

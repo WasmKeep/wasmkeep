@@ -34,6 +34,10 @@
 //! Every answer whose headers or trailers the guest could not set ends
 //! with a line `refused:NAMES` (comma-separated).
 //! - `/stream-spin`: answers 200, sends `started`, then never returns
+//! - `/handoff?class=C&name=N&path=P[&delay=MS][&dup][&partial][&raw]`:
+//!   waits MS, then answers 426 with the three hand-off headers (ADR 0027):
+//!   N percent-encoded (as given with `raw`), the class header twice with
+//!   `dup`, without the path header with `partial`
 //! - anything else: `front ok`
 
 use std::io::Write as _;
@@ -72,6 +76,19 @@ fn decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encodes every byte but ASCII letters, digits and `-._~`.
+fn encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn param(query: &str, key: &str) -> Option<String> {
@@ -370,6 +387,30 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
                 loop {
                     n = std::hint::black_box(n.wrapping_add(1));
                 }
+            }
+            "/handoff" => {
+                if let Some(ms) = param(query, "delay").and_then(|v| v.parse().ok()) {
+                    sleep_ms(ms);
+                }
+                let class = param(query, "class").unwrap_or_default();
+                let name = param(query, "name").unwrap_or_default();
+                let name = if param(query, "raw").is_some() {
+                    name
+                } else {
+                    encode(&name)
+                };
+                let target = param(query, "path").unwrap_or_else(|| "/".into());
+                let mut headers = vec![
+                    ("x-wasmkeep-handoff-class", class.as_str()),
+                    ("x-wasmkeep-handoff-name", name.as_str()),
+                ];
+                if param(query, "partial").is_none() {
+                    headers.push(("x-wasmkeep-handoff-path", target.as_str()));
+                }
+                if param(query, "dup").is_some() {
+                    headers.push(("x-wasmkeep-handoff-class", "other"));
+                }
+                respond(out, 426, &headers, "websocket upgrade required\n");
             }
             _ => respond(out, 200, &[], "front ok"),
         }

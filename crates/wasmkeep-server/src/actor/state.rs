@@ -295,6 +295,26 @@ impl ActorState {
         }
     }
 
+    /// Admission for an event of a socket the front handed over (ADR
+    /// 0027): inside, so an `internal` class is not refused, but, as for
+    /// every socket event, it never creates the actor: under any class but
+    /// `open` the actor must exist (one deleted under the socket stays
+    /// deleted, its close events included).
+    pub(super) async fn admit_socket_event(&mut self) -> Result<Admitted, String> {
+        match self.admit(false).await? {
+            Admitted::Yes => {}
+            other => return Ok(other),
+        }
+        if self.rule() == crate::access::Access::Open {
+            return Ok(Admitted::Yes);
+        }
+        match self.exists().await {
+            Ok(true) => Ok(Admitted::Yes),
+            Ok(false) => Ok(Admitted::Missing),
+            Err(e) => Ok(Admitted::Unavailable(format!("existence check: {e}"))),
+        }
+    }
+
     /// This actor's mode under the rules of the class the event took.
     pub(super) fn rule(&self) -> crate::access::Access {
         self.class
