@@ -310,7 +310,9 @@ acme/todo: version b12d4cbcc397044d is current (deploy 1)
 ```
 
 The front and the class are new, `todos` is `internal` as the file says,
-and the front (`_front`) requires `TOKENS`. The version holds the front
+and the front (`_front`) requires `TOKENS`. The `access` line reads
+`open -> internal` even on a first deploy: the plan compares with `open`,
+the default of a deploy with flags. `todos` was never open. The version holds the front
 and the class together.
 
 ## 9. Start a node
@@ -327,7 +329,8 @@ until curl -sf -o /dev/null localhost:8080/_wasmkeep/ready; do sleep 1; done
 ```
 
 It listens on `127.0.0.1:8080` and keeps its actors' databases in
-`node/`. Ask it for the API:
+`node/`. (A node may also start before the app's first deploy: it waits
+for one, and starts serving when it lands.) Ask it for the API:
 
 <!-- test: front-503 -->
 ```bash
@@ -426,7 +429,18 @@ curl -s -H "Authorization: Bearer $token" localhost:8080/api/todos
 ```
 
 The list is still there: a deploy replaces code, and each actor keeps
-its database.
+its database. Deploy again without changing anything:
+
+<!-- test: no-op -->
+```bash
+wasmkeep deploy --bucket s3://demo
+```
+
+```text
+acme/todo: nothing changed: version 22efbe932f640932 is already current (deploy 2)
+```
+
+The builds run, find nothing new, and `deploy` writes nothing.
 
 ## 12. Roll back
 
@@ -440,10 +454,11 @@ wasmkeep deploy --bucket s3://demo --rollback
 ```text
   front: changed
 note: wasmkeep.toml may now describe another version than the one rolled back to; the next deploy from it deploys the file again
-acme/todo: version b12d4cbcc397044d is current (deploy 3)
+rolled back acme/todo: 22efbe932f640932 -> b12d4cbcc397044d (deploy 3)
 ```
 
-The version id is the first deploy's again, at a new deploy number. A
+The version now current is the first deploy's again, at a new deploy
+number. A
 rollback runs no build: it restores the version the bucket holds, the
 front with its classes, their rules and required names. The page is
 back:

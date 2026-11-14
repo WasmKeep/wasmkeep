@@ -148,12 +148,16 @@ run after-change
 [ "$OUT" = "$(printf '<h1>Our todos</h1>\n[{"id":1,"text":"ship it"}]')" ] \
   || fail "expected the new heading and the list kept"
 echo "  ok: the new heading, the list kept"
+run no-op
+expect_status 0
+expect '^acme/todo: nothing changed: version [0-9a-f]{16} is already current \(deploy 2\)$'
+expect_not "version $v1 "
 
 # 12. Rollback to the first version.
 run rollback
 expect_status 0
 expect '^  front: changed$'
-expect "^acme/todo: version $v1 is current \(deploy 3\)$"
+expect "^rolled back acme/todo: [0-9a-f]{16} -> $v1 \(deploy 3\)$"
 run after-rollback
 expect '^<h1>Todos</h1>$'
 grep -q '<h1>Our todos</h1>' front/src/page.html || fail "the page says the file keeps the change"
