@@ -52,6 +52,7 @@ fn env_does_not_take_the_front() {
 #[test]
 fn front_requests_must_leave_actors_room() {
     let err = refused(&[
+        "front.wasm",
         "--actor",
         "c=missing.wasm",
         "--max-instances",
@@ -62,6 +63,20 @@ fn front_requests_must_leave_actors_room() {
     assert!(err.contains("leaves actors no room"), "{err}");
     let err = refused(&["front.wasm", "--max-front-requests", "0"]);
     assert!(err.contains("at least 1"), "{err}");
+    // The default too: one instance cannot hold a front and an actor.
+    let err = refused(&[
+        "front.wasm",
+        "--actor",
+        "c=missing.wasm",
+        "--max-instances",
+        "1",
+    ]);
+    assert!(err.contains("no room for both"), "{err}");
+    // Slots for a front that is not served.
+    let err = refused(&["--actor", "c=missing.wasm", "--max-front-requests", "5"]);
+    assert!(err.contains("no front is served"), "{err}");
+    let err = refused(&["front.wasm", "--front-cpu-budget-ms", "0"]);
+    assert!(err.contains("front-cpu-budget-ms"), "{err}");
 }
 
 #[test]

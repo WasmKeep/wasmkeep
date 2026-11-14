@@ -13,12 +13,18 @@
 //! - `/sleep?ms=MS`: waits MS (no CPU), answers `slept`
 //! - `/spin`: never returns (CPU budget)
 //! - `/print`: prints a line to stdout, answers `printed`
+//! - `/trailers-in`: reads the body to its end, answers the request's
+//!   trailers as `name: value` lines
+//! - `/trailers-out`: answers `body` with trailers in and out of the
+//!   `x-wasmkeep-` range (the guest's attempts to set them are ignored
+//!   when refused)
+//! - `/stream-spin`: answers 200, sends `started`, then never returns
 //! - anything else: `front ok`
 
 use std::io::Write as _;
 
 use wasip2::http::types::{
-    Fields, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
+    Fields, IncomingBody, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
 };
 
 #[allow(unsafe_code, clippy::all)]
@@ -188,6 +194,49 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
             "/print" => {
                 println!("front says hi");
                 respond(out, 200, &[], "printed");
+            }
+            "/trailers-in" => {
+                let body = request.consume().unwrap();
+                {
+                    let stream = body.stream().unwrap();
+                    while stream.blocking_read(65536).is_ok() {}
+                }
+                let trailers = IncomingBody::finish(body);
+                trailers.subscribe().block();
+                let mut text = String::from("trailers:\n");
+                if let Some(Ok(Ok(Some(t)))) = trailers.get() {
+                    for (k, v) in t.entries() {
+                        text.push_str(&format!("{k}: {}\n", String::from_utf8_lossy(&v)));
+                    }
+                }
+                respond(out, 200, &[], &text);
+            }
+            "/trailers-out" => {
+                let fields = Fields::new();
+                let _ = fields.append("trailer", b"x-wasmkeep-node, x-other");
+                let response = OutgoingResponse::new(fields);
+                let outgoing = response.body().unwrap();
+                ResponseOutparam::set(out, Ok(response));
+                let mut stream = outgoing.write().unwrap();
+                let _ = stream.write_all(b"body");
+                let _ = stream.flush();
+                drop(stream);
+                let trailers = Fields::new();
+                let _ = trailers.append("x-wasmkeep-node", b"forged");
+                let _ = trailers.append("x-other", b"kept");
+                let _ = OutgoingBody::finish(outgoing, Some(trailers));
+            }
+            "/stream-spin" => {
+                let response = OutgoingResponse::new(Fields::new());
+                let outgoing = response.body().unwrap();
+                ResponseOutparam::set(out, Ok(response));
+                let mut stream = outgoing.write().unwrap();
+                let _ = stream.write_all(b"started\n");
+                let _ = stream.flush();
+                let mut n: u64 = 0;
+                loop {
+                    n = std::hint::black_box(n.wrapping_add(1));
+                }
             }
             _ => respond(out, 200, &[], "front ok"),
         }

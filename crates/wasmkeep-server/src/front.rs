@@ -368,7 +368,8 @@ impl HttpComponent {
             wasi: self.guest_log.wasi(FRONT_CLASS.to_owned()),
             http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
-            egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress)),
+            egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress))
+                .forbidding_wasmkeep_headers(),
             tenant: actors.map_or_else(|| "default".to_owned(), |a| a.tenant().to_owned()),
             actors: actors.cloned(),
             env,
@@ -409,55 +410,55 @@ impl HttpComponent {
         actors: Option<&ActorService>,
     ) -> Response<HyperOutgoingBody> {
         let started = Instant::now();
-        let outcome = |o: &str| inc(&METRICS.front_requests.get(&[("outcome", o)]));
         // Past its slots, the front is not instantiated.
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
             outcome("busy");
-            let mut r = text_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "this node is busy; retry\n",
-            );
-            r.headers_mut().insert(
-                hyper::header::RETRY_AFTER,
-                hyper::header::HeaderValue::from_static("1"),
-            );
-            return r;
+            return busy();
         };
         let slot = Slot::new(permit);
         strip_wasmkeep_headers(req.headers_mut());
-        let result = self.try_handle(req, actors, slot).await;
         let observe = move || METRICS.front_request_seconds.observe(started.elapsed());
-        match result {
-            Ok(mut response) => {
+        match self.try_handle(req, actors, slot).await {
+            Ok((mut response, running)) => {
                 // wasmtime-wasi-http lets a guest set any status: never an
-                // upgrade, nor any other informational answer.
+                // upgrade, nor any other informational answer. Dropping
+                // `running` stops the instance.
                 if response.status().is_informational() {
                     tracing::warn!(
                         status = response.status().as_u16(),
                         "front answered with an informational status"
                     );
+                    drop(running);
                     outcome("guest_error");
                     observe();
                     return internal_error();
                 }
                 strip_wasmkeep_headers(response.headers_mut());
-                outcome("ok");
+                // From here the instance's own end says how the request
+                // went: a cut while the body streams is not `ok`.
+                let Running { abort, sent } = running;
+                let _ = sent.send(());
                 response.map(|body| {
                     Timed {
                         inner: body,
                         observe: Some(Box::new(observe)),
+                        abort,
                     }
                     .boxed_unsync()
                 })
             }
             Err(e) => {
-                let reason = if e.downcast_ref::<CpuBudgetExceeded>().is_some() {
-                    "cpu_budget"
-                } else if e.downcast_ref::<WallExceeded>().is_some() {
-                    "wall"
-                } else {
-                    "guest_error"
-                };
+                // The pool had no instance (it keeps the front's slots, so
+                // this is brief): as busy as no slot.
+                if e.downcast_ref::<wasmtime::PoolConcurrencyLimitError>()
+                    .is_some()
+                {
+                    outcome("busy");
+                    observe();
+                    tracing::warn!(error = %format!("{e:#}"), "front request: no instance free");
+                    return busy();
+                }
+                let reason = reason(&e);
                 outcome(reason);
                 observe();
                 tracing::warn!(reason, error = %format!("{e:#}"), "front request failed");
@@ -471,7 +472,7 @@ impl HttpComponent {
         req: Request<Incoming>,
         actors: Option<&ActorService>,
         slot: Slot,
-    ) -> wasmtime::Result<Response<HyperOutgoingBody>> {
+    ) -> wasmtime::Result<(Response<HyperOutgoingBody>, Running)> {
         let version = self.current();
         let mut store = self.runtime.new_async_store_with_budget(
             self.host(actors, Arc::clone(&version.env)),
@@ -484,6 +485,9 @@ impl HttpComponent {
             .new_incoming_request(Scheme::Http, CappedBody::of(req))?;
         let out = store.data_mut().http().new_response_outparam(sender)?;
         let pre = version.pre.clone();
+        // Said once the response went to the client: the instance's end is
+        // then the request's outcome. Dropped otherwise.
+        let (sent, was_sent) = tokio::sync::oneshot::channel::<()>();
 
         // The guest may keep streaming the body after it has set the
         // response, so it runs in its own task, which holds the slot for as
@@ -500,20 +504,39 @@ impl HttpComponent {
             };
             // Past the wall the instance is dropped, which also ends a
             // response still streaming.
-            tokio::time::timeout(wall, run)
+            let result = tokio::time::timeout(wall, run)
                 .await
-                .unwrap_or_else(|_| Err(WallExceeded(wall).into()))
+                .unwrap_or_else(|_| Err(WallExceeded(wall).into()));
+            if was_sent.await.is_ok() {
+                match &result {
+                    Ok(()) => outcome("ok"),
+                    Err(e) => {
+                        let reason = reason(e);
+                        outcome(reason);
+                        tracing::warn!(
+                            reason,
+                            error = %format!("{e:#}"),
+                            "front request failed after its response began"
+                        );
+                    }
+                }
+            }
+            result
         });
+        // A client that leaves before the answer stops the instance, and
+        // frees its slot.
+        let abort = AbortOnDrop(Some(task.abort_handle()));
 
         let Ok(received) = tokio::time::timeout(wall, receiver).await else {
             return Err(WallExceeded(wall).into());
         };
         match received {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => Ok((response, Running { abort, sent })),
             Ok(Err(code)) => Err(code.into()),
             // The sender was dropped with the store: the guest returned or
             // trapped without setting a response.
             Err(_) => {
+                drop(sent);
                 let cause = match task.await {
                     Ok(Ok(())) => wasmtime::format_err!("guest returned without a response"),
                     Ok(Err(e)) => e,
@@ -521,6 +544,59 @@ impl HttpComponent {
                 };
                 Err(cause.context("guest did not set a response"))
             }
+        }
+    }
+}
+
+/// Counts one front request ([`crate::metrics::Metrics::front_requests`]).
+fn outcome(o: &str) {
+    inc(&METRICS.front_requests.get(&[("outcome", o)]));
+}
+
+/// Why an instance failed, as an outcome.
+fn reason(e: &wasmtime::Error) -> &'static str {
+    if e.downcast_ref::<CpuBudgetExceeded>().is_some() {
+        "cpu_budget"
+    } else if e.downcast_ref::<WallExceeded>().is_some() {
+        "wall"
+    } else {
+        "guest_error"
+    }
+}
+
+/// 503, `Retry-After: 1`: no slot or no instance for the front.
+fn busy() -> Response<HyperOutgoingBody> {
+    let mut r = text_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "this node is busy; retry\n",
+    );
+    r.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    r
+}
+
+/// A front instance whose response is on its way: stopped when this is
+/// dropped before the response ends.
+struct Running {
+    abort: AbortOnDrop,
+    sent: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Aborts a task when dropped, unless disarmed.
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
         }
     }
 }
@@ -554,14 +630,19 @@ fn internal_error() -> Response<HyperOutgoingBody> {
 }
 
 /// A response body that records the request's duration once its last
-/// byte went out (or the client left).
+/// byte went out (or the client left), and stops the instance if the
+/// client leaves before the end.
 struct Timed {
     inner: HyperOutgoingBody,
     observe: Option<Box<dyn FnOnce() + Send>>,
+    abort: AbortOnDrop,
 }
 
 impl Drop for Timed {
     fn drop(&mut self) {
+        if hyper::body::Body::is_end_stream(&self.inner) {
+            self.abort.disarm();
+        }
         if let Some(observe) = self.observe.take() {
             observe();
         }
@@ -577,10 +658,12 @@ impl hyper::body::Body for Timed {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        if matches!(polled, std::task::Poll::Ready(None))
-            && let Some(observe) = self.observe.take()
-        {
-            observe();
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            // Whole: the instance may finish on its own, up to its wall.
+            self.abort.disarm();
+            if let Some(observe) = self.observe.take() {
+                observe();
+            }
         }
         polled
     }

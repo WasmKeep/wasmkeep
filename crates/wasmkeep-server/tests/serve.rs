@@ -156,7 +156,7 @@ async fn concurrent_requests_each_get_an_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn exhausted_pool_returns_500_and_server_recovers() {
+async fn exhausted_pool_returns_503_and_server_recovers() {
     // One component slot, held by a store outside the server: requests
     // cannot instantiate until it is released.
     let runtime = Runtime::new(&RuntimeConfig {
@@ -176,8 +176,13 @@ async fn exhausted_pool_returns_500_and_server_recovers() {
     let mut held = runtime.new_store(());
     pre.instantiate(&mut held).unwrap();
 
-    let (status, _) = request(addr, "GET", "/").await;
-    assert_eq!(status, 500);
+    // As busy as a node with no front slot: 503, Retry-After.
+    let (status, text) = request(addr, "GET", "/").await;
+    assert_eq!(status, 503, "{text}");
+    assert!(
+        text.to_ascii_lowercase().contains("retry-after: 1"),
+        "{text}"
+    );
 
     drop(held);
     let (status, text) = request(addr, "GET", "/").await;

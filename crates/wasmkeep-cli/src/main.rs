@@ -474,7 +474,8 @@ struct ServeArgs {
 
     /// The front's CPU time per request, in milliseconds (apart from
     /// --cpu-budget-ms, the actors'). Past it, the request answers 500.
-    #[arg(long, value_name = "MS", default_value_t = 50)]
+    #[arg(long, value_name = "MS", default_value_t = 50,
+          value_parser = clap::value_parser!(u64).range(1..))]
     front_cpu_budget_ms: u64,
 
     /// The app's secrets key (`wasmkeep secrets new-key`), with `--app`:
@@ -648,10 +649,18 @@ fn load_front_env(files: &[PathBuf]) -> anyhow::Result<wasmkeep_server::env::Var
 }
 
 /// `--max-front-requests`, or its default: a tenth of the pool, rounded
-/// up. A value of 0, or one that leaves actors no instance, is refused.
-fn front_requests(given: Option<usize>, pool: usize, actors: bool) -> anyhow::Result<usize> {
+/// up. A value of 0, or one that leaves actors no instance beside a front
+/// (`both`), is refused; so is a pool too small for the default.
+fn front_requests(given: Option<usize>, pool: usize, both: bool) -> anyhow::Result<usize> {
+    let actors = both;
     let Some(n) = given else {
-        return Ok(wasmkeep_server::fds::default_front_requests(pool).max(1));
+        let n = wasmkeep_server::fds::default_front_requests(pool).max(1);
+        anyhow::ensure!(
+            !both || n < pool,
+            "--max-instances {pool} leaves no room for both the front and actors: \
+             give at least 2"
+        );
+        return Ok(n);
     };
     anyhow::ensure!(n > 0, "--max-front-requests must be at least 1");
     if actors {
@@ -932,7 +941,13 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     })?;
     let pool = runtime.max_instances() as usize;
     let serves_actors = !args.actors.is_empty() || args.app.is_some();
-    let front_requests = front_requests(args.max_front_requests, pool, serves_actors)?;
+    let serves_front = args.component.is_some() || args.app.is_some();
+    anyhow::ensure!(
+        args.max_front_requests.is_none() || serves_front,
+        "--max-front-requests: no front is served (give a component, or --app)"
+    );
+    let front_requests =
+        front_requests(args.max_front_requests, pool, serves_actors && serves_front)?;
     // Every resident actor holds three open files: size the caps to the
     // descriptors this process may open (raising the soft limit first).
     let wanted_resident = wasmkeep_server::fds::resident_limit(pool, front_requests);

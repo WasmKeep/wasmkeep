@@ -77,9 +77,10 @@ node's actors with `actors.call`:
 - **Its values.** `env.get` reads the files given with `serve --front-env
   FILE` (`NAME=value` lines, as `--env` for a class). `self-address`
   returns `<tenant>/_front/main`.
-- **The host's headers are the host's.** Every `x-wasmkeep-` header a
-  client sends is removed before the front sees the request, and every one
-  the front sets on its response is removed before the client gets it. On
+- **The host's headers are the host's.** Every `x-wasmkeep-` header or
+  trailer a client sends is removed before the front sees the request, and
+  every one the front sets on its response is removed before the client
+  gets it. On
   `actors.call`, the host drops every `x-wasmkeep-` header a guest set
   (actors too), but the four the SDKs' key-value and queue clients send
   (`x-wasmkeep-kv-expect`, `-kv-ttl-ms`, `-kv-durable`,
@@ -93,7 +94,11 @@ node's actors with `actors.call`:
   a quarter of those may wait on one actor at once; past it the call fails
   with `failed("front busy: ...")`. The front's CPU time per request is
   `--front-cpu-budget-ms` (50 ms), apart from the actors'. A `1xx` status
-  from the front becomes a 500.
+  from the front becomes a 500. A client that leaves before the end of its
+  answer stops the front's instance and frees its slot; one that sends its
+  body slowly holds the slot up to the wall, so put a proxy that buffers
+  request bodies in front of the node (nginx does by default, see [the
+  front door](deploy/front-door.md)).
 - **Upgrades.** A WebSocket upgrade outside `/actor/` reaches the front as
   a plain GET; reach sockets at `/actor/<class>/<name>`.
 - **Where it runs.** On the node that received the request, on the public

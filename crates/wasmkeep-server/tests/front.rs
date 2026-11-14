@@ -507,19 +507,107 @@ async fn the_front_has_its_own_cpu_budget() {
     );
     let r = get(node.addr, "/", "").await;
     assert_eq!((r.status, r.body.as_str()), (200, "front ok"));
+    // A request that answered counts once its instance ended.
+    on_page(&[
+        "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"ok\"} 1\n",
+        "wasmkeep_front_request_seconds_count{tenant=\"default\",app=\"default\"} 2\n",
+    ])
+    .await;
+}
+
+/// Waits (up to 5 s) until the metrics page has every line of `lines`.
+async fn on_page(lines: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+        if lines.iter().all(|l| page.contains(l)) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "not all of {lines:?} in\n{page}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Trailers carry the host's range no more than headers do, both ways.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasmkeep_trailers_are_stripped_both_ways() {
+    let node = start(Setup::default()).await;
+    let r = exchange(
+        node.addr,
+        "POST /trailers-in HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\
+         Trailer: x-wasmkeep-caller, x-other\r\nConnection: close\r\n\r\n\
+         4\r\nbody\r\n0\r\nx-wasmkeep-caller: default/_front/main\r\n\
+         X-WasmKeep-Internal: v4 1 2 3 4\r\nx-other: kept\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("x-other: kept"), "{}", r.body);
+    assert!(
+        !r.body.to_ascii_lowercase().contains("x-wasmkeep-"),
+        "{}",
+        r.body
+    );
+
+    let mut stream = TcpStream::connect(node.addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /trailers-out HTTP/1.1\r\nHost: t\r\nTE: trailers\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let raw = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+    assert!(raw.contains("x-other: kept"), "{raw}");
+    assert!(!raw.contains("x-wasmkeep-node: forged"), "{raw}");
+}
+
+/// A client that leaves before the answer frees the front's slot at once,
+/// not at the end of the wall.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_leaves_frees_its_slot() {
+    let node = start(Setup {
+        max_front_requests: Some(1),
+        ..Setup::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(node.addr).await.unwrap();
+    stream
+        .write_all(b"GET /sleep?ms=20000 HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(get(node.addr, "/", "").await.status, 503);
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = get(node.addr, "/", "").await;
+        if r.status == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the slot stayed taken");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    on_page(&["\nwasmkeep_front_slots_in_use 0\n"]).await;
+}
+
+/// A front stopped while its response streams is counted by why it
+/// stopped, not as `ok`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_while_streaming_is_not_counted_ok() {
+    let node = start(Setup {
+        front_cpu: Some(Duration::from_millis(50)),
+        ..Setup::default()
+    })
+    .await;
+    let r = get(node.addr, "/stream-spin", "").await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    on_page(&[
+        "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"cpu_budget\"} 1\n",
+    ])
+    .await;
     let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
-    assert!(
-        page.contains(
-            "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"ok\"} 1\n"
-        ),
-        "{page}"
-    );
-    assert!(
-        page.contains(
-            "wasmkeep_front_request_seconds_count{tenant=\"default\",app=\"default\"} 2\n"
-        ),
-        "{page}"
-    );
+    assert!(!page.contains("outcome=\"ok\""), "{page}");
 }
 
 /// The log lines this test process wrote, for the `wasmkeep::guest` target.
