@@ -9,7 +9,48 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
-Since 0.4.0, in no release yet.
+Since 0.4.1, in no release yet.
+
+## 0.4.1
+
+**Sockets through the front.** The front hands a client's WebSocket to
+an actor of the app, so a room class can be `internal`, with no public
+`/actor/` address and its token checked once, in the front. Handlers
+send several outbound HTTP requests at once in Rust, TypeScript and Go.
+The host strips its reserved `x-wasmkeep-` headers from outbound HTTP
+answers, so no upstream can hand a socket off through a front. A room
+deleted under its sockets stays deleted: their close events no longer
+bring it back. A node whose lease ran out before it noticed can release
+an actor early; that was always so and safe by ordering, and is now
+documented, counted (`wasmkeep_releases_after_lapse_total`) and pinned
+by tests. Still a **pre-alpha pre-release**. The interface between a
+component and the host stays `wasmkeep:actor@0.2.0`, unchanged:
+components built for 0.4.0 run as they are.
+
+**Upgrade: rolling**, from 0.4.0, one node at a time
+([upgrading WasmKeep](docs/cluster.md#upgrading-wasmkeep)). 0.4.1 changes
+no format in the bucket (layout, manifests, ownership records, alarm
+index) and signs calls between nodes as 0.4.0 does; its heartbeat adds
+the word `handoff`, which 0.4.0 ignores, and a 0.4.1 node relays a
+hand-off only to a node that announces it. While both versions run,
+`cluster status` warns of mixed versions, and a hand-off to a room on a
+0.4.0 node gets a 503 with `Retry-After: 1`: deploy an app that hands
+sockets off once every node runs 0.4.1. From 0.3.x, upgrade to 0.4.0
+first ([upgrading to 0.4.0](docs/deploy/upgrading-to-0.4.md)).
+
+Soaked on three nodes against a real bucket, a node killed every three
+minutes, for two hours on this release's code (commit `0bf0547`; later
+commits change these notes and versions only): 39 kills, 377,095
+acknowledged durable writes, none lost or duplicated; failover p50
+17.6 s, p99 23.1 s, max 27.1 s; no alarm missed; no stale read after a
+takeover; a restarted node ready again within 0.3 s
+(`bench/results/2026-11-14-0bf0547-soak-ovh-bhs-3vps-2h-0.4.1-rc.csv`).
+The rolling upgrade was tried on the same three nodes: one node on 0.4.0
+beside two on 0.4.1 kept one owner per actor, a node of either version
+killed was taken over by a node of the other with every write kept, and
+the last node was then rolled forward.
+
+### What changed
 
 - **Sockets through the front**
   ([ADR 0027](docs/adr/0027-sockets-through-the-front.md)). The front
@@ -65,6 +106,25 @@ Since 0.4.0, in no release yet.
   reply was lost is not counted) with a warning in its log
   ([monitoring](docs/monitoring.md#failovers)), and pinned by a cluster
   test and a simulation (`madsim_early_release`).
+
+### Known limits
+
+The limits listed for 0.4.0 still hold, except the first: the front now
+accepts a WebSocket at its own paths. Also:
+
+- Fronts, `call-many` and the hand-off helpers are in the Rust and
+  TypeScript SDKs only; several outbound requests at once are in Rust,
+  TypeScript and Go (Python, C, Zig, D and MoonBit have no outbound HTTP
+  helper yet).
+- A hand-off needs 0.4.1 on the front's node and on the room's: during
+  an upgrade from 0.4.0 a hand-off to a room on a 0.4.0 node gets a 503.
+
+### Install and verify
+
+[Install](README.md#install) downloads a binary or runs the image.
+[Single node](docs/deploy/single-node.md#1-install-the-binary) shows the
+cosign check, the same for every file of the release;
+[Compose](deploy/compose/README.md) checks the image.
 
 ## 0.4.0
 

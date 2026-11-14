@@ -1,10 +1,11 @@
 # 0027. Sockets through the front
 
-- Status: accepted (2026-11-14); revised after an adversarial review (a
-  socket event never creates the actor; a signed request with the mark is
-  never a call; a hand-off not sent says nothing of the peer)
+- Status: accepted (2026-11-14), built in 0.4.1; revised after an
+  adversarial review (a socket event never creates the actor; a signed
+  request with the mark is never a call; a hand-off not sent says nothing
+  of the peer)
 - Date: 2026-11-14
-- Release: [0.4.1](../../ROADMAP.md#now)
+- Release: [0.4.1](../../ROADMAP.md#m4-operating-a-cluster)
 - Follows: [ADR 0023](0023-the-front.md) ("The WebSocket hand-off: not
   now": the reserved range and the plain GET),
   [ADR 0024](0024-socket-home.md) (where a room with sockets wakes) and

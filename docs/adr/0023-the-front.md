@@ -484,7 +484,7 @@ the alternative ADR 0020 rejected.
 
 ### The WebSocket hand-off: not now
 
-> Decided by [ADR 0027](0027-sockets-through-the-front.md) (0.4.1): the
+> Decided by [ADR 0027](0027-sockets-through-the-front.md), built in 0.4.1: the
 > host marks an upgrade to the front with `x-wasmkeep-upgrade`, the front
 > answers with three `x-wasmkeep-handoff-*` headers, and the host opens
 > the socket on that actor as an inside caller. The text below is what
