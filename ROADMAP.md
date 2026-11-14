@@ -39,6 +39,15 @@ An actor can delete itself and an operator can delete one
 stated time (sessions, carts, temporary rooms), and then an app can be
 deleted as a whole.
 
+Then **files and databases**, each with its design first: files for actors
+and the front in the app's part of the bucket, with links a browser
+uploads to and downloads from directly; static assets shipped with
+`wasmkeep deploy`, served by every node without waking any code, with a
+rule for paths that match no file (pass to the front, a single-page app's
+`index.html`, or a 404 page); and a database client in the SDKs, for a
+database kept by one actor. Redirects and routes stay in the front's own
+code, with SDK helpers.
+
 ## Next
 
 `0.5.0`: **several apps on the same nodes.** For one owner's apps and for
@@ -89,7 +98,9 @@ Not before the releases above.
   decision of their own.
 - Ideas, each needing a design first: encrypting actor state in the
   bucket, exporting many actors' data for analytics, composing components
-  at deploy time; a bucket per app, so that an app's data can stay in its
+  at deploy time, and loading a component at run time (a user's plugin,
+  a tenant's script, generated code) with only the capabilities its
+  caller grants; a bucket per app, so that an app's data can stay in its
   owner's account or a chosen country (the cluster itself keeps one
   bucket).
 
@@ -103,9 +114,8 @@ Each waits for a user who needs it.
 - **Native key-value and queue interfaces**, if the SDK patterns fall
   short.
 - **Cron triggers** (alarms cover them today) and optional built-ins: TLS
-  termination, a Helm chart, static assets uploaded with `wasmkeep deploy`
-  and served by every node without waking an actor. Until then, serve
-  them from the [front door](docs/deploy/front-door.md#static-files).
+  termination, a Helm chart. Until static assets ship, serve them from
+  the [front door](docs/deploy/front-door.md#static-files).
 - **M5, an escape hatch**: a microVM tier (Firecracker) for tenants that
   need raw Linux, behind the same routing and storage API.
 
