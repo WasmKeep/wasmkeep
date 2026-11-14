@@ -1008,7 +1008,12 @@ fn quiet_broken_pipes() {
 
 fn main() -> anyhow::Result<()> {
     quiet_broken_pipes();
+    // The log goes to stdout: plain text when that is a file or a pipe.
     tracing_subscriber::fmt()
+        .with_ansi(log_colours(
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            std::env::var_os("NO_COLOR"),
+        ))
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -1689,6 +1694,39 @@ fn front_secrets_warning(
     })
 }
 
+/// What `wasmkeep deploy --rollback` prints above the line it ends with,
+/// on stdout: the version it rolled back to, what changed, and, from a
+/// project file, that the file may now describe another version.
+fn rollback_lines(
+    tenant: &str,
+    name: &str,
+    deployed: &wasmkeep_server::apps::Deployed,
+    file: Option<&str>,
+) -> Vec<String> {
+    let changes = change_lines(deployed, false);
+    let mut out = Vec::new();
+    if !changes.is_empty() {
+        out.push(format!(
+            "rolling back {tenant}/{name} to {}:",
+            deployed.current.version
+        ));
+        out.extend(changes);
+    }
+    if let Some(file) = file {
+        out.push(format!(
+            "note: {file} may now describe another version than the one rolled back to; the \
+             next deploy from it deploys the file again"
+        ));
+    }
+    out
+}
+
+/// Whether log lines carry colour codes: only on a terminal, and not under
+/// `NO_COLOR` (set and not empty, <https://no-color.org>).
+fn log_colours(stdout_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    stdout_is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
 /// The line `wasmkeep deploy` ends with: the version now current and how
 /// it got there (a deploy, a rollback from the version before, or nothing
 /// changed, with the deploy sequence as it was).
@@ -1890,17 +1928,14 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     };
     // From the file, the plan (and its warnings) was printed before the
     // switch; a deploy that changes nothing says so on its last line.
-    for line in change_lines(&deployed, from_file) {
+    let lines = if args.rollback {
+        let file = project.as_ref().map(|p| p.path.display().to_string());
+        rollback_lines(tenant, name, &deployed, file.as_deref())
+    } else {
+        change_lines(&deployed, from_file)
+    };
+    for line in lines {
         println!("{line}");
-    }
-    if args.rollback
-        && let Some(p) = &project
-    {
-        eprintln!(
-            "note: {} may now describe another version than the one rolled back to; the next \
-             deploy from it deploys the file again",
-            p.path.display()
-        );
     }
     if !from_file {
         for warning in deploy_warnings(&deployed.diff, None) {
@@ -2883,6 +2918,59 @@ mod tests {
             super::deployed_line("acme", "shop", &deployed(new, 2, Some(new), true), false),
             "acme/shop: nothing changed: version 8447609efdefe311 is already current (deploy 2)"
         );
+    }
+
+    /// A rollback says which version it rolled back to above what changed,
+    /// and its note about the project file comes on the same stream, before
+    /// the line it ends with.
+    #[test]
+    fn a_rollback_names_its_version_above_its_changes() {
+        let deployed = |unchanged| wasmkeep_server::apps::Deployed {
+            current: wasmkeep_server::apps::Current {
+                version: "8447609efdefe311".into(),
+                seq: 3,
+                marked: true,
+                rooted: true,
+            },
+            previous: Some("3313a78daa7324b0".into()),
+            unchanged,
+            diff: wasmkeep_server::apps::Diff {
+                front: Some("changed"),
+                ..Default::default()
+            },
+            newly_marked: false,
+        };
+        let note = "note: wasmkeep.toml may now describe another version than the one rolled \
+                    back to; the next deploy from it deploys the file again";
+        assert_eq!(
+            super::rollback_lines("acme", "shop", &deployed(false), Some("wasmkeep.toml")),
+            [
+                "rolling back acme/shop to 8447609efdefe311:",
+                "  front: changed",
+                note,
+            ]
+        );
+        assert_eq!(
+            super::rollback_lines("acme", "shop", &deployed(false), None),
+            [
+                "rolling back acme/shop to 8447609efdefe311:",
+                "  front: changed"
+            ]
+        );
+        // Nothing changed: no header over nothing.
+        assert!(super::rollback_lines("acme", "shop", &deployed(true), None).is_empty());
+    }
+
+    /// Log lines carry colour codes only on a terminal, and not even there
+    /// under NO_COLOR (set and not empty).
+    #[test]
+    fn logs_are_coloured_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsString;
+        assert!(super::log_colours(true, None));
+        assert!(super::log_colours(true, Some(OsString::new())));
+        assert!(!super::log_colours(true, Some(OsString::from("1"))));
+        assert!(!super::log_colours(false, None));
+        assert!(!super::log_colours(false, Some(OsString::from("1"))));
     }
 
     #[test]

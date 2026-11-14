@@ -284,6 +284,7 @@ wasmkeep deploy --app "$APP" --bucket "$BUCKET" --rollback
 ```
 
 ```text
+rolling back demo/shop to 7973128b9d723db8:
   requires counter: ADMIN_TOKEN no longer required
 rolled back demo/shop: 1ce5b445d3fa0b38 -> 7973128b9d723db8 (deploy 3)
 ```

@@ -416,7 +416,7 @@ impl FrontVersion {
             return false;
         }
         if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::error!(actor = FRONT_CLASS, variables = %missing.join(", "), "required values are not set: the front answers 503 (set them with `wasmkeep secrets set --front`, or remove them with `wasmkeep deploy --front-requires ''`)");
+            tracing::error!(actor = FRONT_CLASS, variables = %missing.join(", "), "required values are not set: the front answers 503 (set them with `wasmkeep secrets set --front NAME`, or stop requiring them (`requires` in wasmkeep.toml, or `--front-requires` without a project file))");
         }
         true
     }
@@ -1125,6 +1125,48 @@ mod tests {
             ..front
         };
         assert!(!none.check_instantiates(None).await.unwrap());
+    }
+
+    /// The log line for an unset required value says how to set it and how
+    /// to stop requiring it either way the app is deployed: `requires` in
+    /// a project file (beside which `deploy --front-requires` is refused),
+    /// or the flag without one.
+    #[test]
+    fn the_unset_values_line_works_with_and_without_a_project_file() {
+        #[derive(Clone, Default)]
+        struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+        let wasm = wat::parse_str(TRAPPING_FRONT).unwrap();
+        let component = runtime.compile(&wasm).unwrap();
+        let front = HttpComponent::new(runtime, &component).unwrap();
+        let version = front.current().unwrap().with_values(
+            Arc::default(),
+            Arc::default(),
+            Arc::new(["SESSION_KEY".to_owned()].into()),
+        );
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || assert!(version.unconfigured()));
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("required values are not set"), "{text}");
+        assert!(
+            text.contains("set them with `wasmkeep secrets set --front NAME`, or stop requiring them (`requires` in wasmkeep.toml, or `--front-requires` without a project file)"),
+            "{text}"
+        );
+        assert!(!text.contains("--front-requires ''"), "{text}");
     }
 
     /// Every name of the range goes, in any case, every value of it;

@@ -118,6 +118,7 @@ sleep 4
 echo "  ok: the counter answers under the version that requires ADMIN_TOKEN"
 run rollback
 expect_status 0
+expect "^rolling back demo/shop to $v1:$"
 expect '^  requires counter: ADMIN_TOKEN no longer required$'
 expect "^rolled back demo/shop: [0-9a-f]{16} -> $v1 \\(deploy 3\\)$"
 expect_not 'is current'

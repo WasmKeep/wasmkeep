@@ -157,7 +157,9 @@ expect_not "version $v1 "
 # 12. Rollback to the first version.
 run rollback
 expect_status 0
+expect "^rolling back acme/todo to $v1:$"
 expect '^  front: changed$'
+expect '^note: wasmkeep.toml may now describe another version than the one rolled back to'
 expect "^rolled back acme/todo: [0-9a-f]{16} -> $v1 \(deploy 3\)$"
 run after-rollback
 expect '^<h1>Todos</h1>$'

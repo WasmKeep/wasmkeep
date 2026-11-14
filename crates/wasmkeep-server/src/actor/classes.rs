@@ -39,10 +39,19 @@ impl ActorClass {
         let first = missing.next()?;
         if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
             let all: Vec<&str> = std::iter::once(first).chain(missing).collect();
-            tracing::error!(%class, variables = %all.join(", "), "required values are not set: the class refuses its events (set them with `wasmkeep secrets set`, or remove them with `wasmkeep deploy --requires`)");
+            tracing::error!(%class, variables = %all.join(", "), "required values are not set: the class refuses its events ({})", unset_values_hint(class));
         }
         Some(first)
     }
+}
+
+/// How to set a class's unset required values, or stop requiring them,
+/// for the log line saying they are not set.
+fn unset_values_hint(class: &str) -> String {
+    format!(
+        "set them with `wasmkeep secrets set --class {class} NAME`, or stop requiring them \
+         (`requires` in wasmkeep.toml, or `--requires {class}=` without a project file)"
+    )
 }
 
 /// The linker every actor class is linked against.
@@ -176,4 +185,19 @@ fn merge_values(
         out.insert(name.clone(), value.clone());
     }
     Arc::new(out)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A class's unset required values: how to set them, and how to stop
+    /// requiring them with a project file (beside which `deploy
+    /// --requires` is refused) or without one.
+    #[test]
+    fn the_unset_values_hint_works_with_and_without_a_project_file() {
+        assert_eq!(
+            super::unset_values_hint("rooms"),
+            "set them with `wasmkeep secrets set --class rooms NAME`, or stop requiring them \
+             (`requires` in wasmkeep.toml, or `--requires rooms=` without a project file)"
+        );
+    }
 }
