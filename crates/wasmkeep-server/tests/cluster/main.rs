@@ -1263,12 +1263,31 @@ fn drain_line(body: &str) -> Option<&str> {
     body.lines().nth(line)
 }
 
-/// The drain line of `id`'s heartbeat in `store`, once it reads `want`
-/// (within 5 s).
+/// How many of a node's own heartbeat writes [`wait_drain_line`] waits
+/// for. The node reads `control/` once per heartbeat period (100 ms in
+/// these tests), its drain pass runs once per period, and every node lease
+/// write (as often) carries the drain line it has: a drain marker reaches
+/// the heartbeat within about three writes. Fifty is what the earlier 5 s
+/// allowed at that cadence, for the callers that wait on a hand-over too.
+const DRAIN_LINE_WRITES: usize = 50;
+
+/// Wall time [`wait_drain_line`] gives up after even if the node wrote
+/// fewer heartbeats than that: one that stopped writing altogether.
+const DRAIN_LINE_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// The drain line of `id`'s heartbeat in `store`, once it reads `want`:
+/// within [`DRAIN_LINE_WRITES`] of the node's heartbeat writes, counted as
+/// the bodies change, rather than a wall-clock time. A loaded machine
+/// can stall the whole process for seconds (the node's tasks with it),
+/// and the first write after the stall still has the old line: that is
+/// not the node being late.
 async fn wait_drain_line(store: &Arc<dyn ObjectStore>, id: &str, want: &str) {
     use object_store::ObjectStoreExt as _;
     let key = object_store::path::Path::from(format!("nodes/{id}"));
     let started = std::time::Instant::now();
+    // Each write has a new `written_at`, so a new body.
+    let mut last = None;
+    let mut writes = 0;
     loop {
         // Not written yet counts as not yet.
         let body = match store.get(&key).await {
@@ -1279,9 +1298,19 @@ async fn wait_drain_line(store: &Arc<dyn ObjectStore>, id: &str, want: &str) {
         if drain_line(&body) == Some(want) {
             return;
         }
+        if last.as_ref() != Some(&body) {
+            if last.is_some() {
+                writes += 1;
+            }
+            last = Some(body);
+        }
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the drain line never read {want:?}: {body:?}"
+            writes < DRAIN_LINE_WRITES && started.elapsed() < DRAIN_LINE_BACKSTOP,
+            "{id}'s drain line never read {want:?}: {:?} after {writes} heartbeat writes in {:?}; \
+             last heartbeat: {:?}",
+            last.as_deref().and_then(drain_line),
+            started.elapsed(),
+            last.as_deref().unwrap_or_default(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
