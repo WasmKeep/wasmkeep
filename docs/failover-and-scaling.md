@@ -104,7 +104,9 @@ takeover is on the [roadmap](../ROADMAP.md).
 ### Alarms
 
 Pending alarms are listed in the bucket, and every node reads the overdue
-part of that list every 10 s. An alarm whose node died is fired by another
+part of that list every 10 s while entries are due, when the next one
+becomes due otherwise (at most a minute apart), and at once when a node
+joins or leaves. An alarm whose node died is fired by another
 node once it is overdue by a lease period plus grace: with the defaults,
 24 s late at the median and 36 s at worst with nodes next to their bucket
 ([measured](benchmarks.md#three-nodes-against-a-real-bucket),

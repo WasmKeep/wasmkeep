@@ -90,6 +90,23 @@ Since 0.4.1, in no release yet.
     was valid (a moment after it starts); the heartbeat adds the word
     `ends`, which earlier versions ignore.
 
+- **Fewer listings of the bucket.** An idle node lists the bucket about
+  0.08 times a second instead of 1.1 (on R2 and S3 a LIST costs what a PUT
+  costs): `nodes/` every 30 s, the nodes it knows read one by one every
+  heartbeat in between, and a node that starts says hello so its peers list
+  at once; the drain, move and delete requests when `control/changed` says
+  they changed, or every minute; the alarm index when an entry is due for
+  the sweep, at most a minute apart, and at once when a node joins or
+  leaves. Fencing, failover timings for known nodes and pin revocation are
+  unchanged ([ADR 0009, 0011, 0014, 0017 and 0020](docs/adr/0020-one-lease-per-node.md),
+  amendments of 2026-11-14). New metric: `wasmkeep_node_hellos_total`.
+  Upgrading from 0.4.1 is rolling, and nothing in the bucket changes
+  format. Upgrade the CLI with the nodes: `cluster drain`, `undrain` and
+  `actor move` of 0.4.1 do not write `control/changed`, so nodes of 0.4.2
+  read their requests within a minute instead of 3 s. While both versions
+  run, 0.4.1 nodes answer the hello 404 and keep listing every period, and
+  0.4.2 nodes see a 0.4.1 node that starts within 30 s (sooner over TLS).
+
 ## 0.4.1
 
 **Sockets through the front.** The front hands a client's WebSocket to
