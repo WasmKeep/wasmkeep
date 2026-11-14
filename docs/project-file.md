@@ -73,6 +73,7 @@ least one class.
 | `access` | classes only | `internal` (the default: the app's actors, alarms and front only), `existing`, `existing:NAME,...` or `open`, as `deploy --access` |
 | `config` | optional | a file of `NAME=value` lines, plain configuration (stored in the bucket in the clear: never secrets) |
 | `requires` | optional | names that must be set (by the configuration, the app's secrets or a node's `--env`) before the class or front runs |
+| `expire-after-idle` | classes only | how long an actor of the class may stay idle before it is deleted: a whole number and one unit, `s`, `m`, `h` or `d` (`"7d"`, `"36h"`), at least `"1h"`; none by default (actors are kept). In a cluster only ([idle expiry](cluster.md#idle-expiry)) |
 | `build` | optional | a command for the system shell (`sh -c`, `cmd.exe` on Windows), run in the file's directory before `component` is read |
 | `watch` | optional | files or directories of sources; `wasmkeep dev` runs `build` again when one changes (name sources, not what the build writes) |
 
@@ -122,20 +123,24 @@ acme/todo: version 3c2f0a9e41d5b7a0 is current (deploy 7)
 
 **The file is the whole truth.** A class or front not in the file is
 removed. A class without `access` is `internal`. A class or front without
-`config` or `requires` has none, even if a deploy with flags set some.
+`config`, `requires` or `expire-after-idle` has none, even if a deploy
+with flags set some.
 Deploying the same file again changes nothing. A removed class's actors
 keep their state in the bucket; a later deploy that brings the class back
 finds it.
 
 **Every rule is written** in the version, `open` included, so a class's
 rule never depends on how the app was deployed. Such a version uses
-manifest format 3, read by every 0.4.0 node. The first deploy from the
+manifest format 3, read by every 0.4.0 node; a class with
+`expire-after-idle` makes it format 4, which only nodes of this release
+read (the deploy is refused while an older node of the app is live). The
+first deploy from the
 file of an app deployed with flags may change only that; the plan then
 says `access c: open, now written in the version`.
 
 **With flags.** Beside a file, `--actor`, `--access`, `--config`,
-`--requires`, `--front`, `--no-front`, `--front-config` and
-`--front-requires` are refused. `--app` may be given if it names the
+`--requires`, `--expire-after-idle`, `--front`, `--no-front`,
+`--front-config` and `--front-requires` are refused. `--app` may be given if it names the
 file's app. To deploy with flags only, pass `--no-project` (or run from
 another directory): such a deploy keeps every class's rule, and a class
 it adds without `--access` is `open`, the default of flags. The next

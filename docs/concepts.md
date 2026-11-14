@@ -214,6 +214,16 @@ first event ─▶ on-init ─▶ resident ──idle 30 s──▶ hibernated
 - **An operator** can delete an actor too, with `wasmkeep actor delete`
   ([cluster](cluster.md#deleting-one-actor)): the same delete, run by the
   node that holds it or by any node if nobody does.
+- **Idle expiry**: a class may say how long its actors may stay idle
+  (`expire-after-idle = "7d"` in `wasmkeep.toml`, or `deploy
+  --expire-after-idle`): in a cluster, an actor that ran no event for that
+  long, with no pending alarm and no open WebSocket, is deleted the same
+  way, for sessions, carts and temporary rooms
+  ([cluster](cluster.md#idle-expiry)). An event arriving as it expires
+  either keeps it (the expiry loses) or finds a new, empty actor.
+- **A whole app** is deleted with `wasmkeep app delete`: its nodes stop
+  serving it, then every actor, version and secret of it goes from the
+  bucket ([cluster](cluster.md#deleting-an-app)).
 
 ## Storage
 
