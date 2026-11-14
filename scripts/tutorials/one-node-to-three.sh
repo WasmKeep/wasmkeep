@@ -85,8 +85,9 @@ status_shows_alice_on_a() {
 run_until 15 status status_shows_alice_on_a
 expect_status 0
 for node in a b c; do expect "^$node +yes +[0-9.]+m?s +serving "; done
-expect '^NODE +LIVE +AGE +STATE +ACTORS +SOCKETS +EV/MIN +VERSION +APP +ADDRESS +CLUSTER ADDRESS +TLS$'
-expect '^demo/shop +[0-9a-f]{16} +1 +1$'
+expect '^NODE +LIVE +AGE +STATE +ACTORS +SOCKETS +EV/MIN +FRONT/MIN +VERSION +APP +ADDRESS +CLUSTER ADDRESS +TLS$'
+expect '^APP +DEPLOYED VERSION +SEQ +ACTORS +FRONT$'
+expect '^demo/shop +[0-9a-f]{16} +1 +1 +no$'
 expect '^3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain'
 
 # 8. kill -9 a, right after a write.
@@ -109,7 +110,8 @@ expect '^4'
 echo "  ok: answered after ${waited_ms} ms"
 run post-after-failover
 expect '^5$'
-expect '^a +no \(fenced\) '
+# Not live: STATE (and the load) is `-`, whatever the last heartbeat said.
+expect '^a +no \(fenced\) +[0-9.]+(m?s|m) +- +- +- +- +- '
 expect '^2 of 3 nodes live'
 
 # 9. Restart a.
@@ -138,6 +140,7 @@ status_shows_a_released() {
   printf '%s\n' "$OUT" | grep -Eq '^a +no \(released\) '
 }
 run_until 30 status-after-stop status_shows_a_released
+expect '^a +no \(released\) +[0-9.]+(m?s|m) +- +- +- +- +- '
 
 # 11. Clean up.
 run cleanup

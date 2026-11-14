@@ -1174,3 +1174,59 @@ fn changes(classes: Vec<(String, Vec<u8>)>) -> wasmkeep_server::apps::Changes {
         ..Default::default()
     }
 }
+
+/// What `wasmkeep deploy` says comes from these: the version a deploy or
+/// rollback replaced, and whether a deploy changed nothing (no new version,
+/// no new `seq`, nothing written).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deploy_says_what_it_replaced_and_an_unchanged_one_writes_nothing() {
+    use wasmkeep_server::apps::Changes;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    let classes = |wasm: &[u8]| Changes {
+        classes: Some(vec![("c".into(), wasm.to_vec())]),
+        ..Changes::default()
+    };
+    let first = app
+        .deploy_changes(&rt, classes(counter_wasm()))
+        .await
+        .unwrap();
+    assert_eq!(first.previous, None, "a first deploy replaces nothing");
+    assert!(!first.unchanged);
+    let v1 = first.current.clone();
+
+    let keys = bucket_keys(&store).await;
+    let again = app
+        .deploy_changes(&rt, classes(counter_wasm()))
+        .await
+        .unwrap();
+    assert!(again.unchanged, "the same classes again");
+    assert_eq!(again.current, v1, "no new version and no new seq");
+    assert_eq!(again.previous.as_deref(), Some(v1.version.as_str()));
+    assert_eq!(
+        bucket_keys(&store).await,
+        keys,
+        "an unchanged deploy writes nothing"
+    );
+
+    let second = app
+        .deploy_changes(&rt, classes(test_actor_wasm()))
+        .await
+        .unwrap();
+    assert!(!second.unchanged);
+    assert_eq!(second.previous.as_deref(), Some(v1.version.as_str()));
+    assert_eq!(second.current.seq, 2);
+
+    let back = app.rollback(false).await.unwrap();
+    assert!(!back.unchanged);
+    assert_eq!(
+        back.previous.as_deref(),
+        Some(second.current.version.as_str()),
+        "a rollback says what it rolled back from"
+    );
+    assert_eq!(
+        (back.current.version.as_str(), back.current.seq),
+        (v1.version.as_str(), 3)
+    );
+}

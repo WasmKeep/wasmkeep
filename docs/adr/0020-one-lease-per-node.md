@@ -98,8 +98,10 @@ After the three lease lines comes the payload: id, address, version, app,
 cluster address, pins, drain state, `secrets`, capability words, one per
 line and always written (empty if need be). Payload line 10, added in
 0.4.0, is the node's load, written once known:
-`load actors=<n> sockets=<n> events_per_min=<n|->` (`-` until a minute of
-samples exists; unknown keys and words are skipped). Readers from before
+`load actors=<n> sockets=<n> events_per_min=<n|-> front_per_min=<n|->`
+(`-` until a minute of samples exists; unknown keys and words are
+skipped, and `front_per_min`, front requests per minute, added after
+0.4.0's first form of the line, reads as unknown when absent). Readers from before
 it read 9 payload lines and stop, so they never see it; a missing or
 malformed line 10 reads as no load. Unlike the other payload lines it
 drives nothing (it is shown by `cluster status`), and the lease logic

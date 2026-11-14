@@ -98,23 +98,29 @@ pub struct Load {
     /// Events run per minute over the last minute or more (every node of
     /// the process counted); `None` until a minute of samples exists.
     pub events_per_min: Option<u64>,
+    /// Front requests (ADR 0023) per minute, measured as `events_per_min`
+    /// is; `None` until a minute of samples exists, and from a node of a
+    /// version before it (which writes no `front_per_min`).
+    pub front_per_min: Option<u64>,
 }
 
 impl Load {
-    /// The line: `load actors=<n> sockets=<n> events_per_min=<n|->`.
+    /// The line: `load actors=<n> sockets=<n> events_per_min=<n|->
+    /// front_per_min=<n|->`.
     fn line(&self) -> String {
-        let events = self
-            .events_per_min
-            .map_or_else(|| "-".to_owned(), |n| n.to_string());
+        let rate = |r: Option<u64>| r.map_or_else(|| "-".to_owned(), |n| n.to_string());
         format!(
-            "load actors={} sockets={} events_per_min={events}",
-            self.actors, self.sockets
+            "load actors={} sockets={} events_per_min={} front_per_min={}",
+            self.actors,
+            self.sockets,
+            rate(self.events_per_min),
+            rate(self.front_per_min)
         )
     }
 
     /// Reads the line: the word `load`, then `key=value` words in any
-    /// order. `actors` and `sockets` are required; `events_per_min` may
-    /// be `-` or absent (unknown). Unknown keys and words without `=` are
+    /// order. `actors` and `sockets` are required; `events_per_min` and
+    /// `front_per_min` may be `-` or absent (unknown). Unknown keys and words without `=` are
     /// skipped, for later versions; a known key repeated or with a value
     /// that is not a count is `None`.
     fn parse(line: &str) -> Option<Self> {
@@ -122,7 +128,7 @@ impl Load {
         if words.next()? != "load" {
             return None;
         }
-        let (mut actors, mut sockets, mut events) = (None, None, None);
+        let (mut actors, mut sockets, mut events, mut front) = (None, None, None, None);
         for word in words {
             let Some((key, value)) = word.split_once('=') else {
                 continue;
@@ -131,12 +137,14 @@ impl Load {
                 "actors" => &mut actors,
                 "sockets" => &mut sockets,
                 "events_per_min" => &mut events,
+                "front_per_min" => &mut front,
                 _ => continue,
             };
             if slot.is_some() {
                 return None;
             }
-            *slot = Some(if key == "events_per_min" && value == "-" {
+            let rate = key == "events_per_min" || key == "front_per_min";
+            *slot = Some(if rate && value == "-" {
                 None
             } else {
                 Some(number(value)?)
@@ -146,6 +154,7 @@ impl Load {
             actors: actors??,
             sockets: sockets??,
             events_per_min: events.flatten(),
+            front_per_min: front.flatten(),
         })
     }
 }
@@ -1310,6 +1319,7 @@ mod tests {
                 actors: 12,
                 sockets: 3,
                 events_per_min: Some(840),
+                front_per_min: Some(90),
             }),
             ..tls_node()
         }
@@ -1322,7 +1332,10 @@ mod tests {
         let lines: Vec<&str> = payload.lines().collect();
         assert_eq!(lines.len(), 10, "{payload}");
         assert_eq!(lines[8], "take");
-        assert_eq!(lines[9], "load actors=12 sockets=3 events_per_min=840");
+        assert_eq!(
+            lines[9],
+            "load actors=12 sockets=3 events_per_min=840 front_per_min=90"
+        );
         let body = format3(&node, NodeState::Live, "beef");
         let read = NodeInfo::decode(&body).unwrap();
         assert_eq!(read.load, node.load);
@@ -1338,6 +1351,7 @@ mod tests {
         let early = NodeInfo {
             load: Some(Load {
                 events_per_min: None,
+                front_per_min: None,
                 ..node.load.unwrap()
             }),
             ..node.clone()
@@ -1345,7 +1359,7 @@ mod tests {
         assert!(
             String::from_utf8(early.payload())
                 .unwrap()
-                .ends_with("\ntake\nload actors=12 sockets=3 events_per_min=-\n")
+                .ends_with("\ntake\nload actors=12 sockets=3 events_per_min=- front_per_min=-\n")
         );
         let read = NodeInfo::decode(&format3(&early, NodeState::Live, "beef")).unwrap();
         assert_eq!(read.load, early.load);
@@ -1452,6 +1466,7 @@ mod tests {
                 actors,
                 sockets,
                 events_per_min,
+                front_per_min: None,
             })
         };
         assert_eq!(read("load actors=1 sockets=2"), ok(1, 2, None));
@@ -1459,6 +1474,24 @@ mod tests {
             read("load sockets=2 actors=1 events_per_min=7"),
             ok(1, 2, Some(7))
         );
+        // Front requests, and a line from before them (no key): unknown.
+        assert_eq!(
+            read("load actors=1 sockets=2 events_per_min=7 front_per_min=30"),
+            Some(Load {
+                front_per_min: Some(30),
+                ..ok(1, 2, Some(7)).unwrap()
+            })
+        );
+        assert_eq!(
+            read("load actors=1 sockets=2 events_per_min=7 front_per_min=-"),
+            ok(1, 2, Some(7))
+        );
+        for bad in [
+            "load actors=1 sockets=2 front_per_min=lots",
+            "load actors=1 sockets=2 front_per_min=1 front_per_min=2",
+        ] {
+            assert_eq!(read(bad), None, "{bad:?}");
+        }
         // A later version's keys and words are skipped.
         assert_eq!(
             read("load actors=1 sockets=2 events_per_min=- queued=4 busy"),
@@ -1483,6 +1516,7 @@ mod tests {
             actors: 2,
             sockets: 1,
             events_per_min: None,
+            front_per_min: None,
         };
         a.set_load(load);
         let body = format3(
@@ -1493,7 +1527,7 @@ mod tests {
         assert_eq!(NodeInfo::decode(&body).unwrap().load, Some(load));
         assert!(
             a.lease_payload()
-                .ends_with(b"\nload actors=2 sockets=1 events_per_min=-\n")
+                .ends_with(b"\nload actors=2 sockets=1 events_per_min=- front_per_min=-\n")
         );
     }
 
@@ -1513,6 +1547,7 @@ mod tests {
             actors: seen.load(Ordering::SeqCst),
             sockets: 0,
             events_per_min: None,
+            front_per_min: None,
         }));
         let line = |a: &Membership<&Mem, At<'_>>| {
             String::from_utf8(a.lease_payload())
@@ -1522,10 +1557,16 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        assert_eq!(line(&a), "load actors=0 sockets=0 events_per_min=-");
+        assert_eq!(
+            line(&a),
+            "load actors=0 sockets=0 events_per_min=- front_per_min=-"
+        );
         // An actor taken over: the very next payload has it.
         actors.store(1, Ordering::SeqCst);
-        assert_eq!(line(&a), "load actors=1 sockets=0 events_per_min=-");
+        assert_eq!(
+            line(&a),
+            "load actors=1 sockets=0 events_per_min=- front_per_min=-"
+        );
         // Handed over, then drained: both in the next payload.
         actors.store(0, Ordering::SeqCst);
         a.set_drain_state(DrainState::Drained);

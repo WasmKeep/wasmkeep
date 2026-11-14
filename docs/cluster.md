@@ -679,6 +679,17 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   a broken one is refused and the current version keeps running.
 - Nodes check for a new version every 3 s and switch each actor at its next
   event. No actor is dropped; `on-init` runs once per version.
+- A node may start before the app's first deploy: `serve --app` then logs
+  `waiting for the first deploy of TENANT/APP` and reads `current` every
+  3 s, as for new versions. Until a deploy lands it does not listen,
+  writes no heartbeat (`cluster status` does not list it yet) and opens
+  no secrets; then it starts as if it had been started after the deploy.
+- `deploy` ends with the version now current and its `seq`:
+  `acme/shop: version V is current (deploy N)`. A deploy that changes
+  nothing (the same classes, rules, configuration and front) writes
+  nothing and says `acme/shop: nothing changed: version V is already
+  current (deploy N)`, with `N` as it was; a rollback says
+  `rolled back acme/shop: FROM -> TO (deploy N)`.
 - An actor never runs older code than it already ran: a node that has not
   caught up yet refuses it (the client retries) and updates at once.
 - Rollback makes the previous version current again (as a new deploy),
@@ -719,9 +730,11 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --no-front
   `--rollback` to a version without a front, leaves the app's `_front`
   secrets in the set: a node older than the front cannot open a set with
   them (it refuses every event and drains), and a later front reads the
-  values left. Such a deploy prints a warning while the app has secrets;
-  remove the front's with `wasmkeep secrets unset --front NAME...` (see
-  `wasmkeep secrets list`).
+  values left. Such a deploy prints a warning while the app has secrets,
+  with the two commands to run, complete but for the key file (`--key`)
+  and the names: `wasmkeep secrets list --bucket ... --app ... --key
+  KEY_FILE` shows the names under `_front`, and `wasmkeep secrets unset
+  --bucket ... --app ... --key KEY_FILE --front NAME...` removes them.
 - **The front's scope is not a class.** `--config _front=...`,
   `--requires _front=...` and `--access _front=...` are refused: give
   the front's values with `--front-config` and `--front-requires`; the
@@ -946,13 +959,13 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 ```text
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
-a     yes   979ms  serving  12      3        840     0.4.0    acme/shop  http://a:8080  https://a:7443   pinned
-b     yes   2.2s   serving  4       0        95      0.4.0    acme/shop  http://b:8080  -                plain
-c     no    14m    -        -       -        -       0.4.0    acme/shop  http://c:8080  https://c:7443   pinned
+NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
+a     yes   979ms  serving  12      3        840     310        0.4.0    acme/shop  http://a:8080  https://a:7443   pinned
+b     yes   2.2s   serving  4       0        95      288        0.4.0    acme/shop  http://b:8080  -                plain
+c     no    14m    -        -       -        -       -          0.4.0    acme/shop  http://c:8080  https://c:7443   pinned
 
-APP        DEPLOYED VERSION  SEQ  ACTORS
-acme/shop  9cf4de9152d8dd29  1    16
+APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT
+acme/shop  9cf4de9152d8dd29  1    16      yes
 
 2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.4.0
 warning: mixed plain and TLS nodes: b still plain while a use the cluster listener; give every node a cluster listener, then drop --cluster-plaintext accept (ADR 0011)
@@ -976,21 +989,27 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   stays listed, not live, until its heartbeat object is removed from the
   bucket.
 - **Load** is what each live node says with every heartbeat: **actors**
-  resident in memory, open **WebSockets** (`SOCKETS`), and **events per
-  minute** (`EV/MIN`) over the last minute or more, `-` for its first
-  minute. It is read as each heartbeat is written, with the state of the
+  resident in memory, open **WebSockets** (`SOCKETS`), **events per
+  minute** (`EV/MIN`: actor events) and **front requests per minute**
+  (`FRONT/MIN`, [ADR 0023](adr/0023-the-front.md)) over the last minute
+  or more, each `-` for its first minute. A node that only answers
+  through the front shows its traffic under `FRONT/MIN`, and `EV/MIN`
+  counts only what reaches its actors. It is read as each heartbeat is written, with the state of the
   same moment, so it lags what the node runs by at most one heartbeat
   period (3 s by default): an actor a node just took over shows at its
   next heartbeat. A node that crashed keeps showing its last load until
   its heartbeat is older than the horizon. Nothing places actors by it.
   A node not live shows `-` (a fenced or released heartbeat keeps the
   last load it wrote, which no longer holds), and so does a node of a
-  version before 0.4.0. In
-  `--json`: `actors`, `sockets` and `events_per_min`, `null` when unknown.
-  Events are counted per process, so nodes sharing one process (tests)
-  share one count.
+  version before 0.4.0 (`FRONT/MIN` also for a node of a version that
+  did not publish it yet). In `--json`: `actors`, `sockets`,
+  `events_per_min` and `front_per_min`, `null` when unknown. Events and
+  front requests are counted per process, so nodes sharing one process
+  (tests) share one count.
 - **Apps** come from `apps/<tenant>/<app>/current`: the deployed version and
-  its `seq`. **Actors** is the sum over the app's live nodes that say
+  its `seq`, and **front** (`yes` or `no`) from that version's manifest:
+  whether the app has a front (`-` when the manifest cannot be read;
+  `front`, `true`, `false` or `null`, in `--json`). **Actors** is the sum over the app's live nodes that say
   their load (`-` if none does; `actors` in `--json`): while some of its
   live nodes do not say it (an older version, or a node just started),
   the sum leaves them out. Which version each node has picked up is not

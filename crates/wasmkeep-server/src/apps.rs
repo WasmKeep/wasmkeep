@@ -708,6 +708,8 @@ impl AppRef {
             if base_manifest.identity() == manifest.identity() {
                 return Ok(Deployed {
                     current: current.clone(),
+                    previous: Some(current.version.clone()),
+                    unchanged: true,
                     diff,
                     newly_marked: false,
                 });
@@ -759,6 +761,7 @@ impl AppRef {
             }
         }
         let seq = read.as_ref().map_or(1, |(c, _)| c.seq + 1);
+        let previous = read.as_ref().map(|(c, _)| c.version.clone());
         self.swap_current(read.map(|(_, v)| v), &version, seq, marked)
             .await?;
         Ok(Deployed {
@@ -768,6 +771,8 @@ impl AppRef {
                 marked,
                 rooted: true,
             },
+            previous,
+            unchanged: false,
             diff,
             newly_marked: marked && from_before,
         })
@@ -811,6 +816,8 @@ impl AppRef {
                 marked,
                 rooted: true,
             },
+            previous: Some(current.version),
+            unchanged: false,
             diff,
             newly_marked: marked && !current.marked,
         })
@@ -1072,6 +1079,13 @@ struct Settings {
 pub struct Deployed {
     /// What `current` now points at.
     pub current: Current,
+    /// The version `current` pointed at before (rolled back from, for a
+    /// rollback); `None` for an app's first deploy.
+    pub previous: Option<String>,
+    /// Nothing changed: the version asked for is the current one, so no
+    /// version was written and `current` (its `seq` too) was left as it
+    /// was.
+    pub unchanged: bool,
     /// Against the version before.
     pub diff: Diff,
     /// This change set the marker on an app deployed before it existed:

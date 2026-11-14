@@ -119,8 +119,9 @@ echo "  ok: the counter answers under the version that requires ADMIN_TOKEN"
 run rollback
 expect_status 0
 expect '^  requires counter: ADMIN_TOKEN no longer required$'
-expect '^demo/shop: version [0-9a-f]{16} is current \(deploy 3\)$'
-expect "^demo/shop: version $v1 is current"
+expect "^rolled back demo/shop: [0-9a-f]{16} -> $v1 \\(deploy 3\\)$"
+expect_not 'is current'
+
 
 # 7. Metrics: the series the page names are on node a's page.
 run metrics

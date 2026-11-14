@@ -750,8 +750,8 @@ async fn wait_heartbeat(
 }
 
 /// Payload line 10: a node's heartbeat says how many actors and WebSockets
-/// it holds, kept current with every write; events per minute stay unknown
-/// until a minute of totals exists.
+/// it holds, kept current with every write; events and front requests per
+/// minute stay unknown until a minute of totals exists.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_heartbeat_carries_the_nodes_load() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -773,7 +773,23 @@ async fn the_heartbeat_carries_the_nodes_load() {
     }
     let busy = wait_heartbeat(&store, "a", |i| i.load.is_some_and(|l| l.actors == 2)).await;
     let load = busy.load.unwrap();
-    assert_eq!((load.sockets, load.events_per_min), (0, None), "{busy:?}");
+    assert_eq!(
+        (load.sockets, load.events_per_min, load.front_per_min),
+        (0, None, None),
+        "{busy:?}"
+    );
+    // Front requests are published beside events, unknown (`-`) for the
+    // first minute too; a reader of the version before skips the key.
+    let raw = {
+        use object_store::ObjectStoreExt as _;
+        let body = store.get(&"nodes/a".into()).await.unwrap().bytes().await;
+        String::from_utf8(body.unwrap().to_vec()).unwrap()
+    };
+    assert!(
+        raw.lines()
+            .any(|l| l.starts_with("load ") && l.ends_with(" events_per_min=- front_per_min=-")),
+        "{raw}"
+    );
     assert_eq!(
         busy.lease,
         Some(wasmkeep_cluster::node_lease::NodeState::Live)

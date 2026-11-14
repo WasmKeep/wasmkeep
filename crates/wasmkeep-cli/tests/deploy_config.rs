@@ -413,3 +413,96 @@ fn a_deploy_from_the_file_is_the_file() {
 fn url_prefix(url: &str) -> String {
     url.splitn(4, '/').nth(3).unwrap_or_default().to_owned()
 }
+
+/// A node started before the app's first deploy waits for it and serves
+/// it once it lands; a deploy that changes nothing says so and leaves the
+/// sequence alone; a rollback names the versions it went from and to.
+#[test]
+fn nodes_start_before_the_first_deploy_and_deploys_say_what_they_did() {
+    let Ok(bucket) = std::env::var("WASMKEEP_TEST_S3_BUCKET") else {
+        eprintln!("WASMKEEP_TEST_S3_BUCKET not set; skipping");
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let url = format!("s3://{bucket}/first-deploy-{}-{now}", std::process::id());
+    let wasm = counter_wasm();
+    let dir = tempfile::tempdir().unwrap();
+    let actor = format!("counter={}", wasm.display());
+
+    // Nothing deployed: the node waits, saying for what.
+    let log = dir.path().join("node.log");
+    let node = serve(&url, &dir.path().join("node"), &[])
+        .env("RUST_LOG", "wasmkeep_server=info,wasmkeep=info")
+        .stdout(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut node = Killed(node);
+    let waiting = format!(
+        "waiting for the first deploy of acme/shop (wasmkeep deploy --app acme/shop --bucket {url} ...)"
+    );
+    let started = Instant::now();
+    while !std::fs::read_to_string(&log).unwrap().contains(&waiting) {
+        assert!(
+            node.0.try_wait().unwrap().is_none(),
+            "the node exited before the first deploy:\n{}",
+            std::fs::read_to_string(&log).unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_secs(60), "never waited");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The first deploy lands: the node serves it.
+    let (ok, out, err) = deploy(&url, &["--actor", &actor]);
+    assert!(ok, "{err}");
+    let first = out
+        .lines()
+        .find_map(|l| l.strip_prefix("acme/shop: version "))
+        .and_then(|l| l.strip_suffix(" is current (deploy 1)"))
+        .unwrap_or_else(|| panic!("{out}"))
+        .to_owned();
+    let addr = support::listening_on(&mut node.0, &log, Duration::from_secs(60));
+    let started = Instant::now();
+    while !status(addr, "/actor/counter/x").is_some_and(|s| s < 500) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the node never served the first deploy"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The same again: nothing changed, the sequence as it was.
+    let (ok, out, err) = deploy(&url, &["--actor", &actor]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!(
+            "acme/shop: nothing changed: version {first} is already current (deploy 1)"
+        )),
+        "{out}"
+    );
+    assert!(
+        current(&bucket, &url_prefix(&url), "acme/shop").starts_with(&format!("{first} 1 ")),
+        "an unchanged deploy moved current"
+    );
+
+    // A change, then a rollback from it.
+    let (ok, out, err) = deploy(&url, &["--access", "counter=existing"]);
+    assert!(ok, "{err}");
+    let second = out
+        .lines()
+        .find_map(|l| l.strip_prefix("acme/shop: version "))
+        .and_then(|l| l.strip_suffix(" is current (deploy 2)"))
+        .unwrap_or_else(|| panic!("{out}"))
+        .to_owned();
+    let (ok, out, err) = deploy(&url, &["--rollback", "--allow-reopen"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!(
+            "rolled back acme/shop: {second} -> {first} (deploy 3)"
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("is current"), "{out}");
+}

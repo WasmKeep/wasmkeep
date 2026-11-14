@@ -85,8 +85,10 @@ from these `AWS_*` variables. Against a real bucket, only they change
 
 ## 4. Deploy the app
 
-Nodes started with `--app` run what was last deployed for that app, so
-deploy first. The app is `demo/shop`, with one class, `counter`:
+Nodes started with `--app` run what was last deployed for that app.
+Deploy first here; a node started before the first deploy waits for it
+(it logs `waiting for the first deploy of demo/shop`). The app is
+`demo/shop`, with one class, `counter`:
 
 <!-- test: deploy -->
 ```bash
@@ -191,13 +193,13 @@ wasmkeep cluster status --bucket s3://demo
 ```text
 Cluster s3://demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
-a     yes   2.0s   serving  1       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
-b     yes   2.0s   serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
-c     yes   1.9s   serving  0       0        -       0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
+NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS
+a     yes   2.0s   serving  1       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned
+b     yes   2.0s   serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned
+c     yes   1.9s   serving  0       0        -       -          0.3.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned
 
-APP        DEPLOYED VERSION  SEQ  ACTORS
-demo/shop  469fcd8d39aa32f2  1    1
+APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT
+demo/shop  469fcd8d39aa32f2  1    1       no
 
 3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.3.0+4f1c2a9e7b3d
 ```
@@ -206,13 +208,15 @@ demo/shop  469fcd8d39aa32f2  1    1
   **AGE** is how old it is.
 - **STATE** is `serving`, or `draining` and `drained` (step 10); `-` for
   a node that is not live.
-- **ACTORS**, **SOCKETS** and **EV/MIN** are each node's load as of its
-  last heartbeat: actors in memory, open WebSockets, events per minute.
-  They lag at most one heartbeat (3 s), and EV/MIN is `-` for a node's
-  first minute.
+- **ACTORS**, **SOCKETS**, **EV/MIN** and **FRONT/MIN** are each node's
+  load as of its last heartbeat: actors in memory, open WebSockets,
+  actor events per minute and front requests per minute (this app has no
+  front). They lag at most one heartbeat (3 s), and the two rates are `-`
+  for a node's first minute.
 - **TLS** `pinned`: the other nodes know this node's certificate and talk
   to it over mutual TLS.
-- The app table shows the deployed version and its actors on live nodes.
+- The app table shows the deployed version, its actors on live nodes,
+  and whether it has a front.
 
 The command exits with 1 when no node is live, so scripts can use it;
 `--json` prints the same for them

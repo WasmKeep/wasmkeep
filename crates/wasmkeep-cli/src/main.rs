@@ -395,7 +395,9 @@ struct ServeArgs {
     node_id: Option<String>,
 
     /// Serve the classes deployed for this app (TENANT/APP) with `wasmkeep
-    /// deploy`, following new deploys. Needs --bucket; replaces --actor.
+    /// deploy`, following new deploys. Before the app's first deploy, the
+    /// node waits for it (not listening yet). Needs --bucket; replaces
+    /// --actor.
     #[arg(long, value_parser = parse_app, requires = "bucket", conflicts_with = "actors")]
     app: Option<(String, String)>,
 
@@ -1232,13 +1234,27 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             check_layout(bucket, &store, &prefix, tenant)?;
             let app_store = std::sync::Arc::clone(&store);
             let app_ref = AppRef::new(store, &prefix, tenant, name);
-            let (current, deployed) = rt.block_on(async {
-                let current = app_ref.current().await?.ok_or_else(|| {
-                    anyhow::anyhow!("nothing is deployed for {tenant}/{name} yet")
-                })?;
+            // Before the first deploy: wait for one, as a running node
+            // waits for the next (nothing below can start without it).
+            let Some((current, deployed)) = rt.block_on(async {
+                let Some(current) = first_deploy(
+                    &app_ref,
+                    &format!("{tenant}/{name}"),
+                    bucket,
+                    DEPLOY_CHECK_EVERY,
+                    stop_signal(),
+                )
+                .await?
+                else {
+                    return anyhow::Ok(None);
+                };
                 let deployed = app_ref.version(&current.version).await?;
-                anyhow::Ok((current, deployed))
-            })?;
+                anyhow::Ok(Some((current, deployed)))
+            })?
+            else {
+                tracing::info!("shutting down");
+                return Ok(());
+            };
             // A `current` from before 0.4.0 (no token 3): its rules may still
             // be `--access` ones, which a deploy of this version would drop
             // at run time. Refuse it at start instead (ADR 0022).
@@ -1396,7 +1412,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             wasmkeep_server::older_nodes_advice(&older)
         );
         if let Some((app_ref, _)) = follow.take() {
-            rt.spawn(app_ref.follow(service.clone(), std::time::Duration::from_secs(3)));
+            rt.spawn(app_ref.follow(service.clone(), DEPLOY_CHECK_EVERY));
         }
         if let Some((secrets, keys, opened)) = follow_secrets.take() {
             rt.spawn(secrets.follow(
@@ -1519,6 +1535,45 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     })
 }
 
+/// How often `serve --app` reads the app's `current`: for its first
+/// deploy, then for every new one.
+const DEPLOY_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `serve --app`: the app's `current`, waiting for its first deploy when
+/// there is none yet (read every `every`, as a running node reads it for
+/// new versions), so nodes may start before the app is deployed. The node
+/// neither listens nor writes a heartbeat meanwhile. `None` when `stop`
+/// resolves first. A failed first read fails (the bucket or its
+/// credentials are wrong); a failed read while waiting is retried.
+async fn first_deploy(
+    app_ref: &AppRef,
+    app: &str,
+    bucket: &str,
+    every: std::time::Duration,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<Option<wasmkeep_server::apps::Current>> {
+    if let Some(current) = app_ref.current().await? {
+        return Ok(Some(current));
+    }
+    tracing::info!(
+        "waiting for the first deploy of {app} (wasmkeep deploy --app {app} --bucket {bucket} ...): this node starts serving when one lands"
+    );
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            () = &mut stop => return Ok(None),
+            () = tokio::time::sleep(every) => {}
+        }
+        match app_ref.current().await {
+            Ok(Some(current)) => return Ok(Some(current)),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the app's current version failed; retrying")
+            }
+        }
+    }
+}
+
 /// Refuses to follow a `current` from before 0.4.0 (no token 3, ADR
 /// 0022): its nodes may still take their rules from `--access`, which the
 /// next deploy of this version (token 3 marks the app) would drop at run
@@ -1567,22 +1622,52 @@ pub(crate) async fn stop_signal() {
 /// app has secrets (`has_secrets`: `None` when the bucket did not say):
 /// `_front` entries stay in the set, where a node older than the front
 /// cannot open it, and a later front would read them (ADR 0023). The set
-/// is sealed, so whether it has such entries is only known with the key.
+/// is sealed, so whether it has such entries is only known with the key:
+/// the warning gives the commands to list and remove them, complete but
+/// for the key file and the names.
 fn front_secrets_warning(
     diff: &wasmkeep_server::apps::Diff,
     has_secrets: Option<bool>,
+    bucket: &str,
     tenant: &str,
     app: &str,
 ) -> Option<String> {
     (diff.front == Some("removed") && has_secrets != Some(false)).then(|| {
+        let at = format!("--bucket {bucket} --app {tenant}/{app} --key KEY_FILE");
         format!(
-            "the front was removed, but not its secrets: if `wasmkeep secrets list --app \
-             {tenant}/{app}` shows `{FRONT_SCOPE}`, remove them with `wasmkeep secrets unset \
-             --front NAME...`. Left in the set, they keep nodes older than the front from \
-             opening any of the app's secrets (they refuse every event and drain), and a later \
-             front reads them"
+            "the front was removed, but any secrets it had stay in the app's set. List them \
+             with `wasmkeep secrets list {at}` (KEY_FILE: the app's secrets key), then \
+             remove the names shown under `{FRONT_SCOPE}` with `wasmkeep secrets unset {at} \
+             --front NAME...`. While they stay, nodes older than the front cannot open any of \
+             the app's secrets (they refuse every event and drain), and a later front reads them"
         )
     })
+}
+
+/// The line `wasmkeep deploy` ends with: the version now current and how
+/// it got there (a deploy, a rollback from the version before, or nothing
+/// changed, with the deploy sequence as it was).
+fn deployed_line(
+    tenant: &str,
+    name: &str,
+    deployed: &wasmkeep_server::apps::Deployed,
+    rollback: bool,
+) -> String {
+    let current = &deployed.current;
+    match (&deployed.previous, rollback, deployed.unchanged) {
+        (_, _, true) => format!(
+            "{tenant}/{name}: nothing changed: version {} is already current (deploy {})",
+            current.version, current.seq
+        ),
+        (Some(from), true, false) => format!(
+            "rolled back {tenant}/{name}: {from} -> {} (deploy {})",
+            current.version, current.seq
+        ),
+        _ => format!(
+            "{tenant}/{name}: version {} is current (deploy {})",
+            current.version, current.seq
+        ),
+    }
 }
 
 /// Refuses the front's scope where a deploy flag takes classes: the
@@ -1758,12 +1843,12 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         rt.block_on(app_ref.deploy_changes(&runtime, changes))
             .map_err(named)?
     };
+    // From the file, the plan was printed before the switch (and a deploy
+    // that changes nothing says so on its last line).
     if !from_file {
         for line in deployed.diff.lines() {
             println!("  {line}");
         }
-    } else if deployed.diff.lines().is_empty() {
-        println!("  nothing changed: the deployed version is the file's");
     }
     if args.rollback
         && let Some(p) = &project
@@ -1780,7 +1865,9 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     if deployed.diff.front == Some("removed") {
         let secrets = wasmkeep_server::secret_store::SecretStore::new(store, &prefix, tenant, name);
         let has_secrets = rt.block_on(secrets.current()).ok().map(|c| c.is_some());
-        if let Some(warning) = front_secrets_warning(&deployed.diff, has_secrets, tenant, name) {
+        if let Some(warning) =
+            front_secrets_warning(&deployed.diff, has_secrets, &args.bucket, tenant, name)
+        {
             eprintln!("warning: {warning}");
         }
     }
@@ -1790,11 +1877,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
              and refuse it at their next start. Every class not listed is open."
         );
     }
-    let current = deployed.current;
-    println!(
-        "{tenant}/{name}: version {} is current (deploy {})",
-        current.version, current.seq
-    );
+    println!("{}", deployed_line(tenant, name, &deployed, args.rollback));
     // Old versions beyond what rollbacks need (ADR 0012). The deploy is
     // done either way: a failure here only leaves them for next time.
     let retention = std::time::Duration::from_secs(args.version_retention_secs);
@@ -2409,6 +2492,72 @@ mod tests {
         assert!(e.contains("in progress"), "{e}");
     }
 
+    /// `serve --app` before the app's first deploy waits for one, reading
+    /// `current` as nodes read it for new versions, and goes on with the
+    /// version that lands; a stop signal while it waits ends it cleanly.
+    #[test]
+    fn a_node_started_before_the_first_deploy_waits_for_it() {
+        use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, memory::InMemory};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+        let app = super::AppRef::new(std::sync::Arc::clone(&store), "wk", "acme", "shop");
+        let every = std::time::Duration::from_millis(20);
+        rt.block_on(async {
+            // Stopped while nothing is deployed: no version, no error.
+            let stopped = super::first_deploy(
+                &app,
+                "acme/shop",
+                "s3://b/wk",
+                every,
+                tokio::time::sleep(std::time::Duration::from_millis(100)),
+            )
+            .await
+            .unwrap();
+            assert!(stopped.is_none());
+            // A deploy lands while it waits: that version.
+            let deploy = async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                store
+                    .put(
+                        &"wk/apps/acme/shop/current".into(),
+                        PutPayload::from("3313a78daa7324b0 1 3\n"),
+                    )
+                    .await
+                    .unwrap();
+            };
+            let (current, ()) = tokio::join!(
+                super::first_deploy(
+                    &app,
+                    "acme/shop",
+                    "s3://b/wk",
+                    every,
+                    std::future::pending()
+                ),
+                deploy
+            );
+            let current = current.unwrap().unwrap();
+            assert_eq!(
+                (current.version.as_str(), current.seq),
+                ("3313a78daa7324b0", 1)
+            );
+            // Already deployed: at once.
+            let current = super::first_deploy(
+                &app,
+                "acme/shop",
+                "s3://b/wk",
+                every,
+                std::future::pending(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(current.seq, 1);
+        });
+    }
+
     /// `actor move` runs the start check `serve` runs (ADR 0022): it
     /// refuses a tenant whose state is still in the layout before 0.4.0,
     /// naming the migrate command, and writes nothing.
@@ -2613,20 +2762,82 @@ mod tests {
         };
         // The set is sealed: whether it has `_front` entries is not
         // known without the key, so any set (or one not known) warns.
+        let bucket = "s3://shop-bucket/prod";
         for secrets in [Some(true), None] {
-            let w = super::front_secrets_warning(&removed, secrets, "acme", "shop").unwrap();
+            let w =
+                super::front_secrets_warning(&removed, secrets, bucket, "acme", "shop").unwrap();
             assert!(w.contains("`_front`"), "{w}");
-            assert!(w.contains("wasmkeep secrets unset --front"), "{w}");
-            assert!(w.contains("acme/shop"), "{w}");
+            // Both commands complete, as the secrets CLI parses them, once
+            // the key file and the names are filled in.
+            let commands: Vec<&str> = w.split('`').skip(1).step_by(2).collect();
+            let runnable: Vec<&&str> = commands
+                .iter()
+                .filter(|c| c.starts_with("wasmkeep "))
+                .collect();
+            assert_eq!(runnable.len(), 2, "{w}");
+            for (command, sub) in runnable.iter().zip(["list", "unset"]) {
+                assert!(command.contains(&format!("secrets {sub} ")), "{command}");
+                assert!(command.contains(&format!("--bucket {bucket}")), "{command}");
+                assert!(command.contains("--app acme/shop"), "{command}");
+                assert!(command.contains("--key KEY_FILE"), "{command}");
+                let filled = command
+                    .replace("KEY_FILE", "/etc/wasmkeep/secrets.key")
+                    .replace("NAME...", "SESSION_KEY OTHER");
+                let parsed = <super::Cli as clap::Parser>::try_parse_from(filled.split(' '));
+                assert!(parsed.is_ok(), "{command}: {}", parsed.unwrap_err());
+            }
+            assert!(runnable[1].contains("--front NAME..."), "{w}");
+            assert!(!w.contains(" if "), "plainly worded: {w}");
         }
-        assert!(super::front_secrets_warning(&removed, Some(false), "acme", "shop").is_none());
+        assert!(
+            super::front_secrets_warning(&removed, Some(false), bucket, "acme", "shop").is_none()
+        );
         for front in [None, Some("added"), Some("changed"), Some("unchanged")] {
             let diff = wasmkeep_server::apps::Diff {
                 front,
                 ..Default::default()
             };
-            assert!(super::front_secrets_warning(&diff, Some(true), "acme", "shop").is_none());
+            assert!(
+                super::front_secrets_warning(&diff, Some(true), bucket, "acme", "shop").is_none()
+            );
         }
+    }
+
+    /// The line a deploy ends with: a switch, a rollback (from which
+    /// version to which), or nothing changed (the sequence not bumped).
+    #[test]
+    fn a_deploy_says_whether_it_switched_rolled_back_or_changed_nothing() {
+        let current = |version: &str, seq| wasmkeep_server::apps::Current {
+            version: version.into(),
+            seq,
+            marked: true,
+            rooted: true,
+        };
+        let deployed =
+            |version, seq, previous: Option<&str>, unchanged| wasmkeep_server::apps::Deployed {
+                current: current(version, seq),
+                previous: previous.map(Into::into),
+                unchanged,
+                diff: wasmkeep_server::apps::Diff::default(),
+                newly_marked: false,
+            };
+        let (old, new) = ("3313a78daa7324b0", "8447609efdefe311");
+        assert_eq!(
+            super::deployed_line("acme", "shop", &deployed(new, 2, Some(old), false), false),
+            "acme/shop: version 8447609efdefe311 is current (deploy 2)"
+        );
+        assert_eq!(
+            super::deployed_line("acme", "shop", &deployed(new, 1, None, false), false),
+            "acme/shop: version 8447609efdefe311 is current (deploy 1)"
+        );
+        assert_eq!(
+            super::deployed_line("acme", "shop", &deployed(new, 3, Some(old), false), true),
+            "rolled back acme/shop: 3313a78daa7324b0 -> 8447609efdefe311 (deploy 3)"
+        );
+        assert_eq!(
+            super::deployed_line("acme", "shop", &deployed(new, 2, Some(new), true), false),
+            "acme/shop: nothing changed: version 8447609efdefe311 is already current (deploy 2)"
+        );
     }
 
     #[test]
