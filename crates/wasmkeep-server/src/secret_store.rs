@@ -76,7 +76,9 @@ impl SecretStore {
     /// slashes around it are ignored).
     pub fn new(store: Arc<dyn ObjectStore>, prefix: &str, tenant: &str, app: &str) -> Self {
         Self {
-            store,
+            // Counted for the metrics page, like the app's deploy reads:
+            // `serve` polls `secrets/current` every few seconds.
+            store: crate::counted_store::counted(store),
             prefix: prefix.trim_matches('/').to_owned(),
             tenant: tenant.to_owned(),
             app: app.to_owned(),
