@@ -323,6 +323,97 @@ async fn an_app_header_from_outside_is_stripped() {
     }
 }
 
+/// What a client may send to claim a node's or an actor's word: the app,
+/// the caller, the call chain and a signature. None of it is believed.
+const FORGED: [(&str, &str); 4] = [
+    ("x-wasmkeep-app", "evil/app"),
+    ("x-wasmkeep-caller", "default/t/evil"),
+    ("x-wasmkeep-chain", "default/t/root"),
+    (
+        "x-wasmkeep-internal",
+        "v4 1 0f1e 0000000000000000000000000000000000000000000000000000000000000000 \
+         0000000000000000000000000000000000000000000000000000000000000000",
+    ),
+];
+
+/// A client's app, caller, chain and signature headers reach no actor,
+/// whether it asks the owner or a node that relays its request: each is
+/// stripped where it arrives, and the relay sets its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_headers_from_a_client_are_stripped_from_a_relayed_request() {
+    let p = x_on_a_y_on_b().await;
+    let forged: String = FORGED
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    for node in [p.a.addr, p.b.addr] {
+        for (name, _) in FORGED {
+            let path = format!("/actor/t/x/header?name={name}");
+            let r = send_reachable(node, "GET", &path, &forged).await;
+            assert_eq!(
+                (r.status, r.body.trim(), r.node.as_deref()),
+                (200, "none", Some("a")),
+                "{name} via {node}: {}",
+                r.body
+            );
+        }
+        let r = send_reachable(node, "POST", "/actor/t/x/caller", &forged).await;
+        assert_eq!(
+            (r.status, r.body.trim(), r.node.as_deref()),
+            (200, "none", Some("a")),
+            "caller via {node}: {}",
+            r.body
+        );
+    }
+}
+
+/// The same for a WebSocket upgrade: relayed by the node the client
+/// reached, with those headers sent, it opens on the owner as any other
+/// (a client's app riding the relay would get it refused there). The
+/// guest sees no upgrade's headers, so that the caller, chain and
+/// signature are gone from the relay too is checked where its headers
+/// are built (`upgrade_headers`).
+#[tokio::test(flavor = "multi_thread")]
+async fn node_headers_from_a_client_do_not_ride_a_relayed_upgrade() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let p = x_on_a_y_on_b().await;
+    for node in [p.a.addr, p.b.addr] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ws = loop {
+            let mut req = format!("ws://{node}/actor/t/x")
+                .into_client_request()
+                .unwrap();
+            for (name, value) in FORGED {
+                req.headers_mut().insert(name, value.parse().unwrap());
+            }
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((ws, _)) => break ws,
+                // Out of the relaying node's view a moment: as
+                // `send_reachable` does.
+                Err(tokio_tungstenite::tungstenite::Error::Http(r))
+                    if r.status() == 503 && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("an upgrade via {node} with node headers: {e}"),
+            }
+        };
+        ws.send(Message::text("hi")).await.unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    assert_eq!(t.as_str(), "hi", "via {node}");
+                    break;
+                }
+                Ok(Some(Ok(_))) => {}
+                other => panic!("no echo via {node}: {other:?}"),
+            }
+        }
+    }
+}
+
 /// `serve --actor` (no `--app`): the nodes run as the implicit app
 /// `default/default`, say so in their heartbeats, and serve each other.
 #[tokio::test(flavor = "multi_thread")]
