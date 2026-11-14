@@ -1067,21 +1067,43 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     /// Whether the record at `key` still names this instance at
     /// `generation` (one read): the safeguard re-read of a parked hold
     /// (ADR 0024, section 5). `Ok(false)` once it names anything else, or
-    /// no record exists; `Err` if the bucket did not answer.
+    /// no record exists; `Err` if the bucket did not answer
+    /// (`Unavailable`) or the record cannot be decoded (`Corrupt`: proof of
+    /// nothing, so a caller keeps what it holds).
     pub async fn still_names_this(&self, key: &str, generation: u64) -> Result<bool, AcquireError> {
-        let read = self
+        let Some((body, _)) = self
             .bucket
             .get(key)
             .await
-            .map_err(|_| AcquireError::Unavailable)?;
-        Ok(read
-            .and_then(|(body, _)| OwnerRecord::decode(&body))
-            .is_some_and(|r| {
-                r.generation == generation
-                    && r.holder
-                        .as_ref()
-                        .is_some_and(|(n, i)| n == &self.node && i == &self.instance)
-            }))
+            .map_err(|_| AcquireError::Unavailable)?
+        else {
+            return Ok(false);
+        };
+        let r = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+        Ok(r.generation == generation
+            && r.holder
+                .as_ref()
+                .is_some_and(|(n, i)| n == &self.node && i == &self.instance))
+    }
+
+    /// Whether the record at `key` names this instance at any generation
+    /// (one read): after a release found the record moved on, whether the
+    /// actor is still this node's (a wake of it whose write landed
+    /// unanswered, which its resolver releases, ADR 0024 section 3). `Err`
+    /// if the bucket did not answer or the record is unreadable.
+    pub async fn names_this_instance(&self, key: &str) -> Result<bool, AcquireError> {
+        let Some((body, _)) = self
+            .bucket
+            .get(key)
+            .await
+            .map_err(|_| AcquireError::Unavailable)?
+        else {
+            return Ok(false);
+        };
+        let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+        Ok(record
+            .holder
+            .is_some_and(|(n, i)| n == self.node && i == self.instance))
     }
 
     /// After a conflict: `Superseded` unless the record still names this

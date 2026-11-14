@@ -642,7 +642,7 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> (Store, Counts, Opti
                                 incarnation: madsim::rand::random::<u32>(),
                                 nonces: 0,
                                 // Two nodes in three join with an alarm of their own.
-                                local: (madsim::rand::random::<u32>() % 3 != 0)
+                                local: (!madsim::rand::random::<u32>().is_multiple_of(3))
                                     .then(|| TIMES[usize::from(madsim::rand::random::<bool>())]),
                                 index: usize::try_from(i - 1).unwrap(),
                                 cut,

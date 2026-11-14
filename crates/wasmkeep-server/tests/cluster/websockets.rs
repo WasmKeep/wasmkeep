@@ -735,7 +735,9 @@ async fn a_parked_record_is_released_when_its_last_socket_goes() {
 /// and asked the target to take the room anyway; the target found the
 /// record still naming this node and answered that this node holds it,
 /// which the move took for done: the request was deleted and nothing
-/// moved. Once the bucket accepts the release, the target takes the room.
+/// moved. Once the bucket accepts the release, the target takes the room,
+/// and the sockets left on this node close with 1012 at once, not at the
+/// owner sweep (here every 10 minutes) or the next frame.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_room_moves_only_once_its_release_lands() {
     use object_store::ObjectStoreExt as _;
@@ -774,12 +776,12 @@ async fn a_parked_room_moves_only_once_its_release_lands() {
     .await;
     wait_drain_line(&shared, "b", "serving").await;
     settle().await;
-    let _client = join_lobby(a.addr).await;
+    let mut client = join_lobby(a.addr).await;
     lobby_parked(&shared, &a).await;
     flaky_a.fail_owner_puts.store(true, Ordering::SeqCst);
     let key = request_move_of(&shared, "chat", "lobby", "b").await;
-    // Several move passes while the release cannot land.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Several move passes while the release cannot land: the socket stays.
+    stays_open(&mut client, Duration::from_secs(4)).await;
     assert!(
         shared.head(&key).await.is_ok(),
         "the move was reported done while its release had not landed"
@@ -794,6 +796,86 @@ async fn a_parked_room_moves_only_once_its_release_lands() {
     })
     .await;
     assert_eq!(chat_holder(&shared, "lobby").await.as_deref(), Some("b"));
+    let (code, reason) = closed_within(&mut client, Duration::from_secs(5)).await;
+    assert_eq!((code, reason.as_str()), (1012, "actor moving; reconnect"));
+}
+
+/// The lobby's record made to name the same holder at a higher
+/// generation behind its node's back: a wake of that node whose write
+/// landed unanswered (ADR 0024, section 3), which its resolver releases
+/// later.
+async fn bump_lobby_behind(store: &Arc<dyn ObjectStore>) {
+    use object_store::ObjectStoreExt as _;
+    let key = object_store::path::Path::from(test_key(Family::Owners, "chat/lobby"));
+    let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+    let mut record = wasmkeep_cluster::node_lease::OwnerRecord::decode(&body).unwrap();
+    assert!(record.holder.is_some());
+    record.generation += 1;
+    store.put(&key, record.encode().into()).await.unwrap();
+}
+
+/// ADR 0017 and 0024: a parked record whose release finds the record
+/// naming this node at a later generation (a wake whose write landed
+/// unanswered) is not this hold's any more, but the room is still this
+/// node's. Before, the move took that for released: it closed the sockets
+/// and asked the target, which answered that this node holds the room.
+/// Now the sockets and the request stay while the record names this
+/// node; once it is released (by the resolver; here behind the node's
+/// back), the target takes the room and the sockets close with 1012.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_room_whose_record_names_its_node_again_keeps_its_sockets() {
+    use object_store::ObjectStoreExt as _;
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let no_sweep =
+        |c: &mut ActorConfig| c.cluster.as_mut().unwrap().socket_sweep = Duration::from_secs(600);
+    let a = node_configured(
+        "a",
+        da.path(),
+        &shared,
+        Duration::from_millis(300),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        no_sweep,
+    )
+    .await;
+    let _b = node_configured(
+        "b",
+        db.path(),
+        &shared,
+        Duration::from_secs(30),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        no_sweep,
+    )
+    .await;
+    wait_drain_line(&shared, "b", "serving").await;
+    settle().await;
+    let mut client = join_lobby(a.addr).await;
+    lobby_parked(&shared, &a).await;
+    bump_lobby_behind(&shared).await;
+    let key = request_move_of(&shared, "chat", "lobby", "b").await;
+    stays_open(&mut client, Duration::from_secs(4)).await;
+    assert!(
+        shared.head(&key).await.is_ok(),
+        "the move was reported done while the record names a"
+    );
+    assert_eq!(chat_holder(&shared, "lobby").await.as_deref(), Some("a"));
+    release_lobby_behind(&shared).await;
+    eventually("the move request is deleted", async || {
+        matches!(
+            shared.head(&key).await,
+            Err(object_store::Error::NotFound { .. })
+        )
+    })
+    .await;
+    assert_eq!(chat_holder(&shared, "lobby").await.as_deref(), Some("b"));
+    let (code, reason) = closed_within(&mut client, Duration::from_secs(5)).await;
+    assert_eq!((code, reason.as_str()), (1012, "actor moving; reconnect"));
 }
 
 /// ADR 0024: a lapse closes the sockets of a parked room and puts its

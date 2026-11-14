@@ -14,6 +14,7 @@
 //! reconnect.
 
 use super::*;
+use wasmkeep_cluster::node_lease::AcquireError;
 
 /// Ownership records the sweep reads at once.
 const SWEEP_PARALLEL: usize = 16;
@@ -29,6 +30,48 @@ const PARKED_RECHECK_EVERY: u64 = 10;
 /// Releases of parked records whose last socket went, sent at once: a
 /// burst of closed sockets does not become a burst of writes.
 const VACATED_PARALLEL: usize = 32;
+/// Rooms whose unreadable record the sweep remembers having logged: past
+/// it, further ones are counted, not logged.
+const UNREADABLE_LOGGED: usize = 1_000;
+
+/// What one read of the sweep found, for [`read_in_turn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Read (or nothing to read): go on.
+    Next,
+    /// This record cannot be decoded: counted, logged once, and passed
+    /// over, so it does not hold back the rooms after it.
+    Unreadable,
+    /// The bucket did not answer in time, or the node is shutting down or
+    /// its lease is not valid: end the pass, and start the next one here.
+    Stop,
+}
+
+/// Rooms whose unreadable record was logged already ([`UNREADABLE_LOGGED`]
+/// at most).
+type Logged = std::sync::Mutex<std::collections::HashSet<ActorAddress>>;
+
+/// Counts an unreadable record of `address` for `read` (`owner`, `parked`)
+/// and logs it the first time.
+fn unreadable(logged: &Logged, read: &str, address: &ActorAddress) -> Step {
+    crate::metrics::sweep_unreadable(read);
+    let mut logged = logged.lock().unwrap_or_else(|p| p.into_inner());
+    if logged.len() < UNREADABLE_LOGGED && logged.insert(address.clone()) {
+        tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), read, "the WebSocket sweep cannot decode this actor's ownership record; passed over");
+    }
+    Step::Unreadable
+}
+
+/// Maps one bounded read (`None`: timed out) to its value, or to the step
+/// that passes over it: an undecodable record is that record's fault, any
+/// other failure the bucket's.
+fn sweep_read<T>(read: Option<Result<T, AcquireError>>) -> Result<T, Step> {
+    match read {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(AcquireError::Corrupt)) => Err(Step::Unreadable),
+        Some(Err(_)) | None => Err(Step::Stop),
+    }
+}
 
 /// Releases the parked record of each actor whose last socket slot was
 /// freed (ADR 0024, section 3), unless it has a socket open again; at most
@@ -97,9 +140,15 @@ async fn release_unsocketed(inner: &ServiceInner, cluster: &Cluster) {
 /// parked records read once each, in a stable order from where the last
 /// re-read stopped; one that no longer names this node at the parked
 /// generation is forgotten, and its room's sockets are swept as any
-/// other's. A read that times out stops the re-read until next time,
-/// which starts at the first record not read.
-async fn recheck_parked(inner: &ServiceInner, cluster: &Cluster, cursor: &mut usize) {
+/// other's. A read that times out or that the bucket does not answer stops
+/// the re-read until next time, which starts at the first record not read;
+/// a record that cannot be decoded is kept, counted and passed over.
+async fn recheck_parked(
+    inner: &ServiceInner,
+    cluster: &Cluster,
+    cursor: &mut usize,
+    logged: &Logged,
+) {
     let mut all = cluster.parked();
     all.sort_unstable();
     read_in_turn(
@@ -108,15 +157,19 @@ async fn recheck_parked(inner: &ServiceInner, cluster: &Cluster, cursor: &mut us
         SWEEP_MAX_READS,
         |(address, generation)| async move {
             if inner.mailboxes.is_closed() || !cluster.node_lease_valid() {
-                return false;
+                return Step::Stop;
             }
             crate::metrics::inc(&crate::metrics::METRICS.websocket_sweep_reads);
-            tokio::time::timeout(
+            let read = tokio::time::timeout(
                 SWEEP_READ_TIMEOUT,
                 cluster.drop_parked_if_stale(&address, generation),
             )
-            .await
-            .is_ok()
+            .await;
+            match read {
+                Ok(crate::cluster::Recheck::Read) => Step::Next,
+                Ok(crate::cluster::Recheck::Unreadable) => unreadable(logged, "parked", &address),
+                Ok(crate::cluster::Recheck::Unanswered) | Err(_) => Step::Stop,
+            }
         },
     )
     .await;
@@ -133,7 +186,10 @@ async fn recheck_parked(inner: &ServiceInner, cluster: &Cluster, cursor: &mut us
 /// room another node now runs, and miss every broadcast without a close.
 /// Skipped while this node's lease is not valid (the close at the lapse
 /// handles that); a read that fails closes nothing, and ends the pass (the
-/// bucket is slow or out of reach: the next pass tries again). At most
+/// bucket is slow or out of reach: the next pass tries again), except a
+/// record that cannot be decoded: counted in
+/// `wasmkeep_websocket_sweep_unreadable_total`, logged once, and passed
+/// over, so one bad record never holds back the rooms after it. At most
 /// [`SWEEP_MAX_READS`] reads a pass. Holds neither the service nor the
 /// cluster while it waits, so a node dropped meanwhile stops at once (its
 /// lease is not kept renewing).
@@ -142,6 +198,7 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
     let mut cursor = 0_usize;
     let mut pass = 0_u64;
     let mut recheck_cursor = 0_usize;
+    let logged = Logged::default();
     loop {
         tokio::time::sleep(every).await;
         pass = pass.wrapping_add(1);
@@ -159,7 +216,7 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
         }
         release_unsocketed(&inner, &cluster).await;
         if pass.is_multiple_of(PARKED_RECHECK_EVERY) {
-            recheck_parked(&inner, &cluster, &mut recheck_cursor).await;
+            recheck_parked(&inner, &cluster, &mut recheck_cursor, &logged).await;
         }
         // A parked room is this node's own: no read (ADR 0024).
         let mut unheld: Vec<ActorAddress> = inner
@@ -169,23 +226,25 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
             .filter(|address| !cluster.holds_here(address) && !cluster.is_parked(address))
             .collect();
         unheld.sort_unstable();
-        let (inner_ref, cluster_ref) = (&inner, &cluster);
+        let (inner_ref, cluster_ref, logged) = (&inner, &cluster, &logged);
         read_in_turn(&unheld, &mut cursor, SWEEP_MAX_READS, |address| async move {
             let (inner, cluster) = (inner_ref, cluster_ref);
             if inner.mailboxes.is_closed() || !cluster.node_lease_valid() {
-                return false;
+                return Step::Stop;
             }
             crate::metrics::inc(&crate::metrics::METRICS.websocket_sweep_reads);
-            let read =
-                tokio::time::timeout(SWEEP_READ_TIMEOUT, cluster.other_owner(&address)).await;
-            let owner = match read {
-                Ok(Ok(Some(owner))) => owner,
-                Ok(Ok(None)) => return true,
-                Ok(Err(_)) | Err(_) => return false,
+            let read = tokio::time::timeout(SWEEP_READ_TIMEOUT, cluster.other_owner(&address))
+                .await
+                .ok();
+            let owner = match sweep_read(read) {
+                Ok(Some(owner)) => owner,
+                Ok(None) => return Step::Next,
+                Err(Step::Unreadable) => return unreadable(logged, "owner", &address),
+                Err(step) => return step,
             };
             // Taken here meanwhile: the sockets are where they belong.
             if cluster.holds_here(&address) {
-                return true;
+                return Step::Next;
             }
             let closed = inner
                 .sockets
@@ -194,7 +253,7 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
                 tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %owner, sockets = closed, "closed sockets of an actor another node holds");
                 crate::metrics::owner_closes("sweep", closed);
             }
-            true
+            Step::Next
         })
         .await;
         drop((inner, cluster));
@@ -220,11 +279,12 @@ fn window<T: Clone>(all: &[T], cursor: usize, max: usize) -> (usize, Vec<T>) {
 
 /// Reads up to `max` of `all` from `*cursor` on ([`window`]), in groups of
 /// [`SWEEP_PARALLEL`] at once, and moves the cursor past the groups read
-/// in full. `read` says whether to go on: `false` (a read that failed or
-/// timed out, or the node shutting down or its lease not valid) ends the
-/// pass after its group, and the next pass starts at that group again,
-/// so no record is skipped for a pass that stopped early.
-async fn read_in_turn<T: Clone, F: std::future::Future<Output = bool>>(
+/// in full. `read` says whether to go on: [`Step::Stop`] (the bucket did
+/// not answer, or the node is shutting down or its lease not valid) ends
+/// the pass after its group, and the next pass starts at that group
+/// again, so no record is skipped for a pass that stopped early;
+/// [`Step::Unreadable`] goes on, as that record would stop every pass.
+async fn read_in_turn<T: Clone, F: std::future::Future<Output = Step>>(
     all: &[T],
     cursor: &mut usize,
     max: usize,
@@ -234,7 +294,7 @@ async fn read_in_turn<T: Clone, F: std::future::Future<Output = bool>>(
     let mut done = 0;
     for group in taken.chunks(SWEEP_PARALLEL) {
         let ok = futures_util::future::join_all(group.iter().map(|x| read(x.clone()))).await;
-        if !ok.iter().all(|ok| *ok) {
+        if ok.contains(&Step::Stop) {
             break;
         }
         done += group.len();
@@ -380,7 +440,7 @@ mod tests {
         let seen = std::sync::Mutex::new(Vec::new());
         let read_all = |x: usize| {
             seen.lock().unwrap().push(x);
-            async { true }
+            async { Step::Next }
         };
         let mut cursor = 0;
         read_in_turn(&all, &mut cursor, SWEEP_PARALLEL * 2, read_all).await;
@@ -390,7 +450,7 @@ mod tests {
         let mut cursor = SWEEP_PARALLEL;
         let all: Vec<usize> = (0..SWEEP_PARALLEL * 4).collect();
         read_in_turn(&all, &mut cursor, all.len(), |x: usize| async move {
-            x != failing
+            if x == failing { Step::Stop } else { Step::Next }
         })
         .await;
         assert_eq!(
@@ -404,6 +464,67 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap()[SWEEP_PARALLEL * 2..],
             (SWEEP_PARALLEL * 3..SWEEP_PARALLEL * 4).collect::<Vec<_>>()[..]
+        );
+    }
+
+    /// A record that cannot be decoded is passed over, every pass: the
+    /// rooms after it (here two groups on) are still read, and the cursor
+    /// moves past it. Only the bucket not answering stops a pass.
+    #[tokio::test]
+    async fn an_unreadable_record_does_not_stop_the_sweep() {
+        assert_eq!(
+            sweep_read::<Option<String>>(Some(Err(AcquireError::Corrupt))),
+            Err(Step::Unreadable)
+        );
+        assert_eq!(
+            sweep_read::<Option<String>>(Some(Err(AcquireError::Unavailable))),
+            Err(Step::Stop)
+        );
+        assert_eq!(sweep_read::<Option<String>>(None), Err(Step::Stop));
+        assert_eq!(sweep_read(Some(Ok(None::<String>))), Ok(None));
+        let all: Vec<usize> = (0..SWEEP_PARALLEL * 4).collect();
+        let (corrupt, after) = (1, SWEEP_PARALLEL * 2 + 1);
+        let seen = std::sync::Mutex::new(Vec::new());
+        let read = |x: usize| {
+            seen.lock().unwrap().push(x);
+            let record: Result<Option<String>, AcquireError> = if x == corrupt {
+                Err(AcquireError::Corrupt)
+            } else {
+                Ok(None)
+            };
+            async move {
+                match sweep_read(Some(record)) {
+                    Ok(_) => Step::Next,
+                    Err(step) => step,
+                }
+            }
+        };
+        for _ in 0..2 {
+            let mut cursor = 0;
+            read_in_turn(&all, &mut cursor, all.len(), read).await;
+            assert_eq!(cursor, all.len(), "the pass stopped at the bad record");
+        }
+        assert_eq!(
+            seen.lock().unwrap().iter().filter(|x| **x == after).count(),
+            2
+        );
+        // The counter and the log: one warning, both counted.
+        let logged = Logged::default();
+        let address = ActorAddress::new("default", "chat", "bad").unwrap();
+        let before = crate::metrics::METRICS
+            .websocket_sweep_unreadable
+            .get(&[("read", "owner")])
+            .load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..2 {
+            assert_eq!(unreadable(&logged, "owner", &address), Step::Unreadable);
+        }
+        assert_eq!(logged.lock().unwrap().len(), 1);
+        assert!(
+            crate::metrics::METRICS
+                .websocket_sweep_unreadable
+                .get(&[("read", "owner")])
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= before + 2
         );
     }
 }

@@ -584,12 +584,11 @@ async fn run_node(
                                 }
                                 _ => {}
                             }
-                            if ended {
-                                if let Some(w) = wait.take()
-                                    && w.tries > 1 + (now - w.began_ms) / RETRY_MS
-                                {
-                                    s.waits.spun += 1;
-                                }
+                            if ended
+                                && let Some(w) = wait.take()
+                                && w.tries > 1 + (now - w.began_ms) / RETRY_MS
+                            {
+                                s.waits.spun += 1;
                             }
                         }
                         if let Ok(h) = got
@@ -731,7 +730,11 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
                         skew_ms: op_skew,
                     };
                     let mut rng = Rng::new(seed ^ 0x0FE7_CE00);
-                    while !scenario {
+                    // The scenario case has no operator.
+                    if scenario {
+                        return;
+                    }
+                    loop {
                         sleep(Duration::from_millis(2_000 + rng.below(6_000))).await;
                         let n = 1 + rng.below(3);
                         let key = format!("{NODES}n{n}");

@@ -175,6 +175,10 @@ for test in sim/tests/madsim_*.rs; do
   [ "$name" = madsim_lease ] || gate_sims+=(--test "$name")
 done
 if $full || $simulation; then
+  # The simulation tests compile only under --cfg madsim: the workspace
+  # clippy above does not see them.
+  step 'clippy (simulations)'
+  RUSTFLAGS='--cfg madsim' cargo clippy -p wasmkeep-sim --locked --all-targets --target-dir target/madsim -- -D warnings
   step 'simulations (200 seeds)'
   RUSTFLAGS='--cfg madsim' WASMKEEP_SIM_SEEDS=200 cargo test -p wasmkeep-sim --locked --target-dir target/madsim --lib "${gate_sims[@]}"
   $deep || skip 'madsim_lease (the retired per-actor lease): --deep'

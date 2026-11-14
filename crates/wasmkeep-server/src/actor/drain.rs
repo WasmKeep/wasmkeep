@@ -184,6 +184,8 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
     let every = cluster.heartbeat_period();
     // Moves under way (ADR 0017), by request key.
     let moving: moving::Active = Arc::default();
+    // Parked rooms whose move waits on their record (ADR 0024, section 3).
+    let awaiting: moving::Awaiting = Arc::default();
     loop {
         tokio::time::sleep(every).await;
         let Some(inner) = service.upgrade() else {
@@ -195,7 +197,7 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
         // Not draining: act on move requests instead (a drain already moves
         // every actor).
         if !cluster.draining() {
-            moving::moves_pass(&inner, &cluster, &moving).await;
+            moving::moves_pass(&inner, &cluster, &moving, &awaiting).await;
             continue;
         }
         let addresses = inner.mailboxes.addresses();

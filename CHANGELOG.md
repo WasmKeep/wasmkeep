@@ -240,7 +240,9 @@ Since 0.3.0, in no release yet.
     counts actor events only.
 - **A move of a room parked with open sockets waits for its record's
   release**: one whose release did not land was reported done, its
-  request deleted, while the room stayed. A lapse or a clean stop no
+  request deleted, while the room stayed. Once it lands and the target
+  takes the room, the sockets left on the old node close with 1012 at
+  once, not at the next owner sweep. A lapse or a clean stop no
   longer writes a second release for each parked room whose sockets it
   closed ([ADR 0024](docs/adr/0024-socket-home.md)).
 - **A drain or a move no longer waits until the node stops for an actor
