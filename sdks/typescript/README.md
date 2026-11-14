@@ -73,6 +73,7 @@ after `npm ci` in `sdks/typescript`).
 | `env.get(name)` | the class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/reference/api.md#interface-env)), or `undefined` |
 | `actors.self()` | this actor's address: `{ tenant, class, name }` |
 | `actors.call("class/name", { method, path, headers, body })` | call another actor, wherever it runs |
+| `actors.callMany([["class/name", request], ...])` | up to 16 calls at once: one entry per call, in input order, a response or the `CallError` it failed with (returned, not thrown) ([ADR 0025](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0025-calling-several-actors-at-once.md)) |
 | `sockets.send(conn, data)`, `sockets.broadcast(data, except?)`, `sockets.close(conn)`, `sockets.connections()` | WebSockets held by the host, open across hibernation |
 | `json(value, status?)` | a JSON response |
 | `caller(req)` | who sent the request: `{ kind: "front" }`, `{ kind: "actor", address }` or `{ kind: "outside" }` (see [Writing a front](#writing-a-front)) |

@@ -23,4 +23,5 @@ cargo run -p wasmkeep-cli -- serve examples/ts-todo-front/front.wasm \
 token=$(sed -n 's/^TOKENS=alice://p' front.env)
 curl -H "Authorization: Bearer $token" -d 'buy milk' localhost:8080/api/todos   # {"id":1}
 curl -H "Authorization: Bearer $token" localhost:8080/api/todos                 # [{"id":1,"text":"buy milk"}]
+curl -H "Authorization: Bearer $token" localhost:8080/api/team                  # {"alice":1}: actors.callMany
 ```

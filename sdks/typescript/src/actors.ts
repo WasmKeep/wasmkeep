@@ -1,8 +1,9 @@
 // Calls to the app's actors and the operator's values: what actors and
-// fronts share (`wasmkeep:actor/actors` and `wasmkeep:actor/env`, both in
-// world `front-core`), re-exported by ./index.ts and ./front.ts.
+// fronts share (`wasmkeep:actor/actors`, `wasmkeep:actor/calls` and
+// `wasmkeep:actor/env`, all in world `front-core`), re-exported by ./index.ts and ./front.ts.
 
 import * as wkActors from "wasmkeep:actor/actors@0.2.0";
+import * as wkCalls from "wasmkeep:actor/calls@0.2.0";
 import * as wkEnv from "wasmkeep:actor/env@0.2.0";
 import { CallError } from "./errors";
 
@@ -56,28 +57,64 @@ export const actors = {
 
   /** Calls actor `class/name` (same app) and waits for its response.
    * Other events to this actor wait meanwhile. From a front, the call is
-   * inside: it reaches `internal` classes. */
+   * inside: it reaches `internal` classes. Throws a {@link CallError}. */
   call(address: string, request: CallRequest = {}): CallResponse {
-    const body =
-      typeof request.body === "string" ? encoder.encode(request.body) : (request.body ?? new Uint8Array());
     let r: wkActors.Response;
     try {
-      r = wkActors.call(address, {
-        method: request.method ?? "GET",
-        path: request.path ?? "/",
-        headers: Object.entries(request.headers ?? {}),
-        body,
-      });
+      r = wkActors.call(address, lower(request));
     } catch (e) {
-      const p = (e as { payload?: { tag: string; val?: string } }).payload;
-      if (p && typeof p.tag === "string") throw new CallError(p.tag, p.val ?? p.tag);
-      throw e;
+      throw callError(e);
     }
-    return {
-      status: r.status,
-      headers: Object.fromEntries(r.headers),
-      body: r.body,
-      text: () => decoder.decode(r.body),
-    };
+    return lift(r);
+  },
+
+  /** Calls several actors at once (ADR 0025): every call starts together,
+   * and this returns once all have answered or the batch's deadline
+   * passed, one entry per call in input order: its response, or the
+   * {@link CallError} it failed with (returned, not thrown). At most 16
+   * calls; each is a {@link actors.call} in every other respect.
+   *
+   * ```ts
+   * const [cart, profile] = actors.callMany([
+   *   ["cart/alice", { path: "/" }],
+   *   ["profile/alice", { path: "/" }],
+   * ]);
+   * if (cart instanceof CallError) return unavailable(cart);
+   * ```
+   */
+  callMany(calls: ReadonlyArray<readonly [string, CallRequest?]>): Array<CallResponse | CallError> {
+    const results = wkCalls.callMany(calls.map(([address, request]) => [address, lower(request ?? {})]));
+    return results.map((r) => (r.tag === "ok" ? lift(r.val) : errorOf(r.val)));
   },
 };
+
+function lower(request: CallRequest): wkActors.Request {
+  const body =
+    typeof request.body === "string" ? encoder.encode(request.body) : (request.body ?? new Uint8Array());
+  return {
+    method: request.method ?? "GET",
+    path: request.path ?? "/",
+    headers: Object.entries(request.headers ?? {}),
+    body,
+  };
+}
+
+function lift(r: wkActors.Response): CallResponse {
+  return {
+    status: r.status,
+    headers: Object.fromEntries(r.headers),
+    body: r.body,
+    text: () => decoder.decode(r.body),
+  };
+}
+
+/** A `call-error` value as a {@link CallError}. */
+function errorOf(e: { tag: string; val?: string }): CallError {
+  return new CallError(e.tag, e.val ?? e.tag);
+}
+
+/** What `actors.call` threw, as a {@link CallError} when it is one. */
+function callError(e: unknown): unknown {
+  const p = (e as { payload?: { tag: string; val?: string } }).payload;
+  return p && typeof p.tag === "string" ? errorOf(p) : e;
+}

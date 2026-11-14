@@ -349,6 +349,7 @@ impl actors::Host for ActorHost {
                 target,
                 request,
                 wall,
+                &BodyBudget::one(),
             )
             .await)
     }
@@ -365,6 +366,47 @@ impl actors::Host for ActorHost {
             class: me.class().to_owned(),
             name: me.name().to_owned(),
         })
+    }
+}
+
+impl calls::Host for ActorHost {
+    /// ADR 0025: every entry is an `actors.call` from this actor, with the
+    /// chain one call would carry, all started at once, under one deadline
+    /// and one response budget.
+    async fn call_many(
+        &mut self,
+        calls: Vec<(String, CallRequest)>,
+    ) -> wasmtime::Result<Vec<Result<CallResponse, CallError>>> {
+        if let Some(refused) = refuse_batch(&calls) {
+            return Ok(refused);
+        }
+        let failed = |m: &str| {
+            Ok(calls
+                .iter()
+                .map(|_| Err(CallError::Failed(m.to_owned())))
+                .collect())
+        };
+        let Some(ctx) = self.call.clone() else {
+            return failed("no call context");
+        };
+        let Some(service) = ctx.service.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return failed("node is shutting down");
+        };
+        let deadline = tokio::time::Instant::now() + service.wall;
+        let caller = Caller::Actor(ctx.me.clone());
+        let budget = BodyBudget::one();
+        let entries = calls.into_iter().map(|(address, request)| {
+            let service = Arc::clone(&service);
+            let (caller, ctx, budget) = (&caller, &ctx, &budget);
+            async move {
+                let target = service.call_target(ctx.me.tenant(), &address)?;
+                let limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+                service
+                    .call(caller, &ctx.chain, target, request, limit, budget)
+                    .await
+            }
+        });
+        Ok(futures_util::future::join_all(entries).await)
     }
 }
 

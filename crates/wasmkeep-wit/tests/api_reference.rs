@@ -19,7 +19,8 @@ use wit_parser::{
 
 /// Each WIT function's name in every SDK: Rust, TypeScript, Python, C, Zig.
 /// A new function in the WIT fails `every_function_has_sdk_names` until it is
-/// listed here (and implemented in the SDKs).
+/// listed here (and implemented in the SDKs). An empty name: that SDK does
+/// not have it yet.
 const SDK_NAMES: &[(&str, [&str; 5])] = &[
     // Exports: what an actor implements.
     (
@@ -163,6 +164,11 @@ const SDK_NAMES: &[(&str, [&str; 5])] = &[
             "wk.selfAddress",
         ],
     ),
+    // Adopted SDK by SDK (ADR 0025): "" is "not yet".
+    (
+        "calls.call-many",
+        ["calls::call_many", "actors.callMany", "", "", ""],
+    ),
     (
         "env.get",
         ["env::get", "env.get", "env.get", "wk_env", "wk.env"],
@@ -303,7 +309,11 @@ fn sdk_table(out: &mut String, key: &str) {
     out.push_str(&" --- |".repeat(LANGUAGES.len()));
     out.push_str("\n|");
     for name in names {
-        write!(out, " `{name}` |").unwrap();
+        if name.is_empty() {
+            out.push_str(" not yet |");
+        } else {
+            write!(out, " `{name}` |").unwrap();
+        }
     }
     out.push_str("\n\n");
 }

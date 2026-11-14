@@ -154,3 +154,75 @@ async fn bad_addresses_and_failing_callees_are_reported() {
         "200:0"
     );
 }
+
+/// ADR 0025 from an actor: every entry carries the chain one call would,
+/// so naming the caller (or an actor waiting in the chain) is `reentrant`
+/// for that entry, and the others run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_naming_its_caller_is_reentrant_for_that_entry() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(data.path()).await;
+    let (_, body) = post(addr, "/actor/t/a/call-many?to=t/b,t/a,t/c&path=/fired").await;
+    assert_eq!(body, "200:0 | reentrant | 200:0");
+    // a -> b -> batch [a, c]: a is waiting in b's chain.
+    let (_, body) = post(
+        addr,
+        "/actor/t/a/call?to=t/b&path=%2Fcall-many%3Fto%3Dt%2Fa%2Ct%2Fc",
+    )
+    .await;
+    assert_eq!(body, "200:reentrant | 200:0");
+    // Each callee sees the caller value of a single call.
+    let (_, body) = post(addr, "/actor/t/a/call-many?to=t/b,t/c&path=/caller").await;
+    assert_eq!(body, "200:default/t/a | 200:default/t/a");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_actors_batch_runs_its_calls_at_once() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(data.path()).await;
+    let (_, body) = post(addr, "/actor/t/a/call-many?to=t/b,t/c,t/d,t/e&path=/fired").await;
+    assert_eq!(body, "200:0 | 200:0 | 200:0 | 200:0");
+    let started = std::time::Instant::now();
+    let (_, body) = post(
+        addr,
+        "/actor/t/a/call-many?to=t/b,t/c,t/d,t/e&path=%2Fsleep%3Fms%3D600",
+    )
+    .await;
+    let took = started.elapsed();
+    assert_eq!(body, "200:slept | 200:slept | 200:slept | 200:slept");
+    assert!(took < Duration::from_millis(1_500), "took {took:?}");
+    // Two entries to one callee: two events there, one after the other.
+    let (_, body) = post(
+        addr,
+        "/actor/t/a/call-many?to=t/b,t/b&path=%2Fsleep%3Fms%3D0",
+    )
+    .await;
+    assert_eq!(body, "200:slept | 200:slept");
+}
+
+/// Siblings are not in each other's chain: a batch [b, c] where b calls
+/// c and c calls b deadlocks until the call limit (5 s here, the actors'
+/// wall per event too, so the outer event ends with it), then both actors
+/// serve again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cycle_between_siblings_ends_in_timeout() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(data.path()).await;
+    let started = std::time::Instant::now();
+    // Both siblings run `call-many [b, c]`: each names itself (reentrant)
+    // and the other, which is busy waiting on it.
+    let (status, body) = post(
+        addr,
+        "/actor/t/a/call-many?to=t/b,t/c&path=%2Fcall-many%3Fto%3Dt%2Fb%2Ct%2Fc",
+    )
+    .await;
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(4_500) && took < Duration::from_secs(9),
+        "took {took:?}"
+    );
+    assert!(status != 200 || body.contains("timeout"), "{status} {body}");
+    // Nothing stays stuck.
+    assert_eq!(post(addr, "/actor/t/b/fired").await.1, "0");
+    assert_eq!(post(addr, "/actor/t/c/fired").await.1, "0");
+}

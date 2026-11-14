@@ -20,6 +20,7 @@
 /// <reference path="./interfaces/wasi-random-random.d.ts" />
 /// <reference path="./interfaces/wasmkeep-actor-actors.d.ts" />
 /// <reference path="./interfaces/wasmkeep-actor-alarms.d.ts" />
+/// <reference path="./interfaces/wasmkeep-actor-calls.d.ts" />
 /// <reference path="./interfaces/wasmkeep-actor-env.d.ts" />
 /// <reference path="./interfaces/wasmkeep-actor-storage.d.ts" />
 /// <reference path="./interfaces/wasmkeep-actor-types.d.ts" />
@@ -47,6 +48,7 @@ declare module 'wasmkeep:actor/actor@0.2.0' {
   export type * as WasiRandomRandom0212 from 'wasi:random/random@0.2.12'; // import wasi:random/random@0.2.12
   export type * as WasmkeepActorActors020 from 'wasmkeep:actor/actors@0.2.0'; // import wasmkeep:actor/actors@0.2.0
   export type * as WasmkeepActorAlarms020 from 'wasmkeep:actor/alarms@0.2.0'; // import wasmkeep:actor/alarms@0.2.0
+  export type * as WasmkeepActorCalls020 from 'wasmkeep:actor/calls@0.2.0'; // import wasmkeep:actor/calls@0.2.0
   export type * as WasmkeepActorEnv020 from 'wasmkeep:actor/env@0.2.0'; // import wasmkeep:actor/env@0.2.0
   export type * as WasmkeepActorStorage020 from 'wasmkeep:actor/storage@0.2.0'; // import wasmkeep:actor/storage@0.2.0
   export type * as WasmkeepActorTypes020 from 'wasmkeep:actor/types@0.2.0'; // import wasmkeep:actor/types@0.2.0

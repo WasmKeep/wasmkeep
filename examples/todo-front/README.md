@@ -7,8 +7,8 @@ actor per user as an inside caller, so the actors' class can be
 
 | Crate | World | Role |
 | --- | --- | --- |
-| [`front`](front) | `wasmkeep:actor/front` | `GET /` (the page), `GET /api`, and `/api/todos` (`GET`, `POST`, `DELETE /api/todos/<id>`) for the signed-in user |
-| [`todos`](todos) | `wasmkeep:actor/actor` | class `todos`: one actor per user (`todos/alice`), its list in SQLite; it answers its app's front only |
+| [`front`](front) | `wasmkeep:actor/front` | `GET /` (the page), `GET /api`, `/api/todos` (`GET`, `POST`, `DELETE /api/todos/<id>`) for the signed-in user, and `GET /api/team`: every user's count, from one `calls::call_many` |
+| [`todos`](todos) | `wasmkeep:actor/actor` | class `todos`: one actor per user (`todos/alice`), its list in SQLite (`GET /count` its size); it answers its app's front only |
 
 The same front in TypeScript is [`examples/ts-todo-front`](../ts-todo-front),
 over this `todos` class.
@@ -35,6 +35,7 @@ Open <http://localhost:8080/> and sign in with alice's token from
 token=$(sed -n 's/^TOKENS=alice://p' front.env)
 curl -H "Authorization: Bearer $token" -d 'buy milk' localhost:8080/api/todos   # {"id":1}
 curl -H "Authorization: Bearer $token" localhost:8080/api/todos                 # [{"id":1,"text":"buy milk"}]
+curl -H "Authorization: Bearer $token" localhost:8080/api/team                  # {"alice":1}
 curl -i localhost:8080/api/todos                                                # 401
 curl -i localhost:8080/actor/todos/alice                                        # 403: internal
 ```

@@ -7,6 +7,10 @@
 //! - `GET /api`: where the API is, built from `scheme()` and `host()`
 //! - `GET /api/todos`, `POST /api/todos`, `DELETE /api/todos/<id>`: the
 //!   signed-in user's list, with `Authorization: Bearer <token>`
+//! - `GET /api/team`: for a signed-in user, how many items each user of
+//!   `TOKENS` has, as JSON `{"alice":2,"bob":0}` (`null` for a list that
+//!   did not answer), gathered from every user's actor with one
+//!   `calls::call_many` (ADR 0025): one round trip, not one per user
 //!
 //! Sign-in is a token per user, from the front's secret `TOKENS`:
 //! `alice:<token>,bob:<token>`, each token at least 32 characters (make one
@@ -16,7 +20,7 @@
 //! actor's name, is checked before any call: a name taken from a request
 //! would create one database per guess.
 
-use wasmkeep_sdk::front::{self, actors, env};
+use wasmkeep_sdk::front::{self, actors, calls, env};
 use wasmkeep_sdk::http::{self, IncomingRequest, Method, ResponseOutparam};
 
 /// The class the front calls; deploy it `--access todos=internal`.
@@ -49,24 +53,82 @@ impl http::Guest for Front {
                 let body = format!("{{\"todos\":{}}}\n", json_string(&base));
                 http::respond(out, 200, "application/json", body.as_bytes());
             }
+            (Method::Get, "/api/team") => match signed_in(&request) {
+                Some(_) => team(out),
+                None => unauthorized(out),
+            },
             (_, p) if p == "/api/todos" || p.starts_with("/api/todos/") => {
                 let Some(user) = signed_in(&request) else {
-                    let response = actors::Response {
-                        status: 401,
-                        headers: vec![
-                            ("content-type".into(), "text/plain".into()),
-                            ("www-authenticate".into(), "Bearer".into()),
-                        ],
-                        body: b"sign in with Authorization: Bearer <token>\n".to_vec(),
-                    };
-                    http::respond_with(out, &response);
-                    return;
+                    return unauthorized(out);
                 };
                 api(&request, out, &method, &p["/api/todos".len()..], &user);
             }
             _ => http::respond(out, 404, "text/plain", b"not found\n"),
         }
     }
+}
+
+fn unauthorized(out: ResponseOutparam) {
+    let response = actors::Response {
+        status: 401,
+        headers: vec![
+            ("content-type".into(), "text/plain".into()),
+            ("www-authenticate".into(), "Bearer".into()),
+        ],
+        body: b"sign in with Authorization: Bearer <token>\n".to_vec(),
+    };
+    http::respond_with(out, &response);
+}
+
+/// How many items each user has: every user's actor at once.
+fn team(out: ResponseOutparam) {
+    let users = users(&env::get("TOKENS").unwrap_or_default());
+    let entries: Vec<(String, actors::Request)> = users
+        .iter()
+        .map(|user| {
+            let request = call_request("GET", "/count", Vec::new());
+            (format!("{CLASS}/{user}"), request)
+        })
+        .collect();
+    let counts: Vec<String> = users
+        .iter()
+        .zip(calls::call_many(&entries))
+        .map(|(user, result)| {
+            let n = match result {
+                Ok(r) if r.status == 200 => String::from_utf8_lossy(&r.body)
+                    .trim()
+                    .parse::<u64>()
+                    .map_or_else(|_| "null".to_owned(), |n| n.to_string()),
+                Ok(r) => {
+                    eprintln!("count of {CLASS}/{user}: status {}", r.status);
+                    "null".to_owned()
+                }
+                Err(e) => {
+                    eprintln!("count of {CLASS}/{user}: {e:?}");
+                    "null".to_owned()
+                }
+            };
+            format!("{}:{n}", json_string(user))
+        })
+        .collect();
+    let body = format!("{{{}}}\n", counts.join(","));
+    http::respond(out, 200, "application/json", body.as_bytes());
+}
+
+/// The users who can sign in with `tokens` (as [`user_for`] reads them,
+/// each once, in order), at most the 16 one `call_many` takes.
+fn users(tokens: &str) -> Vec<String> {
+    let mut users: Vec<String> = Vec::new();
+    for entry in tokens.split([',', '\n']) {
+        let Some((user, token)) = entry.trim().split_once(':') else {
+            continue;
+        };
+        let usable = valid_user(user) && token.trim().len() >= MIN_TOKEN;
+        if usable && !users.iter().any(|u| u == user) && users.len() < 16 {
+            users.push(user.to_owned());
+        }
+    }
+    users
 }
 
 /// The user's calls to their own `todos` actor.

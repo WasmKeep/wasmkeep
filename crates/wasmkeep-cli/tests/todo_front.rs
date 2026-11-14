@@ -3,8 +3,8 @@
 //! reach the `todos` actor with the front's caller value; the actor refuses
 //! everyone else, a client posing as the front included. The TypeScript
 //! front (examples/ts-todo-front, built by `scripts/languages.sh`) runs the
-//! same requests when it is built, and must be with
-//! `WASMKEEP_REQUIRE_LANGS=1`.
+//! same requests when it is built (on QuickJS, and on StarlingMonkey), and
+//! must be with `WASMKEEP_REQUIRE_LANGS=1`.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
@@ -62,14 +62,20 @@ impl Drop for Server {
 
 /// The TypeScript front on QuickJS, if it is built.
 fn ts_front() -> Option<PathBuf> {
-    let wasm =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ts-todo-front/front.wasm");
+    ts_built("front.wasm")
+}
+
+/// `examples/ts-todo-front/<file>`, if it is built.
+fn ts_built(file: &str) -> Option<PathBuf> {
+    let wasm = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/ts-todo-front")
+        .join(file);
     if wasm.exists() {
         return Some(wasm);
     }
     assert!(
         std::env::var("WASMKEEP_REQUIRE_LANGS").as_deref() != Ok("1"),
-        "examples/ts-todo-front/front.wasm is not built (scripts/languages.sh builds it)"
+        "examples/ts-todo-front/{file} is not built (scripts/languages.sh builds it)"
     );
     None
 }
@@ -199,6 +205,19 @@ fn the_typescript_front_does_the_same() {
     ));
 }
 
+/// On StarlingMonkey too, whose component lowers the batch's results
+/// itself.
+#[test]
+fn the_typescript_front_on_starlingmonkey_does_the_same() {
+    let Some(front) = ts_built("front-starlingmonkey.wasm") else {
+        return;
+    };
+    signs_in_and_reaches_the_internal_actor(&start_front(
+        front,
+        Some(&format!("alice:{ALICE},bob:{BOB}")),
+    ));
+}
+
 fn signs_in_and_reaches_the_internal_actor(server: &Server) {
     let a = server.addr;
 
@@ -251,6 +270,11 @@ fn signs_in_and_reaches_the_internal_actor(server: &Server) {
     assert_eq!(body.trim(), "[]");
     let (status, _) = request(a, "DELETE", "/api/todos/1", &bearer(ALICE), "").unwrap();
     assert_eq!(status, 204);
+    // Every user's count, from one batch of calls (ADR 0025), in order.
+    let (status, body) = request(a, "GET", "/api/team", &bearer(BOB), "").unwrap();
+    assert_eq!((status, body.trim()), (200, "{\"alice\":1,\"bob\":0}"));
+    let (status, _) = request(a, "GET", "/api/team", "", "").unwrap();
+    assert_eq!(status, 401);
 
     // No token, a wrong one, or another scheme: 401, and no call.
     for headers in [

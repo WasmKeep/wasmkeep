@@ -228,3 +228,85 @@ async fn a_front_passes_a_remote_callees_answer_on() {
     );
     assert_eq!(lease_holder(&store, "w").await.as_deref(), Some("b"));
 }
+
+/// [`front_get`] for a batch: sent again while an entry failed before
+/// reaching its owner.
+async fn front_get_batch(addr: SocketAddr, path: &str) -> Reply {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let reply = send(addr, "GET", path, "").await;
+        if !reply.body.contains(" is not reachable") || tokio::time::Instant::now() >= deadline {
+            return reply;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// ADR 0025 on a cluster: one batch from the front reaches callees on two
+/// nodes at once, each entry a signed call with the front's caller value;
+/// from an actor, each entry carries its chain across the hop, so a callee
+/// on the other node calling the batch's caller back is `reentrant`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_reaches_callees_on_two_nodes_at_once() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = front_node("a", da.path(), &store, true).await;
+    let b = front_node("b", db.path(), &store, false).await;
+    settle().await;
+
+    // t/x lives on b, t/w on a.
+    let r = send_runnable(b.addr, "POST", "/actor/t/x/durable", "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("b")),
+        "{}",
+        r.body
+    );
+    let r = send_runnable(a.addr, "POST", "/actor/t/w/durable", "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("a")),
+        "{}",
+        r.body
+    );
+
+    let batch = |path: &str| {
+        front_call("x", "POST", path).replacen("/call?to=t/x", "/call-many?to=t/x,t/w", 1)
+    };
+    let r = front_get_batch(a.addr, &batch("/caller")).await;
+    assert_eq!(r.body, "200:default/_front/main | 200:default/_front/main");
+    // At once: two 800 ms calls, one over the hop, in about one.
+    let started = std::time::Instant::now();
+    let r = front_get_batch(a.addr, &batch("/sleep?ms=800")).await;
+    let took = started.elapsed();
+    assert_eq!(r.body, "200:slept | 200:slept");
+    assert!(took < Duration::from_millis(1_500), "took {took:?}");
+    // The calls were hops, not takes.
+    assert_eq!(lease_holder(&store, "x").await.as_deref(), Some("b"));
+    assert_eq!(lease_holder(&store, "w").await.as_deref(), Some("a"));
+
+    // From actor t/w on a: t/x on b calls t/w back, which waits in the
+    // chain the hop carried; t/v (on a) is not in it.
+    let inner = "%2Fcall%3Fto%3Dt%2Fw";
+    let r = send_runnable(
+        a.addr,
+        "POST",
+        &format!("/actor/t/w/call-many?to=t/x,t/v&path={inner}"),
+        "",
+    )
+    .await;
+    assert_eq!(r.body.trim(), "200:reentrant | 200:reentrant", "{}", r.body);
+    let r = send_runnable(
+        a.addr,
+        "POST",
+        "/actor/t/w/call-many?to=t/x,t/v&path=%2Fcaller",
+        "",
+    )
+    .await;
+    assert_eq!(
+        r.body.trim(),
+        "200:default/t/w | 200:default/t/w",
+        "{}",
+        r.body
+    );
+}

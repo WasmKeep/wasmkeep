@@ -18,7 +18,7 @@ use wasmkeep_wit::wasmkeep::actor::actors::{
     CallError, Request as CallRequest, Response as CallResponse,
 };
 use wasmkeep_wit::wasmkeep::actor::types::{Rows, SqlError, SqlErrorKind, Value};
-use wasmkeep_wit::wasmkeep::actor::{actors, alarms, env, storage, types};
+use wasmkeep_wit::wasmkeep::actor::{actors, alarms, calls, env, storage, types};
 use wasmkeep_wit::{ActorCore, ActorCorePre};
 use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, InstancePre, Linker, ResourceTable};
@@ -70,6 +70,7 @@ use self::{
 };
 
 pub(crate) use self::routing::is_wasmkeep_header;
+pub(crate) use self::routing::{BodyBudget, refuse_batch};
 
 /// How long a node trusts "node X holds this actor" without asking the
 /// bucket again.
@@ -412,15 +413,18 @@ impl ActorService {
 
     /// `actors.call` from the front (ADR 0023): an inside call, with an
     /// empty chain, given up after `limit`.
+    /// The response takes its bytes from `budget` (shared by the entries
+    /// of a `calls.call-many`, ADR 0025).
     pub(crate) async fn front_call(
         &self,
         target: ActorAddress,
         request: CallRequest,
         limit: Duration,
+        budget: &BodyBudget,
     ) -> Result<CallResponse, CallError> {
         let chain: Chain = Arc::from(Vec::new());
         Arc::clone(&self.inner)
-            .call(&Caller::Front, &chain, target, request, limit)
+            .call(&Caller::Front, &chain, target, request, limit, budget)
             .await
     }
 
