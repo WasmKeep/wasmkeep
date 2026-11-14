@@ -2177,12 +2177,36 @@ fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
     }
     if drain {
         rt.block_on(keys.put_empty(&key))?;
-        println!("{}", drain_asked(&args.node));
     } else {
         rt.block_on(keys.delete(&key))?;
+    }
+    announce_intent(&rt, &keys);
+    if drain {
+        println!("{}", drain_asked(&args.node));
+    } else {
         println!("Withdrew the drain request for {}.", args.node);
     }
     Ok(())
+}
+
+/// Tells the nodes an intent changed (`control/changed`, ADR 0014,
+/// amendment of 2026-11-14), so they list the intents within a heartbeat
+/// period. If that write fails, the intent is still read, by every node's
+/// listing a minute at the latest: a warning, not an error.
+fn announce_intent(
+    rt: &tokio::runtime::Runtime,
+    keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
+) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let token = format!("cli {} {nanos}", std::process::id());
+    if let Err(e) = rt.block_on(wasmkeep_cluster::control::announce(keys, &token)) {
+        eprintln!(
+            "warning: the request is written, but telling the nodes failed ({e}): they read it \
+             within a minute instead of a few seconds"
+        );
+    }
 }
 
 /// What `cluster drain` prints once the request is written: the states the
@@ -2388,6 +2412,7 @@ fn actor_move_on(
         let _ = rt.block_on(keys.delete(&key));
         return Err(e);
     }
+    announce_intent(&rt, &keys);
     println!(
         "Asked the owner of {tenant}/{class}/{name} to move it to {} (expires in 5 minutes).",
         args.to
@@ -2447,6 +2472,9 @@ fn actor_delete_on(
         let _ = rt.block_on(keys.delete(&key));
         return Err(e);
     }
+    // Nodes list the requests when `control/changed` changes (ADR 0014,
+    // amendment of 2026-11-14).
+    announce_intent(&rt, &keys);
     let written = listed(&keys)?
         .into_iter()
         .find(|(k, _)| *k == key)
@@ -3043,7 +3071,17 @@ mod tests {
         rt.block_on(store.put(&segment, PutPayload::from("x")))
             .unwrap();
         super::actor_delete_on(&delete_args(&["--no-wait"]), open, poll).unwrap();
-        let keys = keys_of(&store);
+        // The request, and `control/changed` rewritten after it, so nodes
+        // list it within a period (ADR 0014, amendment of 2026-11-14).
+        let all = keys_of(&store);
+        assert!(all.contains(&"wk/control/changed".to_owned()), "{all:?}");
+        let requests = |store: &std::sync::Arc<dyn ObjectStore>| -> Vec<String> {
+            keys_of(store)
+                .into_iter()
+                .filter(|k| k != "wk/control/changed")
+                .collect()
+        };
+        let keys = requests(&store);
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert_eq!(keys[0], segment.to_string());
         let request = keys[1].clone();
@@ -3057,7 +3095,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("not deleted yet"), "{e}");
-        assert_eq!(keys_of(&store).len(), 3);
+        assert_eq!(requests(&store).len(), 3);
         // Requests carried out as a node does: the outcome written, then
         // the request deleted.
         let carry_out = |store: &std::sync::Arc<dyn ObjectStore>, outcome: &str| {
@@ -3096,7 +3134,7 @@ mod tests {
         assert!(e.contains("no such actor"), "{e}");
         // Carried out: done, and the outcome read is removed.
         run_with(".done").unwrap();
-        assert_eq!(keys_of(&store), [segment.to_string()], "left behind");
+        assert_eq!(requests(&store), [segment.to_string()], "left behind");
         assert!(
             super::Cli::try_parse_from([
                 "wasmkeep",

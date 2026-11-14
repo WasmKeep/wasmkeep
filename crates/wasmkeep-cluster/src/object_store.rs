@@ -177,6 +177,25 @@ impl Directory for ObjectStoreBucket {
         }
         Ok(out)
     }
+
+    async fn read(&self, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            match self.store.get(&self.path(key)).await {
+                Ok(r) => out.push((
+                    key.clone(),
+                    r.bytes()
+                        .await
+                        .map_err(|e| BucketError::Unavailable(e.to_string()))?
+                        .to_vec(),
+                )),
+                // Deleted (`cluster forget`): no longer a node.
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(BucketError::Unavailable(e.to_string())),
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl ObjectStoreBucket {
@@ -318,6 +337,23 @@ impl Keys for ObjectStoreBucket {
         self.put_mode(key, Vec::new(), PutMode::Overwrite)
             .await
             .map(drop)
+    }
+
+    async fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+        self.put_mode(key, body, PutMode::Overwrite).await.map(drop)
+    }
+
+    async fn get_body(&self, key: &str) -> Result<Option<Vec<u8>>, BucketError> {
+        match self.store.get(&self.path(key)).await {
+            Ok(r) => Ok(Some(
+                r.bytes()
+                    .await
+                    .map_err(|e| BucketError::Unavailable(e.to_string()))?
+                    .to_vec(),
+            )),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(BucketError::Unavailable(e.to_string())),
+        }
     }
 
     async fn delete(&self, key: &str) -> Result<(), BucketError> {

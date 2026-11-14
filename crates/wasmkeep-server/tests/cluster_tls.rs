@@ -145,6 +145,14 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 }
 
+/// A node that says no hello (as `heartbeats` writes one, or a node of
+/// 0.4.1) is found by its peers' scheduled listing of `nodes/`, every ten
+/// heartbeat periods (ADR 0020, amendment of 2026-11-14): 1 s here, and
+/// a second of slack.
+async fn settle_joined() {
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+}
+
 struct Reply {
     status: u16,
     node: Option<String>,
@@ -459,7 +467,7 @@ async fn the_cluster_port_trusts_live_pins_only_and_never_forwards() {
     // Once x's heartbeat lists its pin, b lets it in.
     let alive = Arc::new(AtomicBool::new(true));
     heartbeats(&store, x.pin.clone(), Arc::clone(&alive));
-    settle().await;
+    settle_joined().await;
     let r = parse(&get_as(port, &x, "/_wasmkeep/health").await.unwrap());
     assert_eq!(r.status, 200);
 
@@ -609,7 +617,7 @@ async fn refuse_mode_honours_node_calls_on_the_cluster_port_only() {
     let x = stranger();
     let alive = Arc::new(AtomicBool::new(true));
     heartbeats(&store, x.pin.clone(), Arc::clone(&alive));
-    settle().await;
+    settle_joined().await;
     let caller = "default/t/someone";
     let public = |addr: SocketAddr, req: String| async move {
         exchange(TcpStream::connect(addr).await.unwrap(), &req).await

@@ -28,6 +28,13 @@
   by ordering, not by clocks, and is now counted
   (`wasmkeep_releases_after_lapse_total`: every release that landed
   while the node's lease was not valid, logged once per lapse).
+- Amended 2026-11-14 (0.4.2): a node lists `nodes/` every ten heartbeat
+  periods (30 s) and, in between, reads the object of each node it
+  already knows, one GET each: the same bodies, so the fence watch and the
+  failover timings are unchanged for known nodes. A node that starts says
+  hello to its peers so they list at once ([ADR 0011](0011-node-to-node-mtls.md),
+  amendment of the same day). See "Amendment of 2026-11-14: fewer
+  listings of nodes/" at the end.
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 - Amends: [ADR 0007](0007-replication-protocol.md),
@@ -695,3 +702,104 @@ Recorded runs:
   format) and `cluster forget` (a stale old-format heartbeat only). ADR
   0012 is amended (heartbeats, markers and records are never collected),
   and the revocation in [security](../security.md) is rewritten.
+
+## Amendment of 2026-11-14: fewer listings of nodes/
+
+Each node listed `nodes/` every heartbeat period and then read every
+object the listing gave ("Cost, after"): 0.33 LIST/s per node at 3 s,
+priced on R2 and S3 like a PUT. The listing is needed only to find nodes
+this node does not know yet; the bodies of the nodes it knows are what
+the fence watch, the failover wait, the pins and the peer list use, and a
+GET of each gives the same body.
+
+### The rule
+
+`heartbeat_loop` (`cluster/view.rs`), with
+`membership::full_listing_due`:
+
+- A listing of `nodes/` at the node's first period, every
+  `FULL_LISTING_EVERY` (10) periods (30 s), and when one was asked for:
+  a hello from a peer that just started, an ownership record naming a
+  node this node has never seen (`Cluster::address_of`), or with TLS an
+  unknown pin knocking ([ADR 0011](0011-node-to-node-mtls.md), amendment
+  of the same day). An asked-for listing is made at once, at most one
+  early listing a period and none in a period that listed already; one
+  asked for after that is made at the next period. A scheduled listing
+  that fails is tried again the next period.
+- In the other periods, one GET of each node the last refresh found,
+  live or not, this node's own included (`Membership::heartbeats_of`). An
+  object that is gone (`cluster forget`) drops out; a read that fails
+  fails the refresh, which keeps the last view, as a failed listing did.
+- Everything after the read is the same code for both: the twin check,
+  the notes about old versions and leases dated ahead, the peer list, the
+  pins, `failover.observe` and the fence watch.
+
+### What still holds
+
+- **Fencing (section 2).** The watch sees the same bodies, every period,
+  for every node it knows; the decision is still made on its own fresh
+  versioned GET, conditional on it. A node is fenced exactly when it was
+  before.
+- **The free rule (section 3)** reads `nodes/A` after the record, as
+  before; it never used the listing.
+- **Failover timings for a node that was known:** a dead node's lease is
+  watched from the same reads, so the time to fence it, and the time
+  until its actors can be taken, are unchanged. A node fenced, released,
+  restarted with a new instance, or forgotten is seen within a period, as
+  before.
+- **The twin check** still reads this node's own object every period.
+
+### What got slower, worst cases at the defaults
+
+| Event | Before | After |
+| --- | --- | --- |
+| A node of 0.4.2 starts: its peers see it | 3 s | 3 s (its hello makes them list at once; one that already listed early in that period lists at the next) |
+| A node that says no hello starts (0.4.1 in a rolling upgrade, or every hello lost) | 3 s | 30 s, or within a period of its first handshake with an unknown pin over TLS |
+| A node that starts, takes actors and dies before any peer saw it | fenced a lease period plus an attempt after the peers' first sight (3 s after its start) | the same, after the peers' first sight: within a period with its hello, up to 30 s without |
+
+Until a peer sees a new node, it sends nothing to it, counts it in no
+alarm shard and drains nothing to it; a request reaching that peer for an
+actor the new node already holds gets a 503 to retry (the record names a
+node the peer cannot reach), and makes the peer list at once, so for
+about a period. Placement and availability only, never ownership.
+
+### Cost after
+
+Per node and period, at N nodes: N GETs, as before, and one LIST every
+ten periods instead of every period. Three nodes at 3 s: 0.033 LIST/s
+and 1.0 GET/s per node, from 0.33 LIST/s and 1.0 GET/s. Measured in
+`tests/cluster/listings.rs`
+(`an_idle_node_lists_and_reads_what_its_cadences_say`: 11 listings and
+360 heartbeat reads in 120 periods, per node).
+
+The planned improvement above (read a body only when its listed ETag
+changed) saves nothing at idle: a live node rewrites `written_at` on
+every renewal, so every live node's body changes every period. It would
+save the reads of objects of nodes that stopped and were not forgotten.
+
+### Rolling upgrades
+
+A node of 0.4.1 lists every period, as before, and sees nodes of 0.4.2 at
+once; it answers their hello 404 (a reserved path, never reaching a
+component), which changes nothing on either side. A node of 0.4.2 finds
+a node of 0.4.1 that starts within 30 s (above), or sooner over TLS.
+Nothing in the bucket changes format.
+
+### Simulation
+
+`sim/tests/madsim_node_lease.rs` already watched peers by reading each
+peer's object in turn (its fixed peer set; discovery is not modelled):
+the model of the new periods. It passes at 200 seeds, its broken
+variants caught as before.
+
+### Tests
+
+`tests/cluster/listings.rs`: `an_idle_node_lists_and_reads_what_its_cadences_say`
+(the counted cadences of three idle nodes),
+`a_node_that_joins_is_listed_by_its_peers_within_a_period` (fails without
+the hello), `a_node_without_hellos_is_found_by_the_scheduled_listing`
+(a node of 0.4.1, its heartbeat written by the test at an address that
+answers 404, as 0.4.1 answers a hello).
+`tests/revocation.rs`: the old process that "does not list the
+heartbeats" (`Revoke::NewKey`, and the node cut off from listings) now
+also cannot read them one by one; the guarantee checked is the same.

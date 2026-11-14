@@ -213,6 +213,9 @@ pub(crate) struct Metrics {
     /// Fences this node wrote over another node's lease (ADR 0020): that
     /// node stopped writing it for longer than its ttl plus grace.
     pub(crate) node_fences: AtomicU64,
+    /// Hellos from peers that just started (ADR 0011, amendment of
+    /// 2026-11-14): each asks for a listing of `nodes/` at once.
+    pub(crate) hellos_received: AtomicU64,
     /// Ownership records this node released after its own lease ran out,
     /// before its lease task saw the lapse (ADR 0020, section 1): another
     /// node may take those actors at once, without a fence.
@@ -777,6 +780,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_node_fences_total",
         "Fences this node wrote over a node that stopped renewing its lease.",
         m.node_fences.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_node_hellos_total",
+        "Signed hellos from peers that just started, each asking for a listing of the nodes.",
+        m.hellos_received.load(Ordering::Relaxed),
     );
     counter(
         &mut out,

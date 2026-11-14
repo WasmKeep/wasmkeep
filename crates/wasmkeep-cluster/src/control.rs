@@ -2,15 +2,24 @@
 //! ([ADR 0014](../../../docs/adr/0014-draining-a-node-and-moving-an-actor.md)),
 //! delete an actor ([ADR 0028](../../../docs/adr/0028-actors-that-end.md)).
 //!
-//! An intent is an object *key* under `control/`; bodies are empty and never
-//! read. Nodes list the prefix once per heartbeat period, reading keys and
-//! their last-modified time (the bucket's clock) only.
+//! An intent is an object *key*; bodies are empty and never read. Nodes
+//! list the intents' prefixes reading keys and their last-modified time
+//! (the bucket's clock) only.
 //!
 //! ```text
 //! control/drain/<node-id>
 //! state/<tenant>/<app>/moves/<class>/<name hex>/<target node-id>
 //! state/<tenant>/<app>/deletes/<class>/<name hex>/<request id>
+//! control/changed
 //! ```
+//!
+//! Every writer of an intent (the CLI, a node deleting a move or a delete
+//! request it acted on) rewrites `control/changed` with a new body right
+//! after ([`announce`]). Nodes read that one object every heartbeat period
+//! and list the intents only when its body changed, or every
+//! [`LISTING_FALLBACK_EVERY`] periods whatever it says, which covers
+//! writers that do not announce (CLIs of 0.4.1 and before) and an announce
+//! that failed ([`ControlWatch`]; ADR 0014, amendment of 2026-11-14).
 //!
 //! A drain names a node, shared by the bucket prefix; a move or a delete
 //! is an app's, under its state root (ADR 0022). Each delete request has
@@ -29,6 +38,14 @@ use crate::state_root::{Family, STATE_PREFIX, StateRoot};
 pub const CONTROL_PREFIX: &str = "control/";
 const DRAIN: &str = "control/drain/";
 
+/// Rewritten with a new body after every intent written or deleted: nodes
+/// list the intents when it changes.
+pub const CHANGED: &str = "control/changed";
+
+/// Heartbeat periods after which a node lists the intents even though
+/// [`CHANGED`] did not change: 60 s at the default 3 s period.
+pub const LISTING_FALLBACK_EVERY: u32 = 20;
+
 /// A move key older than this, by the bucket's clock, is ignored and
 /// deleted by the next node that lists it.
 pub const MOVE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -45,6 +62,10 @@ pub trait Keys {
     async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>, BucketError>;
     /// Writes `key` with an empty body.
     async fn put_empty(&self, key: &str) -> Result<(), BucketError>;
+    /// Writes `key` with `body`, unconditionally.
+    async fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError>;
+    /// The body of `key`, `None` if it does not exist.
+    async fn get_body(&self, key: &str) -> Result<Option<Vec<u8>>, BucketError>;
     /// Deletes `key`; deleting a missing key succeeds.
     async fn delete(&self, key: &str) -> Result<(), BucketError>;
 }
@@ -266,6 +287,71 @@ fn segment(s: &str) -> bool {
         && s != ".."
         && !s.contains('/')
         && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Tells the nodes that an intent was written or deleted: rewrites
+/// [`CHANGED`] with `token`, which must differ from any body written
+/// before (a time with sub-millisecond digits and the writer's process
+/// id do). Called after the intent's own write or delete has been
+/// acknowledged, so a node that reads the new body and then lists sees
+/// the intent.
+pub async fn announce<K: Keys>(keys: &K, token: &str) -> Result<(), BucketError> {
+    keys.put_body(CHANGED, format!("{token}\n").into_bytes())
+        .await
+}
+
+/// When a node lists the intents (ADR 0014, amendment of 2026-11-14): at
+/// its first period, whenever [`CHANGED`] reads differently than at the
+/// last successful listing, and every [`LISTING_FALLBACK_EVERY`] periods
+/// anyway. A failed read of [`CHANGED`] lists nothing (the bucket is not
+/// answering) unless the fallback is due; a failed listing is tried again
+/// next period, the last intents kept meanwhile.
+#[derive(Debug, Clone, Default)]
+pub struct ControlWatch {
+    /// What [`CHANGED`] read before the last successful listing.
+    listed_with: Listed,
+    /// Periods since the last successful listing.
+    since_listing: u32,
+}
+
+/// [`ControlWatch::listed_with`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Listed {
+    /// No successful listing yet.
+    #[default]
+    Never,
+    /// Listed after a read of [`CHANGED`] that failed: the next good read
+    /// lists again.
+    Unread,
+    /// Listed after reading this (`None`: absent).
+    Marker(Option<Vec<u8>>),
+}
+
+impl ControlWatch {
+    /// No listing yet: the first period lists.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether to list this period, given this period's read of
+    /// [`CHANGED`] (`Err(())`: the read failed). Counts the period.
+    pub fn should_list(&mut self, marker: Result<Option<&[u8]>, ()>) -> bool {
+        self.since_listing = self.since_listing.saturating_add(1);
+        let fallback = self.since_listing >= LISTING_FALLBACK_EVERY;
+        match (&self.listed_with, marker) {
+            (Listed::Never, _) => true,
+            (_, Err(())) => fallback,
+            (Listed::Unread, Ok(_)) => true,
+            (Listed::Marker(then), Ok(now)) => fallback || then.as_deref() != now,
+        }
+    }
+
+    /// A listing succeeded after this period's read of [`CHANGED`]
+    /// (`None`: that read failed).
+    pub fn listed(&mut self, marker: Option<Option<Vec<u8>>>) {
+        self.since_listing = 0;
+        self.listed_with = marker.map_or(Listed::Unread, Listed::Marker);
+    }
 }
 
 /// Reads the intents: drain markers, and the moves and deletes of
@@ -531,6 +617,36 @@ mod tests {
         ]
         .map(|k| (k.to_owned(), 0));
         assert_eq!(parse(&listed, 0), (Control::default(), Vec::new()));
+    }
+
+    #[test]
+    fn the_watch_lists_first_on_a_change_and_on_the_fallback() {
+        let mut w = ControlWatch::new();
+        // The first period lists, whatever the marker says.
+        assert!(w.should_list(Ok(None)));
+        w.listed(Some(None));
+        // Unchanged: not listed until the fallback.
+        for _ in 1..LISTING_FALLBACK_EVERY {
+            assert!(!w.should_list(Ok(None)));
+        }
+        assert!(w.should_list(Ok(None)), "the fallback lists");
+        w.listed(Some(None));
+        // A change lists at once, and once.
+        assert!(w.should_list(Ok(Some(b"1\n"))));
+        w.listed(Some(Some(b"1\n".to_vec())));
+        assert!(!w.should_list(Ok(Some(b"1\n"))));
+        assert!(w.should_list(Ok(Some(b"2\n"))));
+        // A listing that failed is not recorded: the next period lists.
+        assert!(w.should_list(Ok(Some(b"2\n"))));
+        w.listed(Some(Some(b"2\n".to_vec())));
+        // A read that fails lists nothing before the fallback.
+        for _ in 1..LISTING_FALLBACK_EVERY {
+            assert!(!w.should_list(Err(())));
+        }
+        assert!(w.should_list(Err(())));
+        // Listed after a failed read: the next good read lists again.
+        w.listed(None);
+        assert!(w.should_list(Ok(Some(b"2\n"))));
     }
 
     #[test]

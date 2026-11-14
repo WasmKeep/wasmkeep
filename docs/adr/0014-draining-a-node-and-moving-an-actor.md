@@ -24,6 +24,10 @@
   had not listed the drain yet left the alarm to it, and nobody fired it
   until the sweep (`a_handed_alarm_waits_for_the_senders_release`).
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): move keys move under the app's root, and node-to-node calls carry the app.
+- Amended 2026-11-14 (0.4.2): nodes read one object, `control/changed`,
+  every heartbeat period and list the intents only when it changed, or
+  every 20 periods (60 s) anyway; writers of an intent rewrite it. See
+  "Amendment of 2026-11-14" at the end.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster)
 
@@ -430,3 +434,94 @@ updated afterwards. `undrain` returns it to `serving`.
 | Docs: `docs/cluster.md`, `docs/deploy/three-nodes.md` | S | done |
 | Sweep shards skip draining nodes and other apps | S | done |
 | `actor move` (needs the target to acquire first) | M | done in [ADR 0017](0017-moving-one-actor.md) |
+
+## Amendment of 2026-11-14: the intents are listed when they change
+
+Measured on an idle three-node cluster, each node sent 1.10 LIST/s, and
+on R2 and S3 a LIST costs what a PUT costs. Two thirds of that was the
+intents: since ADR 0022 a node lists two prefixes every heartbeat
+period, `control/drain/` and its app's `state/<tenant>/<app>/moves/`, not
+the one this record's Consequences counted ("one more LIST per node per
+period" was one LIST until 0.4.0, two since). At the default 3 s period
+that is 0.67 LIST/s per node, about 1.7 million a month, for intents an
+operator writes a few times a month. [ADR 0028](0028-actors-that-end.md)
+then added a third prefix, the app's `deletes/`, listed the same way:
+1.0 LIST/s per node.
+
+### What changes
+
+- **A marker of change.** `control/changed` holds a body no writer wrote
+  before (a time with sub-millisecond digits and the writer's process,
+  or the node's random seed and a counter). Every writer of an intent
+  rewrites it after its own write or delete was acknowledged: `cluster
+  drain`, `cluster undrain`, `actor move`, `actor delete` (ADR 0028), and
+  a node that deletes a move request it acted on (`delete_move`) or ends
+  a delete request (`end_delete_request`, after its outcome is written);
+  either also forgets the request in its own copy at once, and keeps it
+  out of that copy until it expires, so a listing in flight cannot bring
+  it back.
+- **Nodes read it, and list on a change.** Every heartbeat period a node
+  GETs `control/changed`. It lists the prefixes, as before, at its first
+  period; when the body differs from the one it read before its last
+  successful listing; and every 20 periods anyway
+  (`control::LISTING_FALLBACK_EVERY`, 60 s at the default 3 s), whatever
+  the marker says (`control::ControlWatch`).
+- **Order.** The marker is written after the intent, and a node reads the
+  marker before it lists. A node that reads the new body therefore lists
+  after the intent was acknowledged, and sees it: the bucket's
+  read-after-write consistency, which WasmKeep already requires (the
+  start check tests conditional writes on the same store).
+
+### What still holds
+
+- **A failed listing changes nothing.** A failed listing is not recorded:
+  the next period reads the marker and lists again, and the node keeps
+  the intents it read last meanwhile. A failed read of the marker lists
+  nothing (the bucket is not answering), except when the fallback is due.
+  A failure still never undrains a node.
+- **Safety does not depend on the intents.** Ownership is the node lease
+  and the ownership records (ADR 0020). An intent read late only makes a
+  drain, an undrain or a move start late; a draining node that still
+  receives an actor sends it on (above, "A draining node stops claiming").
+- Eligibility ("no drain marker in D's last listing") is as of the last
+  listing, as before; it lags only as the listing does (below).
+
+### What got slower, worst cases at the defaults
+
+| Intent | Before | After |
+| --- | --- | --- |
+| Drain, undrain or move from a CLI of 0.4.2 on | 3 s (the next period) | 3 s (the next period's read of the marker) |
+| The same from a CLI of 0.4.1 or before (it does not write the marker), or when the marker write failed (the CLI warns) | 3 s | 60 s (the fallback) |
+| A completed move, as other nodes see it | 3 s | 3 s (the node that deleted it writes the marker) |
+| An operator delete from `actor delete` of 0.4.2 (ADR 0028) | 3 s | 3 s; the request is ended by the node that carried it out, which writes the marker, so the others stop acting on it (each would otherwise restore the actor to find it carried out) within a period |
+| An expired move key (5 minutes) | ignored from the next listing on (3 s) | ignored at once: a node checks the expiry of the requests it keeps from its last listing every time it acts on them (`Cluster::moves`), as a listing does; the key itself is deleted at the next listing, within 60 s |
+
+### Cost after
+
+Per node and period: one GET; three LISTs (drains, the app's moves and
+deletes) every 20 periods. At 3 s: 0.05 LIST/s and 0.33 GET/s per node,
+from 1.0 LIST/s. Measured in `tests/cluster/listings.rs`
+(`an_idle_node_lists_and_reads_what_its_cadences_say`: 18 listings of
+the intents in 120 periods per node).
+
+### Rolling upgrades
+
+A node of 0.4.1 ignores `control/changed` and lists its prefixes every
+period, as before (it has no `deletes/`, and ignores delete requests); a node of 0.4.2 reads intents written by either CLI,
+those of an old CLI within the 60 s fallback. Nothing is refused in
+either direction. Upgrading the CLI with the nodes brings the reaction
+back to a period.
+
+### Tests
+
+`tests/cluster/listings.rs`:
+`an_announced_intent_is_listed_within_a_period_and_an_unannounced_one_by_the_fallback`
+(a period with the marker; the fallback, counted in periods, without).
+`draining.rs`, `a_drain_marker_reaches_the_heartbeat_and_a_failed_listing_keeps_it`:
+the drain is written without the marker (read by the fallback), and the
+undrain with it, so that the next period's listing is the one that fails
+(without the marker the node would not list in that window at all, and
+the test would no longer test a failed listing). The tests' `drain` and
+`request_move` helpers write the marker as the CLI does.
+`control::tests::the_watch_lists_first_on_a_change_and_on_the_fallback`
+covers the watch's rule.

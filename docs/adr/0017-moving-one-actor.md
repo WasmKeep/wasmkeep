@@ -11,6 +11,9 @@
   `sim/tests/madsim_drain.rs` models the node leases of
   [ADR 0020](0020-one-lease-per-node.md).
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): move keys move under the app's root, and `actor move` gains `--app`.
+- Amended 2026-11-14 (0.4.2): move keys are listed when `control/changed`
+  changes, or every 60 s, not every period ([ADR 0014](0014-draining-a-node-and-moving-an-actor.md),
+  amendment of 2026-11-14); see "Amendment of 2026-11-14" at the end.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster) (the part [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) left open)
 
@@ -240,3 +243,35 @@ that owner acts.
 | Targets take actors nobody holds | S |
 | Sim case, adversarial review of the code | M |
 | Docs: `docs/cluster.md`, ADR 0014's note | S |
+
+## Amendment of 2026-11-14: move keys are listed when they change
+
+Nodes no longer list the app's `moves/` every heartbeat period
+([ADR 0014](0014-draining-a-node-and-moving-an-actor.md), amendment of
+2026-11-14): they read `control/changed` every period and list when it
+changed, or every 60 s. `actor move` writes the marker after the move
+key, and the node that deletes a request it acted on (done, an actor
+that does not exist, a newer request for the same actor) writes it after
+the delete and forgets the request at once.
+
+- **What still holds:** a move is a drain of one actor; the take call,
+  the owner's hand-over and the 5-minute expiry by the bucket's clock
+  are unchanged. Nothing about ownership depends on when a node reads a
+  move.
+- **What got slower:** a move requested by `actor move` of 0.4.2 starts
+  within a period (3 s), as before. One requested by a CLI of 0.4.1 or
+  before starts within 60 s instead of 3 s. A request deleted by the node
+  that completed it reaches the others within a period, as before; if
+  that node's marker write fails, the others act on their copy until
+  their next listing (at most 60 s), as a node acted on a request between
+  its deletion and its next listing before (then up to 3 s): the target
+  finds the actor held by itself (`Taken::Held`) and deletes the key
+  again, a node that does not hold it does nothing; one that has come to
+  hold it since moves it to the target once more, a move the operator
+  asked for. The node that deleted the request keeps it out of its own
+  copy until it expires, so a listing in flight during the delete does
+  not bring it back there.
+- **Cost:** see ADR 0014's amendment (the prefixes are listed
+  together).
+- **Tests:** the move tests in `tests/cluster/draining.rs` write the
+  marker as the CLI does (`request_move_of`).

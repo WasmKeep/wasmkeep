@@ -96,7 +96,7 @@ only saves the caller the retries. A kept request asks for the actor up
 to a second after this node learns it is free (the requests kept for
 different actors are spread over that second), which is at its own fence
 of the dead node or, when another node wrote the fence, at its next
-heartbeat listing (up to 3 s later). A request is kept when the node
+next read of the heartbeats (up to 3 s later). A request is kept when the node
 has a reason to think the owner is gone or going:
 
 - the owner's heartbeat left this node's view (10 s after its last write)
@@ -186,7 +186,7 @@ What the wait does not cover, with the defaults:
   to it that still work. They are released when a heartbeat listing shows
   a lease write of that node more than 2 s (twice the allowed clock skew)
   after the failure: about 2 to 8 s later, since a node writes its lease
-  every 3 s and this node lists every 3 s. They are then sent to the
+  every 3 s and this node reads the heartbeats every 3 s. They are then sent to the
   owner as usual, and get its answer or the 503 they would have got at
   once. Nobody takes the actors. The node is then not suspected again for
   10 s; while the fault lasts, the next failed connection after that
@@ -210,6 +210,30 @@ What the wait does not cover, with the defaults:
 
 `wasmkeep_failover_waits_total` counts the kept requests and how each
 wait ended ([monitoring](monitoring.md)).
+
+### What an idle cluster asks of the bucket
+
+With nothing to do, each node of a three-node cluster with one app sends
+the bucket, per heartbeat period (3 s by default), since 0.4.2
+([ADR 0009, 0011, 0014 and 0020](adr/0020-one-lease-per-node.md), amendments of 2026-11-14):
+
+| What | Requests | Per node, at 3 s |
+| --- | --- | --- |
+| Its node lease | 1 PUT a period | 0.33 PUT/s |
+| The other nodes' heartbeats | 1 GET per node a period; a LIST of `nodes/` every ten periods (30 s), and at once when a node that just started says hello | 1.0 GET/s, 0.033 LIST/s |
+| The operator's intents (drains, moves, actor deletes) | 1 GET of `control/changed` a period; the three LISTs of the intents when it changed, or every minute | 0.33 GET/s, 0.05 LIST/s |
+| The alarm index | 1 LIST when an entry is due for the sweep, at most every 10 s and at least every minute | 0.017 LIST/s with no alarms |
+| The deployed version, its tombstone, and the secrets (`--app`) | 1 GET each a period | 1.0 GET/s |
+| Idle expiry, on one node, for an app whose classes expire | 2 LISTs (`owners/`, `alarms/`) every 10 minutes | 0.003 LIST/s on that node |
+
+About 0.1 LIST/s per node, down from 1.43 (1.1 in 0.4.1, before the
+app's delete requests were listed too), so about 780,000 LISTs a month
+for the three nodes instead of 11 million. What got
+slower: a drain, an undrain or a move requested by a CLI of 0.4.1 or
+before is read within a minute instead of 3 s (one from the 0.4.2 CLI
+still within 3 s); a node of 0.4.1 that starts is seen by 0.4.2 peers
+within 30 s; and an alarm whose owner is alive but never fires it can
+wait up to 75 s instead of 25 s.
 
 ## Replication
 
@@ -600,7 +624,7 @@ bucket controls the cluster, as with the call secret.
   remove a machine, stop and disable its service too, and rotate its
   bucket credentials ([security](security.md#layers), "Revocation"). A
   node stops trusting a peer whose heartbeat is fenced, released, deleted
-  or names a new key at its next listing of
+  or names a new key at its next read of
   the heartbeats (one per heartbeat, 3 s by default), and one whose
   heartbeat stops at its expiry: three heartbeat periods plus the allowed
   clock skew, 10 s with the defaults, also when the node cannot list the
@@ -1087,6 +1111,13 @@ or older than this feature) keeps serving its actors and reports `stuck`.
 wasmkeep cluster undrain node-b --bucket s3://wasmkeep-demo   # take actors again
 ```
 
+Nodes read a drain or an undrain within a heartbeat period (3 s): the
+command rewrites `control/changed` after its request, and nodes list the
+requests when that object changes. A request written by a CLI of 0.4.1
+or before, which does not, is read within a minute
+([ADR 0014](adr/0014-draining-a-node-and-moving-an-actor.md), amendment
+of 2026-11-14).
+
 Both refuse an id that no live node has (as `cluster status` counts it): a
 drain request for a mistyped id would stay in the bucket until an undrain
 with the same typo. `undrain` still withdraws a request no node answers to.
@@ -1113,8 +1144,10 @@ The target must be a live node: an id no live node has is refused without
 gets a warning (the request is written; the owner keeps the actor), as
 does one that serves another app.
 
-Within a few seconds the actor's owner hands it to `node-c`
-([ADR 0017](adr/0017-moving-one-actor.md)):
+Within a few seconds the actor's owner hands it to `node-c` (within a
+minute for a request written by a CLI of 0.4.1 or before, which does not
+rewrite `control/changed`;
+[ADR 0017](adr/0017-moving-one-actor.md)):
 
 1. its WebSockets close with 1012 and their close events run;
 2. its queued events finish and are uploaded;

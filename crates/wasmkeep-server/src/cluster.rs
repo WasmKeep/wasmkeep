@@ -33,11 +33,13 @@ use crate::http::{ArrivedOnClusterPort, OriginalPath, text_response};
 mod failover_wait;
 mod forwarding;
 mod handoff;
+mod hello;
 mod identity;
 mod lease_hold;
 mod node_lease_task;
 mod signing;
 mod view;
+pub(crate) use hello::HELLO_PATH;
 
 pub use failover_wait::failover_wait_default;
 pub(crate) use failover_wait::{FailoverWait, Kept, Ticket, Waited};
@@ -460,6 +462,38 @@ pub(crate) struct Cluster {
     app_gate: std::sync::atomic::AtomicU8,
     /// [`ClusterConfig::follows_app`].
     follows_app: bool,
+    /// The nodes the last refresh of the view found (live or not): read
+    /// one by one between listings of `nodes/` (ADR 0020, amendment of
+    /// 2026-11-14).
+    known_nodes: Mutex<Vec<String>>,
+    /// A listing of `nodes/` was asked for (a hello, a failed early one):
+    /// the next refresh lists.
+    listing_wanted: std::sync::atomic::AtomicBool,
+    /// Wakes the heartbeat loop for an early listing.
+    listing_asked: Arc<tokio::sync::Notify>,
+    /// The nodes as the last refresh saw them (id, instance, lease state,
+    /// live), to tell the alarm sweep when they change.
+    view_shape: Mutex<Option<view::ViewShape>>,
+    /// Woken when [`Self::view_shape`] changes (ADR 0009, amendment of
+    /// 2026-11-14).
+    pub(crate) view_changed: tokio::sync::Notify,
+    /// Move requests this node deleted, kept out of [`Self::moves`] until
+    /// they expire (a listing in flight could bring one back).
+    deleted_moves: Mutex<Vec<control::MoveIntent>>,
+    /// Delete requests this node ended, kept out of [`Self::deletes`] until
+    /// they expire, likewise.
+    ended_deletes: Mutex<Vec<control::DeleteIntent>>,
+}
+
+/// One page of the alarm index, as the sweep reads it.
+#[derive(Debug)]
+pub(crate) struct AlarmPage {
+    /// The entries due: address, due time, key.
+    pub(crate) due: Vec<(ActorAddress, u64, StorePath)>,
+    /// Where the next page starts, if the walk stopped at its scan cap.
+    pub(crate) next: Option<StorePath>,
+    /// The due time of the first entry not due yet, if the walk met one.
+    pub(crate) next_at: Option<u64>,
 }
 
 /// No tombstone: actors are acquired.
@@ -702,6 +736,13 @@ impl Cluster {
                 APP_OPEN
             }),
             follows_app: config.follows_app,
+            known_nodes: Mutex::new(Vec::new()),
+            listing_wanted: std::sync::atomic::AtomicBool::new(false),
+            listing_asked: Arc::new(tokio::sync::Notify::new()),
+            view_shape: Mutex::new(None),
+            view_changed: tokio::sync::Notify::new(),
+            deleted_moves: Mutex::new(Vec::new()),
+            ended_deletes: Mutex::new(Vec::new()),
         });
         if refuse_plaintext {
             tracing::info!(
@@ -837,12 +878,26 @@ impl Cluster {
     /// resume from, or `None` once the listing reached entries not yet due
     /// (or its end), so the next sweep starts over. Legacy and tagged
     /// entries alike; an actor listed under both is returned for each.
+    #[cfg(test)]
     pub(crate) async fn alarms_due_before(
         &self,
         before_ms: u64,
         after: Option<&StorePath>,
         scan: usize,
     ) -> Result<(Vec<(ActorAddress, u64, StorePath)>, Option<StorePath>), object_store::Error> {
+        self.alarm_page(before_ms, after, scan)
+            .await
+            .map(|p| (p.due, p.next))
+    }
+
+    /// [`Self::alarms_due_before`], with the due time of the first entry
+    /// the walk stopped at, not due before `before_ms` (`next_at`).
+    pub(crate) async fn alarm_page(
+        &self,
+        before_ms: u64,
+        after: Option<&StorePath>,
+        scan: usize,
+    ) -> Result<AlarmPage, object_store::Error> {
         use futures_util::TryStreamExt as _;
         let base = self.alarm_base();
         let tenant = self.root.tenant();
@@ -867,17 +922,29 @@ impl Cluster {
             };
             let at = listed.entry.at;
             if at >= before_ms {
-                return Ok((due, None));
+                return Ok(AlarmPage {
+                    due,
+                    next: None,
+                    next_at: Some(at),
+                });
             }
             if let Ok(address) = ActorAddress::new(tenant, listed.class, listed.name) {
                 due.push((address, at, key.clone()));
             }
             seen += 1;
             if seen >= scan {
-                return Ok((due, Some(key)));
+                return Ok(AlarmPage {
+                    due,
+                    next: Some(key),
+                    next_at: None,
+                });
             }
         }
-        Ok((due, None))
+        Ok(AlarmPage {
+            due,
+            next: None,
+            next_at: None,
+        })
     }
 
     #[cfg(test)]
@@ -1612,12 +1679,27 @@ impl Cluster {
     }
 
     /// The move requests this node last read (ADR 0017).
+    /// Those past their 5 minutes are left out, as a listing leaves them
+    /// out: the intents are listed only when they change (ADR 0014,
+    /// amendment of 2026-11-14), so a request read once can outlive its
+    /// expiry here until the next listing.
     pub(crate) fn moves(&self) -> Vec<wasmkeep_cluster::control::MoveIntent> {
+        let now = now_ms();
+        let live =
+            |m: &control::MoveIntent| now.saturating_sub(m.written_at_ms) <= control::MOVE_TTL_MS;
+        let deleted = {
+            let mut deleted = self.deleted_moves.lock().unwrap_or_else(|p| p.into_inner());
+            deleted.retain(live);
+            deleted.clone()
+        };
         self.control
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .moves
-            .clone()
+            .iter()
+            .filter(|m| live(m) && !deleted.contains(m))
+            .cloned()
+            .collect()
     }
 
     /// Why no actor may be acquired now, if so (ADR 0028, section 5): the
@@ -1676,13 +1758,28 @@ impl Cluster {
         self.validity.valid()
     }
 
-    /// The delete requests this node last read (ADR 0028).
+    /// The delete requests this node last read (ADR 0028), but those it
+    /// ended itself since: the intents are listed only when they change
+    /// (ADR 0014, amendment of 2026-11-14), and a listing in flight while
+    /// it ended one may bring it back into the copy.
     pub(crate) fn deletes(&self) -> Vec<wasmkeep_cluster::control::DeleteIntent> {
+        let now = now_ms();
+        let live = |d: &control::DeleteIntent| {
+            now.saturating_sub(d.written_at_ms) <= control::DELETE_TTL_MS
+        };
+        let ended = {
+            let mut ended = self.ended_deletes.lock().unwrap_or_else(|p| p.into_inner());
+            ended.retain(live);
+            ended.clone()
+        };
         self.control
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .deletes
-            .clone()
+            .iter()
+            .filter(|d| live(d) && !ended.contains(d))
+            .cloned()
+            .collect()
     }
 
     /// Ends a delete request (ADR 0028): writes its outcome beside it for
@@ -1705,15 +1802,53 @@ impl Cluster {
         }
         if let Err(e) = self.control_keys.delete(&key).await {
             tracing::debug!(error = %e, "deleting a delete request failed");
+            return;
+        }
+        // Forgotten here, and the other nodes told (ADR 0014, amendment of
+        // 2026-11-14): without it they would act on their copy, a restore
+        // each to find it carried out, until their next listing.
+        {
+            let mut control = self.control.write().unwrap_or_else(|p| p.into_inner());
+            control.deletes.retain(|d| d != intent);
+        }
+        self.ended_deletes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(intent.clone());
+        if let Err(e) = control::announce(&self.control_keys, &self.change_token()).await {
+            tracing::debug!(error = %e, "announcing an ended delete request failed");
         }
     }
 
-    /// Deletes a move request, best effort.
+    /// Deletes a move request, best effort, forgets it here, and tells the
+    /// other nodes (`control/changed`, ADR 0014, amendment of 2026-11-14),
+    /// which would otherwise act on it until their next listing.
     pub(crate) async fn delete_move(&self, intent: &wasmkeep_cluster::control::MoveIntent) {
         use wasmkeep_cluster::control::Keys as _;
         if let Err(e) = self.control_keys.delete(&intent.key()).await {
             tracing::debug!(error = %e, "deleting a move request failed");
+            return;
         }
+        self.control
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .moves
+            .retain(|m| m != intent);
+        // A listing that started before the delete may still bring it back
+        // into the copy: left out of [`Self::moves`] until it expires.
+        self.deleted_moves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(intent.clone());
+        if let Err(e) = control::announce(&self.control_keys, &self.change_token()).await {
+            tracing::debug!(error = %e, "announcing a deleted move request failed");
+        }
+    }
+
+    /// A body for `control/changed` no writer wrote before: this process's
+    /// random seed, a counter and the time.
+    fn change_token(&self) -> String {
+        format!("{} {}", self.nonce(), now_ms())
     }
 
     /// How long a node that accepted an alarm hand-off looks again while
@@ -1779,9 +1914,27 @@ impl Cluster {
     /// identity, else its plain address (none in refuse mode). Never the
     /// plain address of a node reachable over TLS: if TLS to it fails, the
     /// caller gets a 503.
+    ///
+    /// A node this node has not seen at all (a record names a node that
+    /// started since the last listing, whose hello did not arrive) asks
+    /// for a listing of `nodes/` (at most one early listing a period; ADR
+    /// 0020, amendment of 2026-11-14), so its actors' requests get a 503
+    /// for a period, not until the next scheduled listing.
     pub(crate) fn address_of(&self, node: &str) -> Option<String> {
         let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
-        let peer = peers.get(node)?;
+        let Some(peer) = peers.get(node) else {
+            drop(peers);
+            let known = self
+                .known_nodes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|k| k == node);
+            if !known && node != self.node_id {
+                self.want_listing();
+            }
+            return None;
+        };
         match (&self.tls, &peer.tls) {
             (Some(_), Some(tls)) => Some(tls.clone()),
             _ if self.refuse_plaintext => None,

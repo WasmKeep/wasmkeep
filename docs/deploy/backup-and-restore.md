@@ -32,6 +32,7 @@ app's actor state is under its own root, `state/<tenant>/<app>/` (written
 | `apps/<tenant>/<app>/secrets/` | The app's secrets, sealed, and their own `current` | As above |
 | `cluster/secret` | The secret nodes sign their calls to each other with | Created once |
 | `control/drain/` | Drain requests | By the operator's commands |
+| `control/changed` | Rewritten after every drain, undrain or move request, so nodes list the requests when they change | By the operator's commands, and by a node that completes a move |
 | `cluster/migration`, `cluster/migrated/<tenant>`, `cluster/removed/<tenant>` | The lock of a running `cluster migrate`, each migrated tenant's commit, and the mark `--remove-old` writes before it deletes the tenant's old keys ([upgrading to 0.4.0](upgrading-to-0.4.md)) | By `cluster migrate` |
 | `R leases/<class>/<name>` | One small marker per actor, written by the node that first takes it. It carries the generation the actor's first ownership record starts from, and keeps a binary from before node leases from taking the actor ([ADR 0020](../adr/0020-one-lease-per-node.md)) | Created once, never collected |
 | `probe/` | The object a node's start check writes to test conditional writes | Deleted right after the check |

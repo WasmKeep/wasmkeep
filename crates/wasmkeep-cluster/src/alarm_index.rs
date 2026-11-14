@@ -333,6 +333,43 @@ pub fn plan_sweep(claims: &[SweepClaim], cap: usize, rotation: u64) -> SweepPlan
     SweepPlan { deliver, walked }
 }
 
+/// How many sweep periods a sweep with nothing left to do may wait at
+/// most: with the default 10 s period, a minute (ADR 0009, amendment of
+/// 2026-11-14).
+pub const IDLE_SWEEP_FACTOR: u32 = 6;
+
+/// What a sweep found, for the wait before the next one
+/// ([`next_sweep_wait_ms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepFound {
+    /// The listing failed, stopped at its scan cap, or listed entries due
+    /// to the sweep (delivered or not): the next sweep a period later, as
+    /// before the amendment.
+    Backlog,
+    /// Nothing due; the earliest entry not due yet is due at this time
+    /// (ms), `None` if the index is empty.
+    Idle { next_at: Option<u64> },
+}
+
+/// How long the sweep waits before its next listing (ms): `period_ms` (the
+/// configured sweep period) after a sweep with a backlog; otherwise until
+/// the earliest entry it listed becomes the sweep's (its due time plus
+/// `overdue_ms`), at least a period and at most [`IDLE_SWEEP_FACTOR`]
+/// periods. A change in the view of the nodes ends the wait early
+/// (the server's `sweep_alarms`): that is when entries of a node gone away
+/// need the sweep.
+pub fn next_sweep_wait_ms(found: SweepFound, now_ms: u64, period_ms: u64, overdue_ms: u64) -> u64 {
+    let longest = period_ms.saturating_mul(u64::from(IDLE_SWEEP_FACTOR));
+    match found {
+        SweepFound::Backlog => period_ms,
+        SweepFound::Idle { next_at: None } => longest,
+        SweepFound::Idle { next_at: Some(at) } => at
+            .saturating_add(overdue_ms)
+            .saturating_sub(now_ms)
+            .clamp(period_ms, longest.max(period_ms)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)] // test code
@@ -694,5 +731,40 @@ mod tests {
         for bad in ["", "A", "g", "-", "a/b", &"a".repeat(65)] {
             assert!(Tag::new(1, bad).is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_idle_sweep_waits_for_the_earliest_entry_within_bounds() {
+        let (period, overdue) = (10_000, 15_000);
+        let wait = |found| next_sweep_wait_ms(found, 100_000, period, overdue);
+        assert_eq!(wait(SweepFound::Backlog), period);
+        assert_eq!(wait(SweepFound::Idle { next_at: None }), 60_000);
+        // Due in 5 s: the sweep's 15 s later, 20 s from now.
+        assert_eq!(
+            wait(SweepFound::Idle {
+                next_at: Some(105_000)
+            }),
+            20_000
+        );
+        // The sweep's already, or soon: a period, never less.
+        assert_eq!(
+            wait(SweepFound::Idle {
+                next_at: Some(80_000)
+            }),
+            period
+        );
+        assert_eq!(
+            wait(SweepFound::Idle {
+                next_at: Some(90_000)
+            }),
+            period
+        );
+        // Far ahead: the longest wait.
+        assert_eq!(
+            wait(SweepFound::Idle {
+                next_at: Some(10_000_000)
+            }),
+            60_000
+        );
     }
 }

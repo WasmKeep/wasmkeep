@@ -18,6 +18,9 @@ pub(super) struct FenceDue {
     epoch: u64,
 }
 
+/// The nodes as one refresh saw them: id, instance, lease state, live.
+pub(super) type ViewShape = Vec<(String, Option<String>, Option<NodeState>, bool)>;
+
 /// Fences a fence task tries at once.
 const FENCE_CONCURRENCY: usize = 8;
 
@@ -50,16 +53,35 @@ pub(super) async fn fence_loop(
     }
 }
 
-/// Refreshes the peer list, loads the cluster secret and reads `control/`
-/// every heartbeat period, once the node lease's first write landed (the
-/// node lease itself is written by its own task, `node_lease_loop`). With
-/// TLS, an unknown pin (a peer that just started, or one that changed its
-/// key) makes it list the heartbeats sooner, at most once a period:
-/// strangers knocking on the cluster port can at most double this node's
-/// listings.
+/// Refreshes the peer list, loads the cluster secret and reads the
+/// operator's intents every heartbeat period, once the node lease's first
+/// write landed (the node lease itself is written by its own task,
+/// `node_lease_loop`).
+///
+/// The peer list (ADR 0020 and 0011, amendments of 2026-11-14): a listing
+/// of `nodes/` at the first period and every
+/// [`membership::FULL_LISTING_EVERY`] periods; in between, one read of
+/// each node the last refresh found, which gives the same bodies. A
+/// listing is also made at once when a peer says hello (it just started),
+/// when a record names a node this node does not know, or, with TLS, when
+/// an unknown pin knocks (a peer that just started, or one that changed
+/// its key): at most one such early listing a period, none in a period
+/// that listed already, and one asked for after that at the next period.
+/// So at most two listings a period, as before the amendment over TLS;
+/// strangers can ask only by knocking with a pin (TLS), since a hello is
+/// signed.
+///
+/// After its first refresh, the node says hello to the peers it found, so
+/// that they list at once and see it within a period; again the next two
+/// periods if a peer did not take it.
+///
+/// The intents: see [`Cluster::refresh_control_if_changed`].
 pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Duration) {
     // Held apart from the cluster, so waiting does not keep it alive.
     let tls = cluster.upgrade().and_then(|c| c.tls.clone());
+    let Some(asked) = cluster.upgrade().map(|c| Arc::clone(&c.listing_asked)) else {
+        return;
+    };
     // Nothing until the start check passed and the first lease write
     // landed; never if another process runs with this id.
     {
@@ -76,6 +98,15 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
             return;
         }
     }
+    // Periods since the last listing of `nodes/` that succeeded, that
+    // listing's period counted as the first.
+    let mut since_full: Option<u32> = None;
+    let mut watch = control::ControlWatch::new();
+    // Rounds of hellos left: the first after the first refresh, and again
+    // the next periods while a peer did not take it (lost, or refused
+    // because its cluster secret was not loaded yet).
+    let mut hellos_left = HELLO_ROUNDS;
+    let hello_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         // From the top: the period does not stretch by the bucket's latency.
         let next = tokio::time::Instant::now() + every;
@@ -90,40 +121,106 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
         if c.secret.get().is_none() {
             c.load_secret().await;
         }
-        c.refresh_view().await;
+        let wanted = c.take_listing_wanted();
+        let full = wasmkeep_cluster::membership::full_listing_due(since_full, wanted);
+        let ok = c.refresh_view(full).await;
+        since_full = match (full, ok) {
+            (true, true) => Some(1),
+            // A listing asked for and not made: asked again.
+            (true, false) => {
+                if wanted {
+                    c.want_listing();
+                }
+                since_full
+            }
+            (false, _) => since_full.map(|n| n.saturating_add(1)),
+        };
         if c.identity_taken() {
             return;
         }
-        c.refresh_control().await;
+        let retry = hellos_left < HELLO_ROUNDS
+            && hello_failed.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if (hellos_left == HELLO_ROUNDS || retry)
+            && hellos_left > 0
+            && ok
+            && c.secret.get().is_some()
+        {
+            hellos_left -= 1;
+            c.say_hello(Arc::clone(&hello_failed));
+        }
+        c.refresh_control_if_changed(&mut watch).await;
         drop(c);
-        let unknown = async {
-            match &tls {
-                Some(t) => t.pins().unknown_seen().await,
-                None => std::future::pending().await,
+        // An early listing, at most one a period, and none in a period
+        // that listed already: an unknown pin (TLS) or a peer's hello. One
+        // asked for after that is made at the next period. So at most two
+        // listings a period, a scheduled or asked-for one and an early one.
+        let mut early_left = !(full && ok);
+        let mark = async {
+            loop {
+                listing_asked(&tls, &asked).await;
+                let Some(c) = cluster.upgrade() else {
+                    return;
+                };
+                if early_left {
+                    early_left = false;
+                    c.take_listing_wanted();
+                    if c.refresh_view(true).await {
+                        since_full = Some(1);
+                    } else {
+                        c.want_listing();
+                    }
+                } else {
+                    c.listing_wanted
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
             }
         };
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(next) => {}
-            () = unknown => {
-                let Some(c) = cluster.upgrade() else {
-                    return;
-                };
-                c.refresh_view().await;
-                drop(c);
-                // No other early listing before the next heartbeat.
-                tokio::time::sleep_until(next).await;
-            }
+            () = mark => {}
         }
     }
 }
 
+/// Rounds of hellos a node sends at most after it starts.
+const HELLO_ROUNDS: u32 = 3;
+
+/// Resolves when a listing is asked for: an unknown pin knocked (TLS), or
+/// a hello or a failed early listing asked ([`Cluster::want_listing`]).
+async fn listing_asked(tls: &Option<Arc<ClusterTls>>, asked: &tokio::sync::Notify) {
+    match tls {
+        Some(t) => tokio::select! {
+            () = t.pins().unknown_seen() => {}
+            () = asked.notified() => {}
+        },
+        None => asked.notified().await,
+    }
+}
+
 impl Cluster {
+    /// Once a period: reads `control/changed` (one GET) and, when
+    /// [`control::ControlWatch`] says so, lists the intents
+    /// ([`Self::refresh_control`]): when it changed since the last listing,
+    /// and every [`control::LISTING_FALLBACK_EVERY`] periods anyway (ADR
+    /// 0014, amendment of 2026-11-14).
+    pub(super) async fn refresh_control_if_changed(&self, watch: &mut control::ControlWatch) {
+        use control::Keys as _;
+        let marker = self.control_keys.get_body(control::CHANGED).await;
+        if let Err(e) = &marker {
+            tracing::debug!(error = %e, "reading control/changed failed");
+        }
+        let read = marker.as_ref().map(Option::as_deref).map_err(|_| ());
+        if watch.should_list(read) && self.refresh_control().await {
+            watch.listed(marker.ok());
+        }
+    }
+
     /// Reads the operator's intents (drains under `control/drain/`, this
     /// app's moves under its root) and publishes whether
     /// this node is asked to drain. A failed listing keeps the last intents
-    /// read (ADR 0014).
-    pub(super) async fn refresh_control(&self) {
+    /// read (ADR 0014); false then.
+    pub(super) async fn refresh_control(&self) -> bool {
         match control::read(&self.control_keys, Some(&self.root), now_ms()).await {
             Ok(read) => {
                 let asked = read.draining.contains(&self.node_id);
@@ -151,9 +248,11 @@ impl Cluster {
                     }
                     _ => {}
                 }
+                true
             }
             Err(e) => {
-                tracing::warn!(error = %e, "reading control/ failed; keeping the last intents")
+                tracing::warn!(error = %e, "reading control/ failed; keeping the last intents");
+                false
             }
         }
     }
@@ -361,21 +460,42 @@ impl Cluster {
             .insert(peer.to_owned(), until);
     }
 
-    /// Lists the live nodes: where to reach each (the peer list) and, with
-    /// TLS, the pins this node trusts.
-    pub(super) async fn refresh_view(&self) {
+    /// Reads the nodes' heartbeats, by a listing of `nodes/` (`full`) or
+    /// one read of each node the last refresh found, and refreshes from
+    /// them where to reach each live node (the peer list) and, with TLS,
+    /// the pins this node trusts. False if the bucket did not answer (the
+    /// view is kept).
+    pub(super) async fn refresh_view(&self, full: bool) -> bool {
         // Timed (`wasmkeep_listing_seconds`): past the heartbeat horizon,
         // peers' pins would expire before this renews them.
         let started = std::time::Instant::now();
-        self.list_and_refresh().await;
+        let ok = self.list_and_refresh(full).await;
         crate::metrics::METRICS
             .listing_seconds
             .observe(started.elapsed());
+        ok
     }
 
-    async fn list_and_refresh(&self) {
-        match self.membership.heartbeats().await {
+    async fn list_and_refresh(&self, full: bool) -> bool {
+        let read = if full {
+            self.membership.heartbeats().await
+        } else {
+            let mut known = self
+                .known_nodes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            // This node's own object too: the twin check, and this node's
+            // place in the live set (alarm shards) come from it.
+            if !known.contains(&self.node_id) {
+                known.push(self.node_id.clone());
+            }
+            self.membership.heartbeats_of(&known).await
+        };
+        match read {
             Ok(all) => {
+                *self.known_nodes.lock().unwrap_or_else(|p| p.into_inner()) =
+                    all.iter().map(|n| n.id.clone()).collect();
                 // Against every heartbeat, live or not: a twin whose clock
                 // lags may look stale.
                 self.check_twin(&all);
@@ -422,9 +542,54 @@ impl Cluster {
                 if !due.is_empty() {
                     let _ = self.fences_due.send(due);
                 }
+                self.note_view_shape(&nodes, &all);
+                true
             }
-            Err(e) => tracing::warn!(error = %e, "listing nodes failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the nodes' heartbeats failed");
+                false
+            }
         }
+    }
+
+    /// Wakes the alarm sweep when the nodes it shares the index with
+    /// changed: a node joined, left, went stale, was fenced or released,
+    /// or restarted (ADR 0009, amendment of 2026-11-14). Not on the first
+    /// refresh: the sweep runs anyway then.
+    fn note_view_shape(&self, live: &[NodeInfo], all: &[NodeInfo]) {
+        let mut shape: ViewShape = all
+            .iter()
+            .map(|n| {
+                (
+                    n.id.clone(),
+                    n.instance.clone(),
+                    n.lease,
+                    live.iter().any(|l| l.id == n.id),
+                )
+            })
+            .collect();
+        shape.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut last = self.view_shape.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = last.as_ref().is_some_and(|l| *l != shape);
+        *last = Some(shape);
+        drop(last);
+        if changed {
+            self.view_changed.notify_one();
+        }
+    }
+
+    /// Asks for a listing of `nodes/` at once (at most one early listing a
+    /// period; otherwise at the next period).
+    pub(crate) fn want_listing(&self) {
+        self.listing_wanted
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.listing_asked.notify_one();
+    }
+
+    /// Whether a listing was asked for, and no longer.
+    fn take_listing_wanted(&self) -> bool {
+        self.listing_wanted
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 }
 

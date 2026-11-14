@@ -157,6 +157,11 @@ impl ObjectStore for Gate {
         location: &StorePath,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        // Between listings a node reads the heartbeats it knows one by
+        // one (ADR 0020, amendment of 2026-11-14): cut with the listings.
+        if location.as_ref().starts_with("nodes/") && !self.lists.load(Ordering::SeqCst) {
+            return Err(Self::refused("reading a heartbeat"));
+        }
         self.inner.get_opts(location, options).await
     }
 

@@ -10,6 +10,11 @@
   reported done, sockets closed only once the delete will run, the marker
   holding the request's id, and a single node's failed durable delete no
   longer reported done on a retry.
+- Amended by [ADR 0014](0014-draining-a-node-and-moving-an-actor.md)'s
+  amendment of 2026-11-14 (fewer listings at rest): delete requests are
+  listed with the other intents when `control/changed` changes, or every
+  60 s, not every period. See "Note of 2026-11-14: fewer listings" at the
+  end.
 - Date: 2026-11-14
 - Release: 0.4.2 or later ([ROADMAP](../../ROADMAP.md), "Now": actors
   that end)
@@ -528,3 +533,41 @@ wasmkeep app delete --app acme/legacy --bucket s3://b/p
 | Sim cases, cluster and CLI tests, adversarial review | M |
 | Idle expiry (section 4) | M |
 | `app delete` (section 5) | M |
+
+## Note of 2026-11-14: fewer listings
+
+[ADR 0014](0014-draining-a-node-and-moving-an-actor.md),
+[0020](0020-one-lease-per-node.md) and [0009](0009-alarms-in-a-cluster.md)
+were amended the same day so that a node at rest lists the bucket about
+fourteen times less. What that changes here:
+
+- **Delete requests** are intents: nodes list `deletes/` with the drains
+  and moves when `control/changed` changes, or every 60 s.
+  `actor delete` writes the marker after its request (after the check
+  that takes it back if the app was deleted meanwhile), so a node starts
+  on it within a period, as before; a request written by a CLI that does
+  not (none exists: `actor delete` is new in this version), or whose
+  marker write failed, within 60 s, which can outlast the default
+  `--wait` of 60 s (the command then says the request stays, and it is
+  still carried out). The node that ends a request (its outcome written, the key
+  deleted) writes the marker and keeps the request out of its own copy
+  until the request expires, so other nodes stop acting on it within a
+  period. A node that still acts on a copy finds the request carried out
+  by the marker in the database (section 3), as with a request read
+  twice before.
+- **`app delete`** reads `nodes/` itself (`all_heartbeats`, a listing),
+  as a CLI does, at every step: the nodes' own cadence does not touch it.
+  Its 40 s window (`LATE_WRITES`) counts from the app's nodes' last
+  heartbeat writes and from the fences it writes itself, both read from
+  that listing. Nodes stop on the tombstone they read with each deploy
+  check (3 s), not through `nodes/` or `control/`; a stopped node's
+  `released` lease is seen by its peers at their next read of the nodes
+  they know, within a period, as before. `app delete` therefore writes no
+  `control/changed`: the moves and delete requests it removes belong to
+  an app whose nodes have stopped, and no other app's node reads them.
+- **The collecting node** of idle expiry is the lowest id among the live
+  peers this node knows. A node that just started is known to its peers
+  within a period through its hello (within 30 s without one, as from a
+  node of 0.4.1, which does not collect). Until then two nodes may both
+  run a pass, as when views disagree, which the conditional acquire makes
+  safe (section 4).

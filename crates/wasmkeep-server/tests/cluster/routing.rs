@@ -130,6 +130,10 @@ async fn a_clients_connection_close_does_not_close_the_connection_to_the_owner()
     )
     .await;
     settle().await;
+    // b's hellos to a at its start (ADR 0011, amendment of 2026-11-14) go
+    // through the same proxy, each on a connection of its own, closed
+    // after its answer: counted from here.
+    let hellos = accepted.load(Ordering::SeqCst);
     assert_eq!(
         send(a.addr, "GET", "/actor/t/x/fired", "").await.status,
         200
@@ -175,7 +179,7 @@ async fn a_clients_connection_close_does_not_close_the_connection_to_the_owner()
     // request that checks out just before that starts a connection anyway.
     // `pooled` makes that rare under load; closing per request would show
     // eleven.
-    let opened = accepted.load(Ordering::SeqCst);
+    let opened = accepted.load(Ordering::SeqCst) - hellos;
     assert!(
         (1..=2).contains(&opened),
         "{opened} connections to the owner for 11 forwarded requests"
