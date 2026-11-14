@@ -308,6 +308,15 @@ pub(crate) fn owner_closes(reason: &str, n: usize) {
     }
 }
 
+impl Family<AtomicU64> {
+    /// The sum over every label set.
+    pub(crate) fn total(&self) -> u64 {
+        let mut sum = 0u64;
+        self.each(|_, v| sum = sum.saturating_add(v.load(Ordering::Relaxed)));
+        sum
+    }
+}
+
 /// The process's metrics.
 pub(crate) static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::default);
 
@@ -625,6 +634,16 @@ pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_family_total_sums_every_label_set() {
+        let f: Family<AtomicU64> = Family::default();
+        assert_eq!(f.total(), 0);
+        inc(&f.get(&[("class", "a"), ("outcome", "ok")]));
+        inc(&f.get(&[("class", "a"), ("outcome", "ok")]));
+        inc(&f.get(&[("class", "b"), ("outcome", "failed")]));
+        assert_eq!(f.total(), 3);
+    }
 
     #[test]
     fn histograms_are_cumulative_and_labels_escaped() {

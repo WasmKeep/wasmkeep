@@ -50,6 +50,7 @@ mod deploys;
 mod disk;
 mod drain;
 mod host;
+mod load;
 mod moving;
 mod requests;
 mod routing;

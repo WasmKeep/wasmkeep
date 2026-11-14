@@ -75,6 +75,79 @@ pub struct NodeInfo {
     /// liveness is their age alone. A `released` or `fenced` node is not
     /// live whatever its age.
     pub lease: Option<NodeState>,
+    /// What it runs (format 3, payload line 10, `load ...`); `None` from
+    /// nodes that predate it, or when that line is missing or malformed.
+    /// Only a live node's says anything: a `released` or `fenced` object
+    /// keeps the last payload its node wrote.
+    pub load: Option<Load>,
+}
+
+/// Payload line 10 (format 3): how much a node runs, as of its last
+/// heartbeat. Advisory, like every heartbeat field: it drives nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Load {
+    /// Actors resident in memory.
+    pub actors: u64,
+    /// WebSockets open to its actors.
+    pub sockets: u64,
+    /// Events run per minute over the last minute or more (every node of
+    /// the process counted); `None` until a minute of samples exists.
+    pub events_per_min: Option<u64>,
+}
+
+impl Load {
+    /// The line: `load actors=<n> sockets=<n> events_per_min=<n|->`.
+    fn line(&self) -> String {
+        let events = self
+            .events_per_min
+            .map_or_else(|| "-".to_owned(), |n| n.to_string());
+        format!(
+            "load actors={} sockets={} events_per_min={events}",
+            self.actors, self.sockets
+        )
+    }
+
+    /// Reads the line: the word `load`, then `key=value` words in any
+    /// order. `actors` and `sockets` are required; `events_per_min` may
+    /// be `-` or absent (unknown); unknown keys are ignored, for later
+    /// versions. Anything else, a repeated key included, is `None`.
+    fn parse(line: &str) -> Option<Self> {
+        let mut words = line.split_whitespace();
+        if words.next()? != "load" {
+            return None;
+        }
+        let (mut actors, mut sockets, mut events) = (None, None, None);
+        for word in words {
+            let (key, value) = word.split_once('=')?;
+            let slot = match key {
+                "actors" => &mut actors,
+                "sockets" => &mut sockets,
+                "events_per_min" => &mut events,
+                _ => continue,
+            };
+            if slot.is_some() {
+                return None;
+            }
+            *slot = Some(if key == "events_per_min" && value == "-" {
+                None
+            } else {
+                Some(number(value)?)
+            });
+        }
+        Some(Self {
+            actors: actors??,
+            sockets: sockets??,
+            events_per_min: events.flatten(),
+        })
+    }
+}
+
+/// A count as heartbeats write it: decimal digits only.
+fn number(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 /// Heartbeat line 9: whether a node takes actors (ADR 0014).
@@ -228,11 +301,13 @@ impl NodeInfo {
     /// The heartbeat's fields as format 3 carries them after the node
     /// lease's three lines: id, address, version, app, cluster address,
     /// pins, drain state, `secrets`, capability words, one per line, every
-    /// line written (empty if need be). `written_at` and the instance are
-    /// not in it: the lease lines carry them.
+    /// line written (empty if need be), then the load (line 10) once known.
+    /// `written_at` and the instance are not in it: the lease lines carry
+    /// them. Readers from before line 10 read 9 lines and stop, so it is
+    /// invisible to them.
     pub fn payload(&self) -> Vec<u8> {
         let pins: Vec<String> = self.tls_pins.iter().map(hex).collect();
-        format!(
+        let mut out = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             self.id,
             self.address,
@@ -243,11 +318,16 @@ impl NodeInfo {
             self.drain.unwrap_or_default().as_str(),
             if self.reads_secrets { "secrets" } else { "" },
             if self.can_take { "take" } else { "" },
-        )
-        .into_bytes()
+        );
+        if let Some(load) = &self.load {
+            out.push_str(&load.line());
+            out.push('\n');
+        }
+        out.into_bytes()
     }
 
-    /// Format 3: the node lease's lines, then [`NodeInfo::payload`]. A body
+    /// Format 3: the node lease's lines, then [`NodeInfo::payload`]; a
+    /// missing or malformed load line reads as no load. A body
     /// with no payload (an operator's fence over an absent object) names no
     /// node and reads as `None`.
     fn decode_lease(body: &[u8]) -> Option<Self> {
@@ -263,6 +343,7 @@ impl NodeInfo {
         let drain = lines.next().and_then(DrainState::parse);
         let reads_secrets = lines.next() == Some("secrets");
         let words = Self::words(lines.next());
+        let load = lines.next().and_then(Load::parse);
         Some(Self {
             id,
             address,
@@ -276,6 +357,7 @@ impl NodeInfo {
             can_take: words.can_take,
             instance: lease.instance,
             lease: Some(lease.state),
+            load,
         })
     }
 }
@@ -299,6 +381,7 @@ impl NodeInfo {
             drain: None,
             reads_secrets: false,
             lease: None,
+            load: None,
             can_take: words.contains(&"take"),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
@@ -377,6 +460,8 @@ pub struct Membership<D, C> {
     reads_secrets: bool,
     /// Published on line 11: this process's token.
     instance: Option<String>,
+    /// Published on payload line 10 (format 3); set by the server.
+    load: std::sync::Mutex<Option<Load>>,
     /// A heartbeat older than this (plus `max_skew_ms`) means the node is gone.
     ttl_ms: u64,
     max_skew_ms: u64,
@@ -405,6 +490,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             drain: std::sync::Mutex::new(DrainState::Serving),
             reads_secrets: true,
             instance: None,
+            load: std::sync::Mutex::new(None),
             ttl_ms,
             max_skew_ms,
         })
@@ -460,6 +546,16 @@ impl<D: Directory, C: Clock> Membership<D, C> {
         *self.drain.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Sets what the next node lease writes say on payload line 10.
+    pub fn set_load(&self, load: Load) {
+        *self.load.lock().unwrap_or_else(|p| p.into_inner()) = Some(load);
+    }
+
+    /// What this node's next heartbeats say on payload line 10, if set.
+    pub fn load(&self) -> Option<Load> {
+        *self.load.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Writes this node's heartbeat in format 2 (tests only).
     #[cfg(test)]
     pub(crate) async fn heartbeat(&self) -> Result<(), BucketError> {
@@ -491,6 +587,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_take: true,
             instance: self.instance.clone(),
             lease: None,
+            load: self.load(),
         }
     }
 
@@ -671,6 +768,7 @@ mod tests {
             can_take: false,
             instance: None,
             lease: None,
+            load: None,
         };
         mem.0.borrow_mut().insert("nodes/x".into(), forged.encode());
         mem.0
@@ -703,6 +801,7 @@ mod tests {
             can_take: false,
             instance: None,
             lease: None,
+            load: None,
         };
         assert_eq!(NodeInfo::decode(&info.encode()), Some(info));
         let old = b"wasmkeep-node 1\na\nx:1\n0.1\n5\n";
@@ -771,6 +870,7 @@ mod tests {
             can_take: false,
             instance: None,
             lease: None,
+            load: None,
         }
     }
 
@@ -1101,6 +1201,192 @@ mod tests {
         assert_eq!(run(a.live_nodes()).unwrap().len(), 1);
         // What the lease task writes after the lease lines.
         assert_eq!(a.lease_payload(), info.payload());
+    }
+
+    /// Format 3's decoder before payload line 10, frozen: what a node of
+    /// the version before it runs. It reads 9 payload lines, no more.
+    fn decode_before_load(body: &[u8]) -> Option<NodeInfo> {
+        let lease = NodeLeaseObject::decode(body)?;
+        let text = std::str::from_utf8(crate::node_lease::tail(body)).ok()?;
+        let mut lines = text.lines();
+        let id = lines.next()?.to_owned();
+        let address = lines.next()?.to_owned();
+        let version = lines.next()?.to_owned();
+        let app = lines.next()?.to_owned();
+        let cluster_address = lines.next().and_then(cluster_address);
+        let tls_pins = lines.next().map(pins).unwrap_or_default();
+        let drain = lines.next().and_then(DrainState::parse);
+        let reads_secrets = lines.next() == Some("secrets");
+        let words = NodeInfo::words(lines.next());
+        Some(NodeInfo {
+            id,
+            address,
+            version,
+            written_at_ms: lease.written_at_ms,
+            app,
+            cluster_address,
+            tls_pins,
+            drain,
+            reads_secrets,
+            can_take: words.can_take,
+            instance: lease.instance,
+            lease: Some(lease.state),
+            load: None,
+        })
+    }
+
+    fn loaded_node() -> NodeInfo {
+        NodeInfo {
+            drain: Some(DrainState::Serving),
+            reads_secrets: true,
+            can_take: true,
+            load: Some(Load {
+                actors: 12,
+                sockets: 3,
+                events_per_min: Some(840),
+            }),
+            ..tls_node()
+        }
+    }
+
+    #[test]
+    fn payload_line_10_carries_the_load_and_older_readers_ignore_it() {
+        let node = loaded_node();
+        let payload = String::from_utf8(node.payload()).unwrap();
+        let lines: Vec<&str> = payload.lines().collect();
+        assert_eq!(lines.len(), 10, "{payload}");
+        assert_eq!(lines[8], "take");
+        assert_eq!(lines[9], "load actors=12 sockets=3 events_per_min=840");
+        let body = format3(&node, NodeState::Live, "beef");
+        let read = NodeInfo::decode(&body).unwrap();
+        assert_eq!(read.load, node.load);
+        // A node of the version before reads every other field as before.
+        assert_eq!(
+            decode_before_load(&body),
+            Some(NodeInfo {
+                load: None,
+                ..read.clone()
+            })
+        );
+        // Unknown yet: `-`.
+        let early = NodeInfo {
+            load: Some(Load {
+                events_per_min: None,
+                ..node.load.unwrap()
+            }),
+            ..node.clone()
+        };
+        assert!(
+            String::from_utf8(early.payload())
+                .unwrap()
+                .ends_with("\ntake\nload actors=12 sockets=3 events_per_min=-\n")
+        );
+        let read = NodeInfo::decode(&format3(&early, NodeState::Live, "beef")).unwrap();
+        assert_eq!(read.load, early.load);
+        // No load yet: the 9 lines as before, byte for byte.
+        let none = NodeInfo { load: None, ..node };
+        assert_eq!(
+            String::from_utf8(none.payload()).unwrap().lines().count(),
+            9
+        );
+        assert!(none.payload().ends_with(b"\nsecrets\ntake\n"));
+    }
+
+    #[test]
+    fn a_payload_without_line_10_has_no_load() {
+        // A node of the version before: 9 payload lines.
+        let body =
+            "wasmkeep-node 3\nlive beef\n5\na\nhttp://a\n1\nacme/shop\n\n\nserving\n\ntake\n";
+        let read = NodeInfo::decode(body.as_bytes()).unwrap();
+        assert!(read.can_take);
+        assert_eq!(read.load, None);
+        // Formats 1 and 2 never carry it.
+        assert_eq!(
+            NodeInfo::decode(&loaded_node().encode()).unwrap().load,
+            None
+        );
+    }
+
+    #[test]
+    fn a_malformed_load_line_is_ignored() {
+        let base =
+            "wasmkeep-node 3\nlive beef\n5\na\nhttp://a\n1\nacme/shop\n\n\nserving\n\ntake\n";
+        let read = |line: &str| {
+            let info = NodeInfo::decode(format!("{base}{line}\n").as_bytes()).unwrap();
+            // The other fields are unaffected.
+            assert!(
+                info.can_take && info.drain == Some(DrainState::Serving),
+                "{line}"
+            );
+            info.load
+        };
+        for bad in [
+            "",
+            "load",
+            "loads actors=1 sockets=2",
+            "load actors=1",
+            "load sockets=2",
+            "load actors=-1 sockets=2",
+            "load actors=+1 sockets=2",
+            "load actors=1 sockets=x",
+            "load actors=- sockets=2",
+            "load actors=1 sockets=2 events_per_min=lots",
+            "load actors=1 sockets=2 events_per_min=",
+            "load actors=1 actors=2 sockets=2",
+            "load actors=1 sockets=2 stray",
+            "load actors=99999999999999999999 sockets=2",
+            "actors=1 sockets=2",
+        ] {
+            assert_eq!(read(bad), None, "{bad:?}");
+        }
+        let ok = |actors, sockets, events_per_min| {
+            Some(Load {
+                actors,
+                sockets,
+                events_per_min,
+            })
+        };
+        assert_eq!(read("load actors=1 sockets=2"), ok(1, 2, None));
+        assert_eq!(
+            read("load sockets=2 actors=1 events_per_min=7"),
+            ok(1, 2, Some(7))
+        );
+        // A later version's keys are skipped.
+        assert_eq!(
+            read("load actors=1 sockets=2 events_per_min=- queued=4"),
+            ok(1, 2, None)
+        );
+    }
+
+    #[test]
+    fn a_node_publishes_its_load_once_set() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let a = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
+        assert_eq!(a.load(), None);
+        assert_eq!(
+            String::from_utf8(a.lease_payload())
+                .unwrap()
+                .lines()
+                .count(),
+            9
+        );
+        let load = Load {
+            actors: 2,
+            sockets: 1,
+            events_per_min: None,
+        };
+        a.set_load(load);
+        let body = format3(
+            &NodeInfo::decode(&format3(&a.info(), NodeState::Live, "beef")).unwrap(),
+            NodeState::Live,
+            "beef",
+        );
+        assert_eq!(NodeInfo::decode(&body).unwrap().load, Some(load));
+        assert!(
+            a.lease_payload()
+                .ends_with(b"\nload actors=2 sockets=1 events_per_min=-\n")
+        );
     }
 
     #[test]

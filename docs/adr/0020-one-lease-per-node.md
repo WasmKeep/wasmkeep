@@ -85,6 +85,16 @@ write it replaced, and every reader (membership, alarm shards, routing,
 age. Old decoders cannot read the new format, which is intended (section
 6).
 
+After the three lease lines comes the payload: id, address, version, app,
+cluster address, pins, drain state, `secrets`, capability words, one per
+line and always written (empty if need be). Payload line 10, added in
+0.4.0, is the node's load, written once known:
+`load actors=<n> sockets=<n> events_per_min=<n|->` (`-` until a minute of
+samples exists; unknown keys are ignored). Readers from before it read 9
+payload lines and stop, so they never see it; a missing or malformed line
+10 reads as no load. Like the other payload lines it is advisory: the
+lease logic reads only the three lease lines.
+
 - **One cadence, its own task.** The lease write runs on a task of its
   own, every `min(heartbeat period, ttl / 3)` measured from the previous
   *send*, never waiting for the heartbeat listing, the cluster secret or

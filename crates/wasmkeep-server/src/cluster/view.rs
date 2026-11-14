@@ -175,6 +175,11 @@ impl Cluster {
         self.membership.set_drain_state(state);
     }
 
+    /// What this node's next heartbeats say on payload line 10.
+    pub(crate) fn set_load(&self, load: wasmkeep_cluster::membership::Load) {
+        self.membership.set_load(load);
+    }
+
     /// Whether the operator asked this node to drain, as last read.
     /// A node that cannot open the app's secrets drains too (ADR 0016):
     /// it hands its actors over and takes none.

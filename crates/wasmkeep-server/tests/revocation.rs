@@ -440,8 +440,9 @@ async fn revoke(
                 // Format 3 (ADR 0020): the node lease's three lines (the
                 // third is written_at), then the heartbeat's fields: id,
                 // address, version, app, cluster address, pins, drain
-                // state, reads secrets, take.
-                assert_eq!(lines.len(), 12, "{old}");
+                // state, reads secrets, take, then the load once known
+                // (payload line 10).
+                assert!(matches!(lines.len(), 12 | 13), "{old}");
                 lines[2] = &now;
                 lines[8] = &pin;
                 format!("{}\n", lines.join("\n"))

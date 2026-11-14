@@ -8,7 +8,7 @@ use std::sync::Arc;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::{Value, json};
-use wasmkeep_cluster::membership::{self, DrainState, NodeInfo};
+use wasmkeep_cluster::membership::{self, DrainState, Load, NodeInfo};
 use wasmkeep_cluster::node_lease::NodeState;
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
 use wasmkeep_server::apps::Current;
@@ -75,6 +75,13 @@ impl Node {
     /// It has a cluster listener and publishes the pin to trust there.
     fn tls(&self) -> bool {
         self.info.cluster_address.is_some() && !self.info.tls_pins.is_empty()
+    }
+
+    /// Its load (payload line 10) while it is live: a stale, fenced or
+    /// released heartbeat keeps the last load its node wrote, which no
+    /// longer says anything.
+    fn load(&self) -> Option<Load> {
+        self.info.load.filter(|_| self.live)
     }
 }
 
@@ -175,6 +182,16 @@ async fn read_apps(
 impl Report {
     fn live(&self) -> impl Iterator<Item = &Node> {
         self.nodes.iter().filter(|n| n.live)
+    }
+
+    /// Actors resident on the live nodes serving `app`, summed over those
+    /// that say (payload line 10); `None` if none does.
+    fn app_actors(&self, app: &str) -> Option<u64> {
+        self.live()
+            .filter(|n| n.info.app == app)
+            .filter_map(Node::load)
+            .map(|l| l.actors)
+            .reduce(u64::saturating_add)
     }
 
     /// Whether any node is live: `cluster status` fails otherwise.
@@ -345,16 +362,30 @@ impl Report {
                     // ADR 0020: live, released or fenced; null for a
                     // heartbeat in an older format.
                     "lease": n.info.lease.map(NodeState::as_str),
+                    // Payload line 10, while live; null otherwise, from a
+                    // version without it, or (events) before a minute.
+                    "actors": n.load().map(|l| l.actors),
+                    "sockets": n.load().map(|l| l.sockets),
+                    "events_per_min": n.load().and_then(|l| l.events_per_min),
                 })
             })
             .collect();
         let apps: Vec<Value> = self
             .apps
             .iter()
-            .map(|a| match &a.current {
-                Ok(Some(c)) => json!({"app": a.name, "version": c.version, "seq": c.seq}),
-                Ok(None) => json!({"app": a.name, "version": null, "seq": null}),
-                Err(e) => json!({"app": a.name, "version": null, "seq": null, "error": e}),
+            .map(|a| {
+                let actors = self.app_actors(&a.name);
+                match &a.current {
+                    Ok(Some(c)) => {
+                        json!({"app": a.name, "version": c.version, "seq": c.seq, "actors": actors})
+                    }
+                    Ok(None) => {
+                        json!({"app": a.name, "version": null, "seq": null, "actors": actors})
+                    }
+                    Err(e) => {
+                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "error": e})
+                    }
+                }
             })
             .collect();
         let versions: Vec<&str> = self.versions().into_iter().map(|(v, _)| v).collect();
@@ -388,7 +419,7 @@ impl Report {
         if self.nodes.is_empty() {
             out.push_str("No nodes.\n");
         } else {
-            let rows: Vec<[String; 9]> = self
+            let rows: Vec<[String; 12]> = self
                 .nodes
                 .iter()
                 .map(|n| {
@@ -407,6 +438,9 @@ impl Report {
                         },
                         age(n.age_ms),
                         n.info.drain.map_or("-", DrainState::as_str).to_owned(),
+                        count(n.load().map(|l| l.actors)),
+                        count(n.load().map(|l| l.sockets)),
+                        count(n.load().and_then(|l| l.events_per_min)),
                         n.info.version.clone(),
                         or_dash(&n.info.app),
                         n.info.address.clone(),
@@ -429,6 +463,9 @@ impl Report {
                     "LIVE",
                     "AGE",
                     "STATE",
+                    "ACTORS",
+                    "SOCKETS",
+                    "EV/MIN",
                     "VERSION",
                     "APP",
                     "ADDRESS",
@@ -442,16 +479,28 @@ impl Report {
         if self.apps.is_empty() {
             out.push_str("No deployed apps.\n");
         } else {
-            let rows: Vec<[String; 3]> = self
+            let rows: Vec<[String; 4]> = self
                 .apps
                 .iter()
-                .map(|a| match &a.current {
-                    Ok(Some(c)) => [a.name.clone(), c.version.clone(), c.seq.to_string()],
-                    Ok(None) => [a.name.clone(), "(none)".into(), "-".into()],
-                    Err(e) => [a.name.clone(), format!("({e})"), "-".into()],
+                .map(|a| {
+                    let [version, seq] = match &a.current {
+                        Ok(Some(c)) => [c.version.clone(), c.seq.to_string()],
+                        Ok(None) => ["(none)".into(), "-".into()],
+                        Err(e) => [format!("({e})"), "-".into()],
+                    };
+                    [
+                        a.name.clone(),
+                        version,
+                        seq,
+                        count(self.app_actors(&a.name)),
+                    ]
                 })
                 .collect();
-            table(&mut out, ["APP", "DEPLOYED VERSION", "SEQ"], &rows);
+            table(
+                &mut out,
+                ["APP", "DEPLOYED VERSION", "SEQ", "ACTORS"],
+                &rows,
+            );
         }
         let (tls, plain) = self.tls_split();
         let versions: Vec<&str> = self.versions().into_iter().map(|(v, _)| v).collect();
@@ -474,6 +523,11 @@ impl Report {
         }
         out
     }
+}
+
+/// A count, or `-` when unknown.
+fn count(n: Option<u64>) -> String {
+    n.map_or_else(|| "-".to_owned(), |n| n.to_string())
 }
 
 fn or_dash(s: &str) -> String {
@@ -563,6 +617,18 @@ mod tests {
     /// Writes node `id`'s heartbeat as of `at_ms`, with a cluster listener
     /// when `tls`.
     async fn beat(store: &Arc<dyn ObjectStore>, id: &str, at_ms: u64, tls: bool, app: &str) {
+        beat_with(store, id, at_ms, tls, app, None).await;
+    }
+
+    /// [`beat`], saying `load` on payload line 10 when given.
+    async fn beat_with(
+        store: &Arc<dyn ObjectStore>,
+        id: &str,
+        at_ms: u64,
+        tls: bool,
+        app: &str,
+        load: Option<membership::Load>,
+    ) {
         let bucket = ObjectStoreBucket::new(Arc::clone(store), "demo");
         let m = Membership::new(
             bucket,
@@ -579,6 +645,9 @@ mod tests {
         } else {
             m
         };
+        if let Some(load) = load {
+            m.set_load(load);
+        }
         // As a node writes it: its node lease, format 3 (ADR 0020).
         let body = wasmkeep_cluster::node_lease::NodeLeaseObject {
             state: NodeState::Live,
@@ -858,6 +927,101 @@ mod tests {
         assert!(text.contains("stuck"), "{text}");
     }
 
+    /// Payload line 10: a live node's load per node, summed per app. A node
+    /// not live (stale, fenced or released, which keep their last payload)
+    /// or of a version without the line shows `-`, never a stale count.
+    #[test]
+    fn load_is_shown_for_live_nodes_and_summed_per_app() {
+        let load = |actors, sockets, events_per_min| {
+            Some(membership::Load {
+                actors,
+                sockets,
+                events_per_min,
+            })
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        block_on(async {
+            beat_with(&store, "a", NOW, false, "acme/shop", load(3, 1, Some(120))).await;
+            beat_with(&store, "b", NOW, false, "acme/shop", load(2, 0, None)).await;
+            // c: a version without line 10.
+            beat(&store, "c", NOW, false, "acme/shop").await;
+            // d: stale, its last load kept.
+            beat_with(
+                &store,
+                "d",
+                NOW - 60_000,
+                false,
+                "acme/shop",
+                load(40, 4, Some(9)),
+            )
+            .await;
+            // e: fenced, its last load kept.
+            beat_with(&store, "e", NOW, false, "beta/new", load(50, 5, Some(9))).await;
+            let key = StorePath::from("demo/nodes/e");
+            let live = store.get(&key).await.unwrap().bytes().await.unwrap();
+            let fenced =
+                String::from_utf8(live.to_vec())
+                    .unwrap()
+                    .replacen("\nlive ", "\nfenced ", 1);
+            store.put(&key, PutPayload::from(fenced)).await.unwrap();
+            put(
+                &store,
+                "demo/apps/acme/shop/current",
+                "0123456789abcdef 4\n",
+            )
+            .await;
+            put(&store, "demo/apps/beta/new/current", "fedcba9876543210 1\n").await;
+        });
+        let r = report(store);
+        let j = r.to_json();
+        let cells = |i: usize| {
+            let n = &j["nodes"][i];
+            (
+                n["actors"].clone(),
+                n["sockets"].clone(),
+                n["events_per_min"].clone(),
+            )
+        };
+        assert_eq!(cells(0), (json!(3), json!(1), json!(120)));
+        assert_eq!(cells(1), (json!(2), json!(0), Value::Null));
+        for i in 2..5 {
+            assert_eq!(cells(i), (Value::Null, Value::Null, Value::Null), "{i}");
+        }
+        assert_eq!(j["apps"][0]["actors"], 5);
+        assert_eq!(j["apps"][1]["actors"], Value::Null);
+
+        let text = r.to_text();
+        let row = |id: &str| {
+            text.lines()
+                .find(|l| l.starts_with(&format!("{id} ")))
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        };
+        let header: Vec<&str> = text.lines().nth(2).unwrap().split_whitespace().collect();
+        assert_eq!(
+            header[3..7],
+            ["STATE", "ACTORS", "SOCKETS", "EV/MIN"],
+            "{text}"
+        );
+        assert_eq!(row("a")[4..7], ["3", "1", "120"], "{text}");
+        assert_eq!(row("b")[4..7], ["2", "0", "-"], "{text}");
+        for id in ["c", "d"] {
+            assert_eq!(row(id)[4..7], ["-", "-", "-"], "{text}");
+        }
+        // e's LIVE cell is two words: `no (fenced)`.
+        assert_eq!(row("e")[5..8], ["-", "-", "-"], "{text}");
+        assert!(
+            text.contains("APP        DEPLOYED VERSION  SEQ  ACTORS"),
+            "{text}"
+        );
+        assert_eq!(
+            row("acme/shop"),
+            ["acme/shop", "0123456789abcdef", "4", "5"]
+        );
+        assert_eq!(row("beta/new"), ["beta/new", "fedcba9876543210", "1", "-"]);
+    }
+
     #[test]
     fn mixed_versions_are_flagged() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -884,7 +1048,12 @@ mod tests {
     fn deployed_apps_are_read_from_current() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         block_on(async {
-            beat(&store, "a", NOW, false, "acme/shop").await;
+            let load = membership::Load {
+                actors: 7,
+                sockets: 0,
+                events_per_min: None,
+            };
+            beat_with(&store, "a", NOW, false, "acme/shop", Some(load)).await;
             put(
                 &store,
                 "demo/apps/acme/shop/current",
@@ -908,14 +1077,14 @@ mod tests {
         assert_eq!(
             j["apps"],
             json!([
-                {"app": "acme/admin", "version": null, "seq": null, "error": "unreadable current"},
-                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4},
-                {"app": "beta/new", "version": null, "seq": null},
+                {"app": "acme/admin", "version": null, "seq": null, "actors": null, "error": "unreadable current"},
+                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4, "actors": 7},
+                {"app": "beta/new", "version": null, "seq": null, "actors": null},
             ])
         );
         let text = r.to_text();
         assert!(
-            text.contains("acme/shop   0123456789abcdef      4"),
+            text.contains("acme/shop   0123456789abcdef      4    7\n"),
             "{text}"
         );
     }

@@ -730,6 +730,7 @@ mod tests {
             can_take: false,
             instance: None,
             lease: None,
+            load: None,
         }
     }
 
