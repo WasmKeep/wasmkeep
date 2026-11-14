@@ -361,6 +361,17 @@ front answers the same 503.
   - Note (while building it): `--rollback` makes a version current
     without writing it, so a rollback to a version with a front is
     checked the same way.
+  - Note (while building it, after review): for secrets, the refusal is
+    of a write that gives the set its first `_front` entry, counting only
+    nodes that read secrets from the bucket. When the set already has
+    one, such a node opens nothing already: refusing a class's change or
+    a key rotation then protects no one and blocks a fix. `unset` and
+    `rotate-key` add no entry, so they are never refused; `reset`, which
+    cannot open the current set, is judged on the set it writes.
+  - The check sees the nodes that write heartbeats: a `serve --app`
+    without `--node-id` writes none, as for the word `secrets`. It counts
+    a heartbeat as live with the default timings against the clock of the
+    machine running the command, as `cluster status` does.
 
 ### `serve`
 

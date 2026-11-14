@@ -717,7 +717,12 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --no-front
   while a live node of the app does not announce the capability word
   `front` on its heartbeat; there is no `--force`. Upgrade every node
   first. Versions without a front are written as before, with the same
-  ids.
+  ids. A node started without `--node-id` writes no heartbeat, so the
+  check cannot see it.
+- **A front that links but does not instantiate** (a start function that
+  traps, say) passes the deploy's checks; its requests answer 500 on
+  every node, and a node that restarts meanwhile starts anyway, with its
+  actors, logging the error. Deploy a fixed front, or roll back.
 - **A node's own values:** `serve --front-env FILE` gives the front
   values on that node, over the deployed configuration and the secrets
   (`--env` takes classes only).
@@ -818,12 +823,14 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   NAME`, `secrets unset --front NAME...`, and `_front <name> <length>`
   entries in `set --file`. `secrets list` shows the scope as `_front (the
   front)`. They reach the front's `env.get` over its deployed
-  configuration and under the node's `--front-env`. A write whose
-  resulting set has a `_front` entry (`set`, `unset`, `reset`,
-  `rotate-key`) is refused while a live node of the app does not announce
-  the capability word `front`, with no `--force`: such a node could open
-  none of the app's secrets, and would refuse every event. Removing the
-  last `_front` entry is always allowed.
+  configuration and under the node's `--front-env`. A `set` (or `reset`)
+  that gives the set its first `_front` entry is refused while a live
+  node of the app that reads secrets does not announce the capability
+  word `front`, with no `--force`: such a node could open none of the
+  app's secrets, and would refuse every event. `unset` and `rotate-key`
+  add no entry and are never refused. A node started without `--node-id`
+  writes no heartbeat, so the check cannot see it: upgrade such nodes
+  before using the scope.
 - **A node that cannot open the current secrets** refuses the app's
   events with 503 and `Retry-After`, hands its actors to a node that can,
   takes none, and reports not ready. It blocks at once on a set it cannot

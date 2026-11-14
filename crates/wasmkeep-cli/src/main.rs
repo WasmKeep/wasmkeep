@@ -1287,9 +1287,21 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding {}", args.listen))?;
         if let Some(http) = &app.front {
-            http.instantiate_once()
-                .await
-                .context("test instantiation of the component failed")?;
+            match http.instantiate_once().await {
+                Ok(()) => {}
+                // A deployed front that links but does not instantiate:
+                // the nodes already running serve it (with 500s), so this
+                // one starts too, with its actors, rather than exit (ADR
+                // 0023). The next deploy replaces it.
+                Err(e) if args.app.is_some() => tracing::error!(
+                    error = %format!("{:#}", anyhow::Error::from(e)),
+                    "the deployed front does not instantiate: its requests will fail until a deploy replaces it"
+                ),
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context("test instantiation of the component failed"));
+                }
+            }
         }
         tracing::info!("listening on http://{}", listener.local_addr()?);
         if let Some(addr) = args.metrics_listen {

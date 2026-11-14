@@ -508,6 +508,12 @@ impl AppRef {
                     .into(),
             ));
         }
+        // Removing them without a front: nothing to remove.
+        let (front_config, front_requires) = if has_front {
+            (changes.front_config, changes.front_requires)
+        } else {
+            (None, None)
+        };
 
         // The class table, and what to write for it.
         let table: BTreeMap<String, String> = match changes.classes {
@@ -571,7 +577,7 @@ impl AppRef {
                 .replace(class, spec)
                 .map_err(|e| DeployError::Invalid(class.clone(), e))?;
         }
-        let front_config = changes.front_config.map(|v| (FRONT.to_owned(), v));
+        let front_config = front_config.map(|v| (FRONT.to_owned(), v));
         for (class, vars) in changes.config.into_iter().chain(front_config) {
             if !scoped(&class) {
                 return Err(DeployError::Invalid(
@@ -602,7 +608,7 @@ impl AppRef {
                     .collect(),
                 _ => BTreeMap::new(),
             };
-        let front_requires = changes.front_requires.map(|n| (FRONT.to_owned(), n));
+        let front_requires = front_requires.map(|n| (FRONT.to_owned(), n));
         for (class, names) in changes.requires.into_iter().chain(front_requires) {
             if !scoped(&class) {
                 return Err(DeployError::Invalid(
@@ -1418,8 +1424,9 @@ impl Manifest {
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
                 (Some("previous"), Some(v), None, None) => manifest.previous = Some(v.to_owned()),
-                // `_front` is never a class: in format 3 it names the front.
-                (Some("class"), Some(n), Some(d), None) if format < 3 || n != FRONT => {
+                // `_front` is never a class (no class of that name ever
+                // linked, in any format): it names the front.
+                (Some("class"), Some(n), Some(d), None) if n != FRONT => {
                     manifest.classes.insert(n.to_owned(), d.to_owned());
                 }
                 // At most one front, named `main`.
@@ -1469,6 +1476,31 @@ pub async fn nodes_without_front(
     tenant: &str,
     app: &str,
 ) -> Result<Vec<String>, DeployError> {
+    without_front(store, prefix, tenant, app, false).await
+}
+
+/// [`nodes_without_front`], among the nodes that read the app's secrets
+/// from the bucket (heartbeat line 10): a node run with `--no-secrets`
+/// never opens the set.
+///
+/// # Errors
+/// The bucket did not answer.
+pub async fn secrets_readers_without_front(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> Result<Vec<String>, DeployError> {
+    without_front(store, prefix, tenant, app, true).await
+}
+
+async fn without_front(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+    reading_secrets: bool,
+) -> Result<Vec<String>, DeployError> {
     let prefix = if prefix.is_empty() || prefix.ends_with('/') {
         prefix.to_owned()
     } else {
@@ -1487,7 +1519,7 @@ pub async fn nodes_without_front(
     Ok(nodes
         .into_iter()
         .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon))
-        .filter(|n| n.app == served && !n.can_front)
+        .filter(|n| n.app == served && !n.can_front && (n.reads_secrets || !reading_secrets))
         .map(|n| n.id)
         .collect())
 }
@@ -1809,6 +1841,8 @@ mod tests {
             format!("{front}access _front open\n"),
             // `_front` is never a class.
             format!("{v3}class _front 66\n"),
+            "wasmkeep-manifest 1\nclass _front 66\n".to_owned(),
+            "wasmkeep-manifest 2\nclass _front 66\nconfig _front 55\n".to_owned(),
             // Open for a class the version does not have.
             format!("{v3}access other open\n"),
         ] {

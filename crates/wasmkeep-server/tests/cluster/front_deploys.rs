@@ -316,6 +316,21 @@ async fn deploys_carry_the_front_and_rollbacks_restore_it() {
     assert!(m5.front.is_none() && m5.config.is_empty() && m5.requires.is_empty());
     assert_eq!(m5.format_number(), 2, "class c keeps its rule");
     assert!(front_of(&v5.current.version).await.is_none());
+    // Removing front values of a version without a front: nothing to do,
+    // not an error (`--front-config ''`, `--front-requires ''`).
+    let same = app
+        .deploy_changes(
+            &rt,
+            Changes {
+                front: FrontChange::Remove,
+                front_config: Some(None),
+                front_requires: Some(BTreeSet::new()),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.current, v5.current, "a no-op");
     // A deploy that only adds front values now has no front to give them.
     let e = app
         .deploy_changes(
@@ -613,11 +628,41 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
         Vec::<String>::new()
     );
 
+    // An older node run with `--no-secrets`: it holds format 3 back, never
+    // the front's secrets (it does not open the set).
+    store
+        .put(
+            &"nodes/plain".into(),
+            format!(
+                "wasmkeep-node 2\nplain\nhttp://10.0.0.7:8080\n0.3.9\n{}\ndefault/shop\n\n\nserving\n\ntake\n",
+                now_ms()
+            )
+            .into_bytes()
+            .into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        app.nodes_without_front().await.unwrap(),
+        vec!["plain".to_owned()]
+    );
+    let readers = |store: &Arc<dyn ObjectStore>| {
+        wasmkeep_server::apps::secrets_readers_without_front(
+            Arc::clone(store),
+            "",
+            "default",
+            "shop",
+        )
+    };
+    assert_eq!(readers(&store).await.unwrap(), Vec::<String>::new());
+    store.delete(&"nodes/plain".into()).await.unwrap();
+
     older_node_heartbeat(&store, "old", "default/shop").await;
     assert_eq!(
         app.nodes_without_front().await.unwrap(),
         vec!["old".to_owned()]
     );
+    assert_eq!(readers(&store).await.unwrap(), vec!["old".to_owned()]);
     let before = bucket_keys(&store).await;
     let e = app
         .deploy_changes(

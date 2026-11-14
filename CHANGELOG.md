@@ -181,9 +181,10 @@ An app's front ships in its version, with the classes
   Versions without a front keep format 1 or 2, the same bytes and ids.
 - **Heartbeats** announce the capability word `front` beside `take`. A
   deploy or rollback making a format 3 version current, and a secrets
-  write whose resulting set has a `_front` entry, are refused while a live
-  node of the app lacks it, with no `--force`: such a node could not read
-  the version, or any of the app's secrets.
+  `set` or `reset` that gives the set its first `_front` entry, are
+  refused while a live node of the app lacks it (for secrets, one that
+  reads them), with no `--force`: such a node could not read the version,
+  or any of the app's secrets.
 
 ### App-owned state (for 0.4.0)
 

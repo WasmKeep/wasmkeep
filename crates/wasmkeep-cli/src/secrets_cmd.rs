@@ -222,24 +222,28 @@ fn nodes_without_secrets(bucket: &str, tenant: &str, app: &str) -> anyhow::Resul
 fn nodes_without_front(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<Vec<String>> {
     let (store, prefix) = crate::open_bucket(bucket)?;
     Ok(
-        runtime()?.block_on(wasmkeep_server::apps::nodes_without_front(
+        runtime()?.block_on(wasmkeep_server::apps::secrets_readers_without_front(
             store, &prefix, tenant, app,
         ))?,
     )
 }
 
-/// Refuses a set with a `_front` entry while `lacking` (live nodes of the
-/// app without the word `front`) is not empty: one entry such a node cannot
+/// Refuses a set that gains a `_front` entry (`had`: the set before had
+/// one) while `lacking` (live nodes of the app that read its secrets,
+/// without the word `front`) is not empty: one entry such a node cannot
 /// check makes it fail to open the whole set, refuse every event and drain
-/// (ADR 0023). Unlike [`check_nodes`], there is no `--force`.
+/// (ADR 0023). A set that already had one is not refused: such a node
+/// already opens nothing, and refusing would only block a fix. Unlike
+/// [`check_nodes`], there is no `--force`.
 fn refuse_front(
+    had: bool,
     set: &SecretSet,
     lacking: &[String],
     tenant: &str,
     app: &str,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        !set.has_front() || lacking.is_empty(),
+        had || !set.has_front() || lacking.is_empty(),
         "live nodes of {tenant}/{app} cannot read the front's secrets ({}): with a `_front` \
          entry in the set they could open none of the app's secrets, and would refuse every \
          event. Upgrade them first (this check has no --force)",
@@ -332,19 +336,19 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             let keys = load_keys(&args.app.keys)?;
             let (tenant, app) = &args.app.app;
             let lacking = nodes_without_front(&args.app.bucket, tenant, app)?;
-            refuse_front(&changes, &lacking, tenant, app)?;
             let store = store_for(&args.app.bucket, tenant, app)?;
             let seq = runtime()?.block_on(async {
                 first_key_is_current(&store, &keys, args.app.nodes_have_new_key).await?;
                 let seq = store
                     .change(&keys, &keys[0], |set| {
+                        let had = set.has_front();
                         for (class, names) in changes.names() {
                             let vars = changes.class(&class).cloned().unwrap_or_default();
                             for name in names {
                                 set.set(&class, &name, &vars[&name])?;
                             }
                         }
-                        refuse_front(set, &lacking, tenant, app)
+                        refuse_front(had, set, &lacking, tenant, app)
                     })
                     .await??;
                 tidy(&store).await;
@@ -362,9 +366,8 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                 Some(class) => class.as_str(),
                 None => wasmkeep_server::secrets::FRONT_SCOPE,
             };
-            // Removing the last `_front` entry is the way out: the result
-            // is what is checked.
-            let lacking = nodes_without_front(&args.app.bucket, tenant, app)?;
+            // Removing adds no `_front` entry: no front check (ADR 0023);
+            // removing the last one is the way out.
             let store = store_for(&args.app.bucket, tenant, app)?;
             let (seq, removed) = runtime()?.block_on(async {
                 first_key_is_current(&store, &keys, args.app.nodes_have_new_key).await?;
@@ -372,9 +375,10 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                 let seq = store
                     .change(&keys, &keys[0], |set| {
                         removed = args.names.iter().filter(|n| set.unset(scope, n)).count();
-                        refuse_front(set, &lacking, tenant, app)
+                        Ok::<(), std::convert::Infallible>(())
                     })
-                    .await??;
+                    .await?
+                    .unwrap_or_else(|never| match never {});
                 tidy(&store).await;
                 anyhow::Ok((seq, removed))
             })?;
@@ -418,18 +422,12 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             for (tenant, app) in apps {
                 let one = SecretStore::new(Arc::clone(&store), &prefix, &tenant, &app);
                 let keys = [old.clone(), new.clone()];
-                let lacking = rt.block_on(wasmkeep_server::apps::nodes_without_front(
-                    Arc::clone(&store),
-                    &prefix,
-                    &tenant,
-                    &app,
-                ))?;
+                // Re-sealing adds no entry: no front check (ADR 0023).
                 let seq = rt.block_on(async {
                     let seq = one
-                        .change(&keys, &new, |set| {
-                            refuse_front(set, &lacking, &tenant, &app)
-                        })
-                        .await??;
+                        .change(&keys, &new, |_| Ok::<(), std::convert::Infallible>(()))
+                        .await?
+                        .unwrap_or_else(|never| match never {});
                     tidy(&one).await;
                     anyhow::Ok(seq)
                 })?;
@@ -452,7 +450,10 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             let new = SecretsKey::load(&args.new_key)?;
             let set = read_set(&args.from)?;
             let (tenant, app) = &args.app;
+            // The current set cannot be opened (its key is lost): judged on
+            // the set written alone.
             refuse_front(
+                false,
                 &set,
                 &nodes_without_front(&args.bucket, tenant, app)?,
                 tenant,
@@ -488,17 +489,16 @@ mod tests {
         front.set("_front", "SESSION_KEY", "v").unwrap();
         let old = vec!["old-1".to_owned()];
         // Classes only: an older node reads it, whatever is live.
-        assert!(refuse_front(&classes, &old, "acme", "shop").is_ok());
+        assert!(refuse_front(false, &classes, &old, "acme", "shop").is_ok());
         // A `_front` entry: refused while such a node is live, naming it.
-        let e = refuse_front(&front, &old, "acme", "shop")
+        let e = refuse_front(false, &front, &old, "acme", "shop")
             .unwrap_err()
             .to_string();
         assert!(e.contains("old-1") && e.contains("no --force"), "{e}");
-        assert!(refuse_front(&front, &[], "acme", "shop").is_ok());
-        // Removing the last `_front` entry is the way out.
-        let mut out = front.clone();
-        out.unset("_front", "SESSION_KEY");
-        assert!(refuse_front(&out, &old, "acme", "shop").is_ok());
+        assert!(refuse_front(false, &front, &[], "acme", "shop").is_ok());
+        // Already there: such a node opens nothing already; refusing would
+        // only block a fix.
+        assert!(refuse_front(true, &front, &old, "acme", "shop").is_ok());
     }
 
     #[test]
