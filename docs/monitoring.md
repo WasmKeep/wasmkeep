@@ -162,7 +162,7 @@ its first request.
 | `wasmkeep_websocket_sweep_reads_total` | counter | Ownership records the owner sweep read: once a minute, one per room with WebSockets open here that this node neither holds nor keeps parked, 5,000 a pass at most (the next pass goes on with the rest), and on one pass in ten one per parked record too (a safeguard). A pass stops at its first failed read. Each read is a bucket GET. |
 | `wasmkeep_parked_records` | gauge | Ownership records this node keeps for rooms that hibernated with WebSockets open here ([ADR 0024](adr/0024-socket-home.md)): each such room wakes here, wherever its next event lands. Bounded by the sockets a node accepts (50,000). They cost no request while they last; a node dying with many of them makes those rooms wait for the failover (about 15 to 20 s), as resident actors do. |
 | `wasmkeep_parked_wakes_total` | counter | Wakes of a parked room on this node, each an acquisition at a new generation (the record's read and write). |
-| `wasmkeep_parked_releases_total{reason}` | counter | Parked records released, by `reason`: `last_socket` (the room's last socket here went), `drain`, `move`, `lapse` (this node's lease ran out: the release is pending, retried) and `stop` (a clean stop). |
+| `wasmkeep_parked_releases_total{reason}` | counter | Parked records given up, counted when the release is sent (one that does not land waits in the pending releases, retried), by `reason`: `last_socket` (the room's last socket here went), `drain`, `move`, `lapse` (this node's lease ran out: the release is pending, retried) and `stop` (a clean stop). |
 
 Not there yet: `tenant` and `app` on the series without a class (one app
 per process for now: join on `wasmkeep_info`), traps by reason

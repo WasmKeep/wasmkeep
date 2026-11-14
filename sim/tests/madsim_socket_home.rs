@@ -794,25 +794,30 @@ fn a_room_keeps_one_home_and_releases_it() {
 /// Each broken variant is caught on some seed: the checks have teeth.
 #[test]
 fn each_broken_variant_is_caught() {
-    for variant in [
-        Variant::WakeReusesParked,
-        Variant::LapseForgetsParked,
-        Variant::ReleaseOnHibernate,
-        Variant::ResolverIgnoresGeneration,
-        Variant::UnknownWakeDropsParked,
-        Variant::ResolverEndsUnchanged,
-        Variant::ResolverNeverEnds,
+    // Each with the violation it must cause: one of another kind is not
+    // the check catching it.
+    for (variant, kind) in [
+        (Variant::WakeReusesParked, "one generation, two holds"),
+        (Variant::LapseForgetsParked, "unheld"),
+        (Variant::ReleaseOnHibernate, " sockets"),
+        (Variant::ResolverIgnoresGeneration, "unheld"),
+        (Variant::UnknownWakeDropsParked, "unheld"),
+        (Variant::ResolverEndsUnchanged, "unheld"),
+        (Variant::ResolverNeverEnds, "past its deadline"),
     ] {
-        // The two resolver variants need an unknown wake of a parked room,
-        // rarer: up to 20 times the seeds.
+        // The resolver variants and an unknown wake that drops the parked
+        // hold need a rarer fault (an unknown write of a parked room, or
+        // one that never lands): up to 20 times the seeds, which CI's 200
+        // seeds make 4,000 (the last ones are caught first by seed 2,000).
         let most = seeds().max(200) * 20;
         let caught = (0..most).find_map(|seed| {
             simulate(seed, variant, false)
                 .violation()
+                .filter(|v| v.contains(kind))
                 .map(|v| (seed, v))
         });
         eprintln!("{variant:?}: caught by {caught:?}");
-        assert!(caught.is_some(), "{variant:?} was never caught");
+        assert!(caught.is_some(), "{variant:?} never caused {kind:?}");
     }
 }
 

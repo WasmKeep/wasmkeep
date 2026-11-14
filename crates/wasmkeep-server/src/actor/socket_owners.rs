@@ -22,17 +22,26 @@ const SWEEP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Most records one sweep pass reads; the next pass goes on where it
 /// stopped, so every room is read in turn, at a bounded bucket cost.
 const SWEEP_MAX_READS: usize = 5_000;
-/// One sweep pass in this many also reads every parked record, as a
-/// safeguard (ADR 0024, section 5); the others read none of them.
+/// One sweep pass in this many also re-reads parked records, as a
+/// safeguard (ADR 0024, section 5): up to [`SWEEP_MAX_READS`] of them,
+/// going on where the last re-read stopped; the others read none of them.
 const PARKED_RECHECK_EVERY: u64 = 10;
+/// Releases of parked records whose last socket went, sent at once: a
+/// burst of closed sockets does not become a burst of writes.
+const VACATED_PARALLEL: usize = 32;
 
 /// Releases the parked record of each actor whose last socket slot was
-/// freed (ADR 0024, section 3), unless it has a socket open again. The
-/// sweep does the same for any it missed.
+/// freed (ADR 0024, section 3), unless it has a socket open again; at most
+/// [`VACATED_PARALLEL`] at once. The sweep does the same for any it missed.
+/// Nothing while this node's lease is not valid or it is shutting down:
+/// the sockets were closed by the lapse or the stop, which release the
+/// parked records themselves (a lapse into the pending releases, a stop
+/// with every other), so a nudge then would only be a second write each.
 pub(super) async fn release_vacated(
     service: std::sync::Weak<ServiceInner>,
     mut vacated: tokio::sync::mpsc::UnboundedReceiver<ActorAddress>,
 ) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(VACATED_PARALLEL));
     while let Some(address) = vacated.recv().await {
         let Some(inner) = service.upgrade() else {
             return;
@@ -40,14 +49,21 @@ pub(super) async fn release_vacated(
         let Some(cluster) = inner.cluster.clone() else {
             return;
         };
+        if inner.mailboxes.is_closed() || !cluster.node_lease_valid() {
+            continue;
+        }
         if cluster.is_parked(&address) && !inner.sockets.has_open(&address) {
             let sockets = Arc::clone(&inner.sockets);
             drop(inner);
+            let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                return;
+            };
             tokio::spawn(async move {
+                let _slot = slot;
                 // Asked again under the lock's wait: a socket opened
                 // meanwhile woke the room, which dropped the parked entry.
-                if !sockets.has_open(&address) {
-                    cluster.release_parked(&address, "last_socket").await;
+                if !sockets.has_open(&address) && cluster.node_lease_valid() {
+                    let _ = cluster.release_parked(&address, "last_socket").await;
                 }
             });
         }
@@ -57,48 +73,50 @@ pub(super) async fn release_vacated(
 /// Every sweep pass, before the reads: releases the parked records of
 /// actors with no socket open here any more (the nudge of
 /// [`release_vacated`] missed, or a socket closed without its slot being
-/// freed yet counts as gone).
+/// freed yet counts as gone), [`VACATED_PARALLEL`] at once.
 async fn release_unsocketed(inner: &ServiceInner, cluster: &Cluster) {
-    for (address, _) in cluster.parked() {
-        if !inner.sockets.has_open(&address) {
-            cluster.release_parked(&address, "last_socket").await;
-        }
-    }
+    let gone: Vec<ActorAddress> = cluster
+        .parked()
+        .into_iter()
+        .map(|(address, _)| address)
+        .filter(|address| !inner.sockets.has_open(address))
+        .collect();
+    futures_util::StreamExt::for_each_concurrent(
+        futures_util::stream::iter(gone),
+        VACATED_PARALLEL,
+        |address| async move {
+            if !inner.sockets.has_open(&address) {
+                let _ = cluster.release_parked(&address, "last_socket").await;
+            }
+        },
+    )
+    .await;
 }
 
-/// The safeguard re-read (ADR 0024, section 5): each parked record read
-/// once; one that no longer names this node at the parked generation is
-/// forgotten, and its room's sockets are swept as any other's. A failed
-/// read stops the re-read until next time.
+/// The safeguard re-read (ADR 0024, section 5): up to [`SWEEP_MAX_READS`]
+/// parked records read once each, in a stable order from where the last
+/// re-read stopped; one that no longer names this node at the parked
+/// generation is forgotten, and its room's sockets are swept as any
+/// other's. A read that times out stops the re-read until next time,
+/// which starts at the first record not read.
 async fn recheck_parked(inner: &ServiceInner, cluster: &Cluster, cursor: &mut usize) {
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    // In a stable order, from where the last re-read stopped: every parked
-    // record is read in turn, [`SWEEP_MAX_READS`] at a time.
     let mut all = cluster.parked();
     all.sort_unstable();
-    let parked = window(&all, cursor, SWEEP_MAX_READS);
-    futures_util::StreamExt::for_each_concurrent(
-        futures_util::stream::iter(parked),
-        SWEEP_PARALLEL,
-        |(address, generation)| {
-            let stop = &stop;
-            async move {
-                use std::sync::atomic::Ordering::Relaxed;
-                if stop.load(Relaxed) || inner.mailboxes.is_closed() || !cluster.node_lease_valid()
-                {
-                    return;
-                }
-                crate::metrics::inc(&crate::metrics::METRICS.websocket_sweep_reads);
-                if tokio::time::timeout(
-                    SWEEP_READ_TIMEOUT,
-                    cluster.drop_parked_if_stale(&address, generation),
-                )
-                .await
-                .is_err()
-                {
-                    stop.store(true, Relaxed);
-                }
+    read_in_turn(
+        &all,
+        cursor,
+        SWEEP_MAX_READS,
+        |(address, generation)| async move {
+            if inner.mailboxes.is_closed() || !cluster.node_lease_valid() {
+                return false;
             }
+            crate::metrics::inc(&crate::metrics::METRICS.websocket_sweep_reads);
+            tokio::time::timeout(
+                SWEEP_READ_TIMEOUT,
+                cluster.drop_parked_if_stale(&address, generation),
+            )
+            .await
+            .is_ok()
         },
     )
     .await;
@@ -151,60 +169,45 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
             .filter(|address| !cluster.holds_here(address) && !cluster.is_parked(address))
             .collect();
         unheld.sort_unstable();
-        let batch = window(&unheld, &mut cursor, SWEEP_MAX_READS);
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        futures_util::StreamExt::for_each_concurrent(
-            futures_util::stream::iter(batch),
-            SWEEP_PARALLEL,
-            |address| {
-                let (inner, cluster, stop) = (&inner, &cluster, &stop);
-                async move {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    if stop.load(Relaxed)
-                        || inner.mailboxes.is_closed()
-                        || !cluster.node_lease_valid()
-                    {
-                        return;
-                    }
-                    crate::metrics::inc(&crate::metrics::METRICS.websocket_sweep_reads);
-                    let read =
-                        tokio::time::timeout(SWEEP_READ_TIMEOUT, cluster.other_owner(&address))
-                            .await;
-                    let owner = match read {
-                        Ok(Ok(Some(owner))) => owner,
-                        Ok(Ok(None)) => return,
-                        Ok(Err(_)) | Err(_) => {
-                            stop.store(true, Relaxed);
-                            return;
-                        }
-                    };
-                    // Taken here meanwhile: the sockets are where they belong.
-                    if cluster.holds_here(&address) {
-                        return;
-                    }
-                    let closed = inner
-                        .sockets
-                        .close_owner(&address, 1012, "actor moved; reconnect");
-                    if closed > 0 {
-                        tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %owner, sockets = closed, "closed sockets of an actor another node holds");
-                        crate::metrics::owner_closes("sweep", closed);
-                    }
-                }
-            },
-        )
+        let (inner_ref, cluster_ref) = (&inner, &cluster);
+        read_in_turn(&unheld, &mut cursor, SWEEP_MAX_READS, |address| async move {
+            let (inner, cluster) = (inner_ref, cluster_ref);
+            if inner.mailboxes.is_closed() || !cluster.node_lease_valid() {
+                return false;
+            }
+            crate::metrics::inc(&crate::metrics::METRICS.websocket_sweep_reads);
+            let read =
+                tokio::time::timeout(SWEEP_READ_TIMEOUT, cluster.other_owner(&address)).await;
+            let owner = match read {
+                Ok(Ok(Some(owner))) => owner,
+                Ok(Ok(None)) => return true,
+                Ok(Err(_)) | Err(_) => return false,
+            };
+            // Taken here meanwhile: the sockets are where they belong.
+            if cluster.holds_here(&address) {
+                return true;
+            }
+            let closed = inner
+                .sockets
+                .close_owner(&address, 1012, "actor moved; reconnect");
+            if closed > 0 {
+                tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %owner, sockets = closed, "closed sockets of an actor another node holds");
+                crate::metrics::owner_closes("sweep", closed);
+            }
+            true
+        })
         .await;
         drop((inner, cluster));
     }
 }
 
-/// Up to `max` of `all` from `*cursor` on, wrapping around; moves the
-/// cursor past them.
-fn window<T: Clone>(all: &[T], cursor: &mut usize, max: usize) -> Vec<T> {
+/// Up to `max` of `all` from `*cursor` on, wrapping around, with where
+/// they start; the cursor is left alone.
+fn window<T: Clone>(all: &[T], cursor: usize, max: usize) -> (usize, Vec<T>) {
     if all.is_empty() {
-        *cursor = 0;
-        return Vec::new();
+        return (0, Vec::new());
     }
-    let start = *cursor % all.len();
+    let start = cursor % all.len();
     let taken: Vec<T> = all
         .iter()
         .cycle()
@@ -212,8 +215,31 @@ fn window<T: Clone>(all: &[T], cursor: &mut usize, max: usize) -> Vec<T> {
         .take(max.min(all.len()))
         .cloned()
         .collect();
-    *cursor = start + taken.len();
-    taken
+    (start, taken)
+}
+
+/// Reads up to `max` of `all` from `*cursor` on ([`window`]), in groups of
+/// [`SWEEP_PARALLEL`] at once, and moves the cursor past the groups read
+/// in full. `read` says whether to go on: `false` (a read that failed or
+/// timed out, or the node shutting down or its lease not valid) ends the
+/// pass after its group, and the next pass starts at that group again,
+/// so no record is skipped for a pass that stopped early.
+async fn read_in_turn<T: Clone, F: std::future::Future<Output = bool>>(
+    all: &[T],
+    cursor: &mut usize,
+    max: usize,
+    read: impl Fn(T) -> F,
+) {
+    let (start, taken) = window(all, *cursor, max);
+    let mut done = 0;
+    for group in taken.chunks(SWEEP_PARALLEL) {
+        let ok = futures_util::future::join_all(group.iter().map(|x| read(x.clone()))).await;
+        if !ok.iter().all(|ok| *ok) {
+            break;
+        }
+        done += group.len();
+    }
+    *cursor = start + done;
 }
 
 /// Closes every socket on this node with 1012: its lease is no longer
@@ -338,13 +364,46 @@ mod tests {
     }
 
     #[test]
-    fn the_sweep_window_wraps_and_moves_on() {
+    fn the_sweep_window_wraps() {
         let all = [1, 2, 3, 4, 5];
+        assert_eq!(window(&all, 0, 2), (0, vec![1, 2]));
+        assert_eq!(window(&all, 4, 2), (4, vec![5, 1]));
+        assert_eq!(window(&all, 6, 9), (1, vec![2, 3, 4, 5, 1]));
+        assert!(window::<u8>(&[], 3, 2).1.is_empty());
+    }
+
+    /// The cursor moves past what was read, and only that: a pass that
+    /// stops early starts the next at the first group not read in full.
+    #[tokio::test]
+    async fn the_sweep_moves_on_only_past_what_it_read() {
+        let all: Vec<usize> = (0..SWEEP_PARALLEL * 3).collect();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let read_all = |x: usize| {
+            seen.lock().unwrap().push(x);
+            async { true }
+        };
         let mut cursor = 0;
-        assert_eq!(window(&all, &mut cursor, 2), [1, 2]);
-        assert_eq!(window(&all, &mut cursor, 2), [3, 4]);
-        assert_eq!(window(&all, &mut cursor, 2), [5, 1]);
-        assert_eq!(window(&all, &mut cursor, 9), [2, 3, 4, 5, 1]);
-        assert!(window::<u8>(&[], &mut cursor, 2).is_empty());
+        read_in_turn(&all, &mut cursor, SWEEP_PARALLEL * 2, read_all).await;
+        assert_eq!(cursor, SWEEP_PARALLEL * 2);
+        // A read in the second group fails: the cursor moves one group.
+        let failing = SWEEP_PARALLEL * 3 + 1;
+        let mut cursor = SWEEP_PARALLEL;
+        let all: Vec<usize> = (0..SWEEP_PARALLEL * 4).collect();
+        read_in_turn(&all, &mut cursor, all.len(), |x: usize| async move {
+            x != failing
+        })
+        .await;
+        assert_eq!(
+            cursor,
+            SWEEP_PARALLEL * 3,
+            "moved past a group not read in full"
+        );
+        // Then it reads from there, wrapping around.
+        read_in_turn(&all, &mut cursor, SWEEP_PARALLEL, read_all).await;
+        assert_eq!(cursor, SWEEP_PARALLEL * 4);
+        assert_eq!(
+            seen.lock().unwrap()[SWEEP_PARALLEL * 2..],
+            (SWEEP_PARALLEL * 3..SWEEP_PARALLEL * 4).collect::<Vec<_>>()[..]
+        );
     }
 }

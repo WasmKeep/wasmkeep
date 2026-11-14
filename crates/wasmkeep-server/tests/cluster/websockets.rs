@@ -590,8 +590,11 @@ async fn next_text(ws: &mut Client) -> String {
 /// ADR 0024: a room that hibernated with its sockets open on a keeps its
 /// record, so a request reaching it through b is relayed to a and wakes
 /// it there (each time, at a new generation): the socket stays open and
-/// the room still answers it. Once the last socket closes, the record is
-/// released: any node may take the room.
+/// the room still answers it. Once the last socket closes, the record
+/// names nobody: here the close event wakes the room, which then
+/// hibernates with no socket and releases its record as any actor does
+/// (the parked record's own release, when the close event cannot run, is
+/// `a_parked_record_is_released_when_its_last_socket_goes`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_room_with_open_sockets_wakes_on_their_node() {
     use futures_util::SinkExt;
@@ -725,4 +728,111 @@ async fn a_parked_record_is_released_when_its_last_socket_goes() {
         chat_holder(&shared, "lobby").await.is_none()
     })
     .await;
+}
+
+/// ADR 0017 and 0024: a move of a parked room waits while the parked
+/// record's release does not land. Before, the move closed the sockets
+/// and asked the target to take the room anyway; the target found the
+/// record still naming this node and answered that this node holds it,
+/// which the move took for done: the request was deleted and nothing
+/// moved. Once the bucket accepts the release, the target takes the room.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_room_moves_only_once_its_release_lands() {
+    use object_store::ObjectStoreExt as _;
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let seen_by_a: Arc<dyn ObjectStore> = flaky_a.clone();
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let no_sweep =
+        |c: &mut ActorConfig| c.cluster.as_mut().unwrap().socket_sweep = Duration::from_secs(600);
+    let a = node_configured(
+        "a",
+        da.path(),
+        &seen_by_a,
+        Duration::from_millis(300),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        no_sweep,
+    )
+    .await;
+    let _b = node_configured(
+        "b",
+        db.path(),
+        &shared,
+        Duration::from_secs(30),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        no_sweep,
+    )
+    .await;
+    wait_drain_line(&shared, "b", "serving").await;
+    settle().await;
+    let _client = join_lobby(a.addr).await;
+    lobby_parked(&shared, &a).await;
+    flaky_a.fail_owner_puts.store(true, Ordering::SeqCst);
+    let key = request_move_of(&shared, "chat", "lobby", "b").await;
+    // Several move passes while the release cannot land.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        shared.head(&key).await.is_ok(),
+        "the move was reported done while its release had not landed"
+    );
+    assert_eq!(chat_holder(&shared, "lobby").await.as_deref(), Some("a"));
+    flaky_a.fail_owner_puts.store(false, Ordering::SeqCst);
+    eventually("the move request is deleted", async || {
+        matches!(
+            shared.head(&key).await,
+            Err(object_store::Error::NotFound { .. })
+        )
+    })
+    .await;
+    assert_eq!(chat_holder(&shared, "lobby").await.as_deref(), Some("b"));
+}
+
+/// ADR 0024: a lapse closes the sockets of a parked room and puts its
+/// record into the pending releases (counted as `lapse`); the sockets'
+/// freed slots do not also release it as `last_socket` (a second write
+/// each, a burst after a lapse with many rooms).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lapse_releases_a_parked_record_once() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let down = Arc::new(AtomicBool::new(false));
+    let seen_by_a: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let da = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "a",
+        da.path(),
+        &seen_by_a,
+        Duration::from_millis(300),
+        "chat",
+        chat_wasm(),
+    )
+    .await;
+    settle().await;
+    let metrics = metrics_page().await;
+    let mut client = join_lobby(a.addr).await;
+    lobby_parked(&shared, &a).await;
+    let last_socket = parked_releases(metrics, "last_socket").await;
+    down.store(true, Ordering::SeqCst);
+    let (code, reason) = closed_within(&mut client, Duration::from_secs(5)).await;
+    assert_eq!((code, reason.as_str()), (1012, "node lost its lease"));
+    eventually("a forgot the socket", async || a.service.websockets() == 0).await;
+    eventually("the lapse released the parked record", async || {
+        parked_releases(metrics, "lapse").await > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        parked_releases(metrics, "last_socket").await,
+        last_socket,
+        "the freed slot released it too"
+    );
 }

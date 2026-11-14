@@ -2988,3 +2988,147 @@ async fn a_lapse_runs_its_hook_before_ending_the_holds() {
     cluster.end_holds_after_lapse();
     assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// The record of `key` in `store`, decoded.
+async fn owner_record(
+    store: &Arc<dyn ObjectStore>,
+    key: &str,
+) -> wasmkeep_cluster::node_lease::OwnerRecord {
+    let body = store
+        .get(&StorePath::from(key))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    wasmkeep_cluster::node_lease::OwnerRecord::decode(&body).unwrap()
+}
+
+/// Waits (5 s at most) until `cond` holds.
+async fn until(what: &str, mut cond: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !cond().await {
+        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// ADR 0024, section 1: a hold parked while it may still act keeps the
+/// record naming this node, unwritten; a clean stop's
+/// `release_all_parked("stop")` releases it, generation kept, and leaves
+/// nothing parked or pending.
+#[tokio::test]
+async fn a_parked_record_is_kept_until_a_stop_releases_it() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let generation = hold.generation().unwrap();
+    hold.park(&x);
+    assert!(a.is_parked(&x));
+    assert!(
+        !a.nothing_pending(),
+        "a parked record reads as nothing pending"
+    );
+    assert!(owner_record(&store, &key).await.holder.is_some());
+    a.release_all_parked("stop").await;
+    assert!(!a.is_parked(&x));
+    let record = owner_record(&store, &key).await;
+    assert_eq!((record.holder, record.generation), (None, generation));
+    assert!(a.nothing_pending());
+}
+
+/// ADR 0024, section 1: a hold whose node lease lapsed since it was
+/// acquired is not parked: it is released instead.
+#[tokio::test]
+async fn a_hold_that_may_not_act_is_released_not_parked() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    a.validity.bump_epoch();
+    hold.park(&x);
+    assert!(!a.is_parked(&x), "parked a hold that may not act");
+    until("the hold was released", async || {
+        owner_record(&store, &key).await.holder.is_none()
+    })
+    .await;
+    until("nothing pending", async || a.nothing_pending()).await;
+}
+
+/// ADR 0024, section 3: a lapse ends every parked record into the pending
+/// releases, which land once the lease is valid again.
+#[tokio::test]
+async fn a_lapse_makes_parked_records_pending_releases() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    hold.park(&x);
+    assert!(a.is_parked(&x));
+    a.validity.set_until(Some(now_ms().saturating_sub(1)));
+    wait_lease_valid(&a).await; // the next write sees the lapse
+    until("the lapse took the parked record", async || {
+        !a.is_parked(&x)
+    })
+    .await;
+    until("its release landed", async || {
+        owner_record(&store, &key).await.holder.is_none()
+    })
+    .await;
+    until("nothing pending", async || a.nothing_pending()).await;
+}
+
+/// ADR 0024, section 3: an unresolved wake of a parked room that landed
+/// is released by the resolver (a parked hold counts as held only at its
+/// own generation), and the parked hold behind it, which the record no
+/// longer names, is forgotten (`forget_parked_behind`).
+#[tokio::test]
+async fn a_landed_unresolved_wake_supersedes_the_parked_hold() {
+    use wasmkeep_cluster::node_lease::OwnerRecord;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let instance = a.membership.instance().unwrap().to_owned();
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let parked_at = hold.generation().unwrap();
+    hold.park(&x);
+    let parked_record = owner_record(&store, &key).await;
+    // The wake's write, unanswered, landed.
+    let woken = OwnerRecord {
+        holder: Some(("a".to_owned(), instance)),
+        generation: parked_at + 1,
+    };
+    store
+        .put(&StorePath::from(key.as_str()), woken.encode().into())
+        .await
+        .unwrap();
+    a.pending.push(PendingEntry::Unresolved {
+        key: key.clone(),
+        generation: parked_at + 1,
+        before: Some(parked_record),
+        until_ms: now_ms() + 30_000,
+    });
+    a.retry_pending().await;
+    assert_eq!(
+        owner_record(&store, &key).await,
+        OwnerRecord {
+            holder: None,
+            generation: parked_at + 1
+        }
+    );
+    assert!(!a.is_parked(&x), "the superseded parked hold was kept");
+    assert!(a.nothing_pending());
+}

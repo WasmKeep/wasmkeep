@@ -1315,10 +1315,21 @@ async fn request_move(
     name: &str,
     target: &str,
 ) -> object_store::path::Path {
+    request_move_of(store, "t", name, target).await
+}
+
+/// Asks for actor `class/name` to move to `target` (`wasmkeep actor
+/// move`): the request's key.
+async fn request_move_of(
+    store: &Arc<dyn ObjectStore>,
+    class: &str,
+    name: &str,
+    target: &str,
+) -> object_store::path::Path {
     use object_store::ObjectStoreExt as _;
     let key = wasmkeep_cluster::control::checked_move_key(
         &wasmkeep_cluster::state_root::StateRoot::new("", "default", "default"),
-        "t",
+        class,
         name,
         target,
     )
