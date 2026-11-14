@@ -62,3 +62,4 @@
 - [0020 One lease per node](adr/0020-one-lease-per-node.md)
 - [0021 The app model](adr/0021-the-app-model.md)
 - [0022 App-owned state and the one-time migration](adr/0022-app-owned-state-and-the-one-time-migration.md)
+- [0023 The front](adr/0023-the-front.md)
