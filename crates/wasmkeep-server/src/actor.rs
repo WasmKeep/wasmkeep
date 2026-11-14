@@ -459,7 +459,10 @@ impl ActorService {
         if let Some(cluster) = &self.inner.cluster {
             // Records parked by rooms that hibernated with sockets open
             // (ADR 0024): their sockets are closed; released like the rest.
-            cluster.release_all_parked("stop").await;
+            // Bounded: the node lease's `released` write frees what is left.
+            let _ =
+                tokio::time::timeout(Duration::from_secs(3), cluster.release_all_parked("stop"))
+                    .await;
             if !cluster.releases_done(Duration::from_secs(3)).await {
                 tracing::warn!(
                     "shutdown: some actors' releases did not land; the node lease's `released` \

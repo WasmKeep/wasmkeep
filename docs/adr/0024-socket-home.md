@@ -124,16 +124,19 @@ answer joins the pending releases, retried in the background) when:
   a socket's slot is freed, and again by the owner sweep once a minute,
   whatever the reason the sockets went (a client's close, a close the
   server started, a close event that could not run);
-- **the node drains** (ADR 0014): the sockets of non-resident rooms close
-  with 1012 as today, and every parked record is released at once, without
-  waiting for those sockets. A drain reports `drained` only with no parked
+- **the node drains** (ADR 0014): every parked record is released at the
+  start of each drain pass, before the resident actors are handed over,
+  and an event for a parked room reaching the draining node releases its
+  record before it is sent to the peer; the sockets of non-resident rooms
+  close with 1012 as today. A drain reports `drained` only with no parked
   record and no pending release, so no record is left naming a node that
   no longer serves the actor;
 - **the actor is moved** (ADR 0017): the owner side acts on a parked actor
-  too (today it acts only on resident ones, and the target refuses an
+  too (before, it acted only on resident ones, and the target refuses an
   actor whose record names a live node, so a parked actor would never
-  move): its sockets close with 1012 and the record is released; the
-  target then takes it on the next pass;
+  move): it records the move (every event for the room, its sockets'
+  close events included, then goes to the target), releases the record,
+  closes the sockets with 1012 and sends the target its take call;
 - **the node lease runs out** (no write acknowledged for ttl minus safety):
   every socket closes with 1012 at that moment (as today), and every
   parked record joins the pending releases, as every live hold does;
@@ -177,10 +180,9 @@ no parked record left.
 Releasing loses the room's close events when no instance runs them. A
 drain closes a parked room's sockets without running its close events, as
 it does today for every hibernated room (the draining node takes no
-actor). A move releases the record first and then closes the sockets: the
-close events wake the room on its node again, as a free record, and the
-next pass moves it as a resident actor, close events run. A node shut out
-of the secrets runs no event anyway.
+actor), and so does a move of a parked room (its events go to the target,
+which has no socket to close). A node shut out of the secrets runs no
+event anyway.
 
 ### 4. When the socket node dies
 
@@ -286,8 +288,8 @@ spares a relay for most socket upgrades), no longer a requirement.
 - Drains, moves, clean stops and lapses each release parked records, so
   ADR 0020's "no record left naming a live node that no longer serves it"
   holds. ADR 0020's second reason is answered by releasing, not by
-  handing over: a drain closes a parked room's sockets without its close
-  events, as it does today for every hibernated room.
+  handing over: a drain or a move closes a parked room's sockets without
+  its close events, as a drain does today for every hibernated room.
 - Across a partition between nodes, a parked room is as unreachable from
   the far side as a resident actor (section 4).
 
@@ -308,8 +310,10 @@ spares a relay for most socket upgrades), no longer a requirement.
    neither holds, parks, nor has anything pending for it while its lease
    is valid (a leak). Broken variants that must be caught, and are: a wake
    that re-adopts the parked hold without writing (one generation, two
-   holds), a lapse that forgets parked records (a leak) and releasing on
-   hibernation (sockets lost). The scenario case
+   holds), a lapse that forgets parked records (a leak), releasing on
+   hibernation (sockets lost), a resolver that counts a parked hold at any
+   generation (a leak), and a wake with an unknown outcome that drops the
+   parked hold (a leak). The scenario case
    (`a_room_wakes_where_its_sockets_are`): a room with a socket on n1,
    called through n2 and n3, wakes on n1 each time; n1 is killed and
    another node takes the room within the failover bound; the new node
@@ -317,9 +321,12 @@ spares a relay for most socket upgrades), no longer a requirement.
    naming nobody.
 2. **`tests/cluster/`** (`websockets.rs`): a room with a real WebSocket on
    node a hibernates and is called through node b twice, served on a each
-   time, its socket open and answered; the record is released once the
-   socket closes, and when the socket drops without a close; a drain of a
-   releases the parked record at once and closes the socket with 1012. The
+   time, at a new generation each time, its socket open and answered; the
+   record is released once the socket closes; when the last socket goes
+   and its close event cannot run (its wake's record write is refused),
+   the freed slot releases the record, pending until the bucket accepts
+   it; a drain of a releases the parked record and closes the socket with
+   1012. The
    tests of sockets closed by a room taken elsewhere now change the record
    behind the node's back first.
 3. An adversarial review of this record, then of the code.
@@ -327,7 +334,14 @@ spares a relay for most socket upgrades), no longer a requirement.
 Recorded runs: `madsim_socket_home` at 20,000 seeds in release mode
 (189,717 acquisitions, 71,892 parks, 28,962 wakes at home, 82,577 relays,
 30,511 releases at the last socket, 2,525 drains of a parked room, 12
-exposed takeovers), every broken variant caught (at seeds 0, 9 and 0).
+exposed takeovers), every broken variant caught (at seeds 0, 9, 0, 296
+and 434). The review of the code found two delays (a drain released
+parked records only after its hand-overs; any parked record slowed the
+pending-release retries to every 4 s), a park that could land after the
+last socket's nudge, a move of a parked room that could repeat, and two
+test gaps (the last-socket release was not exercised; the simulation
+could not catch the resolver's generation rule). All are fixed, the gaps
+by the test and the two resolver variants above.
 
 The simulation found one gap of ADR 0020 that this record does not
 change: an acquisition whose write has no answer, and lands only after the

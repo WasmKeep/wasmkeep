@@ -621,6 +621,7 @@ async fn a_room_with_open_sockets_wakes_on_their_node() {
     let mut client = join_lobby(a.addr).await;
     for round in 0..2 {
         lobby_parked(&store, &a).await;
+        let parked_at = chat_generation(&store, "lobby").await;
         let r = send_reachable(b.addr, "GET", "/actor/chat/lobby/", "").await;
         assert_eq!(
             (r.status, r.node.as_deref()),
@@ -629,6 +630,10 @@ async fn a_room_with_open_sockets_wakes_on_their_node() {
             r.body
         );
         assert_eq!(chat_holder(&store, "lobby").await.as_deref(), Some("a"));
+        assert!(
+            chat_generation(&store, "lobby").await > parked_at,
+            "round {round}: woken without a new generation"
+        );
         client
             .send(Message::text(format!("still here {round}")))
             .await
@@ -644,17 +649,52 @@ async fn a_room_with_open_sockets_wakes_on_their_node() {
     .await;
 }
 
-/// ADR 0024: a socket that goes without a close event (dropped by the
-/// client without a close frame) still releases a parked record, once its
-/// slot is freed.
+/// The generation of the ownership record of `chat/<name>`.
+async fn chat_generation(store: &Arc<dyn ObjectStore>, name: &str) -> u64 {
+    use object_store::ObjectStoreExt as _;
+    let key = object_store::path::Path::from(test_key(Family::Owners, &format!("chat/{name}")));
+    let body = String::from_utf8(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    body.lines().nth(2).unwrap().parse().unwrap()
+}
+
+/// Parked records this process released for `reason` so far.
+async fn parked_releases(metrics: SocketAddr, reason: &str) -> u64 {
+    let (status, page) = get_raw(metrics, "/metrics").await;
+    assert_eq!(status, 200);
+    let series = format!("wasmkeep_parked_releases_total{{reason=\"{reason}\"}} ");
+    page.lines()
+        .find_map(|l| l.strip_prefix(&series))
+        .map_or(0, |v| v.trim().parse().unwrap())
+}
+
+/// ADR 0024: when the room's last socket goes and its close event cannot
+/// run (here the event's wake cannot write the record), the freed slot
+/// still releases the parked record: no record is left naming a node for
+/// a room with no socket there. The release waits while the bucket
+/// refuses it, and lands once it accepts.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_parked_record_is_released_when_its_socket_drops() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (da, _db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+async fn a_parked_record_is_released_when_its_last_socket_goes() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let seen_by_a: Arc<dyn ObjectStore> = flaky_a.clone();
+    let da = tempfile::tempdir().unwrap();
     let a = node_configured(
         "a",
         da.path(),
-        &store,
+        &seen_by_a,
         Duration::from_millis(300),
         &["chat"],
         chat_wasm(),
@@ -664,12 +704,25 @@ async fn a_parked_record_is_released_when_its_socket_drops() {
     )
     .await;
     settle().await;
+    let metrics = metrics_page().await;
     let client = join_lobby(a.addr).await;
-    lobby_parked(&store, &a).await;
+    lobby_parked(&shared, &a).await;
+    let before = parked_releases(metrics, "last_socket").await;
+    flaky_a.fail_owner_puts.store(true, Ordering::SeqCst);
     drop(client);
-    eventually(
-        "a released the lobby after the socket dropped",
-        async || a.service.websockets() == 0 && chat_holder(&store, "lobby").await.is_none(),
-    )
+    eventually("a forgot the socket", async || a.service.websockets() == 0).await;
+    eventually("the freed slot released the parked record", async || {
+        parked_releases(metrics, "last_socket").await > before
+    })
+    .await;
+    assert_eq!(
+        chat_holder(&shared, "lobby").await.as_deref(),
+        Some("a"),
+        "released though the bucket refused it"
+    );
+    flaky_a.fail_owner_puts.store(false, Ordering::SeqCst);
+    eventually("the release landed", async || {
+        chat_holder(&shared, "lobby").await.is_none()
+    })
     .await;
 }

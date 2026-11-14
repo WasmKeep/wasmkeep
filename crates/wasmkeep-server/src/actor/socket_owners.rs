@@ -70,9 +70,13 @@ async fn release_unsocketed(inner: &ServiceInner, cluster: &Cluster) {
 /// once; one that no longer names this node at the parked generation is
 /// forgotten, and its room's sockets are swept as any other's. A failed
 /// read stops the re-read until next time.
-async fn recheck_parked(inner: &ServiceInner, cluster: &Cluster) {
+async fn recheck_parked(inner: &ServiceInner, cluster: &Cluster, cursor: &mut usize) {
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let parked: Vec<_> = cluster.parked().into_iter().take(SWEEP_MAX_READS).collect();
+    // In a stable order, from where the last re-read stopped: every parked
+    // record is read in turn, [`SWEEP_MAX_READS`] at a time.
+    let mut all = cluster.parked();
+    all.sort_unstable();
+    let parked = window(&all, cursor, SWEEP_MAX_READS);
     futures_util::StreamExt::for_each_concurrent(
         futures_util::stream::iter(parked),
         SWEEP_PARALLEL,
@@ -119,6 +123,7 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
     // Where the next pass starts, in the sorted list of rooms to read.
     let mut cursor = 0_usize;
     let mut pass = 0_u64;
+    let mut recheck_cursor = 0_usize;
     loop {
         tokio::time::sleep(every).await;
         pass = pass.wrapping_add(1);
@@ -136,7 +141,7 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
         }
         release_unsocketed(&inner, &cluster).await;
         if pass.is_multiple_of(PARKED_RECHECK_EVERY) {
-            recheck_parked(&inner, &cluster).await;
+            recheck_parked(&inner, &cluster, &mut recheck_cursor).await;
         }
         // A parked room is this node's own: no read (ADR 0024).
         let mut unheld: Vec<ActorAddress> = inner

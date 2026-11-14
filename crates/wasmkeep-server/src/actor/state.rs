@@ -184,6 +184,16 @@ impl Drop for ActorState {
             && self.sockets.has_open(&self.address);
         if parkable {
             hold.park(&self.address);
+            // The last socket's slot may have gone between the check above
+            // and the park, its nudge finding nothing parked yet.
+            if !self.sockets.has_open(&self.address)
+                && let Some(cluster) = self.cluster.clone()
+            {
+                let address = self.address.clone();
+                tokio::spawn(async move {
+                    cluster.release_parked(&address, "last_socket").await;
+                });
+            }
         }
     }
 }
@@ -375,6 +385,12 @@ impl ActorState {
         if cluster.draining()
             && let Some(peer) = cluster.chosen_peer(&self.address)
         {
+            // Parked here (ADR 0024): released now, so the peer can take it
+            // instead of finding it held by this node until the drain's
+            // next pass.
+            if cluster.is_parked(&self.address) {
+                cluster.release_parked(&self.address, "drain").await;
+            }
             return Err(OwnershipError::Elsewhere { peer });
         }
         // A drain claims when no peer can take the actor; a node that

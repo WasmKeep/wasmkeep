@@ -1059,10 +1059,9 @@ Within a few seconds the actor's owner hands it to `node-c`
    its alarm.
 
 If no node holds the actor, `node-c` takes it itself. A room that
-hibernated with sockets open on a node is that node's to move: it releases
-the room's record and closes its sockets with 1012; their close events wake
-the room there again, and the next pass moves it as above (or `node-c`
-takes it first). A name that was
+hibernated with sockets open on a node is that node's to move: it records
+the move, releases the room's record, closes its sockets with 1012 (their
+close events do not run) and asks `node-c` to take it. A name that was
 never an actor is not created.
 
 - **The target** must be live, serve the same app, not be draining or

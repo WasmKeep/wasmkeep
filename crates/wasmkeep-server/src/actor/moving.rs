@@ -376,16 +376,16 @@ async fn move_one(
     }
     // The owner: for an actor resident here, or parked here (ADR 0024).
     if !inner.mailboxes.contains(&address) {
-        // Parked: the target refuses a record naming this live node, so
-        // release it, then close its sockets with 1012. Their close events
-        // wake it here again, as a free record, and a later pass moves it
-        // as a resident actor; or the target takes it first.
-        if cluster.is_parked(&address) && cluster.can_take(&intent.target) {
-            cluster.release_parked(&address, "move").await;
-            let closed = inner
-                .sockets
-                .close_owner(&address, 1012, "actor moving; reconnect");
-            crate::metrics::owner_closes("move", closed);
+        // Parked (ADR 0024): the target refuses a record naming this live
+        // node, so this node moves it, as a resident one: record the move
+        // (from here every event, the sockets' close events included, goes
+        // to the target), release the record, close the sockets with 1012,
+        // then ask the target to take it.
+        if cluster.is_parked(&address)
+            && cluster.can_take(&intent.target)
+            && move_parked(inner, cluster, intent, &address).await
+        {
+            cluster.delete_move(intent).await;
         }
         return;
     }
@@ -398,6 +398,52 @@ async fn move_one(
     }
     if move_resident(inner, cluster, active, intent, &address, token).await {
         cluster.delete_move(intent).await;
+    }
+}
+
+/// The owner's side of a move of a parked room (ADR 0024). Whether the
+/// request is finished; `false` keeps it for a later pass, the room then
+/// free (its next event claims it wherever it lands).
+async fn move_parked(
+    inner: &Arc<ServiceInner>,
+    cluster: &Arc<Cluster>,
+    intent: &MoveIntent,
+    address: &ActorAddress,
+) -> bool {
+    let until_ms =
+        now_ms().saturating_add(u64::try_from(MOVE_DEADLINE.as_millis()).unwrap_or(u64::MAX));
+    inner
+        .moves
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            address.clone(),
+            drain::Move {
+                target: intent.target.clone(),
+                until_ms,
+            },
+        );
+    cluster.release_parked(address, "move").await;
+    let closed = inner
+        .sockets
+        .close_owner(address, 1012, "actor moving; reconnect");
+    crate::metrics::owner_closes("move", closed);
+    let answer = cluster.take(&intent.target, address).await;
+    inner
+        .moves
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(address);
+    match answer {
+        TakeAnswer::Held => {
+            tracing::info!(actor = %address, target = %intent.target, "moved (parked)");
+            true
+        }
+        TakeAnswer::HeldBy(holder) => {
+            tracing::info!(actor = %address, %holder, target = %intent.target, "move: held after the release");
+            true
+        }
+        TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
     }
 }
 

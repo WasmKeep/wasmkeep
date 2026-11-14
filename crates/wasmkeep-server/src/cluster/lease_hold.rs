@@ -150,6 +150,15 @@ impl Pending {
             && self.parked().is_empty()
     }
 
+    /// Whether a release or an unresolved acquire waits in the set.
+    fn has_entries(&self) -> bool {
+        !self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
     fn parked(&self) -> std::sync::MutexGuard<'_, Parked<ActorAddress>> {
         self.parked.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -490,6 +499,9 @@ impl LeaseHold {
     pub(crate) fn park(self, address: &ActorAddress) {
         let validity = Arc::clone(&self.cluster.validity);
         let epoch = self.epoch;
+        // In flight from before the hold leaves the live set: the node never
+        // reads as having nothing pending while a release is still due.
+        let in_flight = InFlight::start(&self.cluster.pending.in_flight);
         let release = self
             .cluster
             .pending
@@ -498,7 +510,6 @@ impl LeaseHold {
             });
         if let Some(hold) = release {
             let cluster = Arc::clone(&self.cluster);
-            let in_flight = InFlight::start(&cluster.pending.in_flight);
             tokio::spawn(async move {
                 let _in_flight = in_flight;
                 cluster.release_or_park(hold).await;
@@ -907,7 +918,9 @@ pub(super) async fn pending_loop(cluster: Weak<Cluster>) {
             return;
         };
         let ended = c.retry_pending().await;
-        wait = if ended || c.pending.is_empty() {
+        // Parked records are not entries to retry: a node with one parked
+        // for days must still try a new entry within a quarter second.
+        wait = if ended || !c.pending.has_entries() {
             FIRST
         } else {
             (wait * 2).min(MOST)

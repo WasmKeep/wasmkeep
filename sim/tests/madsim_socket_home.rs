@@ -90,6 +90,10 @@ enum Variant {
     /// A hibernation with sockets open releases the record (before ADR
     /// 0024).
     ReleaseOnHibernate,
+    /// The resolver counts a parked hold at any generation.
+    ResolverIgnoresGeneration,
+    /// A wake with an unknown outcome drops the parked hold.
+    UnknownWakeDropsParked,
 }
 
 #[derive(Clone, Copy)]
@@ -223,6 +227,8 @@ async fn run_node(
     let breaks = Breaks {
         wake_reuses_parked: variant == Variant::WakeReusesParked,
         lapse_forgets_parked: variant == Variant::LapseForgetsParked,
+        resolver_ignores_parked_generation: variant == Variant::ResolverIgnoresGeneration,
+        unknown_wake_drops_parked: variant == Variant::UnknownWakeDropsParked,
         ..Breaks::default()
     };
     loop {
@@ -516,7 +522,9 @@ async fn run_node(
                 let still_idle =
                     !node.is_parked(ACTOR) && node.nothing_pending() && node.lease_valid();
                 match (idle && still_idle && hold.is_none(), mine) {
-                    (true, Some(g)) if unresolved.contains(&g) => {
+                    (true, Some(g))
+                        if unresolved.contains(&g) && !node.resolver_skipped(ACTOR, g) =>
+                    {
                         if leak_suspect == Some(g) && counted.insert(g) {
                             shared.lock().unwrap().late_unresolved += 1;
                         }
@@ -791,8 +799,13 @@ fn each_broken_variant_is_caught() {
         Variant::WakeReusesParked,
         Variant::LapseForgetsParked,
         Variant::ReleaseOnHibernate,
+        Variant::ResolverIgnoresGeneration,
+        Variant::UnknownWakeDropsParked,
     ] {
-        let caught = (0..seeds().max(200)).find_map(|seed| {
+        // The two resolver variants need an unknown wake of a parked room,
+        // rarer: up to 20 times the seeds.
+        let most = seeds().max(200) * 20;
+        let caught = (0..most).find_map(|seed| {
             simulate(seed, variant, false)
                 .violation()
                 .map(|v| (seed, v))

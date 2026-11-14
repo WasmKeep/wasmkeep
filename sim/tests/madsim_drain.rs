@@ -1086,6 +1086,8 @@ async fn node_main(world: Arc<World>, node: usize) {
         pending_uncounted: world.rule == Rule::PendingUncounted,
         wake_reuses_parked: false,
         lapse_forgets_parked: false,
+        resolver_ignores_parked_generation: false,
+        unknown_wake_drops_parked: false,
         ..Breaks::default()
     };
     let lease = start_node(world.start, NAMES, node, breaks).await;
