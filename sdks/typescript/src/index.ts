@@ -29,17 +29,11 @@ import "./console";
 import { explainMissing } from "./engines";
 import * as wkStorage from "wasmkeep:actor/storage@0.2.0";
 import * as wkAlarms from "wasmkeep:actor/alarms@0.2.0";
-import * as wkActors from "wasmkeep:actor/actors@0.2.0";
 import * as wkSockets from "wasmkeep:actor/websockets@0.2.0";
-import * as wkEnv from "wasmkeep:actor/env@0.2.0";
 import type { Value } from "wasmkeep:actor/types@0.2.0";
-import {
-  Fields,
-  OutgoingBody,
-  OutgoingResponse,
-  ResponseOutparam,
-  type IncomingRequest,
-} from "wasi:http/types@0.2.12";
+import type { IncomingRequest, ResponseOutparam } from "wasi:http/types@0.2.12";
+import { respond, toRequest } from "./handler";
+import type { ActorRequest, ActorResponse } from "./request";
 
 /** Key-value storage over shard actors (`new kv.Client("kv", 8)`); see ./kv.ts. */
 export * as kv from "./kv";
@@ -51,9 +45,6 @@ export * as queue from "./queue";
 export * as workflow from "./workflow";
 /** Synchronous outbound HTTP (`http.fetch(url, {...})`); see ./http.ts. */
 export * as http from "./http";
-
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 
 // ---------------------------------------------------------------- storage
 
@@ -166,86 +157,20 @@ export const alarms = {
 
 // ----------------------------------------------------------- actor calls
 
-/** A request to another actor. */
-export interface CallRequest {
-  method?: string;
-  path?: string;
-  headers?: Record<string, string>;
-  body?: string | Uint8Array;
-}
-
-/** Another actor's answer. */
-export interface CallResponse {
-  status: number;
-  headers: Record<string, string>;
-  body: Uint8Array;
-  text(): string;
-}
-
-/** A call that did not get an answer. `kind`: invalid-address, reentrant,
- * too-large, timeout, failed. */
-export class CallError extends Error {
-  constructor(
-    readonly kind: string,
-    message: string,
-  ) {
-    super(message);
-    this.name = "CallError";
-  }
-}
-
-/** Configuration and secrets the operator gives this class
- * (`wasmkeep serve --env CLASS=FILE`). */
-export const env = {
-  /** The value of `name`, or `undefined` if it is not set. */
-  get(name: string): string | undefined {
-    // `none` is `null` on QuickJS: keep `undefined` on either engine.
-    return wkEnv.get(name) ?? undefined;
-  },
-};
-
-/** An actor's address. Within a tenant, `${class}/${name}` is what
- * `actors.call` takes. */
-export interface ActorAddress {
-  tenant: string;
-  class: string;
-  name: string;
-}
-
-export const actors = {
-  /** This actor's own address (requests arrive with `/actor/<class>/<name>`
-   * removed, so this is how an actor learns who it is). */
-  self(): ActorAddress {
-    const a = wkActors.selfAddress();
-    return { tenant: a.tenant, class: a.class, name: a.name };
-  },
-
-  /** Calls actor `class/name` (same tenant) and waits for its response.
-   * Other events to this actor wait meanwhile. */
-  call(address: string, request: CallRequest = {}): CallResponse {
-    const body =
-      typeof request.body === "string" ? encoder.encode(request.body) : (request.body ?? new Uint8Array());
-    let r: wkActors.Response;
-    try {
-      r = wkActors.call(address, {
-        method: request.method ?? "GET",
-        path: request.path ?? "/",
-        headers: Object.entries(request.headers ?? {}),
-        body,
-      });
-    } catch (e) {
-      const p = (e as { payload?: { tag: string; val?: string } }).payload;
-      if (p && typeof p.tag === "string") throw new CallError(p.tag, p.val ?? p.tag);
-      throw e;
-    }
-    return {
-      status: r.status,
-      headers: Object.fromEntries(r.headers),
-      body: r.body,
-      text: () => decoder.decode(r.body),
-    };
-  },
-};
+export { actors, env, CallError, type ActorAddress, type CallRequest, type CallResponse } from "./actors";
+/** Who sent a request, its host and scheme, and the answer to a failed
+ * call (ADR 0023); see ./request.ts. */
+export {
+  caller,
+  host,
+  json,
+  parseCaller,
+  scheme,
+  unavailable,
+  type ActorRequest,
+  type ActorResponse,
+  type Caller,
+} from "./request";
 
 // ------------------------------------------------------------- websockets
 
@@ -281,33 +206,6 @@ export const sockets = {
 
 // ------------------------------------------------------------------- HTTP
 
-/** An incoming request. The path includes the query, relative to the
- * actor (`/actor/<class>/<name>` removed). */
-export interface ActorRequest {
-  method: string;
-  path: string;
-  headers: Record<string, string>;
-  /** The body, read on first use. */
-  bytes(): Uint8Array;
-  text(): string;
-  json<T = unknown>(): T;
-}
-
-/** What a handler returns: a body (status 200), or a full response. */
-export type ActorResponse =
-  | string
-  | Uint8Array
-  | {
-      status?: number;
-      headers?: Record<string, string>;
-      body?: string | Uint8Array;
-    };
-
-/** A JSON response. */
-export function json(value: unknown, status = 200): ActorResponse {
-  return { status, headers: { "content-type": "application/json" }, body: JSON.stringify(value) };
-}
-
 /** An actor: every hook is optional. */
 export interface ActorDefinition {
   /** Runs once per component version, before any other event (migrations). */
@@ -327,55 +225,6 @@ export interface ActorDefinition {
 /** Declares an actor; `export default` it from the entry module. */
 export function defineActor(definition: ActorDefinition): ActorDefinition {
   return definition;
-}
-
-function readAll(request: IncomingRequest): Uint8Array {
-  const body = request.consume();
-  const stream = body.stream();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    let chunk: Uint8Array;
-    try {
-      chunk = stream.blockingRead(65536n);
-    } catch {
-      break; // closed: the body has ended
-    }
-    chunks.push(chunk);
-    total += chunk.length;
-  }
-  const out = new Uint8Array(total);
-  let at = 0;
-  for (const c of chunks) {
-    out.set(c, at);
-    at += c.length;
-  }
-  return out;
-}
-
-function respond(out: ResponseOutparam, response: ActorResponse): void {
-  // Bytes read from SQL on StarlingMonkey are Uint8Arrays of another realm
-  // (not `instanceof Uint8Array` here): any typed-array view is a body.
-  const r = typeof response === "string" || ArrayBuffer.isView(response) ? { body: response as string | Uint8Array } : response;
-  const body = typeof r.body === "string" ? encoder.encode(r.body) : (r.body ?? new Uint8Array());
-  const headers: Record<string, string> = { "content-type": "text/plain; charset=utf-8", ...r.headers };
-  const fields = Fields.fromList(
-    Object.entries(headers).map(([k, v]) => [k.toLowerCase(), encoder.encode(v)] as [string, Uint8Array]),
-  );
-  const outgoing = new OutgoingResponse(fields);
-  outgoing.setStatusCode(r.status ?? 200);
-  const outBody = outgoing.body();
-  ResponseOutparam.set(out, { tag: "ok", val: outgoing });
-  const stream = outBody.write();
-  for (let at = 0; at < body.length; at += 4096) {
-    stream.blockingWriteAndFlush(body.subarray(at, at + 4096));
-  }
-  (stream as unknown as Disposable)[Symbol.dispose]?.();
-  OutgoingBody.finish(outBody, undefined);
-}
-
-function methodName(m: ReturnType<IncomingRequest["method"]>): string {
-  return m.tag === "other" ? m.val : m.tag.toUpperCase();
 }
 
 /** The component exports for `definition`. Called by the build's generated
@@ -415,17 +264,7 @@ export function exportsFor(definition: ActorDefinition) {
     },
     incomingHandler: {
       handle(request: IncomingRequest, out: ResponseOutparam): void {
-        let body: Uint8Array | undefined;
-        const req: ActorRequest = {
-          method: methodName(request.method()),
-          path: request.pathWithQuery() ?? "/",
-          headers: Object.fromEntries(
-            request.headers().entries().map(([k, v]) => [k, decoder.decode(v)]),
-          ),
-          bytes: () => (body ??= readAll(request)),
-          text: () => decoder.decode(req.bytes()),
-          json: <T>() => JSON.parse(req.text()) as T,
-        };
+        const req = toRequest(request);
         let response: ActorResponse;
         try {
           response = definition.fetch ? definition.fetch(req) : { status: 404, body: "no fetch handler\n" };

@@ -25,6 +25,27 @@ pub fn respond(out: ResponseOutparam, status: u16, content_type: &str, body: &[u
     let _ = OutgoingBody::finish(outgoing, None);
 }
 
+/// Sends `response` (status, headers, body) as the answer: an actor's
+/// response to a call, passed on, or [`crate::front::unavailable`]'s.
+/// Headers the host would not accept are left out.
+pub fn respond_with(out: ResponseOutparam, response: &crate::actors::Response) {
+    let headers = Fields::new();
+    for (name, value) in &response.headers {
+        let _ = headers.append(name, value.as_bytes());
+    }
+    let outgoing_response = OutgoingResponse::new(headers);
+    let _ = outgoing_response.set_status_code(response.status);
+    let Ok(outgoing) = outgoing_response.body() else {
+        return;
+    };
+    ResponseOutparam::set(out, Ok(outgoing_response));
+    if let Ok(mut stream) = outgoing.write() {
+        let _ = stream.write_all(&response.body);
+        let _ = stream.flush();
+    }
+    let _ = OutgoingBody::finish(outgoing, None);
+}
+
 /// Reads the whole request body, up to `limit` bytes. `None` if the body
 /// was already consumed, could not be read, or is longer than `limit`.
 pub fn read_body(request: &IncomingRequest, limit: usize) -> Option<Vec<u8>> {

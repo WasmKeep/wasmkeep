@@ -26,10 +26,16 @@
 //!
 //! Build with `cargo build --release --target wasm32-wasip2`. The result is a
 //! component targeting the `wasmkeep:actor/actor` world.
+//!
+//! A front (an app's stateless `wasi:http` component, ADR 0023) uses the
+//! [`front`] module, and depends on the crate without its default `actor`
+//! feature: with it, the component also imports the actor world's
+//! interfaces, and the host refuses it as a front.
 
 // wit-bindgen emits `unsafe` glue; it is confined to the `bindings` module.
 #![deny(unsafe_code)]
 
+#[cfg(feature = "actor")]
 #[doc(hidden)]
 #[allow(
     unsafe_code,
@@ -46,29 +52,47 @@ pub mod bindings {
         export_macro_name: "export_core",
         default_bindings_module: "::wasmkeep_sdk::bindings",
         additional_derives: [PartialEq, Clone],
+        // One `actors` and one `env` for actors and fronts alike.
+        with: {
+            "wasmkeep:actor/actors@0.2.0": crate::front::actors,
+            "wasmkeep:actor/env@0.2.0": crate::front::env,
+        },
     });
 }
 
+pub mod front;
 pub mod http;
+#[cfg(feature = "actor")]
 pub mod kv;
+#[cfg(feature = "actor")]
 pub mod queue;
+#[cfg(feature = "actor")]
 mod value;
+#[cfg(feature = "actor")]
 mod wire;
+#[cfg(feature = "actor")]
 pub mod workflow;
 
-/// Calls to other actors of the same tenant.
-pub use bindings::wasmkeep::actor::actors;
 /// The actor's pending alarm.
+#[cfg(feature = "actor")]
 pub use bindings::wasmkeep::actor::alarms;
-/// Configuration and secrets the operator gives this class
-/// (`env::get("API_KEY")`).
-pub use bindings::wasmkeep::actor::env;
 /// The actor's own SQLite database.
+#[cfg(feature = "actor")]
 pub use bindings::wasmkeep::actor::storage;
+#[cfg(feature = "actor")]
 pub use bindings::wasmkeep::actor::types::{Rows, SqlError, SqlErrorKind, Value};
 /// WebSocket connections to this actor.
+#[cfg(feature = "actor")]
 pub use bindings::wasmkeep::actor::websockets;
+#[cfg(feature = "actor")]
 pub use bindings::wasmkeep::actor::websockets::Message;
+/// Calls to other actors of the same app.
+pub use front::actors;
+/// Configuration and secrets the operator gives this class, or the front
+/// (`env::get("API_KEY")`).
+pub use front::env;
+/// Who sent a request: the app's front, another actor, or a client.
+pub use front::{Caller, caller};
 /// WASI 0.2 bindings (`wasip2` crate): outbound HTTP, clocks, randomness.
 pub use wasip2 as wasi;
 
@@ -82,6 +106,7 @@ pub fn now_ms() -> u64 {
 /// Lifecycle hooks, all optional: `on_init` and `on_alarm` default to
 /// `Ok(())`, `on_websocket_open` to refusing the connection, and the other
 /// WebSocket hooks to ignoring the event.
+#[cfg(feature = "actor")]
 pub trait Actor {
     /// Runs before the first event this instance handles with this component
     /// version: create or migrate tables here.
@@ -114,6 +139,7 @@ pub trait Actor {
 
 /// Exports `$ty` as the actor: its [`Actor`] hooks and its
 /// [`http::Guest`] request handler.
+#[cfg(feature = "actor")]
 #[macro_export]
 macro_rules! export {
     ($ty:ident) => {
@@ -152,6 +178,7 @@ macro_rules! export {
 }
 
 /// Builds a `Vec<Value>` of SQL parameters: `params![42, "name", None::<i64>]`.
+#[cfg(feature = "actor")]
 #[macro_export]
 macro_rules! params {
     ($($value:expr),* $(,)?) => {

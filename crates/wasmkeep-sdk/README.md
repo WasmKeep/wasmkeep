@@ -63,9 +63,11 @@ goes from an empty directory to an actor whose state survives a restart.
 
 - `storage`: the actor's own SQLite database (`exec`, `query`, `params!`).
 - `alarms`: one pending alarm per actor, delivered to `Actor::on_alarm`.
-- `actors`: calls to other actors of the same tenant.
+- `actors`: calls to other actors of the same app.
 - `websockets`: connections to this actor, with the `Actor::on_websocket_*` hooks.
-- `env`: configuration and secrets the operator gives the class.
+- `env`: configuration and secrets the operator gives the class (or the front).
+- `caller`, `Caller`: who sent a request (the app's front, another actor,
+  or a client), and the `front` module (below).
 - `http`: the request handler, helpers to answer, and outbound requests.
 - `kv`, `queue`, `workflow`: a key-value store, queues and durable workflows,
   each built from actors
@@ -75,6 +77,85 @@ goes from an empty directory to an actor whose state survives a restart.
 
 The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/reference/api.md)
 lists every host function with its name in each SDK.
+
+## Writing a front
+
+A front is an app's stateless `wasi:http` component
+([ADR 0023](https://github.com/WasmKeep/wasmkeep/blob/v0.3.0/docs/adr/0023-the-front.md)):
+it receives every request outside `/actor/` and `/_wasmkeep/`, routes,
+signs users in, and calls the app's actors with `actors::call` as an
+inside caller, so it reaches `internal` classes. It targets the
+`wasmkeep:actor/front` world, which has `actors` and `env` and none of
+the actor world's storage, alarms or WebSockets, so its crate depends on
+the SDK without the default `actor` feature:
+
+```toml
+[dependencies]
+wasmkeep-sdk = { version = "0.3", default-features = false }
+```
+
+With the feature on, the component also imports the actor world and is
+not a front. Cargo unifies features of crates built together, so build a
+front in its own workspace (or with `-p`), as the examples do.
+
+```rust
+use wasmkeep_sdk::front::{self, actors};
+use wasmkeep_sdk::http::{self, IncomingRequest, ResponseOutparam};
+
+struct Front;
+
+impl http::Guest for Front {
+    fn handle(_request: IncomingRequest, out: ResponseOutparam) {
+        let call = actors::Request {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        match actors::call("todos/alice", &call) {
+            Ok(response) => http::respond_with(out, &response),
+            Err(e) => http::respond_with(out, &front::unavailable(&e)),
+        }
+    }
+}
+
+wasmkeep_sdk::export_front!(Front);
+```
+
+The `front` module has:
+
+- `actors`, `env`: the same modules as in an actor. The callee reads
+  `<tenant>/_front/main` as its caller; `env::get` reads the front's own
+  values (`serve --front-env FILE`).
+- `caller(&request)`: `Caller::Front`, `Caller::Actor(address)` or
+  `Caller::Outside`, from the `x-wasmkeep-caller` header the host sets. A
+  client cannot set it: the host removes it from what clients send, and
+  from what guests send on `actors.call`. Only the exact value
+  `<tenant>/_front/main` is the front, and any value the host never sends
+  is `Outside`. Actors use it to answer their front only:
+  `if wasmkeep_sdk::caller(&request) != Caller::Front { /* 403 */ }`,
+  which keeps a sensitive class closed if it is ever deployed `open`.
+- `host(&request)`: the request's authority, the client's `Host` (behind a
+  proxy, only if the proxy passes it). The client chooses it, unvalidated:
+  escape it where it goes (HTML, JSON).
+- `scheme(&request)`: `"https"` when the first `X-Forwarded-Proto` value is
+  `https`, else `"http"`. A client can send that header too, so it is only
+  as good as the proxy in front of the node, which must replace it: use it
+  for links and redirects, never to decide what a request may do.
+- `unavailable(&err)`: the answer for a failed call: `503` with
+  `Retry-After: 1` for `failed` and `timeout`, `500` for the others, with
+  a generic body (log the error's detail; do not send it to the client).
+- `export_front!(Type)`: exports the request handler, and nothing else.
+
+Validate any name you take from a request before using it in an address:
+each new name is a new actor with its own database.
+[`examples/todo-front`](https://github.com/WasmKeep/wasmkeep/tree/v0.3.0/examples/todo-front)
+is a front with a page, a JSON API, sign-in by token, and an `internal`
+class that checks `caller()`.
+
+Without the `actor` feature the crate has `front`, `actors`, `env`,
+`caller`, `http` and `wasi`; `storage`, `alarms`, `websockets`, `Actor`,
+`export!`, `params!`, `kv`, `queue` and `workflow` need it.
 
 ## Versions
 

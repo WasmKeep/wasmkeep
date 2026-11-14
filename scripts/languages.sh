@@ -9,8 +9,9 @@
 #      C, Zig, Python, Go on TinyGo and standard Go, D,
 #      MoonBit, C#);
 #   4. the counter contract, the chat suite, jobs, workflows and outbound
-#      fetch against every language, with WASMKEEP_REQUIRE_LANGS=1: a
-#      component that is missing fails instead of being skipped.
+#      fetch against every language, and the todo front in Rust and
+#      TypeScript, with WASMKEEP_REQUIRE_LANGS=1: a component that is
+#      missing fails instead of being skipped.
 # It installs no toolchain (see `scripts/doctor.sh --full`), except that it
 # runs `npm ci` where a TypeScript package has no node_modules yet.
 set -euo pipefail
@@ -46,6 +47,8 @@ rust_examples=(
   'workflows/orders|workflows_orders|actor'
   'workflows/ledger|workflows_ledger|actor'
   'workflows/app|workflows_app|actor'
+  'todo-front/todos|todo_todos|actor'
+  'todo-front/front|todo_front|front'
 )
 for entry in "${rust_examples[@]}"; do
   IFS='|' read -r dir name world <<<"$entry"
@@ -120,3 +123,5 @@ done
 echo '-- every language against the same tests'
 WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked -E "$tests" \
   --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs
+echo '-- the todo front, in Rust and in TypeScript'
+WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-cli --locked --test todo_front

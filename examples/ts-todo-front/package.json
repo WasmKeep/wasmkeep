@@ -1,0 +1,12 @@
+{
+  "name": "wasmkeep-example-ts-todo-front",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wasmkeep-ts build src/index.ts --world front -o front.wasm",
+    "build:starlingmonkey": "wasmkeep-ts build src/index.ts --world front -o front-starlingmonkey.wasm --engine starlingmonkey"
+  },
+  "dependencies": {
+    "@wasmkeep/sdk": "file:../../sdks/typescript"
+  }
+}

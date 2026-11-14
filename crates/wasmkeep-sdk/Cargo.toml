@@ -26,6 +26,14 @@ include = ["src/**", "wit/**", "README.md", "LICENSE", "NOTICE"]
 wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "realloc"] }
 wasip2 = "2.0.1"
 
+[features]
+# The actor world: storage, alarms, WebSockets, the lifecycle hooks,
+# `export!`, and the key-value, queue and workflow patterns. A front
+# (ADR 0023) turns it off (`default-features = false`): its component must
+# import nothing from the actor world beyond `actors` and `env`.
+default = ["actor"]
+actor = []
+
 # The crate is a guest library: document it for the target actors build for.
 [package.metadata.docs.rs]
 default-target = "wasm32-wasip2"
