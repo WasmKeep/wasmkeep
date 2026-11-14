@@ -97,6 +97,8 @@ struct Sim {
     hidden_left: Mutex<BTreeMap<String, u64>>,
     /// The request numbers of the listings of `nodes/`.
     node_listings: Mutex<Vec<u64>>,
+    /// Listings give last-modified times in whole seconds, as S3 does.
+    whole_seconds: Mutex<bool>,
 }
 
 impl Sim {
@@ -111,6 +113,7 @@ impl Sim {
             next_version: Mutex::new(1_000),
             hidden_left: Mutex::new(BTreeMap::new()),
             node_listings: Mutex::new(Vec::new()),
+            whole_seconds: Mutex::new(false),
         }
     }
 
@@ -254,6 +257,7 @@ impl migrate::Store for Sim {
         let objects = self.objects.lock().unwrap().clone();
         let mut rng = self.rng.lock().unwrap();
         let mut hidden = self.hidden_left.lock().unwrap();
+        let seconds = *self.whole_seconds.lock().unwrap();
         Ok(objects
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
@@ -283,7 +287,11 @@ impl migrate::Store for Sim {
             .map(|(k, o)| ObjectMeta {
                 key: k.clone(),
                 size: u64::try_from(o.body.len()).unwrap(),
-                modified_ms: o.written,
+                modified_ms: if seconds {
+                    o.written / 1000 * 1000
+                } else {
+                    o.written
+                },
                 etag: Some(o.version.to_string()),
             })
             .collect())
@@ -1310,6 +1318,60 @@ fn a_rollback_after_a_deploy_or_a_late_root_key_is_refused() {
                 );
                 if deploy {
                     check_migrated(seed, &sim.snapshot(), &before, &actors());
+                }
+            });
+        }
+    }
+}
+
+/// On a bucket that keeps whole seconds, an `actor move` written in the
+/// second of the commit (after it) makes the rollback one-way, as one a
+/// second later does; with nothing written since, the run's own copies in
+/// that second do not, and the rollback restores the bare layout.
+#[test]
+fn a_move_in_the_commit_s_second_makes_the_rollback_one_way() {
+    for seed in 0..seeds() {
+        for moved in [true, false] {
+            runtime(seed).block_on(async move {
+                start_clock();
+                let sim = Sim::new(seed, fixture());
+                *sim.whole_seconds.lock().unwrap() = true;
+                let before = sim.snapshot();
+                apply(&sim).await.unwrap();
+                if moved {
+                    let committed = sim.snapshot()["cluster/migrated/acme"].written;
+                    let key = StateRoot::new("", "acme", "shop")
+                        .key(Family::Moves, &format!("chat/{}/node-b", hex("room 1")));
+                    let version = sim.version();
+                    sim.objects.lock().unwrap().insert(
+                        key,
+                        Obj {
+                            body: Vec::new(),
+                            version,
+                            written: committed,
+                        },
+                    );
+                    let migrated = sim.snapshot();
+                    match rollback(&sim).await {
+                        Err(MigrateError::Refused(why)) => {
+                            assert!(why.concat().contains("one-way"), "seed {seed}: {why:?}");
+                        }
+                        r => panic!("seed {seed}: {r:?}"),
+                    }
+                    assert_eq!(
+                        canonical(&sim.snapshot()),
+                        canonical(&migrated),
+                        "seed {seed}"
+                    );
+                } else {
+                    rollback(&sim)
+                        .await
+                        .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+                    assert_eq!(
+                        canonical(&sim.snapshot()),
+                        canonical(&before),
+                        "seed {seed}: not the bare layout again"
+                    );
                 }
             });
         }

@@ -739,6 +739,17 @@ struct Held {
     version: std::sync::Mutex<Version>,
 }
 
+/// Whether `key`, listed under tenant root `root` (`state/<tenant>/`), is
+/// in an app's moves folder: `<root><app>/moves/...`.
+fn is_rooted_move(root: &str, key: &str) -> bool {
+    key.strip_prefix(root)
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, rest)| {
+            rest.strip_prefix(Family::Moves.folder())
+                .is_some_and(|r| r.starts_with('/'))
+        })
+}
+
 /// A commit, its record, version and last-modified time (bucket clock).
 type Commit = (Record, Version, u64);
 
@@ -2039,7 +2050,12 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
 
     /// Why a rollback is now one-way, if it is: a `nodes/` change since
     /// the run (a node of any version ran), a deploy since a commit, or a
-    /// key under a migrated root written after its commit.
+    /// key under a migrated root written after its commit. A move under a
+    /// root counts from the commit's own last-modified time on: the run
+    /// writes none (moves are not copied), and a store may keep whole
+    /// seconds, so an `actor move` in the commit's second would otherwise
+    /// look older than it. Other keys count only after it: the run's own
+    /// copies may share that second.
     async fn ran_since(
         &self,
         recorded: &[ObjectMeta],
@@ -2102,7 +2118,10 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 .await
                 .map_err(bucket(format!("listing {root}")))?
                 .into_iter()
-                .find(|m| m.modified_ms > *committed_ms)
+                .find(|m| {
+                    m.modified_ms > *committed_ms
+                        || (m.modified_ms == *committed_ms && is_rooted_move(&root, &m.key))
+                })
             {
                 return Ok(one_way(format!("{} was written", late.key)));
             }
@@ -2545,6 +2564,20 @@ mod tests {
             tenant: tenant.into(),
             app: name.into(),
             classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn only_an_app_s_moves_folder_holds_rooted_moves() {
+        let root = "state/acme/";
+        assert!(is_rooted_move(root, "state/acme/shop/moves/chat/72/node-b"));
+        for key in [
+            "state/acme/shop/actors/moves/x",
+            "state/acme/shop/movesx/chat",
+            "state/acme/moves/chat/72/node-b",
+            "state/other/shop/moves/chat/72/node-b",
+        ] {
+            assert!(!is_rooted_move(root, key), "{key}");
         }
     }
 
