@@ -77,3 +77,4 @@
 - [0028 Actors that end](adr/0028-actors-that-end.md)
 - [0029 A database client as an SDK pattern](adr/0029-a-database-client-as-an-sdk-pattern.md)
 - [0030 Files and static assets](adr/0030-files-and-static-assets.md)
+- [0031 Google Cloud Storage and Azure Blob buckets](adr/0031-google-cloud-storage-and-azure-blob-buckets.md)
