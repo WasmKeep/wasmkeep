@@ -652,8 +652,16 @@ async fn a_connection_closed_without_a_reply_is_reported() {
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
+            // The whole request first: closed with some of it unread, the
+            // connection would be reset, and the client's read fail.
+            let mut seen = Vec::new();
             let mut chunk = [0u8; 1024];
-            let _ = socket.read(&mut chunk).await;
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&chunk[..n]),
+                }
+            }
             drop(socket);
         }
     });

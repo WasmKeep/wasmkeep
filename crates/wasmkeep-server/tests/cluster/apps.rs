@@ -337,8 +337,10 @@ const FORGED: [(&str, &str); 4] = [
 ];
 
 /// A client's app, caller, chain and signature headers reach no actor,
-/// whether it asks the owner or a node that relays its request: each is
-/// stripped where it arrives, and the relay sets its own.
+/// whether it asks the owner or a node that relays its request. The relay
+/// sets its own app and forwarded mark and signs nothing, so the owner
+/// takes the relayed request as one from outside and strips the rest
+/// itself: this shows what the actor sees, not what the relay sent on.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_headers_from_a_client_are_stripped_from_a_relayed_request() {
     let p = x_on_a_y_on_b().await;

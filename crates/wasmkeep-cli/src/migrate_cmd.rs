@@ -200,6 +200,8 @@ fn print_removal(removal: &Removal, verb: &str) {
             t.live_moves,
             if t.rollback_open {
                 "; the rollback still works"
+            } else if t.given_up {
+                "; the rollback was given up by an earlier --remove-old --apply"
             } else {
                 ""
             }

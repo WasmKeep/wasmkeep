@@ -97,11 +97,19 @@ const LIST_PAGE: usize = 1000;
 fn listing_requests(counts: &BTreeMap<Family, usize>) -> u64 {
     COPIED
         .iter()
-        .map(|f| {
-            let n = counts.get(f).copied().unwrap_or(0);
-            u64::try_from(n.div_ceil(LIST_PAGE).max(1)).unwrap_or(u64::MAX)
-        })
+        .map(|f| pages(counts.get(f).copied().unwrap_or(0)))
         .sum()
+}
+
+/// The requests of a listing that returned `n` keys: one a page, and one
+/// for none.
+fn pages(n: usize) -> u64 {
+    u64::try_from(n.div_ceil(LIST_PAGE).max(1)).unwrap_or(u64::MAX)
+}
+
+/// The requests of a listing of `n` keys and a read of each.
+fn listed_and_read(n: usize) -> u64 {
+    pages(n).saturating_add(u64::try_from(n).unwrap_or(u64::MAX))
 }
 /// The third line of a tombstone written where no ownership record
 /// existed (an actor from before records, ADR 0020 §6): a rollback deletes
@@ -138,6 +146,11 @@ pub struct TenantRemoval {
     pub tombstones: usize,
     /// Whether `--rollback` would still work (no node ran since).
     pub rollback_open: bool,
+    /// Whether an earlier `--remove-old --apply` marked it
+    /// (`cluster/removed/<tenant>`): the rollback is given up for good, so
+    /// `--forgo-rollback` is not asked for again, even if that run
+    /// deleted nothing (it stopped on a lock taken meanwhile).
+    pub given_up: bool,
 }
 
 /// What `--remove-old` does (or would), and what refuses it.
@@ -316,6 +329,10 @@ pub struct Plan {
     pub hash: String,
     /// Average time of one listing request, ms (for the estimate).
     pub request_ms: u64,
+    /// The quiet window an `--apply` waits before copying, ms: one
+    /// node-lease window, longer with a heartbeat in a format from before
+    /// node leases; 0 with nothing to migrate (it then waits for none).
+    pub wait_ms: u64,
 }
 
 impl Plan {
@@ -337,8 +354,8 @@ impl Plan {
             .sum()
     }
 
-    /// Roughly how long a run takes, ms: the copies `concurrency` at a
-    /// time, the second listing and the tombstones.
+    /// Roughly how long a run takes, ms: the quiet window, then the copies
+    /// `concurrency` at a time, the second listing and the tombstones.
     pub fn estimate_ms(&self, concurrency: usize) -> u64 {
         let objects = u64::try_from(self.objects()).unwrap_or(u64::MAX);
         let owners: usize = self
@@ -355,6 +372,7 @@ impl Plan {
         rounds
             .saturating_add(1)
             .saturating_mul(self.request_ms.max(20))
+            .saturating_add(self.wait_ms)
     }
 }
 
@@ -386,6 +404,22 @@ struct Record {
     /// committed. A rollback refuses once a deploy changed one.
     deployed: BTreeMap<String, String>,
     at_ms: u64,
+    /// A `--rollback` lock only: `Some` while its check under the lock
+    /// has not passed, naming the lock it replaced. Nothing was written
+    /// yet, so a run that finds it checks again, and puts that lock back
+    /// if it refuses. `None` (and a lock from before this field): the
+    /// check passed, and a run that finds it finishes the rollback.
+    unchecked: Option<Replaced>,
+}
+
+/// The lock a `--rollback` not checked yet took over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replaced {
+    /// None: a refusal removes the lock.
+    Nothing,
+    /// An unfinished `--apply`'s, whose fields the unchecked lock keeps:
+    /// a refusal writes it back as it was.
+    Apply,
 }
 
 const LOCK_HEADER: &str = "wasmkeep-migration 1";
@@ -394,11 +428,21 @@ const COMMIT_HEADER: &str = "wasmkeep-migrated 1";
 impl Record {
     fn encode(&self, header: &str) -> Vec<u8> {
         let mut out = format!("{header}\n");
-        let mode = match self.mode {
-            LockMode::Apply => "apply",
-            LockMode::Rollback => "rollback",
+        let mode = match (self.mode, self.unchecked) {
+            (LockMode::Apply, _) => "apply",
+            (LockMode::Rollback, None) => "rollback",
+            // A mode an older build does not read: it refuses the lock
+            // rather than finish a rollback no check allowed.
+            (LockMode::Rollback, Some(_)) => "rollback-unchecked",
         };
         let _ = writeln!(out, "mode {mode}");
+        if let Some(replaced) = self.unchecked {
+            let replaced = match replaced {
+                Replaced::Nothing => "none",
+                Replaced::Apply => "apply",
+            };
+            let _ = writeln!(out, "replaced {replaced}");
+        }
         let _ = writeln!(out, "plan {}", self.hash);
         let _ = writeln!(out, "at {}", self.at_ms);
         for t in &self.tenants {
@@ -445,7 +489,9 @@ impl Record {
             counts: BTreeMap::new(),
             deployed: BTreeMap::new(),
             at_ms: 0,
+            unchecked: None,
         };
+        let mut replaced = None;
         for line in lines {
             let (word, rest) = line.split_once(' ')?;
             match word {
@@ -453,8 +499,19 @@ impl Record {
                     record.mode = match rest {
                         "apply" => LockMode::Apply,
                         "rollback" => LockMode::Rollback,
+                        "rollback-unchecked" => {
+                            record.unchecked = Some(Replaced::Nothing);
+                            LockMode::Rollback
+                        }
                         _ => return None,
                     }
+                }
+                "replaced" => {
+                    replaced = Some(match rest {
+                        "none" => Replaced::Nothing,
+                        "apply" => Replaced::Apply,
+                        _ => return None,
+                    });
                 }
                 "plan" => rest.clone_into(&mut record.hash),
                 "at" => record.at_ms = rest.parse().ok()?,
@@ -490,6 +547,12 @@ impl Record {
                 }
                 _ => return None,
             }
+        }
+        // `replaced` belongs to an unchecked rollback, and it to `replaced`.
+        match (record.unchecked.is_some(), replaced) {
+            (true, Some(r)) => record.unchecked = Some(r),
+            (false, None) => {}
+            _ => return None,
         }
         Some(record)
     }
@@ -949,6 +1012,16 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         }
     }
 
+    /// The quiet window an `--apply` waits, given `nodes/` as judged: the
+    /// longer one for a heartbeat in a format from before node leases.
+    fn quiet_window_ms(&self, nodes: &[NodeSeen]) -> u64 {
+        if nodes.iter().any(|n| n.old) {
+            self.options.old_window_ms.max(self.options.lease_window_ms)
+        } else {
+            self.options.lease_window_ms
+        }
+    }
+
     /// The `nodes/` listing, each object read and judged.
     async fn nodes(&self) -> Result<Vec<NodeSeen>, MigrateError> {
         let listed = self
@@ -1127,7 +1200,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             }
         }
         let commits = self.commits().await?;
-        requests += 1;
+        requests += listed_and_read(commits.len());
         let mut tenants = self.bare_tenants().await?;
         requests += u64::try_from(COPIED.len()).unwrap_or(4);
         tenants.extend(self.apps.iter().map(|a| a.tenant.clone()));
@@ -1219,7 +1292,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             plan.tenants.insert(tenant, t);
         }
         plan.nodes = self.nodes().await?;
-        requests += 1;
+        requests += listed_and_read(plan.nodes.len());
         // Live nodes refuse only a run with something to do: on a prefix
         // already migrated (nodes of this version running), there is none.
         if !plan.pending().is_empty() || plan.locked.is_some() {
@@ -1228,6 +1301,9 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                     plan.refusals.push(why.clone());
                 }
             }
+        }
+        if !plan.pending().is_empty() {
+            plan.wait_ms = self.quiet_window_ms(&plan.nodes);
         }
         plan.request_ms = self.clock.now_ms().saturating_sub(started) / requests.max(1);
         Ok(plan)
@@ -1352,6 +1428,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             counts: BTreeMap::new(),
             deployed: BTreeMap::new(),
             at_ms: self.clock.now_ms(),
+            unchecked: None,
         };
         let held = self
             .take_lock(lock.encode(LOCK_HEADER), existing.as_ref().map(|(_, v)| v))
@@ -1373,12 +1450,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         // renews its node lease in it, which the final proof sees, or has
         // lost it, and acknowledges nothing after. Every source listing
         // comes after it.
-        let window = if plan.nodes.iter().any(|n| n.old) {
-            self.options.old_window_ms.max(self.options.lease_window_ms)
-        } else {
-            self.options.lease_window_ms
-        };
-        self.clock.pause_ms(window).await;
+        self.clock.pause_ms(self.quiet_window_ms(&plan.nodes)).await;
 
         // 3, 4. Copy and verify each tenant.
         let mut copied = BTreeMap::new();
@@ -1453,6 +1525,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
                 counts,
                 deployed: deployed.remove(tenant).unwrap_or_default(),
                 at_ms: self.clock.now_ms(),
+                unchecked: None,
             };
             let key = format!("{COMMIT_PREFIX}{tenant}");
             if let Err(lost) = self.hold(&held).await {
@@ -1488,7 +1561,7 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             // A rollback that took the lock between the check and the
             // commit is deleting what the commit names: take it back.
             if let Err(lost) = self.hold(&held).await {
-                self.undo_commit(&key, &plan.hash).await?;
+                self.undo_commit(tenant, &key, &plan.hash).await?;
                 if outcome.committed.last() == Some(tenant) {
                     outcome.committed.pop();
                 }
@@ -1523,19 +1596,34 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         Ok(outcome)
     }
 
-    /// After this run lost its lock right after writing commit `key`:
-    /// keeps the commit only while a run of the same plan holds the lock
-    /// (it commits the same); otherwise (a rollback, or no lock) deletes
-    /// it.
-    async fn undo_commit(&self, key: &str, hash: &str) -> Result<(), MigrateError> {
-        match self.read_record(LOCK_KEY, LOCK_HEADER).await {
-            Ok(Some((l, _))) if l.mode == LockMode::Apply && l.hash == hash => Ok(()),
-            _ => self
-                .store
-                .delete(key)
-                .await
-                .map_err(bucket(format!("deleting {key}"))),
+    /// After this run lost its lock right after writing commit `key`
+    /// (tenant `tenant`'s): keeps the commit while a run of the same plan
+    /// holds the lock (it commits the same), and while the tenant has a
+    /// `--remove-old` mark: a removal that found this commit and no lock
+    /// (a run with nothing to do releases a lock whose commits are all
+    /// there) may have deleted the old keys, and the roots are then the
+    /// only copy. Otherwise (a rollback, or no lock) deletes it.
+    async fn undo_commit(&self, tenant: &str, key: &str, hash: &str) -> Result<(), MigrateError> {
+        if let Ok(Some((l, _))) = self.read_record(LOCK_KEY, LOCK_HEADER).await
+            && l.mode == LockMode::Apply
+            && l.hash == hash
+        {
+            return Ok(());
         }
+        let mark = format!("{REMOVED_PREFIX}{tenant}");
+        if self
+            .store
+            .get(&mark)
+            .await
+            .map_err(bucket(format!("reading {mark}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.store
+            .delete(key)
+            .await
+            .map_err(bucket(format!("deleting {key}")))
     }
 
     /// Copies tenant `tenant`'s bare keys into its roots until a second
@@ -1864,8 +1952,10 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
 
     /// `--rollback`: puts every migrated tenant back in the layout before
     /// 0.4.0, while no node has run and no app was deployed since its
-    /// migration. A rollback already started is finished whatever ran
-    /// since: from its first write, the old layout is the truth again.
+    /// migration. A rollback whose check under its lock passed is finished
+    /// whatever ran since: from its first write, the old layout is the
+    /// truth again. One that stopped before (a bucket error, a crash)
+    /// checks again: its lock says so.
     pub async fn rollback(&self) -> Result<Vec<String>, MigrateError> {
         let lock = self.read_record(LOCK_KEY, LOCK_HEADER).await?;
         let commits = self.commits().await?;
@@ -1876,8 +1966,14 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         };
         let resuming = lock
             .as_ref()
-            .is_some_and(|(l, _)| l.mode == LockMode::Rollback);
-        if !resuming && let Some(why) = self.ran_since(&recorded, &commits).await? {
+            .is_some_and(|(l, _)| l.mode == LockMode::Rollback && l.unchecked.is_none());
+        // Not before the lock for one that stopped in its check: a refusal
+        // here would leave its lock. The check under the lock suffices.
+        let unchecked = lock.as_ref().is_some_and(|(l, _)| l.unchecked.is_some());
+        if !resuming
+            && !unchecked
+            && let Some(why) = self.ran_since(&recorded, &commits).await?
+        {
             return Err(MigrateError::Refused(vec![why]));
         }
         let mut tenants: BTreeSet<String> = commits.keys().cloned().collect();
@@ -1910,33 +2006,67 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
             counts: BTreeMap::new(),
             deployed: BTreeMap::new(),
             at_ms: self.clock.now_ms(),
+            unchecked: None,
         };
-        let held = self
-            .take_lock(record.encode(LOCK_HEADER), lock.as_ref().map(|(_, v)| v))
-            .await?;
-        // Checked again under the lock: a node that started between the
-        // check and the lock. The lock goes back as it was.
-        if !resuming && let Some(why) = self.ran_since(&recorded, &commits).await? {
+        let held = if resuming {
+            self.take_lock(record.encode(LOCK_HEADER), lock.as_ref().map(|(_, v)| v))
+                .await?
+        } else {
+            // Taken first as not checked: the lock it replaces, kept whole
+            // (an `--apply`'s), so that a refusal, now or in a run after a
+            // failure, puts that one back.
+            let pending = match &lock {
+                Some((l, _)) => Record {
+                    mode: LockMode::Rollback,
+                    unchecked: Some(l.unchecked.unwrap_or(Replaced::Apply)),
+                    ..l.clone()
+                },
+                None => Record {
+                    tenants: BTreeSet::new(),
+                    originals: BTreeMap::new(),
+                    heirs: BTreeMap::new(),
+                    unchecked: Some(Replaced::Nothing),
+                    ..record.clone()
+                },
+            };
+            let held = self
+                .take_lock(pending.encode(LOCK_HEADER), lock.as_ref().map(|(_, v)| v))
+                .await?;
+            // Checked again under the lock: a node that started between
+            // the check and the lock, or a `--remove-old` that marked a
+            // tenant and read no lock. The lock goes back as it was.
+            if let Some(why) = self.ran_since(&recorded, &commits).await? {
+                match pending.unchecked {
+                    Some(Replaced::Apply) => {
+                        let version = held
+                            .version
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        let apply = Record {
+                            mode: LockMode::Apply,
+                            unchecked: None,
+                            ..pending
+                        };
+                        self.store
+                            .replace(LOCK_KEY, apply.encode(LOCK_HEADER), &version)
+                            .await
+                            .map_err(bucket("putting the lock back"))?;
+                    }
+                    _ => self.release(&held).await?,
+                }
+                return Err(MigrateError::Refused(vec![why]));
+            }
+            // Checked: from this write on, the rollback finishes whatever
+            // runs since. Before any other write.
             let version = held
                 .version
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            match &lock {
-                Some((l, _)) => {
-                    self.store
-                        .replace(LOCK_KEY, l.encode(LOCK_HEADER), &version)
-                        .await
-                        .map_err(bucket("putting the lock back"))?;
-                }
-                None => self
-                    .store
-                    .delete(LOCK_KEY)
-                    .await
-                    .map_err(bucket("removing the lock"))?,
-            }
-            return Err(MigrateError::Refused(vec![why]));
-        }
+            self.take_lock(record.encode(LOCK_HEADER), Some(&version))
+                .await?
+        };
 
         // Every record back before any root key goes; twice, so a
         // tombstone an `--apply` that lost the lock wrote meanwhile is
@@ -2235,8 +2365,15 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         now: u64,
         options: RemoveOptions,
     ) -> Result<(TenantRemoval, Vec<String>), MigrateError> {
+        let mark = format!("{REMOVED_PREFIX}{tenant}");
         let mut t = TenantRemoval {
             rollback_open: self.ran_since(&commit.nodes, single).await?.is_none(),
+            given_up: self
+                .store
+                .get(&mark)
+                .await
+                .map_err(bucket(format!("reading {mark}")))?
+                .is_some(),
             ..TenantRemoval::default()
         };
         let mut refusals = Vec::new();
@@ -2407,16 +2544,17 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         }
         // A rollback checks for the marks under its lock: one that takes
         // it from here on sees them and refuses.
-        if self
+        if let Some((body, _)) = self
             .store
             .get(LOCK_KEY)
             .await
             .map_err(bucket(format!("reading {LOCK_KEY}")))?
-            .is_some()
         {
-            return Err(MigrateError::Aborted(format!(
-                "{LOCK_KEY} was taken by a run of migrate meanwhile: nothing was deleted; let \
-                 it finish and run this again"
+            // The marks stay: a removal running at the same time may have
+            // found one there and deletes on the strength of it.
+            return Err(MigrateError::Aborted(locked_removal(
+                Record::decode(&body, LOCK_HEADER).as_ref(),
+                &deleting,
             )));
         }
         // One that took it and let it go since the listing deleted the
@@ -2444,6 +2582,33 @@ impl<'a, S: Store, C: Pause> Migrator<'a, S, C> {
         }
         Ok(removal)
     }
+}
+
+/// Why `--remove-old --apply` stopped on a lock it found after marking
+/// `tenants`, and what the marks left mean, by who holds it.
+fn locked_removal(lock: Option<&Record>, tenants: &[&String]) -> String {
+    let marks = tenants
+        .iter()
+        .map(|t| format!("{REMOVED_PREFIX}{t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let given_up = "the rollback is given up for those tenants: --rollback refuses them, and \
+                    --remove-old --apply deletes their old keys without --forgo-rollback";
+    let what = match lock {
+        Some(l) if l.mode == LockMode::Rollback && l.unchecked.is_none() => format!(
+            "a --rollback past its check holds it: it puts the tenants back and removes the \
+             marks ({marks})"
+        ),
+        Some(l) if l.mode == LockMode::Rollback => format!(
+            "a --rollback holds it, still checking: if its check sees the marks ({marks}) it \
+             refuses, and {given_up}; otherwise it finishes and removes them"
+        ),
+        _ => format!("the marks stay ({marks}): {given_up}"),
+    };
+    format!(
+        "{LOCK_KEY} was taken by a run of migrate meanwhile: nothing was deleted; {what}. Let \
+         it finish and run this again"
+    )
 }
 
 /// The bare ownership keys of tenant `tenant`'s actors that have history
@@ -2596,6 +2761,26 @@ mod tests {
     }
 
     #[test]
+    fn the_estimate_counts_each_read_and_the_quiet_window() {
+        // The commits and `nodes/`: a listing, then a read of each.
+        assert_eq!(listed_and_read(0), 1);
+        assert_eq!(listed_and_read(3), 1 + 3);
+        assert_eq!(listed_and_read(1001), 2 + 1001);
+        let plan = Plan {
+            request_ms: 100,
+            wait_ms: 16_000,
+            ..Plan::default()
+        };
+        // Nothing to copy: one round of requests, then the wait.
+        assert_eq!(plan.estimate_ms(8), 100 + 16_000);
+        let none = Plan {
+            request_ms: 100,
+            ..Plan::default()
+        };
+        assert_eq!(none.estimate_ms(8), 100);
+    }
+
+    #[test]
     fn each_tail_names_its_class() {
         assert_eq!(
             class_of(Family::History, "chat/room/wal/x.ltx"),
@@ -2681,12 +2866,41 @@ mod tests {
             counts: BTreeMap::from([("owners".into(), 2)]),
             deployed: BTreeMap::from([("acme/shop".into(), "v1 4".into())]),
             at_ms: 5,
+            unchecked: None,
         };
         assert_eq!(
             Record::decode(&r.encode(LOCK_HEADER), LOCK_HEADER),
             Some(r.clone())
         );
         assert_eq!(Record::decode(&r.encode(LOCK_HEADER), COMMIT_HEADER), None);
+        // A rollback not checked yet, over nothing or over an `--apply`.
+        for replaced in [Replaced::Nothing, Replaced::Apply] {
+            let u = Record {
+                unchecked: Some(replaced),
+                ..r.clone()
+            };
+            let body = u.encode(LOCK_HEADER);
+            assert!(
+                String::from_utf8_lossy(&body).contains("mode rollback-unchecked\n"),
+                "{body:?}"
+            );
+            assert_eq!(Record::decode(&body, LOCK_HEADER), Some(u));
+        }
+        // A rollback lock from before the check was recorded: its check
+        // passed (it may have written since), so it is finished.
+        let old = b"wasmkeep-migration 1\nmode rollback\nplan 00\nat 5\n";
+        assert_eq!(
+            Record::decode(old, LOCK_HEADER).map(|r| (r.mode, r.unchecked)),
+            Some((LockMode::Rollback, None))
+        );
+        // `replaced` only with an unchecked rollback, and always with it.
+        for bad in [
+            &b"wasmkeep-migration 1\nmode rollback\nreplaced none\n"[..],
+            b"wasmkeep-migration 1\nmode rollback-unchecked\nat 5\n",
+            b"wasmkeep-migration 1\nmode rollback-unchecked\nreplaced other\n",
+        ] {
+            assert_eq!(Record::decode(bad, LOCK_HEADER), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -179,7 +179,22 @@ starts, the migration is one-way.** The bare keys stay until
   between). A rollback checks under its lock, and deletes the commit
   under it: so a rollback that ends before the lock read leaves no
   commit, one that starts after the marks refuses, and a rollback never
-  restores records over deleted history. A rollback that finishes
+  restores records over deleted history. It takes the lock first as not
+  checked (`mode rollback-unchecked`, keeping the lock it replaced), and
+  marks it checked only once that check passes, before its first other
+  write: a rollback that failed or crashed in the check, run again,
+  checks again rather than resuming, and a refusal puts back the lock
+  it replaced (none, or an unfinished `--apply`'s). Only a checked
+  rollback lock is finished whatever ran since; an older build refuses
+  an unchecked one. A removal that finds the lock after its marks
+  leaves them: the rollback is given up for those tenants (unless a
+  checked rollback holds the lock, which removes them as it finishes),
+  so a later `--remove-old` asks no `--forgo-rollback` for a marked
+  tenant. An `--apply` that lost its lock right after writing a commit
+  (a run with nothing to do released it) keeps that commit when the
+  tenant is marked: a removal may have deleted on the strength of it,
+  and without it a later `--apply` would migrate the tenant again from
+  its tombstones over the only copy. A rollback that finishes
   deletes the mark with the commit, and `--apply`, under its lock,
   deletes the mark of a tenant it is about to commit that has no commit:
   only a removal that stopped before deleting can have left it.
