@@ -52,13 +52,13 @@ Read on 2026-11-14 from each vendor's documentation:
 
 | Service | Over HTTP | What it does not cover |
 | --- | --- | --- |
-| Neon ([serverless driver](https://neon.com/docs/serverless/serverless-driver)) | One query per request, or several in one non-interactive transaction (`transaction()`) | Interactive transactions and sessions need its WebSocket mode, which outbound HTTP cannot open. The HTTP endpoint is the JavaScript driver's protocol; Neon does not document it for other languages. Its language-neutral HTTP API is the PostgREST-style [Data API](https://neon.com/docs/data-api/overview), not SQL |
+| Neon ([serverless driver](https://neon.com/docs/serverless/serverless-driver)) | One query per request, or several in one non-interactive transaction (`transaction()`) | Interactive transactions and sessions need its WebSocket mode, which outbound HTTP cannot open. The HTTP endpoint is the JavaScript driver's protocol; no Neon reference for it was found for other languages. Its language-neutral HTTP API is the PostgREST-style [Data API](https://neon.com/docs/data-api/overview), not SQL |
 | Supabase ([Data API](https://supabase.com/docs/guides/api)) | PostgREST over the schema, functions through `rpc` | No SQL text; each request is its own transaction ([PostgREST](https://docs.postgrest.org/en/stable/references/transactions.html)), so atomicity across statements means writing a database function |
-| PlanetScale, MySQL ([serverless driver](https://planetscale.com/docs/vitess/tutorials/planetscale-serverless-driver)) | SQL over HTTP through `@planetscale/database` | A JavaScript driver; the protocol is not documented as an API |
+| PlanetScale, MySQL ([serverless driver](https://planetscale.com/docs/vitess/tutorials/planetscale-serverless-driver)) | SQL over HTTP through `@planetscale/database` | A JavaScript driver; no reference for its HTTP protocol was found for other languages |
 | PlanetScale, Postgres ([serverless driver](https://planetscale.com/docs/postgres/connecting/serverless-driver)) | Through Neon's driver, pointed at PlanetScale | The same limits as Neon's HTTP mode |
 | Upstash Redis ([REST API](https://upstash.com/docs/redis/features/restapi)) | Any command; a pipeline endpoint (not atomic) and a multi-exec endpoint (atomic) | No blocking commands, no `WATCH`; subscribe is server-sent events |
 | Turso / libSQL ([HTTP API](https://docs.turso.tech/sdk/http/reference)) | SQL in pipelines, with a baton to continue a stream, so interactive transactions across requests | A transaction must finish within seconds; this is SQLite's dialect, not Postgres |
-| NATS ([Synadia HTTP Gateway](https://docs.synadia.com/platform/http-gateway)) | Key-value and object store; publish, subscribe and request/reply marked experimental | Synadia's product, not part of `nats-server`; nothing in core NATS speaks HTTP |
+| NATS ([Synadia HTTP Gateway](https://docs.synadia.com/platform/http-gateway)) | Key-value and object store; publish, subscribe and request/reply marked experimental (the page's list is dated June 2024) | Synadia's product, not part of `nats-server`; nothing in core NATS speaks HTTP |
 | Valkey / Redis ([protocol](https://valkey.io/topics/protocol/)) | Nothing | RESP over TCP; no first-party HTTP interface |
 | A self-hosted PostgreSQL or MySQL | Nothing, unless the operator runs a gateway (PostgREST, for example) and opens it with `--allow-outbound` | Everything the gateway does not expose |
 
@@ -101,7 +101,9 @@ Synadia's gateway, and no interactive Postgres transaction at all.
   MySQL: a pool near the database, in transaction mode, so session state
   (`SET`, session advisory locks) does not survive between transactions
   ([how Hyperdrive works](https://developers.cloudflare.com/hyperdrive/concepts/how-hyperdrive-works/)).
-  The credentials live in the Hyperdrive configuration, not the code.
+  The database's address and credentials are set in the Hyperdrive
+  configuration, and the Worker reads a connection string from its
+  binding.
 
 ### What changed in WASI
 
@@ -139,14 +141,14 @@ over a pool of connections it keeps. In order:
 
 Each comes in its own change, with its SDK functions in Rust and
 TypeScript. NATS subscribe, which would wake actors with messages, is a
-larger design, left out (section 14).
+larger design, left out (Not decided here).
 
 Why a host interface and not an SDK pattern, as ADRs 0015, 0019 and 0029
 chose: a pattern can only use outbound HTTP, which is what does not reach
 these services; and only the host can keep a connection across events,
 across instances and across the many actors of a class.
 
-Why not `wasi:sockets` in each actor (section 15 weighs it in full):
+Why not `wasi:sockets` in each actor (section 14 weighs it in full):
 
 - **Connections do not fit actors.** An actor's instance is discarded
   when it hibernates, traps or moves, so its connection dies with it, and
@@ -172,11 +174,19 @@ never a host. In `wasmkeep.toml` (ADR 0026):
 kind = "postgres"               # postgres | redis | mysql | nats
 classes = ["orders", "_front"]  # who may use it; "_front" is the front
 pool = 5                        # connections per node, default 5
+max-rows = 10000                # optional, at most the default (section 8)
+max-bytes = 8388608             # optional, at most the default (section 8)
+transaction-timeout-ms = 5000   # optional, at most 10000 (section 6)
 
 [connections.cache]
 kind = "redis"
 classes = ["sessions"]
 ```
+
+- `kind` and `classes` are required; the other keys are optional, and
+  any other key is refused, as everywhere in the file. A binding name has
+  the grammar of class names. A class or `_front` listed that the file
+  does not define is refused.
 
 - **The file holds no host and no credential.** ADR 0026 keeps values
   and anything specific to one environment out of the file; staging and
@@ -202,7 +212,15 @@ classes = ["sessions"]
   whoever can set the app's secrets, within the node's egress policy
   (section 9), which is the operator's ceiling. An allowlist of hosts in
   the file would be environment-specific and would only check what the
-  same people already control; it is left out (section 14).
+  same people already control; it is left out (Not decided here).
+- **Nodes without the app's secrets.** `wasmkeep dev`, `serve` without
+  `--app`, and a node run with `--no-secrets` read only node files
+  (ADR 0016). For them the URL comes from a node file too:
+  `--connection main=FILE` (a file holding the URL, readable only by the
+  server's user, like `--env` files), and `[dev] connections = ".connections.local"`
+  for `wasmkeep dev` (`NAME=URL` lines, kept out of version control like
+  `[dev] env`). A node value wins over the sealed one by name, as `--env`
+  does over secrets.
 - **A binding without a URL** fails its calls with
   `not-allowed("connection main has no URL")`, and is reported once in
   the log, like a missing required name (ADR 0016). `requires` does not
@@ -358,8 +376,9 @@ interface postgres {
   `not-allowed` before anything is sent, by the first keyword as ADR 0029
   checks it. Also refused: `LISTEN`, `UNLISTEN`, `COPY`, `SET` and
   `RESET` outside a transaction (they would outlive the call on a pooled
-  connection; `SET LOCAL` inside a `batch` or `transaction` is fine), and
-  session advisory locks are released by the reset (section 7).
+  connection; `SET LOCAL` inside a `batch` or `transaction` is fine).
+  What this check cannot see (`set_config`, session advisory locks) is
+  undone by the reset after every call (section 7).
 - **A statement is prepared unnamed**, so no prepared statement outlives
   its call; caching prepared statements per connection is an
   optimisation for later.
@@ -507,10 +526,14 @@ HTTP. A pool of 5 per node could be held by five slow events. So:
   `unavailable`, nothing having been sent, and is not retried by the
   host.
 - **A connection is reset before reuse**: for Postgres, `DISCARD ALL`
-  after any call that could have changed session state (a transaction
-  that ran `SET LOCAL` needs none), so session state never passes from
-  one actor to another; for Redis, nothing can change it, since `SELECT`,
-  `CLIENT` and `HELLO` are refused. A connection whose call failed in a
+  (which also releases session advisory locks) before it returns to the
+  pool, after every call. A check of the SQL text cannot tell which calls
+  change session state (`SELECT set_config(...)`,
+  `SELECT pg_advisory_lock(...)` look like any query), so the reset is
+  unconditional: one more round trip per call, pipelined with the
+  call's own messages where the driver allows. Session state never passes
+  from one actor to another. For Redis, nothing a caller may send changes
+  the session, since `SELECT`, `CLIENT` and `HELLO` are refused. A connection whose call failed in a
   way that leaves it unknown (a timeout, a cancel, a protocol error) is
   closed, never reused.
 - **A secrets change** that changes a binding's URL builds a new pool;
@@ -668,7 +691,89 @@ Rows come back as arrays with named columns, as in ADR 0029; values map
 to the language's types (`bigint` for `int64` in TypeScript). The other
 SDKs follow; the API reference test lists them as missing until then.
 
-### 14. Not decided here
+### 14. `wasi:sockets` later, per class
+
+Weighed honestly: wasmCloud 2 and Cloudflare Workers both give guests TCP
+behind a policy, and Rust can now drive it. It would reach any protocol
+without a connector per protocol, and let unmodified Rust drivers run.
+Against it, in WasmKeep: a connection lives in one instance and dies at
+hibernation, trap or move; the credentials are in the guest; the
+connections multiply with resident actors; and TypeScript, the default
+second language, has no driver to use it. It may come later for
+protocols with no connector, **per class, behind an explicit grant** in
+the project file (`sockets = ["tcp"]` with destinations only within the
+node's egress policy, or only to an operator-run proxy), and only with
+the same resolve-check-connect the egress policy does. Not before WASI
+0.3 is linked: its sockets differ from 0.2's, and the host would carry
+both otherwise.
+
+### 15. Compatibility
+
+- **A capability word, `connect`.** Nodes announce it in their
+  heartbeat once they understand `[connections]` and the `_connection`
+  scope. A secrets write whose resulting set has a `_connection` entry,
+  and a deploy whose version has `[connections]` (a new manifest line,
+  `connection <binding> <kind> <pool> <class,...>`), are refused while a
+  live node of the app does not announce it. There is no `--force`: as
+  ADR 0023 found for `_front`, one entry an older node cannot check makes
+  it fail to open the whole set, refuse every event and drain.
+- **The package is additive.** A component built before imports nothing
+  from `wasmkeep:connect` and links as it did; one that imports it is
+  refused by an older node at link time, as any unknown import is.
+
+## Consequences
+
+- An app reaches a self-hosted or managed PostgreSQL or Valkey, and
+  later MySQL and NATS, from any SDK that binds the interface, with no
+  credential in its code and one pool per node instead of one connection
+  per actor.
+- The operator's egress policy stays the ceiling for every connection:
+  opening a private database means opening its range.
+- The guide states what WasmKeep does not do for those writes: no
+  durability of its own, no transaction with the actor's state, at least
+  once, no fencing. Apps write keyed, idempotent external writes, and
+  the SDK patterns (alarms, workflows) are how they retry.
+- A new secrets scope and a new manifest line are compatibility points,
+  gated by the capability word `connect` (section 15).
+- Driver dependencies enter `wasmkeep-server`, one per protocol, each
+  with its own release cadence and security advisories to follow.
+- A database sees up to nodes × `pool` connections per binding, and the
+  guide must say it.
+
+## Alternatives
+
+- **HTTP only.** No platform change, and enough for managed services
+  built for serverless. It leaves out every self-hosted database and
+  broker, interactive Postgres transactions, Valkey and NATS, and SDKs
+  other than JavaScript (the vendors' HTTP protocols are documented as
+  drivers, not APIs). It also keeps every credential in the guest. Kept
+  as the general path (section 1), not as the only one.
+- **`wasi:sockets` for every actor.** Section 14: connections that die
+  with the instance, one per resident actor, credentials in the guest,
+  no driver for TypeScript. Possible later per class.
+- **A sidecar proxy run by the operator**: PostgREST in front of
+  Postgres, an HTTP gateway for Redis or NATS, reached with outbound HTTP
+  and `--allow-outbound`. It works today, with no change, and is what the
+  guide recommends until connectors ship. Against it as the answer: one
+  more service to run, secure and pool; another hop; a different API per
+  gateway (no SQL through PostgREST); and the gateway's token still in
+  the guest.
+- **Guest-supplied addresses, as in Spin.** Simpler to configure, but
+  the guest holds the credentials and an allowlist of hosts is the only
+  check. wasmCloud 2, by default, refuses connection addresses and
+  credentials supplied by a workload.
+- **One connection per actor, kept by the host across events.** It
+  solves hibernation but not the count (a thousand actors, a thousand
+  connections), and a move to another node still breaks it.
+- **Standard interfaces only** (`wasi:keyvalue`, `wasi:messaging`,
+  `wasi-sql`). Portable, but SQL is at phase 1, key-value
+  covers a fraction of Redis, and messaging is at phase 2. A shim over the connectors is
+  left open (Not decided here).
+- **The database kept by one actor (ADR 0029) for everything.** It is the
+  answer for the app's own shared tables, not for a database other
+  systems use, larger than 1 GB, or with many writers at once.
+
+## Not decided here
 
 - **NATS subscribe, and Redis or Postgres notifications.** Messages that
   wake actors need a consumer on the node: which node consumes (one per
@@ -692,27 +797,11 @@ SDKs follow; the API reference test lists them as missing until then.
 - **`wasi:keyvalue`** (phase 2) over a Redis binding, for portability of
   simple get, set and compare-and-swap.
 - **Kafka, AMQP, MongoDB** and other protocols: by demand, as connectors
-  or as sockets (section 15).
+  or as sockets (section 14).
 - **Limits per app** when several apps share nodes (0.5.0): pools and
   calls in flight then need a share per app.
 - Redis Cluster and Sentinel, Postgres read replicas, and failover
   between several URLs of one binding.
-
-### 15. `wasi:sockets` later, per class
-
-Weighed honestly: wasmCloud 2 and Cloudflare Workers both give guests TCP
-behind a policy, and Rust can now drive it. It would reach any protocol
-without a connector per protocol, and let unmodified Rust drivers run.
-Against it, in WasmKeep: a connection lives in one instance and dies at
-hibernation, trap or move; the credentials are in the guest; the
-connections multiply with resident actors; and TypeScript, the default
-second language, has no driver to use it. It may come later for
-protocols with no connector, **per class, behind an explicit grant** in
-the project file (`sockets = ["tcp"]` with destinations only within the
-node's egress policy, or only to an operator-run proxy), and only with
-the same resolve-check-connect the egress policy does. Not before WASI
-0.3 is linked: its sockets differ from 0.2's, and the host would carry
-both otherwise.
 
 ## Tests (to build)
 
@@ -749,61 +838,6 @@ both otherwise.
 - **No `sim/` case**: nothing in leases, replication or deploys changes.
   The hold check reads the hold as blobs will, and the failure model is
   that of outbound HTTP.
-
-## Alternatives
-
-- **HTTP only.** No platform change, and enough for managed services
-  built for serverless. It leaves out every self-hosted database and
-  broker, interactive Postgres transactions, Valkey and NATS, and SDKs
-  other than JavaScript (the vendors' HTTP protocols are documented as
-  drivers, not APIs). It also keeps every credential in the guest. Kept
-  as the general path (section 1), not as the only one.
-- **`wasi:sockets` for every actor.** Section 15: connections that die
-  with the instance, one per resident actor, credentials in the guest,
-  no driver for TypeScript. Possible later per class.
-- **A sidecar proxy run by the operator**: PostgREST in front of
-  Postgres, an HTTP gateway for Redis or NATS, reached with outbound HTTP
-  and `--allow-outbound`. It works today, with no change, and is what the
-  guide recommends until connectors ship. Against it as the answer: one
-  more service to run, secure and pool; another hop; a different API per
-  gateway (no SQL through PostgREST); and the gateway's token still in
-  the guest.
-- **Guest-supplied addresses, as in Spin.** Simpler to configure, but
-  the guest holds the credentials and an allowlist of hosts is the only
-  check. wasmCloud 2 refuses workload-supplied credentials by default for
-  the same reason.
-- **One connection per actor, kept by the host across events.** It
-  solves hibernation but not the count (a thousand actors, a thousand
-  connections), and a move to another node still breaks it.
-- **Standard interfaces only** (`wasi:keyvalue`, `wasi:messaging`,
-  `wasi-sql`). Portable, but SQL is at phase 1, key-value
-  covers a fraction of Redis, and messaging is at phase 2. A shim over the connectors is
-  left open (section 14).
-- **The database kept by one actor (ADR 0029) for everything.** It is the
-  answer for the app's own shared tables, not for a database other
-  systems use, larger than 1 GB, or with many writers at once.
-
-## Consequences
-
-- An app reaches a self-hosted or managed PostgreSQL or Valkey, and
-  later MySQL and NATS, from any SDK that binds the interface, with no
-  credential in its code and one pool per node instead of one connection
-  per actor.
-- The operator's egress policy stays the ceiling for every connection:
-  opening a private database means opening its range.
-- The guide states what WasmKeep does not do for those writes: no
-  durability of its own, no transaction with the actor's state, at least
-  once, no fencing. Apps write keyed, idempotent external writes, and
-  the SDK patterns (alarms, workflows) are how they retry.
-- A new secrets scope and a new manifest section are compatibility
-  points: a secrets set with a `_connection` entry and a version with
-  `[connections]` are refused while a live node of the app does not
-  announce the capability word `connect` (as ADR 0023 did for `_front`,
-  with no `--force`: an older node would fail to open the whole set).
-- Driver dependencies enter `wasmkeep-server`, one per protocol, each
-  with its own release cadence and security advisories to follow.
-- A database sees up to nodes × `pool` connections per binding, and the
-  guide must say it.
 
 ## Plan
 
