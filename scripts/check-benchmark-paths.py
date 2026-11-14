@@ -88,6 +88,8 @@ REVIEWED_PATHS = {
         "/backup/$db",
     },
     "docs/tutorials/first-actor.md": {"/?who=alice"},
+    # Paths inside the toolchain image's container, not on a machine.
+    "docs/deploy/toolchain.md": {"/src", "/src/counter", "/tmp", "/tmp/cargo", "/tmp/.npm", "/root/.npm"},
 }
 # A checkout may add reviewed paths for files of its own that this list does
 # not know (notes kept outside the published tree, for example) in

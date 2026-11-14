@@ -30,6 +30,7 @@
 - [Buckets: what WasmKeep needs](deploy/buckets.md)
 - [Load balancer, WAF and routing](deploy/front-door.md)
 - [Back up and restore the bucket](deploy/backup-and-restore.md)
+- [The toolchain image](deploy/toolchain.md)
 - [Upgrade a cluster to 0.4.0](deploy/upgrading-to-0.4.md)
 - [Monitoring](monitoring.md)
 

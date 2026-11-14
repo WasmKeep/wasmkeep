@@ -11,6 +11,15 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.0, in no release yet.
 
+- **The toolchain image**, `ghcr.io/wasmkeep/toolchain:<version>` for
+  linux/amd64 and linux/arm64: `wasmkeep` and the build tools of the Rust,
+  TypeScript, Python, Go (TinyGo), C and Zig SDKs at the versions CI uses
+  (`scripts/check-toolchain.py` keeps them equal), so a project builds with
+  only Podman or Docker installed. The release workflow builds it, tests the
+  pushed image on both platforms (`deploy/toolchain/test.sh`), and signs it
+  like the server image; the nightly workflow builds and tests it too. About
+  880 MB to download. [The toolchain image](docs/deploy/toolchain.md).
+
 - **Sockets through the front**
   ([ADR 0027](docs/adr/0027-sockets-through-the-front.md)). The front
   accepts a WebSocket at its own paths and hands it to an actor of the
