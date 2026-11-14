@@ -135,6 +135,15 @@ export const storage = {
   deleteSelf(): void {
     wkStorage.deleteSelf();
   },
+  /** Deletes this actor now, and returns only once the delete is durable
+   * (recorded in the cluster's bucket, or the files removed and fsynced on
+   * a single node). Later storage calls in the same event throw
+   * `not-allowed`. Throws a `SqlError`: `not-allowed` inside a transaction
+   * (nothing changed), `internal` when the delete is not known to be
+   * durable (calling it again is safe). */
+  deleteSelfDurable(): void {
+    sql(() => wkStorage.deleteSelfDurable());
+  },
 };
 
 // ----------------------------------------------------------------- alarms

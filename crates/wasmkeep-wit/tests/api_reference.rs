@@ -115,6 +115,16 @@ const SDK_NAMES: &[(&str, [&str; 5])] = &[
         ],
     ),
     (
+        "storage.delete-self-durable",
+        [
+            "storage::delete_self_durable",
+            "storage.deleteSelfDurable",
+            "",
+            "",
+            "",
+        ],
+    ),
+    (
         "alarms.set-alarm",
         [
             "alarms::set_alarm",

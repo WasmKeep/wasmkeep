@@ -96,3 +96,24 @@ func DeleteSelf() {
 	wasmimport_DeleteSelf()
 	return
 }
+
+// DeleteSelfDurable represents the imported function "delete-self-durable".
+//
+// Deletes this actor now, and returns only once the delete is
+// durable: recorded in the bucket when the node has one (the next
+// event, wherever it runs, starts a fresh actor), the files removed
+// and fsynced when it does not. Its pending alarm is cleared. Later
+// storage calls in the same event are refused with `not-allowed`;
+// `get-alarm` then returns none, and `set-alarm` and `clear-alarm` do
+// nothing. Refused with `not-allowed` inside an open transaction,
+// changing nothing. `internal` means the delete is not known to be
+// durable (it may still land): the actor is restored from the bucket
+// by its next event, and calling this again is safe.
+//
+//	delete-self-durable: func() -> result<_, sql-error>
+//
+//go:nosplit
+func DeleteSelfDurable() (result cm.Result[SQLError, struct{}, SQLError]) {
+	wasmimport_DeleteSelfDurable(&result)
+	return
+}

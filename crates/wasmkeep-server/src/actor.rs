@@ -46,6 +46,7 @@ use wasmkeep_wit::wasmkeep::actor::websockets::{
 mod alarm_delivery;
 mod classes;
 mod collection;
+mod deletes;
 mod deploys;
 mod disk;
 mod drain;
@@ -373,6 +374,13 @@ const OWNER_FENCE_KEY: &str = "owner_fence";
 /// Meta key: the highest deploy sequence that ran an event on this actor.
 const DEPLOY_SEQ_KEY: &str = "deploy_seq";
 
+/// Meta key holding the last operator delete carried out on this actor:
+/// its request's time (ms, the bucket's clock) and id, `<ms> <id>` (ADR
+/// 0028). Written into the empty database a delete leaves, and carried
+/// over by later deletes, so a request listed again is never carried out
+/// twice.
+const OPERATOR_DELETE_KEY: &str = "operator_delete";
+
 /// `refresh_class`: the actor's class was removed by a deploy.
 const CLASS_GONE: &str = "class no longer served";
 
@@ -622,6 +630,16 @@ struct ActorHost {
     /// Kept across a cancelled guest future; drained before event cleanup.
     pending_db: Option<tokio::task::JoinHandle<ResidentDb>>,
     delete_requested: bool,
+    /// After a `delete-self-durable` that returned `ok` (ADR 0028): the
+    /// actor is deleted, and storage calls are refused. In a cluster, the
+    /// empty database its reset carried, for the snapshot at it once the
+    /// event ends.
+    deleted: Option<Option<wasmkeep_storage::wal::Changes>>,
+    /// On one node: a `delete-self-durable` closed the database and could
+    /// not remove its files; a retry removes them, storage stays refused.
+    delete_retry: bool,
+    /// Where the actor's files are, for `delete-self-durable`.
+    deleter: Option<(Storage, ActorAddress)>,
     call: Option<CallContext>,
     sockets: Arc<Sockets>,
     /// Replication, so `exec-durable` can wait for the bucket.

@@ -33,6 +33,27 @@ Since 0.4.1, in no release yet.
   answered. The SQL comes from the app's code, never from its clients.
   [`examples/db`](examples/db) and [`examples/ts-db`](examples/ts-db);
   every client is tested against every handler. The other SDKs come later.
+- **Actors that end** ([ADR 0028](docs/adr/0028-actors-that-end.md)):
+  - `wasmkeep actor delete --app TENANT/APP CLASS/NAME --bucket ...`
+    deletes an actor: the node that holds it, or any node serving its
+    class if nobody does (its node died, say), closes its WebSockets with
+    1000, removes its data and alarm and records the delete in the bucket.
+    The command waits until the delete is recorded (`--wait`, 60 s;
+    `--no-wait`), refuses a name with nothing in the bucket, and a request
+    read twice is carried out once. Nodes of an earlier version ignore the
+    requests ([cluster](docs/cluster.md#deleting-one-actor)).
+  - `storage.delete-self-durable`, added to `wasmkeep:actor@0.2.0` (a
+    component built before links as it did): deletes the actor at once and
+    returns only once the delete is in the bucket (fsynced on one node),
+    or `internal` when it is not known to be. Later storage calls in that
+    event are refused with `not-allowed`. Rust
+    `storage::delete_self_durable`, TypeScript `storage.deleteSelfDurable`;
+    the other SDKs later.
+  - Metrics `wasmkeep_actor_deletes_total{how}` and
+    `wasmkeep_actor_delete_failures_total{how}` (`self`, `self_durable`,
+    `operator`).
+  - Decided, built later: idle expiry per class (`expire-after-idle`) and
+    `wasmkeep app delete`.
 
 ## 0.4.1
 

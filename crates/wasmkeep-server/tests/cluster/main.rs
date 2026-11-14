@@ -49,6 +49,8 @@ mod alarms;
 mod apps;
 #[path = "bucket.rs"]
 mod bucket;
+#[path = "deletes.rs"]
+mod deletes;
 #[path = "deploys.rs"]
 mod deploys;
 #[path = "draining.rs"]
@@ -877,6 +879,9 @@ struct Flaky {
     hold_release_replies_ms: Arc<std::sync::atomic::AtomicU64>,
     releases_held: Arc<std::sync::atomic::AtomicU32>,
     release_held_until_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Deletes of delete requests (`.../deletes/...`, ADR 0028) fail
+    /// while set.
+    fail_request_deletes: Arc<AtomicBool>,
 }
 
 impl Flaky {
@@ -898,6 +903,7 @@ impl Flaky {
             hold_release_replies_ms: Arc::default(),
             releases_held: Arc::default(),
             release_held_until_ms: Arc::default(),
+            fail_request_deletes: Arc::default(),
             inner,
             down,
             fail_wal: Arc::default(),
@@ -1204,6 +1210,7 @@ impl ObjectStore for Flaky {
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
     {
         use futures_util::StreamExt as _;
+        let refuse = Arc::clone(&self.fail_request_deletes);
         let (inner, hold, held, applied, release) = (
             Arc::clone(&self.inner),
             Arc::clone(&self.hold_alarm_deletes),
@@ -1213,6 +1220,7 @@ impl ObjectStore for Flaky {
         );
         locations
             .then(move |location| {
+                let refuse = Arc::clone(&refuse);
                 let (inner, hold, held, applied, mut release) = (
                     Arc::clone(&inner),
                     Arc::clone(&hold),
@@ -1222,6 +1230,12 @@ impl ObjectStore for Flaky {
                 );
                 async move {
                     let path = location?;
+                    if refuse.load(Ordering::SeqCst) && path.as_ref().contains("/deletes/") {
+                        return Err(object_store::Error::Generic {
+                            store: "flaky",
+                            source: "delete refused".into(),
+                        });
+                    }
                     let one = |p: object_store::path::Path| {
                         futures_util::stream::once(async move { Ok(p) }).boxed()
                     };
@@ -1431,6 +1445,26 @@ async fn request_move_of(
         class,
         name,
         target,
+    )
+    .unwrap();
+    let path = object_store::path::Path::from(key);
+    store.put(&path, Vec::new().into()).await.unwrap();
+    path
+}
+
+/// Asks for actor `class/name` to be deleted (`wasmkeep actor delete`,
+/// ADR 0028): the request's key.
+async fn request_delete_of(
+    store: &Arc<dyn ObjectStore>,
+    class: &str,
+    name: &str,
+) -> object_store::path::Path {
+    use object_store::ObjectStoreExt as _;
+    let key = wasmkeep_cluster::control::checked_delete_key(
+        &wasmkeep_cluster::state_root::StateRoot::new("", "default", "default"),
+        class,
+        name,
+        &wasmkeep_cluster::control::new_request_id(),
     )
     .unwrap();
     let path = object_store::path::Path::from(key);

@@ -206,7 +206,14 @@ first event ─▶ on-init ─▶ resident ──idle 30 s──▶ hibernated
   stay. The next event wakes it in about a millisecond.
 - **`delete-self`** removes the actor once the current event ends: its
   database and alarm are gone, and the next event to the address starts a
-  new actor.
+  new actor. In a cluster it is replicated like a plain `exec`, so it can
+  be lost with its node. **`delete-self-durable`** deletes the actor at
+  once and returns only when the delete is durable (in the bucket, or
+  fsynced on one node): use it before telling someone "deleted". Later
+  storage calls in that event are refused.
+- **An operator** can delete an actor too, with `wasmkeep actor delete`
+  ([cluster](cluster.md#deleting-one-actor)): the same delete, run by the
+  node that holds it or by any node if nobody does.
 
 ## Storage
 

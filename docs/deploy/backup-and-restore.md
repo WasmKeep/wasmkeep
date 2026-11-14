@@ -27,6 +27,7 @@ app's actor state is under its own root, `state/<tenant>/<app>/` (written
 | `nodes/<id>` | Each node's heartbeat, which is its lease | Replaced every 3 s |
 | `R alarms/...` | The index of pending alarms, by due time | Created and deleted as alarms change |
 | `R moves/...` | Requests to move one actor (`actor move`) | By the operator; deleted when done or 5 minutes old |
+| `R deletes/...` | Requests to delete one actor (`actor delete`) | By the operator; deleted once the delete is recorded, or an hour old |
 | `apps/<tenant>/<app>/<version>/` and `apps/<tenant>/<app>/current` | Deployed versions (components, access rules, configuration) and the pointer to the current one | Versions created once; `current` replaced by a deploy |
 | `apps/<tenant>/<app>/secrets/` | The app's secrets, sealed, and their own `current` | As above |
 | `cluster/secret` | The secret nodes sign their calls to each other with | Created once |

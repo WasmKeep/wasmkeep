@@ -320,8 +320,13 @@ Each actor's database follows it from node to node (ADR 0007):
 - `storage.delete-self` is recorded in the bucket, so a deleted actor stays
   deleted wherever it runs next. Like a plain `exec`, it is replicated when
   the event ends: if replication fails at that moment, the delete can be
-  lost. Once the delete is recorded, the actor's history in the bucket is
-  erased (see [History in the bucket](#history-in-the-bucket)).
+  lost. `storage.delete-self-durable` is the durable one: it returns only
+  once the bucket holds the delete, or an error (`internal`: not known to
+  be durable; the actor is then restored from what the bucket holds), and
+  storage calls after it in the same event are refused. Once the delete
+  is recorded, the actor's history in the bucket is erased (see
+  [History in the bucket](#history-in-the-bucket)). An operator deletes
+  an actor with `wasmkeep actor delete` ([Deleting one actor](#deleting-one-actor)).
 - Inside a transaction, `exec-durable` takes only the `COMMIT`: it returns
   once the whole transaction is in the bucket. Any other statement there is
   refused before it runs, since nothing is durable before `COMMIT`.
@@ -1139,6 +1144,46 @@ never an actor is not created.
 - **Retries.** A move that cannot finish (a socket that will not close, a
   target that does not answer) is tried again on every heartbeat until it
   works or the request expires (5 minutes).
+
+## Deleting one actor
+
+```bash
+wasmkeep actor delete --app acme/shop cart/u-1842 --bucket s3://acme-wasmkeep/prod
+```
+
+The actor is named as for `actor move`. The command refuses an actor
+with nothing in the bucket (a mistyped name: nothing is written), writes
+a request under the app's root (`state/<tenant>/<app>/deletes/`), and
+waits until the delete is recorded, 60 s by default (`--wait SECS`;
+`--no-wait` returns at once). It prints "Deleted" only once a node has
+recorded the delete in the bucket; otherwise it exits non-zero and the
+cluster keeps trying until the request is an hour old. Running it again is
+safe ([ADR 0028](adr/0028-actors-that-end.md)).
+
+Every node of the app reads the requests once per heartbeat (3 s):
+
+- **The node that holds the actor** (resident, or a room that hibernated
+  with sockets open on it) closes its WebSockets with **1000 "actor
+  deleted"** (not 1012: clients reconnecting at once would recreate an
+  open class's actor), lets their close events run, then deletes it after
+  the events already queued.
+- **If nobody holds it** (hibernated, or its node died), any node serving
+  the class acquires it, restores it and deletes it, running none of its
+  code. The actor of a node that died is free once that node's lease has
+  run out (about ttl plus grace, as for any takeover); `wasmkeep cluster
+  fence` makes that sooner.
+- **The delete** is the one `delete-self` writes: the database and the
+  alarm go, the bucket records an empty database at the head of the
+  actor's history, and its older history is erased. A request read twice
+  (its key could not be deleted, or two nodes acted) is carried out once:
+  the empty database records the request.
+
+The next event to the address starts a new, empty actor; under `existing`
+it still counts as existing ([ADR 0010](adr/0010-who-may-create-an-actor.md)).
+A node from before this release ignores the requests: during a rolling
+upgrade, a delete waits for an upgraded node to hold the actor or find it
+free. A delete cannot be undone, except from a bucket that keeps old
+versions ([backup and restore](deploy/backup-and-restore.md)).
 
 ## Upgrading WasmKeep
 

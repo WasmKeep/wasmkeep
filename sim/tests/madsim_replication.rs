@@ -44,6 +44,18 @@
 //! or a later one (no late segment of an older owner taken over a newer
 //! owner's history).
 //!
+//! With deletes on (ADR 0028), owners also delete the actor as the server
+//! does: a reset segment (the whole empty database, built on the head),
+//! then a snapshot at it and the erase of everything before it by ADR
+//! 0012's rule. Some deletes come right after an acquisition (a node that
+//! takes the actor only to delete it, as an operator delete of an actor
+//! nobody holds does, or a takeover), some from the owner in the middle of
+//! its writes; owners park their hold instead of releasing it half the
+//! time (ADR 0024) and wake it, a new generation, while others try to
+//! acquire. Then an acknowledged write may be missing only if a delete on
+//! the final chain removed it, and nothing an acknowledged delete removed
+//! may be restored.
+//!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --target-dir target/madsim`
 
 #![cfg(madsim)]
@@ -116,6 +128,21 @@ struct Rules {
     /// on its cell alone, until its release is answered
     /// (`Breaks::release_before_stop` and `Breaks::act_on_cell_only`).
     act_until_answered: bool,
+    /// Whether owners delete the actor (ADR 0028).
+    deletes: Deletes,
+}
+
+/// Deletes (ADR 0028): a reset, the snapshot at it, then the erase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deletes {
+    /// Never.
+    Off,
+    /// As the server does: the erase only after the snapshot at an
+    /// acknowledged reset, by ADR 0012's rule.
+    Safe,
+    /// Unsafe, to prove it matters: everything but the reset erased as
+    /// soon as it was sent, acknowledged or not.
+    EraseBeforeAck,
 }
 
 /// Garbage collection (ADR 0012), after a periodic snapshot.
@@ -152,6 +179,7 @@ const SAFE: Rules = Rules {
     collect: Collect::Off,
     lease_cuts: false,
     act_until_answered: false,
+    deletes: Deletes::Off,
 };
 
 const SAFE_RELEASING: Rules = Rules {
@@ -161,6 +189,7 @@ const SAFE_RELEASING: Rules = Rules {
     collect: Collect::Off,
     lease_cuts: false,
     act_until_answered: false,
+    deletes: Deletes::Off,
 };
 
 /// Lease cuts, and no hibernation: besides fences and restarts, the actor
@@ -177,7 +206,30 @@ const SAFE_COLLECTING: Rules = Rules {
     collect: Collect::Safe,
     lease_cuts: false,
     act_until_answered: false,
+    deletes: Deletes::Off,
 };
+
+const SAFE_DELETING: Rules = Rules {
+    deletes: Deletes::Safe,
+    ..SAFE_RELEASING
+};
+
+const SAFE_DELETING_COLLECTING: Rules = Rules {
+    deletes: Deletes::Safe,
+    ..SAFE_COLLECTING
+};
+
+/// The body of a reset segment: the whole database replaced by an empty one.
+const RESET: &[u8] = b"reset";
+
+/// A delete an owner sent: its reset segment, what the deleting owner's
+/// database held (what it removes), and whether it was acknowledged.
+#[derive(Debug, Clone)]
+struct Reset {
+    id: SegmentId,
+    removed: BTreeSet<SegmentId>,
+    acked: bool,
+}
 
 /// Keys under the actor prefix, as a listing.
 fn read_listing<'a>(keys: impl IntoIterator<Item = &'a str>) -> Listing {
@@ -220,8 +272,30 @@ fn restored(plan: &Plan, objects: &[(String, String)]) -> Result<BTreeSet<Segmen
             .ok_or_else(|| format!("snapshot {snapshot:?} is not in the listing"))?;
         held = decode_positions(body);
     }
-    held.extend(plan.segments.iter().copied());
+    for segment in &plan.segments {
+        let key = format!("{PREFIX}{}", segment_key_of(*segment, objects));
+        // A reset replaces everything before it.
+        if objects
+            .iter()
+            .any(|(k, b)| *k == key && b.as_bytes() == RESET)
+        {
+            held.clear();
+        }
+        held.insert(*segment);
+    }
     Ok(held)
+}
+
+/// The key of the segment at `id` in `objects` (its parent generation is
+/// part of the name).
+fn segment_key_of(id: SegmentId, objects: &[(String, String)]) -> String {
+    let listing = read_listing(objects.iter().map(|(k, _)| k.as_str()));
+    listing
+        .segments
+        .iter()
+        .find(|s| s.id == id)
+        .map(segment_key)
+        .unwrap_or_default()
 }
 
 thread_local! {
@@ -233,6 +307,10 @@ thread_local! {
     /// Releases sent after a lapse the lease task had not seen, that
     /// landed, in this run.
     static EARLY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Wakes of a parked hold in this run.
+    static WAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Deletes acknowledged as found carried out (after the fence).
+    static READ_ACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn count_collected(n: usize) {
@@ -352,8 +430,134 @@ async fn snapshot_and_collect(
     }
 }
 
+/// The owner deletes the actor (ADR 0028), as the server's delete routine
+/// does: a reset segment on its head, acknowledged by the same rule as a
+/// write; then a snapshot of the empty database at it, and the erase of
+/// everything before it (ADR 0012's rule). `false` if the upload failed:
+/// the caller gives the actor up.
+async fn delete_actor(
+    node: &Node,
+    bucket: &EpBucket,
+    deletes: &EpBucket,
+    rules: Rules,
+    o: &mut Owner,
+    acked: &Mutex<Vec<SegmentId>>,
+    resets: &Mutex<Vec<Reset>>,
+) -> bool {
+    let segment = Segment {
+        id: SegmentId {
+            generation: o.held.generation,
+            txid: o.head.txid + 1,
+        },
+        parent_generation: o.head.generation,
+    };
+    let key = format!("{PREFIX}{}", segment_key(&segment));
+    let at = resets.lock().unwrap().len();
+    resets.lock().unwrap().push(Reset {
+        id: segment.id,
+        removed: o.held_positions.clone(),
+        acked: false,
+    });
+    let uploaded = bucket.create(&key, RESET.to_vec()).await.is_ok();
+    if rules.deletes == Deletes::EraseBeforeAck
+        && let Ok(objects) = bucket.list(PREFIX).await
+    {
+        for (k, _) in objects {
+            if k != key {
+                count_collected(1);
+                let _ = deletes.delete(&k).await;
+            }
+        }
+    }
+    if !uploaded {
+        trace(&format!(
+            "{} delete upload failed {:?}",
+            node.id(),
+            segment.id
+        ));
+        return false;
+    }
+    let may_ack = if rules.ack_on_lease_only {
+        node.lease_valid()
+    } else {
+        node.may_act(&o.held)
+    };
+    if !rules.ack_within_grant || may_ack {
+        trace(&format!("{} acked delete {:?}", node.id(), segment.id));
+        acked.lock().unwrap().push(segment.id);
+        resets.lock().unwrap()[at].acked = true;
+    } else {
+        LATE.with(|l| l.set(l.get() + 1));
+    }
+    o.head = segment.id;
+    o.held_positions = BTreeSet::from([segment.id]);
+    o.since_snapshot = 0;
+    o.snapshot_failures = 0;
+    o.snapshot_retry_at = 0;
+    if !may_ack || rules.deletes != Deletes::Safe {
+        return true;
+    }
+    let snapshot = format!("{PREFIX}{}", snapshot_key(segment.id));
+    if bucket
+        .create(&snapshot, encode_positions(&o.held_positions))
+        .await
+        .is_err()
+        || !node.may_act(&o.held)
+    {
+        return true;
+    }
+    let Ok(objects) = bucket.list(PREFIX).await else {
+        return true;
+    };
+    let listing = read_listing(objects.iter().map(|(k, _)| k.as_str()));
+    let gone = collectable(&listing, o.held.generation, segment.id);
+    count_collected(gone.len());
+    for key in gone {
+        if !node.may_act(&o.held) {
+            return true;
+        }
+        let _ = deletes.delete(&format!("{PREFIX}{key}")).await;
+    }
+    true
+}
+
+/// A node that restored delete `resets[at]` acknowledges it as carried out
+/// (ADR 0028, a request listed again): after the fence, a one-line upload
+/// of this hold's that ends the history, acknowledged by the write rule.
+/// `false` if the fence's upload failed: the caller gives the actor up.
+async fn ack_by_read(
+    node: &Node,
+    bucket: &EpBucket,
+    o: &mut Owner,
+    acked: &Mutex<Vec<SegmentId>>,
+    resets: &Mutex<Vec<Reset>>,
+    at: usize,
+) -> bool {
+    let segment = Segment {
+        id: SegmentId {
+            generation: o.held.generation,
+            txid: o.head.txid + 1,
+        },
+        parent_generation: o.head.generation,
+    };
+    let key = format!("{PREFIX}{}", segment_key(&segment));
+    if bucket.create(&key, b"x".to_vec()).await.is_err() {
+        return false;
+    }
+    o.head = segment.id;
+    o.held_positions.insert(segment.id);
+    o.since_snapshot += 1;
+    if node.may_act(&o.held) {
+        acked.lock().unwrap().push(segment.id);
+        resets.lock().unwrap()[at].acked = true;
+        READ_ACKS.with(|r| r.set(r.get() + 1));
+    }
+    true
+}
+
 /// One process's life on node leases: until its lease is lost (fenced, or
 /// replaced by its own restart), then it exits.
+#[allow(clippy::too_many_arguments)]
 async fn run_node(
     node: &Rc<Node>,
     bucket: &EpBucket,
@@ -361,8 +565,10 @@ async fn run_node(
     rules: Rules,
     rng: &mut Rng,
     acked: &Mutex<Vec<SegmentId>>,
+    resets: &Mutex<Vec<Reset>>,
     problems: &Mutex<Vec<String>>,
 ) {
+    let deleting = rules.deletes != Deletes::Off;
     let mut owner: Option<Owner> = None;
     // The generation of the hold given up last (once per hold, as the
     // server's dropped hold sends one release).
@@ -374,7 +580,17 @@ async fn run_node(
             return;
         }
         let Some(o) = owner.as_mut() else {
-            let held = match node.acquire(RECORD, 1).await {
+            // A parked hold is woken, a new generation (ADR 0024).
+            let parked = deleting && node.is_parked(RECORD);
+            let taken = if parked {
+                node.wake(RECORD, 1).await
+            } else {
+                node.acquire(RECORD, 1).await
+            };
+            if parked && taken.is_ok() {
+                WAKES.with(|w| w.set(w.get() + 1));
+            }
+            let held = match taken {
                 Ok(held) => held,
                 Err(e) => {
                     trace(&format!("{} acquire: {e:?}", node.id()));
@@ -414,6 +630,31 @@ async fn run_node(
                     // if enough segments were restored, at the restored
                     // head, whoever wrote it.
                     snapshot_and_collect(node, bucket, deletes, rules, &mut o).await;
+                    // A delete found carried out by the restore (its
+                    // request listed again) is acknowledged only once this
+                    // hold's own upload ends the history (the server's
+                    // fence). Acknowledging on the read alone is unsafe,
+                    // but needs an interleaving this model does not reach
+                    // within 20,000 seeds; `wasmkeep_cluster::replication`'s
+                    // unit tests script it.
+                    let restored_reset = resets.lock().unwrap().iter().position(|r| r.id == o.head);
+                    if deleting
+                        && let Some(at) = restored_reset
+                        && rng.chance(50)
+                        && !ack_by_read(node, bucket, &mut o, acked, resets, at).await
+                    {
+                        let _ = node.release(&o.held).await;
+                        continue;
+                    }
+                    // Acquired (or woken) only to delete it, as an operator
+                    // delete of an actor nobody holds, or of a parked room.
+                    if deleting
+                        && rng.chance(25)
+                        && !delete_actor(node, bucket, deletes, rules, &mut o, acked, resets).await
+                    {
+                        let _ = node.release(&o.held).await;
+                        continue;
+                    }
                     owner = Some(o);
                 }
                 Err(e) => problems
@@ -463,10 +704,21 @@ async fn run_node(
         // Its previous upload has finished, as in production, where an
         // actor's state (and hold) is dropped only after its last event.
         let mut released = false;
-        if rules.releases != Releases::Never && rng.chance(4) {
+        if rules.releases != Releases::Never && rng.chance(if deleting { 10 } else { 4 }) {
             trace(&format!("releases gen {}", o.held.generation));
             let held = o.held.clone();
-            let _ = node.release(&held).await;
+            // Half the time it parks instead (a room hibernating with
+            // sockets open, ADR 0024): its record keeps naming this node.
+            if deleting && rng.chance(50) {
+                let parked = node.park(&held).await;
+                trace(&format!(
+                    "{} parks gen {}: {parked}",
+                    node.id(),
+                    held.generation
+                ));
+            } else {
+                let _ = node.release(&held).await;
+            }
             if rules.releases == Releases::AfterUploads {
                 owner = None;
                 sleep(Duration::from_secs(1)).await;
@@ -476,6 +728,16 @@ async fn run_node(
             // event still running), then one more write, wrongly acked.
             sleep(Duration::from_millis(300)).await;
             released = true;
+        }
+
+        // Now and then the owner deletes the actor instead of writing.
+        if deleting && !released && rng.chance(6) {
+            if !delete_actor(node, bucket, deletes, rules, o, acked, resets).await {
+                let held = o.held.clone();
+                let _ = node.release(&held).await;
+                owner = None;
+            }
+            continue;
         }
 
         // One transaction, built on the current head.
@@ -562,6 +824,12 @@ struct Outcome {
     acked: Vec<SegmentId>,
     /// Releases after a lapse the lease task had not seen, that landed.
     early: u64,
+    /// Deletes sent (ADR 0028).
+    resets: Vec<Reset>,
+    /// Wakes of a parked hold.
+    wakes: u64,
+    /// Deletes acknowledged as found carried out.
+    read_acks: u64,
     /// Uploads that succeeded after the uploader's hold ended.
     late: u64,
     /// Objects garbage collection deleted (or sent deletes for).
@@ -577,15 +845,19 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
     EARLY.with(|e| e.set(0));
     LATE.with(|l| l.set(0));
     COLLECTED.with(|c| c.set(0));
+    WAKES.with(|w| w.set(0));
+    READ_ACKS.with(|r| r.set(0));
     let _ = take_fences();
     let config = LeaseConfig::new(1_000, 500, 200, 300).unwrap();
     let max_skew_ms = 300;
     let rt = Runtime::with_seed_and_config(seed, madsim::Config::default());
     let acked = Arc::new(Mutex::new(Vec::new()));
+    let resets = Arc::new(Mutex::new(Vec::new()));
     let problems = Arc::new(Mutex::new(Vec::new()));
     let store = Store::default();
-    let (acked_out, problems_out, store_out) = (
+    let (acked_out, resets_out, problems_out, store_out) = (
         Arc::clone(&acked),
+        Arc::clone(&resets),
         Arc::clone(&problems),
         Arc::clone(&store),
     );
@@ -613,7 +885,11 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
             let span = max_skew_ms * 2 + 1;
             let skew_ms =
                 i64::try_from(rng.below(span)).unwrap() - i64::try_from(max_skew_ms).unwrap();
-            let (acked, problems) = (Arc::clone(&acked), Arc::clone(&problems));
+            let (acked, resets, problems) = (
+                Arc::clone(&acked),
+                Arc::clone(&resets),
+                Arc::clone(&problems),
+            );
             let cut = Arc::clone(&cuts[usize::try_from(i).unwrap() - 1]);
             // Not drawn from `rng`: existing seeds keep their fault schedules.
             let node_seed = seed ^ (u64::from(i) << 40) ^ 0x0E1E_A5E0;
@@ -622,7 +898,11 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
                 .name(format!("n{i}"))
                 .ip(format!("10.0.1.{i}").parse().unwrap())
                 .init(move || {
-                    let (acked, problems) = (Arc::clone(&acked), Arc::clone(&problems));
+                    let (acked, resets, problems) = (
+                        Arc::clone(&acked),
+                        Arc::clone(&resets),
+                        Arc::clone(&problems),
+                    );
                     let cut = Arc::clone(&cut);
                     async move {
                         // A new process each start (and restart): its own
@@ -685,8 +965,10 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
                         let bucket = EpBucket::connect_with_timeout(uploads).await;
                         let deletes = EpBucket::connect_with_timeout(DELETE_WAIT).await;
                         let mut rng = Rng::new(node_seed);
-                        run_node(&node, &bucket, &deletes, rules, &mut rng, &acked, &problems)
-                            .await;
+                        run_node(
+                            &node, &bucket, &deletes, rules, &mut rng, &acked, &resets, &problems,
+                        )
+                        .await;
                     }
                 })
                 .build();
@@ -779,6 +1061,9 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
     Outcome {
         acked: acked_out.lock().unwrap().clone(),
         early: EARLY.with(std::cell::Cell::get),
+        resets: resets_out.lock().unwrap().clone(),
+        wakes: WAKES.with(std::cell::Cell::get),
+        read_acks: READ_ACKS.with(std::cell::Cell::get),
         late: LATE.with(std::cell::Cell::get),
         collected: COLLECTED.with(std::cell::Cell::get),
         fences: take_fences(),
@@ -801,10 +1086,59 @@ fn check(outcome: &Outcome) -> Result<usize, String> {
     let listing = read_listing(objects.iter().map(|(k, _)| k.as_str()));
     let plan = plan_restore(&listing).map_err(|e| format!("final restore: {e}"))?;
     let restored = restored(&plan, &objects)?;
-    for id in &outcome.acked {
-        if !restored.contains(id) {
+    // The deletes on the final chain: those restored, then those an
+    // earlier one on it removed (ADR 0028). What they removed may be
+    // missing; nothing else acknowledged may.
+    let mut on_chain: BTreeSet<SegmentId> = outcome
+        .resets
+        .iter()
+        .filter(|r| restored.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    loop {
+        let more: Vec<SegmentId> = outcome
+            .resets
+            .iter()
+            .filter(|r| on_chain.contains(&r.id))
+            .flat_map(|r| {
+                outcome
+                    .resets
+                    .iter()
+                    .filter(|d| r.removed.contains(&d.id) && !on_chain.contains(&d.id))
+                    .map(|d| d.id)
+            })
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        on_chain.extend(more);
+    }
+    let gone: BTreeSet<SegmentId> = outcome
+        .resets
+        .iter()
+        .filter(|r| on_chain.contains(&r.id))
+        .flat_map(|r| r.removed.iter().copied())
+        .collect();
+    // Never resurrected: nothing an acknowledged delete removed is back.
+    for r in outcome.resets.iter().filter(|r| r.acked) {
+        if let Some(back) = r.removed.iter().find(|p| restored.contains(p)) {
             return Err(format!(
-                "acknowledged write {id:?} lost (restored to {:?})",
+                "deleted data came back: {back:?}, removed by the acknowledged delete {:?} \
+                 (restored to {:?})",
+                r.id,
+                plan.head()
+            ));
+        }
+    }
+    for id in &outcome.acked {
+        if !restored.contains(id) && !gone.contains(id) {
+            let what = if outcome.resets.iter().any(|r| r.id == *id) {
+                "delete (what it removed may be back)"
+            } else {
+                "write"
+            };
+            return Err(format!(
+                "acknowledged {what} {id:?} lost (restored to {:?})",
                 plan.head()
             ));
         }
@@ -1048,4 +1382,86 @@ fn collecting_the_segment_under_the_snapshot_is_caught() {
         ..SAFE_COLLECTING
     });
     eprintln!("replication: collecting the segment at the snapshot caught at seed {seed}");
+}
+
+/// Deletes (ADR 0028) among takeovers, restores, releases and parked holds
+/// woken by their node: acknowledged writes survive unless a delete on the
+/// final chain removed them, and nothing an acknowledged delete removed
+/// comes back.
+fn deletes_hold(rules: Rules, what: &str) {
+    let (mut acked, mut deletes, mut wakes, mut generations, mut read_acks) = (0, 0, 0, 0, 0);
+    for seed in 0..seeds() {
+        let outcome = simulate(seed, rules, Duration::from_secs(30));
+        match check(&outcome) {
+            Ok(n) => acked += u64::try_from(n).unwrap(),
+            Err(v) => panic!("seed {seed}: {v}"),
+        }
+        deletes += u64::try_from(outcome.resets.iter().filter(|r| r.acked).count()).unwrap();
+        wakes += outcome.wakes;
+        read_acks += outcome.read_acks;
+        generations += outcome
+            .acked
+            .iter()
+            .map(|id| id.generation)
+            .max()
+            .unwrap_or(0);
+    }
+    assert!(acked > seeds() * 10, "too few writes ({acked})");
+    assert!(
+        deletes > seeds(),
+        "too few acknowledged deletes ({deletes})"
+    );
+    assert!(wakes > seeds() / 4, "parked holds rarely woken ({wakes})");
+    assert!(
+        read_acks > seeds() / 4,
+        "deletes rarely acknowledged on a restore ({read_acks})"
+    );
+    assert!(
+        generations > seeds() * 3,
+        "ownership rarely changed ({generations})"
+    );
+    eprintln!(
+        "replication {what}: {} seeds x 30 s: {acked} acknowledged writes and {deletes} \
+         acknowledged deletes ({read_acks} found carried out by a restore), none lost, \
+         nothing deleted back; {wakes} wakes",
+        seeds()
+    );
+}
+
+#[test]
+fn deletes_never_bring_data_back() {
+    deletes_hold(SAFE_DELETING, "with deletes");
+}
+
+#[test]
+fn deletes_with_collection_never_bring_data_back() {
+    deletes_hold(SAFE_DELETING_COLLECTING, "with deletes and collection");
+}
+
+#[test]
+fn a_delete_acked_after_its_hold_ended_can_bring_data_back() {
+    // A delete acknowledged because the node lease is valid, though a lapse
+    // ended the hold: another node may have taken the actor without it.
+    let rules = Rules {
+        ack_on_lease_only: true,
+        ..SAFE_DELETING
+    };
+    let seed = (0..seeds())
+        .find(|&s| {
+            check(&simulate(s, rules, Duration::from_secs(30)))
+                .is_err_and(|e| e.contains("deleted data came back"))
+        })
+        .unwrap_or_else(|| panic!("no resurrection within the seed budget"));
+    let again = check(&simulate(seed, rules, Duration::from_secs(30)));
+    assert!(again.is_err(), "seed {seed} did not reproduce");
+    eprintln!("replication: a delete acked after its hold ended came back at seed {seed}");
+}
+
+#[test]
+fn erasing_before_the_delete_is_acked_loses_writes() {
+    let seed = caught(Rules {
+        deletes: Deletes::EraseBeforeAck,
+        ..SAFE_DELETING
+    });
+    eprintln!("replication: erasing before the delete is acked caught at seed {seed}");
 }

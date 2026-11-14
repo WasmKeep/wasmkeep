@@ -166,6 +166,16 @@ async fn history_keys_carry_the_prefix() {
             c.history_key(&actor(ESCAPED)),
             format!("{p}state/acme/blog/actors/chat/%52oom%201%20%C3%A9")
         );
+        // The command line's view of the same folder (ADR 0028).
+        for name in [PLAIN, ESCAPED, long().as_str()] {
+            assert_eq!(
+                format!(
+                    "{p}{}",
+                    crate::history_folder(&StateRoot::new("", "acme", "blog"), "chat", name)
+                ),
+                format!("{}/", c.history_key(&actor(name)))
+            );
+        }
         assert_eq!(
             c.history_key(&actor(&long())),
             format!("{p}state/acme/blog/actors/chat/{}", long_encoded())

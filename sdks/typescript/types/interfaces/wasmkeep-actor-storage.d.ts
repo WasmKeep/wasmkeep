@@ -25,6 +25,19 @@ declare module 'wasmkeep:actor/storage@0.2.0' {
    * starts a fresh actor.
    */
   export function deleteSelf(): void;
+  /**
+   * Deletes this actor now, and returns only once the delete is
+   * durable: recorded in the bucket when the node has one (the next
+   * event, wherever it runs, starts a fresh actor), the files removed
+   * and fsynced when it does not. Its pending alarm is cleared. Later
+   * storage calls in the same event are refused with `not-allowed`;
+   * `get-alarm` then returns none, and `set-alarm` and `clear-alarm` do
+   * nothing. Refused with `not-allowed` inside an open transaction,
+   * changing nothing. `internal` means the delete is not known to be
+   * durable (it may still land): the actor is restored from the bucket
+   * by its next event, and calling this again is safe.
+   */
+  export function deleteSelfDurable(): void;
   export type Value = import('wasmkeep:actor/types@0.2.0').Value;
   export type Rows = import('wasmkeep:actor/types@0.2.0').Rows;
   export type SqlError = import('wasmkeep:actor/types@0.2.0').SqlError;

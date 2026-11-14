@@ -382,6 +382,8 @@ impl Actor {
                 &Entry::owned(5_000, 1, "ab").unwrap(),
             ),
             Family::Moves => format!("{}/{}/node-b", self.class, hex(&self.name)),
+            // Not in `Family::ALL`: nothing migrates delete requests.
+            Family::Deletes => format!("{}/{}", self.class, hex(&self.name)),
         }
     }
 

@@ -745,22 +745,33 @@ impl ActorState {
     /// database is made in a scratch directory instead; the stale local
     /// file no longer matches what the bucket and its sidecar name, so the
     /// next restore sets it aside rather than using it.
-    pub(super) async fn replicate_delete(&mut self, files_removed: bool) {
+    ///
+    /// `operator_delete`: the operator delete marker the empty database
+    /// carries (ADR 0028). An error means the delete is not recorded: the
+    /// actor was given up, and its data is still the bucket's.
+    pub(super) async fn replicate_delete(
+        &mut self,
+        files_removed: bool,
+        operator_delete: Option<String>,
+        erase_now: bool,
+    ) -> Result<(), String> {
         let Some(slot) = self.replica.clone() else {
-            return;
+            return Ok(());
         };
         let storage = self.storage.clone();
         let a = self.address.clone();
         let residency = self.residency.clone();
         let opened = tokio::task::spawn_blocking(move || {
             if !files_removed {
-                return empty_database_snapshot(&storage, &a).map(|all| (None, all));
+                return empty_database_snapshot(&storage, &a, operator_delete.as_deref())
+                    .map(|all| (None, all));
             }
             let mut db = residency.retain(
                 storage
                     .open(a.class(), a.name())
                     .map_err(|e| format!("{e:#}"))?,
             );
+            mark_deleted(&mut db, operator_delete.as_deref())?;
             db.start_capture().map_err(|e| e.to_string())?;
             let all = db.snapshot().map_err(|e| e.to_string())?;
             Ok::<_, String>((Some(db), all))
@@ -790,7 +801,7 @@ impl ActorState {
                                     retention: Duration::ZERO,
                                     erase: true,
                                 };
-                                if files_removed {
+                                if files_removed && !erase_now {
                                     spawn_collection(
                                         self.address.clone(),
                                         Arc::clone(&self.collecting),
@@ -826,9 +837,91 @@ impl ActorState {
         if let Some(cluster) = &self.cluster {
             cluster.snapshot_waits.forget(&self.address);
         }
-        if let Err(e) = result {
+        if let Err(e) = &result {
             self.abandon(&format!("recording the delete: {e}"));
         }
+        result
+    }
+
+    /// After a `delete-self-durable` whose reset is in the bucket (ADR
+    /// 0028): the snapshot of the empty database at it, then the erase,
+    /// at once (the actor is given up right after).
+    async fn after_durable_delete(&mut self, empty: wasmkeep_storage::wal::Changes) {
+        let Some(slot) = self.replica.clone() else {
+            return;
+        };
+        let mut replica = slot.lock().await;
+        match replica
+            .ship_snapshot(&empty, crate::replica::SnapshotKind::AfterDelete)
+            .await
+        {
+            Ok(true) => {
+                let request = CollectRequest {
+                    collector: replica.collector(),
+                    snapshot: replica.head(),
+                    retention: Duration::ZERO,
+                    erase: true,
+                };
+                drop(replica);
+                run_collection(&self.address, &request).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                crate::metrics::inc(&crate::metrics::METRICS.history_collect_failures);
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "snapshot after a delete failed; its history is not erased");
+            }
+        }
+        if let Some(cluster) = &self.cluster {
+            cluster.snapshot_waits.forget(&self.address);
+        }
+    }
+
+    /// The end of every delete but the durable one's (ADR 0028, section
+    /// 1): with the database closed, removes its files and records the
+    /// empty database in the bucket, then the alarm entry `stale` the
+    /// actor's state named. `operator_delete`: the marker the empty
+    /// database carries. Called with the actor held.
+    /// `erase_now`: erase the history before returning, for a caller that
+    /// gives the actor up right after (a pass in the background would
+    /// stop with the hold).
+    pub(super) async fn delete_recorded(
+        &mut self,
+        stale: Option<Entry>,
+        operator_delete: Option<String>,
+        erase_now: bool,
+    ) -> Result<(), String> {
+        if let Some(mut live) = self.live.take() {
+            let _ = live.store.data_mut().drain_db().await;
+        }
+        self.db = None; // close before removing the files
+        let storage = self.storage.clone();
+        let a = self.address.clone();
+        let removed =
+            tokio::task::spawn_blocking(move || storage.delete(a.class(), a.name())).await;
+        let files_removed = matches!(removed, Ok(Ok(())));
+        if !files_removed {
+            if self.replica.is_some() {
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; the bucket records it empty anyway");
+            } else {
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; its data stays on this node");
+            }
+        }
+        let recorded = self
+            .replicate_delete(files_removed, operator_delete, erase_now)
+            .await;
+        // Only once the delete is in the bucket.
+        self.retire_alarm_entry(stale).await;
+        if !files_removed {
+            // The old files are still here: give the actor up, so its
+            // next event restores from the bucket, which sets them
+            // aside (their sidecar no longer matches) instead of
+            // serving them.
+            self.replica = None;
+            self.live = None;
+            self.db = None;
+            self.lease = None; // releases
+        }
+        recorded
     }
 
     /// Gives the actor up after a replication failure: everything local may
@@ -953,6 +1046,7 @@ impl ActorState {
             let db = self.start_replication(db).await?;
             let mut host = ActorHost::new(db, Arc::clone(&self.sockets));
             host.replica = self.replica.clone();
+            host.deleter = Some((self.storage.clone(), self.address.clone()));
             host.egress = crate::egress::EgressHooks::new(Arc::clone(&self.egress));
             host.wasi = self.guest_log.wasi(
                 crate::logging::app(&self.address).to_string(),
@@ -1083,6 +1177,28 @@ impl ActorState {
             db.alarm()
         });
         let delete = live.store.data().delete_requested;
+        // `delete-self-durable` already recorded the delete (ADR 0028).
+        let host = live.store.data_mut();
+        // A single node's durable delete that could not remove the files:
+        // removed now, as for `delete-self`.
+        let durable = host
+            .deleted
+            .take()
+            .or_else(|| std::mem::take(&mut host.delete_retry).then_some(None));
+        // The operator delete marker, carried over to the empty database.
+        let carried = if delete && durable.is_none() {
+            match with_db_inline(&mut live.store, |db| db.meta(OPERATOR_DELETE_KEY)) {
+                Ok(Ok(v)) => v,
+                // A request whose key is still listed may then be carried
+                // out again on the new actor (ADR 0028).
+                other => {
+                    tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?other, "reading the operator delete marker failed; the delete does not carry it");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // The committed alarm, for the bucket's index (if it could be read).
         let indexed = if delete {
             Some(None)
@@ -1121,7 +1237,11 @@ impl ActorState {
             Some(Published { named, replaced }) => (Some(named), replaced),
             None => (None, None),
         };
-        self.replicate().await;
+        // After a durable delete the replica's head is the reset; what the
+        // event wrote before it is not kept.
+        if durable.is_none() {
+            self.replicate().await;
+        }
         if !delete {
             self.retire_alarm_entry(stale.take()).await;
         }
@@ -1131,31 +1251,39 @@ impl ActorState {
             self.db = live.store.data_mut().db.take();
         }
         if delete {
-            self.db = None; // close before removing the files
-            let storage = self.storage.clone();
-            let a = self.address.clone();
-            let removed =
-                tokio::task::spawn_blocking(move || storage.delete(a.class(), a.name())).await;
-            let files_removed = matches!(removed, Ok(Ok(())));
-            if !files_removed {
-                if self.replica.is_some() {
-                    tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; the bucket records it empty anyway");
-                } else {
-                    tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; its data stays on this node");
+            match durable {
+                // Recorded in the call: the snapshot at the reset and the
+                // erase, the alarm entry, the files; then the actor is
+                // given up, so its next event restores the empty database
+                // (the local one still holds the old data until removed).
+                Some(Some(empty)) => {
+                    self.db = None;
+                    let storage = self.storage.clone();
+                    let a = self.address.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || storage.delete(a.class(), a.name()))
+                            .await;
+                    self.after_durable_delete(empty).await;
+                    self.retire_alarm_entry(stale).await;
+                    self.replica = None;
+                    self.live = None;
+                    self.db = None;
+                    self.lease = None; // releases
                 }
-            }
-            self.replicate_delete(files_removed).await;
-            // Only once the delete is in the bucket.
-            self.retire_alarm_entry(stale).await;
-            if !files_removed {
-                // The old files are still here: give the actor up, so its
-                // next event restores from the bucket, which sets them
-                // aside (their sidecar no longer matches) instead of
-                // serving them.
-                self.replica = None;
-                self.live = None;
-                self.db = None;
-                self.lease = None; // releases
+                // One node: the files went in the call (or, if that failed,
+                // now).
+                Some(None) => {
+                    self.db = None;
+                    let storage = self.storage.clone();
+                    let a = self.address.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || storage.delete(a.class(), a.name()))
+                            .await;
+                }
+                None => match self.delete_recorded(stale, carried, false).await {
+                    Ok(()) => crate::metrics::deleted("self"),
+                    Err(_) => crate::metrics::delete_failed("self"),
+                },
             }
             // The bucket's state is now the empty database (or, if
             // recording the delete failed, the actor was given up and

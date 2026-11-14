@@ -368,6 +368,29 @@ fn delete_removes_the_database() {
 }
 
 #[test]
+fn a_durable_delete_removes_the_wal_and_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = storage(&dir);
+    let path = {
+        let mut db = s.open("c", "a").unwrap();
+        db.exec("CREATE TABLE t (x)", &[]).unwrap();
+        db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+        db.path().to_owned()
+    };
+    s.delete_durably("c", "a").unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        assert!(!std::path::PathBuf::from(format!("{}{suffix}", path.display())).exists());
+    }
+    s.delete_durably("c", "a").unwrap(); // idempotent
+    s.delete_durably("never", "made").unwrap(); // no directory
+    let mut db = s.open("c", "a").unwrap();
+    assert_eq!(
+        db.query("SELECT * FROM t", &[]).unwrap_err().kind,
+        SqlErrorKind::Syntax
+    );
+}
+
+#[test]
 fn host_tables_are_hidden_from_guests() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = storage(&dir).open("c", "a").unwrap();

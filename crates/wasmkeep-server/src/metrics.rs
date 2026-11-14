@@ -247,6 +247,10 @@ pub(crate) struct Metrics {
     /// their actor, by how it found out (`event`, `sweep`, `lease_lapse`,
     /// `drain`, `move`).
     pub(crate) websocket_owner_closes: Family<AtomicU64>,
+    /// Actor deletes recorded, by `how` (ADR 0028).
+    pub(crate) actor_deletes: Family<AtomicU64>,
+    /// Actor deletes that failed to be recorded, by `how`.
+    pub(crate) actor_delete_failures: Family<AtomicU64>,
     /// Ownership records the WebSocket owner sweep read.
     pub(crate) websocket_sweep_reads: AtomicU64,
     /// Ownership records the WebSocket owner sweep could not decode and
@@ -335,6 +339,16 @@ pub(crate) fn owner_closes(reason: &str, n: usize) {
     }
 }
 
+/// Counts an actor delete recorded, by `how` ([`DELETE_HOWS`]).
+pub(crate) fn deleted(how: &str) {
+    inc(&METRICS.actor_deletes.get(&[("how", how)]));
+}
+
+/// Counts an actor delete that failed to be recorded, by `how`.
+pub(crate) fn delete_failed(how: &str) {
+    inc(&METRICS.actor_delete_failures.get(&[("how", how)]));
+}
+
 /// Counts a record the WebSocket sweep could not decode, for `read`
 /// ([`Metrics::websocket_sweep_unreadable`]).
 pub(crate) fn sweep_unreadable(read: &str) {
@@ -401,6 +415,9 @@ pub(crate) const SIGNATURE_RECORDS: [&str; 2] = ["calls", "control"];
 /// `reason` of `wasmkeep_websocket_owner_closes_total`.
 pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
     ["event", "sweep", "lease_lapse", "drain", "move"];
+/// `how` of `wasmkeep_actor_deletes_total` and
+/// `wasmkeep_actor_delete_failures_total` (ADR 0028).
+pub(crate) const DELETE_HOWS: [&str; 3] = ["self", "self_durable", "operator"];
 /// `read` of `wasmkeep_websocket_sweep_unreadable_total`.
 pub(crate) const SWEEP_UNREADABLE_READS: [&str; 2] = ["owner", "parked"];
 /// `reason` of `wasmkeep_parked_releases_total`.
@@ -474,6 +491,8 @@ impl Metrics {
         one(&m.forwards, "kind", &FORWARD_KINDS);
         one(&m.signatures_refused_full, "record", &SIGNATURE_RECORDS);
         one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
+        one(&m.actor_deletes, "how", &DELETE_HOWS);
+        one(&m.actor_delete_failures, "how", &DELETE_HOWS);
         one(
             &m.websocket_sweep_unreadable,
             "read",
@@ -794,6 +813,18 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_websocket_owner_closes_total",
         "WebSockets closed with 1012 because this node no longer owned their actor, by how it found out.",
         &m.websocket_owner_closes,
+    );
+    family(
+        &mut out,
+        "wasmkeep_actor_deletes_total",
+        "Actor deletes recorded, by how they were asked for.",
+        &m.actor_deletes,
+    );
+    family(
+        &mut out,
+        "wasmkeep_actor_delete_failures_total",
+        "Actor deletes that failed to be recorded (the data stays), by how they were asked for.",
+        &m.actor_delete_failures,
     );
     counter(
         &mut out,
@@ -1241,6 +1272,12 @@ mod tests {
                 "read",
                 &SWEEP_UNREADABLE_READS[..],
             ),
+            ("wasmkeep_actor_deletes_total", "how", &DELETE_HOWS[..]),
+            (
+                "wasmkeep_actor_delete_failures_total",
+                "how",
+                &DELETE_HOWS[..],
+            ),
             (
                 "wasmkeep_parked_releases_total",
                 "reason",
@@ -1395,6 +1432,24 @@ mod tests {
             .flat_map(|src| literals(src, "owner_closes("))
             .collect(),
             &OWNER_CLOSE_REASONS,
+        );
+        check(
+            "actor deletes",
+            [
+                include_str!("actor/host.rs"),
+                include_str!("actor/state.rs"),
+                include_str!("actor/deletes.rs"),
+            ]
+            .iter()
+            .flat_map(|src| {
+                [
+                    literals(src, "metrics::deleted("),
+                    literals(src, "metrics::delete_failed("),
+                ]
+                .concat()
+            })
+            .collect(),
+            &DELETE_HOWS,
         );
         check(
             "parked releases",

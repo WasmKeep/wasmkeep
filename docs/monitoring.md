@@ -164,6 +164,8 @@ its first request.
 | `wasmkeep_websocket_sweep_reads_total` | counter | Ownership records the owner sweep read: once a minute, one per room with WebSockets open here that this node neither holds nor keeps parked, 5,000 a pass at most (the next pass goes on with the rest), and on one pass in ten one per parked record too (a safeguard). A pass stops at its first read the bucket does not answer. Each read is a bucket GET. |
 | `wasmkeep_websocket_sweep_unreadable_total{read}` | counter | Ownership records the owner sweep could not decode, by `read`: `owner` (a room with WebSockets here that this node neither holds nor keeps parked) and `parked` (the safeguard re-read of a parked record, which is kept). Each is logged once per room and passed over, so the pass goes on with the rooms after it; it is read again on later passes. Should stay at 0: a nonzero value means a record was written by something other than WasmKeep, or damaged in the bucket. |
 | `wasmkeep_parked_records` | gauge | Ownership records this node keeps for rooms that hibernated with WebSockets open here ([ADR 0024](adr/0024-socket-home.md)): each such room wakes here, wherever its next event lands. Bounded by the sockets a node accepts (50,000). They cost no request while they last; a node dying with many of them makes those rooms wait for the failover (about 15 to 20 s), as resident actors do. |
+| `wasmkeep_actor_deletes_total{how}` | counter | Actor deletes this node recorded ([ADR 0028](adr/0028-actors-that-end.md)), by `how`: `self` (`delete-self`, at the end of its event), `self_durable` (`delete-self-durable`, in the call) and `operator` (`wasmkeep actor delete`). On one node, recorded means the files removed. |
+| `wasmkeep_actor_delete_failures_total{how}` | counter | Actor deletes that failed to be recorded, by `how` as above: the actor was given up, and its data is still the bucket's (for `self`, the delete is lost; `self_durable` returned an error; `operator` is tried again on the next pass). Steadily rising: the bucket refuses uploads. |
 | `wasmkeep_parked_wakes_total` | counter | Wakes of a parked room on this node, each an acquisition at a new generation (the record's read and write). |
 | `wasmkeep_parked_releases_total{reason}` | counter | Parked records given up, counted when the release is sent (one that does not land waits in the pending releases, retried), by `reason`: `last_socket` (the room's last socket here went), `drain`, `move`, `lapse` (this node's lease ran out: the release is pending, retried) and `stop` (a clean stop). |
 
@@ -232,6 +234,8 @@ every metric above except `wasmkeep_classes`, the guest log counters
 the history collection counters (`wasmkeep_history_collected_total`,
 `wasmkeep_history_collect_failures_total`),
 `wasmkeep_snapshot_upload_failures_total`,
+the delete counters (`wasmkeep_actor_deletes_total`,
+`wasmkeep_actor_delete_failures_total`),
 `wasmkeep_signatures_refused_full_total`,
 `wasmkeep_websocket_owner_closes_total`,
 `wasmkeep_websocket_sweep_reads_total`,

@@ -1585,6 +1585,38 @@ impl Cluster {
             .clone()
     }
 
+    /// The delete requests this node last read (ADR 0028).
+    pub(crate) fn deletes(&self) -> Vec<wasmkeep_cluster::control::DeleteIntent> {
+        self.control
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .deletes
+            .clone()
+    }
+
+    /// Ends a delete request (ADR 0028): writes its outcome beside it for
+    /// the command waiting on it, then deletes the request, best effort (a
+    /// request left behind is listed again and found done). Nothing is
+    /// deleted if the outcome could not be written: the next pass tries
+    /// again.
+    pub(crate) async fn end_delete_request(
+        &self,
+        intent: &wasmkeep_cluster::control::DeleteIntent,
+        outcome: Option<wasmkeep_cluster::control::DeleteOutcome>,
+    ) {
+        use wasmkeep_cluster::control::Keys as _;
+        let key = intent.key();
+        if let Some(outcome) = outcome
+            && let Err(e) = self.control_keys.put_empty(&outcome.key(&key)).await
+        {
+            tracing::debug!(error = %e, "recording a delete request's outcome failed");
+            return;
+        }
+        if let Err(e) = self.control_keys.delete(&key).await {
+            tracing::debug!(error = %e, "deleting a delete request failed");
+        }
+    }
+
     /// Deletes a move request, best effort.
     pub(crate) async fn delete_move(&self, intent: &wasmkeep_cluster::control::MoveIntent) {
         use wasmkeep_cluster::control::Keys as _;

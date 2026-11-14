@@ -61,3 +61,18 @@ pub fn state_dir(root: &StateRoot) -> wasmkeep_storage::StateDir {
         tenant: root.tenant().to_owned(),
     }
 }
+
+/// The folder of actor `class/name`'s history in the bucket, relative to
+/// the bucket prefix and ending in `/` (what `Cluster::history_key`
+/// lists): for the command line, which checks an actor exists before
+/// asking for its delete (ADR 0028).
+#[must_use]
+pub fn history_folder(root: &StateRoot, class: &str, name: &str) -> String {
+    format!(
+        "{}/",
+        root.key(
+            wasmkeep_cluster::state_root::Family::History,
+            &format!("{class}/{}", wasmkeep_storage::encode_segment(name)),
+        )
+    )
+}
