@@ -114,6 +114,23 @@ test("answers are read and written as the Rust SDK does", () => {
   );
   assert.equal(`{"results":[${rows},{"changes":3}]}`, RESPONSE);
   assert.equal(rowsBody(["a"], [[{ tag: "text", val: "x".repeat(100) }]], 0, 50), undefined, "over the cap");
+  // An answer whose least size is over the cap is refused before any of it
+  // is encoded: no byte of these blobs is read.
+  const unread = new Proxy(new Uint8Array(20_000), {
+    get(target, key) {
+      if (key === "length") return target.length;
+      throw new Error(`blob read: ${String(key)}`);
+    },
+  });
+  const blobs = [0, 1, 2].map(() => [{ tag: "blob", val: unread } as const]);
+  assert.equal(rowsBody(["b"], blobs, 0, 64 * 1024), undefined, "refused unread");
+  // The least size never refuses what fits: exactly at the cap is kept.
+  const small = [[{ tag: "blob", val: new Uint8Array([0, 255]) } as const]];
+  const fits = rowsBody(["b"], small, 0, Infinity)!;
+  assert.equal(fits, '{"columns":["b"],"rows":[[{"blob":"00ff"}]]}');
+  const counted = fits.length - "]}".length; // the caller counts the closing
+  assert.equal(rowsBody(["b"], small, 0, counted), fits, "at the cap");
+  assert.equal(rowsBody(["b"], small, 0, counted - 1), undefined, "a byte over");
 
   const malformed = (body: string, statements: Statement[] = STATEMENTS) => {
     assert.throws(
