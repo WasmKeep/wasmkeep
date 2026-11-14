@@ -559,6 +559,18 @@ impl Drop for LeaseHold {
     }
 }
 
+/// What the safeguard re-read of a parked record found
+/// ([`Cluster::drop_parked_if_stale`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recheck {
+    /// Read: kept, or dropped if no longer this hold's.
+    Read,
+    /// The record cannot be decoded: kept.
+    Unreadable,
+    /// The bucket did not answer: kept.
+    Unanswered,
+}
+
 /// What handing an actor back did (ADR 0014, 0020).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LeaseReturn {
@@ -737,6 +749,17 @@ impl Cluster {
             .await
     }
 
+    /// Whether `address`'s record names this process, at any generation
+    /// (one read; ADR 0024, section 3).
+    pub(crate) async fn names_this_instance(
+        &self,
+        address: &ActorAddress,
+    ) -> Result<bool, AcquireError> {
+        self.owners
+            .names_this_instance(&self.owner_key(address))
+            .await
+    }
+
     /// Whether this node holds `address` now, with its lease valid: a
     /// resident actor that acquired it. One that hibernated released it.
     pub(crate) fn holds_here(&self, address: &ActorAddress) -> bool {
@@ -792,30 +815,32 @@ impl Cluster {
         .await;
     }
 
-    /// The safeguard re-read of a parked record (ADR 0024, section 5):
-    /// `true` if the record no longer names this instance at the parked
-    /// generation, and the entry was dropped (nothing to release: the
-    /// record is not this hold's any more). A failed read drops nothing.
+    /// The safeguard re-read of a parked record (ADR 0024, section 5): if
+    /// the record no longer names this instance at the parked generation,
+    /// the entry is dropped (nothing to release: the record is not this
+    /// hold's any more). A failed read drops nothing; a record that cannot
+    /// be decoded neither (it proves nothing).
     pub(crate) async fn drop_parked_if_stale(
         &self,
         address: &ActorAddress,
         generation: u64,
-    ) -> bool {
+    ) -> Recheck {
         let key = self.owner_key(address);
         let lock = self.pending.lock_of(&key);
         let _locked = lock.lock().await;
         if !self.pending.parked().holds_at(&key, generation) {
-            return false;
+            return Recheck::Read;
         }
         match self.owners.still_names_this(&key, generation).await {
             Ok(false) => {
-                let dropped = self.pending.take_parked(&key, Some(generation)).is_some();
-                if dropped {
+                if self.pending.take_parked(&key, Some(generation)).is_some() {
                     tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), generation, "a parked record no longer names this node; forgotten");
                 }
-                dropped
+                Recheck::Read
             }
-            Ok(true) | Err(_) => false,
+            Ok(true) => Recheck::Read,
+            Err(AcquireError::Corrupt) => Recheck::Unreadable,
+            Err(_) => Recheck::Unanswered,
         }
     }
 

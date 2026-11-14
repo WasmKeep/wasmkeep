@@ -136,7 +136,20 @@ answer joins the pending releases, retried in the background) when:
   actor whose record names a live node, so a parked actor would never
   move): it records the move (every event for the room, its sockets'
   close events included, then goes to the target), releases the record,
-  closes the sockets with 1012 and sends the target its take call;
+  closes the sockets with 1012 and sends the target its take call. Only
+  a release that landed lets it go on. One left pending, or one that
+  finds the record naming this node at a later generation (a wake whose
+  write landed unanswered, which its resolver releases; read again to
+  tell it from another holder, and an unread record counts as this
+  node's), keeps the sockets and the request, since the target would
+  find the record naming a live node. The parked entry is gone by then,
+  so the room is no longer this node's to move: on each move pass, for
+  up to two minutes, the owner reads its record while the room has
+  sockets here and is neither resident, parked nor held here, and closes
+  them with 1012 once another live node holds it. The target deletes the
+  request as it takes the room, so this look does not depend on the
+  request still being listed; past the two minutes, the owner sweep
+  closes them;
 - **the node lease runs out** (no write acknowledged for ttl minus safety):
   every socket closes with 1012 at that moment (as today), and every
   parked record joins the pending releases, as every live hold does;
@@ -232,7 +245,11 @@ record is read within ten passes per 5,000 parked (100 passes at the
 at the first record it did not read. One that no longer names
 this instance at the parked generation is dropped from the set, and its
 sockets are then treated as today (closed if another live node holds the
-room).
+room). A record that cannot be decoded proves nothing: it is kept,
+counted (`wasmkeep_websocket_sweep_unreadable_total`), logged once and
+passed over, in the re-read and in the owner sweep alike, so one bad
+record never holds back the rooms after it; only a bucket that does not
+answer cuts a pass short.
 
 The room stays on its node while it has sockets: placement at wake-up
 (ROADMAP) does not move it. Moving it is a move or a drain, both of which
@@ -330,7 +347,10 @@ spares a relay for most socket upgrades), no longer a requirement.
    and its close event cannot run (its wake's record write is refused),
    the freed slot releases the record, pending until the bucket accepts
    it; a drain of a releases the parked record and closes the socket with
-   1012. The
+   1012; a move of a parked room waits while its release is pending, or
+   while the record names that node at a later generation, its socket
+   open, and closes the socket with 1012 once the target takes the room
+   (without the owner sweep). The
    tests of sockets closed by a room taken elsewhere now change the record
    behind the node's back first.
 3. An adversarial review of this record, then of the code.

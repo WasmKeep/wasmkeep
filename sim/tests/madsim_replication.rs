@@ -293,10 +293,11 @@ async fn snapshot_and_collect(
     };
     let listing = read_listing(objects.iter().map(|(k, _)| k.as_str()));
     let mut gone = collectable(&listing, owner_generation, at);
-    if rules.collect == Collect::DropSegmentAtSnapshot && !gone.is_empty() {
-        if let Some(s) = listing.segments.iter().find(|s| s.id == at) {
-            gone.push(segment_key(s));
-        }
+    if rules.collect == Collect::DropSegmentAtSnapshot
+        && !gone.is_empty()
+        && let Some(s) = listing.segments.iter().find(|s| s.id == at)
+    {
+        gone.push(segment_key(s));
     }
     if !gone.is_empty() {
         count_collected(gone.len());

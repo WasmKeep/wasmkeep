@@ -25,11 +25,42 @@ const MOVES_PARALLEL: usize = 16;
 const SOCKETS_CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// How long the owner waits for the events queued before the move job.
 const MOVE_WAIT: Duration = Duration::from_secs(30);
+/// How long the owner of a parked room whose move waits on its record
+/// (a release left pending, or a record naming this node again) looks for
+/// the target taking it, to close the sockets left here; past it, the
+/// owner sweep closes them.
+const AWAITING_LIMIT: Duration = Duration::from_secs(120);
+/// How long one look at such a room waits for its record.
+const AWAITING_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Move requests being acted on, by key, each with its attempt's token: a
 /// move job whose token is no longer there (the attempt was abandoned)
 /// does nothing.
 pub(super) type Active = Arc<Mutex<HashMap<String, u64>>>;
+
+/// Parked rooms whose move waits on their record (ADR 0024, section 3):
+/// the parked entry is gone (its release was sent), but the record may
+/// still name this node, so the target cannot take the room yet and the
+/// sockets stay. Once another node holds it, the sockets here close with
+/// 1012. By actor, with when to stop looking (ms). Looked at on every move
+/// pass, whether or not the request is still listed: the target deletes
+/// it as soon as it takes the room.
+pub(super) type Awaiting = Arc<AwaitingRooms>;
+
+/// The rooms of [`Awaiting`], and whether a look at them is under way.
+#[derive(Default)]
+pub(super) struct AwaitingRooms {
+    rooms: Mutex<HashMap<ActorAddress, u64>>,
+    /// A look runs in its own task, one at a time: a slow bucket never
+    /// holds up the drain loop.
+    looking: std::sync::atomic::AtomicBool,
+}
+
+impl AwaitingRooms {
+    fn rooms(&self) -> std::sync::MutexGuard<'_, HashMap<ActorAddress, u64>> {
+        self.rooms.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
 
 /// A fresh token per attempt.
 static ATTEMPTS: AtomicU64 = AtomicU64::new(1);
@@ -293,7 +324,20 @@ impl ActorService {
 /// While the node is not draining: starts acting on the move requests that
 /// concern it (ADR 0017), each in its own task, so a slow move never holds
 /// up the drain loop. Requests being acted on are in `active`.
-pub(super) async fn moves_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, active: &Active) {
+pub(super) async fn moves_pass(
+    inner: &Arc<ServiceInner>,
+    cluster: &Arc<Cluster>,
+    active: &Active,
+    awaiting: &Awaiting,
+) {
+    if !awaiting.rooms().is_empty() && !awaiting.looking.swap(true, Ordering::AcqRel) {
+        let (inner, cluster, awaiting) =
+            (Arc::clone(inner), Arc::clone(cluster), Arc::clone(awaiting));
+        tokio::spawn(async move {
+            look_at_awaiting(&inner, &cluster, &awaiting).await;
+            awaiting.looking.store(false, Ordering::Release);
+        });
+    }
     // One move per actor: the newest key counts, the others are deleted.
     let mut newest: BTreeMap<(String, String), MoveIntent> = BTreeMap::new();
     // Only this app's moves are listed (under its root, ADR 0022).
@@ -322,9 +366,14 @@ pub(super) async fn moves_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>
             }
             active.insert(key.clone(), token);
         }
-        let (inner, cluster, active) = (Arc::clone(inner), Arc::clone(cluster), Arc::clone(active));
+        let (inner, cluster, active, awaiting) = (
+            Arc::clone(inner),
+            Arc::clone(cluster),
+            Arc::clone(active),
+            Arc::clone(awaiting),
+        );
         tokio::spawn(async move {
-            move_one(&inner, &cluster, &active, &intent, token).await;
+            move_one(&inner, &cluster, &active, &awaiting, &intent, token).await;
             let mut active = active.lock().unwrap_or_else(|p| p.into_inner());
             if active.get(&key) == Some(&token) {
                 active.remove(&key);
@@ -338,6 +387,7 @@ async fn move_one(
     inner: &Arc<ServiceInner>,
     cluster: &Arc<Cluster>,
     active: &Active,
+    awaiting: &Awaiting,
     intent: &MoveIntent,
     token: u64,
 ) {
@@ -381,11 +431,17 @@ async fn move_one(
         // (from here every event, the sockets' close events included, goes
         // to the target), release the record, close the sockets with 1012,
         // then ask the target to take it.
-        if cluster.is_parked(&address)
-            && cluster.can_take(&intent.target)
-            && move_parked(inner, cluster, intent, &address).await
-        {
-            cluster.delete_move(intent).await;
+        if cluster.is_parked(&address) {
+            if cluster.can_take(&intent.target)
+                && move_parked(inner, cluster, awaiting, intent, &address).await
+            {
+                cluster.delete_move(intent).await;
+            }
+        } else if !awaiting.rooms().contains_key(&address) {
+            // Neither resident nor parked, and not looked at by the pass
+            // already: sockets left here after a parked record's release
+            // are closed once another node holds the room.
+            look_after_release(inner, cluster, &address).await;
         }
         return;
     }
@@ -409,13 +465,18 @@ async fn move_one(
 /// (or found the record no longer this hold's) lets the sockets close and
 /// the target take the room. A release left pending keeps the sockets and
 /// the request: the target would find the record still naming this node,
-/// and the move would be reported done while nothing moved. Nothing parked
+/// and the move would be reported done while nothing moved. So does a
+/// release that found the record naming this node at a later generation (a
+/// wake whose write landed unanswered, which its resolver releases): the
+/// room is still this node's. Either way the room is then [`Awaiting`]:
+/// once the target takes it, its sockets here close. Nothing parked
 /// any more (an event woke the room since the caller looked) keeps the
 /// request too: the room is resident again, and a later pass moves it as
 /// such.
 async fn move_parked(
     inner: &Arc<ServiceInner>,
     cluster: &Arc<Cluster>,
+    awaiting: &Awaiting,
     intent: &MoveIntent,
     address: &ActorAddress,
 ) -> bool {
@@ -439,10 +500,26 @@ async fn move_parked(
             .unwrap_or_else(|p| p.into_inner())
             .remove(address);
     };
+    let wait = || {
+        end_move();
+        let until =
+            now_ms().saturating_add(u64::try_from(AWAITING_LIMIT.as_millis()).unwrap_or(u64::MAX));
+        awaiting.rooms().insert(address.clone(), until);
+    };
     match cluster.release_parked(address, "move").await {
-        Some(LeaseReturn::Released | LeaseReturn::Superseded) => {}
+        Some(LeaseReturn::Released) => {}
+        // Not this hold's record any more; but one naming this node at a
+        // later generation (or unread) means the room is still this node's.
+        Some(LeaseReturn::Superseded) => match cluster.names_this_instance(address).await {
+            Ok(false) => {}
+            again => {
+                wait();
+                tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, names_this_node = ?again.ok(), "move: the parked record moved on, still naming this node or unread; the move waits");
+                return false;
+            }
+        },
         Some(LeaseReturn::Pending) => {
-            end_move();
+            wait();
             tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "move: the parked record's release is pending; the move waits");
             return false;
         }
@@ -471,6 +548,79 @@ async fn move_parked(
         }
         TakeAnswer::HeldBy(_) | TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
     }
+}
+
+/// What a look at a room left with sockets after its parked record's
+/// release found.
+#[derive(Debug, PartialEq, Eq)]
+enum Look {
+    /// Nothing more to do here: its sockets are gone or closed now, or
+    /// the room is this node's again (parked or held).
+    Finished,
+    /// The record names nobody or this node, or could not be read: look
+    /// again on the next pass.
+    Waiting,
+}
+
+/// A room neither resident nor parked here, after its parked record's
+/// release ([`Awaiting`]): closes its sockets with 1012 once its record
+/// names another live node, as the owner sweep would, without waiting for
+/// it. Local checks first, so a room without sockets here costs no read.
+async fn look_after_release(
+    inner: &ServiceInner,
+    cluster: &Cluster,
+    address: &ActorAddress,
+) -> Look {
+    // As the owner sweep: a mailbox here without the hold (a request
+    // forwarded, waiting) does not make the room this node's.
+    let ours = |address| cluster.is_parked(address) || cluster.holds_here(address);
+    if !inner.sockets.has_open(address) || ours(address) || !cluster.node_lease_valid() {
+        return Look::Finished;
+    }
+    let owner =
+        match tokio::time::timeout(AWAITING_READ_TIMEOUT, cluster.other_owner(address)).await {
+            Ok(Ok(Some(owner))) => owner,
+            Ok(Ok(None) | Err(_)) | Err(_) => return Look::Waiting,
+        };
+    // Taken back here meanwhile: the sockets are where they belong.
+    if ours(address) {
+        return Look::Finished;
+    }
+    let closed = inner
+        .sockets
+        .close_owner(address, 1012, "actor moving; reconnect");
+    if closed > 0 {
+        tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %owner, sockets = closed, "move: closed the sockets of a room another node took");
+        crate::metrics::owner_closes("move", closed);
+    }
+    Look::Finished
+}
+
+/// Every move pass: looks at each [`Awaiting`] room, [`MOVES_PARALLEL`] at
+/// once, and forgets those finished or past their limit.
+async fn look_at_awaiting(inner: &ServiceInner, cluster: &Cluster, awaiting: &Awaiting) {
+    let rooms: Vec<(ActorAddress, u64)> = awaiting
+        .rooms()
+        .iter()
+        .map(|(a, until)| (a.clone(), *until))
+        .collect();
+    futures_util::StreamExt::for_each_concurrent(
+        futures_util::stream::iter(rooms),
+        MOVES_PARALLEL,
+        |(address, until)| async move {
+            if now_ms() < until
+                && look_after_release(inner, cluster, &address).await == Look::Waiting
+            {
+                return;
+            }
+            let mut awaiting = awaiting.rooms();
+            // Unless a later move put it back meanwhile.
+            if awaiting.get(&address) == Some(&until) {
+                awaiting.remove(&address);
+            }
+        },
+    )
+    .await;
 }
 
 /// The owner's side of a move. Whether the request is finished (done, or

@@ -1067,21 +1067,43 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     /// Whether the record at `key` still names this instance at
     /// `generation` (one read): the safeguard re-read of a parked hold
     /// (ADR 0024, section 5). `Ok(false)` once it names anything else, or
-    /// no record exists; `Err` if the bucket did not answer.
+    /// no record exists; `Err` if the bucket did not answer
+    /// (`Unavailable`) or the record cannot be decoded (`Corrupt`: proof of
+    /// nothing, so a caller keeps what it holds).
     pub async fn still_names_this(&self, key: &str, generation: u64) -> Result<bool, AcquireError> {
-        let read = self
+        let Some((body, _)) = self
             .bucket
             .get(key)
             .await
-            .map_err(|_| AcquireError::Unavailable)?;
-        Ok(read
-            .and_then(|(body, _)| OwnerRecord::decode(&body))
-            .is_some_and(|r| {
-                r.generation == generation
-                    && r.holder
-                        .as_ref()
-                        .is_some_and(|(n, i)| n == &self.node && i == &self.instance)
-            }))
+            .map_err(|_| AcquireError::Unavailable)?
+        else {
+            return Ok(false);
+        };
+        let r = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+        Ok(r.generation == generation
+            && r.holder
+                .as_ref()
+                .is_some_and(|(n, i)| n == &self.node && i == &self.instance))
+    }
+
+    /// Whether the record at `key` names this instance at any generation
+    /// (one read): after a release found the record moved on, whether the
+    /// actor is still this node's (a wake of it whose write landed
+    /// unanswered, which its resolver releases, ADR 0024 section 3). `Err`
+    /// if the bucket did not answer or the record is unreadable.
+    pub async fn names_this_instance(&self, key: &str) -> Result<bool, AcquireError> {
+        let Some((body, _)) = self
+            .bucket
+            .get(key)
+            .await
+            .map_err(|_| AcquireError::Unavailable)?
+        else {
+            return Ok(false);
+        };
+        let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+        Ok(record
+            .holder
+            .is_some_and(|(n, i)| n == self.node && i == self.instance))
     }
 
     /// After a conflict: `Superseded` unless the record still names this
@@ -1583,6 +1605,59 @@ mod tests {
     /// client retry meeting the landed write: S3's 409 then 412) is read
     /// back: the record names this process at the generation tried, so
     /// the acquisition holds it, with a version that works (it releases).
+    /// Whether a record names this process, at any generation (a move of a
+    /// parked room asks after a release found the record moved on), and
+    /// the parked re-read: an undecodable record is an error for both,
+    /// never an answer.
+    #[test]
+    fn a_record_names_this_process_at_any_generation() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let record = |holder: Option<(&str, &str)>, generation| {
+            OwnerRecord {
+                holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
+                generation,
+            }
+            .encode()
+        };
+        assert_eq!(run(a.names_this_instance("owners/x")), Ok(false));
+        for (holder, names) in [
+            (Some(("a", "i1")), true),
+            (Some(("a", "i0")), false),
+            (Some(("b", "i2")), false),
+            (None, false),
+        ] {
+            mem.overwrite("owners/x", Some(&record(holder, 7)));
+            assert_eq!(
+                run(a.names_this_instance("owners/x")),
+                Ok(names),
+                "{holder:?}"
+            );
+        }
+        // At another generation than the one asked: still this process,
+        // but not the parked hold.
+        mem.overwrite("owners/x", Some(&record(Some(("a", "i1")), 7)));
+        assert_eq!(run(a.still_names_this("owners/x", 7)), Ok(true));
+        assert_eq!(run(a.still_names_this("owners/x", 6)), Ok(false));
+        assert_eq!(run(a.still_names_this("owners/y", 6)), Ok(false));
+        mem.overwrite("owners/x", Some(b"junk"));
+        assert_eq!(
+            run(a.names_this_instance("owners/x")),
+            Err(AcquireError::Corrupt)
+        );
+        assert_eq!(
+            run(a.still_names_this("owners/x", 7)),
+            Err(AcquireError::Corrupt)
+        );
+        assert_eq!(
+            run(a.other_owner("owners/x", |_, _| true)),
+            Err(AcquireError::Corrupt)
+        );
+    }
+
     #[test]
     fn an_acquire_whose_write_landed_unanswered_holds_it() {
         use crate::lease::tests::{At, Mem, run};

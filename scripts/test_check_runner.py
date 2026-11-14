@@ -149,6 +149,8 @@ esac
         result, calls = self.run_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('cargo test -p wasmkeep-sim --locked --target-dir target/madsim', calls)
+        self.assertIn('clippy -p wasmkeep-sim --locked --all-targets --target-dir target/madsim'
+                      ' -- -D warnings flags=--cfg madsim', calls)
         self.assertNotIn('nextest run', calls)
 
     def test_full_leaves_the_retired_lease_sim_to_deep(self):
@@ -252,7 +254,8 @@ esac
 
     def test_failure_propagates(self):
         for failure in ('check-benchmark-paths.py', 'check-docs.py', 'test_check_runner.py',
-                        'cargo clippy', 'cargo nextest run', 'cargo test -p wasmkeep-sim',
+                        'cargo clippy', 'cargo clippy -p wasmkeep-sim', 'cargo nextest run',
+                        'cargo test -p wasmkeep-sim',
                         'cargo +1.97 check', 'cargo deny check', 'go test', 'npm test'):
             with self.subTest(failure=failure):
                 result, _ = self.run_check('--full', fail=failure)

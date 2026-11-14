@@ -245,6 +245,9 @@ pub(crate) struct Metrics {
     pub(crate) websocket_owner_closes: Family<AtomicU64>,
     /// Ownership records the WebSocket owner sweep read.
     pub(crate) websocket_sweep_reads: AtomicU64,
+    /// Ownership records the WebSocket owner sweep could not decode and
+    /// passed over, by `read` (`owner`, `parked`).
+    pub(crate) websocket_sweep_unreadable: Family<AtomicU64>,
     /// Records kept for actors that hibernated with sockets open (a gauge,
     /// ADR 0024).
     pub(crate) parked_records: AtomicU64,
@@ -328,6 +331,15 @@ pub(crate) fn owner_closes(reason: &str, n: usize) {
     }
 }
 
+/// Counts a record the WebSocket sweep could not decode, for `read`
+/// ([`Metrics::websocket_sweep_unreadable`]).
+pub(crate) fn sweep_unreadable(read: &str) {
+    METRICS
+        .websocket_sweep_unreadable
+        .get(&[("read", read)])
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 /// Counts `n` parked records released for `reason`
 /// ([`Metrics::parked_releases`]).
 pub(crate) fn parked_released(reason: &str, n: usize) {
@@ -385,6 +397,8 @@ pub(crate) const SIGNATURE_RECORDS: [&str; 2] = ["calls", "control"];
 /// `reason` of `wasmkeep_websocket_owner_closes_total`.
 pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
     ["event", "sweep", "lease_lapse", "drain", "move"];
+/// `read` of `wasmkeep_websocket_sweep_unreadable_total`.
+pub(crate) const SWEEP_UNREADABLE_READS: [&str; 2] = ["owner", "parked"];
 /// `reason` of `wasmkeep_parked_releases_total`.
 pub(crate) const PARKED_RELEASE_REASONS: [&str; 5] =
     ["last_socket", "drain", "move", "lapse", "stop"];
@@ -455,6 +469,11 @@ impl Metrics {
         one(&m.forwards, "kind", &FORWARD_KINDS);
         one(&m.signatures_refused_full, "record", &SIGNATURE_RECORDS);
         one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
+        one(
+            &m.websocket_sweep_unreadable,
+            "read",
+            &SWEEP_UNREADABLE_READS,
+        );
         one(&m.parked_releases, "reason", &PARKED_RELEASE_REASONS);
         one(&m.front_requests, "outcome", &FRONT_REQUEST_OUTCOMES);
         one(&m.front_calls, "outcome", &FRONT_CALL_OUTCOMES);
@@ -770,6 +789,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_websocket_sweep_reads_total",
         "Ownership records the WebSocket owner sweep read.",
         m.websocket_sweep_reads.load(Ordering::Relaxed),
+    );
+    family(
+        &mut out,
+        "wasmkeep_websocket_sweep_unreadable_total",
+        "Ownership records the WebSocket owner sweep could not decode and passed over, by read.",
+        &m.websocket_sweep_unreadable,
     );
     head(
         &mut out,
@@ -1201,6 +1226,11 @@ mod tests {
                 &OWNER_CLOSE_REASONS[..],
             ),
             (
+                "wasmkeep_websocket_sweep_unreadable_total",
+                "read",
+                &SWEEP_UNREADABLE_READS[..],
+            ),
+            (
                 "wasmkeep_parked_releases_total",
                 "reason",
                 &PARKED_RELEASE_REASONS[..],
@@ -1376,6 +1406,20 @@ mod tests {
             })
             .collect(),
             &PARKED_RELEASE_REASONS,
+        );
+        check(
+            "sweep unreadable",
+            literals(
+                include_str!("actor/socket_owners.rs"),
+                "unreadable(&logged, ",
+            )
+            .into_iter()
+            .chain(literals(
+                include_str!("actor/socket_owners.rs"),
+                "unreadable(logged, ",
+            ))
+            .collect(),
+            &SWEEP_UNREADABLE_READS,
         );
         check(
             "front requests",
