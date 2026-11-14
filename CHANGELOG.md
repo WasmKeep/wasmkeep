@@ -146,6 +146,11 @@ Since 0.3.0, in no release yet.
   - A cluster node logs `checking that no other process runs node id a;
     ready in about 15 s` when its start check begins, and `no other
     process runs node id a: ready to take actors` when it ends.
+  - Log lines name an actor as its app does, with the app as a field of
+    its own: `app=demo/shop actor=counter/alice`, instead of
+    `actor=demo/counter/alice` (tenant, class and name), in the guest log
+    and every other line about an actor. Log queries on `actor=` need the
+    new form.
   - A command whose output goes to a closed pipe (`wasmkeep cluster
     status --json | head`) exits quietly with status 141 instead of
     panicking with "failed printing to stdout: Broken pipe".

@@ -399,7 +399,7 @@ impl LeaseHold {
             Ok(hold) => {
                 if let Some(previous) = &hold.previous {
                     crate::metrics::inc(&crate::metrics::METRICS.failovers);
-                    tracing::info!(actor = %address, from = %previous, generation = hold.generation, "took over an actor whose node stopped");
+                    tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), from = %previous, generation = hold.generation, "took over an actor whose node stopped");
                 }
                 let cell = Arc::new(Mutex::new(Some(hold)));
                 cluster.pending.register(&key, &cell);
@@ -725,7 +725,7 @@ impl Cluster {
             return;
         };
         crate::metrics::parked_released(reason, 1);
-        tracing::debug!(actor = %address, reason, "released a parked record");
+        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), reason, "released a parked record");
         self.release_or_park(hold).await;
     }
 
@@ -759,7 +759,7 @@ impl Cluster {
             Ok(false) => {
                 let dropped = self.pending.take_parked(&key, Some(generation)).is_some();
                 if dropped {
-                    tracing::warn!(actor = %address, generation, "a parked record no longer names this node; forgotten");
+                    tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), generation, "a parked record no longer names this node; forgotten");
                 }
                 dropped
             }

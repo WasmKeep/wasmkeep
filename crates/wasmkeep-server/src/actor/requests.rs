@@ -382,14 +382,14 @@ impl ActorService {
                 }))
             }
             Ok(Outcome::Failed(e)) => {
-                tracing::warn!(actor = %address, error = %e, "event failed");
+                tracing::warn!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = %e, "event failed");
                 Ok(text_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "actor error\n",
                 ))
             }
             Ok(Outcome::Refused(why)) => {
-                tracing::debug!(actor = %address, %why, "event refused");
+                tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %why, "event refused");
                 crate::metrics::refused(crate::metrics::Refusal::Unavailable);
                 Ok(crate::cluster::unavailable(
                     "this node cannot run the actor now; retry\n",
@@ -416,7 +416,7 @@ impl ActorService {
                     text_response(StatusCode::TOO_MANY_REQUESTS, "actor overloaded\n")
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(actor = %address, error = %e, "event not run");
+                    tracing::warn!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = %e, "event not run");
                     crate::metrics::refused(crate::metrics::Refusal::Unavailable);
                     text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n")
                 }

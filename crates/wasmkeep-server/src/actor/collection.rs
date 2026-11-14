@@ -101,17 +101,17 @@ pub(super) async fn run_collection(address: &ActorAddress, request: &CollectRequ
             .await
         {
             Ok(n) => {
-                tracing::debug!(actor = %address, snapshot = ?request.snapshot, deleted = n, "history collected");
+                tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), snapshot = ?request.snapshot, deleted = n, "history collected");
                 return;
             }
             Err(e) => {
                 crate::metrics::inc(&crate::metrics::METRICS.history_collect_failures);
                 let last = attempt == attempts || !request.collector.lease_valid();
                 if last {
-                    tracing::warn!(actor = %address, error = %e, erase = request.erase, "collecting history failed; it is tried again after the next snapshot");
+                    tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), error = %e, erase = request.erase, "collecting history failed; it is tried again after the next snapshot");
                     return;
                 }
-                tracing::debug!(actor = %address, error = %e, "collecting history failed; retrying");
+                tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), error = %e, "collecting history failed; retrying");
                 tokio::time::sleep(wait).await;
                 wait *= 2;
             }

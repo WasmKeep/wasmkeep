@@ -71,6 +71,8 @@ impl ActorService {
             None => None,
         };
         let root = cluster.as_ref().map_or(root, |c| c.state_root().clone());
+        // Log lines name this tenant's actors as this app's.
+        crate::logging::register(root.tenant(), root.app());
         // What this node's metrics page names: the app it serves, as
         // resolved above, and its node id in a cluster.
         let metrics_identity = crate::metrics::Identity {

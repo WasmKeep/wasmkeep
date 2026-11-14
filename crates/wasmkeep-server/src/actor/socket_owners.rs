@@ -186,7 +186,7 @@ pub(super) async fn sweep_sockets(service: std::sync::Weak<ServiceInner>, every:
                         .sockets
                         .close_owner(&address, 1012, "actor moved; reconnect");
                     if closed > 0 {
-                        tracing::info!(actor = %address, %owner, sockets = closed, "closed sockets of an actor another node holds");
+                        tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %owner, sockets = closed, "closed sockets of an actor another node holds");
                         crate::metrics::owner_closes("sweep", closed);
                     }
                 }

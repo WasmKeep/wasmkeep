@@ -23,6 +23,7 @@ mod front;
 pub mod guest_log;
 mod http;
 mod local_layout;
+mod logging;
 pub mod metrics;
 mod replica;
 pub mod secret_store;

@@ -113,7 +113,9 @@ async fn what_an_actor_prints_is_logged_with_its_address() {
     logged(&captured, "second line").await;
     let text = captured.text();
     let first = text.lines().find(|l| l.contains("first line")).unwrap();
-    assert!(first.contains("actor=default/t/alice"), "{first}");
+    // The actor as its app sees it, the app as a field of its own.
+    assert!(first.contains("app=default/default"), "{first}");
+    assert!(first.contains("actor=t/alice"), "{first}");
     assert!(
         first.contains("stream=\"stdout\"") || first.contains("stream=stdout"),
         "{first}"
@@ -142,7 +144,7 @@ async fn control_characters_cannot_forge_log_lines() {
     logged(&captured, "FAKE ERROR").await;
     let text = captured.text();
     let line = text.lines().find(|l| l.contains("FAKE ERROR")).unwrap();
-    assert!(line.contains("actor=default/t/mallory"), "{line}");
+    assert!(line.contains("actor=t/mallory"), "{line}");
     assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
 }
 
