@@ -86,6 +86,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         can_take: false,
         instance: None,
         lease: None,
+        load: None,
     };
     let nodes = [
         n("me", "acme/shop"),
@@ -2479,6 +2480,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         can_take: false,
         instance: Some("iz".into()),
         lease: Some(wasmkeep_cluster::node_lease::NodeState::Live),
+        load: None,
     };
     a.note_future_leases(&[lease(now_ms())]);
     assert!(!logged(), "a lease within the skew reported");
@@ -2589,6 +2591,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         can_take: false,
         instance: Some("0011223344556677".to_owned()),
         lease: Some(state),
+        load: None,
     }
 }
 

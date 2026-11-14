@@ -13,6 +13,13 @@ Since 0.3.0, in no release yet.
 
 ### What changed
 
+- **`wasmkeep cluster status` shows each node's load**: ACTORS, SOCKETS
+  and EV/MIN (events per minute over the last minute or more) per live
+  node, and ACTORS per app, summed over its live nodes; `actors`,
+  `sockets` and `events_per_min` in `--json`, `null` when unknown. Nodes
+  say it on a new last line of their heartbeat, which nodes of 0.3.0
+  never read; a node that is not live, or of an earlier version, shows
+  `-`.
 - **Every hop between nodes names its app, and a node refuses another
   app's.** A forwarded request, a relayed WebSocket upgrade and a call
   between nodes carry `x-wasmkeep-app: tenant/app`, the sending node's

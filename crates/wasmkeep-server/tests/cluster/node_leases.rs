@@ -721,3 +721,68 @@ async fn a_twin_of_an_older_version_is_found_too() {
         Some("an older version of WasmKeep runs with this node id")
     );
 }
+
+/// `id`'s heartbeat as the bucket holds it, decoded, once `ok` holds for
+/// it (within 5 s).
+async fn wait_heartbeat(
+    store: &Arc<dyn ObjectStore>,
+    id: &str,
+    ok: impl Fn(&wasmkeep_cluster::membership::NodeInfo) -> bool,
+) -> wasmkeep_cluster::membership::NodeInfo {
+    use object_store::ObjectStoreExt as _;
+    let key = object_store::path::Path::from(format!("nodes/{id}"));
+    let started = std::time::Instant::now();
+    loop {
+        let read = match store.get(&key).await {
+            Ok(r) => wasmkeep_cluster::membership::NodeInfo::decode(&r.bytes().await.unwrap()),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(e) => panic!("{e}"),
+        };
+        if let Some(info) = read.as_ref().filter(|i| ok(i)) {
+            return info.clone();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{id}'s heartbeat never matched: {read:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Payload line 10: a node's heartbeat says how many actors and WebSockets
+/// it holds, kept current with every write; events per minute stay unknown
+/// until a minute of totals exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_heartbeat_carries_the_nodes_load() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let da = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    let idle = wait_heartbeat(&store, "a", |i| i.load.is_some()).await;
+    assert_eq!(idle.load.unwrap().actors, 0, "{idle:?}");
+    for name in ["one", "two"] {
+        let r = send(a.addr, "GET", &format!("/actor/t/{name}/fired"), "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let busy = wait_heartbeat(&store, "a", |i| i.load.is_some_and(|l| l.actors == 2)).await;
+    let load = busy.load.unwrap();
+    assert_eq!((load.sockets, load.events_per_min), (0, None), "{busy:?}");
+    assert_eq!(
+        busy.lease,
+        Some(wasmkeep_cluster::node_lease::NodeState::Live)
+    );
+
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/actor/t/sock", a.addr))
+        .await
+        .unwrap();
+    wait_heartbeat(&store, "a", |i| i.load.is_some_and(|l| l.sockets == 1)).await;
+    drop(ws);
+    drop(a);
+}

@@ -1989,6 +1989,7 @@ mod tests {
             can_take,
             instance: None,
             lease: None,
+            load: None,
         };
         assert!(move_warnings(&node(true, Some(DrainState::Serving)), "acme/shop").is_empty());
         assert!(move_warnings(&node(true, None), "acme/shop").is_empty());
