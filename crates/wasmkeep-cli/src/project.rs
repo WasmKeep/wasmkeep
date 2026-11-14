@@ -856,6 +856,28 @@ env = ".env.dev"
 "#;
 
     #[test]
+    fn expire_after_idle_is_a_class_key() {
+        // ADR 0028: a duration, at least an hour; classes only.
+        let base =
+            "[app]\ntenant = \"acme\"\nname = \"shop\"\n[classes.carts]\ncomponent = \"c.wasm\"\n";
+        let p = parse_ok(&format!("{base}expire-after-idle = \"7d\"\n"));
+        assert_eq!(p.classes["carts"].expire_after_idle, Some(7 * 86_400));
+        assert_eq!(parse_ok(base).classes["carts"].expire_after_idle, None);
+        for (bad, why) in [
+            ("expire-after-idle = \"30m\"\n", "one hour"),
+            ("expire-after-idle = \"7\"\n", "unit"),
+            ("expire-after-idle = 7\n", "expire-after-idle"),
+        ] {
+            let err = parse_err(&format!("{base}{bad}"));
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        let err = parse_err(
+            "[app]\ntenant = \"acme\"\nname = \"shop\"\n[front]\ncomponent = \"f.wasm\"\nexpire-after-idle = \"7d\"\n",
+        );
+        assert!(err.contains("expire-after-idle"), "{err}");
+    }
+
+    #[test]
     fn a_full_file_parses_with_paths_from_its_directory() {
         let p = parse_ok(FULL);
         assert_eq!((p.tenant.as_str(), p.name.as_str()), ("acme", "todo"));

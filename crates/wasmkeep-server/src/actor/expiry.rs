@@ -173,6 +173,9 @@ async fn pass(
         if !read(&inner.classes).contains_key(class) {
             continue;
         }
+        // Before the listing: a listing slow to come back never makes a
+        // record look idler than it was when it was taken.
+        let now = now_ms();
         let listed = match cluster.list_owner_records(class).await {
             Ok(l) => l,
             Err(e) => {
@@ -185,7 +188,6 @@ async fn pass(
             .filter(|(c, _)| c == class)
             .map(|(_, n)| n.clone())
             .collect();
-        let now = now_ms();
         let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
         let chosen = candidates(
             listed,

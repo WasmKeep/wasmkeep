@@ -30,10 +30,12 @@ use wasmkeep_runtime::Runtime;
 use crate::ActorService;
 
 mod collect;
+mod delete;
 use crate::access::AccessRules;
 use crate::actor::FRONT_CLASS as FRONT;
 use crate::env::Vars;
 pub use collect::KEEP_PREVIOUS;
+pub use delete::{DeleteApp, delete_app};
 
 /// Why a deploy, rollback or update failed.
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +97,10 @@ pub enum DeployError {
          again, deploy with --recreate"
     )]
     Deleted(String),
+    /// `wasmkeep app delete` refused, or stopped before the data went
+    /// (ADR 0028): why, and what was written.
+    #[error("{0}")]
+    Refused(String),
     /// A rollback would make these classes more open (ADR 0013).
     #[error("rolling back would reopen {0}; pass --allow-reopen to do it anyway")]
     Reopens(String),

@@ -203,12 +203,12 @@ async fn awkward_names_reach_their_room_from_any_node() {
     }
 }
 
-type Client =
+pub(super) type Client =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// A chat client of room `lobby` on the node at `addr`, past its join
 /// message.
-async fn join_lobby(addr: SocketAddr) -> Client {
+pub(super) async fn join_lobby(addr: SocketAddr) -> Client {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/actor/chat/lobby"))
@@ -226,7 +226,7 @@ async fn join_lobby(addr: SocketAddr) -> Client {
 /// The close code and reason `ws` gets within `within`, reading past any
 /// message; panics if it gets none. Reads on until the connection ends, so
 /// the client's answer to the close goes out, as a browser's does.
-async fn closed_within(ws: &mut Client, within: Duration) -> (u16, String) {
+pub(super) async fn closed_within(ws: &mut Client, within: Duration) -> (u16, String) {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
     let deadline = tokio::time::Instant::now() + within;
@@ -249,7 +249,7 @@ async fn closed_within(ws: &mut Client, within: Duration) -> (u16, String) {
 }
 
 /// Whether `ws` stays open, with nothing but messages, for `for_`.
-async fn stays_open(ws: &mut Client, for_: Duration) {
+pub(super) async fn stays_open(ws: &mut Client, for_: Duration) {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
     let deadline = tokio::time::Instant::now() + for_;
@@ -263,7 +263,7 @@ async fn stays_open(ws: &mut Client, for_: Duration) {
 }
 
 /// The node the ownership record of `chat/<name>` names, if any.
-async fn chat_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String> {
+pub(super) async fn chat_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String> {
     use object_store::ObjectStoreExt as _;
     let key = object_store::path::Path::from(test_key(Family::Owners, &format!("chat/{name}")));
     let body = match store.get(&key).await {
@@ -277,7 +277,7 @@ async fn chat_holder(store: &Arc<dyn ObjectStore>, name: &str) -> Option<String>
 
 /// Room `lobby` hibernated on `a` with its sockets open: no instance
 /// left, its record kept naming `a` (ADR 0024, parked).
-async fn lobby_parked(store: &Arc<dyn ObjectStore>, a: &Node) {
+pub(super) async fn lobby_parked(store: &Arc<dyn ObjectStore>, a: &Node) {
     eventually("the lobby hibernated on a, its record kept", async || {
         a.service.resident() == 0 && chat_holder(store, "lobby").await.as_deref() == Some("a")
     })
@@ -959,4 +959,49 @@ async fn an_operator_delete_closes_a_parked_rooms_sockets_with_1000() {
         )
     })
     .await;
+}
+
+/// Idle expiry (ADR 0028, section 4) of a class whose room is parked on a
+/// with a socket open: the record names a, so it is never expired, and
+/// the socket stays open, however long past the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_room_with_a_socket_never_expires() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let expiring = |config: &mut ActorConfig| {
+        config
+            .expire_after_idle
+            .insert("chat".into(), Duration::from_secs(1));
+        config.cluster.as_mut().unwrap().expiry_every = Duration::from_millis(300);
+    };
+    let wasm = chat_wasm();
+    let a = node_configured(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_millis(300),
+        &["chat"],
+        wasm,
+        Duration::from_secs(30),
+        "",
+        expiring,
+    )
+    .await;
+    let _b = node_configured(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_millis(300),
+        &["chat"],
+        wasm,
+        Duration::from_secs(30),
+        "",
+        expiring,
+    )
+    .await;
+    settle().await;
+    let mut client = join_lobby(a.addr).await;
+    lobby_parked(&store, &a).await;
+    stays_open(&mut client, Duration::from_secs(4)).await;
+    assert_eq!(chat_holder(&store, "lobby").await.as_deref(), Some("a"));
 }

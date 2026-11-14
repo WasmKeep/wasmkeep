@@ -3537,6 +3537,157 @@ mod tests {
     }
 
     #[test]
+    fn idle_limits_and_app_delete_parse() {
+        use clap::Parser as _;
+        // ADR 0028: --expire-after-idle CLASS=DURATION, CLASS= removes it.
+        let deploy = |args: &[&str]| {
+            super::Cli::try_parse_from(
+                ["wasmkeep", "deploy", "--app", "t/a", "--bucket", "s3://b"]
+                    .iter()
+                    .chain(args),
+            )
+        };
+        let limits = |args: &[&str]| match deploy(args).unwrap().command {
+            super::Command::Deploy(d) => d.expire_after_idle,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            limits(&[
+                "--expire-after-idle",
+                "carts=7d",
+                "--expire-after-idle",
+                "rooms="
+            ]),
+            [
+                ("carts".to_owned(), Some(7 * 86_400)),
+                ("rooms".to_owned(), None)
+            ]
+        );
+        for bad in [
+            "carts=30m",
+            "carts=7",
+            "carts",
+            "=7d",
+            "_front=7d",
+            "carts=7w",
+        ] {
+            assert!(deploy(&["--expire-after-idle", bad]).is_err(), "{bad}");
+        }
+        assert!(deploy(&["--rollback", "--expire-after-idle", "c=1h"]).is_err());
+        assert!(deploy(&["--recreate", "--actor", "c=c.wasm"]).is_ok());
+        assert!(deploy(&["--recreate", "--rollback"]).is_err());
+        // `app delete --app T/A --bucket ...`, with its wait and --force.
+        let delete = |args: &[&str]| {
+            super::Cli::try_parse_from(["wasmkeep", "app", "delete"].iter().chain(args))
+        };
+        match delete(&["--app", "acme/legacy", "--bucket", "s3://b/p"])
+            .unwrap()
+            .command
+        {
+            super::Command::App(super::AppCommand::Delete(d)) => {
+                assert_eq!(d.app, ("acme".to_owned(), "legacy".to_owned()));
+                assert_eq!((d.wait, d.force), (60, false));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            delete(&[
+                "--app",
+                "acme/legacy",
+                "--bucket",
+                "s3://b",
+                "--wait",
+                "5",
+                "--force"
+            ])
+            .is_ok()
+        );
+        assert!(
+            delete(&["--bucket", "s3://b"]).is_err(),
+            "--app is required"
+        );
+        assert!(delete(&["--app", "acme", "--bucket", "s3://b"]).is_err());
+    }
+
+    /// `app delete` against a bucket with no node: the tombstone, every key
+    /// of the app but it removed, other apps untouched; run again, it
+    /// finishes; the implicit app is refused.
+    #[test]
+    fn app_delete_removes_both_prefixes_and_keeps_the_tombstone() {
+        use object_store::ObjectStoreExt as _;
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let keys = [
+            "p/apps/acme/legacy/current",
+            "p/apps/acme/legacy/0123/manifest",
+            "p/apps/acme/legacy/secrets/0000000000000001",
+            "p/state/acme/legacy/actors/c/n/wal/1",
+            "p/state/acme/legacy/owners/c/n",
+            "p/state/acme/other/owners/c/n",
+            "p/apps/acme/legacy-two/current",
+        ];
+        rt.block_on(async {
+            for k in keys {
+                store
+                    .put(&object_store::path::Path::from(k), b"x".to_vec().into())
+                    .await
+                    .unwrap();
+            }
+        });
+        let ask = wasmkeep_server::apps::DeleteApp {
+            wait: std::time::Duration::from_secs(1),
+            force: false,
+            who: "test".into(),
+        };
+        let run = |tenant: &str, app: &str| {
+            let mut said = Vec::new();
+            let out = rt.block_on(wasmkeep_server::apps::delete_app(
+                std::sync::Arc::clone(&store),
+                "p",
+                tenant,
+                app,
+                &ask,
+                &mut |l| said.push(l),
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(10),
+            ));
+            (out, said)
+        };
+        let (out, said) = run("acme", "legacy");
+        assert!(
+            out.as_ref().unwrap().contains("5 object(s) removed"),
+            "{out:?}"
+        );
+        assert!(said[0].contains("tombstone written"), "{said:?}");
+        let left: Vec<String> = rt.block_on(async {
+            use futures_util::TryStreamExt as _;
+            store
+                .list(None)
+                .map_ok(|m| m.location.to_string())
+                .try_collect()
+                .await
+                .unwrap()
+        });
+        assert_eq!(
+            left,
+            [
+                "p/apps/acme/legacy-two/current",
+                "p/apps/acme/legacy/deleted",
+                "p/state/acme/other/owners/c/n",
+            ]
+        );
+        let (out, said) = run("acme", "legacy");
+        assert!(out.unwrap().contains("0 object(s) removed"));
+        assert!(said[0].contains("already deleted"), "{said:?}");
+        assert!(run("acme", "none").0.is_err(), "no such app");
+        assert!(run("default", "default").0.is_err(), "the implicit app");
+    }
+
+    #[test]
     fn deploy_flags_parse() {
         use clap::Parser as _;
         let parse = |args: &[&str]| {
