@@ -169,6 +169,58 @@ impl AccessRules {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
+
+    /// One line for the log, as a fact: which of `classes` outside
+    /// requests reach, and how far (`existing` and `internal` listed after
+    /// the open ones; rules of classes not in `classes` left out).
+    #[must_use]
+    pub fn describe(&self, classes: &[&str]) -> String {
+        let mut classes = classes.to_vec();
+        classes.sort_unstable();
+        classes.dedup();
+        let of = |mode: Access| -> Vec<&str> {
+            classes
+                .iter()
+                .copied()
+                .filter(|c| self.of(c) == mode)
+                .collect()
+        };
+        let open = of(Access::Open);
+        let mut out = format!(
+            "classes open to outside requests: {}",
+            if open.is_empty() {
+                "none".to_owned()
+            } else {
+                open.join(", ")
+            }
+        );
+        let existing: Vec<String> = of(Access::Existing)
+            .into_iter()
+            .map(|c| {
+                let mut names: Vec<&str> = self
+                    .creatable
+                    .get(c)
+                    .map(|n| n.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                names.sort_unstable();
+                if names.is_empty() {
+                    c.to_owned()
+                } else {
+                    format!("{c} ({} created on request)", names.join(", "))
+                }
+            })
+            .collect();
+        if !existing.is_empty() {
+            out.push_str("; existing actors only: ");
+            out.push_str(&existing.join(", "));
+        }
+        let internal = of(Access::Internal);
+        if !internal.is_empty() {
+            out.push_str("; internal: ");
+            out.push_str(&internal.join(", "));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -221,5 +273,34 @@ mod tests {
         let mut again = AccessRules::default();
         again.apply("hub", &rules.spec("hub").unwrap()).unwrap();
         assert_eq!(again.spec("hub"), rules.spec("hub"));
+    }
+
+    /// One line per start or deploy, as a fact: which classes outside
+    /// requests reach, and how far.
+    #[test]
+    fn rules_are_described_in_one_line() {
+        let mut rules = AccessRules::default();
+        assert_eq!(
+            rules.describe(&["counter"]),
+            "classes open to outside requests: counter"
+        );
+        rules.apply("hub", "existing:main").unwrap();
+        rules.apply("monitor", "existing").unwrap();
+        rules.apply("admin", "internal").unwrap();
+        // A rule for a class not served is not mentioned.
+        rules.apply("gone", "internal").unwrap();
+        assert_eq!(
+            rules.describe(&["monitor", "counter", "hub", "admin", "board"]),
+            "classes open to outside requests: board, counter; existing actors only: \
+             hub (main created on request), monitor; internal: admin"
+        );
+        assert_eq!(
+            rules.describe(&["admin"]),
+            "classes open to outside requests: none; internal: admin"
+        );
+        assert_eq!(
+            AccessRules::default().describe(&[]),
+            "classes open to outside requests: none"
+        );
     }
 }

@@ -3,8 +3,10 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
+mod support;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -44,10 +46,6 @@ fn get(addr: SocketAddr, path: &str) -> Option<String> {
 fn sigterm_shuts_down_gracefully() {
     let wasm = counter_wasm();
     let dir = tempfile::tempdir().unwrap();
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
     let log = dir.path().join("serve.log");
     let mut child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
         .args(["serve", "--actor"])
@@ -56,13 +54,15 @@ fn sigterm_shuts_down_gracefully() {
         .arg(dir.path().join("data"))
         .arg("--cache-dir")
         .arg(dir.path().join("cache"))
-        .args(["--listen", &addr.to_string()])
+        // Bound by the server, read from its log (support/mod.rs).
+        .args(["--listen", "127.0.0.1:0"])
         .env("RUST_LOG", "info")
         // The CLI logs to stdout.
         .stdout(std::fs::File::create(&log).unwrap())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let addr = support::listening_on(&mut child, &log, Duration::from_secs(120));
 
     let started = Instant::now();
     while get(addr, "/actor/counter/a").is_none() {

@@ -68,6 +68,7 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
         return;
     }
     c.identity.send_replace(Identity::Unique);
+    tracing::info!("{}", super::identity::checked_message(&c.node_id));
     let every = c.lease_every;
     drop(c);
     // The first renewal a period after the first write.

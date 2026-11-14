@@ -21,7 +21,7 @@ impl ActorState {
         if let Err(e) = self.refresh_class() {
             // Nothing to run it; it stays in the database (and the
             // bucket's index), for a deploy that brings the class back.
-            tracing::info!(actor = %self.address, error = %e, "alarm: class no longer served");
+            tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "alarm: class no longer served");
             self.alarms.clear(self.address.clone());
             return;
         }
@@ -30,7 +30,7 @@ impl ActorState {
             // Another node owns the actor: it fires the alarm (it is in the
             // owner's committed state and the bucket's index).
             Err(OwnershipError::NotOwner { owner, .. }) => {
-                tracing::debug!(actor = %self.address, %owner, "alarm: not the owner");
+                tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %owner, "alarm: not the owner");
                 return;
             }
             // This node is draining (ADR 0014): the chosen peer arms the
@@ -43,12 +43,12 @@ impl ActorState {
                 };
                 match cluster.hand_off_alarm(&peer, &self.address, hint).await {
                     Ok(()) => {
-                        tracing::debug!(actor = %self.address, %peer, hint, "alarm handed off");
+                        tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %peer, hint, "alarm handed off");
                     }
                     Err(e) => {
                         // Refused or failed alike: skip this peer for a
                         // while (the rendezvous choice would pick it again).
-                        tracing::info!(actor = %self.address, %peer, error = %e, "alarm hand-off failed; retrying");
+                        tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %peer, error = %e, "alarm hand-off failed; retrying");
                         cluster.suspect(&peer);
                         self.alarms.set_if_earlier(
                             self.address.clone(),
@@ -65,7 +65,7 @@ impl ActorState {
                 | OwnershipError::Refused(e)
                 | OwnershipError::Broken(e),
             ) => {
-                tracing::debug!(actor = %self.address, error = %e, "alarm: bucket unavailable");
+                tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "alarm: bucket unavailable");
                 let wait = self
                     .cluster
                     .as_ref()
@@ -89,7 +89,7 @@ impl ActorState {
         // committed anything) has nothing to deliver: running the actor for
         // it would only create it again. Its entries at the hint go instead.
         if let Some(indexed) = self.without_state().await {
-            tracing::debug!(actor = %self.address, hint, "alarm: the actor has no state; removing its entries");
+            tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), hint, "alarm: the actor has no state; removing its entries");
             self.alarms.clear(self.address.clone());
             if !self.clear_stale_hint(Some(hint), Some(indexed)).await {
                 // Not removable yet (the bucket has nothing for the actor:
@@ -113,7 +113,7 @@ impl ActorState {
             return;
         }
         if let Err(e) = self.ensure_ready().await {
-            tracing::warn!(actor = %self.address, error = %e, "alarm: actor not ready");
+            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "alarm: actor not ready");
             self.retry_alarm().await;
             return;
         }
@@ -205,7 +205,7 @@ impl ActorState {
                     Err(cut) => format!("on-alarm {cut}"),
                     Ok(Ok(Ok(()))) => unreachable!("handled above"),
                 };
-                tracing::warn!(actor = %self.address, %reason, "alarm will be retried");
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %reason, "alarm will be retried");
                 // The retry is the committed alarm, moved later with backoff:
                 // it survives hibernation and moves, and the index (which
                 // mirrors the committed alarm) lists the retry time, so no
@@ -509,11 +509,11 @@ impl ActorState {
             return;
         };
         if !alarm_index::may_delete(&stale, generation) {
-            tracing::warn!(actor = %self.address, ?stale, generation, "not removing an alarm entry from a newer owner");
+            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?stale, generation, "not removing an alarm entry from a newer owner");
             return;
         }
         if let Err(e) = cluster.delete_alarm_entry(&self.address, &stale).await {
-            tracing::debug!(actor = %self.address, error = %e, "removing a stale alarm entry failed");
+            tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "removing a stale alarm entry failed");
         }
     }
 
@@ -546,7 +546,7 @@ impl ActorState {
         // own upload ends the history, an earlier owner's late upload can
         // still become it (a late commit) and name an entry removed here.
         if !self.fence().await {
-            tracing::debug!(actor = %self.address, hint, "not clearing stale alarm entries: no upload of this owner yet");
+            tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), hint, "not clearing stale alarm entries: no upload of this owner yet");
             return false;
         }
         let Some((cluster, generation)) = self.may_index().await else {
@@ -555,13 +555,13 @@ impl ActorState {
         let listed = match cluster.alarm_entries_at(&self.address, hint).await {
             Ok(listed) => listed,
             Err(e) => {
-                tracing::debug!(actor = %self.address, error = %e, "listing stale alarm entries failed");
+                tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "listing stale alarm entries failed");
                 return true;
             }
         };
         for stale in alarm_index::entries_to_clear(hint, &listed, indexed.as_ref(), generation) {
             if let Err(e) = cluster.delete_alarm_entry(&self.address, &stale).await {
-                tracing::debug!(actor = %self.address, error = %e, "removing a stale alarm entry failed");
+                tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "removing a stale alarm entry failed");
             }
         }
         true
@@ -773,7 +773,7 @@ pub(super) async fn sweep_alarms(
                     let Some((address, at, _)) = due.get(i) else {
                         continue;
                     };
-                    tracing::debug!(actor = %address, at, "alarm sweep: delivering an overdue alarm");
+                    tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), at, "alarm sweep: delivering an overdue alarm");
                     alarms.sweep(address.clone(), *at, retry_max);
                 }
             }

@@ -258,11 +258,13 @@ fails if a rule names a metric the page does not have.
 What an actor writes to stdout or stderr (Rust's `println!` and
 `eprintln!`, `console.log` in TypeScript, `print` in Python, `printf` in C)
 reaches the node's log, one entry per line, as target `wasmkeep::guest` with
-the actor's address and the stream; the front's (the stateless component)
-says `actor=_front`:
+the app (`app=tenant/app`), the actor as the app names it
+(`actor=class/name`) and the stream; the front's (the stateless component)
+says `actor=_front`. Every other log line about an actor names it the same
+way:
 
 ```text
-INFO wasmkeep::guest: order 42 shipped actor=acme/orders/42 stream="stdout"
+INFO wasmkeep::guest: order 42 shipped app=acme/shop actor=orders/42 stream="stdout"
 ```
 
 - **Limits:** `--guest-log-rate` lines a second per actor instance (50 by

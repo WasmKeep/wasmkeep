@@ -752,8 +752,8 @@ pub(crate) fn access_rules(
         out.apply(class, mode)
             .map_err(|e| anyhow::anyhow!("--access {class}: {e}"))?;
     }
-    for (class, mode) in out.restricted() {
-        tracing::info!(%class, access = %mode, "access restricted");
+    if !rules.is_empty() {
+        tracing::info!("access rules (--access): {}", out.describe(served));
     }
     Ok(out)
 }
@@ -863,15 +863,9 @@ pub(crate) fn serve_app_rules(
                 given.join(" ")
             );
         }
-        if deployed.restricted().is_empty() {
-            tracing::warn!(
-                "no class of this app has a deployed access rule: every class is open. \
-                 Deploy rules with `wasmkeep deploy --access CLASS=MODE`"
-            );
-        }
-        for (class, mode) in deployed.restricted() {
-            tracing::info!(%class, access = %mode, "access restricted (deployed)");
-        }
+        // A fact, once per start (each deploy logs its own): open is the
+        // default, and a deploy with `--access CLASS=MODE` changes it.
+        tracing::info!("access rules (deployed): {}", deployed.describe(served));
         return Ok(deployed);
     }
     if flags.is_empty() {
@@ -898,7 +892,44 @@ fn parse_actor(s: &str) -> Result<(String, PathBuf), String> {
     Ok((class.to_owned(), PathBuf::from(path)))
 }
 
+/// The status a process killed by SIGPIPE reports in a shell (128 + 13).
+const BROKEN_PIPE_EXIT: i32 = 141;
+
+/// Whether a panic is the standard library's on a print to a closed pipe
+/// (`println!` to `| head` once it exits): "failed printing to stdout:
+/// Broken pipe (os error 32)".
+fn is_broken_pipe_panic(message: &str) -> bool {
+    message.starts_with("failed printing to std")
+        && (message.contains("Broken pipe") || message.contains("os error 32"))
+}
+
+/// A command whose reader went away (`wasmkeep cluster status --json |
+/// head`) stops quietly with [`BROKEN_PIPE_EXIT`], as a command killed by
+/// SIGPIPE would, instead of panicking: Rust ignores SIGPIPE, so the print
+/// fails instead. Every other panic is reported as before, and so is every
+/// error a command returns (an EPIPE on a bucket connection is a real
+/// failure). Logs are not affected (the log writer drops what it cannot
+/// write), so a node whose log reader goes away keeps serving: `serve`
+/// must log through `tracing`, never `println!`, which would end the node
+/// here without releasing its lease.
+fn quiet_broken_pipes() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if is_broken_pipe_panic(message) {
+            std::process::exit(BROKEN_PIPE_EXIT);
+        }
+        report(info);
+    }));
+}
+
 fn main() -> anyhow::Result<()> {
+    quiet_broken_pipes();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -1665,15 +1696,22 @@ fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
     }
     if drain {
         rt.block_on(keys.put_empty(&key))?;
-        println!(
-            "Asked {} to drain; it reports `draining` within a few seconds (wasmkeep cluster status).",
-            args.node
-        );
+        println!("{}", drain_asked(&args.node));
     } else {
         rt.block_on(keys.delete(&key))?;
         println!("Withdrew the drain request for {}.", args.node);
     }
     Ok(())
+}
+
+/// What `cluster drain` prints once the request is written: the states the
+/// node goes through, the shortest included.
+fn drain_asked(node: &str) -> String {
+    format!(
+        "Asked {node} to drain; it reports `draining`, then `drained` once its actors are \
+         handed over (a node with few actors may go straight to `drained`; see `wasmkeep \
+         cluster status`)."
+    )
 }
 
 /// `wasmkeep cluster fence` (ADR 0020, section 2).
@@ -2553,6 +2591,32 @@ mod tests {
             retention(&["--rollback", "--version-retention-secs", "0"]),
             0
         );
+    }
+
+    #[test]
+    fn broken_pipes_are_told_from_other_failures() {
+        assert!(super::is_broken_pipe_panic(
+            "failed printing to stdout: Broken pipe (os error 32)"
+        ));
+        assert!(super::is_broken_pipe_panic(
+            "failed printing to stderr: Broken pipe (os error 32)"
+        ));
+        assert!(!super::is_broken_pipe_panic(
+            "failed printing to stdout: No space left on device (os error 28)"
+        ));
+        assert!(!super::is_broken_pipe_panic("Broken pipe somewhere else"));
+    }
+
+    #[test]
+    fn a_drain_request_names_both_states() {
+        let said = super::drain_asked("a");
+        assert!(said.starts_with("Asked a to drain; "), "{said}");
+        assert!(
+            said.contains("`draining`, then `drained` once its actors are handed over"),
+            "{said}"
+        );
+        assert!(said.contains("straight to `drained`"), "{said}");
+        assert!(!said.contains("within a few seconds"), "{said}");
     }
 
     #[test]

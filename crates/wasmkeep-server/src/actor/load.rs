@@ -57,29 +57,32 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Sets this node's load in its membership every `every` (the heartbeat
-/// period, so each node lease write carries a fresh count), until the
-/// service is gone. Events are the process's (every node it runs).
-pub(super) async fn publish_load(service: std::sync::Weak<ServiceInner>, every: Duration) {
+/// This node's load, read as each node lease write is built (payload
+/// line 10): actors and sockets as of that write, so `cluster status` lags
+/// what the node runs by at most one heartbeat period, and shows the drain
+/// state of the same moment. No write of its own: it rides on the lease
+/// writes. Events are the process's (every node it runs).
+pub(super) fn load_source(
+    service: std::sync::Weak<ServiceInner>,
+) -> wasmkeep_cluster::membership::LoadSource {
     let start = tokio::time::Instant::now();
-    let mut rate = EventRate::default();
-    loop {
-        let Some(inner) = service.upgrade() else {
-            return;
-        };
-        let Some(cluster) = inner.cluster.as_ref() else {
-            return;
-        };
+    let rate = std::sync::Mutex::new(EventRate::default());
+    Box::new(move || {
         let at = millis(start.elapsed());
-        let events_per_min = rate.sample(at, crate::metrics::METRICS.events.total());
-        cluster.set_load(Load {
-            actors: u64::try_from(inner.mailboxes.resident()).unwrap_or(u64::MAX),
-            sockets: u64::try_from(inner.sockets.len()).unwrap_or(u64::MAX),
-            events_per_min,
+        let events_per_min = rate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sample(at, crate::metrics::METRICS.events.total());
+        // Gone (the service is stopping): nothing runs here any more.
+        let (actors, sockets) = service.upgrade().map_or((0, 0), |inner| {
+            (inner.mailboxes.resident(), inner.sockets.len())
         });
-        drop(inner);
-        tokio::time::sleep(every).await;
-    }
+        Load {
+            actors: u64::try_from(actors).unwrap_or(u64::MAX),
+            sockets: u64::try_from(sockets).unwrap_or(u64::MAX),
+            events_per_min,
+        }
+    })
 }
 
 #[cfg(test)]

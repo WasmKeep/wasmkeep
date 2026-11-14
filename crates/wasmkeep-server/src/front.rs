@@ -629,7 +629,16 @@ impl HttpComponent {
 
     fn host(&self, actors: Option<&ActorService>, env: Arc<crate::env::Vars>) -> FrontHost {
         FrontHost {
-            wasi: self.guest_log.wasi(FRONT_CLASS.to_owned()),
+            wasi: self.guest_log.wasi(
+                actors.map_or_else(
+                    || "default/default".to_owned(),
+                    |a| {
+                        let id = a.metrics_identity();
+                        format!("{}/{}", id.tenant, id.app)
+                    },
+                ),
+                FRONT_CLASS.to_owned(),
+            ),
             http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
             egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress)),

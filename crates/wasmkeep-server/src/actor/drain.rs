@@ -291,14 +291,14 @@ async fn hand_over_one(inner: Arc<ServiceInner>, cluster: Arc<Cluster>, address:
         HandOver::Done { alarm } => {
             inner.mailboxes.hibernate(&address);
             cluster.snapshot_waits.forget(&address);
-            tracing::info!(actor = %address, "handed over (draining)");
+            tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), "handed over (draining)");
             if let Some(at) = alarm {
                 hand_off(&inner, &cluster, &address, at).await;
             }
         }
         HandOver::Expiring { alarm } => {
             inner.mailboxes.hibernate(&address);
-            tracing::warn!(actor = %address, "the actor's release is pending; retried in the background");
+            tracing::warn!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), "the actor's release is pending; retried in the background");
             // Nobody can take the actor before the release lands: keep its
             // alarm here, where the timer hands it off when it fires.
             if let Some(at) = alarm {
@@ -329,7 +329,7 @@ async fn hand_off(
             true
         }
         Err(e) => {
-            tracing::info!(actor = %address, %peer, error = %e, "alarm hand-off failed; kept here");
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %peer, error = %e, "alarm hand-off failed; kept here");
             cluster.suspect(&peer);
             inner.alarms.set_if_earlier(address.clone(), at);
             false

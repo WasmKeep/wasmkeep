@@ -82,6 +82,18 @@ impl Stopped {
     }
 }
 
+/// The start check's line, before the wait: what it waits for, and for how
+/// long (whole seconds, rounded up).
+pub(super) fn checking_message(node: &str, wait: Duration) -> String {
+    let secs = wait.as_millis().div_ceil(1000);
+    format!("checking that no other process runs node id {node}; ready in about {secs} s")
+}
+
+/// The line once the start check passed and the first lease write landed.
+pub(super) fn checked_message(node: &str) -> String {
+    format!("no other process runs node id {node}: ready to take actors")
+}
+
 impl Cluster {
     /// Whether another writer was found with this node id or over its
     /// lease (at start, or since).
@@ -364,14 +376,11 @@ impl Cluster {
                 }
             }
         }
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
         tracing::info!(
-            wait_ms = u64::try_from(
-                deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .as_millis()
-            )
-            .unwrap_or(u64::MAX),
-            "checking that no other process runs with this node id"
+            wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            "{}",
+            checking_message(&self.node_id, wait)
         );
         loop {
             tokio::time::sleep(period / 2).await;
@@ -427,5 +436,32 @@ impl Cluster {
                 return (Identity::Unique, last.map(|(_, version)| version));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One line when the start check begins, with the node id and the
+    /// wait in seconds, and one once the node is ready.
+    #[test]
+    fn the_start_check_says_how_long_and_when_it_is_done() {
+        assert_eq!(
+            checking_message("a", Duration::from_millis(14_999)),
+            "checking that no other process runs node id a; ready in about 15 s"
+        );
+        assert_eq!(
+            checking_message("b", Duration::from_millis(3_200)),
+            "checking that no other process runs node id b; ready in about 4 s"
+        );
+        assert_eq!(
+            checking_message("c", Duration::ZERO),
+            "checking that no other process runs node id c; ready in about 0 s"
+        );
+        assert_eq!(
+            checked_message("a"),
+            "no other process runs node id a: ready to take actors"
+        );
     }
 }

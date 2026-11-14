@@ -83,6 +83,13 @@ impl Node {
     fn load(&self) -> Option<Load> {
         self.info.load.filter(|_| self.live)
     }
+
+    /// Its drain state (line 9), while live: a fenced, released or stale
+    /// node serves nothing whatever its last heartbeat said, and LIVE says
+    /// why.
+    fn state(&self) -> Option<DrainState> {
+        self.info.drain.filter(|_| self.live)
+    }
 }
 
 /// One app's deploy: `Ok(None)` when it has uploads but no `current` yet.
@@ -358,7 +365,9 @@ impl Report {
                     "cluster_address": n.info.cluster_address,
                     "tls_pins": n.info.tls_pins.iter().map(membership::pin_hex).collect::<Vec<_>>(),
                     "tls": n.tls(),
-                    "state": n.info.drain.map(DrainState::as_str),
+                    // Line 9, while live; null otherwise, or from a
+                    // version without it.
+                    "state": n.state().map(DrainState::as_str),
                     // ADR 0020: live, released or fenced; null for a
                     // heartbeat in an older format.
                     "lease": n.info.lease.map(NodeState::as_str),
@@ -437,7 +446,7 @@ impl Report {
                             (false, Some(NodeState::Live)) => "no".to_owned(),
                         },
                         age(n.age_ms),
-                        n.info.drain.map_or("-", DrainState::as_str).to_owned(),
+                        n.state().map_or("-", DrainState::as_str).to_owned(),
                         count(n.load().map(|l| l.actors)),
                         count(n.load().map(|l| l.sockets)),
                         count(n.load().and_then(|l| l.events_per_min)),
@@ -1011,6 +1020,15 @@ mod tests {
         }
         // e's LIVE cell is two words: `no (fenced)`.
         assert_eq!(row("e")[5..8], ["-", "-", "-"], "{text}");
+        // STATE too: a node not live serves nothing, whatever its last
+        // heartbeat said; LIVE says why.
+        assert_eq!(row("a")[3], "serving", "{text}");
+        assert_eq!(row("d")[3], "-", "{text}");
+        assert_eq!(row("e")[4], "-", "{text}");
+        assert_eq!(j["nodes"][0]["state"], json!("serving"));
+        for i in [3, 4] {
+            assert_eq!(j["nodes"][i]["state"], Value::Null, "{i}");
+        }
         assert!(
             text.contains("APP        DEPLOYED VERSION  SEQ  ACTORS"),
             "{text}"

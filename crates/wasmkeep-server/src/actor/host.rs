@@ -173,7 +173,7 @@ impl ActorHost {
             && alarm_index::may_delete(&previous, generation)
             && let Err(e) = cluster.delete_alarm_entry(&address, &previous).await
         {
-            tracing::debug!(actor = %address, error = %e, "removing a stale alarm entry failed");
+            tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = %e, "removing a stale alarm entry failed");
         }
         Ok(Ok(changed))
     }

@@ -46,13 +46,14 @@ impl GuestLog {
         }
     }
 
-    /// The WASI context for one instance of `who` (an actor's address, or
-    /// `stateless`): [`crate::egress::guest_wasi`]'s, with its stdout and
-    /// stderr logged.
-    pub(crate) fn wasi(&self, who: String) -> wasmtime_wasi::WasiCtx {
+    /// The WASI context for one instance of `who` (an actor as its app
+    /// names it, `class/name`, or `_front`) of `app` (`tenant/app`):
+    /// [`crate::egress::guest_wasi`]'s, with its stdout and stderr logged.
+    pub(crate) fn wasi(&self, app: String, who: String) -> wasmtime_wasi::WasiCtx {
         let mut builder = crate::egress::guest_wasi_builder();
         if self.rate > 0 {
             let output = Arc::new(Mutex::new(Output {
+                app,
                 who,
                 pending: [Vec::new(), Vec::new()],
                 bucket: Bucket::new(self.rate),
@@ -117,6 +118,7 @@ impl Bucket {
 
 /// One instance's output: what is waiting for a newline, on each stream.
 struct Output {
+    app: String,
     who: String,
     pending: [Vec<u8>; 2],
     bucket: Bucket,
@@ -153,6 +155,7 @@ impl Output {
         if self.dropped > 0 {
             tracing::warn!(
                 target: "wasmkeep::guest",
+                app = %self.app,
                 actor = %self.who,
                 dropped = self.dropped,
                 "guest output dropped: over the line rate"
@@ -161,7 +164,7 @@ impl Output {
         }
         crate::metrics::inc(&crate::metrics::METRICS.guest_log_lines);
         let text = clean(line);
-        tracing::info!(target: "wasmkeep::guest", actor = %self.who, stream = NAMES[which], "{text}");
+        tracing::info!(target: "wasmkeep::guest", app = %self.app, actor = %self.who, stream = NAMES[which], "{text}");
     }
 }
 
@@ -177,6 +180,7 @@ impl Drop for Output {
         if self.dropped > 0 {
             tracing::warn!(
                 target: "wasmkeep::guest",
+                app = %self.app,
                 actor = %self.who,
                 dropped = self.dropped,
                 "guest output dropped: over the line rate"

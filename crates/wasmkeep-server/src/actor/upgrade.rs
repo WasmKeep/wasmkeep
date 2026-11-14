@@ -192,7 +192,7 @@ impl ActorService {
             break;
         }
         if let Err(e) = self.inner.sockets.can_open(&address) {
-            tracing::debug!(actor = %address, error = ?e, "websocket refused");
+            tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = ?e, "websocket refused");
             crate::metrics::refused(crate::metrics::Refusal::Capacity);
             let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, "too many connections\n");
             r.headers_mut().insert(
@@ -240,7 +240,7 @@ impl ActorService {
             let upgraded = match on_upgrade.await {
                 Ok(u) => u,
                 Err(e) => {
-                    tracing::debug!(actor = %opening, error = %e, "websocket upgrade failed");
+                    tracing::debug!(app = %crate::logging::app(&opening), actor = %crate::logging::actor(&opening), error = %e, "websocket upgrade failed");
                     inner.abandon_socket(accepted).await;
                     return;
                 }
@@ -258,7 +258,7 @@ impl ActorService {
             Ok(Err(e)) => {
                 // Over a cap after all: others raced in since `can_open`.
                 // Nothing was registered.
-                tracing::debug!(actor = %address, error = ?e, "websocket refused");
+                tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = ?e, "websocket refused");
                 crate::metrics::refused(crate::metrics::Refusal::Capacity);
                 let mut r =
                     text_response(StatusCode::SERVICE_UNAVAILABLE, "too many connections\n");

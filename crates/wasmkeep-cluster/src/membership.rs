@@ -459,6 +459,19 @@ fn unhex(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Reads this node's load as a heartbeat is built
+/// ([`Membership::set_load_source`]).
+pub type LoadSource = Box<dyn Fn() -> Load + Send + Sync>;
+
+/// A [`LoadSource`], printable.
+struct LoadFn(LoadSource);
+
+impl std::fmt::Debug for LoadFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoadFn")
+    }
+}
+
 /// Heartbeats for one node, and the view of the others.
 #[derive(Debug)]
 pub struct Membership<D, C> {
@@ -476,8 +489,10 @@ pub struct Membership<D, C> {
     reads_secrets: bool,
     /// Published on line 11: this process's token.
     instance: Option<String>,
-    /// Published on payload line 10 (format 3); set by the server.
+    /// Published on payload line 10 (format 3); set by the server, or read
+    /// from `load_source` as each payload is built (the last read kept).
     load: std::sync::Mutex<Option<Load>>,
+    load_source: std::sync::OnceLock<LoadFn>,
     /// A heartbeat older than this (plus `max_skew_ms`) means the node is gone.
     ttl_ms: u64,
     max_skew_ms: u64,
@@ -507,6 +522,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             reads_secrets: true,
             instance: None,
             load: std::sync::Mutex::new(None),
+            load_source: std::sync::OnceLock::new(),
             ttl_ms,
             max_skew_ms,
         })
@@ -567,9 +583,31 @@ impl<D: Directory, C: Clock> Membership<D, C> {
         *self.load.lock().unwrap_or_else(|p| p.into_inner()) = Some(load);
     }
 
-    /// What this node's next heartbeats say on payload line 10, if set.
+    /// Reads the load from `source` each time a heartbeat is built, instead
+    /// of what [`Self::set_load`] last set: each node lease write then
+    /// carries the load as of that write (a takeover shows at the next
+    /// one, no later), read just after the drain state, so a `drained`
+    /// node never shows actors counted before it handed them over. The
+    /// first source set stays.
+    pub fn set_load_source(&self, source: LoadSource) {
+        let _ = self.load_source.set(LoadFn(source));
+    }
+
+    /// What this node's next heartbeats say on payload line 10, if set (as
+    /// last read, with a source).
     pub fn load(&self) -> Option<Load> {
         *self.load.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The load for a heartbeat built now: read from the source if there
+    /// is one (and kept), else as last set.
+    fn load_now(&self) -> Option<Load> {
+        let Some(source) = self.load_source.get() else {
+            return self.load();
+        };
+        let load = (source.0)();
+        *self.load.lock().unwrap_or_else(|p| p.into_inner()) = Some(load);
+        Some(load)
     }
 
     /// Writes this node's heartbeat in format 2 (tests only).
@@ -588,8 +626,11 @@ impl<D: Directory, C: Clock> Membership<D, C> {
         self.info().payload()
     }
 
-    /// This node's heartbeat as of now.
+    /// This node's heartbeat as of now: the drain state read first, then
+    /// the load, so the load is never older than the state.
     fn info(&self) -> NodeInfo {
+        let drain = Some(self.drain_state());
+        let load = self.load_now();
         NodeInfo {
             id: self.id.clone(),
             address: self.address.clone(),
@@ -598,13 +639,13 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             app: self.app.clone(),
             cluster_address: self.cluster_address.clone(),
             tls_pins: self.tls_pins.clone(),
-            drain: Some(self.drain_state()),
+            drain,
             reads_secrets: self.reads_secrets,
             can_take: true,
             can_front: true,
             instance: self.instance.clone(),
             lease: None,
-            load: self.load(),
+            load,
         }
     }
 
@@ -1454,6 +1495,44 @@ mod tests {
             a.lease_payload()
                 .ends_with(b"\nload actors=2 sockets=1 events_per_min=-\n")
         );
+    }
+
+    /// With a source, each payload reads the load as it is built, with the
+    /// drain state of the same moment: a takeover shows at the next lease
+    /// write, and `drained` never comes with actors sampled before it.
+    #[test]
+    fn a_load_source_is_read_when_each_payload_is_built() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let a = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
+        let actors = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&actors);
+        a.set_load_source(Box::new(move || Load {
+            actors: seen.load(Ordering::SeqCst),
+            sockets: 0,
+            events_per_min: None,
+        }));
+        let line = |a: &Membership<&Mem, At<'_>>| {
+            String::from_utf8(a.lease_payload())
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(line(&a), "load actors=0 sockets=0 events_per_min=-");
+        // An actor taken over: the very next payload has it.
+        actors.store(1, Ordering::SeqCst);
+        assert_eq!(line(&a), "load actors=1 sockets=0 events_per_min=-");
+        // Handed over, then drained: both in the next payload.
+        actors.store(0, Ordering::SeqCst);
+        a.set_drain_state(DrainState::Drained);
+        let info = NodeInfo::decode(&format3(&a.info(), NodeState::Live, "beef")).unwrap();
+        assert_eq!(info.drain, Some(DrainState::Drained));
+        assert_eq!(info.load.map(|l| l.actors), Some(0));
+        assert_eq!(a.load().map(|l| l.actors), Some(0), "the last read kept");
     }
 
     #[test]

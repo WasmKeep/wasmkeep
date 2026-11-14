@@ -101,8 +101,6 @@ You should see the class added and the new version (its id differs):
 demo/shop: version 469fcd8d39aa32f2 is current (deploy 1)
 ```
 
-It also prints a note about access rules, which you can ignore here.
-
 ## 5. Start three nodes
 
 Each node has its own id, data directory, client port (8081 to 8083) and
@@ -141,7 +139,9 @@ done
 This takes a little over 15 s. Before it takes any actor, a node checks
 for 15 s that no other process runs with its id
 ([why](../cluster.md#flags)). Each node logs to its file in
-`.wasmkeep/cluster/`.
+`.wasmkeep/cluster/`: `checking that no other process runs node id a;
+ready in about 15 s` when it starts, then `no other process runs node id
+a: ready to take actors`.
 
 ## 6. One actor, any node
 
@@ -204,11 +204,12 @@ demo/shop  469fcd8d39aa32f2  1    1
 
 - **LIVE** is `yes` when the node's heartbeat in the bucket is recent;
   **AGE** is how old it is.
-- **STATE** is `serving`, or `draining` and `drained` (step 10).
+- **STATE** is `serving`, or `draining` and `drained` (step 10); `-` for
+  a node that is not live.
 - **ACTORS**, **SOCKETS** and **EV/MIN** are each node's load as of its
   last heartbeat: actors in memory, open WebSockets, events per minute.
-  They lag a few seconds (ACTORS can read 0 at first), and EV/MIN is `-`
-  for a node's first minute.
+  They lag at most one heartbeat (3 s), and EV/MIN is `-` for a node's
+  first minute.
 - **TLS** `pinned`: the other nodes know this node's certificate and talk
   to it over mutual TLS.
 - The app table shows the deployed version and its actors on live nodes.
@@ -272,8 +273,9 @@ curl -X POST localhost:8083/actor/counter/alice
 wasmkeep cluster status --bucket s3://demo
 ```
 
-In the status, `a` is `no (fenced)`: a peer fenced its heartbeat to take
-its actors, and the summary reads `2 of 3 nodes live`. What callers get
+In the status, `a` is `no (fenced)`, with `-` for its state and load: a
+peer fenced its heartbeat to take its actors, and the summary reads `2 of
+3 nodes live`. What callers get
 during the wait, and why it lasts that long:
 [When a node dies](../failover-and-scaling.md#a-node-that-dies).
 
@@ -316,7 +318,7 @@ wasmkeep cluster drain a --bucket s3://demo
 ```
 
 ```text
-Asked a to drain; it reports `draining` within a few seconds (wasmkeep cluster status).
+Asked a to drain; it reports `draining`, then `drained` once its actors are handed over (a node with few actors may go straight to `drained`; see `wasmkeep cluster status`).
 ```
 
 Wait for `drained` in the STATE column:
@@ -333,8 +335,7 @@ a     yes   1.2s   drained  0       ...
 ```
 
 A drain this small can go from `serving` to `drained` between two
-heartbeats, so you may never see `draining`, and ACTORS can still read 1
-for a few seconds. `bob` moved with its value:
+heartbeats, so you may never see `draining`. `bob` moved with its value:
 
 <!-- test: after-drain -->
 ```bash
@@ -350,8 +351,8 @@ curl -si localhost:8081/actor/counter/bob | grep -iE '^x-wasmkeep-node|^[0-9]'
 kill $(cat .wasmkeep/cluster/a.pid)
 ```
 
-A few seconds later the status shows `a` as `no (released)`: a clean
-stop.
+A few seconds later the status shows `a` as `no (released)`, with `-`
+for its state: a clean stop.
 
 <!-- test: status-after-stop -->
 ```bash

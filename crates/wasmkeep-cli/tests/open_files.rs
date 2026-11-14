@@ -4,13 +4,20 @@
 //! resident actor holds three).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
+mod support;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Warnings only, but the line naming the address the node bound
+/// (`wasmkeep`, the binary's target; the library crates stay at warn).
+const QUIET_BUT_LISTENING: &str = "warn,wasmkeep=info,wasmkeep_server=warn,wasmkeep_cluster=warn,\
+     wasmkeep_runtime=warn,wasmkeep_storage=warn";
 
 struct Node(Child);
 
@@ -165,10 +172,6 @@ impl Drop for DescriptorSampler {
 fn a_low_open_files_limit_caps_residents_instead_of_failing() {
     let wasm = counter_wasm();
     let dir = tempfile::tempdir().unwrap();
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
     let log = dir.path().join("node.log");
     // Hard limit 1,024: the node cannot raise it, so it must fit inside.
     let node = Node(
@@ -186,13 +189,17 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
             .arg(dir.path().join("data"))
             .arg("--cache-dir")
             .arg(dir.path().join("cache"))
-            .args(["--listen", &addr.to_string(), "--idle-timeout-secs", "600"])
-            .env("RUST_LOG", "warn")
+            // Bound by the server, read from its log (support/mod.rs).
+            .args(["--listen", "127.0.0.1:0", "--idle-timeout-secs", "600"])
+            // Warnings, and the line naming the address.
+            .env("RUST_LOG", QUIET_BUT_LISTENING)
             .stdout(std::fs::File::create(&log).unwrap())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
     );
+    let mut node = node;
+    let addr = support::listening_on(&mut node.0, &log, Duration::from_secs(60));
     let started = Instant::now();
     while !request(addr, "GET", "/_wasmkeep/health").is_some_and(|reply| reply.status == 200) {
         assert!(started.elapsed() < Duration::from_secs(60), "never started");
@@ -285,11 +292,7 @@ fn an_eight_instance_cli_node_can_run_an_actor_call() {
     assert!(status.success());
     let wasm = guest.join("target/wasm32-wasip2/release/test_actor.wasm");
     let dir = tempfile::tempdir().unwrap();
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let _node = Node(
+    let node = Node(
         Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
             .args(["serve", "--actor"])
             .arg(format!("t={}", wasm.display()))
@@ -297,13 +300,21 @@ fn an_eight_instance_cli_node_can_run_an_actor_call() {
             .arg(dir.path().join("data"))
             .arg("--cache-dir")
             .arg(dir.path().join("cache"))
-            .args(["--listen", &addr.to_string(), "--max-instances", "8"])
-            .stdout(Stdio::null())
+            // Bound by the server, read from its log (support/mod.rs).
+            .args(["--listen", "127.0.0.1:0", "--max-instances", "8"])
+            .env("RUST_LOG", QUIET_BUT_LISTENING)
             // Kept: it once never answered within 60 s under full-suite
-            // load, with nothing to say why.
-            .stderr(std::fs::File::create(dir.path().join("serve.log")).unwrap())
+            // load, with nothing to say why. The log goes to stdout.
+            .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
+            .stderr(std::fs::File::create(dir.path().join("serve.err")).unwrap())
             .spawn()
             .unwrap(),
+    );
+    let mut node = node;
+    let addr = support::listening_on(
+        &mut node.0,
+        &dir.path().join("serve.log"),
+        Duration::from_secs(60),
     );
     let started = Instant::now();
     while !request(addr, "GET", "/_wasmkeep/health").is_some_and(|reply| reply.status == 200) {

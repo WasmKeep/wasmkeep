@@ -121,7 +121,7 @@ impl ActorState {
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(actor = %self.address, error = %e, "reading the alarm failed; the sweep delivers it");
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "reading the alarm failed; the sweep delivers it");
             }
         }
     }
@@ -262,7 +262,7 @@ impl ActorService {
             }
             Taken::NoSuchActor => text_response(StatusCode::NOT_FOUND, "no such actor\n"),
             Taken::Refused(why) => {
-                tracing::debug!(actor = %address, %why, "take refused");
+                tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %why, "take refused");
                 crate::cluster::unavailable("cannot take the actor now; retry\n")
             }
         }
@@ -363,11 +363,11 @@ async fn move_one(
         }
         match service.take_here(&address).await {
             Taken::Held => {
-                tracing::info!(actor = %address, "move: this node holds the actor");
+                tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), "move: this node holds the actor");
                 cluster.delete_move(intent).await;
             }
             Taken::NoSuchActor => {
-                tracing::info!(actor = %address, "move: no such actor; dropped");
+                tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), "move: no such actor; dropped");
                 cluster.delete_move(intent).await;
             }
             Taken::HeldBy(_) | Taken::Refused(_) => {}
@@ -393,7 +393,7 @@ async fn move_one(
     // another app, an older version): the request stays, tried on later
     // passes until it expires.
     if !cluster.can_take(&intent.target) {
-        tracing::debug!(actor = %address, target = %intent.target, "move: the target cannot take actors now");
+        tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), target = %intent.target, "move: the target cannot take actors now");
         return;
     }
     if move_resident(inner, cluster, active, intent, &address, token).await {
@@ -436,11 +436,11 @@ async fn move_parked(
         .remove(address);
     match answer {
         TakeAnswer::Held => {
-            tracing::info!(actor = %address, target = %intent.target, "moved (parked)");
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "moved (parked)");
             true
         }
         TakeAnswer::HeldBy(holder) => {
-            tracing::info!(actor = %address, %holder, target = %intent.target, "move: held after the release");
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, target = %intent.target, "move: held after the release");
             true
         }
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
@@ -486,7 +486,7 @@ async fn move_resident(
     let alarm = match outcome {
         MoveOut::Released { alarm } => alarm,
         MoveOut::Expiring => {
-            tracing::warn!(actor = %address, "move: the release is pending (retried in the background); the move is tried again later");
+            tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), "move: the release is pending (retried in the background); the move is tried again later");
             return false;
         }
         MoveOut::Busy | MoveOut::NotHeld | MoveOut::Kept => return false,
@@ -516,11 +516,11 @@ async fn move_resident(
         TakeAnswer::Held => {}
         TakeAnswer::HeldBy(holder) if holder == intent.target => {}
         TakeAnswer::HeldBy(holder) => {
-            tracing::info!(actor = %address, %holder, target = %intent.target, "move: another node took the actor first");
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, target = %intent.target, "move: another node took the actor first");
             return true;
         }
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => {
-            tracing::info!(actor = %address, target = %intent.target, ?answer, "move: the target did not take the actor; tried again later");
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, ?answer, "move: the target did not take the actor; tried again later");
             return false;
         }
     }
@@ -532,6 +532,6 @@ async fn move_resident(
     if let Some(at) = alarm {
         inner.alarms.clear_if(address.clone(), at);
     }
-    tracing::info!(actor = %address, target = %intent.target, "moved");
+    tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "moved");
     true
 }

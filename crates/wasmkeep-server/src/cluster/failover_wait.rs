@@ -237,7 +237,7 @@ impl Cluster {
             counts.total += 1;
             counts.actors.insert(address.clone(), actor + 1);
         }
-        tracing::debug!(actor = %address, owner, ?verdict, "keeping a request for a takeover");
+        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), owner, ?verdict, "keeping a request for a takeover");
         Some(Ticket {
             cluster: self,
             address: address.clone(),
@@ -348,7 +348,7 @@ impl Drop for Ticket<'_> {
             }
         }
         if self.outcome == "left" {
-            tracing::debug!(actor = %self.address, "a kept request's client left; not run");
+            tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "a kept request's client left; not run");
         }
         FailoverWait::count(self.kind, self.outcome);
     }
