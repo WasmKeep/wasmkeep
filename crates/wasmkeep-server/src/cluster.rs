@@ -173,6 +173,9 @@ pub struct ClusterConfig {
     /// Requests kept that way at once on this node; more get the 503 at
     /// once. `serve` sets a quarter of its connection limit.
     pub failover_wait_max: usize,
+    /// How often the collecting node runs an idle-expiry pass (ADR 0028,
+    /// section 4): ten minutes; tests shorten it.
+    pub expiry_every: Duration,
 }
 
 /// Plain HTTP between nodes, for a node with a cluster listener (ADR 0011).
@@ -232,6 +235,7 @@ impl ClusterConfig {
             reads_secrets: true,
             failover_wait: None,
             failover_wait_max: crate::http::ServeLimits::default().max_connections / 4,
+            expiry_every: Duration::from_millis(wasmkeep_cluster::expiry::PASS_EVERY_MS),
         }
     }
 }
@@ -444,7 +448,20 @@ pub(crate) struct Cluster {
     fences_due: tokio::sync::mpsc::UnboundedSender<Vec<FenceDue>>,
     /// Requests kept until a dead node's actor can be taken over.
     pub(crate) failover: FailoverWait,
+    /// How often the collecting node runs an idle-expiry pass (ADR 0028).
+    pub(crate) expiry_every: Duration,
+    /// The app's tombstone (ADR 0028, section 5): [`APP_OPEN`],
+    /// [`APP_UNCHECKED`] or [`APP_DELETED`].
+    app_gate: std::sync::atomic::AtomicU8,
 }
+
+/// No tombstone: actors are acquired.
+const APP_OPEN: u8 = 0;
+/// A node following its app's deploys, before its first check for a
+/// tombstone made while its lease was valid: no actor is acquired yet.
+const APP_UNCHECKED: u8 = 1;
+/// The tombstone was seen: no actor is acquired again.
+const APP_DELETED: u8 = 2;
 
 /// Where a live node is reached, as its heartbeat says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +478,9 @@ pub(crate) struct Peer {
     pub(crate) can_take: bool,
     /// It opens sockets the front hands over (heartbeat line 11, ADR 0027).
     pub(crate) can_handoff: bool,
+    /// It expires idle actors and honours an app's tombstone (heartbeat
+    /// line 11, ADR 0028).
+    pub(crate) can_end: bool,
     /// The process its heartbeat names: routing trusts a record only if
     /// it names this one (ADR 0020).
     pub(crate) instance: Option<String>,
@@ -480,6 +500,7 @@ impl Peer {
             drain: node.drain,
             can_take: node.can_take,
             can_handoff: node.can_handoff,
+            can_end: node.can_end,
             instance: node.instance.clone(),
         })
     }
@@ -667,6 +688,8 @@ impl Cluster {
             )),
             fences_due,
             failover: FailoverWait::new(config),
+            expiry_every: config.expiry_every,
+            app_gate: std::sync::atomic::AtomicU8::new(APP_OPEN),
         });
         if refuse_plaintext {
             tracing::info!(
@@ -1583,6 +1606,49 @@ impl Cluster {
             .unwrap_or_else(|p| p.into_inner())
             .moves
             .clone()
+    }
+
+    /// Why no actor may be acquired now, if so (ADR 0028, section 5): the
+    /// app's tombstone was seen, or the node follows its app and has not
+    /// yet looked for one since its lease was valid.
+    pub(crate) fn app_refusal(&self) -> Option<&'static str> {
+        match self.app_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            APP_OPEN => None,
+            APP_UNCHECKED => Some("this node has not yet checked whether its app was deleted"),
+            _ => Some("the app was deleted"),
+        }
+    }
+
+    /// Acquisitions wait for a tombstone check (a node following its app).
+    pub(crate) fn expect_app_check(&self) {
+        let _ = self.app_gate.compare_exchange(
+            APP_OPEN,
+            APP_UNCHECKED,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// A check for the tombstone found none: acquisitions may proceed
+    /// (unless one was seen before).
+    pub(crate) fn app_checked(&self) {
+        let _ = self.app_gate.compare_exchange(
+            APP_UNCHECKED,
+            APP_OPEN,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// The tombstone was seen: no actor is acquired again.
+    pub(crate) fn app_tombstoned(&self) {
+        self.app_gate
+            .store(APP_DELETED, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this node's lease is valid now.
+    pub(crate) fn lease_valid_now(&self) -> bool {
+        self.validity.valid()
     }
 
     /// The delete requests this node last read (ADR 0028).

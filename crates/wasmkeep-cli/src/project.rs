@@ -49,6 +49,8 @@ pub(crate) struct Class {
     pub(crate) item: Item,
     /// As `--access` takes it; `internal` when the file says nothing.
     pub(crate) access: String,
+    /// `expire-after-idle` (ADR 0028), in seconds; `None`: never.
+    pub(crate) expire_after_idle: Option<u64>,
 }
 
 /// `[dev]`: for `wasmkeep dev` only.
@@ -72,6 +74,7 @@ const CLASS: &[&str] = &[
     "config",
     "requires",
     "watch",
+    "expire-after-idle",
 ];
 const DEV: &[&str] = &["port", "data-dir", "env"];
 
@@ -449,7 +452,26 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
                     check.spec(name_str).unwrap_or_else(|| "open".to_owned())
                 }
             };
-            classes.insert(name_str.to_owned(), Class { item, access });
+            let expire_after_idle = match string(&src, ct, "expire-after-idle", &what)? {
+                None => None,
+                Some(limit) => match wasmkeep_cluster::expiry::parse_idle(&limit) {
+                    Ok(secs) => Some(secs),
+                    Err(e) => {
+                        let span = get(ct, "expire-after-idle")
+                            .map(|(_, v)| v.span())
+                            .unwrap_or(0..0);
+                        return src.err(span, format!("{what} expire-after-idle: {e}"));
+                    }
+                },
+            };
+            classes.insert(
+                name_str.to_owned(),
+                Class {
+                    item,
+                    access,
+                    expire_after_idle,
+                },
+            );
         }
     }
     if front.is_none() && classes.is_empty() {
@@ -741,6 +763,7 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
                 wasm,
                 config: config.remove(&name),
                 requires: class.item.requires.clone(),
+                expire: class.expire_after_idle,
             };
             Some((name, class.access.clone(), part))
         })
@@ -750,6 +773,7 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
             wasm,
             config: config.remove(crate::FRONT_SCOPE),
             requires: item.requires.clone(),
+            expire: None,
         }),
         _ => None,
     };

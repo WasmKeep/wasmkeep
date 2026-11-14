@@ -219,6 +219,9 @@ impl ActorService {
                 owner_hints: std::sync::Mutex::default(),
                 handed: std::sync::Mutex::default(),
                 metrics_identity,
+                expiry: std::sync::RwLock::new(config.expire_after_idle.clone()),
+                local_app_dir: data_dir.join(root.local_root(wasmkeep_storage::encode_segment)),
+                app_deleted: tokio::sync::watch::Sender::new(false),
             }),
         };
         let _ = fire_to.set(Arc::downgrade(&service.inner));
@@ -235,6 +238,11 @@ impl ActorService {
             ));
             // While asked to drain, hand resident actors over (ADR 0014).
             tokio::spawn(drain::drain_loop(
+                Arc::downgrade(&service.inner),
+                Arc::clone(&cluster),
+            ));
+            // Idle expiry (ADR 0028), on the collecting node only.
+            tokio::spawn(expiry::expiry_loop(
                 Arc::downgrade(&service.inner),
                 Arc::clone(&cluster),
             ));

@@ -194,6 +194,8 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 
 fn store_for(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<SecretStore> {
     let (store, prefix) = crate::open_bucket(bucket)?;
+    // A deleted app's secrets went with it (ADR 0028): none is written.
+    crate::refuse_deleted(&store, &prefix, tenant, app)?;
     Ok(SecretStore::new(store, &prefix, tenant, app))
 }
 

@@ -411,6 +411,11 @@ impl Drop for InFlight {
     }
 }
 
+/// Why an idle expiry's acquisition was refused (ADR 0028): the record is
+/// not the one the listing showed (a wake rewrote it), or names a holder.
+/// Nothing was written; the actor is not expired.
+pub(crate) const RECORD_CHANGED: &str = "the ownership record changed since the listing";
+
 /// This node's hold on one actor, released when dropped (hibernation).
 pub(crate) struct LeaseHold {
     cell: Cell,
@@ -420,14 +425,36 @@ pub(crate) struct LeaseHold {
 }
 
 impl LeaseHold {
-    /// Acquires the actor's ownership record (ADR 0020, section 3).
-    /// `NotOwner` carries the node that holds it. Waits for the node id
-    /// check and the node lease's first write.
+    /// [`Self::acquire_with`], as an event acquires (tests).
+    #[cfg(test)]
     pub(crate) async fn acquire(
         cluster: &Arc<Cluster>,
         address: &ActorAddress,
     ) -> Result<Self, OwnershipError> {
+        Self::acquire_with(cluster, address, None).await
+    }
+
+    /// Acquires the actor's ownership record (ADR 0020, section 3).
+    /// `NotOwner` carries the node that holds it. Waits for the node id
+    /// check and the node lease's first write.
+    ///
+    /// With `listed`, for an idle expiry (ADR 0028, section 4) when
+    /// `listed` is the record's `ETag` as the listing of `owners/` showed
+    /// it: the record is taken only if it names nobody and is still that
+    /// version (`Owners::acquire_unchanged`); otherwise
+    /// [`OwnershipError::Changed`].
+    pub(crate) async fn acquire_with(
+        cluster: &Arc<Cluster>,
+        address: &ActorAddress,
+        listed: Option<&str>,
+    ) -> Result<Self, OwnershipError> {
         cluster.identity().await.map_err(OwnershipError::Refused)?;
+        // An app deleted (its tombstone seen), or not yet checked for one
+        // since this node's lease was first valid: no actor is acquired
+        // (ADR 0028, section 5).
+        if let Some(why) = cluster.app_refusal() {
+            return Err(OwnershipError::Refused(why.into()));
+        }
         let key = cluster.owner_key(address);
         let lock = cluster.pending.lock_of(&key);
         // From the read until the hold is registered (or the failure
@@ -437,14 +464,32 @@ impl LeaseHold {
         // hold invalid from the start, and the write is not sent (the
         // question right before it is asked in this epoch).
         let epoch = cluster.validity.epoch();
-        let acquired = cluster
-            .owners
-            .acquire(
-                &key,
-                || cluster.validity.valid_in(epoch),
-                async || cluster.seed_generation(address).await,
-            )
-            .await;
+        let acquired = match listed {
+            None => {
+                cluster
+                    .owners
+                    .acquire(
+                        &key,
+                        || cluster.validity.valid_in(epoch),
+                        async || cluster.seed_generation(address).await,
+                    )
+                    .await
+            }
+            Some(listed) => {
+                cluster
+                    .owners
+                    .acquire_unchanged(
+                        &key,
+                        |v| {
+                            let read = v.0.split('\n').next().unwrap_or_default();
+                            wasmkeep_cluster::expiry::etag(read)
+                                == wasmkeep_cluster::expiry::etag(listed)
+                        },
+                        || cluster.validity.valid_in(epoch),
+                    )
+                    .await
+            }
+        };
         // A parked hold of this actor (ADR 0024): dropped if this write may
         // have moved the record.
         if cluster.pending.after_wake(&key, &acquired) && acquired.is_ok() {
@@ -486,6 +531,8 @@ impl LeaseHold {
             Err(AcquireError::Unavailable) => Err(OwnershipError::Unavailable(
                 "the bucket did not answer".into(),
             )),
+            // Only an expiry's acquisition gives it (ADR 0028).
+            Err(AcquireError::Changed) => Err(OwnershipError::Refused(RECORD_CHANGED.into())),
         }
     }
 

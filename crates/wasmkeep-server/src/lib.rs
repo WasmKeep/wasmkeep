@@ -76,3 +76,11 @@ pub fn history_folder(root: &StateRoot, class: &str, name: &str) -> String {
         )
     )
 }
+
+/// The folder of app `tenant/app`'s local files under the data directory
+/// `data_dir` (its databases and scratch space): what a node removes once
+/// the app is deleted (ADR 0028).
+#[must_use]
+pub fn local_app_dir(data_dir: &std::path::Path, tenant: &str, app: &str) -> std::path::PathBuf {
+    data_dir.join(StateRoot::new("", tenant, app).local_root(wasmkeep_storage::encode_segment))
+}

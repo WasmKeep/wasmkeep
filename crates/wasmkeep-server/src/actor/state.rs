@@ -354,6 +354,17 @@ impl ActorState {
     /// the instance (it may be stale: another node may have run events since)
     /// and is acquired again.
     pub(super) async fn ensure_owner(&mut self) -> Result<(), OwnershipError> {
+        self.ensure_owner_with(None).await
+    }
+
+    /// [`Self::ensure_owner`]; with `listed` (an idle expiry, ADR 0028), the
+    /// acquisition takes the record only if it names nobody and is still
+    /// the version the listing showed, and a hold already here or a learned
+    /// owner is never taken as one (the caller refuses those first).
+    pub(super) async fn ensure_owner_with(
+        &mut self,
+        listed: Option<&str>,
+    ) -> Result<(), OwnershipError> {
         let blocked = self
             .secrets_blocked
             .load(std::sync::atomic::Ordering::Acquire);
@@ -367,7 +378,7 @@ impl ActorState {
             }
             return Ok(());
         };
-        if self.lease.as_ref().is_some_and(LeaseHold::is_valid) {
+        if listed.is_none() && self.lease.as_ref().is_some_and(LeaseHold::is_valid) {
             // Held, but this node cannot open the app's current secrets:
             // never run the actor with an older set. The drain hands it
             // over; until then its events are refused (ADR 0016).
@@ -378,7 +389,8 @@ impl ActorState {
             }
             return Ok(());
         }
-        if let Some((owner, until)) = &self.owner_hint
+        if listed.is_none()
+            && let Some((owner, until)) = &self.owner_hint
             && now_ms() < *until
         {
             return Err(OwnershipError::NotOwner {
@@ -420,7 +432,7 @@ impl ActorState {
                 "this node cannot open the app's secrets".into(),
             ));
         }
-        match LeaseHold::acquire(&cluster, &self.address).await {
+        match LeaseHold::acquire_with(&cluster, &self.address, listed).await {
             Ok(hold) => {
                 self.owner_hint = None;
                 let (view, generation) = (hold.view(), hold.generation().unwrap_or(0));
