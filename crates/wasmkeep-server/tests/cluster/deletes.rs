@@ -95,11 +95,20 @@ async fn an_operator_delete_of_a_resident_actor_is_done_once_recorded() {
     assert_eq!(a.service.resident(), 1);
     let key = request_delete(&store, "res").await;
     done_within(&store, &key, Duration::from_secs(10)).await;
-    // Its history is erased down to the reset and the snapshot at it.
-    eventually("the history erased", async || {
-        actor_keys(&store, "res").await.len() == 2
-    })
-    .await;
+    // Its history is erased down to the reset and the snapshot at it, and
+    // before the request is done: the operator delete erases before its
+    // job returns. Only uploads after the reset may follow it, such as
+    // the fence of a node that read the same request before it was done,
+    // took the actor once it was released and found the delete already
+    // carried out (ADR 0007).
+    let (snapshots, segments) = history_of(&store, "res").await;
+    let [reset] = snapshots[..] else {
+        panic!("one snapshot, at the reset: {snapshots:?} {segments:?}");
+    };
+    assert!(
+        segments.contains(&reset) && segments.iter().all(|&txid| txid >= reset),
+        "history below the reset {reset} left: {segments:?}"
+    );
     // Done means recorded: whichever node runs it next restores it empty.
     assert_eq!(read(b.addr, "res").await, "0", "the deleted data came back");
     assert_eq!(read(a.addr, "res").await, "0");
