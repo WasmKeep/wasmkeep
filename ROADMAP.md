@@ -52,7 +52,11 @@ Not before the releases above.
 - **Operating without the author**: mixed versions during an upgrade
   (today every node is upgraded together,
   [how](docs/cluster.md#upgrading-wasmkeep)); inspect or export one actor;
-  verify a bucket; traces.
+  verify a bucket; traces. Required before a stable `1.0`: within `1.x`,
+  every upgrade is rolling, one node at a time, with no stop of the whole
+  cluster and no offline migration. Two consecutive versions work in one
+  cluster, and a new bucket format is written only once every node reads
+  it.
 - **Faster, and compared.** Performance targets on dedicated hardware
   with a stated scale envelope; a plain write that does not hold its
   actor during the upload; the comparison with celld on a cloud bucket
