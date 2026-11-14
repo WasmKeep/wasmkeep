@@ -757,10 +757,14 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
 }
 
 /// What a deploy from the file changes, printed before it switches
-/// (ADR 0026): one line per change, removals saying what goes.
+/// (ADR 0026): one line per change, removals saying what goes, then the
+/// warnings about it (on stderr), saying what to set in the file.
 pub(crate) fn print_plan(file: &str, tenant: &str, app: &str, diff: &wasmkeep_server::apps::Diff) {
     for line in plan_lines(file, tenant, app, diff) {
         println!("{line}");
+    }
+    for warning in crate::deploy_warnings(diff, Some(file)) {
+        eprintln!("warning: {warning}");
     }
 }
 
