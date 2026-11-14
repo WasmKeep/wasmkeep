@@ -49,7 +49,9 @@ own machines.**
   disk, plus a little host state for any open WebSocket. It wakes in about
   a millisecond, with its data, its pending alarm and even its open
   WebSockets.
-- **Any language.** Actors are standard WASI 0.2 components. Rust,
+- **Any language.** The runtime is language-agnostic: actors are standard
+  WASI 0.2 components, and an app can be polyglot, its actors in
+  different languages calling each other. Rust,
   TypeScript, Python, C, Zig and Go (TinyGo) have SDKs and pass the same
   tests; standard Go, D and MoonBit are experimental, and a C# counter
   builds through componentize-dotnet; more are next ([languages](docs/languages.md)). An
