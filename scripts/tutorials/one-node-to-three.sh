@@ -58,7 +58,7 @@ expect_status 0
 # 4. Deploy.
 run deploy
 expect_status 0
-expect '^  class counter: added (open)$'
+expect '^  class counter: added \(open\)$'
 expect '^demo/shop: version [0-9a-f]{16} is current \(deploy 1\)$'
 
 # 5. Three nodes.
