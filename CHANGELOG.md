@@ -11,6 +11,16 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.1, in no release yet.
 
+- **`wasmkeep new DIR --lang rust|typescript [--front] [--app TENANT/APP]`**
+  writes a project that builds and runs the first time: a class `counter`,
+  optionally a front over it (the class then `internal`), its
+  `wasmkeep.toml`, a README with the commands (`wasmkeep dev`, then
+  `wasmkeep deploy`), a `.gitignore` and an `.env.local.example`. The
+  templates are in the binary (no network), the SDK is pinned to the CLI's
+  own version, and a directory that is not empty is refused. Every variant
+  is built and served by `wasmkeep dev` in the tests. Other languages
+  later. [Starting a project](docs/tutorials/first-actor.md#starting-a-project-with-wasmkeep-new).
+
 ## 0.4.1
 
 **Sockets through the front.** The front hands a client's WebSocket to

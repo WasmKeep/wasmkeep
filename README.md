@@ -199,7 +199,18 @@ To develop with hot reload (rebuilds and swaps on every save, keeping data;
 wasmkeep dev examples/counter   # from a clone
 ```
 
-To write your own actor, install the SDK of your language, at the version
+To start a project of your own (from the release after `0.4.1`),
+`wasmkeep new` writes one that builds and runs as it is, in Rust or
+TypeScript, with a front or without:
+
+```bash
+wasmkeep new hits --lang rust --front && cd hits
+rustup target add wasm32-wasip2   # or, with --lang typescript: npm install
+wasmkeep dev                      # then: wasmkeep deploy --bucket s3://...
+```
+
+[Starting a project](docs/tutorials/first-actor.md#starting-a-project-with-wasmkeep-new)
+says what it writes. Or install the SDK of your language, at the version
 of your server:
 
 | Language | Install | Start from |

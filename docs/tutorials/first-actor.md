@@ -6,6 +6,19 @@ serve it with WasmKeep, and see its state survive a restart.
 Applies to: WasmKeep `0.4.1` (pre-alpha). Commands assume Linux; on macOS,
 build the server from source (step 1).
 
+**The fast path**, from the release after `0.4.1`: `wasmkeep new` writes a
+project that builds and runs as it is, with its `wasmkeep.toml`, a README,
+a `.gitignore` and an `.env.local` example
+([starting a project](#starting-a-project-with-wasmkeep-new) below):
+
+```bash
+wasmkeep new hits --lang rust && cd hits
+rustup target add wasm32-wasip2
+wasmkeep dev
+```
+
+This page builds an actor by hand instead, to show every part.
+
 ## 1. Get WasmKeep
 
 Install the `wasmkeep` binary from a release, as in
@@ -146,6 +159,41 @@ curl 'localhost:8080/actor/visits/home?who=dave'
 ```
 
 The count survived because it lives in the actor's database, not in memory.
+
+## Starting a project with `wasmkeep new`
+
+From the release after `0.4.1`:
+
+```bash
+wasmkeep new DIR --lang rust|typescript [--front] [--app TENANT/APP]
+```
+
+It writes into `DIR` (created, or empty: anything else is refused) a class
+`counter`, one durable counter per actor, and with `--front` a front over
+it: a page and an API, the class then `internal`. Without a front the
+class is `open`, at `/actor/counter/<name>`. `[app]` is `--app`, or the
+tenant `my-team` and the directory's name: choose both before the first
+deploy. The templates are in the binary, so it needs no network; the
+README it writes has the commands (`rustup target add wasm32-wasip2` or
+`npm install`, then `wasmkeep dev`, then `wasmkeep deploy`), checked by
+`crates/wasmkeep-cli/tests/new_project.rs` for every variant.
+
+The SDK is pinned to the version of the `wasmkeep` that wrote the project
+(`wasmkeep-sdk = "0.5.0"`, `"@wasmkeep/sdk": "0.5.0"`, say), the version
+every release publishes the SDKs at. A `wasmkeep` built from a clone pins
+the clone's version: until that version is on crates.io and npm, build
+against the clone's SDK instead (`<clone>` its absolute path), without
+editing the project:
+
+```toml
+# .cargo/config.toml, in the project or any directory above it
+[patch.crates-io]
+wasmkeep-sdk = { path = "<clone>/crates/wasmkeep-sdk" }
+```
+
+and for TypeScript, `npm install <clone>/sdks/typescript` in
+place of `npm install` (run `npm ci` in the clone's `sdks/typescript`
+first). Other languages come later ([Languages](../languages.md)).
 
 ## What just happened
 

@@ -1,0 +1,8 @@
+# Build output
+target/
+node_modules/
+*.wasm
+
+# wasmkeep dev: local values (they may hold secrets) and the actors' data
+.env.local
+.wasmkeep/

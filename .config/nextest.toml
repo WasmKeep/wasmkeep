@@ -29,6 +29,12 @@ test-group = 'cluster'
 filter = 'binary(soak) | binary(failover)'
 slow-timeout = { period = "300s" }
 
+[[profile.default.overrides]]
+# `wasmkeep new`: each test builds a generated project from cold (a fresh
+# target directory, release builds with LTO), then serves it.
+filter = 'binary(new_project)'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 # Pull requests (ci.yml). The cluster suite is compiled twice, plain and
 # over mutual TLS (tests/cluster_over_tls.rs); the TLS copy differs only
 # where nodes talk to each other. A pull request runs it without the

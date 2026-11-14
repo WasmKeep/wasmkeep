@@ -92,6 +92,8 @@ Not before the releases above.
   ([tiers](docs/languages.md)). Java, Kotlin and PHP cannot produce an
   actor yet, and languages that need Wasm garbage collection wait on a
   decision of their own.
+- **Client libraries** for calling actors from existing native apps (Go,
+  Java, Python, Node, Rust).
 - Ideas, each needing a design first: encrypting actor state in the
   bucket, exporting many actors' data for analytics, composing components
   at deploy time, and loading a component at run time (a user's plugin,

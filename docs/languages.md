@@ -394,6 +394,13 @@ worlds `front` and `front-core` and the interface `calls` under
 ([ADR 0023](adr/0023-the-front.md),
 [ADR 0025](adr/0025-calling-several-actors-at-once.md)).
 
+`wasmkeep new` (from the release after `0.4.1`) writes Rust and TypeScript
+projects, pinned to its own version
+([Starting a project](tutorials/first-actor.md#starting-a-project-with-wasmkeep-new));
+the other languages are to come, and start from their examples until then.
+Its templates name the version by a placeholder, so they are not in the
+list below.
+
 `scripts/check-versions.py` (run by `./scripts/check.sh` and CI) fails when a
 manifest it lists has another version than the workspace's in `Cargo.toml`;
 an SDK that gains a manifest with a version is added to that list. The C

@@ -6,13 +6,12 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-
 mod support;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
+
+use support::request;
 
 /// A bucket nothing resolves: reaching it fails, so a test passing proves
 /// the command stopped before.
@@ -265,52 +264,10 @@ fn builds_print_to_stderr_without_the_bucket_credentials() {
 
 const ALICE: &str = "0123456789abcdef0123456789abcdef";
 
-struct Dev {
-    child: Child,
-    addr: SocketAddr,
-    dir: tempfile::TempDir,
-}
-
-impl Dev {
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("dev.log")).unwrap_or_default()
-    }
-}
-
-impl Drop for Dev {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn request(
-    addr: SocketAddr,
-    method: &str,
-    path: &str,
-    headers: &str,
-    body: &str,
-) -> Option<(u16, String)> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
-    write!(
-        s,
-        "{method} {path} HTTP/1.1\r\nHost: todo.example\r\nConnection: close\r\n\
-         {headers}Content-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .ok()?;
-    let mut raw = String::new();
-    s.read_to_string(&mut raw).ok()?;
-    let status = raw.split_whitespace().nth(1)?.parse().ok()?;
-    let body = raw.split_once("\r\n\r\n").map_or("", |(_, b)| b);
-    Some((status, body.to_owned()))
-}
-
 /// The example's own file, unchanged, in a directory of its own whose
 /// `front` and `todos` are the example's crates: `.env.local` and the
 /// databases stay out of the source tree.
-fn dev_on_the_example() -> Dev {
+fn dev_on_the_example() -> support::Dev {
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/todo-front");
     let example = example.canonicalize().unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -327,29 +284,9 @@ fn dev_on_the_example() -> Dev {
         format!("TOKENS=alice:{ALICE}\n"),
     )
     .unwrap();
-    let log_path = dir.path().join("dev.log");
-    let log = std::fs::File::create(&log_path).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
-        .current_dir(dir.path())
-        .args(["dev", "--listen", "127.0.0.1:0", "--poll-ms", "100"])
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .stdin(Stdio::null())
-        .spawn()
-        .unwrap();
     // Builds both crates first: a cold build takes minutes.
-    let addr = support::listening_on(&mut child, &log_path, Duration::from_secs(600));
-    let dev = Dev { child, addr, dir };
-    let started = Instant::now();
-    while request(addr, "GET", "/", "", "").is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(600),
-            "dev never answered: {}",
-            dev.log()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    dev
+    let path = dir.path().to_path_buf();
+    support::start_dev(dir, path, 100, Duration::from_secs(600))
 }
 
 #[test]
@@ -371,13 +308,12 @@ fn dev_runs_the_example_file_with_its_front_rules_and_local_values() {
     let (status, _) = request(dev.addr, "GET", "/actor/todos/alice", "", "").unwrap();
     assert_eq!(status, 403, "{}", dev.log());
     // The databases are beside the file, under the file's app.
-    assert!(dev.dir.path().join(".wasmkeep/dev").exists());
+    assert!(dev.dir.as_path().join(".wasmkeep/dev").exists());
 
     // A component written again (as a build run elsewhere would) reloads
     // the whole app; the actor's state is kept.
     let front = dev
         .dir
-        .path()
         .join("front/target/wasm32-wasip2/release/todo_front.wasm");
     let bytes = std::fs::read(&front).unwrap();
     std::thread::sleep(Duration::from_millis(1100));
@@ -415,9 +351,9 @@ fn counter_wasm() -> PathBuf {
 }
 
 /// Waits until `done` holds for `dev`'s directory and log.
-fn wait_for(dev: &Dev, what: &str, done: impl Fn(&Path, &str) -> bool) {
+fn wait_for(dev: &support::Dev, what: &str, done: impl Fn(&Path, &str) -> bool) {
     let started = Instant::now();
-    while !done(dev.dir.path(), &dev.log()) {
+    while !done(dev.dir.as_path(), &dev.log()) {
         assert!(
             started.elapsed() < Duration::from_secs(60),
             "{what}: {}",
@@ -445,18 +381,9 @@ fn dev_rebuilds_on_watch_and_a_failed_build_keeps_the_previous_version() {
         ),
     )
     .unwrap();
-    let log_path = dir.path().join("dev.log");
-    let log = std::fs::File::create(&log_path).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
-        .current_dir(dir.path())
-        .args(["dev", "--listen", "127.0.0.1:0", "--poll-ms", "50"])
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .stdin(Stdio::null())
-        .spawn()
-        .unwrap();
-    let addr = support::listening_on(&mut child, &log_path, Duration::from_secs(60));
-    let dev = Dev { child, addr, dir };
+    let path = dir.path().to_path_buf();
+    let dev = support::start_dev(dir, path, 50, Duration::from_secs(60));
+    let addr = dev.addr;
     let builds = |d: &Path| {
         std::fs::read_to_string(d.join("builds.txt"))
             .unwrap_or_default()
@@ -465,7 +392,7 @@ fn dev_rebuilds_on_watch_and_a_failed_build_keeps_the_previous_version() {
     };
     let reloads = |log: &str| log.matches("reloaded").count();
     let edit = |n: u64| {
-        let path = dev.dir.path().join("src/lib");
+        let path = dev.dir.as_path().join("src/lib");
         std::fs::write(&path, n.to_string()).unwrap();
         std::fs::File::options()
             .write(true)
@@ -474,7 +401,7 @@ fn dev_rebuilds_on_watch_and_a_failed_build_keeps_the_previous_version() {
             .set_modified(std::time::SystemTime::now() + Duration::from_secs(10 * n))
             .unwrap();
     };
-    assert_eq!(builds(dev.dir.path()), 1, "{}", dev.log());
+    assert_eq!(builds(dev.dir.as_path()), 1, "{}", dev.log());
     assert_eq!(request(addr, "GET", "/actor/c/x", "", "").unwrap().0, 200);
 
     // An edit under watch: built again, reloaded.
@@ -484,7 +411,7 @@ fn dev_rebuilds_on_watch_and_a_failed_build_keeps_the_previous_version() {
     });
 
     // A failed build: the previous version keeps serving.
-    std::fs::write(dev.dir.path().join("fail"), "").unwrap();
+    std::fs::write(dev.dir.as_path().join("fail"), "").unwrap();
     edit(2);
     wait_for(&dev, "the build failing", |_, log| {
         log.contains("build failed")
@@ -494,7 +421,7 @@ fn dev_rebuilds_on_watch_and_a_failed_build_keeps_the_previous_version() {
     assert_eq!(request(addr, "GET", "/actor/c/x", "", "").unwrap().0, 200);
 
     // Fixed: it builds and reloads.
-    std::fs::remove_file(dev.dir.path().join("fail")).unwrap();
+    std::fs::remove_file(dev.dir.as_path().join("fail")).unwrap();
     edit(3);
     wait_for(&dev, "the fixed build and reload", |d, log| {
         builds(d) == 3 && reloads(log) == 2
