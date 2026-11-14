@@ -678,13 +678,8 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   An app is those two prefixes, for deleting, exporting and access
   policies alike. Nodes started with `--actor` run as the implicit app
   `default/default`; `deploy --app default/default` moves such a cluster
-  to deploys and keeps its actors. There is no `app delete` yet: to remove
-  an app nobody runs, stop its nodes and delete both prefixes:
-
-  ```bash
-  aws s3 rm --recursive s3://wasmkeep-demo/apps/acme/legacy/
-  aws s3 rm --recursive s3://wasmkeep-demo/state/acme/legacy/
-  ```
+  to deploys and keeps its actors. `wasmkeep app delete` removes an app
+  ([Deleting an app](#deleting-an-app)).
 
 - A bucket prefix that holds actor state written by a version before
   0.4.0 is migrated once with `wasmkeep cluster migrate` while every node
@@ -1184,6 +1179,96 @@ A node from before this release ignores the requests: during a rolling
 upgrade, a delete waits for an upgraded node to hold the actor or find it
 free. A delete cannot be undone, except from a bucket that keeps old
 versions ([backup and restore](deploy/backup-and-restore.md)).
+
+## Idle expiry
+
+A class may say how long its actors may stay idle before they are
+deleted ([ADR 0028](adr/0028-actors-that-end.md), section 4):
+
+```toml
+[classes.carts]
+component = "carts.wasm"
+expire-after-idle = "7d"
+```
+
+or, with flags, `wasmkeep deploy --app acme/shop --expire-after-idle
+carts=7d` (per class, kept by later deploys that do not name it;
+`carts=` removes it). The limit is a whole number and one unit, `s`,
+`m`, `h` or `d`, at least one hour. It is part of the version, so a
+rollback restores the limit the version had. A version with a limit uses
+manifest format 4: the deploy is refused while a live node of the app
+runs a version from before (its heartbeat lacks the word `ends`).
+
+- **Idle** means no event ran the actor's code: no request, call, alarm,
+  WebSocket open, message or close. An actor with a **pending alarm** is
+  never expired (the alarm is activity to come), nor one with an **open
+  WebSocket** (its node holds it, or keeps its record parked).
+- **Who collects.** One node of the app: the live node with the lowest id
+  that serves and announces `ends`, once every 10 minutes. Per class with
+  a limit, it lists `owners/<class>/` once (an actor's ownership record is
+  written when it wakes and when it hibernates, so its last-modified time
+  says how long it has been idle), and the app's alarm index once. A pass
+  deletes at most 100 actors, four at a time, oldest first; another node
+  takes over once that one stops heartbeating.
+- **The delete** runs none of the actor's code. The node acquires the
+  actor only if its record still names nobody and is exactly the version
+  listed, restores it, checks its database for an alarm, then deletes it
+  as `delete-self` does (the database and its history in the bucket, an
+  empty database recorded at the head).
+- **An event arriving meanwhile** either wakes the actor before the
+  expiry acquires it (the record changes, nothing is deleted) or is
+  forwarded to the expiring node and queued after it, and finds a new,
+  empty actor, as any event after the expiry would.
+- **One node, no cluster**: nothing expires (there are no ownership
+  records to list). A name longer than about 200 bytes once encoded (its
+  record key holds a hash) is never expired.
+
+`wasmkeep_actor_deletes_total{how="expired"}`,
+`wasmkeep_expiry_candidates_total` and `wasmkeep_expiry_kept_total{reason}`
+show what the passes do ([monitoring](monitoring.md)).
+
+## Deleting an app
+
+```bash
+wasmkeep app delete --app acme/legacy --bucket s3://acme-wasmkeep/prod
+```
+
+([ADR 0028](adr/0028-actors-that-end.md), section 5.)
+
+1. **The tombstone first**: `apps/<tenant>/<app>/deleted`, written once,
+   holding who and when. From then `deploy` (and `--rollback`), `secrets
+   set`, `actor move` and `actor delete` refuse the app, and a node
+   refuses to start serving it. A node serving it sees the tombstone at
+   its next version check (3 s): it stops taking events, closes the app's
+   WebSockets with **1001 "app deleted"**, stops its alarms, releases its
+   actors and its node lease, removes its local files of the app, and
+   `serve` exits with an error. No node acquires an actor of an app with a
+   tombstone, nor before it has checked for one since its lease was valid.
+2. **Then the data**, once no live node of the app is left: the command
+   waits up to `--wait SECS` (60) for them, then removes every key under
+   `state/<tenant>/<app>/` and `apps/<tenant>/<app>/` but the tombstone:
+   every actor's history, the ownership records, the alarm index, the
+   requests, every deployed version and the sealed secrets. First it
+   fences any node lease of the app still written live (a node paused or
+   cut off past its horizon), so that node can never act again. It lists
+   again until a listing finds nothing at least 40 s after the app's
+   nodes last wrote (a write sent before a node stopped may land late).
+   The secrets key, kept outside the bucket, is yours to destroy.
+3. **The tombstone stays.** `wasmkeep deploy --app acme/legacy --recreate
+   ...` uses the name again: it removes the tombstone only once nothing
+   else is left under the two prefixes, and not within 40 s of the
+   delete. A node whose data directory still
+   holds files of the app from before the delete (it was down throughout)
+   removes them before it serves the new app.
+
+The command refuses before writing anything if a live node of the app
+runs a version that ignores a tombstone (its heartbeat lacks `ends`), and
+the implicit app `default/default` (its nodes do not follow deploys).
+Nodes still live after the wait: it stops, the tombstone written and
+nothing removed; run it again (it goes on where it stopped). `--force`
+removes the data anyway: only after `wasmkeep cluster fence` of each node
+still listed. A delete cannot be undone, except from a bucket that keeps
+old versions ([backup and restore](deploy/backup-and-restore.md)).
 
 ## Upgrading WasmKeep
 

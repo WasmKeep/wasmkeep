@@ -2,8 +2,9 @@
 
 - Status: accepted (2026-11-14). Sections 1 to 3 (what a deleted actor
   is, the durable delete, the operator delete) are built with this
-  record; sections 4 (idle expiry) and 5 (deleting an app) are decided
-  here and built later, each in its own change. Revised after an
+  record; sections 4 (idle expiry) and 5 (deleting an app) were decided
+  here and built in the change after it, with the dated notes at the end
+  of each section where the code made a choice the text left open. Revised after an
   adversarial review: a request's outcome written beside it (the key going
   away proves nothing), the fence before a request found carried out is
   reported done, sockets closed only once the delete will run, the marker
@@ -291,7 +292,7 @@ and `operator` (`actor delete`). `wasmkeep_actor_delete_failures_total{how}`
 counts those that failed to be recorded (the actor was given up, its data
 still in the bucket).
 
-### 4. Idle expiry (decided; built later)
+### 4. Idle expiry
 
 A class may say how long an actor of it may stay idle before it is
 deleted:
@@ -331,7 +332,45 @@ restores it. The minimum is one hour; seconds, minutes, hours and days.
 - **Metrics**: `wasmkeep_actor_deletes_total{how="expired"}`, and the
   candidates found per pass.
 
-### 5. Deleting an app (decided; built later)
+*Note, 2026-11-14, as built.*
+
+- **"The record exactly as the listing showed it"** is its version: the
+  listing's `ETag` (quotes and a weak marker aside) must equal the one the
+  expiry's own read returns, and that read must name nobody; the
+  conditional write is `If-Match` on that read
+  (`Owners::acquire_unchanged`). One read decides and conditions the
+  write, so a wake between a check and the acquire cannot slip through. A
+  last-modified time has a precision of a second on S3 and is not
+  returned by the read the acquire uses; an `ETag` changes with every
+  write. A listing without an `ETag` expires nothing.
+- **The job never takes a hold it has.** An actor resident, parked or
+  with a socket on the collecting node is not a candidate's victim, and
+  the job's acquire never counts a hold already there. After the restore
+  the job reads the database's own alarm: the `alarms/` listing is a
+  filter, an entry missing from it never deletes an actor with an alarm.
+  The operator delete's marker is carried over, as `delete-self` does.
+- **The pass's clock is read before the listing**, so a listing slow to
+  come back never makes a record look idler than it was.
+- **Records found changed or held** are not tried again at that version
+  (long-resident actors have old records that the listing cannot tell
+  from released ones), so they do not take each pass's budget.
+- **The collector** is the lowest id among this node and the live peers
+  of the app that serve (not draining, not suspected) and announce the
+  heartbeat word `ends`; a node behind on deploys or before its tombstone
+  check runs no pass.
+- **Format.** A limit is the manifest line `expire <class> <seconds>`,
+  in format 4, written only for a version with a limit (a version without
+  one keeps its bytes and id). Nodes announce `ends` on heartbeat line 11;
+  a deploy writing format 4 is refused while a live node of the app does
+  not, as format 3 is for `front`.
+- **One node, no cluster**: nothing expires (no ownership records). A
+  name whose encoded form was shortened with a hash cannot be told back
+  from its record key and is never expired.
+- Simulated by `madsim_expiry` (expiry passes racing wakes and alarms, two
+  broken variants caught); cluster tests in `tests/cluster/expiry.rs` and
+  `websockets.rs`.
+
+### 5. Deleting an app
 
 ```bash
 wasmkeep app delete --app acme/legacy --bucket s3://b/p
@@ -355,6 +394,52 @@ wasmkeep app delete --app acme/legacy --bucket s3://b/p
    before this section. Re-using the name is `deploy --app acme/legacy
    --recreate`, which removes the tombstone only once nothing else is
    left under the two prefixes.
+
+*Note, 2026-11-14, as built.*
+
+- **A node stops being live.** A node that sees the tombstone stops as a
+  clean stop does, with 1001 instead of 1012 and no hand-over: its actors
+  finish their queued events and are released, then its node lease is
+  released, so `app delete` sees it gone. It then removes its local files
+  of the app (`<data_dir>/state/<t>/<a>/`), and `serve` exits with an
+  error. A node refusing to start on a tombstone removes them too.
+- **The start race, and lapses.** A node following its app acquires no
+  actor until a check for the tombstone, sent while its lease was valid,
+  found none: from the moment its cluster is built, and again after
+  every lapse of its lease (a node paused or cut off). Either the node's
+  lease was written before the command read the live nodes (the command
+  waits for it), or its check came after the tombstone (it stops). The
+  check after a lapse also compares the `recreated` marker below: a node
+  that was away through a delete and a `--recreate` stops.
+- **Fencing.** Before it removes anything (and after every round), the
+  command fences each node lease of the app still written live, as
+  `cluster fence` does: a node past its horizon but not stopped (paused,
+  cut off) can then never renew, and never acts again.
+- **Late writes.** The command lists and deletes until a listing comes
+  back empty at least 40 s (a bucket client's wait for a write, 30 s,
+  plus a lease's ttl) after the tombstone and after any node of the app
+  last wrote its heartbeat; it also waits for any node that turned live
+  meanwhile and refuses one without `ends` that started. `--recreate` is
+  refused within that same window. A deploy re-reads the tombstone after
+  its switch, and `secrets`, `actor move` and `actor delete` after their
+  write (the two requests are taken back): each reports the app deleted
+  meanwhile, and what they wrote goes when `app delete` runs again.
+- **Local files after `--recreate`.** A node down throughout a delete
+  keeps its local databases, and an actor with no history in the bucket
+  takes its local file as its first snapshot. `--recreate` leaves
+  `apps/<t>/<a>/recreated` (the tombstone's body); a node whose local
+  copy of it differs removes its local files of the app before it serves.
+- **Refusals.** Besides deploys and node starts, rollbacks, `secrets`
+  writes, `actor move` and `actor delete` refuse an app with a tombstone.
+  The command refuses the implicit app `default/default`, whose nodes do
+  not follow deploys. `--force` removes the data while nodes still look
+  live (after `cluster fence`) and beside nodes without `ends`.
+- **Waiting.** The command waits up to `--wait SECS` (60) for the live
+  nodes, then stops with the tombstone written and nothing removed; run
+  again, it resumes (an existing tombstone is not an error).
+- Tested end to end in `tests/cluster/app_delete.rs` (nodes stop, sockets
+  1001, both prefixes removed, refusals, `--recreate`, a node that kept
+  files from before the delete) and by the command line's tests.
 
 ## Alternatives
 

@@ -37,9 +37,42 @@ pub fn encode_segment(segment: &str) -> String {
     out
 }
 
+/// The segment [`encode_segment`] encoded as `encoded`, if it can be told:
+/// `None` for a long one shortened with a hash, or for anything
+/// `encode_segment` would not write.
+#[must_use]
+pub fn decode_segment(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    (encode_segment(&decoded) == encoded).then_some(decoded)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::encode_segment;
+    use super::{decode_segment, encode_segment};
+
+    #[test]
+    fn segments_decode_back_unless_hashed() {
+        for name in ["room-1", "Room", "a/b", "..", "é", "u/1 ünï", "a.b_c"] {
+            assert_eq!(decode_segment(&encode_segment(name)).as_deref(), Some(name));
+        }
+        assert_eq!(decode_segment(&encode_segment(&"x".repeat(256))), None);
+        for junk in ["%5", "%zz", "R", "%72", "a/b", ".x"] {
+            assert_eq!(decode_segment(junk), None, "{junk}");
+        }
+    }
 
     #[test]
     fn plain_names_stay_readable() {

@@ -53,7 +53,7 @@ async fn ended_within(
 }
 
 /// `n` durable increments of actor `t/<name>` on the node at `addr`.
-async fn write(addr: SocketAddr, name: &str, n: u32) {
+pub(super) async fn write(addr: SocketAddr, name: &str, n: u32) {
     for i in 1..=n {
         let r = send(addr, "POST", &format!("/actor/t/{name}/durable"), "").await;
         assert_eq!((r.status, r.body.trim()), (200, i.to_string().as_str()));
@@ -62,7 +62,7 @@ async fn write(addr: SocketAddr, name: &str, n: u32) {
 
 /// What actor `t/<name>` reads as on the node at `addr` (its `durable`
 /// counter), once it answers.
-async fn read(addr: SocketAddr, name: &str) -> String {
+pub(super) async fn read(addr: SocketAddr, name: &str) -> String {
     let started = std::time::Instant::now();
     loop {
         let r = poll_get(addr, &format!("/actor/t/{name}/durable")).await;

@@ -227,6 +227,93 @@ impl Cluster {
         !self.eligible_peers().is_empty()
     }
 
+    /// Whether this node runs the idle-expiry passes (ADR 0028, section
+    /// 4): its lease valid, not draining, and the lowest id among itself
+    /// and the live peers of its app that serve (heartbeat line 9), are not
+    /// asked to drain, are not suspected, and announce `ends`. Another node
+    /// takes over once this one stops heartbeating.
+    pub(crate) fn collects_expiry(&self) -> bool {
+        if self.draining() || !self.lease_valid_now() {
+            return false;
+        }
+        let draining = self
+            .control
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .draining
+            .clone();
+        let now = now_ms();
+        let suspects: Vec<String> = {
+            let mut s = self.suspects.lock().unwrap_or_else(|p| p.into_inner());
+            s.retain(|_, until| *until > now);
+            s.keys().cloned().collect()
+        };
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
+        let others = peers.iter().filter(|(id, peer)| {
+            **id != self.node_id
+                && peer.app == self.serves
+                && peer.drain == Some(DrainState::Serving)
+                && peer.can_end
+                && !draining.contains(*id)
+                && !suspects.contains(*id)
+        });
+        wasmkeep_cluster::expiry::collects(&self.node_id, others.map(|(id, _)| id.as_str()))
+    }
+
+    /// The ownership records of class `class` (ADR 0028): one listing of
+    /// `owners/<class>/`, each with its key after that folder, its
+    /// last-modified time and its `ETag`.
+    pub(crate) async fn list_owner_records(
+        &self,
+        class: &str,
+    ) -> Result<Vec<wasmkeep_cluster::expiry::Listed>, String> {
+        use wasmkeep_cluster::migrate::Store as _;
+        let folder = format!("{}/", self.root.key(Family::Owners, class));
+        let listed = self
+            .control_keys
+            .list(&folder)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(listed
+            .into_iter()
+            .filter_map(|m| {
+                let name = m.key.strip_prefix(&folder)?;
+                (!name.is_empty() && !name.contains('/')).then(|| {
+                    wasmkeep_cluster::expiry::Listed {
+                        name: name.to_owned(),
+                        modified_ms: m.modified_ms,
+                        version: m.etag.unwrap_or_default(),
+                    }
+                })
+            })
+            .collect())
+    }
+
+    /// The actors with an entry in this root's alarm index (ADR 0028): one
+    /// listing of `alarms/`, as `(class, name encoded as record keys are)`.
+    pub(crate) async fn alarmed_actors(
+        &self,
+    ) -> Result<std::collections::BTreeSet<(String, String)>, String> {
+        use wasmkeep_cluster::migrate::Store as _;
+        let folder = format!("{}/", self.root.base(Family::Alarms));
+        let listed = self
+            .control_keys
+            .list(&folder)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(listed
+            .iter()
+            .filter_map(|m| {
+                let entry =
+                    wasmkeep_cluster::alarm_index::parse_listed(m.key.strip_prefix(&folder)?)?;
+                Some((
+                    entry.class.to_owned(),
+                    wasmkeep_storage::encode_segment(&entry.name),
+                ))
+            })
+            .collect())
+    }
+
     /// The peers that may receive this node's actors (see `chosen_peer`).
     pub(super) fn eligible_peers(&self) -> Vec<String> {
         let draining = self

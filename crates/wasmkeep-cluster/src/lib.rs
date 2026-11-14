@@ -38,6 +38,7 @@ mod version_tests {
 pub mod alarm_index;
 pub mod bucket_check;
 pub mod control;
+pub mod expiry;
 pub mod failover;
 pub mod holds;
 pub mod lease;

@@ -730,6 +730,7 @@ mod tests {
             can_take: false,
             can_front: false,
             can_handoff: false,
+            can_end: false,
             instance: None,
             lease: None,
             load: None,

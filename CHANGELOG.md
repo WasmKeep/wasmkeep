@@ -52,8 +52,30 @@ Since 0.4.1, in no release yet.
   - Metrics `wasmkeep_actor_deletes_total{how}` and
     `wasmkeep_actor_delete_failures_total{how}` (`self`, `self_durable`,
     `operator`).
-  - Decided, built later: idle expiry per class (`expire-after-idle`) and
-    `wasmkeep app delete`.
+  - **Idle expiry**: a class's `expire-after-idle` (`"7d"`, at least an
+    hour) in `wasmkeep.toml`, or `deploy --expire-after-idle CLASS=7d`
+    (`CLASS=` removes it), part of the version. In a cluster, the lowest
+    live node of the app lists the class's ownership records every 10
+    minutes and deletes actors idle that long, never one with a pending
+    alarm or an open WebSocket; an event arriving meanwhile wins, or
+    finds a new actor ([cluster](docs/cluster.md#idle-expiry)). A version
+    with a limit is manifest format 4: deploys are refused while a live
+    node of the app does not announce the new heartbeat word `ends`.
+  - **`wasmkeep app delete --app TENANT/APP --bucket ...`**: writes the
+    app's tombstone (`apps/<t>/<a>/deleted`), from which deploys, secrets,
+    moves and deletes refuse the app and its nodes stop serving it
+    (WebSockets closed with 1001, node lease released, local files
+    removed, `serve` exits); once none is live, removes everything under
+    `state/<t>/<a>/` and `apps/<t>/<a>/` but the tombstone. Refused while
+    a live node of the app lacks `ends`. `deploy --recreate` uses the name
+    again ([cluster](docs/cluster.md#deleting-an-app)).
+  - Metrics: `how="expired"` on the delete counters,
+    `wasmkeep_expiry_passes_total`, `wasmkeep_expiry_candidates_total`,
+    `wasmkeep_expiry_kept_total{reason}`.
+  - Behaviour changes: a node following an app (`serve --app`) acquires
+    no actor until it has checked for the app's tombstone since its lease
+    was valid (a moment after it starts); the heartbeat adds the word
+    `ends`, which earlier versions ignore.
 
 ## 0.4.1
 

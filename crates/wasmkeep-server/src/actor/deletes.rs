@@ -96,7 +96,7 @@ impl ActorState {
         if self.cluster.is_some() && self.replica.is_none() {
             return Deleted::Refused("no replication for the actor".into());
         }
-        let (marker, stale) = match self.delete_marks().await {
+        let (marker, stale, _) = match self.delete_marks().await {
             Ok(read) => read,
             Err(e) => return Deleted::Refused(format!("reading the database: {e}")),
         };
@@ -133,16 +133,20 @@ impl ActorState {
         }
     }
 
-    /// The operator delete marker and the alarm index entry the actor's
-    /// database holds, read from the open instance or the restored database
-    /// (opened without instantiating the component).
-    async fn delete_marks(&mut self) -> Result<(Option<String>, Option<Entry>), String> {
-        let read = |db: &mut ActorDb| -> Result<(Option<String>, Option<String>), String> {
+    /// The operator delete marker, the alarm index entry and the pending
+    /// alarm the actor's database holds, read from the open instance or the
+    /// restored database (opened without instantiating the component).
+    pub(super) async fn delete_marks(
+        &mut self,
+    ) -> Result<(Option<String>, Option<Entry>, Option<u64>), String> {
+        type Read = (Option<String>, Option<String>, Option<u64>);
+        let read = |db: &mut ActorDb| -> Result<Read, String> {
             let marker = db.meta(OPERATOR_DELETE_KEY).map_err(|e| e.to_string())?;
             let indexed = db.meta(ALARM_INDEXED_KEY).map_err(|e| e.to_string())?;
-            Ok((marker, indexed))
+            let alarm = db.alarm().map_err(|e| e.to_string())?;
+            Ok((marker, indexed, alarm))
         };
-        let (marker, indexed) = if let Some(live) = self.live.as_mut() {
+        let (marker, indexed, alarm) = if let Some(live) = self.live.as_mut() {
             with_db(&mut live.store, read)
                 .await
                 .map_err(|e| format!("{e:#}"))??
@@ -173,7 +177,11 @@ impl ActorState {
             self.db = Some(db);
             out?
         };
-        Ok((marker, indexed.as_deref().and_then(alarm_index::parse_meta)))
+        Ok((
+            marker,
+            indexed.as_deref().and_then(alarm_index::parse_meta),
+            alarm,
+        ))
     }
 }
 

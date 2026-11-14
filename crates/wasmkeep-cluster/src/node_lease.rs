@@ -808,6 +808,10 @@ pub enum AcquireError {
     Corrupt,
     /// No answer before writing: nothing written.
     Unavailable,
+    /// An idle expiry's acquisition ([`Owners::acquire_unchanged`]): the
+    /// record is not the one the listing showed, or names a holder. Nothing
+    /// written.
+    Changed,
 }
 
 /// What a release or a resolution did.
@@ -967,6 +971,61 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             generation,
             version,
             previous,
+        })
+    }
+
+    /// Acquires the record at `key` for an idle expiry ([ADR 0028],
+    /// section 4): only if it names nobody and `unchanged(version)` says
+    /// the version read is the one the listing of `owners/` showed. The
+    /// check and the conditional write use the one read, so a wake that
+    /// rewrote the record since the listing (its acquire, or its acquire
+    /// and its release) makes this fail with [`AcquireError::Changed`],
+    /// and a wake landing after the read makes the write fail its
+    /// condition. Never takes a record that names a holder, this process
+    /// included, nor one that is absent.
+    ///
+    /// [ADR 0028]: ../../../docs/adr/0028-actors-that-end.md
+    pub async fn acquire_unchanged(
+        &self,
+        key: &str,
+        unchanged: impl Fn(&Version) -> bool,
+        lease_valid: impl Fn() -> bool,
+    ) -> Result<Hold, AcquireError> {
+        let Some((body, version)) = self
+            .bucket
+            .get(key)
+            .await
+            .map_err(|_| AcquireError::Unavailable)?
+        else {
+            return Err(AcquireError::Changed);
+        };
+        let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+        if record.holder.is_some() || !unchanged(&version) {
+            return Err(AcquireError::Changed);
+        }
+        let generation = record
+            .generation
+            .checked_add(1)
+            .ok_or(AcquireError::Corrupt)?;
+        if !lease_valid() {
+            return Err(AcquireError::LeaseInvalid);
+        }
+        let written = self
+            .bucket
+            .replace(key, self.mine(generation), &version)
+            .await;
+        let version = match written {
+            Ok(version) => version,
+            Err(_) => {
+                self.read_back(key, generation, Some((version, record)))
+                    .await?
+            }
+        };
+        Ok(Hold {
+            key: key.to_owned(),
+            generation,
+            version,
+            previous: None,
         })
     }
 
@@ -1599,6 +1658,70 @@ mod tests {
             (taken.generation, taken.previous),
             (43, Some("a".to_owned()))
         );
+    }
+
+    /// An idle expiry's acquisition (ADR 0028, section 4) takes the record
+    /// only as the listing showed it: released, at that version. A wake
+    /// since the listing (an acquire, or an acquire and its release), a
+    /// record naming a holder (this process too) or no record at all
+    /// writes nothing.
+    #[test]
+    fn an_expiry_acquires_only_the_record_the_listing_showed() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let mut la = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        run(la.start(None)).unwrap();
+        let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "i2", cfg());
+        run(lb.start(None)).unwrap();
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let b = Owners::new(&mem, At(&t), "b", "i2", "nodes/", cfg());
+        let version_of = |key: &str| run((&mem).get(key)).unwrap().unwrap().1;
+        // Absent: nothing to expire, nothing created.
+        assert_eq!(
+            run(b.acquire_unchanged("owners/x", |_| true, || true)),
+            Err(AcquireError::Changed)
+        );
+        assert!(run((&mem).get("owners/x")).unwrap().is_none());
+        // Held by a (live): never taken, not even when the version matches.
+        let hold = run(a.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        let listed = version_of("owners/x");
+        assert_eq!(
+            run(b.acquire_unchanged("owners/x", |v| *v == listed, || true)),
+            Err(AcquireError::Changed)
+        );
+        assert_eq!(
+            run(a.acquire_unchanged("owners/x", |v| *v == listed, || true)),
+            Err(AcquireError::Changed),
+            "this process's own hold"
+        );
+        // Released: the listing's version, taken at the next generation.
+        assert_eq!(run(a.release(&hold)), Released::Released);
+        let listed = version_of("owners/x");
+        // A wake after the listing (acquire then release): the record
+        // names nobody again, at another version: refused.
+        let wake = run(a.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(run(a.release(&wake)), Released::Released);
+        assert_eq!(
+            run(b.acquire_unchanged("owners/x", |v| *v == listed, || true)),
+            Err(AcquireError::Changed)
+        );
+        // Listed again: taken, and the waker's next acquire finds b.
+        let listed = version_of("owners/x");
+        assert_eq!(
+            run(b.acquire_unchanged("owners/x", |v| *v == listed, || false)),
+            Err(AcquireError::LeaseInvalid)
+        );
+        let expired = run(b.acquire_unchanged("owners/x", |v| *v == listed, || true)).unwrap();
+        assert_eq!(
+            (expired.generation, expired.previous),
+            (wake.generation + 1, None)
+        );
+        assert!(matches!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Held { .. })
+        ));
     }
 
     /// A write that landed with a failure reported (its reply lost, or a

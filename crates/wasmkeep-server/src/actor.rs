@@ -50,6 +50,7 @@ mod deletes;
 mod deploys;
 mod disk;
 mod drain;
+mod expiry;
 mod host;
 mod load;
 mod moving;
@@ -127,6 +128,10 @@ pub struct ActorConfig {
     pub secrets: crate::secrets::SecretSet,
     /// Each class's required names (ADR 0016, `requires`).
     pub requires: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// How long each class's actors may stay idle before they are deleted
+    /// (ADR 0028, section 4): the deployed version's limits (in a cluster
+    /// only; classes not listed never expire).
+    pub expire_after_idle: std::collections::BTreeMap<String, Duration>,
     /// Who may reach each class from outside (ADR 0010): the deployed
     /// version's rules, or `--access` for classes not from a deploy.
     pub access: crate::access::AccessRules,
@@ -182,6 +187,7 @@ impl ActorConfig {
             config: std::collections::BTreeMap::new(),
             secrets: crate::secrets::SecretSet::default(),
             requires: std::collections::BTreeMap::new(),
+            expire_after_idle: std::collections::BTreeMap::new(),
             access: crate::access::AccessRules::default(),
             flag_access: None,
             deploy_seq: 0,
@@ -262,6 +268,15 @@ struct ServiceInner {
     handed: std::sync::Mutex<HashMap<ActorAddress, u64>>,
     /// What the metrics page names this node: its app and node id.
     metrics_identity: crate::metrics::Identity,
+    /// Each class's idle limit (ADR 0028, section 4), the deployed
+    /// version's.
+    expiry: std::sync::RwLock<std::collections::BTreeMap<String, Duration>>,
+    /// The app's folder under the data directory, removed once its
+    /// tombstone is seen (ADR 0028, section 5).
+    local_app_dir: std::path::PathBuf,
+    /// Set once the app's tombstone was seen and this node stopped serving
+    /// it (ADR 0028, section 5).
+    app_deleted: tokio::sync::watch::Sender<bool>,
 }
 
 impl ServiceInner {
@@ -458,9 +473,14 @@ impl ActorService {
     /// of their own. A release that does not make it is safe: the node
     /// lease's `released` write frees its record, or else a peer's fence.
     pub async fn shutdown(&self, limit: Duration) {
+        self.stop_actors(limit, 1012, "node shutting down").await;
+    }
+
+    /// [`Self::shutdown`], its sockets closed with `code` and `reason`.
+    async fn stop_actors(&self, limit: Duration, code: u16, reason: &str) {
         let started = tokio::time::Instant::now();
         let resident = self.inner.mailboxes.resident();
-        self.inner.sockets.close_all(1012, "node shutting down");
+        self.inner.sockets.close_all(code, reason);
         self.inner.mailboxes.close();
         if !self.inner.mailboxes.drained(limit).await {
             tracing::warn!(
@@ -495,6 +515,100 @@ impl ActorService {
             }
         }
         tracing::info!(actors = resident, took = ?started.elapsed(), "actors stopped");
+    }
+
+    /// Each class's idle limit from now on (ADR 0028), in seconds: the
+    /// deployed version's, swapped in with it.
+    pub fn set_expiry(&self, limits: &std::collections::BTreeMap<String, u64>) {
+        let limits = limits
+            .iter()
+            .map(|(c, s)| (c.clone(), Duration::from_secs(*s)))
+            .collect();
+        *self
+            .inner
+            .expiry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limits;
+    }
+
+    /// A node following its app's deploys: no actor is acquired until a
+    /// check for the app's tombstone made while its lease was valid finds
+    /// none ([`Self::app_checked`]; ADR 0028, section 5).
+    pub fn expect_app_check(&self) {
+        if let Some(c) = &self.inner.cluster {
+            c.expect_app_check();
+        }
+    }
+
+    /// Whether acquisitions wait for a tombstone check (at start, and after
+    /// a lapse of the node lease).
+    pub fn app_unchecked(&self) -> bool {
+        self.inner
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.app_unchecked())
+    }
+
+    /// The app's folder under the data directory.
+    pub fn local_app_dir(&self) -> &std::path::Path {
+        &self.inner.local_app_dir
+    }
+
+    /// A check for the tombstone made while the lease was valid found none.
+    pub fn app_checked(&self) {
+        if let Some(c) = &self.inner.cluster {
+            c.app_checked();
+        }
+    }
+
+    /// Whether the node lease is valid now (always, outside a cluster).
+    pub fn lease_valid_now(&self) -> bool {
+        self.inner
+            .cluster
+            .as_ref()
+            .is_none_or(|c| c.lease_valid_now())
+    }
+
+    /// The app's tombstone was seen (ADR 0028, section 5): this node stops
+    /// serving it for good. No actor is acquired again; its WebSockets are
+    /// closed with 1001, its events and alarms refused, each actor
+    /// finishes its queued events and is released; then its node lease is
+    /// released (it is no longer live, which `app delete` waits for), and
+    /// its local files of the app are removed. [`Self::app_deleted`]
+    /// resolves after.
+    pub async fn stop_for_deleted_app(&self) {
+        if *self.inner.app_deleted.borrow() {
+            return;
+        }
+        tracing::error!("the app was deleted (wasmkeep app delete): this node stops serving it");
+        if let Some(c) = &self.inner.cluster {
+            c.app_tombstoned();
+        }
+        self.begin_shutdown();
+        self.stop_actors(crate::http::SHUTDOWN_GRACE, 1001, "app deleted")
+            .await;
+        // No new database is opened past the closed mailboxes.
+        let dir = self.inner.local_app_dir.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        if !matches!(removed, Ok(Ok(()))) {
+            tracing::warn!(dir = %self.inner.local_app_dir.display(), "removing this node's local files of the deleted app failed; remove them before reusing this data directory");
+        }
+        self.inner.app_deleted.send_replace(true);
+    }
+
+    /// Resolves once this node stopped serving its app because it was
+    /// deleted ([`Self::stop_for_deleted_app`]); never otherwise. The
+    /// server then shuts down.
+    pub async fn app_deleted(&self) {
+        let mut rx = self.inner.app_deleted.subscribe();
+        let _ = rx.wait_for(|d| *d).await;
     }
 
     /// Live nodes on the same bucket prefix of the version before the

@@ -30,10 +30,12 @@ use wasmkeep_runtime::Runtime;
 use crate::ActorService;
 
 mod collect;
+mod delete;
 use crate::access::AccessRules;
 use crate::actor::FRONT_CLASS as FRONT;
 use crate::env::Vars;
 pub use collect::KEEP_PREVIOUS;
+pub use delete::{DeleteApp, LATE_WRITES, delete_app};
 
 /// Why a deploy, rollback or update failed.
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +77,30 @@ pub enum DeployError {
         /// Their ids, comma separated.
         nodes: String,
     },
+    /// Live nodes of the app do not announce the capability word `ends`
+    /// (ADR 0028): they could not read a version with an idle limit
+    /// (manifest format 4).
+    #[error(
+        "live nodes of {app} cannot read a version with an idle limit (manifest format 4) \
+         ({nodes}): upgrade them first"
+    )]
+    NodesWithoutEnds {
+        /// `tenant/app`.
+        app: String,
+        /// Their ids, comma separated.
+        nodes: String,
+    },
+    /// The app was deleted (`wasmkeep app delete`, ADR 0028): its
+    /// tombstone is in the bucket.
+    #[error(
+        "{0} was deleted (wasmkeep app delete): nothing is written for it; to use the name \
+         again, deploy with --recreate"
+    )]
+    Deleted(String),
+    /// `wasmkeep app delete` refused, or stopped before the data went
+    /// (ADR 0028): why, and what was written.
+    #[error("{0}")]
+    Refused(String),
     /// A rollback would make these classes more open (ADR 0013).
     #[error("rolling back would reopen {0}; pass --allow-reopen to do it anyway")]
     Reopens(String),
@@ -110,6 +136,17 @@ pub struct AppRef {
     tenant: String,
     app: String,
 }
+
+/// The app's tombstone, under `apps/<t>/<a>/` (ADR 0028, section 5).
+pub const TOMBSTONE: &str = "deleted";
+
+/// Left by `deploy --recreate` (the tombstone's body): a node whose local
+/// files of the app hold another value removes them before it serves.
+const RECREATED: &str = "recreated";
+
+/// The local copy of [`RECREATED`], in the app's folder under the data
+/// directory.
+const RECREATED_LOCAL: &str = ".recreated";
 
 /// Longest wait between attempts after a failed update.
 const FOLLOW_BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -185,6 +222,21 @@ impl AppRef {
 
     /// Refuses `manifest` while a live node could not read it.
     async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        if manifest.format_number() >= 4 {
+            let nodes = nodes_without_ends(
+                Arc::clone(&self.store),
+                &self.prefix,
+                &self.tenant,
+                &self.app,
+            )
+            .await?;
+            if !nodes.is_empty() {
+                return Err(DeployError::NodesWithoutEnds {
+                    app: format!("{}/{}", self.tenant, self.app),
+                    nodes: nodes.join(", "),
+                });
+            }
+        }
         if manifest.format_number() < 3 {
             return Ok(());
         }
@@ -201,6 +253,209 @@ impl AppRef {
 
     fn path(&self, key: &str) -> StorePath {
         StorePath::from(format!("{}{key}", self.base))
+    }
+
+    /// `tenant/app`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        format!("{}/{}", self.tenant, self.app)
+    }
+
+    /// The app's tombstone (`apps/<t>/<a>/deleted`, ADR 0028), if it was
+    /// deleted: its body (who and when).
+    ///
+    /// # Errors
+    /// The bucket did not answer.
+    pub async fn tombstone(&self) -> Result<Option<String>, DeployError> {
+        Ok(self
+            .get(TOMBSTONE)
+            .await?
+            .map(|(bytes, _)| String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    /// [`DeployError::Deleted`] if the app has a tombstone.
+    ///
+    /// # Errors
+    /// Deleted, or the bucket did not answer.
+    pub async fn check_not_deleted(&self) -> Result<(), DeployError> {
+        match self.tombstone().await? {
+            Some(_) => Err(DeployError::Deleted(self.name())),
+            None => Ok(()),
+        }
+    }
+
+    /// Writes the app's tombstone, `If-None-Match: *`, holding `body` (who
+    /// and when): `true` if this wrote it, `false` if it was already there
+    /// (an `app delete` resumed).
+    ///
+    /// # Errors
+    /// The bucket did not answer.
+    pub async fn write_tombstone(&self, body: &str) -> Result<bool, DeployError> {
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match self
+            .store
+            .put_opts(
+                &self.path(TOMBSTONE),
+                PutPayload::from(body.as_bytes().to_vec()),
+                opts,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => Ok(false),
+            Err(e) => Err(bucket(e)),
+        }
+    }
+
+    /// Every key of the app but its tombstone, relative to the bucket
+    /// prefix: under `state/<t>/<a>/` (histories, ownership records, the
+    /// alarm index, requests) and `apps/<t>/<a>/` (every version, the
+    /// deploy history, the sealed secrets).
+    ///
+    /// # Errors
+    /// The bucket did not answer.
+    pub async fn app_keys(&self) -> Result<Vec<String>, DeployError> {
+        use futures_util::TryStreamExt as _;
+        let tombstone = self.path(TOMBSTONE);
+        let mut out = Vec::new();
+        for base in [
+            format!("{}state/{}/{}/", self.prefix, self.tenant, self.app),
+            self.base.clone(),
+        ] {
+            let listed: Vec<_> = self
+                .store
+                .list(Some(&StorePath::from(base.trim_end_matches('/'))))
+                .try_collect()
+                .await
+                .map_err(bucket)?;
+            out.extend(
+                listed
+                    .into_iter()
+                    .filter(|m| m.location != tombstone)
+                    .map(|m| m.location.to_string()),
+            );
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Deletes `keys` (from [`Self::app_keys`]), at most 16 at a time.
+    ///
+    /// # Errors
+    /// The bucket did not answer for one of them.
+    pub async fn delete_keys(&self, keys: &[String]) -> Result<(), DeployError> {
+        use futures_util::StreamExt as _;
+        let results: Vec<Result<(), DeployError>> = futures_util::stream::iter(keys)
+            .map(|k| async move {
+                match self.store.delete(&StorePath::from(k.as_str())).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                    Err(e) => Err(bucket(e)),
+                }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+        results.into_iter().collect()
+    }
+
+    /// `deploy --recreate` (ADR 0028): removes the tombstone, only once
+    /// nothing else is left under the app's two prefixes, and leaves the
+    /// marker nodes compare their local files with
+    /// (`apps/<t>/<a>/recreated`, the tombstone's body). `false` if the
+    /// app has no tombstone (nothing to do). Refused until `late` has
+    /// passed since the tombstone and since any of the app's nodes last
+    /// wrote its heartbeat ([`LATE_WRITES`]): a write sent before then may
+    /// still land.
+    ///
+    /// # Errors
+    /// Something is left (run `app delete` again), too soon, or the bucket.
+    pub async fn recreate(&self, late: Duration) -> Result<bool, DeployError> {
+        let Some(body) = self.tombstone().await? else {
+            return Ok(false);
+        };
+        let written = body
+            .lines()
+            .find_map(|l| l.strip_prefix("at ")?.parse::<u64>().ok())
+            .unwrap_or(0);
+        let heartbeats = wasmkeep_cluster::membership::all_heartbeats(
+            &wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+                Arc::clone(&self.store),
+                self.prefix.clone(),
+            ),
+        )
+        .await
+        .map_err(bucket)?;
+        let served = self.name();
+        let last = heartbeats
+            .iter()
+            .filter(|n| n.app == served)
+            .map(|n| n.written_at_ms)
+            .fold(written, u64::max);
+        let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
+        let ready = last.saturating_add(u64::try_from(late.as_millis()).unwrap_or(u64::MAX));
+        if now < ready {
+            return Err(DeployError::Refused(format!(
+                "{served} was deleted moments ago: a write its nodes sent may still land; \
+                 --recreate in {}s",
+                (ready - now).div_ceil(1000)
+            )));
+        }
+        let left = self.app_keys().await?;
+        if !left.is_empty() {
+            return Err(DeployError::Nothing(
+                "the deleted app still has data in the bucket: run `wasmkeep app delete` again to \
+                 finish removing it, then --recreate",
+            ));
+        }
+        self.store
+            .put(&self.path(RECREATED), PutPayload::from(body.into_bytes()))
+            .await
+            .map_err(bucket)?;
+        match self.store.delete(&self.path(TOMBSTONE)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(true),
+            Err(e) => Err(bucket(e)),
+        }
+    }
+
+    /// Before a node serves the app (ADR 0028): refuses an app with a
+    /// tombstone, removing this node's local files of it; and, after a
+    /// `--recreate`, removes local files kept from before the delete
+    /// (`local` is the app's folder under the data directory), so no
+    /// deleted actor comes back from a disk.
+    ///
+    /// # Errors
+    /// [`DeployError::Deleted`], the bucket, or the local folder.
+    pub async fn prepare_local(&self, local: &std::path::Path) -> Result<(), DeployError> {
+        let remove = |why: &str| {
+            if local.exists() {
+                tracing::warn!(dir = %local.display(), "{why}: removing this node's local files of the app");
+                std::fs::remove_dir_all(local)
+                    .map_err(|e| DeployError::Bucket(format!("removing {}: {e}", local.display())))
+            } else {
+                Ok(())
+            }
+        };
+        if self.tombstone().await?.is_some() {
+            remove("the app was deleted")?;
+            return Err(DeployError::Deleted(self.name()));
+        }
+        let Some((marker, _)) = self.get(RECREATED).await? else {
+            return Ok(());
+        };
+        let mine = local.join(RECREATED_LOCAL);
+        if std::fs::read(&mine).ok().as_deref() != Some(marker.as_slice()) {
+            remove("the app was deleted and created again since this node last ran it")?;
+            std::fs::create_dir_all(local)
+                .and_then(|()| std::fs::write(&mine, &marker))
+                .map_err(|e| DeployError::Bucket(format!("writing {}: {e}", mine.display())))?;
+        }
+        Ok(())
     }
 
     async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, UpdateVersion)>, DeployError> {
@@ -346,6 +601,7 @@ impl AppRef {
             access,
             config,
             requires,
+            expire: manifest.expire.clone(),
             front,
         })
     }
@@ -456,6 +712,7 @@ impl AppRef {
         exact: Option<Settings>,
         plan: &mut (dyn FnMut(&Diff) -> bool + Send),
     ) -> Result<Deployed, DeployError> {
+        self.check_not_deleted().await?;
         self.check_layout().await?;
         let every_rule = changes.every_rule;
         if let Some(classes) = &changes.classes {
@@ -650,6 +907,43 @@ impl AppRef {
                 requires.insert(class, names);
             }
         }
+        // Idle limits (ADR 0028): kept for the classes still there unless
+        // the whole set is given, with the changes applied.
+        let mut expire: BTreeMap<String, u64> = match (keep_requires, &base) {
+            (true, Some((_, m, _))) => m
+                .expire
+                .iter()
+                .filter(|(c, _)| table.contains_key(*c))
+                .map(|(c, s)| (c.clone(), *s))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        for (class, secs) in changes.expire {
+            if !table.contains_key(&class) {
+                return Err(DeployError::Invalid(
+                    class,
+                    "an idle limit for a class this version does not have".into(),
+                ));
+            }
+            match secs {
+                Some(secs)
+                    if !(wasmkeep_cluster::expiry::MIN_IDLE_SECS
+                        ..=wasmkeep_cluster::expiry::MAX_IDLE_SECS)
+                        .contains(&secs) =>
+                {
+                    return Err(DeployError::Invalid(
+                        class,
+                        "an idle limit must be between 1h and 36500d".into(),
+                    ));
+                }
+                Some(secs) => {
+                    expire.insert(class, secs);
+                }
+                None => {
+                    expire.remove(&class);
+                }
+            }
+        }
         let mut manifest = Manifest {
             previous: None,
             classes: table,
@@ -657,6 +951,7 @@ impl AppRef {
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires,
+            expire,
         };
         for (class, _) in set.access.restricted() {
             if !manifest.classes.contains_key(&class) {
@@ -764,6 +1059,15 @@ impl AppRef {
         let previous = read.as_ref().map(|(c, _)| c.version.clone());
         self.swap_current(read.map(|(_, v)| v), &version, seq, marked)
             .await?;
+        // Deleted while this deployed (ADR 0028): what it wrote is left to
+        // `app delete`, which removes everything but the tombstone.
+        if self.tombstone().await?.is_some() {
+            return Err(DeployError::Refused(format!(
+                "{} was deleted while this deployed: what the deploy wrote stays in the \
+                 bucket until `wasmkeep app delete` is run again",
+                self.name()
+            )));
+        }
         Ok(Deployed {
             current: Current {
                 version,
@@ -782,6 +1086,7 @@ impl AppRef {
     /// a new, higher `seq`, and its rules and configuration. Refused if that
     /// makes a class more open, unless `allow_reopen` (ADR 0013).
     pub async fn rollback(&self, allow_reopen: bool) -> Result<Deployed, DeployError> {
+        self.check_not_deleted().await?;
         self.check_layout().await?;
         let (current, read) = self
             .read_current()
@@ -828,6 +1133,16 @@ impl AppRef {
     /// [`ActorService::deploy_seq`]), and swaps classes in at event
     /// boundaries when it changes. Runs until the service is dropped.
     pub async fn follow(self, service: ActorService, every: Duration) {
+        // No actor is acquired until a check for the app's tombstone made
+        // while this node's lease was valid finds none (ADR 0028, section
+        // 5): a node whose lease is written after `app delete` read the
+        // live nodes sees the tombstone, one written before is seen live.
+        // The same after every lapse of the lease (a node paused or cut off
+        // while the app was deleted, and maybe created again).
+        service.expect_app_check();
+        if !self.app_check(&service).await {
+            return;
+        }
         let wake = service.deploy_wakeup();
         // After a failure (a version this node cannot build, a bucket
         // outage), wait longer each time, wake-ups included: refused
@@ -841,10 +1156,17 @@ impl AppRef {
                     () = wake.notified() => {}
                 },
             }
+            if service.app_unchecked() && !self.app_check(&service).await {
+                return;
+            }
             match self.update(&service).await {
                 Ok(_) => {
                     backoff = None;
                     service.set_deploy_behind(false);
+                }
+                Err(DeployError::Deleted(_)) => {
+                    service.stop_for_deleted_app().await;
+                    return;
                 }
                 Err(e) => {
                     // Read but not applicable: this node would decide under
@@ -864,8 +1186,51 @@ impl AppRef {
         }
     }
 
+    /// Until a check sent while the lease is valid settles it: `true` once
+    /// the app has no tombstone and was not created again since this node
+    /// prepared its local files (acquisitions may go on); `false` once this
+    /// node stopped serving it.
+    async fn app_check(&self, service: &ActorService) -> bool {
+        loop {
+            if !service.lease_valid_now() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            match self.still_ours(service.local_app_dir()).await {
+                Ok(true) => {
+                    service.app_checked();
+                    return true;
+                }
+                Ok(false) => {
+                    service.stop_for_deleted_app().await;
+                    return false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "checking whether the app was deleted failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// Whether this node may go on serving the app with the local files in
+    /// `local`: no tombstone, and no `--recreate` since it prepared them
+    /// ([`Self::prepare_local`] wrote the marker it compares).
+    async fn still_ours(&self, local: &std::path::Path) -> Result<bool, DeployError> {
+        if self.tombstone().await?.is_some() {
+            return Ok(false);
+        }
+        let Some((marker, _)) = self.get(RECREATED).await? else {
+            return Ok(true);
+        };
+        Ok(std::fs::read(local.join(RECREATED_LOCAL)).ok().as_deref() == Some(marker.as_slice()))
+    }
+
     /// One check of `current`; swaps classes in if it changed.
     pub async fn update(&self, service: &ActorService) -> Result<bool, DeployError> {
+        // The app deleted (ADR 0028, section 5): checked at every version
+        // check, before `current`.
+        self.check_not_deleted().await?;
         let Some(current) = self.current().await? else {
             return Ok(false);
         };
@@ -877,6 +1242,7 @@ impl AppRef {
             access,
             config,
             requires,
+            expire,
             front,
         } = self.version(&current.version).await?;
         // Everything compiled first, then swapped in at once with the
@@ -917,6 +1283,7 @@ impl AppRef {
                     DeployError::Invalid(name, e.to_string())
                 }
             })?;
+        service.set_expiry(&expire);
         tracing::info!(version = %current.version, seq = current.seq, "now running the deployed version");
         Ok(true)
     }
@@ -1005,6 +1372,9 @@ pub struct Changes {
     /// `(class, names)`: replaces the names the class requires among its
     /// values (ADR 0016); empty removes them.
     pub requires: Vec<(String, std::collections::BTreeSet<String>)>,
+    /// `(class, limit)`: sets how long the class's actors may stay idle
+    /// before they are deleted, in seconds (ADR 0028); `None` removes it.
+    pub expire: Vec<(String, Option<u64>)>,
     /// The front (ADR 0023): kept by default.
     pub front: FrontChange,
     /// The front's configuration (`--front-config`): `None` keeps it,
@@ -1027,6 +1397,9 @@ pub struct Part {
     pub config: Option<Vars>,
     /// Empty removes them.
     pub requires: std::collections::BTreeSet<String>,
+    /// A class's idle limit in seconds (ADR 0028); `None`: never. Ignored
+    /// for the front.
+    pub expire: Option<u64>,
 }
 
 impl std::fmt::Debug for Part {
@@ -1058,6 +1431,7 @@ impl Changes {
             changes.access.push((name.clone(), access));
             changes.config.push((name.clone(), part.config));
             changes.requires.push((name.clone(), part.requires));
+            changes.expire.push((name.clone(), part.expire));
             if let Some(table) = changes.classes.as_mut() {
                 table.push((name, part.wasm));
             }
@@ -1184,6 +1558,8 @@ pub struct Diff {
     /// ADR 0026) or no longer written (`false`, a flag deploy after one).
     /// The rule does not change; the version does.
     pub open_written: Vec<(String, bool)>,
+    /// `"class: expire after idle never -> 7d"` and the like (ADR 0028).
+    pub expire: Vec<String>,
 }
 
 impl Diff {
@@ -1201,6 +1577,7 @@ impl Diff {
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
+            expire: BTreeMap::new(),
         };
         let empty = Settings::default();
         let (bm, bs) = before.unwrap_or((&empty_manifest, &empty));
@@ -1291,6 +1668,20 @@ impl Diff {
                 diff.requires
                     .push(format!("{class}: {name} no longer required"));
             }
+            let idle = |s: Option<&u64>| {
+                s.map_or_else(
+                    || "never".to_owned(),
+                    |s| wasmkeep_cluster::expiry::format_idle(*s),
+                )
+            };
+            let (b, a) = (bm.expire.get(class), am.expire.get(class));
+            if class != FRONT && a != b && (a.is_some() || bm.classes.contains_key(class)) {
+                diff.expire.push(format!(
+                    "{class}: expire after idle {} -> {}",
+                    idle(b),
+                    idle(a)
+                ));
+            }
         }
         diff
     }
@@ -1324,6 +1715,7 @@ impl Diff {
         }));
         out.extend(self.config.iter().map(|l| format!("config {l}")));
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
+        out.extend(self.expire.iter().cloned());
         out.extend(
             self.open_past_front.iter().map(|c| {
                 format!("class {c}: open, reachable at /actor/{c}/<name>, past the front")
@@ -1375,6 +1767,9 @@ pub struct Version {
     /// Each class's required names (ADR 0016; classes not listed require
     /// none).
     pub requires: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Each class's idle limit in seconds (ADR 0028; classes not listed
+    /// never expire).
+    pub expire: BTreeMap<String, u64>,
     /// The version's front (ADR 0023), if it has one. Its values are not
     /// in `config` and `requires`, which hold classes only.
     pub front: Option<VersionFront>,
@@ -1471,6 +1866,10 @@ pub struct Manifest {
     /// Class name (or `_front`, with a front) -> the names it requires among its values (ADR 0016):
     /// a class missing one refuses its events.
     pub requires: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Class name -> how long its actors may stay idle before they are
+    /// deleted, in seconds (`expire <class> <secs>`, ADR 0028): written in
+    /// format 4 only, so a version without one keeps its bytes and id.
+    pub expire: BTreeMap<String, u64>,
 }
 
 impl Manifest {
@@ -1500,6 +1899,9 @@ impl Manifest {
                 out.push_str(&format!("requires {class} {name}\n"));
             }
         }
+        for (class, secs) in &self.expire {
+            out.push_str(&format!("expire {class} {secs}\n"));
+        }
         out
     }
 
@@ -1519,7 +1921,9 @@ impl Manifest {
     /// 0013, kept as the minimal one), else 2.
     #[must_use]
     pub fn format_number(&self) -> u8 {
-        if self.front.is_some() || self.access.values().any(|s| s == "open") {
+        if !self.expire.is_empty() {
+            4
+        } else if self.front.is_some() || self.access.values().any(|s| s == "open") {
             3
         } else if self.access.is_empty() && self.config.is_empty() && self.requires.is_empty() {
             1
@@ -1543,6 +1947,7 @@ impl Manifest {
             "wasmkeep-manifest 1" => 1,
             "wasmkeep-manifest 2" => 2,
             "wasmkeep-manifest 3" => 3,
+            "wasmkeep-manifest 4" => 4,
             _ => return None,
         };
         let mut manifest = Self {
@@ -1552,6 +1957,7 @@ impl Manifest {
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
+            expire: BTreeMap::new(),
         };
         for line in lines {
             // `access` keeps the rest of the line: names may hold spaces.
@@ -1590,6 +1996,19 @@ impl Manifest {
                 (Some("config"), Some(n), Some(d), None) if format >= 2 => {
                     manifest.config.insert(n.to_owned(), d.to_owned());
                 }
+                // A class's idle limit (ADR 0028), once per class.
+                (Some("expire"), Some(n), Some(secs), None)
+                    if format >= 4 && !manifest.expire.contains_key(n) =>
+                {
+                    let secs: u64 = secs.parse().ok()?;
+                    if !(wasmkeep_cluster::expiry::MIN_IDLE_SECS
+                        ..=wasmkeep_cluster::expiry::MAX_IDLE_SECS)
+                        .contains(&secs)
+                    {
+                        return None;
+                    }
+                    manifest.expire.insert(n.to_owned(), secs);
+                }
                 (Some("requires"), Some(n), Some(name), None)
                     if format >= 2 && crate::env::valid_name(name) =>
                 {
@@ -1607,6 +2026,7 @@ impl Manifest {
         // and only beside a `front` line.
         let scoped = |c: &String| known(c) || (manifest.front.is_some() && c == FRONT);
         if !manifest.access.keys().all(known)
+            || !manifest.expire.keys().all(known)
             || !manifest.config.keys().all(scoped)
             || !manifest.requires.keys().all(scoped)
         {
@@ -1644,6 +2064,59 @@ pub async fn secrets_readers_without_front(
     app: &str,
 ) -> Result<Vec<String>, DeployError> {
     without_front(store, prefix, tenant, app, true).await
+}
+
+/// Live nodes of `tenant/app` whose heartbeat does not announce `ends`
+/// (ADR 0028), under the bucket key `prefix`: they cannot read a version
+/// with an idle limit, and would keep serving an app deleted under them.
+///
+/// # Errors
+/// The bucket did not answer.
+pub async fn nodes_without_ends(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> Result<Vec<String>, DeployError> {
+    Ok(live_nodes(store, prefix, tenant, app)
+        .await?
+        .into_iter()
+        .filter(|n| !n.can_end)
+        .map(|n| n.id)
+        .collect())
+}
+
+/// The live nodes of `tenant/app` under the bucket key `prefix`, live as
+/// `cluster status` counts them (the default horizon, this machine's
+/// clock).
+///
+/// # Errors
+/// The bucket did not answer.
+pub async fn live_nodes(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> Result<Vec<wasmkeep_cluster::membership::NodeInfo>, DeployError> {
+    let prefix = if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}/")
+    };
+    let heartbeats = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
+    let horizon = crate::heartbeat_horizon_ms(
+        crate::DEFAULT_HEARTBEAT,
+        &crate::LeaseConfig::default_safe(),
+    );
+    let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
+    let served = format!("{tenant}/{app}");
+    let nodes = wasmkeep_cluster::membership::all_heartbeats(&heartbeats)
+        .await
+        .map_err(bucket)?;
+    Ok(nodes
+        .into_iter()
+        .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon) && n.app == served)
+        .collect())
 }
 
 async fn without_front(
@@ -1709,6 +2182,7 @@ mod tests {
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
+            expire: BTreeMap::new(),
         }
     }
 
@@ -1884,6 +2358,7 @@ mod tests {
                 Vars::from([("URL".to_owned(), "https://hidden.test".to_owned())]),
             )]),
             requires: BTreeMap::new(),
+            expire: BTreeMap::new(),
             front: None,
         };
         let shown = format!("{v:?}");
@@ -1918,8 +2393,16 @@ mod tests {
     fn manifests_with_unknown_or_inconsistent_lines_are_refused() {
         let base = "wasmkeep-manifest 2\nclass chat 11\n";
         for bad in [
-            "wasmkeep-manifest 4\nclass chat 11\n".to_owned(),
+            "wasmkeep-manifest 5\nclass chat 11\n".to_owned(),
             format!("{base}secret chat 11\n"),
+            // Idle limits (ADR 0028): format 4 only, a known class, once,
+            // between an hour and the longest.
+            format!("{base}expire chat 3600\n"),
+            "wasmkeep-manifest 3\nclass chat 11\nexpire chat 3600\n".to_owned(),
+            "wasmkeep-manifest 4\nclass chat 11\nexpire other 3600\n".to_owned(),
+            "wasmkeep-manifest 4\nclass chat 11\nexpire chat 3599\n".to_owned(),
+            "wasmkeep-manifest 4\nclass chat 11\nexpire chat 7d\n".to_owned(),
+            "wasmkeep-manifest 4\nclass chat 11\nexpire chat 3600\nexpire chat 7200\n".to_owned(),
             format!("{base}access other existing\n"),
             format!("{base}config other 33\n"),
             format!("{base}access chat closed\n"),
@@ -1933,6 +2416,22 @@ mod tests {
         ] {
             assert_eq!(Manifest::parse(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn an_idle_limit_makes_format_4_and_reads_back() {
+        // ADR 0028: without a limit, the version keeps its bytes and id.
+        let mut m = two_classes();
+        let before = (m.format(), m.version_id());
+        m.expire.insert("chat".into(), 7 * 86_400);
+        assert_eq!(m.format_number(), 4);
+        let text = m.format();
+        assert!(text.starts_with("wasmkeep-manifest 4\n"), "{text}");
+        assert!(text.ends_with("expire chat 604800\n"), "{text}");
+        assert_ne!(m.version_id(), before.1);
+        assert_eq!(Manifest::parse(&text), Some(m.clone()));
+        m.expire.clear();
+        assert_eq!((m.format(), m.version_id()), before);
     }
 
     #[test]
@@ -2000,6 +2499,7 @@ mod tests {
             access: BTreeMap::new(),
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
+            expire: BTreeMap::new(),
         };
         assert_eq!(alone.format(), "wasmkeep-manifest 3\nfront main 44\n");
         assert_eq!(Manifest::parse(&alone.format()), Some(alone));

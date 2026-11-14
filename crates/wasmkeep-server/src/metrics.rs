@@ -251,6 +251,14 @@ pub(crate) struct Metrics {
     pub(crate) actor_deletes: Family<AtomicU64>,
     /// Actor deletes that failed to be recorded, by `how`.
     pub(crate) actor_delete_failures: Family<AtomicU64>,
+    /// Idle-expiry passes this node ran as the collector (ADR 0028).
+    pub(crate) expiry_passes: AtomicU64,
+    /// Idle actors those passes found (candidates acted on).
+    pub(crate) expiry_candidates: AtomicU64,
+    /// Candidates kept, by `reason` (ADR 0028): the record `changed` since
+    /// the listing (a wake), an `alarm` or a `socket`, the actor `active`
+    /// here, or the expiry `failed`.
+    pub(crate) expiry_kept: Family<AtomicU64>,
     /// Ownership records the WebSocket owner sweep read.
     pub(crate) websocket_sweep_reads: AtomicU64,
     /// Ownership records the WebSocket owner sweep could not decode and
@@ -344,6 +352,12 @@ pub(crate) fn deleted(how: &str) {
     inc(&METRICS.actor_deletes.get(&[("how", how)]));
 }
 
+/// Counts an idle-expiry candidate kept, by `reason`
+/// ([`EXPIRY_KEPT_REASONS`]).
+pub(crate) fn expiry_kept(reason: &str) {
+    inc(&METRICS.expiry_kept.get(&[("reason", reason)]));
+}
+
 /// Counts an actor delete that failed to be recorded, by `how`.
 pub(crate) fn delete_failed(how: &str) {
     inc(&METRICS.actor_delete_failures.get(&[("how", how)]));
@@ -417,7 +431,10 @@ pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
     ["event", "sweep", "lease_lapse", "drain", "move"];
 /// `how` of `wasmkeep_actor_deletes_total` and
 /// `wasmkeep_actor_delete_failures_total` (ADR 0028).
-pub(crate) const DELETE_HOWS: [&str; 3] = ["self", "self_durable", "operator"];
+pub(crate) const DELETE_HOWS: [&str; 4] = ["self", "self_durable", "operator", "expired"];
+/// `reason` of `wasmkeep_expiry_kept_total` (ADR 0028).
+pub(crate) const EXPIRY_KEPT_REASONS: [&str; 5] =
+    ["changed", "alarm", "socket", "active", "failed"];
 /// `read` of `wasmkeep_websocket_sweep_unreadable_total`.
 pub(crate) const SWEEP_UNREADABLE_READS: [&str; 2] = ["owner", "parked"];
 /// `reason` of `wasmkeep_parked_releases_total`.
@@ -493,6 +510,7 @@ impl Metrics {
         one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
         one(&m.actor_deletes, "how", &DELETE_HOWS);
         one(&m.actor_delete_failures, "how", &DELETE_HOWS);
+        one(&m.expiry_kept, "reason", &EXPIRY_KEPT_REASONS);
         one(
             &m.websocket_sweep_unreadable,
             "read",
@@ -825,6 +843,24 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_actor_delete_failures_total",
         "Actor deletes that failed to be recorded (the data stays), by how they were asked for.",
         &m.actor_delete_failures,
+    );
+    counter(
+        &mut out,
+        "wasmkeep_expiry_passes_total",
+        "Idle-expiry passes this node ran as the collecting node.",
+        m.expiry_passes.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_expiry_candidates_total",
+        "Idle actors the expiry passes found and acted on.",
+        m.expiry_candidates.load(Ordering::Relaxed),
+    );
+    family(
+        &mut out,
+        "wasmkeep_expiry_kept_total",
+        "Idle-expiry candidates kept, by reason (the record changed since the listing, an alarm, a socket, active here, or failed).",
+        &m.expiry_kept,
     );
     counter(
         &mut out,
@@ -1274,6 +1310,11 @@ mod tests {
             ),
             ("wasmkeep_actor_deletes_total", "how", &DELETE_HOWS[..]),
             (
+                "wasmkeep_expiry_kept_total",
+                "reason",
+                &EXPIRY_KEPT_REASONS[..],
+            ),
+            (
                 "wasmkeep_actor_delete_failures_total",
                 "how",
                 &DELETE_HOWS[..],
@@ -1439,6 +1480,7 @@ mod tests {
                 include_str!("actor/host.rs"),
                 include_str!("actor/state.rs"),
                 include_str!("actor/deletes.rs"),
+                include_str!("actor/expiry.rs"),
             ]
             .iter()
             .flat_map(|src| {

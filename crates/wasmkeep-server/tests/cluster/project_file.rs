@@ -22,6 +22,7 @@ fn file_changes(with_d: bool) -> Changes {
         wasm: wasm.to_vec(),
         config: None,
         requires: BTreeSet::new(),
+        expire: None,
     };
     let mut classes = vec![("c".to_owned(), "open".to_owned(), part(counter_wasm()))];
     if with_d {
@@ -247,6 +248,7 @@ async fn a_file_with_a_front_and_an_added_open_class() {
         wasm: wasm.to_vec(),
         config: None,
         requires: requires.iter().map(|s| (*s).to_owned()).collect(),
+        expire: None,
     };
     let changes = Changes::whole(
         Some(Part {

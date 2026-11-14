@@ -233,6 +233,13 @@ impl Cluster {
     /// pending releases, and none is valid again (ADR 0020, section 1):
     /// the actors are acquired afresh, at new generations.
     fn publish_validity(&self, lease: &NodeLease<ObjectStoreBucket, SystemClock>) {
+        // Not valid until now (the first write, or a lapse: a node paused or
+        // cut off): a node following its app checks for its tombstone again
+        // before it acquires (ADR 0028). Re-armed before the new validity,
+        // and its epoch, are published.
+        if !self.validity.valid() {
+            self.rearm_app_check();
+        }
         if self.validity.publish(lease.valid_until_ms()) {
             tracing::warn!("this node's lease ran out: every actor it held is released");
             self.end_holds_after_lapse();

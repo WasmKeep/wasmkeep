@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod app_delete;
 mod dev;
 mod dev_project;
 mod diagnose;
@@ -61,6 +62,46 @@ enum Command {
     /// optionally a front, its wasmkeep.toml, a README, .gitignore and an
     /// .env.local example. It builds and runs with `wasmkeep dev`.
     New(new_cmd::NewArgs),
+    /// Act on a whole app, through its bucket.
+    #[command(subcommand)]
+    App(AppCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum AppCommand {
+    /// Delete an app (ADR 0028): writes its tombstone first, from which
+    /// deploys refuse the app and its nodes stop serving it within a few
+    /// seconds (closing its WebSockets with 1001); then, once no live node
+    /// of the app is left, removes every key under its two prefixes: every
+    /// actor's history, the ownership records, the alarm index, the
+    /// requests, every deployed version and the sealed secrets. The
+    /// tombstone stays; `deploy --recreate` reuses the name. Run it again
+    /// to finish a delete that stopped. Cannot be undone. Keys held
+    /// outside the bucket (the secrets key) are yours to destroy.
+    Delete(AppDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+struct AppDeleteArgs {
+    /// The app, TENANT/APP.
+    #[arg(long, value_parser = parse_app)]
+    app: (String, String),
+
+    /// Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from
+    /// the AWS_* environment variables).
+    #[arg(long)]
+    bucket: String,
+
+    /// How long to wait for the app's live nodes to stop, in seconds;
+    /// still live then, the command stops with the tombstone written and
+    /// nothing removed (run it again).
+    #[arg(long, default_value_t = 60, value_name = "SECS")]
+    wait: u64,
+
+    /// Remove the data even though nodes of the app still look live: only
+    /// after `wasmkeep cluster fence` of each of them.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -314,6 +355,7 @@ struct DeployArgs {
         conflicts_with_all = [
             "actors", "access", "config", "requires",
             "front", "no_front", "front_config", "front_requires",
+            "expire_after_idle",
         ]
     )]
     rollback: bool,
@@ -321,6 +363,23 @@ struct DeployArgs {
     /// Let a rollback make a class more open (refused otherwise).
     #[arg(long, requires = "rollback")]
     allow_reopen: bool,
+
+    /// How long a class's actors may stay idle before they are deleted, as
+    /// CLASS=DURATION (`7d`, `36h`, `90m`; at least 1h) (ADR 0028): in a
+    /// cluster, an actor with no event for that long, no pending alarm
+    /// and no open WebSocket is deleted. Part of the version; classes not
+    /// named keep theirs; CLASS= removes it. Repeatable.
+    #[arg(
+        long = "expire-after-idle",
+        value_name = "CLASS=DURATION",
+        value_parser = parse_expire
+    )]
+    expire_after_idle: Vec<(String, Option<u64>)>,
+
+    /// Deploy to an app deleted with `wasmkeep app delete`: its tombstone
+    /// is removed first, only if nothing else of it is left in the bucket.
+    #[arg(long, conflicts_with = "rollback")]
+    recreate: bool,
 
     /// Seconds an old version stays in the bucket before this command may
     /// delete it (ADR 0012). The current version and the five before it are
@@ -1088,6 +1147,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
         Command::Actor(ActorCommand::Delete(args)) => actor_delete(&args),
+        Command::App(AppCommand::Delete(args)) => app_delete::run(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
         Command::Dev(args) => dev(args),
         Command::New(args) => new_cmd::run(&args),
@@ -1329,6 +1389,12 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             check_layout(bucket, &store, &prefix, tenant)?;
             let app_store = std::sync::Arc::clone(&store);
             let app_ref = AppRef::new(store, &prefix, tenant, name);
+            // A deleted app is never served, and this node's files of it
+            // go; after a `--recreate`, files from before the delete go
+            // too (ADR 0028).
+            let local = wasmkeep_server::local_app_dir(&args.data_dir, tenant, name);
+            rt.block_on(app_ref.prepare_local(&local))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             // Before the first deploy: wait for one, as a running node
             // waits for the next (nothing below can start without it).
             let Some((current, deployed)) = rt.block_on(async {
@@ -1357,6 +1423,11 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             deployed_rules = Some((current.marked, deployed.access));
             config.config = deployed.config;
             config.requires = deployed.requires;
+            config.expire_after_idle = deployed
+                .expire
+                .iter()
+                .map(|(c, s)| (c.clone(), std::time::Duration::from_secs(*s)))
+                .collect();
             // The version's front (ADR 0023), compiled like its classes.
             if let Some(front) = deployed.front {
                 let component = cache
@@ -1449,6 +1520,9 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             cluster.failover_wait = args.failover_wait_secs.map(std::time::Duration::from_secs);
             // Three quarters of the connections stay for everything else.
             cluster.failover_wait_max = max_connections / 4;
+            // Follows its app: no actor before a check for its tombstone
+            // (ADR 0028).
+            cluster.follows_app = args.app.is_some();
             cluster.reads_secrets = !args.no_secrets;
             if let Some((tenant, name)) = &args.app {
                 cluster.app = format!("{tenant}/{name}");
@@ -1595,7 +1669,18 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     None => std::future::pending().await,
                 }
             };
+            let app_deleted = async {
+                match &actors {
+                    Some(a) => a.app_deleted().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
+                () = app_deleted => {
+                    let why = "the app was deleted (wasmkeep app delete): this node no longer serves it".to_owned();
+                    tracing::error!("shutting down: {why}");
+                    *lost_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+                }
                 () = stop_signal() => tracing::info!("shutting down"),
                 why = node_id_lost => {
                     tracing::error!("shutting down: {why}");
@@ -1835,6 +1920,7 @@ fn version_flags(args: &DeployArgs) -> Vec<&'static str> {
         ("--no-front", args.no_front),
         ("--front-config", args.front_config.is_some()),
         ("--front-requires", args.front_requires.is_some()),
+        ("--expire-after-idle", !args.expire_after_idle.is_empty()),
     ]
     .into_iter()
     .filter_map(|(flag, given)| given.then_some(flag))
@@ -1884,6 +1970,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         anyhow::anyhow!(e.to_string().replace("<this bucket>", &args.bucket))
     };
     let from_file = file_changes.is_some();
+    if args.recreate
+        && rt
+            .block_on(app_ref.recreate(wasmkeep_server::apps::LATE_WRITES))
+            .map_err(named)?
+    {
+        println!("{tenant}/{name}: the deleted app's tombstone is removed; deploying it anew");
+    }
     let deployed = if args.rollback {
         rt.block_on(app_ref.rollback(args.allow_reopen))
             .map_err(named)?
@@ -1904,9 +1997,11 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 && args.front.is_none()
                 && !args.no_front
                 && args.front_config.is_none()
-                && args.front_requires.is_none()),
-            "nothing to deploy: give --actor, --access, --config, --requires or a front flag \
-             (--front, --no-front, --front-config, --front-requires), or --rollback"
+                && args.front_requires.is_none()
+                && args.expire_after_idle.is_empty()),
+            "nothing to deploy: give --actor, --access, --config, --requires, \
+             --expire-after-idle or a front flag (--front, --no-front, --front-config, \
+             --front-requires), or --rollback"
         );
         let runtime = Runtime::new(&RuntimeConfig::default())?;
         let mut classes = Vec::new();
@@ -1965,6 +2060,16 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                     );
                 }
                 args.requires.clone()
+            },
+            expire: {
+                let mut seen = std::collections::BTreeSet::new();
+                for (class, _) in &args.expire_after_idle {
+                    anyhow::ensure!(
+                        seen.insert(class.clone()),
+                        "--expire-after-idle names {class} twice"
+                    );
+                }
+                args.expire_after_idle.clone()
             },
             every_rule: false,
         };
@@ -2214,6 +2319,22 @@ fn cluster_forget(args: &NodeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuses an app deleted with `wasmkeep app delete` (ADR 0028): nothing
+/// is written for it.
+pub(crate) fn refuse_deleted(
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> anyhow::Result<()> {
+    let app_ref = AppRef::new(std::sync::Arc::clone(store), prefix, tenant, app);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(app_ref.check_not_deleted())
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// Writes the actor's move request (ADR 0017), under its app's root.
 fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
     actor_move_on(args, || open_bucket(&args.bucket))
@@ -2242,6 +2363,8 @@ fn actor_move_on(
     )?;
     let (store, prefix) = open()?;
     check_layout(&args.bucket, &store, &prefix, tenant)?;
+    refuse_deleted(&store, &prefix, tenant, &app)?;
+    let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2260,6 +2383,11 @@ fn actor_move_on(
         }
     }
     rt.block_on(keys.put_empty(&key))?;
+    // Deleted meanwhile (ADR 0028): the request is taken back.
+    if let Err(e) = refuse_deleted(&app_store, &app_prefix, tenant, &app) {
+        let _ = rt.block_on(keys.delete(&key));
+        return Err(e);
+    }
     println!(
         "Asked the owner of {tenant}/{class}/{name} to move it to {} (expires in 5 minutes).",
         args.to
@@ -2295,6 +2423,8 @@ fn actor_delete_on(
     let key = control::checked_delete_key(&root, &class, &name, &control::new_request_id())?;
     let (store, prefix) = open()?;
     check_layout(&args.bucket, &store, &prefix, &tenant)?;
+    refuse_deleted(&store, &prefix, &tenant, &app)?;
+    let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2312,6 +2442,11 @@ fn actor_delete_on(
         rt.block_on(keys.list_keys(&folder))
     };
     rt.block_on(keys.put_empty(&key))?;
+    // Deleted meanwhile (ADR 0028): the request is taken back.
+    if let Err(e) = refuse_deleted(&app_store, &app_prefix, &tenant, &app) {
+        let _ = rt.block_on(keys.delete(&key));
+        return Err(e);
+    }
     let written = listed(&keys)?
         .into_iter()
         .find(|(k, _)| *k == key)
@@ -2491,6 +2626,22 @@ fn cluster_status(args: StatusArgs) -> anyhow::Result<()> {
 /// configuration).
 fn parse_path(s: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(s))
+}
+
+/// `--expire-after-idle CLASS=DURATION` (ADR 0028): the limit in seconds,
+/// or `None` for `CLASS=` (removes it).
+fn parse_expire(s: &str) -> Result<(String, Option<u64>), String> {
+    let (class, limit) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected CLASS=DURATION, got {s:?}"))?;
+    if class.is_empty() || class == FRONT_SCOPE {
+        return Err(format!("expected a class name in {s:?}"));
+    }
+    if limit.is_empty() {
+        return Ok((class.to_owned(), None));
+    }
+    let secs = wasmkeep_cluster::expiry::parse_idle(limit)?;
+    Ok((class.to_owned(), Some(secs)))
 }
 
 /// `--front-requires NAMES`: comma-separated names, empty for none.
@@ -3053,6 +3204,7 @@ mod tests {
             can_take,
             can_front: true,
             can_handoff: true,
+            can_end: true,
             instance: None,
             lease: None,
             load: None,
@@ -3401,6 +3553,158 @@ mod tests {
             ]
         );
         assert!(super::change_lines(&deployed(false), true).is_empty());
+    }
+
+    #[test]
+    fn idle_limits_and_app_delete_parse() {
+        use clap::Parser as _;
+        // ADR 0028: --expire-after-idle CLASS=DURATION, CLASS= removes it.
+        let deploy = |args: &[&str]| {
+            super::Cli::try_parse_from(
+                ["wasmkeep", "deploy", "--app", "t/a", "--bucket", "s3://b"]
+                    .iter()
+                    .chain(args),
+            )
+        };
+        let limits = |args: &[&str]| match deploy(args).unwrap().command {
+            super::Command::Deploy(d) => d.expire_after_idle,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            limits(&[
+                "--expire-after-idle",
+                "carts=7d",
+                "--expire-after-idle",
+                "rooms="
+            ]),
+            [
+                ("carts".to_owned(), Some(7 * 86_400)),
+                ("rooms".to_owned(), None)
+            ]
+        );
+        for bad in [
+            "carts=30m",
+            "carts=7",
+            "carts",
+            "=7d",
+            "_front=7d",
+            "carts=7w",
+        ] {
+            assert!(deploy(&["--expire-after-idle", bad]).is_err(), "{bad}");
+        }
+        assert!(deploy(&["--rollback", "--expire-after-idle", "c=1h"]).is_err());
+        assert!(deploy(&["--recreate", "--actor", "c=c.wasm"]).is_ok());
+        assert!(deploy(&["--recreate", "--rollback"]).is_err());
+        // `app delete --app T/A --bucket ...`, with its wait and --force.
+        let delete = |args: &[&str]| {
+            super::Cli::try_parse_from(["wasmkeep", "app", "delete"].iter().chain(args))
+        };
+        match delete(&["--app", "acme/legacy", "--bucket", "s3://b/p"])
+            .unwrap()
+            .command
+        {
+            super::Command::App(super::AppCommand::Delete(d)) => {
+                assert_eq!(d.app, ("acme".to_owned(), "legacy".to_owned()));
+                assert_eq!((d.wait, d.force), (60, false));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            delete(&[
+                "--app",
+                "acme/legacy",
+                "--bucket",
+                "s3://b",
+                "--wait",
+                "5",
+                "--force"
+            ])
+            .is_ok()
+        );
+        assert!(
+            delete(&["--bucket", "s3://b"]).is_err(),
+            "--app is required"
+        );
+        assert!(delete(&["--app", "acme", "--bucket", "s3://b"]).is_err());
+    }
+
+    /// `app delete` against a bucket with no node: the tombstone, every key
+    /// of the app but it removed, other apps untouched; run again, it
+    /// finishes; the implicit app is refused.
+    #[test]
+    fn app_delete_removes_both_prefixes_and_keeps_the_tombstone() {
+        use object_store::ObjectStoreExt as _;
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let keys = [
+            "p/apps/acme/legacy/current",
+            "p/apps/acme/legacy/0123/manifest",
+            "p/apps/acme/legacy/secrets/0000000000000001",
+            "p/state/acme/legacy/actors/c/n/wal/1",
+            "p/state/acme/legacy/owners/c/n",
+            "p/state/acme/other/owners/c/n",
+            "p/apps/acme/legacy-two/current",
+        ];
+        rt.block_on(async {
+            for k in keys {
+                store
+                    .put(&object_store::path::Path::from(k), b"x".to_vec().into())
+                    .await
+                    .unwrap();
+            }
+        });
+        let ask = wasmkeep_server::apps::DeleteApp {
+            wait: std::time::Duration::from_secs(1),
+            force: false,
+            who: "test".into(),
+            late: std::time::Duration::from_millis(10),
+        };
+        let run = |tenant: &str, app: &str| {
+            let mut said = Vec::new();
+            let out = rt.block_on(wasmkeep_server::apps::delete_app(
+                std::sync::Arc::clone(&store),
+                "p",
+                tenant,
+                app,
+                &ask,
+                &mut |l| said.push(l),
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(10),
+            ));
+            (out, said)
+        };
+        let (out, said) = run("acme", "legacy");
+        assert!(
+            out.as_ref().unwrap().contains("5 object(s) removed"),
+            "{out:?}"
+        );
+        assert!(said[0].contains("tombstone written"), "{said:?}");
+        let left: Vec<String> = rt.block_on(async {
+            use futures_util::TryStreamExt as _;
+            store
+                .list(None)
+                .map_ok(|m| m.location.to_string())
+                .try_collect()
+                .await
+                .unwrap()
+        });
+        assert_eq!(
+            left,
+            [
+                "p/apps/acme/legacy-two/current",
+                "p/apps/acme/legacy/deleted",
+                "p/state/acme/other/owners/c/n",
+            ]
+        );
+        let (out, said) = run("acme", "legacy");
+        assert!(out.unwrap().contains("0 object(s) removed"));
+        assert!(said[0].contains("already deleted"), "{said:?}");
+        assert!(run("acme", "none").0.is_err(), "no such app");
+        assert!(run("default", "default").0.is_err(), "the implicit app");
     }
 
     #[test]

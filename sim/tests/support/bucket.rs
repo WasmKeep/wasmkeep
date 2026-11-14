@@ -65,6 +65,34 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// When each key was last written, by the simulation's clock (ms since
+    /// [`reset_modified`]): what a listing's last-modified time says.
+    static MODIFIED: std::cell::RefCell<(Option<madsim::time::Instant>, BTreeMap<String, u64>)> =
+        const { std::cell::RefCell::new((None, BTreeMap::new())) };
+}
+
+/// Starts the last-modified clock at 0 and forgets every time recorded: a
+/// simulation that lists with times calls it first.
+#[allow(dead_code, reason = "not every simulation lists with times")]
+pub(crate) fn reset_modified() {
+    MODIFIED.with(|m| *m.borrow_mut() = (Some(madsim::time::Instant::now()), BTreeMap::new()));
+}
+
+fn note_modified(key: &str) {
+    MODIFIED.with(|m| {
+        let mut m = m.borrow_mut();
+        let at = m.0.map_or(0, |t| {
+            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
+        m.1.insert(key.to_owned(), at);
+    });
+}
+
+fn modified(key: &str) -> u64 {
+    MODIFIED.with(|m| m.borrow().1.get(key).copied().unwrap_or(0))
+}
+
 /// The bucket applies the next request for `key` only `ms` after it
 /// arrives (once).
 #[allow(dead_code, reason = "not every simulation aims a delay")]
@@ -193,6 +221,18 @@ fn apply(store: &Store, next: &AtomicU64, request: &[u8]) -> (u64, Vec<u8>) {
             }
             r
         }
+        // Keys, versions and last-modified times, no bodies: what an S3
+        // listing gives (its ETag and LastModified).
+        "LISTV" => {
+            let mut r = b"OK\n0\n".to_vec();
+            for (k, (_, v)) in store.range(key.clone()..) {
+                if !k.starts_with(key.as_str()) {
+                    break;
+                }
+                r.extend_from_slice(format!("{k}\t{v}\t{}\n", modified(k)).as_bytes());
+            }
+            r
+        }
         // Removes exactly this key; an absent key is fine (as on S3).
         "DELETE" => {
             store.remove(key.as_str());
@@ -201,16 +241,19 @@ fn apply(store: &Store, next: &AtomicU64, request: &[u8]) -> (u64, Vec<u8>) {
         // Unconditional overwrite: only a deliberately broken variant uses
         // it (a fence written without its condition).
         "PUT" => {
+            note_modified(key);
             let v = bump();
             store.insert(key.clone(), (body, v));
             format!("OK\n{v}\n").into_bytes()
         }
         "CREATE" if current.is_none() => {
+            note_modified(key);
             let v = bump();
             store.insert(key.clone(), (body, v));
             format!("OK\n{v}\n").into_bytes()
         }
         "REPLACE" if current.as_deref() == Some(version.as_str()) => {
+            note_modified(key);
             let v = bump();
             store.insert(key.clone(), (body, v));
             format!("OK\n{v}\n").into_bytes()
@@ -287,6 +330,24 @@ impl EpBucket {
     /// Removes exactly `key` (absent is fine).
     pub(crate) async fn delete(&self, key: &str) -> Result<(), BucketError> {
         self.call("DELETE", key, "", &[]).await.map(drop)
+    }
+
+    /// Every object under `prefix`, as a listing shows it: (key, version,
+    /// last-modified ms since [`reset_modified`]).
+    #[allow(dead_code, reason = "not every simulation lists with times")]
+    pub(crate) async fn list_versions(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String, u64)>, BucketError> {
+        let (_, _, body) = self.call("LISTV", prefix, "", &[]).await?;
+        Ok(String::from_utf8_lossy(&body)
+            .lines()
+            .filter_map(|l| {
+                let mut parts = l.split('\t');
+                let (k, v, m) = (parts.next()?, parts.next()?, parts.next()?);
+                Some((k.to_owned(), v.to_owned(), m.parse().ok()?))
+            })
+            .collect())
     }
 
     /// Every object under `prefix`: (key, body). Bodies must not contain

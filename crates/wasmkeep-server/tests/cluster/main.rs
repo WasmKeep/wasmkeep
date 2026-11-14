@@ -45,6 +45,8 @@ mod guests;
 // The tests, by theme; this file keeps what they share.
 #[path = "alarms.rs"]
 mod alarms;
+#[path = "app_delete.rs"]
+mod app_delete;
 #[path = "apps.rs"]
 mod apps;
 #[path = "bucket.rs"]
@@ -57,6 +59,8 @@ mod deploys;
 mod draining;
 #[path = "durable_writes.rs"]
 mod durable_writes;
+#[path = "expiry.rs"]
+mod expiry;
 #[path = "failover.rs"]
 mod failover;
 #[path = "failover_wait.rs"]
@@ -882,6 +886,13 @@ struct Flaky {
     /// Deletes of delete requests (`.../deletes/...`, ADR 0028) fail
     /// while set.
     fail_request_deletes: Arc<AtomicBool>,
+    /// Listings of ownership records (`.../owners/...`, an idle-expiry
+    /// pass, ADR 0028) are taken, then handed back only this many ms later.
+    delay_owner_lists_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// When each listing of ownership records was taken (ms since the
+    /// epoch, this machine's clock), and how many were handed back.
+    owner_lists_taken: Arc<std::sync::Mutex<Vec<u64>>>,
+    owner_lists_done: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Flaky {
@@ -904,6 +915,9 @@ impl Flaky {
             releases_held: Arc::default(),
             release_held_until_ms: Arc::default(),
             fail_request_deletes: Arc::default(),
+            delay_owner_lists_ms: Arc::default(),
+            owner_lists_taken: Arc::default(),
+            owner_lists_done: Arc::default(),
             inner,
             down,
             fail_wal: Arc::default(),
@@ -1274,6 +1288,23 @@ impl ObjectStore for Flaky {
                     source: "listing failed".into(),
                 })
             })
+            .boxed();
+        }
+        if prefix.is_some_and(|p| p.as_ref().contains("/owners/")) {
+            let delay = self.delay_owner_lists_ms.load(Ordering::SeqCst);
+            let (taken, done) = (
+                Arc::clone(&self.owner_lists_taken),
+                Arc::clone(&self.owner_lists_done),
+            );
+            let listing = self.inner.list(prefix);
+            return futures_util::stream::once(async move {
+                let listed: Vec<_> = listing.collect().await;
+                taken.lock().unwrap().push(now_ms());
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                done.fetch_add(1, Ordering::SeqCst);
+                futures_util::stream::iter(listed)
+            })
+            .flatten()
             .boxed();
         }
         self.inner.list(prefix)
