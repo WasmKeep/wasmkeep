@@ -22,6 +22,7 @@ requires `TOKENS`. From this directory:
 
 ```bash
 printf 'TOKENS=alice:%s\n' "$(openssl rand -hex 32)" > .env.local
+chmod 600 .env.local
 cargo run -p wasmkeep-cli -- dev
 ```
 

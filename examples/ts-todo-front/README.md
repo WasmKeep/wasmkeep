@@ -12,6 +12,7 @@ from this directory (after `npm ci` in `sdks/typescript`):
 ```bash
 npm ci
 printf 'TOKENS=alice:%s\n' "$(openssl rand -hex 32)" > .env.local
+chmod 600 .env.local
 cargo run -p wasmkeep-cli -- dev        # builds front.wasm and the todos class, serves both
 ```
 

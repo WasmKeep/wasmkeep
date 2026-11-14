@@ -239,6 +239,18 @@ Since 0.3.0, in no release yet.
     earlier readers skip), and whether each app's deployed version has a
     front (FRONT, `yes` or `no`; `front` in `--json`). EV/MIN still
     counts actor events only.
+  - `deploy --rollback` prints `rolling back demo/shop to V:` above the
+    changes it lists, and its note that a project file may now describe
+    another version goes to stdout with them, before the `rolled back`
+    line, instead of to stderr.
+  - `wasmkeep serve` and `dev` write their log without colour codes when
+    stdout is not a terminal (a file, a pipe, journald), and honour
+    `NO_COLOR`; on a terminal they keep their colours.
+  - The log line for unset required values names both ways to stop
+    requiring them: `requires` in `wasmkeep.toml`, or `--requires
+    CLASS=` / `--front-requires` without a project file (deploy refuses
+    those flags beside one), and gives `secrets set` with `--class CLASS
+    NAME` or `--front NAME`.
 - **A move of a room parked with open sockets waits for its record's
   release**: one whose release did not land was reported done, its
   request deleted, while the room stayed. Once it lands and the target

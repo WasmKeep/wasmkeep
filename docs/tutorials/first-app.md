@@ -449,6 +449,7 @@ wasmkeep deploy --bucket s3://demo --rollback
 ```
 
 ```text
+rolling back acme/todo to b12d4cbcc397044d:
   front: changed
 note: wasmkeep.toml may now describe another version than the one rolled back to; the next deploy from it deploys the file again
 rolled back acme/todo: 22efbe932f640932 -> b12d4cbcc397044d (deploy 3)

@@ -534,4 +534,11 @@ fn nodes_start_before_the_first_deploy_and_deploys_say_what_they_did() {
         "{out}"
     );
     assert!(!out.contains("is current"), "{out}");
+    // Above its changes, the version it rolled back to.
+    assert!(
+        out.starts_with(&format!(
+            "rolling back acme/shop to {first}:\n  access counter: "
+        )),
+        "{out}"
+    );
 }

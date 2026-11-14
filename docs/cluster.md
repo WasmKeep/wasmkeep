@@ -688,7 +688,8 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   `acme/shop: version V is current (deploy N)`. A deploy that changes
   nothing (the same classes, rules, configuration and front) writes
   nothing and says `acme/shop: nothing changed: version V is already
-  current (deploy N)`, with `N` as it was; a rollback says
+  current (deploy N)`, with `N` as it was; a rollback lists its changes
+  under `rolling back acme/shop to TO:` and says
   `rolled back acme/shop: FROM -> TO (deploy N)`.
 - An actor never runs older code than it already ran: a node that has not
   caught up yet refuses it (the client retries) and updates at once.
