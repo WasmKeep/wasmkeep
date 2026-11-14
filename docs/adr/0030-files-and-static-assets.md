@@ -1,6 +1,10 @@
 # 0030. Files and static assets
 
-- Status: proposed (2026-11-14)
+- Status: proposed (2026-11-14); revised after an adversarial review
+  (asset contents refreshed before reuse, a start proof of every link
+  condition, fixed-length namespaces, the sweep judged only after a
+  delete's outcome, stored headers overridden on download, indexes
+  content-addressed, the fallback index the one served before)
 - Date: 2026-11-14
 - Milestone: [Now](../../ROADMAP.md#now), files and databases
 - Follows: [ADR 0021](0021-the-app-model.md) (the app is the unit),
@@ -101,14 +105,17 @@ Under the app's root `R = <prefix>state/<tenant>/<app>/` (ADR 0022):
 
 | Family | Key |
 | --- | --- |
-| an actor's files | `R blobs/<class>/<name hex>/<incarnation>/<key>` |
+| an actor's files | `R blobs/<class>/<name id>/<incarnation>/<key>` |
 | the front's files | `R blobs/_front/main/0/<key>` |
-| files to remove after a delete | `R blob-sweeps/<class>/<name hex>/<incarnation>` |
+| files to remove after a delete | `R blob-sweeps/<class>/<name id>/<incarnation>` |
+| the app's last count (section 7) | `R blob-usage` |
 
-- `<name hex>` is the actor's name in lowercase hex, as ADR 0028's
-  `deletes/` keys: lossless, unlike the history's segment encoding, and
-  never `.` or `..`. `_front` is not a class, so the front cannot collide
-  with one.
+- `<name id>` is the SHA-256 of the actor's name, 64 lowercase hex
+  digits: a fixed length whatever the name (up to 256 bytes, so up to 512
+  hex digits written out, past S3's 1,024-byte key and a file system's
+  255-byte name), never `.` or `..`. The name itself is written in the
+  sweep record's body, so nothing needs to reverse the hash. `_front` is
+  not a class, so the front cannot collide with one.
 - **`<incarnation>`** is 16 lowercase hex digits, or `0` for an actor
   never deleted since this release. The delete routine (ADR 0028,
   section 1) draws a new one and writes it in the host meta of the empty
@@ -118,19 +125,26 @@ Under the app's root `R = <prefix>state/<tenant>/<app>/` (ADR 0022):
   a namespace no file of the old one can be in, whatever is still being
   swept or uploaded there.
 - **`<key>`**, the part the guest gives: 1 to 512 bytes of
-  `[A-Za-z0-9._~-]` and `/`, made of segments separated by single `/`,
-  none empty, none `.` or `..`, not starting or ending with `/`. Anything
-  else is `invalid-key`. The alphabet is the one S3, `object_store`'s
-  `Path` and file systems all take without escaping, so a key has one
-  spelling in the bucket, on disk and in a link, and no key can name a
-  parent. A file's display name (with spaces, accents) is the app's data,
+  `[A-Za-z0-9._~-]` and `/`, made of segments of at most 255 bytes
+  separated by single `/`, none empty, none `.` or `..`, not starting or
+  ending with `/`. Anything else is `invalid-key`, never `unavailable`.
+  With the tenant, app and class at most 64 bytes each, the rest of a key
+  is at most 790 bytes; a node with an app that imports `blobs` refuses to
+  start on a bucket prefix longer than 200 bytes, so no object key passes
+  1,024 bytes. The alphabet is the one S3 and `object_store`'s
+  `Path` take without escaping, so a key has one spelling in the bucket
+  and in a link, and no key can name a parent. A file's display name (with spaces, accents) is the app's data,
   given back in a download link's `filename` (section 4).
 - **A node without a bucket** (`serve` with a data directory only, and
-  `wasmkeep dev`) keeps the same tree under
-  `<data_dir>/state/<t>/<a>/blobs/...`. It writes a file to a temporary
-  name in the same directory, fsyncs it and renames it, opens every path
-  below the namespace directory without following symbolic links, and
-  holds a per-namespace lock for conditional writes.
+  `wasmkeep dev`) does not map keys to paths: a file system cannot hold
+  both `a` and `a/b`, and some fold case. Each namespace is a directory
+  `<data_dir>/state/<t>/<a>/blobs/<class>/<name id>/<incarnation>/` holding
+  a small SQLite index (`index.db`: key, file id, size, type, ETag, time)
+  and the contents as `f/<random id>`, written to `tmp/` beside them,
+  fsynced, renamed into `f/`, then committed in the index; conditions are
+  checked in the index's transaction. Files in `f/` or `tmp/` that no row
+  names are removed when the node starts. No path is built from a key, so
+  nothing below the namespace can be named by one.
 
 The app is still two prefixes, `apps/<t>/<a>/` and `state/<t>/<a>/`, for
 deleting, exporting, backups and access policies (ADR 0022).
@@ -253,8 +267,11 @@ interface blobs {
     /// Removes the file if it exists. Durable when it returns.
     delete: func(key: string) -> result<_, blob-error>;
 
-    /// Files whose key starts with `prefix`, in key order, after `after`,
-    /// at most `limit` (1 to 1,000).
+    /// Files whose key starts with `prefix` as a string (`up` finds
+    /// `uploads/a`; `uploads/` finds what is under it), in key order,
+    /// after the key `after`, at most `limit` (1 to 1,000). `prefix` is
+    /// empty or over the key alphabet and may end with `/`; `after` is a
+    /// key.
     list: func(prefix: string, after: option<string>, limit: u32) -> result<listing, blob-error>;
 
     /// A link a browser downloads the file from, without this code.
@@ -281,6 +298,9 @@ interface blobs {
   `finish` or `delete` whose acknowledgement arrives after the hold
   lapsed returns `unavailable`, as `exec-durable` does. The write may
   still have landed: a plain PUT is not fenced (section 6).
+- **Listing** uses the bucket's listing of the prefix's last full
+  segment (`object_store` matches whole segments) with an offset, and
+  filters the rest of the prefix on the node.
 - **Not transactional.** Blob calls are not part of the database's
   transaction, may run inside one, and survive its rollback.
 - **Streams** use `wasi:io`, which every actor and front already links
@@ -308,28 +328,43 @@ it. So links are short-lived, narrow, and never logged by the host (logs
 name the key and the namespace).
 
 **Presigned links** (a node with a bucket that passed the start proof
-below). The node keeps the concrete `AmazonS3` beside its trait object,
-and signs with `signed_url_opts` (SigV4 query signing) using its own
-credentials:
+below). `signed_url_opts` builds the URL from the store's own endpoint,
+so the node builds a second, signer-only `AmazonS3` for the link
+endpoint (below), with the same credential provider, region, bucket and
+addressing style (path or virtual-hosted) as its own store, and signs
+with it (SigV4 query signing):
 
 - **Download**: `GET` (a browser's `HEAD` is refused by the signature;
   links are for GET), the exact object key, the expiry, and the signed
-  query parameters `response-content-disposition` and, for an inline
-  link, `response-content-type` set to the stored type. The browser gets
-  the bytes from the bucket, with the host out of the path.
+  query parameters that override whatever headers the object was stored
+  with: `response-content-disposition` (section 8),
+  `response-content-type` (the stored type for an inline link,
+  `application/octet-stream` for an attachment), `response-cache-control`
+  (`private, max-age=<seconds left>`) and `response-content-encoding`
+  (`identity`). The browser gets the bytes from the bucket, with the host
+  out of the path.
 - **Upload**: `PUT` to the exact object key, with signed headers
   `content-length` (the exact `size`), `content-type` (exactly as
-  given) and `if-none-match: *`. The browser sends the body with those
-  headers (`content-length` is set by the browser from the body). A
-  different size, a different type, a missing header or a key that
-  already exists is refused by the bucket. Upload links are therefore
-  **create-only and in effect single-use**: once the file exists, the
-  same link fails. To replace a file, an app uploads to a new key and
-  deletes the old one.
+  given), `if-none-match: *` and `cache-control: private, no-store`. The
+  browser sends the body with those headers (`content-length` is set by
+  the browser from the body). A different size, a different type, a
+  missing header or a key that already exists is refused by the bucket.
+  Other headers the uploader adds (`Content-Encoding`, `x-amz-meta-*`)
+  may be stored with the object; downloads override every one that
+  matters, and the start proof checks that unsigned `x-amz-` headers are
+  refused. Upload links are **create-only**: while the file exists the
+  link fails. They are not single-use: if the app deletes the file
+  before the link expires, the link can create it again. So each upload
+  gets a key never used before (`uploads/<random>`), the app records the
+  key as used once confirmed, and deletes any file that reappears at a
+  key it already deleted. To replace a file, an app uploads to a new key
+  and deletes the old one.
 - **Expiry**: download 300 s by default, upload 900 s, at most 3,600 s
-  for both, and never past the remaining lifetime of the node's
-  credentials when they are temporary (the link would die with them).
-  SigV4's own ceiling (7 days) is never approached.
+  for both. SigV4's own ceiling (7 days) is never approached. With
+  temporary credentials (a role), a link dies when they do, which may be
+  sooner: `object_store` does not say when they expire, so the host
+  cannot shorten the link to match, and the docs say to give the node
+  credentials that outlive the longest link.
 - **The signed host** is the bucket's endpoint as browsers reach it:
   `--blob-link-endpoint URL` on `serve` (default: the endpoint the node
   uses, `AWS_ENDPOINT` or the provider's). A node that reaches its
@@ -351,25 +386,42 @@ proof, or `--blob-links node`). The URL is the node's own public port,
   HKDF and the label `wasmkeep blob links v1 <tenant>/<app>`; a node
   without a bucket keeps a random key in its data directory. Any node of
   the app verifies a token; a node of another app refuses it (`403`)
-  before reading a body, as its key and its app differ.
+  before reading a body, as its key and its app differ, and a node that
+  has seen the app's tombstone (ADR 0028, section 5) refuses every token.
 - A download streams the file from the bucket or disk with the response
-  headers of section 8. An upload streams the body to the bucket as a
-  create-if-absent write, refuses a `Content-Length` other than the
-  signed size before reading (`413` or `400`), stops reading at the
-  signed size, and answers `412` if the key exists.
+  headers of section 8, never the stored ones.
+- An upload refuses, before reading, a `Content-Length` other than the
+  signed size, a chunked body, or a `Content-Type` other than the signed
+  one. It streams exactly the signed number of bytes to the bucket as a
+  create-if-absent write and commits only if the body then ends: a short
+  body, or one that does not end there, aborts the write and answers
+  `400`. An existing key answers `412`. The whole upload must end by the
+  link's expiry plus one hour, or it is aborted.
 - They cost the node's bandwidth and a request slot each, and are
   counted (section 7). Rotating `cluster/secret` ends every node link.
 
 `--blob-links auto|presigned|node` (default `auto`): `auto` presigns on a
 bucket whose start proof passed, and uses node links otherwise; `presigned`
 refuses to start when the proof fails. **The start proof**, beside the
-conditional-write check every node runs on `probe/`: one presigned upload
-of the right size and type, then one of a wrong size, signed for the link
-endpoint. The first must land and the second must be refused; otherwise
-the node uses node links, says so once in the log and in
-`wasmkeep_blob_links_mode`. A store that accepts a presigned upload of
-another size than the one signed would let a link holder store anything:
-the proof is what lets a node trust links at all.
+conditional-write check every node runs on `probe/`, sends to the link
+endpoint, with links signed for it, every case a link relies on:
+
+1. an upload of the right size, type and headers lands;
+2. the same link again is refused (the key exists);
+3. uploads with another size, another type, without `if-none-match`, or
+   with an unsigned `x-amz-acl: public-read` header, each to a fresh key,
+   are refused;
+4. a link signed for one key writes no other;
+5. a download link returns the bytes with the signed
+   `response-content-type` and `response-content-disposition`.
+
+About ten small requests at start. Any case failing, or the link
+endpoint not answering from the node, makes the node use node links,
+said once in the log and in `wasmkeep_blob_links_mode`. A store that
+ignores any one of these conditions would let a link holder store
+another size, type or key than the app allowed, or overwrite a confirmed
+file: the proof is what lets a node trust links at all. `cluster
+diagnose` runs the same cases (section 10).
 
 ### 5. Lifecycle
 
@@ -378,30 +430,41 @@ the proof is what lets a node trust links at all.
 gains two steps:
 
 1. **Before the reset is uploaded**, the node writes the sweep record
-   `R blob-sweeps/<class>/<name hex>/<old incarnation>` (empty body).
+   `R blob-sweeps/<class>/<name id>/<old incarnation>`, whose body is the
+   actor's name and the word `pending`.
    If it cannot be written, the delete fails as an upload failure does
    (ADR 0028: given up, or `internal` for the durable delete). The reset
    then carries the new `blob_incarnation`.
-2. **Once the reset is acknowledged**, the node removes everything under
-   `R blobs/<class>/<name hex>/<old incarnation>/`, in the background, at
-   most 1,000 keys per delete request, and rewrites the record's body as
-   `swept <ms>`. Download links to those files fail from then on.
+2. **Once the reset is acknowledged** while the hold is valid (ADR 0028:
+   only then is the delete done), the node rewrites the record's body as
+   `swept` (creating the record again if it is missing), then removes
+   everything under `R blobs/<class>/<name id>/<old incarnation>/`, in the
+   background, at most 1,000 keys per delete request. Download links to
+   those files fail from then on. A delete given up (the upload failed)
+   leaves the record `pending` for the pass to judge.
 
 **The sweep pass.** One node per app (the live node with the lowest id,
 as idle expiry chooses it, ADR 0028, section 4) lists `R blob-sweeps/`
 once a minute and, for each record:
 
-- **Unswept** (empty body: the node crashed, or the delete failed
-  after the record was written): it acquires the actor as the operator
-  delete's job does (ADR 0028, section 3: the owner acts, or any serving
-  node if nobody holds it), restores, fences, and reads
-  `blob_incarnation`. If it differs from the record's, the delete
-  happened: sweep as in step 2. If it is the same, the delete did not
-  happen: delete the record and touch no file.
-- **Swept**, and the record is more than 3,900 s old (the longest link,
-  plus 5 minutes): list the prefix once more (an upload link issued
-  before the delete may have landed since), remove what is there, then
-  delete the record. Until then, leave it.
+- **Pending**, and last modified more than 10 minutes ago (by the
+  bucket's clock; a younger one may belong to a delete still running):
+  a judging job is queued as the operator delete's job is (ADR 0028,
+  section 3: the owner runs it in the actor's mailbox, so after any
+  delete routine already there has its outcome; or any serving node
+  acquires the actor if nobody holds it). It restores, **fences** (ADR
+  0028, section 3, step 3: what a restore read is the state only once
+  this hold's upload is in), and reads `blob_incarnation`. If it differs
+  from the record's, the delete happened: step 2. If it is the same, the
+  delete did not happen, and no late reset can make it happen after the
+  fence: the record is deleted and no file is touched.
+- **Swept**: the prefix is listed again, and what is there removed, when
+  the record is one hour old and again at 25 hours (by its last-modified
+  time): an upload started before its link expired may land well after,
+  and a node link aborts an upload one hour past expiry. Then the record
+  is deleted. An upload to a presigned link that is still running a day
+  later leaks its file; the docs give a bucket lifecycle rule for
+  `state/*/*/blobs/` as the backstop for such strays.
 
 **Idle expiry** (ADR 0028, section 4) counts events only. A file
 downloaded through a link every day does not keep its actor alive: no
@@ -409,10 +472,14 @@ code runs. The docs say so beside `expire-after-idle`.
 
 **`app delete`** (ADR 0028, section 5) already removes every key under
 `state/<t>/<a>/`, files included. Nodes stop issuing links when they see
-the app's tombstone (within 3 s). The command then waits until 3,900 s
-after the tombstone and lists `state/<t>/<a>/blobs/` once more, so an
-upload link issued just before cannot leave a file behind; `--no-wait`
-skips that wait and prints the command that finishes it.
+the app's tombstone (within 3 s), and refuse node links after it. The
+command lists `state/<t>/<a>/blobs/` again one hour and 25 hours after
+the tombstone (it waits for the first, or with `--no-wait` prints the
+command that finishes each), so an upload link issued just before leaves
+nothing behind. `deploy --recreate` is refused until both listings have
+run and found nothing: a re-created app's actors start at incarnation
+`0`, the same keys as the old app's, and an old link must not reach
+them.
 
 **Garbage the host does not collect.** The host knows owners, not
 references. A file an actor wrote but never recorded (the event failed
@@ -422,6 +489,11 @@ first and the row after, give upload links unique keys
 (`uploads/<random>`), record each pending upload with its expiry, check
 it with `head` when the browser says it is done, and sweep pending ones
 past their expiry from an alarm.
+
+**Restoring history to a point before a delete** (from a bucket that
+keeps versions, or a backup) brings back the old incarnation's rows but
+not its files, which were swept. Such a restore takes the files from the
+same backup.
 
 **Versioning is not assumed.** WasmKeep never reads object versions. A
 bucket that keeps old versions keeps deleted files as old versions too:
@@ -469,8 +541,8 @@ app's two prefixes (ADR 0022).
 **Measured, and enforced with a lag.** S3 gives no size for a prefix,
 and links bypass the host, so nothing can refuse a write by a total
 known at that moment. Once an hour the sweep node lists
-`state/<t>/<a>/blobs/` and publishes the app's stored bytes and file
-count. With `--max-app-blob-bytes`, writes and upload links are refused
+`state/<t>/<a>/blobs/` and writes the app's stored bytes and file count
+to `R blob-usage`, which every node of the app reads once a minute. With `--max-app-blob-bytes`, writes and upload links are refused
 with `quota-exceeded` while the last count is over it, until a count is
 under it again. The quota can be exceeded by up to an hour of writes
 plus every upload link outstanding; the docs say so. Per-actor totals
@@ -511,9 +583,9 @@ work):
   and the sweep after a delete bound the damage; the docs advise
   `Referrer-Policy: no-referrer` on pages that show download links. A
   link discloses the bucket's endpoint and name, the app's prefix layout,
-  the access key id that signed it and the actor's class and name in hex:
-  operators who must not disclose an actor's name use names that are
-  identifiers, not personal data.
+  the access key id that signed it (and, with temporary credentials, the
+  session token, valid only with the secret it never carries) and the
+  actor's class; the name is hashed.
 - **What a browser renders.** A file uploaded by one user and opened by
   another must not run as the app's page.
   - Downloads are `attachment` unless asked `inline`, and `inline` is
@@ -531,10 +603,16 @@ work):
   - **Node-link downloads come from the app's origin**, so the host adds
     `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox;
     default-src 'none'`, `Cross-Origin-Resource-Policy: same-origin` and
-    `Cache-Control: private, max-age=<seconds left>` to every one.
+    `Cache-Control: private, max-age=<seconds left>` to every one. A
+    sandbox and an attachment do not stop a page from loading the URL as
+    a subresource (`<script src>`, a stylesheet): so an attachment is
+    always sent as `application/octet-stream`, which `nosniff` keeps from
+    running as script or style, and an inline one only has a type of the
+    list above, none of which a browser runs. Presigned attachments get
+    the same type through `response-content-type`.
 - **No path traversal.** The key alphabet and segment rule make `..`,
-  `\`, `%2F` and empty segments impossible; on disk, no symbolic link is
-  followed below the namespace directory.
+  `\`, `%2F` and empty segments impossible; on disk, no path is built
+  from a key (section 2).
 - **SSRF does not apply.** The host never fetches a URL a guest gives:
   links point at the bucket endpoint the operator configured, or at the
   node itself. Outbound HTTP keeps its egress policy (`egress.rs`).
@@ -558,13 +636,16 @@ dir = "web/dist"                       # required
 build = "cd web && npm run build"      # optional, run before the front's
 not-found = "spa"                      # "front" (default), "spa" or "404"
 front-first = ["api/", "auth/"]        # path prefixes the front answers first
-immutable = ["assets/"]                # names cached for good
+immutable = ["assets/"]                # name prefixes cached for good
 watch = ["web/src"]                    # `wasmkeep dev`
 ```
 
+- `front-first` and `immutable` entries are prefixes of whole segments:
+  each ends with `/` (`api/` matches `api/x`, never `apiary.png`); an
+  entry without the `/` is refused.
 - Flags: `--assets DIR` sets them, `--no-assets` removes them, neither
-  keeps the current ones (no copy: the version refers to the same
-  index). `--assets-not-found`, `--assets-front-first` and
+  keeps the current ones (no copy: the new version names the same
+  index, which is content-addressed). `--assets-not-found`, `--assets-front-first` and
   `--assets-immutable` take what the keys take and need `--assets`.
   `--rollback` conflicts with all of them. With a project file they are
   refused, as the other flags that say what the version is (ADR 0026).
@@ -579,12 +660,17 @@ with its path relative to `DIR` as its name:
   accident), a name that is not valid UTF-8, holds a control character,
   `\`, or a segment `.` or `..`; a top-level `actor/` or `_wasmkeep/`
   (those paths never reach assets); more than 20,000 files; a file over
-  25 MiB; more than 512 MiB in all; a name over 1,024 bytes.
+  25 MiB; more than 512 MiB in all; a name over 1,024 bytes; a name under
+  an `immutable` prefix that the previous version has with other
+  contents (an immutable name must keep its bytes, or browsers keep the
+  old ones for a year). A name that is not in Unicode NFC is warned
+  about: names match as bytes, and some systems write NFD.
 - **Skipped**, and listed in the plan: names with a segment starting
   with `.`, except under `.well-known/`.
 - **Precompressed files.** For a file `X`, a sibling `X.br` or `X.gz` is
   its Brotli or gzip variant, not a file of its own: the deploy checks
-  that it decompresses to `X` exactly and refuses it otherwise. For text
+  that it decompresses to `X` exactly and refuses it otherwise (an `X.gz`
+  meant as a download of its own is shipped under another name). For text
   types without one (HTML, CSS, JavaScript, JSON, SVG, XML, WebAssembly,
   plain text, source maps), the deploy makes both, kept when they save
   at least 10%. `X.br` without `X` is a file of its own.
@@ -596,39 +682,53 @@ with its path relative to `DIR` as its name:
 **Storage: content-addressed, beside the versions.**
 
 ```
-apps/<t>/<a>/_assets/<sha256>               one object per distinct content, immutable
-apps/<t>/<a>/<version>/_assets.index        the version's table, immutable
+apps/<t>/<a>/_assets/<sha256>      one object per distinct content, the indexes
+                                   included; immutable
 ```
 
 - The deploy lists `_assets/` and uploads only the contents not there,
   each created with `If-None-Match: *` (an existing one is the same
-  bytes by its name). A deploy that changes one file uploads one object.
+  bytes by its name). A deploy that changes one file uploads one object
+  and an index.
+- **Reused contents are refreshed.** Collection deletes a content by its
+  age, so a content the deploy reuses must be young: before writing its
+  manifest, the deploy writes again (a plain overwrite of the same bytes,
+  which it has) every reused content last modified more than half the
+  retention window ago, then heads each reused content and refuses to
+  switch `current` if any is missing or if more than half the window has
+  passed since its refreshes began. A content the deploy names is then
+  younger than the window until the manifest naming it exists, so a
+  collection that runs meanwhile, which has not seen that manifest, does
+  not delete it. Redeploying a site unchanged for longer than half the
+  window re-uploads its files once.
 - The index is text: a header with `not-found`, `front-first` and
   `immutable`, then one line per file in name order: the percent-encoded
   name, the type, and for each representation (`identity`, `br`, `gzip`)
   its digest and size.
 - **Manifest format 4**, written only for a version with assets: format
-  3 plus one line, `assets <sha256 of the index>`, after the front line,
+  3 plus one line, `assets <sha256 of the index>` (the index is
+  `_assets/<that digest>`), after the front line,
   in the version's identity, so a deploy that changes only a file makes
   a new version. A version without assets is written exactly as before.
 - `_assets` is not a version id (an `_`), so version collection never
   treats it as one. ADR 0012's deploy collection gains a step after it
-  deletes versions: list `_assets/`, read the index of **every** version
-  directory with a readable manifest (not only the lineage: a version a
-  rollback stepped back from still counts), and delete the contents none
-  of them names and that are older than the retention window
-  (`--version-retention-secs`, at least one hour), so a deploy still
-  uploading is never swept. A manifest or index it cannot read stops the
-  step with nothing deleted.
+  deletes versions: list `_assets/`, read the manifest of **every**
+  version directory and the index it names (not only the lineage: a
+  version a rollback stepped back from still counts), and delete the
+  contents none of them names, indexes included, last modified more than
+  the retention window ago (`--version-retention-secs`, at least one
+  hour). A manifest or index it cannot read, a format it does not know
+  included, stops the step with nothing deleted, and says which: a newer
+  CLI collects. A directory a failed deploy left keeps its contents
+  until someone removes it; the step names such directories.
 
 **Serving.** `App::route` becomes:
 
 1. `/_wasmkeep/...`: the server's, now with `/_wasmkeep/blobs/v1/`
    (section 4).
 2. `/actor/<class>/<name>...`: the actors.
-3. A path under one of `front-first` (prefixes of the path after its
-   leading `/`, as `immutable` is of names, matched after the decoding
-   below): the front.
+3. A path whose decoded form (below) is under one of `front-first`:
+   the front.
 4. **A `GET` or `HEAD` without `Upgrade`** whose path names an asset:
    the asset, answered by the host. No code runs.
 5. A `GET` or `HEAD` without `Upgrade` that names none: the `not-found`
@@ -637,15 +737,21 @@ apps/<t>/<a>/<version>/_assets.index        the version's table, immutable
    `404 not found` without one.
 
 Assets are served on the public port only, never on the cluster port,
-never forwarded.
+never forwarded. A path that fails the decoding below goes straight to
+step 6, whatever `not-found` says. A path whose decoded form starts with
+`_wasmkeep/` or `actor/` while its raw form does not (`/%5Fwasmkeep/`,
+`/%61ctor/`) answers `400`: the reserved prefixes have one spelling. The
+front receives the raw path, as today.
 
 **Matching.** The path (the query is ignored) is percent-decoded once
 and must then be valid UTF-8 with no control character, no `\`, no empty
 segment, no `.` or `..` segment, and no `/` that came from `%2F`;
 anything else names no asset. Then, in order: the name itself; for a
 path ending in `/`, its `index.html`; for a path not ending in `/` whose
-`<path>/index.html` exists and that names no file, a `308` to the path
-with `/` added (query kept). Matching is case-sensitive and a lookup in
+`<path>/index.html` exists and that names no file, a `308` whose
+`Location` is the raw path with `/` added (query kept, one leading `/`),
+with `Cache-Control: no-cache` (a cached `308` would outlive a version
+that drops the `index.html`). Matching is case-sensitive and a lookup in
 the index held in memory: no file system is involved, so no request
 can reach a file outside the version's table.
 
@@ -661,6 +767,12 @@ can reach a file outside the version's table.
 - `404`: the root `404.html` with status `404`, or `404 not found`
   without one. Unmatched paths never reach the front, but through
   `front-first` and other methods.
+
+Every not-found answer the host makes carries `Cache-Control: no-store`,
+and so does the front's answer, if it is not a `2xx`, to an unmatched
+path under an `immutable` prefix (the host replaces the front's
+`Cache-Control` there): during a rollout a node not yet switched does
+not have a new file, and a cache must not keep that answer.
 
 **Responses.**
 
@@ -696,7 +808,7 @@ the version and so reviewed, deployed and rolled back with it. This is
 the point of assets: their answers do not depend on code.
 
 **On the node.** At a version switch the node reads the index (digest
-checked against the manifest) under the same lock as the classes and the
+checked against the manifest line) under the same lock as the classes and the
 front (ADR 0023), and swaps it with them. Contents are fetched on first
 use, one fetch per digest at a time, verified against their digest
 before they are served or kept, and kept on disk in
@@ -704,16 +816,26 @@ before they are served or kept, and kept on disk in
 1 GiB, least recently used out first). In the background the node
 fetches the rest of the version's contents while they fit. A content
 the bucket cannot give is `503` with `Retry-After: 1`. Since every
-byte is checked against a digest the manifest chains to, a corrupt or
-tampered object, or a partial download, is never served.
+byte fetched is checked against a digest the manifest chains to, a
+corrupt or tampered object, or a partial download, is never served. The
+cache on disk is the node's own, checked once when filled and again when
+the node starts (a size check, and the digest of any file whose size or
+time changed); bytes changed on disk afterwards are the node's disk
+failing, outside this check.
 
 **Versions side by side.** Nodes switch a few seconds apart, and a
 browser keeps a page for hours: a page from the new version can ask an
 old node for a new file, and an open tab can ask for a file a new
-version dropped. A node therefore keeps the index of the version before
-its current one (`previous` in the manifest) and, for a name under an
-`immutable` prefix that the current index lacks, answers from it. Only
-immutable names: their content cannot differ between versions. A new
+version dropped. A node therefore keeps the index it served before its
+current one (whatever the switch was: a deploy or a rollback, so after
+a rollback from B to A it keeps B's), in memory and in its data
+directory so that a restart keeps it; a node that never served another
+takes the index of the manifest's `previous`. For a name under an
+`immutable` prefix that the current index lacks, it answers from that
+one. Only immutable names: the deploy refuses to change their contents
+(above). Collection keeps the contents of the versions it keeps (the
+current one and the five before it, ADR 0012), which includes the one a
+node served before unless six deploys ran within the retention window. A new
 file asked of a node not yet switched falls to the `not-found` rule
 (never HTML for a script under `spa`), for those few seconds.
 
@@ -722,6 +844,8 @@ contents collection kept: the assets come back with the front and the
 classes, with no upload.
 
 **`wasmkeep dev`** serves `[assets] dir` from disk with the same rules,
+the deploy's refusals and skips included (no symbolic link is followed,
+no dotfile served), building its table from the directory and
 rereading it on change, and makes no compressed variants.
 
 **Metrics**: `wasmkeep_asset_requests_total{outcome}` (`ok`,
@@ -740,10 +864,12 @@ the scratch prefix, signed with the node's credentials for
 - `presigned-upload`: an upload link with a size, type and
   `if-none-match: *` lands with exactly those.
 - `presigned-upload-conditions`: the same link with another size,
-  another type, no `if-none-match`, or over an existing key, is refused
-  each time; a link signed for one key does not write another.
+  another type, no `if-none-match`, an unsigned `x-amz-acl`, or over an
+  existing key, is refused each time; a link signed for one key does not
+  write another (the cases of the node's start proof, section 4).
 - `presigned-download`: a download link returns the bytes with the
-  signed `Content-Disposition`, and a link for one key reads no other.
+  signed `Content-Disposition` and `Content-Type`, and a link for one key
+  reads no other.
 - `presigned-expiry`: a link signed for 2 s is refused after 4 s.
 - `cors` (with `--origin URL` only): a preflight `PUT` from that origin
   with `content-type` and `if-none-match` is allowed.
@@ -766,12 +892,24 @@ to add. The existing checks and their verdict do not change.
     format 4 is refused while a live node lacks `assets`. Neither has a
     `--force`, as for `front`. A rollback to such a version is checked
     the same way.
+  - **Deletes need the word too.** A delete of an actor whose class
+    imports `blobs` must write the sweep record and a new incarnation;
+    a node without this release would not, and the next actor would
+    inherit the old files at incarnation `0`. Such a node cannot link the
+    class, so it does not serve it, and ADR 0028 leaves a request to the
+    nodes that serve the class; the delete job and idle expiry also
+    check, on the node that runs them, that it has the word.
+  - The TypeScript engine (ADR 0018) must import `blobs` only in builds
+    that use it, or every TypeScript deploy would wait for the word
+    during an upgrade; checked when built.
   - A node and CLI of this release write and read formats 1 to 4. An
     older CLI cannot read a format-4 `current` and stops, as with format
     3 before 0.4.0.
 - **Older deploys** are unchanged: a version without assets is served as
   before, and its manifest keeps its bytes and id.
 - **Behaviour changes**, for the release notes:
+  - a decoded path that spells `/_wasmkeep/` or `/actor/` with escapes
+    answers `400`;
   - a `GET` or `HEAD` to a path that names an asset no longer reaches the
     front;
   - `/_wasmkeep/blobs/v1/` answers on the public port;
@@ -845,6 +983,9 @@ to add. The existing checks and their verdict do not change.
   allow it.
 - Uploads larger than one presigned PUT (5 GiB) and resumable uploads:
   presigned multipart parts.
+- Binding a content digest to upload links (`x-amz-checksum-sha256`)
+  when the app knows it, and a node-side set of used node-link tokens:
+  both would make a link truly single-use.
 - Per-actor quotas kept by the host, and a hard app quota.
 - Custom headers on assets (`Content-Security-Policy`,
   `Strict-Transport-Security`), and redirects or rewrites declared
