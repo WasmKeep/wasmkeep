@@ -65,6 +65,13 @@ Since 0.4.0, in no release yet.
   reply was lost is not counted) with a warning in its log
   ([monitoring](docs/monitoring.md#failovers)), and pinned by a cluster
   test and a simulation (`madsim_early_release`).
+- `wasmkeep_releases_after_lapse_total` counts every release that landed
+  while the node's lease was not valid, not only those before its lease
+  task saw the lapse: also one sent between the lease task's seeing the
+  lapse and its ending the holds (the WebSockets the lapse closes), and
+  one of a hold whose acquisition landed after the lapse. Its warning is
+  logged once per lapse, for the first such release, with the count
+  logged once the lease is valid again, instead of one line per actor.
 
 ## 0.4.0
 

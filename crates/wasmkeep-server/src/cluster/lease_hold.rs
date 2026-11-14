@@ -325,6 +325,43 @@ impl Pending {
     }
 }
 
+/// Releases that landed while this node's lease was not valid (ADR 0020,
+/// section 1, amendment of 2026-11-14), on this node: another node may
+/// have taken those actors at once, without a fence. Every one is counted
+/// (here and in `wasmkeep_releases_after_lapse_total`); the first after
+/// the lease was last valid is logged, and how many followed it is logged
+/// once the lease is valid again, so a lapse that closes many sockets
+/// logs two lines, not one per actor.
+#[derive(Debug, Default)]
+pub(crate) struct InvalidReleases {
+    /// Since this node started.
+    total: AtomicUsize,
+    /// Since the lease was last found valid again.
+    since_valid: AtomicUsize,
+}
+
+impl InvalidReleases {
+    /// Counts one; whether it is the first since the lease was last valid
+    /// (the one to log).
+    pub(crate) fn count(&self) -> bool {
+        self.total.fetch_add(1, Ordering::SeqCst);
+        self.since_valid.fetch_add(1, Ordering::SeqCst) == 0
+    }
+
+    /// The lease is valid again: how many were counted since it was last
+    /// (the count starts again).
+    pub(crate) fn valid_again(&self) -> usize {
+        self.since_valid.swap(0, Ordering::SeqCst)
+    }
+
+    /// How many since this node started (tests: the metric is shared by
+    /// every node of a process).
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> usize {
+        self.total.load(Ordering::SeqCst)
+    }
+}
+
 /// A handle on one actor's lock ([`Pending::lock_of`]).
 pub(super) struct ActorLock<'a> {
     pending: &'a Pending,
@@ -628,11 +665,11 @@ impl LeaseHold {
             let bound = cluster
                 .release_attempt()
                 .min(left.max(Duration::from_millis(50)));
-            let lapsed = cluster.lease_ran_out_unnoticed();
+            let invalid = !cluster.node_lease_valid();
             let sent = tokio::time::timeout(bound, cluster.owners.release(&hold))
                 .await
                 .unwrap_or(Released::Pending);
-            if lapsed && sent == Released::Released {
+            if invalid && sent == Released::Released {
                 cluster.released_after_lapse(&hold.key);
             }
             match sent {
@@ -714,39 +751,53 @@ impl Cluster {
         self.lease_attempt.min(Duration::from_secs(1))
     }
 
-    /// One release, bounded by [`Self::release_attempt`].
+    /// One release, bounded by [`Self::release_attempt`]. One sent while
+    /// this node's lease is not valid, with a hold in hand, is counted if
+    /// it lands (ADR 0020, section 1, amendment of 2026-11-14): sent
+    /// before the lease task saw a lapse (it ends every hold into the
+    /// pending releases, which wait for a valid lease, only at the end of
+    /// its next attempt), between its publishing the lapse and its ending
+    /// the holds (the lapse hook closing sockets runs in between), or for
+    /// a hold registered after that (an acquisition asked before the
+    /// lapse, its write landing after).
     async fn send_release(&self, hold: &Hold) -> Released {
-        let lapsed = self.lease_ran_out_unnoticed();
+        let invalid = !self.node_lease_valid();
         let sent = tokio::time::timeout(self.release_attempt(), self.owners.release(hold))
             .await
             .unwrap_or(Released::Pending);
-        if lapsed && sent == Released::Released {
+        if invalid && sent == Released::Released {
             self.released_after_lapse(&hold.key);
         }
         sent
     }
 
-    /// Whether this node's lease ran out and the lease task has not yet
-    /// seen it: it does at the end of its next attempt, and then ends
-    /// every hold into the pending releases, which wait for a valid lease.
-    /// Until then a hold dropped by its actor (an event that found it no
-    /// longer valid, a parked record's last socket) is released at once
-    /// (ADR 0020, section 1, amendment of 2026-11-14). Not after a clean
-    /// stop or a lost lease: those make the lease invalid outright.
-    fn lease_ran_out_unnoticed(&self) -> bool {
-        self.validity.until().is_some_and(|until| now_ms() >= until)
-    }
-
-    /// A release that landed while this node's lease had run out: another
-    /// node may take the actor at once, without the fence. Counted and
-    /// logged here, since the record it leaves names nobody, and the node
-    /// that takes it sees an ordinary released actor.
+    /// A release that landed while this node's lease was not valid:
+    /// another node may take the actor at once, without the fence.
+    /// Counted here, since the record it leaves names nobody, and the
+    /// node that takes it sees an ordinary released actor; logged for the
+    /// first since the lease was last valid ([`InvalidReleases`]).
     fn released_after_lapse(&self, key: &str) {
         crate::metrics::inc(&crate::metrics::METRICS.releases_after_lapse);
-        tracing::warn!(
-            key,
-            "released an actor after this node's lease ran out: another node may take it now"
-        );
+        if self.invalid_releases.count() {
+            tracing::warn!(
+                key,
+                "released an actor after this node's lease ran out: another node may take it \
+                 now; any more until the lease is valid again are counted, and logged then"
+            );
+        }
+    }
+
+    /// This node's lease is valid again: logs how many actors were
+    /// released while it was not, if more than the one already logged.
+    pub(super) fn lease_valid_again(&self) {
+        let n = self.invalid_releases.valid_again();
+        if n > 1 {
+            tracing::warn!(
+                released = n,
+                "released actors after this node's lease ran out, the first logged above; \
+                 its lease is valid again"
+            );
+        }
     }
 
     /// Sends a release once; if it did not land, it waits in the pending

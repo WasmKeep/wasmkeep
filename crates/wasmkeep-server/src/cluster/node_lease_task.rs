@@ -221,6 +221,9 @@ impl Cluster {
     fn node_lease_written(&self, lease: &NodeLease<ObjectStoreBucket, SystemClock>) {
         crate::metrics::inc(&crate::metrics::METRICS.node_lease_writes);
         self.publish_validity(lease);
+        if self.node_lease_valid() {
+            self.lease_valid_again();
+        }
         self.heartbeat_reached_bucket(now_ms());
     }
 

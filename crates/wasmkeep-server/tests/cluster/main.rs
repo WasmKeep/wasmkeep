@@ -870,6 +870,13 @@ struct Flaky {
     /// The next this-many snapshot (`/snapshot/`) uploads never answer,
     /// and are applied 8 s later: after their sender gave them up.
     late_snapshot_puts: Arc<std::sync::atomic::AtomicU32>,
+    /// Releases of ownership records (a record naming nobody) land at
+    /// once and are answered this many ms later (0: at once). Each one
+    /// held counts in `releases_held`, and `release_held_until_ms` says
+    /// until when (wall clock, ms) the last one's answer waits.
+    hold_release_replies_ms: Arc<std::sync::atomic::AtomicU64>,
+    releases_held: Arc<std::sync::atomic::AtomicU32>,
+    release_held_until_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Flaky {
@@ -888,6 +895,9 @@ impl Flaky {
             hang_snapshot_puts: Arc::default(),
             fail_snapshot_puts: Arc::default(),
             late_snapshot_puts: Arc::default(),
+            hold_release_replies_ms: Arc::default(),
+            releases_held: Arc::default(),
+            release_held_until_ms: Arc::default(),
             inner,
             down,
             fail_wal: Arc::default(),
@@ -1061,6 +1071,28 @@ impl ObjectStore for Flaky {
                     source: "upload failed".into(),
                 });
             }
+        }
+        let hold_reply = self.hold_release_replies_ms.load(Ordering::SeqCst);
+        if hold_reply > 0
+            && location.as_ref().starts_with(&test_key(Family::Owners, ""))
+            && String::from_utf8_lossy(&bytes::Bytes::from(payload.clone()))
+                .lines()
+                .nth(1)
+                .is_some_and(|holder| holder.split(' ').next() == Some("-"))
+        {
+            let landed = self.inner.put_opts(location, payload, opts).await;
+            let now = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
+            self.release_held_until_ms
+                .store(now + hold_reply, Ordering::SeqCst);
+            self.releases_held.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(hold_reply)).await;
+            return landed;
         }
         self.inner.put_opts(location, payload, opts).await
     }
