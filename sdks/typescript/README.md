@@ -85,7 +85,12 @@ after `npm ci` in `sdks/typescript`).
 
 SQL errors throw `SqlError` (with `kind`), failed calls throw `CallError`.
 A `fetch` handler returns a string, bytes, or `{ status, headers, body }`;
-an exception becomes a 500.
+an exception becomes a 500. `req.bytes()`, `req.text()` and `req.json()`
+read the whole request body (up to the host's 16 MiB). `req.bytes(limit)`
+and `req.text(limit)` return `undefined` for a body longer than `limit`
+bytes, having read at most `limit + 1` of it: check a size this way, as a
+chunked body has no `Content-Length` to check first
+(`const body = req.bytes(1000); if (body === undefined) return { status: 413 };`).
 
 ## Writing a front
 

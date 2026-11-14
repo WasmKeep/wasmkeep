@@ -26,7 +26,10 @@ Since 0.3.0, in no release yet.
   `scheme()` (`https` when the first `X-Forwarded-Proto` value is) and
   `unavailable(err)` (503 with `Retry-After: 1` for `failed` and
   `timeout`, 500 otherwise, with a generic body), exported for actors too.
-  TypeScript requests gain `authority` and `headerList`. Example:
+  TypeScript requests gain `authority`, `headerList`, and bounded body
+  reads: `req.bytes(limit)` and `req.text(limit)` return `undefined` for
+  a body longer than `limit` bytes, having read at most `limit + 1` of it,
+  chunked or not. Example:
   [`examples/todo-front`](examples/todo-front) (Rust front and `internal`
   class) and [`examples/ts-todo-front`](examples/ts-todo-front). Python,
   Go, C, Zig, D and MoonBit fronts come later
@@ -153,9 +156,17 @@ An app's front ships in its version, with the classes
   previous version's front with its classes. A first deploy may give a
   front and no class.
 - **Checked before anything is written**: the front must link against the
-  front world and export the incoming handler; one that imports
-  `storage`, `alarms` or `websockets`, or exports an actor's `on-*`
-  functions, is refused.
+  front world, export the incoming handler and instantiate once (without
+  values, required names or not); one whose start function traps or that
+  needs more than the limits, one that imports `storage`, `alarms` or
+  `websockets`, or one that exports an actor's `on-*` functions, is
+  refused. `--config _front=...`, `--requires _front=...` and `--access
+  _front=...` are refused too, naming the front's own flags.
+- **The front's secrets stay when it goes**: `--no-front`, or a rollback
+  to a version without a front, warns while the app has secrets that its
+  `_front` entries remain (`wasmkeep secrets unset --front NAME...`
+  removes them): a node older than the front cannot open a set with them,
+  and a later front would read them.
 - **`deploy` prints** `front: added`, `changed`, `removed` or `unchanged`,
   the front's values by name (`config _front: NAME added`), and each open
   class as `reachable at /actor/<class>/<name>, past the front`.

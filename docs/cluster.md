@@ -684,6 +684,17 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --no-front
   kept, copied inside the bucket as classes are without `--actor`. A first
   deploy may give a front and no class: the app then serves its front,
   and its calls fail with `invalid-address`.
+- **The front's secrets stay when the front goes.** `--no-front`, or a
+  `--rollback` to a version without a front, leaves the app's `_front`
+  secrets in the set: a node older than the front cannot open a set with
+  them (it refuses every event and drains), and a later front reads the
+  values left. Such a deploy prints a warning while the app has secrets;
+  remove the front's with `wasmkeep secrets unset --front NAME...` (see
+  `wasmkeep secrets list`).
+- **The front's scope is not a class.** `--config _front=...`,
+  `--requires _front=...` and `--access _front=...` are refused: give
+  the front's values with `--front-config` and `--front-requires`; the
+  front has no access rule.
 - **`--front-config FILE` and `--front-requires NAMES`** are the front's
   `--config` and `--requires`, with the same rules: kept by later deploys,
   `--front-config ''` and `--front-requires ''` remove them. While a
@@ -694,10 +705,16 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --no-front
   never to the client. The same 503 answers while the node cannot open the
   app's secrets.
 - **Checked before anything is written.** The front must link against
-  the front world (WASI, `wasi:http`, `actors`, `env`) and export the
-  incoming handler. A component that imports `storage`, `alarms` or
-  `websockets`, or exports an actor's `on-*` functions (an actor given
-  as a front by mistake), is refused.
+  the front world (WASI, `wasi:http`, `actors`, `env`), export the
+  incoming handler, and instantiate once: a start function that traps,
+  or memory past the limits of the machine running `deploy` (its default
+  limits), is refused, as is a component that imports `storage`,
+  `alarms` or `websockets`, or exports an actor's `on-*` functions (an
+  actor given as a front by mistake). The test instantiation runs
+  without values, required names or not. A node starting with a
+  deployed front instantiates it once too, unless its required values
+  are not set (or the secrets not open) yet; a failure there is logged,
+  and the node starts.
 - **What `deploy` prints:** `front: added`, `changed`, `removed` or
   `unchanged`, the front's configuration and required names by name
   (`config _front: NAME added`), and every class whose rule is `open`
