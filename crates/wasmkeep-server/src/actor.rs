@@ -234,6 +234,8 @@ struct ServiceInner {
     /// Actors a draining node handed this node an alarm for, until when
     /// (ms): their record may still name that node, its release pending.
     handed: std::sync::Mutex<HashMap<ActorAddress, u64>>,
+    /// What the metrics page names this node: its app and node id.
+    metrics_identity: crate::metrics::Identity,
 }
 
 impl ServiceInner {

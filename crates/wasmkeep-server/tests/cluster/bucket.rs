@@ -881,7 +881,7 @@ async fn readiness_follows_the_bucket_and_metrics_count_events() {
     };
     let events = |kind: &str, outcome: &str| {
         value(&format!(
-            "wasmkeep_events_total{{class=\"t\",kind=\"{kind}\",outcome=\"{outcome}\"}}"
+            "wasmkeep_events_total{{tenant=\"default\",app=\"default\",class=\"t\",kind=\"{kind}\",outcome=\"{outcome}\"}}"
         ))
     };
     // One actor: created once, its on-init run once, four requests.
@@ -893,7 +893,9 @@ async fn readiness_follows_the_bucket_and_metrics_count_events() {
     assert_eq!(value("wasmkeep_instantiate_seconds_count"), 1, "{page}");
     assert_eq!(value("wasmkeep_durable_write_seconds_count"), 3, "{page}");
     assert_eq!(
-        value("wasmkeep_event_duration_seconds_count{class=\"t\"}"),
+        value(
+            "wasmkeep_event_duration_seconds_count{tenant=\"default\",app=\"default\",class=\"t\"}"
+        ),
         5,
         "{page}"
     );

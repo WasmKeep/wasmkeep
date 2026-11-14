@@ -104,16 +104,20 @@ curl 127.0.0.1:9100/metrics
 
 Off by default. The page names classes and counts events, so bind it to
 loopback or a private address that only your Prometheus reaches. Labels are
-class names, event kinds and fixed reasons, never actor names.
+the node's tenant and app, class names, event kinds and fixed reasons, never
+actor names. Every series with a `class` label also has `tenant` and `app`:
+the app the node serves (`serve --app tenant/app`), or the implicit app
+`default/default` for classes given on the command line.
 
 | Metric | Type | What it tells you |
 | --- | --- | --- |
+| `wasmkeep_info{version,tenant,app,node}` | gauge | Always 1: the running version and the node's app, with `node` its node id in a cluster (no `node` label otherwise). Join on it to see which version each node runs, or to add the app to the series that do not carry it: `wasmkeep_actors_resident * on (instance) group_left (tenant, app, version) wasmkeep_info`. |
 | `wasmkeep_actors_resident` | gauge | Actors in memory now: capacity planning. |
 | `wasmkeep_websockets_open` | gauge | Registered WebSockets, including pending close cleanup. |
 | `wasmkeep_classes` | gauge | Classes served. |
 | `wasmkeep_ready`, `wasmkeep_not_ready{reason}` | gauges | 1 when `/_wasmkeep/ready` answers 200; otherwise one `wasmkeep_not_ready` series saying why. |
-| `wasmkeep_events_total{class,kind,outcome}` | counter | Events run; `kind` is `request`, `alarm`, `websocket` or `init`, `outcome` is `ok` or `failed` (trapped, cut, or a handler that returned an error). |
-| `wasmkeep_event_duration_seconds{class}` | histogram | Slow handlers and hot classes. |
+| `wasmkeep_events_total{tenant,app,class,kind,outcome}` | counter | Events run; `kind` is `request`, `alarm`, `websocket` or `init`, `outcome` is `ok` or `failed` (trapped, cut, or a handler that returned an error). |
+| `wasmkeep_event_duration_seconds{tenant,app,class}` | histogram | Slow handlers and hot classes. |
 | `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit) or `lease` (this node lost the actor mid-event). |
 | `wasmkeep_cpu_budget_exceeded_total` | counter | Guest calls stopped for using their CPU budget. |
 | `wasmkeep_instantiate_seconds` | histogram | Creating an actor's instance: the wake cost. |
@@ -139,9 +143,10 @@ class names, event kinds and fixed reasons, never actor names.
 | `wasmkeep_websocket_owner_closes_total{reason}` | counter | WebSockets closed with 1012 because this node no longer owned their actor, by how it found out: `event` (a message or close on one of them found another node owning the actor, or this draining node sending it to a peer), `sweep` (the owner sweep found another node holding a room that hibernated with sockets open here), `lease_lapse` (this node's lease ran out) and `drain` (a draining node closing the sockets of hibernated rooms). Clients reconnect. A steady `event` or `sweep` rate means rooms often wake on another node than the one holding their sockets: hash the load balancer on the room's path ([front door](deploy/front-door.md)). |
 | `wasmkeep_websocket_sweep_reads_total` | counter | Ownership records the owner sweep read: once a minute, one per room that hibernated with WebSockets open here, 5,000 a pass at most (the next pass goes on with the rest). A pass stops at its first failed read. Rising with the number of such rooms; each read is a bucket GET. |
 
-Not there yet: per-tenant labels (one tenant per process until
-multi-tenancy), traps by reason (`wasmkeep_events_total{outcome="failed"}`
-and `wasmkeep_cpu_budget_exceeded_total` cover them for now) and parked
+Not there yet: `tenant` and `app` on the series without a class (one app
+per process for now: join on `wasmkeep_info`), traps by reason
+(`wasmkeep_events_total{outcome="failed"}` and
+`wasmkeep_cpu_budget_exceeded_total` cover them for now) and parked
 WebSockets (sockets are not parked yet; `wasmkeep_websockets_open` counts
 them).
 

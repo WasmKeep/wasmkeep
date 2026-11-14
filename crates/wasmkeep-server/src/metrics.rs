@@ -1,6 +1,12 @@
 //! Process-wide metrics in the Prometheus text format, served by
-//! `serve --metrics-listen` (off by default). Labels are bounded: class
-//! names, event kinds and fixed reasons, never actor names.
+//! `serve --metrics-listen` (off by default). Labels are bounded: the
+//! node's tenant and app, class names, event kinds and fixed reasons, never
+//! actor names.
+//!
+//! Series with a `class` label also carry `tenant` and `app`: those of the
+//! node the page is about ([`Identity`]), added when the page is rendered.
+//! A process serves one app for now, so these families are kept without
+//! it; when one serves several, they would be kept by app instead.
 //!
 //! Counters and histograms are recorded where things happen; gauges (resident
 //! actors, open sockets) are read from the service when scraped.
@@ -121,13 +127,53 @@ fn render_labels(labels: &[(&str, &str)]) -> String {
     out
 }
 
+/// The node a metrics page is about: the app it serves (ADR 0022) and, in
+/// a cluster, its node id. Without actors, the implicit app
+/// `default/default` and no node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// The app's tenant.
+    pub tenant: String,
+    /// The app, within its tenant.
+    pub app: String,
+    /// The node id, or empty when not in a cluster.
+    pub node: String,
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Self {
+            tenant: "default".into(),
+            app: crate::cluster::IMPLICIT_APP_NAME.into(),
+            node: String::new(),
+        }
+    }
+}
+
+impl Identity {
+    /// `tenant="...",app="..."`, in front of a class's labels.
+    fn app_labels(&self) -> String {
+        render_labels(&[("tenant", &self.tenant), ("app", &self.app)])
+    }
+}
+
+/// `front` then `labels`, either possibly empty.
+fn join_labels(front: &str, labels: &str) -> String {
+    match (front.is_empty(), labels.is_empty()) {
+        (true, _) => labels.to_owned(),
+        (_, true) => front.to_owned(),
+        _ => format!("{front},{labels}"),
+    }
+}
+
 /// Everything WasmKeep counts.
 #[derive(Debug, Default)]
 pub(crate) struct Metrics {
     /// Events run, by class, kind (`request`, `alarm`, `websocket`, `init`)
-    /// and outcome (`ok`, `failed`).
+    /// and outcome (`ok`, `failed`); rendered with the node's tenant and app.
     pub(crate) events: Family<AtomicU64>,
-    /// How long events ran, by class.
+    /// How long events ran, by class; rendered with the node's tenant and
+    /// app.
     pub(crate) event_seconds: Family<Histogram>,
     /// Events stopped by the host, by reason (`wall`, `lease`).
     pub(crate) cuts: Family<AtomicU64>,
@@ -284,10 +330,18 @@ pub struct Gauges {
     pub not_ready: Option<&'static str>,
 }
 
-/// The metrics page: everything recorded so far plus `gauges`, and the
-/// runtime's CPU-budget traps.
+/// The metrics page of a process serving no actors ([`render_for`] with
+/// the implicit app `default/default` and no node).
 pub fn render(gauges: Gauges) -> String {
+    render_for(gauges, &Identity::default())
+}
+
+/// The metrics page of the node `identity` names: everything recorded so
+/// far plus `gauges`, and the runtime's CPU-budget traps. Series with a
+/// class carry its tenant and app; `wasmkeep_info` its version and node.
+pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
     let m = &*METRICS;
+    let app = identity.app_labels();
     let mut out = String::new();
     let head = |out: &mut String, name: &str, kind: &str, help: &str| {
         let _ = writeln!(out, "# HELP {name} {help}");
@@ -308,6 +362,21 @@ pub fn render(gauges: Gauges) -> String {
         });
     };
 
+    head(
+        &mut out,
+        "wasmkeep_info",
+        "gauge",
+        "Always 1: the running version, and the tenant, app and node id (in a cluster) of the node, for joining with other series.",
+    );
+    let mut info = vec![
+        ("version", env!("CARGO_PKG_VERSION")),
+        ("tenant", identity.tenant.as_str()),
+        ("app", identity.app.as_str()),
+    ];
+    if !identity.node.is_empty() {
+        info.push(("node", identity.node.as_str()));
+    }
+    let _ = writeln!(out, "wasmkeep_info{{{}}} 1", render_labels(&info));
     gauge(
         &mut out,
         "wasmkeep_actors_resident",
@@ -345,20 +414,33 @@ pub fn render(gauges: Gauges) -> String {
         "Actor classes served.",
         gauges.classes,
     );
-    family(
+    head(
         &mut out,
         "wasmkeep_events_total",
-        "Events run, by class, kind and outcome.",
-        &m.events,
+        "counter",
+        "Events run, by tenant, app, class, kind and outcome.",
     );
+    m.events.each(|labels, v| {
+        let _ = writeln!(
+            out,
+            "wasmkeep_events_total{{{}}} {}",
+            join_labels(&app, labels),
+            v.load(Ordering::Relaxed)
+        );
+    });
     head(
         &mut out,
         "wasmkeep_event_duration_seconds",
         "histogram",
-        "How long events ran, by class.",
+        "How long events ran, by tenant, app and class.",
     );
-    m.event_seconds
-        .each(|labels, h| h.render(&mut out, "wasmkeep_event_duration_seconds", labels));
+    m.event_seconds.each(|labels, h| {
+        h.render(
+            &mut out,
+            "wasmkeep_event_duration_seconds",
+            &join_labels(&app, labels),
+        );
+    });
     family(
         &mut out,
         "wasmkeep_event_cuts_total",
@@ -613,6 +695,107 @@ mod tests {
                 ("class=\"b\",outcome=\"ok\"".to_owned(), 1)
             ]
         );
+    }
+
+    /// The node's tenant and app for [`render_for`]: `acme/shop` on `n1`.
+    fn shop() -> Identity {
+        Identity {
+            tenant: "acme".into(),
+            app: "shop".into(),
+            node: "n1".into(),
+        }
+    }
+
+    #[test]
+    fn series_with_a_class_label_carry_the_tenant_and_app() {
+        inc(&METRICS
+            .events
+            .get(&[("class", "c"), ("kind", "request"), ("outcome", "ok")]));
+        METRICS
+            .event_seconds
+            .get(&[("class", "c")])
+            .observe(Duration::from_millis(3));
+        inc(&METRICS
+            .bucket_requests
+            .get(&[("operation", "get"), ("status", "ok")]));
+        let page = render_for(Gauges::default(), &shop());
+        for line in [
+            "wasmkeep_events_total{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"request\",outcome=\"ok\"} 1\n",
+            "wasmkeep_event_duration_seconds_bucket{tenant=\"acme\",app=\"shop\",class=\"c\",le=\"0.005\"} 1\n",
+            "wasmkeep_event_duration_seconds_bucket{tenant=\"acme\",app=\"shop\",class=\"c\",le=\"+Inf\"} 1\n",
+            "wasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"c\"} 1\n",
+        ] {
+            assert!(page.contains(line), "no {line} in\n{page}");
+        }
+        assert!(
+            page.contains(
+                "\nwasmkeep_event_duration_seconds_sum{tenant=\"acme\",app=\"shop\",class=\"c\"} "
+            ),
+            "{page}"
+        );
+        // Without a node's identity (no actors served): the implicit app.
+        let page = render(Gauges::default());
+        assert!(
+            page.contains("wasmkeep_events_total{tenant=\"default\",app=\"default\",class=\"c\",kind=\"request\",outcome=\"ok\"} 1\n"),
+            "{page}"
+        );
+        // Every series with a class has them; the others are as they were,
+        // and gauges of the process stay unlabelled.
+        for l in page.lines().filter(|l| !l.starts_with('#')) {
+            if l.contains("class=\"") {
+                assert!(l.contains("{tenant=\"default\",app=\"default\","), "{l}");
+            } else if !l.starts_with("wasmkeep_info{") {
+                assert!(!l.contains("tenant=") && !l.contains("app="), "{l}");
+            }
+        }
+        for line in [
+            "\nwasmkeep_bucket_requests_total{operation=\"get\",status=\"ok\"} 1\n",
+            "\nwasmkeep_admission_refused_total{reason=\"access\"} 0\n",
+            "\nwasmkeep_actors_resident 0\n",
+            "\nwasmkeep_websockets_open 0\n",
+        ] {
+            assert!(page.contains(line), "no {line} in\n{page}");
+        }
+    }
+
+    #[test]
+    fn the_info_series_names_the_version_tenant_app_and_node() {
+        let version = env!("CARGO_PKG_VERSION");
+        let page = render_for(Gauges::default(), &shop());
+        assert!(page.contains("# TYPE wasmkeep_info gauge\n"), "{page}");
+        assert!(
+            page.contains(&format!(
+                "\nwasmkeep_info{{version=\"{version}\",tenant=\"acme\",app=\"shop\",node=\"n1\"}} 1\n"
+            )),
+            "{page}"
+        );
+        // Not clustered: no node label.
+        let page = render(Gauges::default());
+        assert!(
+            page.contains(&format!(
+                "\nwasmkeep_info{{version=\"{version}\",tenant=\"default\",app=\"default\"}} 1\n"
+            )),
+            "{page}"
+        );
+        assert_eq!(page.matches("\nwasmkeep_info{").count(), 1, "{page}");
+    }
+
+    /// `docs/monitoring.md` lists every metric on the page.
+    #[test]
+    fn the_monitoring_docs_list_every_metric() {
+        let docs = include_str!("../../../docs/monitoring.md");
+        let page = render(Gauges::default());
+        let names: Vec<&str> = page
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE ")?.split(' ').next())
+            .collect();
+        assert!(names.len() > 20, "{names:?}");
+        for name in names {
+            assert!(
+                docs.contains(&format!("`{name}`")) || docs.contains(&format!("`{name}{{")),
+                "docs/monitoring.md does not list {name}"
+            );
+        }
     }
 
     /// The alert rules in `deploy/prometheus` name only metrics this page

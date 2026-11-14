@@ -31,6 +31,16 @@ Since 0.3.0, in no release yet.
   (`acme/room/lobby`) is refused with a message asking for `--app`. A
   target serving another app gets a warning
   ([moving one actor](docs/cluster.md#moving-one-actor)).
+- **Metrics name the node's app, and `wasmkeep_info` its version.**
+  Every series with a `class` label (`wasmkeep_events_total`,
+  `wasmkeep_event_duration_seconds`) also carries `tenant` and `app`: the
+  app the node serves, or `default/default` without `--app`. This changes
+  those series' identity: selectors that match every label exactly, and
+  recording rules or dashboards that list all of them, need `tenant` and
+  `app` added; `sum by (class)` and selectors on some labels keep
+  working. The new gauge `wasmkeep_info{version,tenant,app,node}`, always
+  1, shows which version each node runs (`node` only in a cluster); other
+  series are unchanged ([metrics](docs/monitoring.md#metrics)).
 
 ### App-owned state (for 0.4.0)
 
