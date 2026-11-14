@@ -14,6 +14,7 @@ cannot be undone.
 | The TypeScript SDK | npm, `@wasmkeep/sdk` | `publish.yml` |
 | The Python SDK | PyPI, `wasmkeep` | `publish.yml` |
 | The Go SDK | this repository, tag `sdks/go/v<version>` | a maintainer, with the release's tag |
+| The docs site | https://docs.wasmkeep.dev (GitHub Pages) | `.github/workflows/docs.yml`, when the release is published |
 
 One version for all of it: the workspace version in `Cargo.toml`, which
 every SDK manifest carries (`scripts/check-versions.py`).
@@ -43,7 +44,8 @@ registry.
    registry that lacks the version wait for a reviewer. Before approving,
    look at the run: it is `publish.yml`, started by the release, on the
    tag. Approving publishes: a version on a registry stays there for good.
-5. **Check from outside.** In an empty directory: `cargo add wasmkeep-sdk`,
+5. **Check from outside.** https://docs.wasmkeep.dev shows the new
+   version's docs once `docs.yml` has run. In an empty directory: `cargo add wasmkeep-sdk`,
    `npm install @wasmkeep/sdk`, `pip install wasmkeep` and
    `go get github.com/wasmkeep/wasmkeep/sdks/go@v<version>` each give the
    new version, and each registry's page names this repository as the
