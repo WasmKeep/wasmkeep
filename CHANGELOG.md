@@ -20,6 +20,19 @@ Since 0.4.1, in no release yet.
   own version, and a directory that is not empty is refused. Every variant
   is built and served by `wasmkeep dev` in the tests. Other languages
   later. [Starting a project](docs/tutorials/first-actor.md#starting-a-project-with-wasmkeep-new).
+- **A database kept by one actor**, in the Rust and TypeScript SDKs
+  ([guide](docs/database.md),
+  [ADR 0029](docs/adr/0029-a-database-client-as-an-sdk-pattern.md)): a
+  class mounts the SDK's handler (`db::handle`, `db.define`) and its
+  ordered migrations (`db::migrate`); the app's other actors and its front
+  send it SQL with `db::Client` / `db.Client` (`query`, `exec`, `batch`,
+  `read`) over `actors.call`. Parameters are bound, each request is one
+  transaction (a batch is all or none, a read is always rolled back, a
+  write commits durably), statements that control the transaction are
+  refused, requests and answers are capped, and only inside callers are
+  answered. The SQL comes from the app's code, never from its clients.
+  [`examples/db`](examples/db) and [`examples/ts-db`](examples/ts-db);
+  every client is tested against every handler. The other SDKs come later.
 
 ## 0.4.1
 

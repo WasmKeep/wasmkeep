@@ -546,7 +546,7 @@ jobs:
           sdks/python/scripts/package.sh "$RUNNER_TEMP/python-package"
           cp "$RUNNER_TEMP/python-package/counter.wasm" examples/py-counter/counter.wasm
       - name: the counter contract and the chat suite, against every language
-        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --locked
+        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --test db_langs --locked
       - name: the todo front, in Rust and in TypeScript, with its actor; the projects wasmkeep new writes
         run: cargo nextest run -p wasmkeep-cli --test todo_front --test new_project --locked
 
@@ -595,6 +595,8 @@ jobs:
             examples/workflows/orders
             examples/workflows/ledger
             examples/workflows/app
+            examples/db/database
+            examples/db/app
             examples/todo-front/todos
             examples/todo-front/front
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
@@ -618,6 +620,8 @@ jobs:
             workflows/orders  actor  workflows_orders
             workflows/ledger  actor  workflows_ledger
             workflows/app     actor  workflows_app
+            db/database       actor  db_database
+            db/app            actor  db_app
             todo-front/todos  actor  todo_todos
             todo-front/front  front  todo_front
           '

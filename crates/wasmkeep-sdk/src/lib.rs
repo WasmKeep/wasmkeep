@@ -61,8 +61,12 @@ pub mod bindings {
     });
 }
 
+#[cfg(feature = "actor")]
+pub mod db;
 pub mod front;
 pub mod http;
+#[cfg(feature = "actor")]
+mod json;
 #[cfg(feature = "actor")]
 pub mod kv;
 #[cfg(feature = "actor")]
