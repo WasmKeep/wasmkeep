@@ -32,6 +32,13 @@ Then `0.4.1`: **sockets through the front.** The front accepts a
 WebSocket at its own path and hands it to an actor, so a room needs no
 public `/actor/` address.
 
+And right after: **actors that end.** Today an actor, once created, is
+kept for good; only its old history and old app versions are collected.
+An actor can delete itself and an operator can delete one
+(`wasmkeep actor delete`), a class can expire actors left idle for a
+stated time (sessions, carts, temporary rooms), and then an app can be
+deleted as a whole.
+
 ## Next
 
 `0.5.0`: **several apps on the same nodes.** For one owner's apps and for
