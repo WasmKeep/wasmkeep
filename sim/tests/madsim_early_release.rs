@@ -4,7 +4,9 @@
 //! writes are refused for a while (a slow or throttled bucket timing them
 //! out, an error on that one key), long enough for its lease to run out;
 //! its ownership records still land. The bucket also applies one request
-//! in 25 late, and answers another in 25 only after its client gave up.
+//! in 25 late, and answers another in 25 only after its client gave up;
+//! a release after a lapse it applies at once and answers 150 to 290 ms
+//! later, within the client's timeout.
 //!
 //! Each process runs on the simulations' shared node (`wasmkeep_sim::node`,
 //! the server's rules). Its actor writes while its hold may act: each write
@@ -21,12 +23,13 @@
 //! hold after a later generation's acquisition landed (the new owner's
 //! restore could miss it: an acknowledged write lost). The correct run
 //! must hand the actor over that way (releases after a lapse that landed,
-//! then acquisitions from nobody). Two broken variants must be caught on
-//! some seed: a hold that keeps acting until its release is answered (on
-//! a hibernation's release, while the lease is valid), and, with no
-//! hibernation, a hold that acts on its cell alone and keeps acting until
-//! its release is answered: what is left after a lapse if the node did not
-//! also stop acting by its own clock.
+//! then acquisitions of the records they freed). Two broken variants must
+//! each be caught on a tenth of the seeds at least: a hold that keeps
+//! acting until its release is answered (on a hibernation's release,
+//! while the lease is valid), and, with no hibernation, a hold that acts
+//! on its cell alone and keeps acting until its release is answered: what
+//! is left after a lapse if the node did not also stop acting by its own
+//! clock.
 //!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --target-dir target/madsim`
 
@@ -40,7 +43,7 @@ use std::time::Duration;
 
 use madsim::runtime::{Handle, Runtime};
 use madsim::time::{Instant, sleep};
-use wasmkeep_cluster::lease::{Bucket, BucketError, LeaseConfig, Version};
+use wasmkeep_cluster::lease::{Bucket, LeaseConfig};
 use wasmkeep_cluster::node_lease::{OwnerRecord, Released};
 use wasmkeep_sim::check::{double_ownership, stop_process};
 use wasmkeep_sim::driver::{Claim, Env, SkewedClock};
@@ -49,7 +52,7 @@ use wasmkeep_sim::rng::Rng;
 
 #[path = "support/bucket.rs"]
 mod bucket;
-use bucket::{EpBucket, Store, bucket_node_with};
+use bucket::{CutWrites, EpBucket, Store, bucket_node_with};
 
 const ACTOR: &str = "owners/t/c/a";
 const NODES: &str = "nodes/";
@@ -78,46 +81,6 @@ impl Env for SimEnv {
 
     async fn sleep_ms(&self, ms: u64) {
         sleep(Duration::from_millis(ms)).await;
-    }
-}
-
-/// The lease's own client: its writes are refused while `cut` is set
-/// (reads still answer), the node's other clients unaffected.
-struct LeaseWrites {
-    inner: EpBucket,
-    cut: Arc<AtomicBool>,
-}
-
-impl LeaseWrites {
-    fn refused(&self) -> Option<BucketError> {
-        self.cut
-            .load(Ordering::SeqCst)
-            .then(|| BucketError::Unavailable("lease write refused".into()))
-    }
-}
-
-impl Bucket for LeaseWrites {
-    async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
-        self.inner.get(key).await
-    }
-
-    async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
-        if let Some(e) = self.refused() {
-            return Err(e);
-        }
-        self.inner.create(key, body).await
-    }
-
-    async fn replace(
-        &self,
-        key: &str,
-        body: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BucketError> {
-        if let Some(e) = self.refused() {
-            return Err(e);
-        }
-        self.inner.replace(key, body, expected).await
     }
 }
 
@@ -151,6 +114,8 @@ struct Shared {
     /// ones that landed.
     lapsed_releases: u64,
     lapsed_landed: u64,
+    /// The generations whose release after a lapse landed.
+    lapsed_generations: Vec<u64>,
     /// Times a node's lease writes were cut.
     cuts: u64,
 }
@@ -223,22 +188,13 @@ async fn run_node(
         // The lease's writes go through the cut; nothing else does. The
         // peers' client reads and fences with the node's other clients.
         let buckets = NodeBuckets {
-            lease: LeaseWrites {
+            lease: CutWrites {
                 inner: EpBucket::connect().await,
                 cut: Arc::clone(&cut),
             },
-            task_records: LeaseWrites {
-                inner: EpBucket::connect().await,
-                cut: Arc::new(AtomicBool::new(false)),
-            },
-            peers: LeaseWrites {
-                inner: EpBucket::connect().await,
-                cut: Arc::new(AtomicBool::new(false)),
-            },
-            records: LeaseWrites {
-                inner: EpBucket::connect().await,
-                cut: Arc::new(AtomicBool::new(false)),
-            },
+            task_records: CutWrites::uncut(EpBucket::connect().await),
+            peers: CutWrites::uncut(EpBucket::connect().await),
+            records: CutWrites::uncut(EpBucket::connect().await),
         };
         let (node, task) =
             LeaseNode::start(setup, &instance, clock, buckets, Vec::new(), &env).await;
@@ -249,8 +205,10 @@ async fn run_node(
             stop_process(&mut shared.lock().unwrap().claims, i, process, env.now());
         };
         // Gives `h` up in the background, as the server's dropped hold
-        // does, noting a release sent after a lapse.
-        let give_up = |h: Held| {
+        // does (once: `given` keeps its generation), noting a release sent
+        // after a lapse.
+        let give_up = |h: Held, given: &mut Option<u64>| {
+            *given = Some(h.generation);
             let lapsed = node.still_held(&h) && !node.lease_valid();
             let (node, shared) = (Rc::clone(&node), Arc::clone(&shared));
             madsim::task::spawn_local(async move {
@@ -260,11 +218,13 @@ async fn run_node(
                     s.lapsed_releases += 1;
                     if got == Some(Released::Released) {
                         s.lapsed_landed += 1;
+                        s.lapsed_generations.push(h.generation);
                     }
                 }
             });
         };
         let mut hold: Option<Held> = None;
+        let mut given: Option<u64> = None;
         loop {
             if node.lost() {
                 end(&shared);
@@ -273,10 +233,20 @@ async fn run_node(
             match hold.take() {
                 // An event reaches the actor after a lapse the lease task
                 // has not seen yet: the server's actor finds the hold no
-                // longer valid by the lease, and gives it up.
-                Some(h) if node.still_held(&h) && !node.lease_valid() && rng.chance(40) => {
+                // longer valid by the lease, and gives it up. The bucket
+                // applies that release at once and answers it a while
+                // later, within the client's timeout: the window in which a
+                // hold that acted until its release is answered acts beside
+                // the node that took the record.
+                Some(h)
+                    if given != Some(h.generation)
+                        && node.still_held(&h)
+                        && !node.lease_valid()
+                        && rng.chance(40) =>
+                {
                     end(&shared);
-                    give_up(h.clone());
+                    bucket::late_reply_next("REPLACE", ACTOR, 150 + rng.below(140));
+                    give_up(h.clone(), &mut given);
                     hold = Some(h);
                 }
                 Some(h) if node.may_act(&h) => {
@@ -291,9 +261,9 @@ async fn run_node(
                         from_ms: env.now(),
                         until_ms: until,
                     });
-                    if hibernate && rng.chance(10) {
+                    if hibernate && given != Some(h.generation) && rng.chance(10) {
                         // A hibernation: given up while it may act.
-                        give_up(h.clone());
+                        give_up(h.clone(), &mut given);
                         if !breaks.release_before_stop {
                             end(&shared);
                         }
@@ -348,13 +318,15 @@ struct Outcome {
     shared_generation: Option<(Acquired, Acquired)>,
     lapsed_releases: u64,
     lapsed_landed: u64,
-    from_nobody: u64,
+    /// Acquisitions of a record a release after a lapse freed.
+    after_lapse: u64,
     acquired: u64,
     cuts: u64,
 }
 
 /// `hibernate`: holds are also given up while they may act.
 fn simulate(seed: u64, breaks: Breaks, hibernate: bool, duration: Duration) -> Outcome {
+    bucket::clear_delays();
     let rt = Runtime::with_seed_and_config(seed, madsim::Config::default());
     let shared = Arc::new(Mutex::new(Shared::default()));
     let out = Arc::clone(&shared);
@@ -434,7 +406,17 @@ fn simulate(seed: u64, breaks: Breaks, hibernate: bool, duration: Duration) -> O
         shared_generation: shared_generation(&s),
         lapsed_releases: s.lapsed_releases,
         lapsed_landed: s.lapsed_landed,
-        from_nobody: s.acquired.iter().filter(|a| a.from_nobody).count() as u64,
+        // The record named nobody at the generation a release after a
+        // lapse freed: this acquisition took what that release handed over.
+        after_lapse: s
+            .acquired
+            .iter()
+            .filter(|a| {
+                a.from_nobody
+                    && s.lapsed_generations
+                        .contains(&a.generation.saturating_sub(1))
+            })
+            .count() as u64,
         acquired: s.acquired.len() as u64,
         cuts: s.cuts,
     }
@@ -449,7 +431,7 @@ fn seeds() -> u64 {
 
 #[test]
 fn a_release_after_a_lapse_hands_the_actor_over_safely() {
-    let (mut sent, mut landed, mut from_nobody, mut acquired, mut cuts) = (0, 0, 0, 0, 0);
+    let (mut sent, mut landed, mut after_lapse, mut acquired, mut cuts) = (0, 0, 0, 0, 0);
     for seed in 0..seeds() {
         let o = simulate(seed, Breaks::default(), true, Duration::from_secs(20));
         if let Some(d) = double_ownership(&o.claims) {
@@ -463,13 +445,13 @@ fn a_release_after_a_lapse_hands_the_actor_over_safely() {
         }
         sent += o.lapsed_releases;
         landed += o.lapsed_landed;
-        from_nobody += o.from_nobody;
+        after_lapse += o.after_lapse;
         acquired += o.acquired;
         cuts += o.cuts;
     }
     eprintln!(
         "{} seeds: {cuts} lease cuts, {sent} releases after a lapse ({landed} landed), \
-         {acquired} acquisitions ({from_nobody} from nobody)",
+         {acquired} acquisitions ({after_lapse} of a record such a release freed)",
         seeds()
     );
     let floor = (seeds() / 4).max(1);
@@ -478,8 +460,8 @@ fn a_release_after_a_lapse_hands_the_actor_over_safely() {
         "{landed} releases after a lapse landed, want {floor}"
     );
     assert!(
-        from_nobody >= floor,
-        "{from_nobody} acquisitions from nobody, want {floor}"
+        after_lapse >= floor,
+        "{after_lapse} acquisitions of a record a release after a lapse freed, want {floor}"
     );
 }
 
@@ -494,33 +476,42 @@ fn a_hold_acting_until_its_release_is_answered_is_caught() {
         release_before_stop: true,
         ..Breaks::default()
     };
-    caught(before_stop, true, "release before stop, hibernating");
     let after_lapse = Breaks {
         act_on_cell_only: true,
         ..before_stop
     };
-    caught(
+    let hibernating = caught(before_stop, true, "release before stop, hibernating");
+    let lapsed = caught(
         after_lapse,
         false,
         "release before stop, acting on the cell alone",
     );
+    // Caught often, not on one lucky seed: a tenth of the seeds at least.
+    let floor = (seeds() / 10).max(1);
+    for (what, n) in [("hibernating", hibernating), ("after a lapse", lapsed)] {
+        assert!(n >= floor, "{what}: caught on {n} seeds, want {floor}");
+    }
 }
 
-fn caught(breaks: Breaks, hibernate: bool, what: &str) {
-    let caught = (0..seeds().max(200)).find_map(|seed| {
+/// On how many seeds the variant is caught.
+fn caught(breaks: Breaks, hibernate: bool, what: &str) -> u64 {
+    let n = seeds();
+    let mut first = None;
+    let mut caught = 0u64;
+    for seed in 0..n {
         let o = simulate(seed, breaks, hibernate, Duration::from_secs(20));
-        if double_ownership(&o.claims).is_some() {
-            Some((seed, "two owners"))
+        let why = if double_ownership(&o.claims).is_some() {
+            Some("two owners")
         } else if o.lost_ack.is_some() {
-            Some((seed, "an acknowledged write lost"))
+            Some("an acknowledged write lost")
         } else {
             None
+        };
+        if let Some(why) = why {
+            caught += 1;
+            first.get_or_insert((seed, why));
         }
-    });
-    eprintln!("{what}: caught by {caught:?}");
-    assert!(
-        caught.is_some(),
-        "{what}: never caught in {} seeds",
-        seeds().max(200)
-    );
+    }
+    eprintln!("{what}: caught on {caught} of {n} seeds, first {first:?}");
+    caught
 }
