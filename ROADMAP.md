@@ -70,7 +70,8 @@ Not before the releases above.
 - **Operating without the author**: mixed versions during an upgrade
   (today every node is upgraded together,
   [how](docs/cluster.md#upgrading-wasmkeep)); inspect or export one actor;
-  verify a bucket; traces. Required before a stable `1.0`: within `1.x`,
+  verify a bucket; back a cluster's bucket up to another and restore it;
+  traces. Required before a stable `1.0`: within `1.x`,
   every upgrade is rolling, one node at a time, with no stop of the whole
   cluster and no offline migration. Two consecutive versions work in one
   cluster, and a new bucket format is written only once every node reads
@@ -88,7 +89,9 @@ Not before the releases above.
   decision of their own.
 - Ideas, each needing a design first: encrypting actor state in the
   bucket, exporting many actors' data for analytics, composing components
-  at deploy time.
+  at deploy time; a bucket per app, so that an app's data can stay in its
+  owner's account or a chosen country (the cluster itself keeps one
+  bucket).
 
 ## Later, on demand
 
