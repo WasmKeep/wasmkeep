@@ -42,3 +42,25 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --locked --no-tests=pass
+
+  # The tutorials run as written (scripts/test-tutorials.sh): three nodes
+  # against moto, a kill -9, a drain. Minutes of real time, so not on pull
+  # requests; a tutorial skipped for a missing tool fails here.
+  tutorials:
+    name: tutorials (as written)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      WASMKEEP_TUTORIALS_NO_SKIP: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: tutorials
+          workspaces: |
+            .
+            examples/counter
+      # The S3 store at the version the page names (the test uses uvx
+      # instead when the runner has it).
+      - run: pip install --quiet "moto[server]==5.2.5"
+      - run: ./scripts/test-tutorials.sh

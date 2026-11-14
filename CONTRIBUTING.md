@@ -57,6 +57,12 @@ Actions) is split so that a pull request waits a minute or two, not ten:
   test suites on Linux x86_64, arm64 and macOS, every language, and the S3
   suites. When several changes land together, only the last commit's run
   is kept. A failure there is fixed forward.
+- **Nightly only**: the tutorials, run as written. `./scripts/test-tutorials.sh`
+  runs each page in `docs/tutorials/` that has a test in
+  `scripts/tutorials/` (the blocks marked `<!-- test: ID -->`, as a reader
+  pastes them) and checks the output the page promises. Run it when you
+  change a tutorial or the commands it uses; it skips a tutorial whose
+  tools (moto, for the cluster one) are missing, and says so.
 - **A release** needs a passing run on its commit.
 
 ## Code rules
