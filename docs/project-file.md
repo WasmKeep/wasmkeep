@@ -87,7 +87,8 @@ least one class.
 There is no key for a value, a secret or a bucket. Configuration goes in
 the files `config` names; secrets go in the bucket with `wasmkeep secrets
 set` ([Secrets in the bucket](cluster.md#secrets-in-the-bucket)); local
-values go in `.env.local`, which belongs in `.gitignore`. The bucket is
+values go in `.env.local`, which belongs in `.gitignore` (a `config` that
+names the `[dev] env` file is refused). The bucket is
 `deploy --bucket`, so one file deploys to staging and production alike.
 
 ## `wasmkeep deploy`
@@ -98,7 +99,7 @@ wasmkeep deploy --bucket s3://my-bucket/prod
 
 1. Runs every `build` (the front's first, then the classes' in name
    order). A failed build stops the deploy before the bucket is opened.
-   `--no-build` skips them.
+   `--no-build` skips them. `--bucket` is checked first.
 2. Reads every component and configuration file, and warns about
    configuration names that look like secrets.
 3. Prints what changes against the deployed version, before anything is
@@ -123,7 +124,9 @@ finds it.
 
 **Every rule is written** in the version, `open` included, so a class's
 rule never depends on how the app was deployed. Such a version uses
-manifest format 3, read by every 0.4.0 node.
+manifest format 3, read by every 0.4.0 node. The first deploy from the
+file of an app deployed with flags may change only that; the plan then
+says `access c: open, now written in the version`.
 
 **With flags.** Beside a file, `--actor`, `--access`, `--config`,
 `--requires`, `--front`, `--no-front`, `--front-config` and
@@ -133,8 +136,8 @@ another directory): such a deploy keeps every class's rule, and a class
 it adds without `--access` is `open`, the default of flags. The next
 deploy from the file makes the version the file's again.
 
-**Rollback.** `wasmkeep deploy --rollback` reads only `[app]` and runs no
-build: it restores the previous version as the bucket holds it. The file
+**Rollback.** `wasmkeep deploy --rollback` reads only `[app]` (a typo
+elsewhere in the file does not block it) and runs no build: it restores the previous version as the bucket holds it. The file
 may then describe another version; the next deploy from it deploys the
 file. A rollback that would make a class more open (from a file's
 `internal` back to a flag deploy's `open`, say) is refused without

@@ -142,6 +142,52 @@ fn a_failed_build_stops_before_the_bucket_and_a_rollback_builds_nothing() {
     );
     assert!(!out.contains("the build of"), "{out}");
 
+    // A mistyped bucket fails before the build.
+    let (ok, out) = wasmkeep(dir.path(), &["deploy", "--bucket", "nonsense"]);
+    assert!(!ok && out.contains("--bucket"), "{out}");
+    assert!(
+        !dir.path().join("built").exists(),
+        "built before the bucket was checked"
+    );
+
+    // A rollback reads [app] only: a typo elsewhere in the file (which may
+    // describe a version not deployed yet) does not block it.
+    std::fs::write(
+        dir.path().join("wasmkeep.toml"),
+        format!(
+            "{APP}[classes.c]\ncomponent = \"c.wasm\"\nacess = \"x\"\nbuild = \"touch built\"\n"
+        ),
+    )
+    .unwrap();
+    let (ok, out) = wasmkeep(dir.path(), &["deploy", "--bucket", NO_BUCKET, "--rollback"]);
+    assert!(!ok, "{out}");
+    assert!(
+        !out.contains("acess"),
+        "the rest of the file was read: {out}"
+    );
+    assert!(!dir.path().join("built").exists(), "{out}");
+    std::fs::write(
+        dir.path().join("wasmkeep.toml"),
+        format!("{APP}[classes.c]\ncomponent = \"c.wasm\"\nbuild = \"touch built && exit 7\"\n"),
+    )
+    .unwrap();
+    // --no-build without a file has nothing to skip.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (ok, out) = wasmkeep(
+        elsewhere.path(),
+        &[
+            "deploy",
+            "--bucket",
+            NO_BUCKET,
+            "--app",
+            "acme/shop",
+            "--actor",
+            "c=c.wasm",
+            "--no-build",
+        ],
+    );
+    assert!(!ok && out.contains("--no-build"), "{out}");
+
     // --no-build skips the build; the missing component is then the error.
     let (ok, out) = wasmkeep(dir.path(), &["deploy", "--bucket", NO_BUCKET, "--no-build"]);
     assert!(!ok, "{out}");

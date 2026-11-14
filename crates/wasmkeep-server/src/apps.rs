@@ -1106,6 +1106,11 @@ pub struct Diff {
     /// With a front after the change: the classes whose rule is `open`,
     /// reachable from outside past it.
     pub open_past_front: Vec<String>,
+    /// `(class, written)`: kept classes that stay `open` but whose rule is
+    /// now written in the version (`true`, a deploy from the project file,
+    /// ADR 0026) or no longer written (`false`, a flag deploy after one).
+    /// The rule does not change; the version does.
+    pub open_written: Vec<(String, bool)>,
 }
 
 impl Diff {
@@ -1153,6 +1158,14 @@ impl Diff {
                 .filter(|c| as_.access.of(c) == crate::access::Access::Open)
                 .cloned()
                 .collect();
+        }
+        for class in am.classes.keys().filter(|c| bm.classes.contains_key(*c)) {
+            let (b, a) = (bm.access.get(class), am.access.get(class));
+            match (b.map(String::as_str), a.map(String::as_str)) {
+                (None, Some("open")) => diff.open_written.push((class.clone(), true)),
+                (Some("open"), None) => diff.open_written.push((class.clone(), false)),
+                _ => {}
+            }
         }
         let open = || "open".to_owned();
         // The classes, and the front's scope when either version has a
@@ -1216,6 +1229,13 @@ impl Diff {
                 .iter()
                 .map(|(c, b, a)| format!("access {c}: {b} -> {a}")),
         );
+        out.extend(self.open_written.iter().map(|(c, written)| {
+            if *written {
+                format!("access {c}: open, now written in the version")
+            } else {
+                format!("access {c}: open, no longer written in the version (the same rule)")
+            }
+        }));
         out.extend(self.config.iter().map(|l| format!("config {l}")));
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
         out.extend(

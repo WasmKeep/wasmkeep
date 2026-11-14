@@ -162,6 +162,13 @@ async fn a_file_deploy_is_the_whole_version_and_writes_every_rule() {
         "{:?}",
         v4.diff
     );
+    assert!(
+        v4.diff.lines().contains(
+            &"access c: open, no longer written in the version (the same rule)".to_owned()
+        ),
+        "{:?}",
+        v4.diff.lines()
+    );
     let m4 = app.manifest(&v4.current.version).await.unwrap();
     assert_eq!(m4.access.get("c"), None);
     assert_eq!(m4.access.get("d").map(String::as_str), Some("internal"));
@@ -191,4 +198,37 @@ async fn a_file_deploy_is_the_whole_version_and_writes_every_rule() {
     let back = app.rollback(false).await.unwrap();
     assert_eq!(back.current.version, v4.current.version);
     status_of(node.addr, "/actor/d/x", 403).await;
+}
+
+/// An app deployed with flags whose rules the file keeps (an open class
+/// written `open`) gets a new version, and the plan says why: it is never
+/// an empty plan for a new version.
+#[tokio::test(flavor = "multi_thread")]
+async fn writing_an_open_rule_is_shown() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    let v1 = app
+        .deploy_changes(
+            &rt,
+            Changes {
+                classes: Some(vec![("c".into(), counter_wasm().to_vec())]),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut plan = None;
+    let v2 = app
+        .deploy_changes_with(&rt, file_changes(false), |d| {
+            plan = Some(d.lines());
+            true
+        })
+        .await
+        .unwrap();
+    assert_ne!(v2.current.version, v1.current.version);
+    assert_eq!(
+        plan.unwrap(),
+        vec!["access c: open, now written in the version".to_owned()]
+    );
 }

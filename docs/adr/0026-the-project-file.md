@@ -111,7 +111,9 @@ env = ".env.local"              # local values, never committed
   stored in the bucket in the clear, as with `--config` (the deploy warns
   about names that look secret, as it does); secrets stay `wasmkeep
   secrets set` (ADR 0016). `[dev] env` is read by `dev` only, never by
-  `deploy`, and its default, `.env.local`, is meant for `.gitignore`.
+  `deploy`, and its default, `.env.local`, is meant for `.gitignore`. A
+  `config` naming the `[dev] env` file is refused: it would upload local
+  values in the clear.
 - **No bucket in the file.** The bucket is where an app is deployed
   (staging, production), not part of the app: `--bucket` stays a flag. A
   deploy names it every time, so the same file deploys anywhere.
@@ -154,7 +156,9 @@ needs no `open` line and keeps format 2.
 An explicit `open` and an absent rule mean the same to a node (`open`).
 They differ in the version's identity, so the first deploy from the file
 of an app deployed with flags makes a new version even when nothing else
-changes.
+changes; its plan says so (`access c: open, now written in the
+version`), and a flag deploy dropping the line says `no longer written`:
+a new version never comes with an empty plan.
 
 **A deploy with flags after one from the file** (`--no-project`, or from
 another directory) keeps each class's rule, as flag deploys do; an
@@ -195,10 +199,12 @@ to Rust: `npm run build`, `make`, `tinygo build` are commands like
   nothing is written. `dev` stops at start, and keeps the previous
   version serving after a failed rebuild.
 - `--no-build` skips them (a CI that built the components in an earlier
-  step).
+  step); without a project file it is refused. `--bucket` is checked
+  before any build, so a mistyped one costs no build.
 - **`--rollback` runs no build** and reads only `[app]` from the file: a
   rollback restores what the bucket holds, and the file may already
-  describe a version not deployed yet.
+  describe a version not deployed yet, typos included, which must not
+  block the way back.
 - Builds are commands from the file, which the person deploying runs as
   themselves, as they would run the repository's `Makefile` or `npm`
   scripts: the file is code of the app's repository, not input from

@@ -1001,7 +1001,7 @@ fn main() -> anyhow::Result<()> {
 /// (ADR 0026), else the crates.
 fn dev(args: DevArgs) -> anyhow::Result<()> {
     let project = if args.crates.is_empty() || args.project.is_some() {
-        project::discover(args.project.as_deref(), args.no_project)?
+        project::discover(args.project.as_deref(), args.no_project, false)?
     } else if !args.no_project && std::path::Path::new(project::FILE_NAME).exists() {
         anyhow::bail!(
             "crate directories are given beside {}: run `wasmkeep dev` alone to run the \
@@ -1630,7 +1630,13 @@ fn version_flags(args: &DeployArgs) -> Vec<&'static str> {
 
 /// `wasmkeep deploy`: validate, upload, switch (or roll back).
 fn deploy(args: DeployArgs) -> anyhow::Result<()> {
-    let project = project::discover(args.project.as_deref(), args.no_project)?;
+    let project = project::discover(args.project.as_deref(), args.no_project, args.rollback)?;
+    anyhow::ensure!(
+        project.is_some() || !args.no_build,
+        "--no-build: there is no project file, so nothing to build"
+    );
+    // A mistyped bucket fails before a build runs.
+    parse_bucket(&args.bucket)?;
     // Builds run and files are read before the bucket is opened: a failed
     // build writes nothing. A rollback runs no build (ADR 0026).
     let mut file_changes = None;

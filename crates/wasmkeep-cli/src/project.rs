@@ -259,6 +259,13 @@ fn item(
 /// Parses the file at `path` (its `text`): every key checked, errors with
 /// the file, line, column and key.
 pub(crate) fn parse(text: &str, path: &Path) -> Result<Project, String> {
+    parse_with(text, path, false)
+}
+
+/// [`parse`], or with `app_only` only `[app]` (a rollback, ADR 0026: the
+/// rest of the file may describe a version not deployed yet, typos
+/// included); the rest is then left empty.
+fn parse_with(text: &str, path: &Path, app_only: bool) -> Result<Project, String> {
     let src = Source { text, path };
     let root = DeTable::parse(text).map_err(|e| match e.span() {
         Some(span) => format!("{}: {}", src.at(span), e.message().trim()),
@@ -273,7 +280,9 @@ pub(crate) fn parse(text: &str, path: &Path) -> Result<Project, String> {
     } else {
         dir
     };
-    known_keys(&src, root, "the file", TOP)?;
+    if !app_only {
+        known_keys(&src, root, "the file", TOP)?;
+    }
 
     let app = table(&src, root, "app")?.ok_or_else(|| {
         format!(
@@ -296,6 +305,21 @@ pub(crate) fn parse(text: &str, path: &Path) -> Result<Project, String> {
             );
         }
         names.push(value);
+    }
+    if app_only {
+        let mut names = names.into_iter();
+        return Ok(Project {
+            path: path.to_path_buf(),
+            dir: dir.clone(),
+            tenant: names.next().unwrap_or_default(),
+            name: names.next().unwrap_or_default(),
+            front: None,
+            classes: BTreeMap::new(),
+            dev: Dev {
+                env: dir.join(".env.local"),
+                ..Dev::default()
+            },
+        });
     }
 
     let front = match get(root, "front") {
@@ -397,6 +421,23 @@ pub(crate) fn parse(text: &str, path: &Path) -> Result<Project, String> {
         }
     }
 
+    // The local values file is never configuration: configuration is
+    // uploaded in the clear.
+    for (what, item) in front.iter().map(|f| ("[front]".to_owned(), f)).chain(
+        classes
+            .iter()
+            .map(|(n, c)| (format!("[classes.{n}]"), &c.item)),
+    ) {
+        if item.config.as_ref() == Some(&dev.env) {
+            return Err(format!(
+                "{}: {what} config is {}, the [dev] env file of local values: configuration is \
+                 stored in the bucket in the clear; give it a file of its own",
+                path.display(),
+                dev.env.display()
+            ));
+        }
+    }
+
     let mut names = names.into_iter();
     Ok(Project {
         path: path.to_path_buf(),
@@ -411,17 +452,23 @@ pub(crate) fn parse(text: &str, path: &Path) -> Result<Project, String> {
 
 /// Reads and parses the project file at `path`.
 pub(crate) fn load(path: &Path) -> anyhow::Result<Project> {
+    load_with(path, false)
+}
+
+fn load_with(path: &Path, app_only: bool) -> anyhow::Result<Project> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    parse(&text, path).map_err(anyhow::Error::msg)
+    parse_with(&text, path, app_only).map_err(anyhow::Error::msg)
 }
 
 /// The project file for a command: `--project PATH` (a file, or a
 /// directory holding `wasmkeep.toml`), else `./wasmkeep.toml` if there is
-/// one, unless `--no-project`.
+/// one, unless `--no-project`. With `app_only`, only `[app]` is read
+/// (`deploy --rollback`).
 pub(crate) fn discover(
     project: Option<&Path>,
     no_project: bool,
+    app_only: bool,
 ) -> anyhow::Result<Option<Project>> {
     if no_project {
         return Ok(None);
@@ -433,12 +480,12 @@ pub(crate) fn discover(
             } else {
                 p.to_path_buf()
             };
-            load(&path).map(Some)
+            load_with(&path, app_only).map(Some)
         }
         None => {
             let path = PathBuf::from(FILE_NAME);
             if path.exists() {
-                load(&path).map(Some)
+                load_with(&path, app_only).map(Some)
             } else {
                 Ok(None)
             }
@@ -914,6 +961,33 @@ env = ".env.dev"
         let c = to_changes(&p, parts(true, &[]));
         assert_eq!(c.front_config, Some(None));
         assert_eq!(c.front_requires, Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn a_rollback_reads_only_the_app() {
+        let text = "[app]\ntenant='acme'\nname='todo'\n[classes.a]\ncomponent='a'\nacess='open'\n[nonsense]\n";
+        assert!(parse(text, Path::new("wasmkeep.toml")).is_err());
+        let p = parse_with(text, Path::new("wasmkeep.toml"), true).unwrap();
+        assert_eq!((p.tenant.as_str(), p.name.as_str()), ("acme", "todo"));
+        assert!(p.classes.is_empty() && p.front.is_none());
+        // [app] alone is enough, and still checked.
+        assert!(parse_with("[app]\ntenant='acme'\nname='todo'\n", Path::new("w"), true).is_ok());
+        let err =
+            parse_with("[app]\ntenant='acme'\nnmae='todo'\n", Path::new("w"), true).unwrap_err();
+        assert!(err.contains("unknown key \"nmae\""), "{err}");
+    }
+
+    #[test]
+    fn the_local_values_file_is_not_configuration() {
+        let base = "[app]\ntenant='a'\nname='b'\n";
+        let err = parse_err(&format!(
+            "{base}[classes.c]\ncomponent='c'\nconfig='.env.local'\n"
+        ));
+        assert!(err.contains("[classes.c] config is"), "{err}");
+        let err = parse_err(&format!(
+            "{base}[front]\ncomponent='f'\nconfig='local.env'\n[dev]\nenv='local.env'\n"
+        ));
+        assert!(err.contains("[front] config is"), "{err}");
     }
 
     #[test]
