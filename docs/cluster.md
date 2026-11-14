@@ -749,9 +749,11 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --no-front
   first. Versions without a front are written as before, with the same
   ids. A node started without `--node-id` writes no heartbeat, so the
   check cannot see it.
-- **A front that links but does not instantiate** (a start function that
-  traps, say) passes the deploy's checks; its requests answer 500 on
-  every node, and a node that restarts meanwhile starts anyway, with its
+- **A front that passes the deploy's checks and still fails** (it traps
+  in its handler rather than at instantiation, as a Rust static
+  constructor does since it runs at the first call, or a node has lower
+  limits than the machine that ran `deploy`) answers 500 for its
+  requests; a node that restarts meanwhile starts anyway, with its
   actors, logging the error. Deploy a fixed front, or roll back.
 - **A node's own values:** `serve --front-env FILE` gives the front
   values on that node, over the deployed configuration and the secrets
