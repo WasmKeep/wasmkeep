@@ -70,7 +70,7 @@ Since 0.3.0, in no release yet.
   `front-core`: `call-many(list<(address, request)>)` starts up to 16
   calls together and returns one `result<response, call-error>` per
   entry, in input order, once all have answered or the batch's one
-  deadline passed (an actor's call limit, a front's call deadline). A
+  deadline passed (an actor's call deadline, a front's call deadline). A
   front gathering four slow actors pays about one round trip, not four.
   Each entry is an `actors.call` in every other respect: caller value,
   chain (an entry naming the caller is `reentrant`), routing and signed
@@ -89,6 +89,14 @@ Since 0.3.0, in no release yet.
   interface and run unchanged; one that imports it needs this release.
   The todo-front examples gain `GET /api/team`, every user's count from
   one batch ([ADR 0025](docs/adr/0025-calling-several-actors-at-once.md)).
+- **An actor's `actors.call` gives up before its own event is cut.** A
+  call from an actor now fails with `timeout` while 5 s of the caller's
+  event wall remain (a fifth of a wall shorter than 25 s), as a front's
+  call does; before, it waited the whole wall from
+  when it started, so the caller's event was always cut first and its
+  client got the failed event's answer instead of what the guest made of
+  the `timeout`. A batch's entries share that deadline, so the ones that
+  answered keep their answers.
 - **`wasmkeep cluster status` shows each node's load**: ACTORS, SOCKETS
   and EV/MIN (events per minute over the last minute or more) per live
   node, and ACTORS per app, summed over its live nodes; `actors`,

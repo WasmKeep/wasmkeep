@@ -201,9 +201,10 @@ async fn an_actors_batch_runs_its_calls_at_once() {
 }
 
 /// Siblings are not in each other's chain: a batch [b, c] where b calls
-/// c and c calls b deadlocks until the call limit (5 s here, the actors'
-/// wall per event too, so the outer event ends with it), then both actors
-/// serve again.
+/// c and c calls b deadlocks until the caller's call deadline: its event's
+/// wall (5 s here) less the margin it keeps to answer (1 s at this wall).
+/// The caller then answers itself with a per-entry `timeout`, before its
+/// own event is cut, and both actors serve again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cycle_between_siblings_ends_in_timeout() {
     let data = tempfile::tempdir().unwrap();
@@ -218,11 +219,39 @@ async fn a_cycle_between_siblings_ends_in_timeout() {
     .await;
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_millis(4_500) && took < Duration::from_secs(9),
+        took >= Duration::from_millis(3_500) && took < Duration::from_millis(4_900),
         "took {took:?}"
     );
-    assert!(status != 200 || body.contains("timeout"), "{status} {body}");
+    assert_eq!((status, body.as_str()), (200, "timeout | timeout"));
     // Nothing stays stuck.
     assert_eq!(post(addr, "/actor/t/b/fired").await.1, "0");
     assert_eq!(post(addr, "/actor/t/c/fired").await.1, "0");
+}
+
+/// A callee busy past the caller's wall: the entries that answered keep
+/// their answers and the late one is `timeout`, in a batch as in a single
+/// call; the caller's event is not cut, so nothing it got is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_callee_times_out_before_the_callers_wall() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(data.path()).await;
+    // c is busy for about 6 s: two events of 3 s, one after the other.
+    let busy: Vec<_> = (0..2)
+        .map(|_| {
+            let task = tokio::spawn(async move { post(addr, "/actor/t/c/sleep?ms=3000").await });
+            std::thread::sleep(Duration::from_millis(50));
+            task
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    let batch = tokio::spawn(async move { post(addr, "/actor/t/a/call-many?to=t/b,t/c").await });
+    let single = tokio::spawn(async move { post(addr, "/actor/t/d/call?to=t/c").await });
+    assert_eq!(batch.await.unwrap(), (200, "200:0 | timeout".into()));
+    assert_eq!(single.await.unwrap(), (200, "timeout".into()));
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(4_900), "took {took:?}");
+    for task in busy {
+        assert_eq!(task.await.unwrap(), (200, "slept".into()));
+    }
 }

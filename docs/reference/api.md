@@ -236,7 +236,7 @@ A fully buffered request, delivered to the callee's
 | `invalid-address(string)` | The address is not `class/name`, or the class does not exist. |
 | `reentrant` | The call would re-enter an actor already waiting in this call chain (including the caller itself), which would deadlock. |
 | `too-large` | The request or response exceeded the body limit (16 MB). |
-| `timeout` | The callee did not answer within the event's wall-clock limit. |
+| `timeout` | The callee did not answer by the caller's call deadline. |
 | `failed(string)` | The callee trapped, or the host could not deliver the call. |
 
 ### `actor-address` (record)
@@ -309,8 +309,8 @@ same actor are allowed; each is its own call.
 Limits, for the batch as a whole:
 - at most 16 entries: a longer batch starts no call, and every entry
   is `failed("too many calls: ...")`;
-- one deadline, fixed when the call starts (an actor's call limit,
-  or a front's call deadline): an entry still waiting then is
+- one deadline, the caller's (its event's wall less a margin kept
+  to answer, or a front's call deadline): an entry still waiting then is
   `timeout`, and the others keep their answers;
 - request bodies together at most 16 MB (else every entry is
   `too-large` and none starts), responses together at most 16 MB

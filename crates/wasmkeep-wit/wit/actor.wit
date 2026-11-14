@@ -132,7 +132,7 @@ interface actors {
         reentrant,
         /// The request or response exceeded the body limit (16 MB).
         too-large,
-        /// The callee did not answer within the event's wall-clock limit.
+        /// The callee did not answer by the caller's call deadline.
         timeout,
         /// The callee trapped, or the host could not deliver the call.
         failed(string),
@@ -182,8 +182,8 @@ interface calls {
     /// Limits, for the batch as a whole:
     /// - at most 16 entries: a longer batch starts no call, and every entry
     ///   is `failed("too many calls: ...")`;
-    /// - one deadline, fixed when the call starts (an actor's call limit,
-    ///   or a front's call deadline): an entry still waiting then is
+    /// - one deadline, the caller's (its event's wall less a margin kept
+    ///   to answer, or a front's call deadline): an entry still waiting then is
     ///   `timeout`, and the others keep their answers;
     /// - request bodies together at most 16 MB (else every entry is
     ///   `too-large` and none starts), responses together at most 16 MB

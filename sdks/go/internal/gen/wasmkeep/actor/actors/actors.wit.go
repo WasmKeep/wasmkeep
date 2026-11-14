@@ -96,7 +96,7 @@ func (self *CallError) TooLarge() bool {
 
 // CallErrorTimeout returns a [CallError] of case "timeout".
 //
-// The callee did not answer within the event's wall-clock limit.
+// The callee did not answer by the caller's call deadline.
 func CallErrorTimeout() CallError {
 	var data struct{}
 	return cm.New[CallError](3, data)
