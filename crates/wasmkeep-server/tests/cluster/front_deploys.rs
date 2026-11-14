@@ -222,7 +222,7 @@ async fn deploys_carry_the_front_and_rollbacks_restore_it() {
     let lines = v2.diff.lines();
     for want in [
         "front: unchanged",
-        "class c: added (open)",
+        "class c: added (existing)",
         "config _front: GREETING added",
         "requires _front: SESSION_KEY now required",
     ] {
