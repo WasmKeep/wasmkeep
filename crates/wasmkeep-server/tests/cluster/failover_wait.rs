@@ -403,17 +403,30 @@ async fn the_wait_ends_at_its_deadline_with_the_same_503() {
     d.kill_a().await;
     d.a_left_the_view("/actor/t/x/durable").await;
 
+    // The deadline is the node's wall clock in whole milliseconds: the
+    // time the request arrived, truncated, plus the wait; the wait ends
+    // once that clock, truncated too, reaches it. Measured on the same
+    // clock from before the send, the answer comes no sooner than the
+    // wait. A monotonic clock may read up to a millisecond less, from the
+    // truncation of the arrival.
+    let sent_ms = now_ms();
     let started = std::time::Instant::now();
     let r = send(d.b.addr, "GET", "/actor/t/x/visit", "").await;
     let took = started.elapsed();
+    let took_ms = now_ms() - sent_ms;
     assert_eq!(
         (r.status, r.body.trim(), r.retry_after.as_deref()),
         (503, NOT_REACHABLE, Some("1")),
         "what a request for a dead node's actor gets without the wait"
     );
+    let wait_ms = u64::try_from(wait.as_millis()).unwrap();
     assert!(
-        took >= wait && took < wait + Duration::from_secs(2),
-        "answered after {took:?}"
+        took_ms >= wait_ms,
+        "answered {took_ms} ms after it was sent (wall clock), before its {wait_ms} ms deadline ({took:?} monotonic)"
+    );
+    assert!(
+        took < wait + Duration::from_secs(2),
+        "answered after {took:?}, long past its deadline"
     );
     assert_eq!(d.waits("request", "expired").await, 1);
     // It never ran: once b has the actor, the count is the one a left.
