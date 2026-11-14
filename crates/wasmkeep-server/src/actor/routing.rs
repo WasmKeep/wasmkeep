@@ -72,10 +72,14 @@ impl ServiceInner {
         self.owner_hints().remove(address);
     }
 
-    /// The actor `address` (`class/name`) names in this node's tenant, for
-    /// `actors.call`: `invalid-address` if it is malformed or its class is
-    /// not served. `_front` is never a class (ADR 0023).
-    pub(super) fn call_target(&self, address: &str) -> Result<ActorAddress, CallError> {
+    /// The actor `address` (`class/name`) names in `tenant` (the caller's),
+    /// for `actors.call`: `invalid-address` if it is malformed or its class
+    /// is not served. `_front` is never a class (ADR 0023).
+    pub(super) fn call_target(
+        &self,
+        tenant: &str,
+        address: &str,
+    ) -> Result<ActorAddress, CallError> {
         let invalid = |m: &str| CallError::InvalidAddress(m.to_owned());
         let (class, name) = address
             .split_once('/')
@@ -83,8 +87,7 @@ impl ServiceInner {
         if !read(&self.classes).contains_key(class) {
             return Err(invalid("no such actor class"));
         }
-        ActorAddress::new(&self.tenant, class, name)
-            .map_err(|e| CallError::InvalidAddress(e.to_string()))
+        ActorAddress::new(tenant, class, name).map_err(|e| CallError::InvalidAddress(e.to_string()))
     }
 
     /// `actors.call`: delivers `request` to `target` (from

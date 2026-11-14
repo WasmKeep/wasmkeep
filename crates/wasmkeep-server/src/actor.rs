@@ -397,7 +397,7 @@ impl ActorService {
 
     /// The actor `address` names, for a call from the front.
     pub(crate) fn front_target(&self, address: &str) -> Result<ActorAddress, CallError> {
-        self.inner.call_target(address)
+        self.inner.call_target(&self.inner.tenant, address)
     }
 
     /// `actors.call` from the front (ADR 0023): an inside call, with an

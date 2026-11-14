@@ -337,7 +337,7 @@ impl actors::Host for ActorHost {
         let Some(service) = ctx.service.as_ref().and_then(std::sync::Weak::upgrade) else {
             return Ok(Err(CallError::Failed("node is shutting down".into())));
         };
-        let target = match service.call_target(&address) {
+        let target = match service.call_target(ctx.me.tenant(), &address) {
             Ok(target) => target,
             Err(e) => return Ok(Err(e)),
         };
