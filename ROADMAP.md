@@ -43,12 +43,13 @@ WebSocket at its own path and hands it to an actor, so a room needs no
 public `/actor/` address. The SDKs say how a handler makes several
 outbound HTTP requests at once.
 
-And right after: **actors that end.** Today an actor, once created, is
-kept for good; only its old history and old app versions are collected.
-An actor can delete itself and an operator can delete one
-(`wasmkeep actor delete`), a class can expire actors left idle for a
-stated time (sessions, carts, temporary rooms), and then an app can be
-deleted as a whole.
+And right after: **actors that end.** Today an actor ends only when its
+own code calls `storage.delete-self`, a delete replicated like a plain
+write; otherwise it is kept for good, and only its old history and old
+app versions are collected. Next: an operator can delete an actor
+(`wasmkeep actor delete`), a delete that is durable when asked, a class
+can expire actors left idle for a stated time (sessions, carts,
+temporary rooms), and then an app can be deleted as a whole.
 
 Then **files and databases**, each with its design first: files for actors
 and the front in the app's part of the bucket, with links a browser
