@@ -146,8 +146,9 @@ export function encodeName(name: string): string {
  * Return it only when `isWebSocket(req)`; to any other request the host
  * passes it on as a plain `426`. Check what you must (a token, the name)
  * first: the actor trusts the path when its class is `internal`. If the
- * actor refuses, the client gets `403` with the actor's error. Never copy
- * another server's answer headers onto it. */
+ * actor refuses, the client gets `403` with the actor's error. The host
+ * strips the `x-wasmkeep-` range from every outbound HTTP answer, so an
+ * upstream's answer passed on cannot hand a socket off. */
 export function handOff(cls: string, name: string, path: string): ActorResponse {
   return {
     status: 426,

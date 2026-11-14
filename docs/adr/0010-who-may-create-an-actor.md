@@ -57,6 +57,15 @@ class. Open classes keep their sockets on delete, as before.
   one inside opener of sockets: the app's front, which hands a client's
   upgrade to an actor. Such a socket, and each of its events, admits as
   inside; sockets opened at `/actor/` stay outside.
+- Note (2026-11-14): in a cluster a deleted actor still exists for the
+  check (see Consequences), so the close events of the sockets its delete
+  closed ran on a new, empty instance, `/actor/` sockets of an `existing`
+  class included. Those sockets are now marked when the delete closes
+  them, and their close events are not delivered
+  (`tests/cluster/front_sockets.rs`,
+  `a_deleted_rooms_sockets_do_not_bring_it_back`). A new outside request
+  or socket to a deleted name in a cluster still wakes it empty, as
+  Consequences says.
 
 **Existence** is decided without creating anything, before the lease. The
 actor exists if it is in memory on this node, has a database file here, or,

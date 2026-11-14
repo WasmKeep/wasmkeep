@@ -801,6 +801,9 @@ async fn durable_write_survives_failover(name: &str) {
 struct Flaky {
     inner: Arc<dyn ObjectStore>,
     down: Arc<AtomicBool>,
+    /// Heartbeats (`nodes/`) are written without the capability word
+    /// `handoff`, as a node of an older version writes them (ADR 0027).
+    no_handoff_word: Arc<AtomicBool>,
     /// Fail this many segment (`/wal/`) uploads.
     fail_wal: Arc<std::sync::atomic::AtomicU32>,
     /// Delay segment uploads by this many ms (applied before writing).
@@ -872,6 +875,7 @@ struct Flaky {
 impl Flaky {
     fn new(inner: Arc<dyn ObjectStore>, down: Arc<AtomicBool>) -> Self {
         Self {
+            no_handoff_word: Arc::default(),
             lease_gets: Arc::default(),
             hold_lease_get_at: Arc::default(),
             lease_held: Arc::default(),
@@ -959,6 +963,21 @@ impl ObjectStore for Flaky {
         mut opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
         self.check()?;
+        let payload = if location.as_ref().starts_with("nodes/")
+            && self.no_handoff_word.load(Ordering::SeqCst)
+        {
+            let body = String::from_utf8(bytes::Bytes::from(payload).to_vec()).unwrap();
+            let words: Vec<String> = body
+                .split('\n')
+                .map(|line| {
+                    let kept: Vec<&str> = line.split(' ').filter(|w| *w != "handoff").collect();
+                    kept.join(" ")
+                })
+                .collect();
+            object_store::PutPayload::from(words.join("\n"))
+        } else {
+            payload
+        };
         if location.as_ref().starts_with("nodes/")
             && self.fail_released.load(Ordering::SeqCst) > 0
             && String::from_utf8_lossy(&bytes::Bytes::from(payload.clone())).contains("\nreleased ")

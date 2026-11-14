@@ -100,6 +100,10 @@ impl ActorState {
 
     /// `on-websocket-close`.
     pub(super) async fn ws_close(&mut self, conn: u64, code: u16, reason: String) {
+        // Closed by its actor's delete: the actor stays deleted.
+        if self.sockets.deleted(conn) {
+            return;
+        }
         if !self.ws_prepare(conn).await {
             return;
         }

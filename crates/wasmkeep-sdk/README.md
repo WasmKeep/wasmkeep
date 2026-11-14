@@ -187,8 +187,10 @@ The `front` module has:
   room's `on-websocket-open` receives the path. Check the client's token
   and the name first: an `internal` room trusts what the path says, and
   only an `internal` room knows every socket came through the front. If
-  the room refuses, the client gets a 403 with the room's error. Never
-  copy another server's answer headers onto a hand-off.
+  the room refuses, the client gets a 403 with the room's error. The
+  host strips the `x-wasmkeep-` range from every outbound HTTP answer
+  (from 0.4.1), so an upstream's answer passed on cannot hand a socket
+  off.
 - `export_front!(Type)`: exports the request handler, and nothing else.
 
 Validate any name you take from a request before using it in an address:

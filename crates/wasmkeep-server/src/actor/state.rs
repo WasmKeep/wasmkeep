@@ -1096,11 +1096,10 @@ impl ActorState {
             self.alarms.clear(self.address.clone());
             // Under `existing`, a deleted actor's sockets go with it (an
             // open class keeps them: the next message recreates the actor).
+            // Their close events do not run: they would create it again.
             if self.rule() != crate::access::Access::Open {
-                for conn in self.sockets.of(&self.address, None) {
-                    self.sockets
-                        .close(&self.address, conn, 1000, "actor deleted".into());
-                }
+                self.sockets
+                    .close_deleted(&self.address, 1000, "actor deleted");
             }
         } else if sync_alarm {
             match committed {

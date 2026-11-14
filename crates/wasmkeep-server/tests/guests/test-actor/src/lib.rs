@@ -44,6 +44,10 @@
 //! - `GET /fetch?url=U` (U percent-encoded): outbound GET, answers
 //!   `STATUS:BODY` or `error: ...`; with `&send=N`, a POST with an N-byte
 //!   body instead
+//! - `GET /fetch-raw?url=U` (U percent-encoded): outbound GET through
+//!   `wasi:http` itself, answers `STATUS`, then `headers: NAMES` and
+//!   `trailers: NAMES` (each the answer's names, lowercase, sorted,
+//!   comma-separated), then `body: BODY`; or `error: ...`
 //! - `GET /fetch-all?u=I&u=...` (each I percent-encoded `N URL`): those
 //!   requests (a GET, or a POST of N bytes when N > 0) with
 //!   `http::fetch_all`, one answer per line as `/fetch` words it; with
@@ -174,6 +178,70 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A GET of `url` with `wasi:http` alone, as `/fetch-raw` words it.
+fn fetch_raw(url: &str) -> Result<String, String> {
+    use wasmkeep_sdk::wasi::http::{outgoing_handler, types};
+    let (scheme, rest) = url.split_once("://").ok_or("no scheme")?;
+    let (authority, path) = rest.find('/').map_or((rest, "/"), |i| rest.split_at(i));
+    let request = types::OutgoingRequest::new(types::Fields::new());
+    let scheme = if scheme == "https" {
+        types::Scheme::Https
+    } else {
+        types::Scheme::Http
+    };
+    request.set_scheme(Some(&scheme)).map_err(|()| "scheme")?;
+    request
+        .set_authority(Some(authority))
+        .map_err(|()| "authority")?;
+    request
+        .set_path_with_query(Some(path))
+        .map_err(|()| "path")?;
+    let body = request.body().map_err(|()| "body")?;
+    types::OutgoingBody::finish(body, None).map_err(|e| format!("{e:?}"))?;
+    let pending = outgoing_handler::handle(request, None).map_err(|e| format!("{e:?}"))?;
+    pending.subscribe().block();
+    let response = pending
+        .get()
+        .ok_or("no answer")?
+        .map_err(|()| "taken")?
+        .map_err(|e| format!("{e:?}"))?;
+    let names = |fields: &types::Fields| {
+        let mut names: Vec<String> = fields
+            .entries()
+            .into_iter()
+            .map(|(k, _)| k.to_ascii_lowercase())
+            .collect();
+        names.sort();
+        names.dedup();
+        names.join(",")
+    };
+    let headers = names(&response.headers());
+    let status = response.status();
+    let incoming = response.consume().map_err(|()| "consume")?;
+    let mut bytes = Vec::new();
+    {
+        let stream = incoming.stream().map_err(|()| "stream")?;
+        loop {
+            match stream.blocking_read(65536) {
+                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Err(wasmkeep_sdk::wasi::io::streams::StreamError::Closed) => break,
+                Err(e) => return Err(format!("{e:?}")),
+            }
+        }
+    }
+    let trailers = types::IncomingBody::finish(incoming);
+    trailers.subscribe().block();
+    let trailers = match trailers.get() {
+        Some(Ok(Ok(Some(t)))) => names(&t),
+        Some(Ok(Ok(None))) => String::new(),
+        other => return Err(format!("trailers: {other:?}")),
+    };
+    Ok(format!(
+        "{status}\nheaders: {headers}\ntrailers: {trailers}\nbody: {}",
+        String::from_utf8_lossy(&bytes)
+    ))
 }
 
 fn query_param(path: &str, key: &str) -> Option<String> {
@@ -440,6 +508,12 @@ impl http::Guest for TestActor {
                     Ok(r) => format!("{}:{}", r.status, String::from_utf8_lossy(&r.body)),
                     Err(e) => format!("error: {e}"),
                 }
+            }
+            (Method::Get, "/fetch-raw") => {
+                let url = query_param(&full, "url")
+                    .map(|u| percent_decode(&u))
+                    .unwrap_or_default();
+                fetch_raw(&url).unwrap_or_else(|e| format!("error: {e}"))
             }
             (Method::Get, "/fetch-all") => {
                 let query = full.split_once('?').map_or("", |(_, q)| q);

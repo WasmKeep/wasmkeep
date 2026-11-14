@@ -131,8 +131,9 @@ pub fn is_websocket(request: &IncomingRequest) -> bool {
 /// name) before: the actor trusts the path when its class is `internal`.
 /// If the actor refuses, the client gets `403` with the actor's error.
 ///
-/// Never copy another server's answer headers onto this answer: a name in
-/// the `x-wasmkeep-handoff-` range would choose the actor.
+/// The host strips the `x-wasmkeep-` range from every outbound HTTP answer
+/// a guest receives, so an upstream's answer passed on to an upgrade
+/// cannot hand the socket off: only this answer can.
 pub fn hand_off(class: &str, name: &str, path: &str) -> Response {
     Response {
         status: 426,
