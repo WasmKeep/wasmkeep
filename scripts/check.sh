@@ -199,7 +199,7 @@ if $s3; then
   step 'S3 suites'
   ./scripts/s3-suites.sh
 elif $full || $rust; then
-  skip 'the S3 suites (s3, failover, cluster_tls, cluster_status, deploy_config): --s3'
+  skip 'the S3 suites (s3, failover, cluster_tls, cluster_status, deploy_config, cluster_diagnose): --s3'
 fi
 if $full; then
   # Every example and every language against the same tests, as the CI's

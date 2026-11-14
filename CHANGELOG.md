@@ -29,6 +29,21 @@ Since 0.3.0, in no release yet.
   reads the record of a parked room each minute (one pass in ten, as a
   safeguard). No format changes: a node of an earlier version beside one
   of this version keeps closing its own sockets as before.
+- **`wasmkeep cluster diagnose` checks a bucket.** It runs, through the
+  nodes' own bucket code, what WasmKeep relies on: conditional creates
+  and replaces (one winner among simultaneous creates, a stale or
+  deleted version refused, a read's version accepted), reads right after
+  writes, overwrites and deletes, listings that show a new key and drop
+  a deleted one (the lag is measured) and return more than one page,
+  deletes of absent keys, a 16 MiB round trip, last-modified order and
+  precision, and this machine's clock against the bucket's. One line per
+  check, then `safe for WasmKeep` (exit 0), `not safe: ...` (1) or no
+  verdict (2); `--json` for scripts. It writes only under a scratch
+  prefix (`diagnose/run-<time>-<pid>/`, or `--prefix-for-test`) that must
+  be empty, and deletes it afterwards even when a check fails. The
+  bucket requirements, how to run it and the providers checked so far
+  (moto and OVHcloud Object Storage) are in
+  [Buckets](docs/deploy/buckets.md).
 - **Fronts in Rust and TypeScript.** The Rust SDK has a `front` module
   (from world `front-core`): `actors` and `env` as in an actor,
   `export_front!`, and `http::respond_with`. A front crate depends on
