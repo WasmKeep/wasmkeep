@@ -175,9 +175,16 @@ curl localhost:8080/actor/counter/bob             # 0, a separate actor
 ```
 
 Each name is its own actor with its own SQLite database under `.wasmkeep/data/`.
-Restart the server and the counts are still there. The release's
+Restart the server and the counts are still there.
+
+The same counter comes prebuilt in the other Recommended and Supported
+languages too, each signed the same way: `counter-typescript.wasm`,
+`counter-python.wasm`, `counter-go.wasm` (TinyGo), `counter-c.wasm` and
+`counter-zig.wasm`. Serve any of them in place of `counter.wasm`; they
+answer the same requests. The release's
 `THIRD_PARTY_NOTICES-components.txt` holds the notices of the libraries
-compiled into `counter.wasm` and the other example components.
+and language runtimes compiled into `counter.wasm`, the other counters and
+the other example components.
 
 Or build the counter yourself, from a clone. You need
 [rustup](https://rustup.rs); the pinned toolchain and the `wasm32-wasip2`

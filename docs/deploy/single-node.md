@@ -16,9 +16,11 @@ Debian 10, Ubuntu 20.04 and later), a tarball with the binary and its
 third-party notices, a CycloneDX SBOM, `SHA256SUMS`, and a Sigstore bundle
 for each file. CI builds and signs them (`.github/workflows/release.yml`);
 no key is involved, the signature's certificate names the workflow and
-the tag. The example components (`counter.wasm` and the others) are
-attached too, with `THIRD_PARTY_NOTICES-components.txt`, the notices of
-the libraries compiled into them, and the C and Zig SDKs as archives; each
+the tag. The example components (`counter.wasm`, the same counter in
+TypeScript, Python, Go, C and Zig as `counter-<lang>.wasm`, and the others)
+are attached too, with `THIRD_PARTY_NOTICES-components.txt`, the notices of
+the libraries and language runtimes compiled into them, and the C and Zig
+SDKs as archives; each
 has its own bundle, checked the same way. To check a download with cosign 3
 (the version that signs them), here for `v0.4.1`:
 

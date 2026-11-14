@@ -27,9 +27,10 @@ you took this from before you trust it.
 
 A node serves components. The release this tarball came from
 (<https://github.com/WasmKeep/wasmkeep/releases>) also carries
-`counter.wasm`, the counter example already built, and
+`counter.wasm`, the counter example already built (and the same counter
+in TypeScript, Python, Go, C and Zig, `counter-<lang>.wasm`), and
 `THIRD_PARTY_NOTICES-components.txt`, the licenses of the libraries
-compiled into it. Download it, then:
+compiled into them. Download it, then:
 
 ```bash
 wasmkeep serve --actor counter=counter.wasm

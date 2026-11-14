@@ -63,7 +63,16 @@ The release workflow puts that file in every tarball, next to the binary.
 The example components a release carries (`counter.wasm` and the others)
 link the Rust SDK's dependencies: `scripts/notices.sh --components` writes
 their notices the same way, for wasm32-wasip2, and the release attaches
-that file, `THIRD_PARTY_NOTICES-components.txt`, next to them.
+that file, `THIRD_PARTY_NOTICES-components.txt`, next to them. The counter
+in the other Recommended and Supported languages (`counter-typescript.wasm`,
+`counter-python.wasm`, `counter-go.wasm`, `counter-c.wasm`,
+`counter-zig.wasm`) embeds the runtimes in the table below:
+`scripts/runtime-notices.sh` appends their license texts to the same file,
+from the installed tools where they ship one and from
+[`deploy/notices/`](../deploy/notices) where they do not (QuickJS-ng,
+CPython, TinyGo, the WASI adapter), each of those taken from the source
+and version its header names; a tool at another version fails the
+release until its text is updated.
 `scripts/sbom.sh` writes a CycloneDX SBOM of the `wasmkeep` binary for one
 target.
 
