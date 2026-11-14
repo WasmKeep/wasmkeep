@@ -1,10 +1,13 @@
-"""The toolchain image builds with the tools CI builds the examples with.
+"""The toolchain image and the release build with the tools CI builds the examples with.
 
 deploy/toolchain/Dockerfile pins each tool with an ARG; each must equal
 what .github/workflows/ci.yml installs (Node.js: the same major version,
 since CI takes the newest of it), and the base image must be
 deploy/Dockerfile's. A pin missing on either side fails too, so moving one
 in ci.yml without the image (or the other way round) is caught here.
+.github/workflows/release.yml builds the counter of every language the
+image is for (the release's counter-<lang>.wasm) and must pin the same
+versions too.
 
     python3 -I scripts/check-toolchain.py [ROOT]
 """
@@ -22,6 +25,9 @@ PINS = {
     'COMPONENTIZE_PY_VERSION': r'componentize-py==([0-9.]+)',
     'ZIGLANG_VERSION': r'ziglang==([0-9.]+)',
 }
+# Tools the release's counters do not need (their builds do not run them):
+# checked only when release.yml names them.
+OPTIONAL_IN_RELEASE = {'WIT_BINDGEN_GO_VERSION'}
 
 
 def args(text):
@@ -33,8 +39,15 @@ def check(root):
     image = args((root / 'deploy/toolchain/Dockerfile').read_text())
     server = args((root / 'deploy/Dockerfile').read_text())
     ci = (root / '.github/workflows/ci.yml').read_text()
+    release = (root / '.github/workflows/release.yml').read_text()
     errors = []
     for arg, pattern in PINS.items():
+        found = sorted(set(re.findall(pattern, release)))
+        if arg in OPTIONAL_IN_RELEASE and not found:
+            continue
+        if arg in image and found != [image[arg]]:
+            errors.append(f'{arg} is {image[arg]} in deploy/toolchain/Dockerfile, '
+                          f'{", ".join(found) or "missing"} in release.yml')
         found = sorted(set(re.findall(pattern, ci)))
         if arg not in image:
             errors.append(f'deploy/toolchain/Dockerfile: no ARG {arg}')
@@ -43,6 +56,8 @@ def check(root):
         elif found != [image[arg]]:
             errors.append(f'{arg} is {image[arg]} in deploy/toolchain/Dockerfile, {", ".join(found)} in ci.yml')
     node = sorted(set(re.findall(r'node-version: "?([0-9]+)"?', ci)))
+    if sorted(set(re.findall(r'node-version: "?([0-9]+)"?', release))) != node:
+        errors.append('node-version: release.yml and ci.yml must use the same Node.js major')
     if 'NODE_VERSION' not in image or not node:
         errors.append('NODE_VERSION: missing in deploy/toolchain/Dockerfile or node-version in ci.yml')
     elif node != [image['NODE_VERSION'].split('.')[0]]:

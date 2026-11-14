@@ -7,7 +7,8 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-FILES = ('deploy/toolchain/Dockerfile', 'deploy/Dockerfile', '.github/workflows/ci.yml')
+FILES = ('deploy/toolchain/Dockerfile', 'deploy/Dockerfile', '.github/workflows/ci.yml',
+         '.github/workflows/release.yml')
 
 
 class Toolchain(unittest.TestCase):
@@ -38,6 +39,23 @@ class Toolchain(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
         self.assertIn('COMPONENTIZE_PY_VERSION', result.stderr)
+
+    def test_a_pin_moved_in_ci_only_fails_in_the_release_too(self):
+        # The image and the release follow ci.yml: moving both of those
+        # without the release is caught.
+        self.edit('.github/workflows/ci.yml', 'tinygo0.39.0', 'tinygo0.40.0')
+        self.edit('.github/workflows/ci.yml', 'download/v0.39.0/', 'download/v0.40.0/')
+        self.edit('deploy/toolchain/Dockerfile', 'ARG TINYGO_VERSION=0.39.0', 'ARG TINYGO_VERSION=0.40.0')
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('TINYGO_VERSION is 0.40.0 in deploy/toolchain/Dockerfile, 0.39.0 in release.yml', result.stderr)
+
+    def test_a_pin_missing_from_the_release_fails(self):
+        self.edit('.github/workflows/release.yml', 'componentize-py==', 'componentize-py>=')
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('COMPONENTIZE_PY_VERSION', result.stderr)
+        self.assertIn('missing in release.yml', result.stderr)
 
     def test_a_pin_missing_from_the_image_fails(self):
         self.edit('deploy/toolchain/Dockerfile', 'ARG TINYGO_VERSION=', 'ARG TINYGO_RELEASE=')

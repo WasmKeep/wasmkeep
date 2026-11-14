@@ -11,6 +11,19 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.1, in no release yet.
 
+- **The counter in every Recommended and Supported language, prebuilt**:
+  besides `counter.wasm` (Rust), the release carries
+  `counter-typescript.wasm`, `counter-python.wasm`, `counter-go.wasm`
+  (TinyGo), `counter-c.wasm` and `counter-zig.wasm`, built with the tool
+  versions CI tests, each in `SHA256SUMS` with its own Sigstore bundle
+  (36 files in the release, from 26). The license texts of the runtimes
+  they embed (QuickJS-ng, CPython and the C libraries it links, the Rust
+  crates of the componentize-qjs and componentize-py runtimes, TinyGo and
+  the Go standard library, wasi-libc, Zig's library, the WASI adapter) are
+  added to `THIRD_PARTY_NOTICES-components.txt`. The Experimental languages
+  (standard Go, D, MoonBit, C#) are not released.
+  [Verifying a download](docs/deploy/single-node.md#1-install-the-binary).
+
 - **`wasmkeep new DIR --lang rust|typescript [--front] [--app TENANT/APP]`**
   writes a project that builds and runs the first time: a class `counter`,
   optionally a front over it (the class then `internal`), its

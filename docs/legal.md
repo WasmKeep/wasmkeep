@@ -63,7 +63,23 @@ The release workflow puts that file in every tarball, next to the binary.
 The example components a release carries (`counter.wasm` and the others)
 link the Rust SDK's dependencies: `scripts/notices.sh --components` writes
 their notices the same way, for wasm32-wasip2, and the release attaches
-that file, `THIRD_PARTY_NOTICES-components.txt`, next to them.
+that file, `THIRD_PARTY_NOTICES-components.txt`, next to them. The counter
+in the other Recommended and Supported languages (`counter-typescript.wasm`,
+`counter-python.wasm`, `counter-go.wasm`, `counter-c.wasm`,
+`counter-zig.wasm`) embeds the runtimes in the table below:
+`scripts/runtime-notices.sh` appends their license texts to the same file:
+the runtime, the C libraries it links, and the Rust crates compiled into
+the runtimes componentize-qjs and componentize-py embed (listed with
+cargo-about and `about.toml` from those tools' sources at the pinned tags,
+so a crate outside the accepted licenses fails as for WasmKeep's own). The
+texts come from the installed tools where they ship one and from
+[`deploy/notices/`](../deploy/notices/README.md) where they do not, each
+taken from the source and version its header names; a tool at another
+version fails the release until its text is updated. The TypeScript
+counter records the crates its runtime was built from (cargo auditable),
+and the release fails if one of them is not listed. Two licenses there are
+outside the crates' accepted set: CPython's PSF-2.0 and SQLite's public
+domain dedication, both permissive.
 `scripts/sbom.sh` writes a CycloneDX SBOM of the `wasmkeep` binary for one
 target.
 
@@ -80,9 +96,9 @@ running it on your own servers) carries that runtime's license:
 | Language | Runtime inside the component | License |
 | --- | --- | --- |
 | Rust | the Rust standard library | MIT OR Apache-2.0 |
-| TypeScript (default) | QuickJS-ng, via componentize-qjs | MIT (QuickJS-ng); Apache-2.0 (componentize-qjs) |
+| TypeScript (default) | QuickJS-ng and componentize-qjs's runtime crates, via componentize-qjs | MIT (QuickJS-ng); Apache-2.0 (componentize-qjs); MIT, Apache-2.0, BSD-3-Clause, ISC, Unicode-3.0, Zlib (the crates) |
 | TypeScript (`--engine starlingmonkey`) | SpiderMonkey, via StarlingMonkey and ComponentizeJS | **MPL-2.0** (SpiderMonkey): distributing the component requires making SpiderMonkey's source available; Apache-2.0 (StarlingMonkey, ComponentizeJS) |
-| Python | CPython, via componentize-py | PSF License (keep its notice); Apache-2.0 |
+| Python | CPython (with expat, libmpdec, HACL*, zlib and SQLite) and componentize-py's runtime crates, via componentize-py | PSF License (keep its notice); MIT, BSD-2-Clause, Zlib, public domain (SQLite); Apache-2.0 and MIT (the crates) |
 | C, Zig | wasi-libc | MIT / Apache-2.0 / CC0 |
 | Go | the TinyGo runtime | BSD-3-Clause |
 | All (except Rust and Go) | the WASI 0.1 adapter (Wasmtime) | Apache-2.0 WITH LLVM-exception |
