@@ -532,6 +532,53 @@ impl Restorer {
         })
     }
 
+    /// Continue a verified raw replay on a private copy of a cached database.
+    /// Recomputes every page checksum before accepting the cache. Never use
+    /// this on a live actor database or a database with uncheckpointed WAL.
+    pub fn resume(path: &Path, max_bytes: u64, expected: u64) -> Result<Self, RestoreError> {
+        let io = |source| RestoreError::Io {
+            path: path.to_owned(),
+            source,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(io)?;
+        let size = file.metadata().map_err(io)?.len();
+        if size > max_bytes {
+            return Err(RestoreError::Chain("cached database exceeds size cap"));
+        }
+        let mut header = [0u8; 18];
+        file.read_exact(&mut header).map_err(io)?;
+        let page_size = match u16::from_be_bytes([header[16], header[17]]) {
+            1 => 65536,
+            n => u32::from(n),
+        };
+        if !(512..=65536).contains(&page_size)
+            || !page_size.is_power_of_two()
+            || !size.is_multiple_of(u64::from(page_size))
+        {
+            return Err(RestoreError::Chain("invalid cached database page size"));
+        }
+        let capture = WalCapture::start(path, page_size)
+            .map_err(|_| RestoreError::Chain("invalid cached database"))?;
+        if capture.checksum().value() != expected {
+            return Err(RestoreError::Chain("cached database checksum mismatch"));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            page_size,
+            commit: capture.pages(),
+            max_bytes,
+            db: capture.checksum(),
+            applied: 1,
+            page: vec![0; page_size as usize],
+            failed: false,
+        })
+    }
+
     /// Applies an encoded LTX file, decoding it page by page.
     ///
     /// # Errors

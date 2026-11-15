@@ -39,6 +39,13 @@ fn immutable(path: &Path) -> Result<Connection, SqlError> {
 /// Checks the raw file, then converts this private copy to a rollback journal.
 /// The caller must verify its LTX checksum before calling this function.
 pub fn verify_and_make_portable(path: &Path) -> Result<Verification, SqlError> {
+    let verification = verify(path)?;
+    make_portable(path)?;
+    Ok(verification)
+}
+
+/// Verify a raw replay without modifying its bytes, suitable for backup caches.
+pub fn verify(path: &Path) -> Result<Verification, SqlError> {
     let conn = immutable(path)?;
     let mut stmt = conn.prepare("PRAGMA integrity_check")?;
     let mut rows = stmt.query([])?;
@@ -88,6 +95,14 @@ pub fn verify_and_make_portable(path: &Path) -> Result<Verification, SqlError> {
         None
     };
     drop(conn);
+    Ok(Verification {
+        foreign_key_violations,
+        tables,
+        replaced,
+    })
+}
+
+fn make_portable(path: &Path) -> Result<(), SqlError> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.pragma_update(None, "trusted_schema", false)?;
     let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
@@ -98,11 +113,7 @@ pub fn verify_and_make_portable(path: &Path) -> Result<Verification, SqlError> {
         ));
     }
     conn.close().map_err(|(_, e)| SqlError::from(e))?;
-    Ok(Verification {
-        foreign_key_violations,
-        tables,
-        replaced,
-    })
+    Ok(())
 }
 
 /// Executes exactly one read-only statement on a completed, private export.
@@ -189,6 +200,38 @@ pub fn query(path: &Path, sql: &str) -> Result<Rows, SqlError> {
 fn hidden(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.starts_with("_wasmkeep_") || name.starts_with("sqlite_") || name.starts_with("pragma_")
+}
+
+/// Alarm state from a verified private database; no guest SQL or write access.
+pub fn backup_alarm(path: &Path) -> Result<(Option<i64>, Option<String>), SqlError> {
+    use rusqlite::OptionalExtension;
+    let conn = immutable(path)?;
+    let has = |table: &str| -> Result<bool, rusqlite::Error> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+            [table],
+            |r| r.get(0),
+        )
+    };
+    let alarm = if has("_wasmkeep_alarm")? {
+        conn.query_row("SELECT at FROM _wasmkeep_alarm WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?
+    } else {
+        None
+    };
+    let indexed = if has("_wasmkeep_meta")? {
+        conn.query_row(
+            "SELECT value FROM _wasmkeep_meta WHERE key='alarm_indexed'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    Ok((alarm, indexed))
 }
 
 #[cfg(test)]

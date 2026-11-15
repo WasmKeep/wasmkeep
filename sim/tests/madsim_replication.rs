@@ -298,7 +298,22 @@ fn segment_key_of(id: SegmentId, objects: &[(String, String)]) -> String {
         .unwrap_or_default()
 }
 
+// Independent ledger captured from owners before uploads, never from the
+// backup reader's GETs. Includes late tips; acknowledgements remain separate.
+pub(crate) type BackupHistory = std::collections::BTreeMap<SegmentId, (BTreeSet<SegmentId>, bool)>;
+fn record_backup_state(o: &Owner, id: SegmentId, reset: bool) {
+    let mut positions = if reset {
+        BTreeSet::new()
+    } else {
+        o.held_positions.clone()
+    };
+    positions.insert(id);
+    BACKUP_HISTORY.with(|h| {
+        h.borrow_mut().insert(id, (positions, reset));
+    });
+}
 thread_local! {
+    static BACKUP_HISTORY: std::cell::RefCell<BackupHistory> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     /// Uploads in this run that succeeded after their hold ended. The
     /// simulation runs on one thread, so a thread-local counts one run.
     static LATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -458,6 +473,7 @@ async fn delete_actor(
         removed: o.held_positions.clone(),
         acked: false,
     });
+    record_backup_state(o, segment.id, true);
     let uploaded = bucket.create(&key, RESET.to_vec()).await.is_ok();
     if rules.deletes == Deletes::EraseBeforeAck
         && let Ok(objects) = bucket.list(PREFIX).await
@@ -541,6 +557,7 @@ async fn ack_by_read(
         parent_generation: o.head.generation,
     };
     let key = format!("{PREFIX}{}", segment_key(&segment));
+    record_backup_state(o, segment.id, false);
     if bucket.create(&key, b"x".to_vec()).await.is_err() {
         return false;
     }
@@ -749,6 +766,7 @@ async fn run_node(
             parent_generation: o.head.generation,
         };
         let key = format!("{PREFIX}{}", segment_key(&segment));
+        record_backup_state(o, segment.id, false);
         if bucket.create(&key, b"x".to_vec()).await.is_err() {
             trace(&format!("{} upload failed {:?}", node.id(), segment.id));
             // Unknown whether it landed: stop, and restore again later.
@@ -847,6 +865,28 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
 }
 
 fn simulate_with_exports(seed: u64, rules: Rules, duration: Duration, export: bool) -> Outcome {
+    simulate_observed(seed, rules, duration, export, None)
+}
+
+type Observer = Box<dyn FnMut(&Store, &[SegmentId], &BackupHistory)>;
+#[allow(dead_code)]
+pub(crate) fn backup_simulation(seed: u64, observer: Observer) {
+    simulate_observed(
+        seed,
+        SAFE_DELETING_COLLECTING,
+        Duration::from_secs(90),
+        false,
+        Some(observer),
+    );
+}
+fn simulate_observed(
+    seed: u64,
+    rules: Rules,
+    duration: Duration,
+    export: bool,
+    mut observer: Option<Observer>,
+) -> Outcome {
+    BACKUP_HISTORY.with(|h| h.borrow_mut().clear());
     bucket::clear_delays();
     EARLY.with(|e| e.set(0));
     LATE.with(|l| l.set(0));
@@ -996,6 +1036,10 @@ fn simulate_with_exports(seed: u64, rules: Rules, duration: Duration, export: bo
         for step in 1..=steps {
             sleep(Duration::from_millis(50)).await;
             let at = step * 50;
+            if let Some(observer) = &mut observer {
+                BACKUP_HISTORY
+                    .with(|h| observer(&export_store, &acked.lock().unwrap(), &h.borrow()));
+            }
             // ADR 0033: an observer with no node lease or hold lists, then
             // fetches later while writers, kills and collection keep running.
             // The model checks positions; real LTX verification is covered

@@ -137,7 +137,9 @@ async fn read(source: &Source, output: &Path) -> anyhow::Result<history::Export>
 }
 
 // Returning from select drops the export future and its TempDirs before exit.
-fn run(work: impl std::future::Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
+pub(crate) fn run(
+    work: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -396,6 +398,120 @@ fn render(rows: &Rows, format: Format, out: &mut impl Write) -> anyhow::Result<(
         )?;
     }
     Ok(())
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct HistoryArgs {
+    #[arg(value_name = "TENANT/APP", value_parser = crate::parse_app)]
+    app: (String, String),
+    actor: String,
+    #[arg(long)]
+    bucket: String,
+    #[arg(long)]
+    deep: bool,
+    #[arg(long)]
+    json: bool,
+}
+pub(crate) fn history(args: &HistoryArgs) -> anyhow::Result<()> {
+    run(async {
+        use wasmkeep_cluster::replication::{Listing, plan_restore};
+        use wasmkeep_cluster::state_root::{Family, StateRoot};
+        let (tenant, app) = &args.app;
+        let (_, class, name) = crate::move_target(&args.actor, Some(&args.app))?;
+        let actor = wasmkeep_runtime::ActorAddress::new(tenant, class, name)?;
+        let (store, prefix) = crate::open_bucket_unchecked(&args.bucket)?;
+        let root = StateRoot::new(&prefix, tenant, app);
+        let tail = format!(
+            "{}/{}",
+            actor.class(),
+            wasmkeep_storage::encode_segment(actor.name())
+        );
+        let prefix = format!("{}/", root.bucket_key(Family::History, &tail));
+        let objects = history::list_objects(&store, &prefix).await?;
+        let listing = Listing::from_keys(objects.keys().map(String::as_str));
+        let plan = plan_restore(&listing)?;
+        anyhow::ensure!(plan.head().txid != 0, "actor has no retained history");
+        let chain = history::ancestry(&listing, plan.head());
+        let snapshots: Vec<_> = chain
+            .iter()
+            .filter(|id| listing.snapshots.contains(id))
+            .map(|id| serde_json::json!({"generation":id.generation,"txid":id.txid}))
+            .collect();
+        let oldest = chain
+            .iter()
+            .find(|id| listing.snapshots.contains(id) || id.txid == 1);
+        let on_chain = listing
+            .segments
+            .iter()
+            .filter(|s| chain.contains(&s.id))
+            .count()
+            + snapshots.len();
+        let mut result = serde_json::json!({"head":{"generation":plan.head().generation,"txid":plan.head().txid}, "oldest_txid":oldest.map(|id|id.txid), "snapshots":snapshots,"objects":objects.len(),"bytes":objects.values().map(|m|m.size).sum::<u64>(),"off_chain":objects.len().saturating_sub(on_chain)});
+        let head_key = listing
+            .segments
+            .iter()
+            .find(|segment| segment.id == plan.head())
+            .map(wasmkeep_cluster::replication::segment_key)
+            .unwrap_or_else(|| wasmkeep_cluster::replication::snapshot_key(plan.head()));
+        result["head"]["landed_at"] = objects
+            .get(&head_key)
+            .map_or(serde_json::Value::Null, |meta| {
+                serde_json::json!(meta.last_modified.to_rfc3339())
+            });
+        if args.deep {
+            let mut stamps = Vec::new();
+            for id in &chain {
+                let name = listing
+                    .segments
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .map(wasmkeep_cluster::replication::segment_key)
+                    .or_else(|| {
+                        (id.txid == 1 && listing.snapshots.contains(id))
+                            .then(|| wasmkeep_cluster::replication::snapshot_key(*id))
+                    });
+                let Some(name) = name else {
+                    continue;
+                };
+                let meta = objects
+                    .get(&name)
+                    .context("capture-time object missing from listing")?;
+                let bytes = history::get(
+                    &store,
+                    &meta.location,
+                    Some(meta),
+                    (2u64 << 30) + (129 << 20),
+                )
+                .await?;
+                let (header, _) =
+                    wasmkeep_storage::ltx::visit(&bytes, |_| Ok::<_, ()>(()), |_, _| Ok(()))
+                        .map_err(|e| anyhow::anyhow!("invalid history capture header: {e:?}"))?;
+                anyhow::ensure!(
+                    header.max_txid == id.txid && !header.no_checksum(),
+                    "capture header does not match history position"
+                );
+                stamps.push(serde_json::json!({"generation":id.generation,"txid":id.txid,"timestamp_ms":header.timestamp_ms}));
+            }
+            result["capture_times"] = serde_json::json!(stamps);
+            let dir = tempfile::tempdir()?;
+            let export = history::export(
+                &store,
+                &root,
+                &actor,
+                Point::Head,
+                &dir.path().join("actor.db"),
+                2 << 30,
+            )
+            .await?;
+            result["deep"] = serde_json::json!({"generation":export.position.generation,"txid":export.position.txid,"timestamp_ms":export.timestamp_ms,"replacement":export.verification.replaced,"probably_deleted":export.verification.tables.is_empty() && export.verification.replaced.is_none()});
+        }
+        if args.json {
+            println!("{}", result);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

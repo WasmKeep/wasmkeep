@@ -5,12 +5,147 @@ disk is a cache of it ([replication](../cluster.md#replication)). This
 page says what is in the bucket, how to copy it so that the copy can be
 restored, how to restore it, and how to check that it works.
 
-> **Pre-alpha, and a guide without a tool.** WasmKeep has no command to
-> back up a bucket, to verify one or a copy of one, to restore one, or to
-> export or restore a single actor. Verifying a bucket and exporting an
-> actor are on the [roadmap](../../ROADMAP.md). Until then a backup is a
-> copy made with an S3 tool, and the only proof that it restores is a
-> restore drill ([below](#a-restore-drill)).
+## Online archives
+
+Use `backup create` to copy a running app, then `backup verify` to check
+what the destination actually holds:
+
+```bash
+wasmkeep backup create --bucket s3://live/prod --app acme/shop \
+  --to s3://archive/prod --to-env backup.env --history head --cache backup-cache
+wasmkeep backup list --from s3://archive/prod
+# Run with the archive account's AWS_* environment:
+wasmkeep backup verify --from s3://archive/prod
+```
+
+`backup.env` contains destination `AWS_*` settings as `NAME=value`, one per
+line. Bucket overrides (`AWS_BUCKET`, `AWS_BUCKET_NAME`, `bucket`, and
+`bucket_name`) are rejected in both source and destination settings. The CLI
+bucket is applied after configuration; overlapping prefixes with the same
+bucket name are refused unless both endpoints identify distinct, well-known AWS
+partitions (AWS and AWS China). Source credentials need only LIST and GET; no lease, owner request,
+source write or running-node connection is made. The destination needs
+LIST, GET and PUT. Use a separate bucket and account. Keep credentials,
+archives and the local plaintext cache private. `--all` discovers deployed
+apps instead of requiring `--app`. Legacy app layouts must be migrated first.
+
+Each copied actor is replayed with LTX trailer and chain checksums, an
+independent final database checksum, and SQLite `integrity_check`.
+Foreign-key violations are reported rather than treated as storage corruption.
+A copied head includes writes acknowledged before that actor's listing;
+it may include unacknowledged tips. **There is no consistent point across
+actors.** Reconcile cross-actor business invariants after restoring.
+
+Online create refuses all virtual-hosted-style settings (including an explicit
+false value) and bucket overrides. Explicit endpoint URLs must be origins
+without paths, queries, fragments or credentials. Path-style custom DNS
+endpoints are supported, including Cloudflare R2
+(`https://<account>.r2.cloudflarestorage.com`), OVHcloud
+(`https://s3.<region>.io.cloud.ovh.net`) and MinIO behind a hostname.
+Bucket-hosted AWS URLs and hosts beginning with the configured bucket name
+are refused. A destination host beginning with the source bucket's DNS label
+(or full bucket name for dotted names) is also refused. These checks apply
+before any backup requests. With the same bucket name, equal or overlapping source/destination prefixes
+are refused for any custom endpoint, even when the hostnames differ: aliases
+can reach the same store. Choose a different bucket name or a non-overlapping
+prefix. AWS regional service endpoints identify the same AWS partition; only
+distinct known partitions (AWS and AWS China) prove separation.
+Configure a path-style service endpoint; do not use a bucket-hosted URL.
+
+`--history head` keeps the snapshot, its boundary segment and the segments
+to the head. `--history all` also retains the available historical objects
+and the previous compatible run's objects. Deletes erase live history
+immediately, but **older backups still contain the deleted data**. An app
+recreated between runs starts a new history set; a tombstone or recreation
+during a run refuses completion.
+
+Each actor records the recoverable transaction ranges actually archived.
+A GET miss in retained history can split a range, even when the head is intact.
+Create reports these gaps and exits nonzero with `--require-continuous true`,
+the default for `--history all`. Use `--require-continuous false` to explicitly
+accept a partial historical range; full verify replays every position within
+each recorded range and reports those ranges. Runs closer than the retention
+window alone do not guarantee continuous history: a read can cross expiry.
+Every retry adds its observed keys to gap accounting. A retained snapshot
+restores its own position even if its boundary segment has disappeared.
+Objects already erased before listing cannot be promised by this archive.
+
+The archive uses immutable `data/<sha256>` objects and checksummed actor
+manifest chunks bounded by serialized bytes below the 64 MiB loader cap;
+actor records span ordered 1 MiB fragments. The loader streams fragments to a
+private temporary file, without concatenating them in memory, and parses one
+bounded actor at a time. Limits are 8 MiB serialized metadata per actor,
+64 MiB per metadata object and accounted resident index, and 1 GiB of actor
+metadata spool per run (incarnation markers are capped at 64 KiB each). Listing indexes and create use the same bounded policy;
+exceeding a budget is an explicit error, not a truncated backup. These are
+metadata budgets, not an RSS limit: JSON trees and allocator overhead add
+memory, and LTX bodies/database replay have the separate 2 GiB database cap.
+Temporary manifest files are removed on success or error. Split large runs by
+app if a run budget is exceeded; oversized individual histories need a future
+streaming history format.
+
+`started` binds the run ID, source and expected app incarnations. Each app
+record references that run and the started digest and binds actor membership
+and status. `complete` references these records and the started digest;
+`runs/<id>/root`, written after completion, references its completion digest.
+Every load, including `verify --run ID`, checks that run's own root and
+reconciles app membership with the incarnations. `latest` is only a convenience
+pointer. Archives predating the per-run root must be recreated.
+Never start nodes against this layout. `backup list` distinguishes incomplete
+runs from complete runs and reports failed actors. A partial run exits nonzero,
+and verification refuses it. A missing object, invalid chunk, corrupted LTX
+or mismatched head/checksum also causes verification to fail. `--run ID`
+selects an older run; `--sample N` checks a random subset and explicitly
+records partial verification. Use full verification before a restore drill.
+
+Threat model: verify detects corruption and inconsistent edits. Protected
+chunk and app records bind expected actor membership and copied/failed status.
+There is no key and no signature: an attacker who can rewrite the whole archive,
+including all digests and per-run roots, can forge a consistent archive.
+These hashes do not authenticate the archive or provide an externally trusted root.
+
+Deploys (current plus five predecessors) and sealed secrets are copied after
+actor history, with current pointers checked again. Owners, leases, node
+heartbeats, cluster secrets, alarms and operator intents are excluded.
+The manifest records each database's pending alarm and indexed tag for the
+future restore command. Keep the secrets decryption key separately.
+
+Collection continues normally. A missing link/object causes a fresh actor
+listing, up to eight attempts; checksum failures are terminal. Set
+`--history-retention-secs` above twice the largest actor's read deadline plus
+clock skew: about 35 minutes at the 1 GiB cap; the default hour covers this.
+A busy zero-retention actor can starve the reader and fail the run safely.
+
+Copying runs up to 16 actors concurrently with listing backpressure.
+Unchanged head plans reuse their manifest only when
+all listed sizes and ETags match. Moved actors fetch only new source objects,
+and `--cache` keeps content, raw databases and checksum sidecars. When the cached
+head is on the new replay plan, only its new segments are applied after checking
+the cached database checksum. A new snapshot beyond the cached head starts a
+fresh replay. Destination reads therefore exceed ADR 0033's optimized estimates. Existing or concurrent
+prune markers refuse completion conservatively. `backup prune`, archive
+`backup restore`, and actor restore are later plan steps; a verified archive
+is not yet an automated restore procedure. The stopped-cluster copy and drill
+below remain available today.
+
+## Inspect one actor
+
+```bash
+wasmkeep actor history acme/shop counter/alice --bucket s3://live/prod --json
+wasmkeep actor history acme/shop counter/alice --bucket s3://live/prod --deep
+wasmkeep actor export acme/shop counter/alice --bucket s3://live/prod -o alice.db
+```
+
+Shallow history uses only LIST. Deep history replays the head and reports its
+capture time and replacement label (or “probably deleted” for an empty database
+without a label). The app argument follows the existing positional export/SQL
+syntax. See [actor data access](../actor-data-access.md).
+
+## Stopped-cluster copies
+
+The remaining sections describe copies made by an S3 tool, not the online
+archive format. A running-bucket `rclone` copy is still not established as
+restorable. A restore drill remains the proof of your operational procedure.
 
 ## What is in the bucket
 

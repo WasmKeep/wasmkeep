@@ -2215,7 +2215,8 @@ impl Manifest {
         out
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    /// Decode a deploy manifest without contacting or mutating the app.
+    pub fn parse(text: &str) -> Option<Self> {
         let mut lines = text.lines();
         let format = match lines.next()? {
             "wasmkeep-manifest 1" => 1,
