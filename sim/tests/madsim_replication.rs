@@ -837,10 +837,16 @@ struct Outcome {
     /// Fences nodes wrote over peers cut off from the bucket.
     fences: u64,
     problems: Vec<String>,
+    exports: usize,
+    export_retries: usize,
     store: Store,
 }
 
 fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
+    simulate_with_exports(seed, rules, duration, false)
+}
+
+fn simulate_with_exports(seed: u64, rules: Rules, duration: Duration, export: bool) -> Outcome {
     bucket::clear_delays();
     EARLY.with(|e| e.set(0));
     LATE.with(|l| l.set(0));
@@ -861,7 +867,11 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
         Arc::clone(&problems),
         Arc::clone(&store),
     );
+    let export_counts = Arc::new(Mutex::new((0usize, 0usize)));
+    let export_counts_out = Arc::clone(&export_counts);
     rt.block_on(async move {
+        let export_store = Arc::clone(&store);
+        let mut pending_export: Option<(Plan, Vec<SegmentId>, usize)> = None;
         let handle = Handle::current();
         let time = GlobalTime(Instant::now());
         let mut rng = Rng::new(seed ^ 0x5EED_0007);
@@ -986,6 +996,49 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
         for step in 1..=steps {
             sleep(Duration::from_millis(50)).await;
             let at = step * 50;
+            // ADR 0033: an observer with no node lease or hold lists, then
+            // fetches later while writers, kills and collection keep running.
+            // The model checks positions; real LTX verification is covered
+            // by the server's export fixtures and cluster tests.
+            if export && step % 2 == 0 {
+                let objects: Vec<(String, String)> = export_store
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, (body, _))| (k.clone(), String::from_utf8_lossy(body).into_owned()))
+                    .collect();
+                let mut attempts = 0;
+                if let Some((plan, before, tried)) = pending_export.take() {
+                    let complete = plan
+                        .segments
+                        .iter()
+                        .all(|id| !segment_key_of(*id, &objects).is_empty());
+                    if let Ok(found) = restored(&plan, &objects).and_then(|found| {
+                        if complete {
+                            Ok(found)
+                        } else {
+                            Err("collected segment".into())
+                        }
+                    }) {
+                        if let Some(lost) = before.iter().find(|id| !found.contains(id)) {
+                            problems
+                                .lock()
+                                .unwrap()
+                                .push(format!("lease-free export lost acknowledged {lost:?}"));
+                        }
+                        export_counts.lock().unwrap().0 += 1;
+                    } else {
+                        attempts = tried + 1;
+                        export_counts.lock().unwrap().1 += 1;
+                    }
+                }
+                if attempts < 8 {
+                    let listing = read_listing(objects.iter().map(|(key, _)| key.as_str()));
+                    if let Ok(plan) = plan_restore(&listing) {
+                        pending_export = Some((plan, acked.lock().unwrap().clone(), attempts));
+                    }
+                }
+            }
             if rules.lease_cuts {
                 // One node's lease writes refused for 0.3 to 1.6 s: past
                 // 800 ms its lease runs out, and it is seldom fenced (ttl
@@ -1058,6 +1111,7 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
         }
         sleep(Duration::from_secs(3)).await;
     });
+    let (exports, export_retries) = *export_counts_out.lock().unwrap();
     Outcome {
         acked: acked_out.lock().unwrap().clone(),
         early: EARLY.with(std::cell::Cell::get),
@@ -1069,6 +1123,8 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
         fences: take_fences(),
         problems: problems_out.lock().unwrap().clone(),
         store: store_out,
+        exports,
+        export_retries,
     }
 }
 
@@ -1464,4 +1520,28 @@ fn erasing_before_the_delete_is_acked_loses_writes() {
         ..SAFE_DELETING
     });
     eprintln!("replication: erasing before the delete is acked caught at seed {seed}");
+}
+
+/// A read-only observer has no ownership machinery. Its delayed reads either
+/// replan on collection or contain all writes acknowledged before its listing.
+#[test]
+fn lease_free_exports_during_writes_kills_and_collection_keep_acknowledged_positions() {
+    let (mut exports, mut retries) = (0, 0);
+    for seed in 0..seeds() {
+        let outcome = simulate_with_exports(seed, SAFE_COLLECTING, Duration::from_secs(30), true);
+        if let Err(error) = check(&outcome) {
+            panic!("seed {seed}: {error}");
+        }
+        exports += outcome.exports;
+        retries += outcome.export_retries;
+    }
+    assert!(
+        exports > seeds() as usize * 10,
+        "too few exports: {exports}"
+    );
+    assert!(retries > 0, "collection never invalidated an export");
+    eprintln!(
+        "lease-free exports: {exports} verified, {retries} collection retries across {} seeds",
+        seeds()
+    );
 }

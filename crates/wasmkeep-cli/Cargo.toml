@@ -14,6 +14,14 @@ name = "wasmkeep"
 path = "src/main.rs"
 
 [dependencies]
+# Local export queries and result values, using the server's SQLite build.
+wasmkeep-storage.workspace = true
+# Automatically cleaned SQL export directories; already a workspace dependency.
+tempfile.workspace = true
+# RFC3339 operator timestamps; already locked through object_store.
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+# Lossless BLOB output in JSON; already locked through object_store.
+base64 = "=0.23.1"
 wasmkeep-runtime.workspace = true
 wasmkeep-server.workspace = true
 wasmkeep-cluster.workspace = true

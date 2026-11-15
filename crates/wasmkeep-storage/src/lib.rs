@@ -16,6 +16,7 @@ pub mod faults;
 mod local;
 pub mod ltx;
 mod path;
+pub mod readonly;
 mod value;
 pub mod wal;
 
