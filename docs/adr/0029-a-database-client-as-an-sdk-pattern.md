@@ -7,9 +7,9 @@
   [`examples/ts-db`](../../examples/ts-db), and every client tested against
   every handler (`crates/wasmkeep-server/tests/db_langs.rs`). The other
   SDKs come later ([languages](../languages.md#a-database-kept-by-one-actor)).
-  To ship in `0.4.2`, the release after `0.4.1`.
+  Built in `0.4.2`.
 - Date: 2026-11-14
-- Milestone: [Now](../../ROADMAP.md#now), files and databases
+- Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster), released in 0.4.2
 
 ## Context
 

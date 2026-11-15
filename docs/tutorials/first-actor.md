@@ -3,10 +3,10 @@
 You will write a small actor in Rust, build it into a WebAssembly component,
 serve it with WasmKeep, and see its state survive a restart.
 
-Applies to: WasmKeep `0.4.1` (pre-alpha). Commands assume Linux; on macOS,
+Applies to: WasmKeep `0.4.2` (pre-alpha). Commands assume Linux; on macOS,
 build the server from source (step 1).
 
-**The fast path**, from the release after `0.4.1`: `wasmkeep new` writes a
+**The fast path**, from `0.4.2` on: `wasmkeep new` writes a
 project that builds and runs as it is, with its `wasmkeep.toml`, a README,
 a `.gitignore` and an `.env.local` example
 ([starting a project](#starting-a-project-with-wasmkeep-new) below):
@@ -52,7 +52,7 @@ cargo add wasmkeep-sdk
 
 `cargo add` takes the newest version: the SDK carries the version of the
 server it is released with, so keep the two the same
-(`cargo add wasmkeep-sdk@0.4.1` names one). Add to `Cargo.toml`:
+(`cargo add wasmkeep-sdk@0.4.2` names one). Add to `Cargo.toml`:
 
 ```toml
 [lib]
@@ -162,7 +162,7 @@ The count survived because it lives in the actor's database, not in memory.
 
 ## Starting a project with `wasmkeep new`
 
-From the release after `0.4.1`:
+From `0.4.2` on:
 
 ```bash
 wasmkeep new DIR --lang rust|typescript [--front] [--app TENANT/APP]

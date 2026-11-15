@@ -1324,8 +1324,40 @@ during this upgrade. Sockets through the front
 ends: a hand-off to a room owned by a 0.4.0 node gets a 503 with
 `Retry-After: 1`, and a front on a 0.4.0 node sees an upgrade as the
 plain `GET` it saw before. Deploy an app that hands sockets off once
-every node runs 0.4.1. Every other pair of versions follows the rule
-above.
+every node runs 0.4.1.
+
+**A second exception: from 0.4.1 to 0.4.2, one node at a time**, the
+same steps. 0.4.2 changes no format 0.4.1 reads in the bucket (layout,
+ownership records, history, alarm index, intents); what it adds, 0.4.1
+never reads: the delete requests under `state/<t>/<a>/deletes/`,
+`control/changed`, an app's tombstone and `recreated` marker, and
+manifest format 4. It signs calls between nodes as 0.4.1 does, and adds
+one heartbeat word, `ends`, which 0.4.1 ignores. A 0.4.2 node that
+starts says hello to its peers (`/_wasmkeep/hello`); a 0.4.1 node
+answers 404 and lists `nodes/` every period anyway. Until the last node
+is upgraded:
+
+- A deploy with an idle limit (`expire-after-idle`, manifest format 4)
+  and [`app delete`](#deleting-an-app) are refused while a live node of
+  the app runs 0.4.1. [`actor delete`](#deleting-one-actor) requests wait
+  until a 0.4.2 node holds the actor, or finds it free.
+- A component that imports `storage.delete-self-durable` cannot be
+  loaded by a 0.4.1 node, and the deploy does not check for it: that node
+  stays not ready on the version ("cannot apply the deployed version").
+  Every TypeScript and Python component built with the 0.4.2 SDK imports
+  it, called or not, as do Rust, Go, C and Zig components that call it.
+  Deploy them once every node runs 0.4.2.
+- Use the 0.4.2 CLI. A drain, an undrain or a move from the 0.4.1 CLI is
+  read within a minute instead of 3 s; the 0.4.1 CLI cannot read a
+  version with an idle limit (it refuses to deploy over one), and knows
+  nothing of tombstones.
+- A 0.4.1 node that starts is seen by 0.4.2 peers within 30 s (sooner
+  over TLS), instead of a period.
+
+Going back to 0.4.1 is the same, one node at a time, as long as no
+version with an idle limit is current and no component that needs 0.4.2
+is deployed; a 0.4.1 node cannot serve either. Every other pair of
+versions follows the rule above.
 
 1. `wasmkeep cluster status --bucket ...`: note the nodes it lists as live.
 2. Stop every node cleanly (`systemctl stop wasmkeep`, `SIGTERM`). Each
@@ -1343,7 +1375,7 @@ the 0.4.0 layout change: `cluster migrate --rollback` works only until
 the first node starts after the migration, and never after
 `--remove-old --apply` ([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
 a git checkout report the release they follow and their commit
-(`0.4.1+4f1c2a9e7b3d`), a release's tag the release alone, so the version
+(`0.4.2+4f1c2a9e7b3d`), a release's tag the release alone, so the version
 column tells two builds of `main` apart. A build without git (a source
 tarball, a container image built locally) reports the release alone:
 step 3 is what proves no old node is left.

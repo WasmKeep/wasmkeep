@@ -2,9 +2,9 @@
 
 - Status: proposed (2026-11-14). On paper only: nothing here is built.
 - Date: 2026-11-14
-- Milestone: none yet. This is not on the [roadmap](../../ROADMAP.md);
-  it would follow "files and databases", and it is written now to answer
-  whether outbound HTTP is enough before anyone builds on the answer.
+- Milestone: [Later, on demand](../../ROADMAP.md#later-on-demand) (since
+  0.4.2); it is written now to answer whether outbound HTTP is enough
+  before anyone builds on the answer.
 - Follows: [ADR 0016](0016-secrets-in-the-bucket.md) (secrets),
   [ADR 0021](0021-the-app-model.md) (the app is the unit),
   [ADR 0023](0023-the-front.md) (the front),

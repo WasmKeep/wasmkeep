@@ -1,6 +1,6 @@
 # 0028. Actors that end
 
-- Status: accepted (2026-11-14). Sections 1 to 3 (what a deleted actor
+- Status: accepted (2026-11-14), built in 0.4.2. Sections 1 to 3 (what a deleted actor
   is, the durable delete, the operator delete) are built with this
   record; sections 4 (idle expiry) and 5 (deleting an app) were decided
   here and built in the change after it, with the dated notes at the end
@@ -16,8 +16,7 @@
   60 s, not every period. See "Note of 2026-11-14: fewer listings" at the
   end.
 - Date: 2026-11-14
-- Release: 0.4.2 or later ([ROADMAP](../../ROADMAP.md), "Now": actors
-  that end)
+- Release: [0.4.2](../../ROADMAP.md#m4-operating-a-cluster)
 - Amends: [ADR 0002](0002-wasmkeep-actor-wit-v0.1.md) (one function added
   to `storage`, `delete-self-durable`, under `wasmkeep:actor@0.2.0`),
   [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) and
