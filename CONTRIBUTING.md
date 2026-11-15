@@ -54,12 +54,16 @@ Actions) is split so that a pull request waits a minute or two, not ten:
   CodeQL workflow and its configuration (the list is in
   `scripts/ci-changes.sh`) runs the docs site and the
   publication checks alone.
-- **On `main` after the merge, and nightly**: everything, which adds the
+- **On `main` after the merge**: the same fast jobs. Only the latest
+  commit runs: a newer push to `main` or to a pull request replaces the run
+  in progress.
+- **Nightly, and by hand before a release**: everything, which adds the
   test suites on Linux x86_64, arm64 and macOS, every language, and the S3
-  suites. Only the latest commit runs: a newer push to `main` or to a
-  pull request replaces the run in progress. A failure there is fixed
-  forward. A release needs a passing run on its tagged commit; if a later
-  merge cancelled it, start CI again on that commit by hand.
+  suites (`gh workflow run ci.yml --ref main`). A failure there is fixed
+  forward. A release needs a passing full run on its tagged commit
+  ([releasing](docs/releasing.md)).
+- **The benchmark comparison** (base against the change) runs on a pull
+  request labelled `bench`.
 - **CodeQL**: weekly and by hand, with results in test code dropped
   before the upload (`scripts/filter-sarif.py`).
 - **Nightly only**: the tutorials, run as written. `./scripts/test-tutorials.sh`
