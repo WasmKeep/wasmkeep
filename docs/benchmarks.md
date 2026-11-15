@@ -1115,6 +1115,35 @@ answers the rest `503`, which the rows record as `handshake_503`. Measuring
 one room past 1,000 needs those limits raised first, a server change of its
 own.
 
+### A workstation trial
+
+These are workstation figures that prove the harness works, not fleet
+results: one desktop (16 cores) ran the node, moto and the load over
+loopback, with the node's data on tmpfs, 10 s of sending per cell and 10
+senders, in
+[`2026-11-15-44b4a95-room-workstation.csv`](../bench/results/2026-11-15-44b4a95-room-workstation.csv)
+(on moto) and
+[`2026-11-15-df15d66-room-workstation-nobucket.csv`](../bench/results/2026-11-15-df15d66-room-workstation-nobucket.csv)
+(`ROOM_BUCKET=none`). What they show, in shape:
+
+- No cell lost, duplicated or reordered a message, and no acknowledged
+  message was missing from the room's table.
+- On a bucket, the room's `plain` and `durable` modes both stopped at a
+  few hundred messages a second, whatever the room's size (10 sockets as
+  1,000) and with the node mostly idle: each event that writes waits for
+  the bucket before the next one runs, so the room's rate is one bucket
+  round trip per message. At 1,000 messages a second the rest queued in the
+  senders' sockets (`outcome_stall`: unacknowledged, latency growing for
+  the whole run). `batch` took every rate, about 30 ms of latency at the
+  median (half the 50 ms window) and under 100 ms at p99 in every cell but
+one (1,000 sockets at 100 a second, 178 ms).
+- Without a bucket, the limit moves to the broadcast itself: a room of
+  1,000 sockets kept up at 100 messages a second and fell behind at 1,000
+  (its sends to 1,000 sockets per message), where `batch`, one frame per
+  socket per batch, did not.
+- 10,000 sockets: 1,000 accepted, 9,000 answered `503` (`refused`), as the
+  limits above say. The workstation did not need any system change for it.
+
 ### Run it on one machine
 
 ```bash

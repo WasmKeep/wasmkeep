@@ -16,7 +16,7 @@
 # Settings (environment):
 #   ROOM_LABEL   names the setup in the file name (required for local, merge)
 #   ROOM_SIZES   sockets in the room, over all clients ("10 100 1000")
-#   ROOM_RATES   messages a second into the room, over all clients ("10 100")
+#   ROOM_RATES   messages a second into the room, over all clients ("100 1000")
 #   ROOM_MODES   how the room stores a message ("plain durable batch")
 #   ROOM_SECS    seconds of sending per cell (10); ROOM_DRAIN after it (5)
 #   ROOM_SENDERS sockets that send, over all clients (10)
@@ -42,7 +42,7 @@ cd "$(dirname "$0")/.."
 
 role=${1:-local}
 sizes=${ROOM_SIZES:-10 100 1000}
-rates=${ROOM_RATES:-10 100}
+rates=${ROOM_RATES:-100 1000}
 modes=${ROOM_MODES:-plain durable batch}
 secs=${ROOM_SECS:-10}
 drain=${ROOM_DRAIN:-5}
