@@ -354,16 +354,18 @@ impl ActorService {
             .deploy_seq
             .load(std::sync::atomic::Ordering::SeqCst);
         // New code, same rules and values (a reload changes only code).
-        let (rules, env, requires) = match map.get(name) {
+        let (rules, env, requires, writes) = match map.get(name) {
             Some(old) => (
                 Arc::clone(&old.rules),
                 Arc::clone(&old.env),
                 Arc::clone(&old.requires),
+                old.writes,
             ),
             None => (
                 Arc::clone(&self.inner.start_rules),
                 self.inner.node_env.for_class(name),
                 Arc::default(),
+                crate::apps::Writes::Strict,
             ),
         };
         map.insert(
@@ -373,6 +375,7 @@ impl ActorService {
                 rules,
                 env,
                 requires,
+                writes,
                 ..class
             }),
         );

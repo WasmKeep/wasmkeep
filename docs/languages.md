@@ -420,7 +420,7 @@ those built with the next SDK a node of that release. Rust, Go, C and Zig
 components import only what they call.
 
 From the next release on, `wasmkeep deploy` checks this before it
-writes anything: it reads each component it is given, and refuses one
+writes anything: it reads each component of the version, and refuses one
 that imports `storage.flush` while a live node of the app does not
 announce the capability word `flush`, or one that imports
 `storage.delete-self-durable` while a live node does not announce `ends`

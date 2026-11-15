@@ -5,8 +5,10 @@
 
 use super::*;
 
-/// The actor's history segments and alarm index entries in the bucket.
+/// The actor's history segments and alarm index entries in the bucket,
+/// once the upload at the end of the last event (after its answer) landed.
 async fn counted(p: &Pair) -> (usize, usize) {
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let store: Arc<dyn ObjectStore> = p.flaky.clone();
     let keys = bucket_keys(&store).await;
     let wal = keys.iter().filter(|k| k.contains("/wal/")).count();
@@ -41,16 +43,22 @@ async fn a_flush_ships_the_events_writes_in_one_upload_or_none() {
     warmed(&p).await;
     let before = counted(&p).await;
 
-    // Three plain writes, then the flush: one segment, and nothing left
-    // for the event's end to upload.
-    let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=3", "").await;
+    // Three plain writes, the flush, one more write: the flush's segment,
+    // then the event end's for the write after it. Without the flush the
+    // end would upload all four in one.
+    let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=3&after=1", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "ok:4"), "{}", r.body);
-    assert_eq!(counted(&p).await, (before.0 + 1, before.1), "one upload");
+    assert_eq!(counted(&p).await, (before.0 + 2, before.1), "two uploads");
+    // Nothing after it: the flush's one upload, nothing at the end.
+    let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=1", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "ok:6"), "{}", r.body);
+    assert_eq!(counted(&p).await, (before.0 + 3, before.1), "one upload");
 
     // Nothing written since: no request at all.
     let keys = bucket_keys(&(p.flaky.clone() as Arc<dyn ObjectStore>)).await;
     let r = send(p.a.addr, "POST", "/actor/t/x/flush", "").await;
-    assert_eq!((r.status, r.body.trim()), (200, "ok:4"), "{}", r.body);
+    assert_eq!((r.status, r.body.trim()), (200, "ok:6"), "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         bucket_keys(&(p.flaky.clone() as Arc<dyn ObjectStore>)).await,
         keys,
@@ -61,16 +69,16 @@ async fn a_flush_ships_the_events_writes_in_one_upload_or_none() {
     let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=1&twice", "").await;
     assert_eq!(
         (r.status, r.body.trim()),
-        (200, "ok:5 | ok:5"),
+        (200, "ok:7 | ok:7"),
         "{}",
         r.body
     );
-    assert_eq!(counted(&p).await, (before.0 + 2, before.1));
+    assert_eq!(counted(&p).await, (before.0 + 4, before.1));
 
     let r = b_answers(&p, "/actor/t/x/plain").await;
     assert_eq!(
         (r.status, r.body.trim(), r.node.as_deref()),
-        (200, "5", Some("b")),
+        (200, "7", Some("b")),
         "{}",
         r.body
     );
@@ -83,9 +91,17 @@ async fn a_flush_lists_a_pending_alarm_first() {
     let p = pair(Duration::from_secs(30), Duration::from_secs(30)).await;
     warmed(&p).await;
     let before = counted(&p).await;
-    let r = send(p.a.addr, "POST", "/actor/t/x/flush?alarm=3600000", "").await;
+    // The alarm, the flush, a write after it: the flush's segment carries
+    // the alarm (its entry written first), the end's the write.
+    let r = send(
+        p.a.addr,
+        "POST",
+        "/actor/t/x/flush?alarm=3600000&after=1",
+        "",
+    )
+    .await;
     assert_eq!((r.status, r.body.trim()), (200, "ok:1"), "{}", r.body);
-    assert_eq!(counted(&p).await, (before.0 + 1, before.1 + 1));
+    assert_eq!(counted(&p).await, (before.0 + 2, before.1 + 1));
     let r = b_answers(&p, "/actor/t/x/alarm").await;
     assert_eq!(
         (r.status, r.node.as_deref()),

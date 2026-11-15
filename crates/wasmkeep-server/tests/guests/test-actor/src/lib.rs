@@ -25,10 +25,12 @@
 //! - `POST /plain`: adds 1 to `plain` with a plain `exec` (uploaded after
 //!   the answer: lost with its node if not uploaded yet); answers the new
 //!   value; `GET /plain`
-//! - `POST /flush?n=N[&alarm=MS][&tx][&twice]`: N plain `exec` increments
-//!   of `plain` (default none), an alarm MS from now with `alarm`, then
-//!   `flush` (inside BEGIN ... ROLLBACK with `tx`; twice with `twice`);
-//!   answers each as `ok:PLAIN` or `err:KIND:MESSAGE`, joined by ` | `
+//! - `POST /flush?n=N[&alarm=MS][&tx][&twice][&after=K]`: N plain `exec`
+//!   increments of `plain` (default none), an alarm MS from now with
+//!   `alarm`, then `flush` (inside BEGIN ... ROLLBACK with `tx`; twice
+//!   with `twice`), then K more plain increments; answers each flush as
+//!   `ok:PLAIN` (`plain` at the flush) or `err:KIND:MESSAGE`, joined by
+//!   ` | `
 //! - `POST /durable-twice`: two `exec-durable` increments in one event;
 //!   answers `first=ok|err second=ok|err`
 //! - `POST /durable-in-tx`: `exec-durable` inside BEGIN/ROLLBACK; answers
@@ -437,14 +439,22 @@ impl http::Guest for TestActor {
                 if tx {
                     let _ = storage::exec("ROLLBACK", &[]);
                 }
-                answers
+                let answered = answers
                     .into_iter()
                     .map(|r| match r {
                         Ok(()) => format!("ok:{}", get("plain")),
                         Err(e) => format!("err:{:?}:{}", e.kind, e.message),
                     })
                     .collect::<Vec<_>>()
-                    .join(" | ")
+                    .join(" | ");
+                for _ in 0..num("after") {
+                    let _ = storage::exec(
+                        "INSERT INTO config (key, value) VALUES ('plain', 1)
+                         ON CONFLICT (key) DO UPDATE SET value = value + 1",
+                        &[],
+                    );
+                }
+                answered
             }
             (Method::Post, "/durable-in-tx") => {
                 let _ = storage::exec("BEGIN", &[]);

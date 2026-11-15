@@ -34,9 +34,10 @@ Since 0.4.2, in no release yet.
   or not they call it, so they need a node of this release.
 - **`deploy` refuses a component a live node could not link**
   ([cluster](docs/cluster.md#rolling-upgrades-and-new-storage-functions)).
-  Nodes now announce the heartbeat word `flush`. `deploy` reads the
-  imports of each component it is given and refuses, before writing
-  anything and without `--force`, one that imports `storage.flush` while
+  Nodes now announce the heartbeat word `flush`. `deploy` (and
+  `--rollback`) reads the imports of each component of the version it
+  would make current and refuses, before writing anything and without
+  `--force`, one that imports `storage.flush` while
   a live node of the app lacks `flush`, or one that imports
   `storage.delete-self-durable` while a live node lacks `ends` (a node of
   0.4.1). The second is new for every class: 0.4.2 accepted that deploy
@@ -51,7 +52,9 @@ Since 0.4.2, in no release yet.
   batched class will be written as manifest format 5, which this release
   reads and a deploy holds back while a live node lacks `flush`; each
   hold keeps the mode it was acquired with until its writes are flushed
-  ([project file](docs/project-file.md)).
+  ([project file](docs/project-file.md)). Until batched writes are built,
+  a node of this release runs a batched class's events as strict ones.
+  No `deploy --writes` flag yet: the project file only.
 - **`cluster diagnose` requires listings that are strongly consistent
   after a write.** A node taking an actor over plans its restore from one
   listing of the actor's history, and after a voluntary hand-over it may

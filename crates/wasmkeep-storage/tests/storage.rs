@@ -246,6 +246,14 @@ fn an_interrupted_write_aborts_the_events_transaction() {
         let err = db.exec_durable(sql, &[]).unwrap_err();
         assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{sql}: {err:?}");
     }
+    // And `storage.flush` (ADR 0034): the guest believes its transaction
+    // open, so nothing is made durable under it.
+    for _ in 0..2 {
+        let err = db.sync_committed().unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{err:?}");
+        assert!(err.message.contains("rolled back"), "{err:?}");
+        assert!(db.flushable().is_err());
+    }
     // The guest's own ROLLBACK (an error handler's) is what happened: Ok.
     assert_eq!(db.exec("ROLLBACK", &[]).unwrap(), 0);
     let err = db.query("SELECT count(*) FROM t", &[]).unwrap_err();

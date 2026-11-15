@@ -347,23 +347,22 @@ impl AppRef {
         }
     }
 
-    /// Refuses components that import a `storage` function a live node of
-    /// the app lacks (ADR 0034, section 15): `flush` needs the word
-    /// `flush`, `delete-self-durable` the word `ends` (for strict classes
-    /// too: section 1, exception 2). Such a node could not link the
-    /// component and would stay not ready on the version. Only the
-    /// components a deploy gives are read: those it keeps passed this
-    /// check when they were given, and a rollback reads no component.
-    async fn check_imports(&self, imports: &[(String, StorageImports)]) -> Result<(), DeployError> {
-        let classes = |pick: fn(&StorageImports) -> bool| -> Vec<&str> {
-            imports
-                .iter()
-                .filter(|(_, i)| pick(i))
-                .map(|(c, _)| c.as_str())
-                .collect()
-        };
-        let (flush, ends) = (classes(|i| i.flush), classes(|i| i.delete_self_durable));
-        if flush.is_empty() && ends.is_empty() {
+    /// Refuses a version whose components import a `storage` function a
+    /// live node of the app lacks (ADR 0034, section 15): `flush` needs the
+    /// word `flush`, `delete-self-durable` the word `ends` (for strict
+    /// classes too: section 1, exception 2). Such a node could not link the
+    /// component and would stay not ready on the version. `given` are the
+    /// components a deploy was given, already read; `kept`, `(version,
+    /// class)`, those it keeps or a rollback brings back, read from the
+    /// bucket only when a live node lacks a word.
+    async fn check_imports(
+        &self,
+        runtime: Option<&Runtime>,
+        given: &[(String, StorageImports)],
+        kept: &[(String, String)],
+    ) -> Result<(), DeployError> {
+        let needs_any = given.iter().any(|(_, i)| i.flush || i.delete_self_durable);
+        if !needs_any && kept.is_empty() {
             return Ok(());
         }
         let nodes = live_nodes(
@@ -373,6 +372,40 @@ impl AppRef {
             &self.app,
         )
         .await?;
+        if nodes.iter().all(|n| n.can_flush && n.can_end) {
+            return Ok(());
+        }
+        let mut imports = given.to_vec();
+        if !kept.is_empty() {
+            let own;
+            let runtime = match runtime {
+                Some(r) => r,
+                None => {
+                    own = Runtime::new(&wasmkeep_runtime::RuntimeConfig::default())
+                        .map_err(|e| DeployError::Bucket(format!("checking imports: {e:#}")))?;
+                    &own
+                }
+            };
+            for (version, class) in kept {
+                let key = format!("{version}/{class}.wasm");
+                let (bytes, _) = self
+                    .get(&key)
+                    .await?
+                    .ok_or_else(|| DeployError::Corrupt(format!("{key} (missing)")))?;
+                let component = runtime
+                    .compile(&bytes)
+                    .map_err(|e| DeployError::Invalid(class.clone(), format!("{e:#}")))?;
+                imports.push((class.clone(), StorageImports::of(runtime, &component)));
+            }
+        }
+        let classes = |pick: fn(&StorageImports) -> bool| -> Vec<&str> {
+            imports
+                .iter()
+                .filter(|(_, i)| pick(i))
+                .map(|(c, _)| c.as_str())
+                .collect()
+        };
+        let (flush, ends) = (classes(|i| i.flush), classes(|i| i.delete_self_durable));
         let app = format!("{}/{}", self.tenant, self.app);
         let lacking = |has: fn(&wasmkeep_cluster::membership::NodeInfo) -> bool| {
             nodes
@@ -881,6 +914,9 @@ impl AppRef {
         // What the components given import of `storage` beyond 0.4.1's
         // (ADR 0034, section 15): checked against the live nodes below.
         let mut imports = Vec::new();
+        // The classes kept from the current version: read only if a live
+        // node lacks a word.
+        let mut kept = Vec::new();
         if let Some(classes) = &changes.classes {
             let mut compiled = Vec::new();
             for (name, bytes) in classes {
@@ -980,6 +1016,7 @@ impl AppRef {
                 Some((current, manifest, _)) => {
                     for class in manifest.classes.keys() {
                         copies.push((current.version.clone(), format!("{class}.wasm")));
+                        kept.push((current.version.clone(), class.clone()));
                     }
                     manifest.classes.clone()
                 }
@@ -1142,7 +1179,7 @@ impl AppRef {
             }
         }
         // Not built yet (ADR 0034, slices S7 to S12): refused before
-        // anything is read or written.
+        // anything is written.
         if let Some(class) = batched.first() {
             return Err(DeployError::BatchedNotYet(class.clone()));
         }
@@ -1218,7 +1255,7 @@ impl AppRef {
         // such node may be live (ADR 0023). Checked before any write, as
         // is a component no live node could link (ADR 0034, section 15).
         self.check_readers(&manifest).await?;
-        self.check_imports(&imports).await?;
+        self.check_imports(Some(runtime), &imports, &kept).await?;
         if !plan(&diff) {
             return Err(DeployError::Stopped);
         }
@@ -1312,8 +1349,14 @@ impl AppRef {
             return Err(DeployError::Reopens(diff.reopened.join(", ")));
         }
         // Back to a version with a front: its readers are checked as a
-        // deploy writing it checks them.
+        // deploy writing it checks them, and its components' imports too.
         self.check_readers(&back).await?;
+        let kept: Vec<(String, String)> = back
+            .classes
+            .keys()
+            .map(|c| (previous.clone(), c.clone()))
+            .collect();
+        self.check_imports(None, &[], &kept).await?;
         // Rooted, so marked (ADR 0022).
         let marked = true;
         let seq = current.seq + 1;
@@ -1624,6 +1667,8 @@ impl std::fmt::Debug for Part {
                 &self.config.as_ref().map(|v| v.keys().collect::<Vec<_>>()),
             )
             .field("requires", &self.requires)
+            .field("expire", &self.expire)
+            .field("writes", &self.writes)
             .finish()
     }
 }

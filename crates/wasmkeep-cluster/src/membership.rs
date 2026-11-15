@@ -103,7 +103,9 @@ pub struct NodeInfo {
     /// lines, ADR 0034, section 15) (heartbeat line 11, `flush`); `false`
     /// from nodes that predate it, which cannot link a component that
     /// imports `storage.flush` nor read such a version. Announced from the
-    /// binary alone.
+    /// binary alone. Until batched writes are built (ADR 0034, slice S9), a
+    /// node announcing it runs a batched class's events as strict ones,
+    /// which keeps every promise a batched class makes.
     pub can_flush: bool,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which

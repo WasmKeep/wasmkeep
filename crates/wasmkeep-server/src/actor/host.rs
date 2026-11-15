@@ -193,8 +193,8 @@ impl ActorHost {
         let mut replica = slot.lock().await;
         let outcome = self
             .with_db(|db| {
-                if db.in_transaction() {
-                    return Ok(None);
+                if let Err(e) = db.flushable() {
+                    return Ok(Err(from_db_error(e)));
                 }
                 let alarm = db.alarm().map_err(from_db_error)?;
                 let indexed = db
@@ -202,20 +202,19 @@ impl ActorHost {
                     .map_err(from_db_error)?
                     .as_deref()
                     .and_then(alarm_index::parse_meta);
-                Ok(Some((alarm, indexed)))
+                Ok(Ok((alarm, indexed)))
             })
             .await?;
         let (alarm, indexed) = match outcome {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok(Err(flush_in_transaction())),
-            Err(e) => return Ok(Err(e)),
+            Ok(Ok(v)) => v,
+            Ok(Err(refused)) | Err(refused) => return Ok(Err(refused)),
         };
         if let Some(reason) = replica.failed() {
             // The local database may be ahead of the bucket: nothing is
             // shipped until the actor is restored.
             return Ok(Err(SqlError {
                 kind: SqlErrorKind::Internal,
-                message: format!("{REPLICATION_STOPPED} ({reason}); retry"),
+                message: format!("{REPLICATION_STOPPED} ({reason})"),
             }));
         }
         let stopped = |e: &dyn std::fmt::Display| SqlError {
@@ -360,14 +359,6 @@ pub(crate) const REPLICATION_STOPPED: &str = "replication stopped";
 /// Reserved: a strict class never answers it, its upload being inline.
 #[allow(dead_code, reason = "a batched flush's wall case (ADR 0034, slice S9)")]
 pub(crate) const STILL_UPLOADING: &str = "not durable: still uploading";
-
-/// `storage.flush` inside an open transaction.
-fn flush_in_transaction() -> SqlError {
-    SqlError {
-        kind: SqlErrorKind::NotAllowed,
-        message: "flush inside a transaction: commit or roll back first".into(),
-    }
-}
 
 /// A durable delete not known to be durable.
 fn not_durable(e: impl std::fmt::Display) -> SqlError {

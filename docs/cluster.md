@@ -1437,10 +1437,12 @@ Rolling upgrades of WasmKeep across mixed versions are planned
 From the release after 0.4.2, every node announces the heartbeat word
 `flush`: it has `storage.flush`
 ([ADR 0034](adr/0034-batched-plain-writes.md)), which a node of 0.4.2
-or before cannot link. `wasmkeep deploy` reads the imports of each
-component it is given, before it writes anything, and refuses the
-deploy, naming the nodes and the classes, while a live node of the app
-lacks what a component imports:
+or before cannot link. Before it writes anything, `wasmkeep deploy`
+reads the imports of each component of the version it would make
+current (those it is given, and those it keeps or a `--rollback` brings
+back, read from the bucket when a live node lacks a word), and refuses,
+naming the nodes and the classes, while a live node of the app lacks
+what a component imports:
 
 - a component importing `storage.flush` needs every live node to
   announce `flush`;
@@ -1460,10 +1462,6 @@ What the check does not cover, during a rolling upgrade:
 - It runs in `deploy`, from the heartbeats in the bucket, not on the
   nodes. A node started without `--node-id` writes no heartbeat, so the
   check cannot see it, nor a node that starts after the deploy.
-- It reads only the components the deploy is given: a class it keeps
-  (a deploy that changes only rules or values) was checked when it was
-  given, or not at all if an older CLI deployed it, and `--rollback`
-  reads no component.
 - A node that misses it cannot link the component and stays not ready on
   the version ("cannot apply the deployed version"), but it still takes
   actors: their events are refused until it is upgraded. The data is

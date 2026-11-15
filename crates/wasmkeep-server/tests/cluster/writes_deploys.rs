@@ -133,7 +133,8 @@ async fn a_batched_class_is_refused_for_now() {
 
 /// A component importing `storage.flush` needs every live node of the app
 /// to announce `flush`; one importing `storage.delete-self-durable` needs
-/// `ends`, for a strict class too (ADR 0034, section 1, exception 2). The
+/// `ends`, for a strict class too (ADR 0034, section 1, exception 2), in
+/// the components a deploy gives, keeps or a rollback brings back. The
 /// refusal names the nodes and the classes, and writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_component_a_live_node_cannot_link_is_refused() {
@@ -212,4 +213,36 @@ async fn a_component_a_live_node_cannot_link_is_refused() {
     )
     .await
     .unwrap();
+
+    // A node without `flush` again (one started from an older binary): a
+    // deploy that keeps the class reads its component from the bucket,
+    // and a rollback the version it brings back.
+    node_with_words(&store, "old", "take front handoff ends").await;
+    let e = app
+        .deploy_changes(
+            &rt,
+            Changes {
+                access: vec![("c".into(), "internal".into())],
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, DeployError::NodesWithoutFlush { .. }), "{e}");
+    let v3 = app
+        .deploy_changes(
+            &rt,
+            Changes {
+                classes: classes(counter_wasm()),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap();
+    let e = app.rollback(false).await.unwrap_err();
+    assert!(
+        matches!(&e, DeployError::NodesWithoutFlush { nodes, .. } if nodes == "old"),
+        "{e}"
+    );
+    assert_eq!(app.current().await.unwrap().unwrap(), v3.current);
 }
