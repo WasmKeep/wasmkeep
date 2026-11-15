@@ -21,6 +21,7 @@ use crate::replica::{
     UploadFailure, list_with, plan_restore,
 };
 use std::sync::Arc;
+use wasmkeep_cluster::alarm_index::Entry;
 use wasmkeep_storage::ltx::DbChecksum;
 
 /// Long enough for any upload of these tests (an upload's budget at the
@@ -1244,6 +1245,194 @@ async fn an_abandoned_ticket_leaves_its_boundaries_marked() {
     assert_eq!(land(&mut r).await.unwrap(), Applied::Acknowledged(id));
     assert!(r.acknowledged_covers(second));
     assert_eq!(r.unacknowledged_events(), 0);
+    drop(hold);
+    drop(db);
+}
+
+/// An alarm index that records its requests, its PUTs held at a gate
+/// while `gated` and failed while `refuse`.
+struct Index {
+    puts: std::sync::Mutex<Vec<Entry>>,
+    deletes: std::sync::Mutex<Vec<Entry>>,
+    gated: std::sync::atomic::AtomicBool,
+    gate: tokio::sync::Semaphore,
+    refuse: std::sync::atomic::AtomicBool,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Self {
+            puts: std::sync::Mutex::default(),
+            deletes: std::sync::Mutex::default(),
+            gated: std::sync::atomic::AtomicBool::default(),
+            gate: tokio::sync::Semaphore::new(0),
+            refuse: std::sync::atomic::AtomicBool::default(),
+        }
+    }
+}
+
+impl Index {
+    fn handle(self: &Arc<Self>) -> crate::replica::AlarmIndex {
+        let (put, delete) = (Arc::clone(self), Arc::clone(self));
+        crate::replica::AlarmIndex::new(
+            move |entry| {
+                let index = Arc::clone(&put);
+                async move {
+                    if index.gated.load(SeqCst) {
+                        index.gate.acquire().await.unwrap().forget();
+                    }
+                    if index.refuse.load(SeqCst) {
+                        return Err("refused".to_owned());
+                    }
+                    index.puts.lock().unwrap().push(entry);
+                    Ok(())
+                }
+            },
+            move |entry| {
+                let index = Arc::clone(&delete);
+                async move {
+                    index.deletes.lock().unwrap().push(entry);
+                    Ok(())
+                }
+            },
+        )
+    }
+    fn puts(&self) -> Vec<Entry> {
+        self.puts.lock().unwrap().clone()
+    }
+    fn deletes(&self) -> Vec<Entry> {
+        self.deletes.lock().unwrap().clone()
+    }
+}
+
+fn entry(at: u64, generation: u64, nonce: &str) -> Entry {
+    Entry::owned(at, generation, nonce).unwrap()
+}
+
+/// One event naming `named`: a committed row, its boundary, recorded.
+fn write_naming(r: &mut Replica, db: &mut ActorDb, v: &str, named: Option<&Entry>) -> WalBoundary {
+    let b = write(db, v);
+    r.note_named_boundary(b, std::time::Instant::now(), named.cloned());
+    b
+}
+
+/// The entry a segment's end names goes up before the segment, and the
+/// one the acknowledged head named is retired only once the segment is
+/// acknowledged; the acknowledged entry then follows (ADR 0034, section 9).
+///
+/// Model: `Switch::SegmentBeforeEntry`, `Switch::RetireBeforeAck`
+/// (`Violation::AlarmMissing`).
+#[tokio::test]
+async fn a_segments_entry_goes_up_first_and_the_old_one_retires_after_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let generation = r.acknowledged_position().0.generation;
+    let (old, new) = (entry(1000, generation, "a"), entry(2000, generation, "b"));
+    let index = Arc::new(Index::default());
+    index.gated.store(true, SeqCst);
+    r.set_alarm_index(index.handle(), Some(old.clone()));
+    let head = r.head();
+    write_naming(&mut r, &mut db, "one", Some(&new));
+    start(&mut r, &mut db, &budget).await;
+    let mut landed = Box::pin(r.landed());
+    assert!(
+        pending(&mut landed).await,
+        "the segment waits for its entry"
+    );
+    assert_eq!(
+        bucket_head(&r).await,
+        head,
+        "nothing uploaded before the entry"
+    );
+    assert!(index.deletes().is_empty());
+    index.gate.add_permits(1);
+    landed.await;
+    let id = match r.apply().await.unwrap() {
+        Applied::Acknowledged(id) => id,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(bucket_head(&r).await, id);
+    assert_eq!(index.puts(), vec![new.clone()]);
+    let started = std::time::Instant::now();
+    while index.deletes().is_empty() {
+        assert!(started.elapsed() < PATIENCE, "never retired");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(index.deletes(), vec![old]);
+    assert_eq!(r.acknowledged_entry(), Some(Some(new.clone())));
+    // A segment naming the acknowledged entry again sends no request.
+    write_naming(&mut r, &mut db, "two", Some(&new));
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    assert_eq!((index.puts().len(), index.deletes().len()), (1, 1));
+    drop(hold);
+    drop(db);
+}
+
+/// Only the entry a segment's end names is listed, never one named only
+/// inside it; a segment that fails retires nothing (ADR 0034, section 9).
+///
+/// Model: `Switch::IntermediateEntry`, `Switch::RetireOnFailure`
+/// (`Violation::AlarmMissing`).
+#[tokio::test]
+async fn only_the_end_entry_goes_up_and_a_failed_segment_retires_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let generation = r.acknowledged_position().0.generation;
+    let old = entry(1000, generation, "a");
+    let (inside, end) = (entry(2000, generation, "b"), entry(3000, generation, "c"));
+    let index = Arc::new(Index::default());
+    r.set_alarm_index(index.handle(), Some(old));
+    write_naming(&mut r, &mut db, "one", Some(&inside));
+    write_naming(&mut r, &mut db, "two", Some(&end));
+    store.fail_next.store(1_000, SeqCst);
+    start(&mut r, &mut db, &budget).await;
+    assert!(land(&mut r).await.is_err());
+    assert_eq!(index.puts(), vec![end]);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        index.deletes().is_empty(),
+        "a failed segment retired its entry"
+    );
+    drop(hold);
+    drop(db);
+}
+
+/// An entry PUT that fails fails the segment before its upload: the
+/// replica stops, and no state naming the entry reaches the bucket (ADR
+/// 0034, sections 8 and 9).
+#[tokio::test]
+async fn a_failed_entry_put_fails_the_segment_before_its_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let generation = r.acknowledged_position().0.generation;
+    let index = Arc::new(Index::default());
+    index.refuse.store(true, SeqCst);
+    r.set_alarm_index(index.handle(), None);
+    let head = r.head();
+    write_naming(&mut r, &mut db, "one", Some(&entry(2000, generation, "b")));
+    start(&mut r, &mut db, &budget).await;
+    assert!(land(&mut r).await.is_err());
+    assert!(r.failed().is_some());
+    assert_eq!(bucket_head(&r).await, head, "the segment never went up");
     drop(hold);
     drop(db);
 }

@@ -403,7 +403,15 @@ impl ActorState {
                 .index_missed("the lease is no longer valid, or replication stopped")
                 .await;
         };
+        // A batched hold names the entry now and lists it with the segment
+        // that carries this event's end (ADR 0034, section 9); a strict
+        // one lists it now, before the event is replicated.
+        let batched = self.batched_replica().is_some();
         let entry = match at {
+            Some(at) if batched => match cluster.name_alarm_entry(at, generation) {
+                Ok(entry) => Some(entry),
+                Err(e) => return self.index_missed(&e.to_string()).await,
+            },
             Some(at) => match cluster
                 .put_new_alarm_entry(&self.address, at, generation)
                 .await
@@ -522,10 +530,8 @@ impl ActorState {
         let Some(stale) = stale else {
             return;
         };
-        // A batched hold's event is not acknowledged when it ends: only an
-        // acknowledged segment may retire the entry it stopped naming (ADR
-        // 0034, section 9, slice S10). Kept: an extra entry costs one
-        // wake-up, and is removed as unnamed then.
+        // A batched hold's segments retire the entry they stop naming, on
+        // their upload task once acknowledged (ADR 0034, section 9).
         if self.batched_replica().is_some() {
             return;
         }
@@ -563,18 +569,32 @@ impl ActorState {
         hint: Option<u64>,
         indexed: Option<Option<Entry>>,
     ) -> bool {
-        let (Some(hint), Some(indexed)) = (hint, indexed) else {
+        let Some(hint) = hint else {
             return true;
         };
-        // A batched hold clears only at a `Flushed` barrier, where its
-        // database is its acknowledged head (ADR 0034, section 9). Its
-        // events' ends pass no entry here (`finish`); without state, the
-        // alarm flushed it first.
-        if let Some(slot) = self.batched_replica()
-            && !slot.lock().await.nothing_pending()
-        {
+        // A batched hold clears only at a `Flushed` barrier, and judges R2
+        // on the entry its acknowledged head names, never the local
+        // database's (ADR 0034, section 9): it flushes first, with one
+        // upload budget. Past it nothing is cleared now (an entry left
+        // costs one wake-up); on a failure the actor is given up.
+        let indexed = match self.batched_replica() {
+            Some(slot) => {
+                let deadline = self.upload_deadline().await;
+                match self.flush_to_barrier(Some(deadline)).await {
+                    Some(Barrier::Flushed) => {}
+                    Some(Barrier::GaveUp(_)) => {
+                        self.abandon("replication stopped before clearing alarm entries");
+                        return true;
+                    }
+                    None => return true,
+                }
+                slot.lock().await.acknowledged_entry()
+            }
+            None => indexed,
+        };
+        let Some(indexed) = indexed else {
             return true;
-        }
+        };
         // R2 relies on the replicated state being this owner's; until its
         // own upload ends the history, an earlier owner's late upload can
         // still become it (a late commit) and name an entry removed here.

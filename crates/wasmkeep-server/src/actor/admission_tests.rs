@@ -684,7 +684,7 @@ async fn batched_capture_is_enabled_after_a_cancelled_database_step() {
                 assert!(host.db.is_none(), "the connection is with the cut work");
                 release.send(()).unwrap();
                 let token = wasmkeep_storage::CaptureHold::default();
-                let enabled = host.ensure_batched_capture(&token).await;
+                let enabled = host.ensure_batched_capture(&token).await.map(|_| ());
                 let on = host
                     .with_db(|db| db.batched_capture_enabled())
                     .await

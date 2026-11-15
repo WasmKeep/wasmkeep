@@ -358,11 +358,11 @@ impl ActorHost {
     }
 
     /// A batched hold's `flush` (ADR 0034, section 4), and the flush of its
-    /// `exec-durable` once the statement committed: a pending alarm listed
-    /// in the bucket's index first (its PUT returns before any segment
-    /// naming it is captured; the entry it replaces is not retired, slice
-    /// S10), then every commit so far flushed through the uploader, until
-    /// the event's wall less one second. Refused inside a transaction.
+    /// `exec-durable` once the statement committed: a pending alarm's entry
+    /// named first (recorded in `ALARM_INDEXED_KEY` before the boundary, and
+    /// listed by the segment's upload task before the segment, section 9),
+    /// then every commit so far flushed through the uploader, until the
+    /// event's wall less one second. Refused inside a transaction.
     async fn flush_batched(&mut self, slot: SharedReplica) -> Result<(), SqlError> {
         let read = self
             .with_db(|db| {
@@ -377,32 +377,14 @@ impl ActorHost {
             .await
             .map_err(|e| uploads::FlushError::Stopped(format!("{e:#}")).to_sql())?;
         let (alarm, indexed) = read.map_err(from_db_error)?;
-        if let Some((cluster, address)) = self.alarm_index.clone()
+        if let Some((cluster, _)) = self.alarm_index.clone()
             && alarm_index::needs_publish(indexed.as_ref(), alarm)
         {
-            let (generation, budget) = {
-                let r = slot.lock().await;
-                (r.generation(), r.upload_budget())
-            };
-            // Bounded by the flush's deadline and one upload budget (ADR
-            // 0034, section 9): past them the commit stays unmarked, so no
-            // segment carries it before its entry exists; an entry landing
-            // later is an extra one, delivered and removed as unnamed.
-            let until = self
-                .batched
-                .as_ref()
-                .map_or_else(tokio::time::Instant::now, |b| b.flush_until)
-                .min(tokio::time::Instant::now() + budget);
+            let generation = slot.lock().await.generation();
             let entry = match alarm {
-                Some(at) => match tokio::time::timeout_at(
-                    until,
-                    cluster.put_new_alarm_entry(&address, at, generation),
-                )
-                .await
-                {
-                    Err(_) => return Err(uploads::FlushError::StillUploading.to_sql()),
-                    Ok(Ok(entry)) => Some(entry),
-                    Ok(Err(e)) => {
+                Some(at) => match cluster.name_alarm_entry(at, generation) {
+                    Ok(entry) => Some(entry),
+                    Err(e) => {
                         slot.lock().await.fail(format!("alarm index: {e}"));
                         return Err(
                             uploads::FlushError::Stopped(format!("alarm index: {e}")).to_sql()

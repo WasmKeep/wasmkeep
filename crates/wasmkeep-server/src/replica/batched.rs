@@ -57,6 +57,83 @@ use wasmkeep_storage::ltx::DbChecksum;
 use wasmkeep_storage::wal::{BoundaryPlan, DEFAULT_SEGMENT_BYTES, WalBoundary};
 
 use super::{Replica, ReplicaError, UploadTarget};
+use wasmkeep_cluster::alarm_index::{self, Entry};
+
+/// One request to the bucket's alarm index, for an entry.
+type IndexCall = Arc<
+    dyn Fn(Entry) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Where a batched hold's segments list and retire alarm entries (ADR
+/// 0034, section 9): the PUT and the DELETE of one exact entry of this
+/// actor's in the bucket's index, run on the segment's upload task.
+#[derive(Clone)]
+pub(crate) struct AlarmIndex {
+    put: IndexCall,
+    delete: IndexCall,
+}
+
+impl std::fmt::Debug for AlarmIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AlarmIndex")
+    }
+}
+
+impl AlarmIndex {
+    /// From the two requests.
+    pub(crate) fn new<P, D, PF, DF>(put: P, delete: D) -> Self
+    where
+        P: Fn(Entry) -> PF + Send + Sync + 'static,
+        PF: Future<Output = Result<(), String>> + Send + 'static,
+        D: Fn(Entry) -> DF + Send + Sync + 'static,
+        DF: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        Self {
+            put: Arc::new(move |e| Box::pin(put(e))),
+            delete: Arc::new(move |e| Box::pin(delete(e))),
+        }
+    }
+
+    /// `address`'s entries in `cluster`'s index.
+    pub(crate) fn of(
+        cluster: Arc<crate::cluster::Cluster>,
+        address: wasmkeep_runtime::ActorAddress,
+    ) -> Self {
+        let (c, a) = (Arc::clone(&cluster), address.clone());
+        Self::new(
+            move |entry| {
+                let (c, a) = (Arc::clone(&c), a.clone());
+                async move {
+                    c.put_alarm_entry(&a, &entry)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            },
+            move |entry| {
+                let (c, a) = (Arc::clone(&cluster), address.clone());
+                async move {
+                    c.delete_alarm_entry(&a, &entry)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            },
+        )
+    }
+}
+
+/// What a segment's upload task does in the alarm index: the entry its
+/// end names, listed before the segment, and the entry the acknowledged
+/// head named, retired once the segment is acknowledged (ADR 0034,
+/// section 9).
+#[derive(Debug, Clone)]
+struct SegmentAlarm {
+    index: AlarmIndex,
+    publish: Option<Entry>,
+    retire: Option<Entry>,
+    generation: u64,
+}
 
 /// The node-wide budget of batched segments in flight, in encoded bytes
 /// (ADR 0034, section 2), as one node's restores are bounded.
@@ -329,6 +406,16 @@ pub(super) struct Uploads {
     /// were marked: what the event-start rule (ADR 0034, section 3) and the
     /// drop counter (section 10) read. Pruned when a segment is prepared.
     marked: std::collections::VecDeque<(WalBoundary, std::time::Instant)>,
+    /// The alarm entry each marked boundary's state names, where known, by
+    /// (session, sequence): what a segment ending there lists (section 9).
+    names: std::collections::BTreeMap<(u64, u64), Option<Entry>>,
+    /// Where segments list and retire entries; `None`: not at all (a hold
+    /// without an index, or the uploader's own tests).
+    index: Option<AlarmIndex>,
+    /// The entry the acknowledged head names; `None`: not known yet.
+    acked_entry: Option<Option<Entry>>,
+    /// The entry the segment in flight's end names, if known.
+    flight_named: Option<Option<Entry>>,
 }
 
 impl Default for Uploads {
@@ -341,6 +428,10 @@ impl Default for Uploads {
             sidecar_write: None,
             captured: None,
             marked: std::collections::VecDeque::new(),
+            names: std::collections::BTreeMap::new(),
+            index: None,
+            acked_entry: None,
+            flight_named: None,
         }
     }
 }
@@ -439,6 +530,7 @@ impl Replica {
         });
         self.batched.captured = None;
         self.batched.marked.clear();
+        self.batched.names.clear();
         Ok(())
     }
 
@@ -474,10 +566,43 @@ impl Replica {
         }
     }
 
+    /// [`Self::note_boundary`], with the alarm entry the state at the
+    /// boundary names (`ALARM_INDEXED_KEY` read with the mark): what a
+    /// segment ending there lists (ADR 0034, section 9).
+    pub(crate) fn note_named_boundary(
+        &mut self,
+        boundary: WalBoundary,
+        at: std::time::Instant,
+        named: Option<Entry>,
+    ) {
+        self.note_boundary(boundary, at);
+        if !self.acknowledged_covers(boundary) {
+            self.batched
+                .names
+                .insert((boundary.session, boundary.sequence), named);
+        }
+    }
+
+    /// Where this hold's segments list and retire alarm entries, and the
+    /// entry its acknowledged head names: set where the local database is
+    /// the acknowledged head (batched capture enabled at a barrier).
+    pub(crate) fn set_alarm_index(&mut self, index: AlarmIndex, acknowledged: Option<Entry>) {
+        self.batched.index = Some(index);
+        self.batched.acked_entry = Some(acknowledged);
+    }
+
+    /// The alarm entry the acknowledged head names (`Some(None)`: none),
+    /// if known: what every R2 decision of a batched hold uses (ADR 0034,
+    /// section 9).
+    pub(crate) fn acknowledged_entry(&self) -> Option<Option<Entry>> {
+        self.batched.acked_entry.clone()
+    }
+
     /// Forgets every boundary marked and not captured: the database has
     /// nothing left to capture (its own count is the one that holds).
     pub(crate) fn forget_marked(&mut self) {
         self.batched.marked.clear();
+        self.batched.names.clear();
     }
 
     /// When the oldest boundary not captured yet was marked: the age the
@@ -629,11 +754,46 @@ impl Replica {
                 a.closed.insert(session);
             }
         });
+        // The entry the segment's end names goes up before it unless the
+        // acknowledged head names it already (the captured position's,
+        // with nothing in flight); the acknowledged head's, if another, is
+        // retired once the segment is acknowledged. Entries named only
+        // inside the segment are never listed (ADR 0034, section 9).
+        let named = self
+            .batched
+            .names
+            .get(&(plan.boundary.session, plan.boundary.sequence))
+            .cloned();
+        let alarm = match (&self.batched.index, &named) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(
+                    self.refuse_batched("a segment whose end names no known alarm entry".into())
+                );
+            }
+            (Some(index), Some(named)) => {
+                let acked = self.batched.acked_entry.clone();
+                let publish = named
+                    .clone()
+                    .filter(|n| acked.as_ref().is_none_or(|a| a.as_ref() != Some(n)));
+                let retire = match acked {
+                    Some(Some(a)) if named.as_ref() != Some(&a) => Some(a),
+                    _ => None,
+                };
+                Some(SegmentAlarm {
+                    index: index.clone(),
+                    publish,
+                    retire,
+                    generation: self.generation,
+                })
+            }
+        };
         // Kept until acknowledged: a ticket dropped before its capture
         // leaves them uncaptured. Only another capture session's go.
-        self.batched
-            .marked
-            .retain(|(b, _)| b.session == plan.boundary.session);
+        let session = plan.boundary.session;
+        self.batched.marked.retain(|(b, _)| b.session == session);
+        self.batched.names.retain(|(s, _), _| *s == session);
+        self.batched.flight_named = named;
         self.in_flight = Some(segment.id);
         self.batched.flight = Some(Flight {
             id: segment.id,
@@ -656,6 +816,7 @@ impl Replica {
             runtime,
             consumed: false,
             reported: false,
+            alarm,
         })
     }
 
@@ -718,6 +879,13 @@ impl Replica {
                 self.batched.marked.retain(|(b, _)| {
                     b.session != flight.sequence.session || b.sequence > flight.sequence.sequence
                 });
+                let end = (flight.sequence.session, flight.sequence.sequence);
+                self.batched
+                    .names
+                    .retain(|(s, q), _| *s != end.0 || *q > end.1);
+                if let Some(named) = self.batched.flight_named.take() {
+                    self.batched.acked_entry = Some(named);
+                }
                 self.head = id;
                 self.checksum = post_apply;
                 self.since_snapshot += 1;
@@ -873,6 +1041,8 @@ pub(crate) struct Ticket {
     consumed: bool,
     /// An outcome (the upload task, or a failure) is in the cell.
     reported: bool,
+    /// The alarm entries its task lists and retires.
+    alarm: Option<SegmentAlarm>,
 }
 
 impl Ticket {
@@ -956,12 +1126,45 @@ impl Ticket {
             .slot
             .send_replace(Slot::Uploading { id, post_apply });
         self.reported = true;
+        let alarm = self.alarm.take();
         self.runtime.spawn(async move {
-            let sent = target.put_bounded(&key, bytes, "segment").await;
+            // One budget for the entry and the segment (ADR 0034, section 9).
+            let until = tokio::time::Instant::now() + target.budget_for(bytes.len());
+            if let Some(entry) = alarm.as_ref().and_then(|a| a.publish.clone().map(|e| (a, e))) {
+                let (a, entry) = entry;
+                let listed = tokio::time::timeout_at(until, (a.index.put)(entry)).await;
+                let failed = match listed {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(format!("alarm index: {e}")),
+                    Err(_) => Some("alarm index: the entry's upload ran out of time".to_owned()),
+                };
+                if let Some(e) = failed {
+                    // Never a segment before its entry: the replica fails.
+                    drop(permit);
+                    outcome.record(Err(ReplicaError::Bucket(e)));
+                    return;
+                }
+            }
+            let sent = target
+                .put_bounded_by(&key, bytes, "segment", Some(until))
+                .await;
             // The PUT future has ended: its bytes leave the node's budget
             // now, whoever applies the outcome, and whenever.
             drop(permit);
+            let acknowledged = sent.is_ok();
             outcome.record(sent);
+            // Only an acknowledged segment retires the entry the head before
+            // it named, and never a newer owner's (R2, R3). Off the actor's
+            // path; a failed DELETE leaves an extra entry, removed as
+            // unnamed when it comes due.
+            if acknowledged
+                && let Some(a) = alarm
+                && let Some(stale) = a.retire
+                && alarm_index::may_delete(&stale, a.generation)
+                && let Err(e) = (a.index.delete)(stale).await
+            {
+                tracing::debug!(prefix = %target.prefix, error = %e, "retiring an alarm entry failed");
+            }
         });
         Ok(id)
     }

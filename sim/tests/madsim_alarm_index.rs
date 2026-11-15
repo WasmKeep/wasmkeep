@@ -1007,3 +1007,15 @@ fn strict_split_alarm_mutations_are_caught() {
         batched::caught_mode(rule, batched::Violation::AlarmMissing, false);
     }
 }
+
+/// ADR 0034, section 9: stale-hint clearing re-reads the acknowledged
+/// entry at its barrier; a LIST resumed on one read before the hold wrote
+/// on removes the entry the head now names.
+#[test]
+fn batched_clearing_on_an_earlier_acknowledged_entry_is_caught() {
+    batched::caught_in_scenario(
+        batched::Switch::ClearOldAcknowledged,
+        batched::Violation::AlarmMissing,
+        31,
+    );
+}

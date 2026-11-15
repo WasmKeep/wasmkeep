@@ -669,3 +669,64 @@ async fn a_batched_room_parks_only_once_flushed() {
         }
     }
 }
+
+/// The actor's alarm index entries in the bucket now.
+async fn entries(p: &Pair) -> Vec<String> {
+    let store: Arc<dyn ObjectStore> = p.flaky.clone();
+    bucket_keys(&store)
+        .await
+        .into_iter()
+        .filter(|k| k.starts_with(&test_key(Family::Alarms, "")))
+        .collect()
+}
+
+/// An alarm moved by every event (ADR 0034, section 9): entries are named
+/// at each event and listed with the segment that carries them, so an
+/// entry named only inside a segment is never written; the entry the
+/// acknowledged head named stays until the segment replacing it is
+/// acknowledged, then goes. One entry is left, for the last time, and the
+/// next owner fires it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alarm_moved_by_every_event_keeps_one_entry_retired_after_acknowledgement() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    let base = now_ms() + 600_000;
+    let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={base}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let first = entries(&p).await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    p.flaky.delay_wal_ms.store(800, Ordering::SeqCst);
+    for i in 1..=5u64 {
+        let at = base + i * 1_000;
+        let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={at}"), "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let during = entries(&p).await;
+    assert!(
+        during.contains(&first[0]),
+        "the acknowledged entry went before its replacement was acknowledged: {during:?}"
+    );
+    assert!(
+        during.len() <= 2,
+        "entries named inside a segment were listed: {during:?}"
+    );
+    p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let after = entries(&p).await;
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert!(
+        after[0].contains(&format!("{:015}", base + 5_000)),
+        "{after:?}"
+    );
+    let r = b_answers(&p, "/actor/t/x/alarm").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, (base + 5_000).to_string().as_str(), Some("b")),
+        "{}",
+        r.body
+    );
+}
