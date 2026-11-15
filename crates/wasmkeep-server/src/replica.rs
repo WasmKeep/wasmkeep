@@ -538,6 +538,11 @@ pub(crate) enum ReplicaError {
     /// Local file trouble.
     #[error("local: {0}")]
     Local(String),
+    /// A snapshot or a reset that would not be labelled at the position it
+    /// holds (ADR 0034, section 7): refused before anything is uploaded,
+    /// and replication stops, as for a fork.
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 /// One actor's replication state, owned by the actor while it holds the
@@ -583,6 +588,15 @@ pub(crate) struct Replica {
     /// given up and restored. Also set while an upload is in flight, so an
     /// upload cancelled half-way (the event was cut) counts as failed.
     failed: Option<String>,
+    /// The segment whose upload has started and not ended, if any. A
+    /// snapshot or a reset is refused while one is (ADR 0034, section 7):
+    /// its key would name a position the bucket may not hold yet. In a
+    /// class with strict writes an upload runs inside [`Self::ship`], which
+    /// holds the replica until it ends, so no snapshot or reset ever sees
+    /// one, except after a `ship` cancelled half-way, which leaves `failed`
+    /// set as well. Batched writes (ADR 0034, section 2) will keep a segment
+    /// in flight here while the actor runs on.
+    in_flight: Option<SegmentId>,
     /// An upload attempt's base bound ([`UPLOAD_IDLE`]; shorter in tests).
     upload_idle: std::time::Duration,
 }
@@ -736,6 +750,7 @@ impl Replica {
             checksum: DbChecksum::default(),
             max_db_bytes,
             failed: None,
+            in_flight: None,
             upload_idle: UPLOAD_IDLE,
         };
         replica.resume_snapshot_wait();
@@ -1036,6 +1051,10 @@ impl Replica {
     /// upload not acknowledged is counted
     /// (`wasmkeep_snapshot_upload_failures_total`), whether or not the
     /// bucket ends up holding it: an attempt given up may still land.
+    ///
+    /// Refused before any of that, and replication stopped, while a
+    /// segment is in flight, or for a snapshot at the head that does not
+    /// hold the head's database ([`Self::refuse_unless_at_head`]).
     pub(crate) async fn ship_snapshot(
         &mut self,
         all: &Changes,
@@ -1053,6 +1072,9 @@ impl Replica {
                 "replication stopped: {reason}"
             )));
         }
+        // Before anything is counted or uploaded, so a refusal leaves the
+        // periodic snapshot's schedule as it was.
+        self.refuse_unless_at_head(all, kind)?;
         let bytes = all
             .to_ltx(1, position.txid.max(1), crate::alarm::now_ms_i64())
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
@@ -1168,12 +1190,15 @@ impl Replica {
             .to_ltx(segment.id.txid, segment.id.txid, crate::alarm::now_ms_i64())
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
         // Marked failed until the upload is known to have succeeded, so a
-        // cancelled upload (the event was cut mid-way) stops replication.
+        // cancelled upload (the event was cut mid-way) stops replication;
+        // and in flight until it ends, which a cancelled one never does.
         self.failed = Some("an upload was interrupted".into());
-        if let Err(e) = self
+        self.in_flight = Some(segment.id);
+        let sent = self
             .put_bounded(&segment_key(&segment), bytes, "segment")
-            .await
-        {
+            .await;
+        self.in_flight = None;
+        if let Err(e) = sent {
             self.failed = Some(e.to_string());
             return Err(e);
         }
@@ -1190,12 +1215,68 @@ impl Replica {
     /// Replaces the whole database in the history (after `delete-self`):
     /// one segment holding every page of the new database, applied on top
     /// of the current head, so the current chain ends in the new state.
+    ///
+    /// Refused, and replication stopped, while a segment is in flight
+    /// (ADR 0034, section 7): the reset's key would be that segment's.
+    /// It needs no checksum guard: it chains on the acknowledged head's
+    /// checksum by construction, whatever the database it replaces.
     pub(crate) async fn ship_reset(&mut self, all: Changes) -> Result<(), ReplicaError> {
+        if let Some(reason) = &self.failed {
+            return Err(ReplicaError::Local(format!(
+                "replication stopped: {reason}"
+            )));
+        }
+        if let Some(segment) = self.in_flight {
+            return Err(self.refuse(format!("a reset while segment {segment:?} is in flight")));
+        }
         let changes = Changes {
             pre_apply: self.checksum,
             ..all
         };
         self.ship(&changes).await
+    }
+
+    /// The guard of [`Self::ship_snapshot`] (ADR 0034, section 7): a
+    /// snapshot is refused while a segment is in flight, and one labelled
+    /// at the head (periodic, after a delete) unless it holds the database
+    /// at the head: its post-apply checksum must be the acknowledged
+    /// head's. Without it, a snapshot of a database that moved past the
+    /// head would be labelled at the head, collection would delete what
+    /// lies below it, and the next segment's pre-apply checksum would not
+    /// match it: an actor that never restores again. The first snapshot
+    /// is at a new position on an empty bucket, and keeps today's rule.
+    ///
+    /// Neither case can happen with strict writes (a periodic snapshot is
+    /// taken right after the event's segment, the one after a delete
+    /// right after the reset, and nothing is in flight then): a refusal
+    /// is a bug, so it stops replication ([`Self::failed`]) and the actor
+    /// is given up as after a failed upload (its next event restores from
+    /// the bucket), rather than a history built on a wrong label. Logged
+    /// as an error.
+    fn refuse_unless_at_head(
+        &mut self,
+        all: &Changes,
+        kind: SnapshotKind,
+    ) -> Result<(), ReplicaError> {
+        if let Some(segment) = self.in_flight {
+            return Err(self.refuse(format!("a snapshot while segment {segment:?} is in flight")));
+        }
+        if kind != SnapshotKind::First && all.post_apply != self.checksum {
+            return Err(self.refuse(format!(
+                "a snapshot of database {:x} labelled at head {:?}, whose database is {:x}",
+                all.post_apply.value(),
+                self.head,
+                self.checksum.value()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stops replication for `reason`, a refused snapshot or reset.
+    fn refuse(&mut self, reason: String) -> ReplicaError {
+        tracing::error!(prefix = %self.prefix, head = ?self.head, %reason, "refused: replication stops");
+        self.fail(format!("refused: {reason}"));
+        ReplicaError::Refused(reason)
     }
 
     /// Whether a periodic snapshot is due: [`SNAPSHOT_EVERY`] segments
@@ -1949,6 +2030,7 @@ mod tests {
             checksum: DbChecksum::from_value(7),
             max_db_bytes: 1 << 30,
             failed: None,
+            in_flight: None,
             upload_idle: UPLOAD_IDLE,
         }
     }
@@ -1960,6 +2042,15 @@ mod tests {
             pages: BTreeMap::from([(1, vec![1u8; 512])]),
             pre_apply,
             post_apply: DbChecksum::from_value(9),
+        }
+    }
+
+    /// A snapshot of the database at `r`'s head: all of it (as from
+    /// `ActorDb::snapshot`), its post-apply checksum the head's.
+    fn at_head(r: &Replica) -> Changes {
+        Changes {
+            post_apply: r.checksum,
+            ..changes(DbChecksum::from_value(0))
         }
     }
 
@@ -2458,7 +2549,7 @@ mod tests {
         let started = std::time::Instant::now();
         let shipped = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            r.ship_snapshot(&changes(DbChecksum::from_value(7)), SnapshotKind::Periodic),
+            r.ship_snapshot(&at_head(&r), SnapshotKind::Periodic),
         )
         .await
         .expect("a snapshot upload is bounded");
@@ -2524,7 +2615,7 @@ mod tests {
         store
             .fail_next
             .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
-        let all = changes(DbChecksum::from_value(7));
+        let all = at_head(&r);
         r.since_snapshot = SNAPSHOT_EVERY;
         // How many segments pass before each next attempt.
         let mut waits = Vec::new();
@@ -2567,7 +2658,7 @@ mod tests {
         store
             .fail_next
             .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
-        let all = changes(DbChecksum::from_value(7));
+        let all = at_head(&r);
         r.since_snapshot = SNAPSHOT_EVERY;
         r.head.txid = 100;
         // Two failures in a row: the next try waits for 8 segments.
@@ -2613,7 +2704,7 @@ mod tests {
     async fn the_nodes_record_of_waits_is_cleared_and_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, store) = faulty(dir.path(), 0, 0).await;
-        let all = changes(DbChecksum::from_value(7));
+        let all = at_head(&r);
         r.since_snapshot = SNAPSHOT_EVERY;
         store
             .fail_next
@@ -2667,7 +2758,7 @@ mod tests {
         store
             .fail_next
             .store(1, std::sync::atomic::Ordering::SeqCst);
-        let all = changes(DbChecksum::from_value(7));
+        let all = at_head(&r);
         r.since_snapshot = SNAPSHOT_EVERY;
         let before = tokio::time::Instant::now();
         assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.is_err());
@@ -2700,7 +2791,7 @@ mod tests {
         store
             .fail_next
             .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
-        let all = changes(DbChecksum::from_value(7));
+        let all = at_head(&r);
         r.since_snapshot = 10;
         let schedule = |r: &Replica| {
             (
@@ -2745,7 +2836,7 @@ mod tests {
     async fn a_periodic_snapshot_refused_with_nothing_there_is_not_taken() {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, _store) = faulty_with(dir.path(), 0, 0, 1).await;
-        let all = changes(DbChecksum::from_value(7));
+        let all = at_head(&r);
         r.since_snapshot = SNAPSHOT_EVERY;
         let shipped = r.ship_snapshot(&all, SnapshotKind::Periodic).await;
         assert!(
@@ -3073,5 +3164,186 @@ mod tests {
         assert_eq!(r.head.txid, 2);
         assert_eq!(r.checksum, DbChecksum::from_value(9));
         assert_eq!(list_with(&r.store, &r.prefix, None).await.unwrap().len(), 1);
+    }
+
+    /// What the guards of ADR 0034, section 7 must leave as it was when
+    /// they refuse: the head, the periodic snapshot's schedule and the
+    /// node's record of its wait.
+    fn untouched(r: &Replica) -> impl PartialEq + std::fmt::Debug + use<> {
+        (
+            r.head,
+            r.checksum,
+            r.since_snapshot,
+            r.snapshot_failures,
+            r.snapshot_retry_at,
+            r.snapshot_retry_after,
+            r.snapshot_waits.get(&r.address),
+        )
+    }
+
+    async fn nothing_uploaded(r: &Replica) {
+        assert!(
+            list_with(&r.store, &r.prefix, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing uploaded"
+        );
+    }
+
+    /// A periodic snapshot, or the one after a delete, of a database that
+    /// is not the head's is refused before anything is uploaded or
+    /// counted: the periodic schedule stays as it was, and replication
+    /// stops (the actor is given up).
+    #[tokio::test]
+    async fn a_snapshot_labelled_at_a_head_it_does_not_hold_is_refused() {
+        for kind in [SnapshotKind::Periodic, SnapshotKind::AfterDelete] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut r = replica(dir.path()).await;
+            r.since_snapshot = SNAPSHOT_EVERY;
+            let was = untouched(&r);
+            let failures = snapshot_failures_counted();
+            // The database moved past the head: `changes` always ends at
+            // 9, and the test replica's head is at 7.
+            let moved = changes(DbChecksum::from_value(7));
+            let shipped = r.ship_snapshot(&moved, kind).await;
+            assert!(
+                matches!(&shipped, Err(ReplicaError::Refused(m)) if m.contains("labelled at head")),
+                "{kind:?}: {shipped:?}"
+            );
+            assert!(
+                r.failed().is_some_and(|f| f.starts_with("refused: ")),
+                "{kind:?}: {:?}",
+                r.failed()
+            );
+            assert_eq!(untouched(&r), was, "{kind:?}");
+            assert_eq!(
+                snapshot_failures_counted(),
+                failures,
+                "{kind:?}: not counted"
+            );
+            nothing_uploaded(&r).await;
+            // Nothing more goes out: not the snapshot at the head either.
+            assert!(r.ship_snapshot(&at_head(&r), kind).await.is_err());
+            assert!(r.ship(&changes(DbChecksum::from_value(7))).await.is_err());
+            nothing_uploaded(&r).await;
+        }
+    }
+
+    /// The first snapshot is at a new position on an empty bucket: it is
+    /// not compared with a head, as before.
+    #[tokio::test]
+    async fn the_first_snapshot_is_not_compared_with_a_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.head = EMPTY;
+        r.checksum = DbChecksum::default();
+        r.needs_snapshot = true;
+        let all = changes(DbChecksum::from_value(7));
+        assert!(
+            r.ship_snapshot(&all, SnapshotKind::First).await.unwrap(),
+            "taken"
+        );
+        assert_eq!(r.checksum, all.post_apply);
+        assert!(!r.needs_snapshot());
+    }
+
+    /// No snapshot of any kind is taken while a segment is in flight, even
+    /// one holding the database at the head.
+    #[tokio::test]
+    async fn a_snapshot_while_a_segment_is_in_flight_is_refused() {
+        for kind in [
+            SnapshotKind::First,
+            SnapshotKind::Periodic,
+            SnapshotKind::AfterDelete,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut r = replica(dir.path()).await;
+            r.since_snapshot = SNAPSHOT_EVERY;
+            let segment = SegmentId {
+                generation: 1,
+                txid: 2,
+            };
+            r.in_flight = Some(segment);
+            let was = untouched(&r);
+            let shipped = r.ship_snapshot(&at_head(&r), kind).await;
+            assert!(
+                matches!(&shipped, Err(ReplicaError::Refused(m)) if m.contains("in flight")),
+                "{kind:?}: {shipped:?}"
+            );
+            assert!(r.failed().is_some(), "{kind:?}");
+            assert_eq!(untouched(&r), was, "{kind:?}");
+            nothing_uploaded(&r).await;
+        }
+    }
+
+    /// A reset while a segment is in flight is refused (its key would be
+    /// that segment's), and replication stops; with nothing in flight it
+    /// chains on the head, whatever database it replaces.
+    #[tokio::test]
+    async fn a_reset_while_a_segment_is_in_flight_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.in_flight = Some(SegmentId {
+            generation: 1,
+            txid: 2,
+        });
+        let was = untouched(&r);
+        let reset = r.ship_reset(changes(DbChecksum::from_value(3))).await;
+        assert!(
+            matches!(&reset, Err(ReplicaError::Refused(m)) if m.contains("in flight")),
+            "{reset:?}"
+        );
+        assert!(r.failed().is_some());
+        assert_eq!(untouched(&r), was);
+        nothing_uploaded(&r).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.ship_reset(changes(DbChecksum::from_value(3)))
+            .await
+            .unwrap();
+        assert_eq!(r.head.txid, 2);
+        assert_eq!(r.checksum, DbChecksum::from_value(9));
+    }
+
+    /// A segment is in flight while its upload runs, and no longer once it
+    /// ends; one whose `ship` was cancelled half-way (the event cut) stays
+    /// in flight, and replication is stopped too, so what follows is
+    /// refused as after any interrupted upload.
+    #[tokio::test]
+    async fn a_segment_is_in_flight_until_its_upload_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, _store) = faulty(dir.path(), 1, 0).await;
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            r.ship(&changes(DbChecksum::from_value(7))),
+        )
+        .await;
+        assert!(cut.is_err(), "the hung upload was cut");
+        assert_eq!(
+            r.in_flight,
+            Some(SegmentId {
+                generation: 1,
+                txid: 2
+            })
+        );
+        assert!(matches!(
+            r.ship_snapshot(&at_head(&r), SnapshotKind::Periodic).await,
+            Err(ReplicaError::Local(m)) if m.contains("replication stopped")
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.ship(&changes(DbChecksum::from_value(7))).await.unwrap();
+        assert_eq!(r.in_flight, None);
+        // A failed upload ends too.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        store
+            .fail_next
+            .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        assert!(r.ship(&changes(DbChecksum::from_value(7))).await.is_err());
+        assert_eq!(r.in_flight, None);
     }
 }

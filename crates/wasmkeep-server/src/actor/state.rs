@@ -791,6 +791,7 @@ impl ActorState {
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r);
+        let mut refused = None;
         let result = match opened {
             Ok((db, all)) => {
                 self.db = db;
@@ -827,6 +828,12 @@ impl ActorState {
                                 }
                             }
                             Ok(false) => {}
+                            // Not a bucket's failure but a bug (ADR 0034,
+                            // section 7): replication stopped, and the
+                            // actor is given up below.
+                            Err(crate::replica::ReplicaError::Refused(e)) => {
+                                refused = Some(format!("snapshot after a delete refused: {e}"));
+                            }
                             // The delete itself is recorded (the reset);
                             // only its history stays until the actor
                             // writes again.
@@ -851,6 +858,8 @@ impl ActorState {
         }
         if let Err(e) = &result {
             self.abandon(&format!("recording the delete: {e}"));
+        } else if let Some(reason) = refused {
+            self.abandon(&reason);
         }
         result
     }
@@ -878,6 +887,9 @@ impl ActorState {
                 run_collection(&self.address, &request).await;
             }
             Ok(false) => {}
+            // A bug, not the bucket (ADR 0034, section 7): already logged
+            // by the replica; the actor is given up right after anyway.
+            Err(crate::replica::ReplicaError::Refused(_)) => {}
             Err(e) => {
                 crate::metrics::inc(&crate::metrics::METRICS.history_collect_failures);
                 tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "snapshot after a delete failed; its history is not erased");

@@ -71,6 +71,8 @@ mod front;
 mod front_deploys;
 #[path = "front_sockets.rs"]
 mod front_sockets;
+#[path = "golden_trace.rs"]
+mod golden_trace;
 #[path = "listings.rs"]
 mod listings;
 #[path = "migrate.rs"]

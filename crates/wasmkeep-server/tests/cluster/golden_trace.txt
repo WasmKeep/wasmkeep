@@ -1,0 +1,202 @@
+## plain writes: the first event takes the actor, then a segment each
+a LIST history/ -> -
+a PUT owner [create] -> ok holder=a generation=1
+a LIST history/ -> -
+a PUT history/snapshot/0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=4 txid=1..1 pre=- post=C1 wal=0/0/0/0 node=0 pages=[1:d722d9ee73335103 2:efcdff0134f58f5f 3:a9cef6bcf16738ac 4:cefabea8fa1219de])
+a PUT history/wal/0000000000000002-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=2..2 pre=C1 post=C2 wal=0/0/0/0 node=0 pages=[1:f0cd81077fde4783 2:aba4090d3815a457 3:d17caeda31c87567 5:bb64ce5d0ea3a9df 6:95c65f43137179dd 7:a8fb39d7dbf14ac6 8:dde6497f15c8df6d 9:e3451618c0354b3c 10:ff4c1b3b643a39d6])
+a PUT history/wal/0000000000000003-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=3..3 pre=C2 post=C3 wal=0/0/0/0 node=0 pages=[7:cc3e8e32ea2c66ab])
+a PUT history/wal/0000000000000004-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=4..4 pre=C3 post=C4 wal=0/0/0/0 node=0 pages=[7:cd8e8e32ea2c66ab])
+## exec-durable
+a PUT history/wal/0000000000000005-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=5..5 pre=C4 post=C5 wal=0/0/0/0 node=0 pages=[7:cf7acfaae59e4e22 8:db35c9fdf5ab1063])
+## an alarm set, then changed
+a PUT alarms/T1/t.t/78/1-N1 [overwrite] -> ok
+a PUT history/wal/0000000000000006-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=6..6 pre=C5 post=C6 wal=0/0/0/0 node=0 pages=[2:volatile 3:volatile 4:fa0c5faaacad6076])
+a PUT alarms/T2/t.t/78/1-N2 [overwrite] -> ok
+a PUT history/wal/0000000000000007-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=7..7 pre=C6 post=C7 wal=0/0/0/0 node=0 pages=[2:volatile 4:a019bbbaacad6076])
+a DELETE alarms/T1/t.t/78/1-N1 -> -
+## plain writes up to a periodic snapshot, and the collection pass after it
+a PUT history/wal/0000000000000008-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=8..8 pre=C7 post=C8 wal=0/0/0/0 node=0 pages=[7:cb6acfaae59e4e22])
+a PUT history/wal/0000000000000009-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=9..9 pre=C8 post=C9 wal=0/0/0/0 node=0 pages=[7:cadacfaae59e4e22])
+a PUT history/wal/000000000000000a-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=10..10 pre=C9 post=C10 wal=0/0/0/0 node=0 pages=[7:c80acfaae59e4e22])
+a PUT history/wal/000000000000000b-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=11..11 pre=C10 post=C11 wal=0/0/0/0 node=0 pages=[7:c9bacfaae59e4e22])
+a PUT history/wal/000000000000000c-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=12..12 pre=C11 post=C12 wal=0/0/0/0 node=0 pages=[7:c02acfaae59e4e22])
+a PUT history/wal/000000000000000d-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=13..13 pre=C12 post=C13 wal=0/0/0/0 node=0 pages=[7:c19acfaae59e4e22])
+a PUT history/wal/000000000000000e-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=14..14 pre=C13 post=C14 wal=0/0/0/0 node=0 pages=[7:c34acfaae59e4e22])
+a PUT history/wal/000000000000000f-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=15..15 pre=C14 post=C15 wal=0/0/0/0 node=0 pages=[7:c2facfaae59e4e22])
+a PUT history/wal/0000000000000010-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=16..16 pre=C15 post=C16 wal=0/0/0/0 node=0 pages=[7:c6eacfaae59e4e22])
+a PUT history/wal/0000000000000011-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=17..17 pre=C16 post=C17 wal=0/0/0/0 node=0 pages=[7:c75acfaae59e4e22])
+a PUT history/wal/0000000000000012-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=18..18 pre=C17 post=C18 wal=0/0/0/0 node=0 pages=[7:c58acfaae59e4e22])
+a PUT history/wal/0000000000000013-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=19..19 pre=C18 post=C19 wal=0/0/0/0 node=0 pages=[7:c43acfaae59e4e22])
+a PUT history/wal/0000000000000014-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=20..20 pre=C19 post=C20 wal=0/0/0/0 node=0 pages=[7:d6aacfaae59e4e22])
+a PUT history/wal/0000000000000015-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=21..21 pre=C20 post=C21 wal=0/0/0/0 node=0 pages=[7:d71acfaae59e4e22])
+a PUT history/wal/0000000000000016-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=22..22 pre=C21 post=C22 wal=0/0/0/0 node=0 pages=[7:d5cacfaae59e4e22])
+a PUT history/wal/0000000000000017-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=23..23 pre=C22 post=C23 wal=0/0/0/0 node=0 pages=[7:d47acfaae59e4e22])
+a PUT history/wal/0000000000000018-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=24..24 pre=C23 post=C24 wal=0/0/0/0 node=0 pages=[7:d06acfaae59e4e22])
+a PUT history/wal/0000000000000019-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=25..25 pre=C24 post=C25 wal=0/0/0/0 node=0 pages=[7:d1dacfaae59e4e22])
+a PUT history/wal/000000000000001a-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=26..26 pre=C25 post=C26 wal=0/0/0/0 node=0 pages=[7:d30acfaae59e4e22])
+a PUT history/wal/000000000000001b-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=27..27 pre=C26 post=C27 wal=0/0/0/0 node=0 pages=[7:d2bacfaae59e4e22])
+a PUT history/wal/000000000000001c-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=28..28 pre=C27 post=C28 wal=0/0/0/0 node=0 pages=[7:db2acfaae59e4e22])
+a PUT history/wal/000000000000001d-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=29..29 pre=C28 post=C29 wal=0/0/0/0 node=0 pages=[7:da9acfaae59e4e22])
+a PUT history/wal/000000000000001e-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=30..30 pre=C29 post=C30 wal=0/0/0/0 node=0 pages=[7:d84acfaae59e4e22])
+a PUT history/wal/000000000000001f-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=31..31 pre=C30 post=C31 wal=0/0/0/0 node=0 pages=[7:d9facfaae59e4e22])
+a PUT history/wal/0000000000000020-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=32..32 pre=C31 post=C32 wal=0/0/0/0 node=0 pages=[7:ddeacfaae59e4e22])
+a PUT history/wal/0000000000000021-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=33..33 pre=C32 post=C33 wal=0/0/0/0 node=0 pages=[7:dc5acfaae59e4e22])
+a PUT history/wal/0000000000000022-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=34..34 pre=C33 post=C34 wal=0/0/0/0 node=0 pages=[7:de8acfaae59e4e22])
+a PUT history/wal/0000000000000023-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=35..35 pre=C34 post=C35 wal=0/0/0/0 node=0 pages=[7:df3acfaae59e4e22])
+a PUT history/wal/0000000000000024-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=36..36 pre=C35 post=C36 wal=0/0/0/0 node=0 pages=[7:fbaacfaae59e4e22])
+a PUT history/wal/0000000000000025-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=37..37 pre=C36 post=C37 wal=0/0/0/0 node=0 pages=[7:fa1acfaae59e4e22])
+a PUT history/wal/0000000000000026-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=38..38 pre=C37 post=C38 wal=0/0/0/0 node=0 pages=[7:f8cacfaae59e4e22])
+a PUT history/wal/0000000000000027-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=39..39 pre=C38 post=C39 wal=0/0/0/0 node=0 pages=[7:f97acfaae59e4e22])
+a PUT history/wal/0000000000000028-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=40..40 pre=C39 post=C40 wal=0/0/0/0 node=0 pages=[7:fd6acfaae59e4e22])
+a PUT history/wal/0000000000000029-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=41..41 pre=C40 post=C41 wal=0/0/0/0 node=0 pages=[7:fcdacfaae59e4e22])
+a PUT history/wal/000000000000002a-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=42..42 pre=C41 post=C42 wal=0/0/0/0 node=0 pages=[7:fe0acfaae59e4e22])
+a PUT history/wal/000000000000002b-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=43..43 pre=C42 post=C43 wal=0/0/0/0 node=0 pages=[7:ffbacfaae59e4e22])
+a PUT history/wal/000000000000002c-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=44..44 pre=C43 post=C44 wal=0/0/0/0 node=0 pages=[7:f62acfaae59e4e22])
+a PUT history/wal/000000000000002d-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=45..45 pre=C44 post=C45 wal=0/0/0/0 node=0 pages=[7:f79acfaae59e4e22])
+a PUT history/wal/000000000000002e-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=46..46 pre=C45 post=C46 wal=0/0/0/0 node=0 pages=[7:f54acfaae59e4e22])
+a PUT history/wal/000000000000002f-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=47..47 pre=C46 post=C47 wal=0/0/0/0 node=0 pages=[7:f4facfaae59e4e22])
+a PUT history/wal/0000000000000030-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=48..48 pre=C47 post=C48 wal=0/0/0/0 node=0 pages=[7:f0eacfaae59e4e22])
+a PUT history/wal/0000000000000031-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=49..49 pre=C48 post=C49 wal=0/0/0/0 node=0 pages=[7:f15acfaae59e4e22])
+a PUT history/wal/0000000000000032-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=50..50 pre=C49 post=C50 wal=0/0/0/0 node=0 pages=[7:f38acfaae59e4e22])
+a PUT history/wal/0000000000000033-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=51..51 pre=C50 post=C51 wal=0/0/0/0 node=0 pages=[7:f23acfaae59e4e22])
+a PUT history/wal/0000000000000034-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=52..52 pre=C51 post=C52 wal=0/0/0/0 node=0 pages=[7:e0aacfaae59e4e22])
+a PUT history/wal/0000000000000035-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=53..53 pre=C52 post=C53 wal=0/0/0/0 node=0 pages=[7:e11acfaae59e4e22])
+a PUT history/wal/0000000000000036-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=54..54 pre=C53 post=C54 wal=0/0/0/0 node=0 pages=[7:e3cacfaae59e4e22])
+a PUT history/wal/0000000000000037-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=55..55 pre=C54 post=C55 wal=0/0/0/0 node=0 pages=[7:e27acfaae59e4e22])
+a PUT history/wal/0000000000000038-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=56..56 pre=C55 post=C56 wal=0/0/0/0 node=0 pages=[7:e66acfaae59e4e22])
+a PUT history/wal/0000000000000039-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=57..57 pre=C56 post=C57 wal=0/0/0/0 node=0 pages=[7:e7dacfaae59e4e22])
+a PUT history/wal/000000000000003a-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=58..58 pre=C57 post=C58 wal=0/0/0/0 node=0 pages=[7:e50acfaae59e4e22])
+a PUT history/wal/000000000000003b-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=59..59 pre=C58 post=C59 wal=0/0/0/0 node=0 pages=[7:e4bacfaae59e4e22])
+a PUT history/wal/000000000000003c-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=60..60 pre=C59 post=C60 wal=0/0/0/0 node=0 pages=[7:ed2acfaae59e4e22])
+a PUT history/wal/000000000000003d-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=61..61 pre=C60 post=C61 wal=0/0/0/0 node=0 pages=[7:ec9acfaae59e4e22])
+a PUT history/wal/000000000000003e-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=62..62 pre=C61 post=C62 wal=0/0/0/0 node=0 pages=[7:ee4acfaae59e4e22])
+a PUT history/wal/000000000000003f-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=63..63 pre=C62 post=C63 wal=0/0/0/0 node=0 pages=[7:effacfaae59e4e22])
+a PUT history/wal/0000000000000040-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=64..64 pre=C63 post=C64 wal=0/0/0/0 node=0 pages=[7:ebeacfaae59e4e22])
+a PUT history/wal/0000000000000041-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=65..65 pre=C64 post=C65 wal=0/0/0/0 node=0 pages=[7:ea5acfaae59e4e22])
+a PUT history/snapshot/0000000000000041-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=1..65 pre=- post=C65 wal=0/0/0/0 node=0 pages=[1:f0cd81077fde4783 2:volatile 3:volatile 4:a019bbbaacad6076 5:bb64ce5d0ea3a9df 6:95c65f43137179dd 7:ea5acfaae59e4e22 8:db35c9fdf5ab1063 9:e3451618c0354b3c 10:ff4c1b3b643a39d6])
+a LIST history/ -> -
+## two more writes after the snapshot
+a PUT history/wal/0000000000000042-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=66..66 pre=C65 post=C66 wal=0/0/0/0 node=0 pages=[7:e88acfaae59e4e22])
+a PUT history/wal/0000000000000043-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=67..67 pre=C66 post=C67 wal=0/0/0/0 node=0 pages=[7:e93acfaae59e4e22])
+## a segment upload that fails: the actor is given up
+a PUT history/wal/0000000000000044-0000000000000001-0000000000000001.ltx [create] -> error ltx(flags=0 page_size=4096 commit=10 txid=68..68 pre=C67 post=C68 wal=0/0/0/0 node=0 pages=[7:a1aacfaae59e4e22])
+a PUT history/wal/0000000000000044-0000000000000001-0000000000000001.ltx [create] -> error ltx(flags=0 page_size=4096 commit=10 txid=68..68 pre=C67 post=C68 wal=0/0/0/0 node=0 pages=[7:a1aacfaae59e4e22])
+a PUT history/wal/0000000000000044-0000000000000001-0000000000000001.ltx [create] -> error ltx(flags=0 page_size=4096 commit=10 txid=68..68 pre=C67 post=C68 wal=0/0/0/0 node=0 pages=[7:a1aacfaae59e4e22])
+a PUT owner [update] -> ok holder=- generation=1
+## the next event restores what the bucket has
+a PUT owner [update] -> ok holder=a generation=2
+a GET history/snapshot/0000000000000041-0000000000000001.ltx -> ok
+a GET history/wal/0000000000000042-0000000000000001-0000000000000001.ltx -> ok
+a GET history/wal/0000000000000043-0000000000000001-0000000000000001.ltx -> ok
+a LIST history/ -> -
+a PUT history/wal/0000000000000044-0000000000000002-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=68..68 pre=C67 post=C68 wal=0/0/0/0 node=0 pages=[7:a1aacfaae59e4e22])
+## hibernation: another actor needs a's only slot
+a PUT owner [update] -> ok holder=- generation=2
+## wake: the local file is the bucket's head
+a PUT owner [update] -> ok holder=a generation=3
+a LIST history/ -> -
+a PUT history/wal/0000000000000045-0000000000000003-0000000000000002.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=69..69 pre=C68 post=C69 wal=0/0/0/0 node=0 pages=[7:a01acfaae59e4e22])
+## hand-over: x moves to b
+a PUT owner [update] -> ok holder=- generation=3
+b LIST history/ -> -
+b PUT owner [update] -> ok holder=b generation=4
+b GET history/snapshot/0000000000000041-0000000000000001.ltx -> ok
+b GET history/wal/0000000000000042-0000000000000001-0000000000000001.ltx -> ok
+b GET history/wal/0000000000000043-0000000000000001-0000000000000001.ltx -> ok
+b GET history/wal/0000000000000044-0000000000000002-0000000000000001.ltx -> ok
+b GET history/wal/0000000000000045-0000000000000003-0000000000000002.ltx -> ok
+b LIST history/ -> -
+b PUT history/wal/0000000000000046-0000000000000004-0000000000000003.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=70..70 pre=C69 post=C70 wal=0/0/0/0 node=0 pages=[7:a2cacfaae59e4e22])
+## delete-self on b, and the erase of the history before it
+b PUT history/wal/0000000000000047-0000000000000004-0000000000000004.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=71..71 pre=C70 post=C71 wal=0/0/0/0 node=0 pages=[2:volatile])
+b PUT history/wal/0000000000000048-0000000000000004-0000000000000004.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=4 txid=72..72 pre=C71 post=C1 wal=0/0/0/0 node=0 pages=[1:d722d9ee73335103 2:efcdff0134f58f5f 3:a9cef6bcf16738ac 4:cefabea8fa1219de])
+b PUT history/snapshot/0000000000000048-0000000000000004.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=4 txid=1..72 pre=- post=C1 wal=0/0/0/0 node=0 pages=[1:d722d9ee73335103 2:efcdff0134f58f5f 3:a9cef6bcf16738ac 4:cefabea8fa1219de])
+b DELETE alarms/T2/t.t/78/1-N2 -> -
+b LIST history/ -> -
+b DELETE history/snapshot/0000000000000001-0000000000000001.ltx -> -
+b DELETE history/snapshot/0000000000000041-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000002-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000003-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000004-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000005-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000006-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000007-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000008-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000009-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000000a-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000000b-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000000c-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000000d-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000000e-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000000f-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000010-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000011-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000012-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000013-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000014-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000015-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000016-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000017-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000018-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000019-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000001a-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000001b-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000001c-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000001d-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000001e-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000001f-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000020-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000021-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000022-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000023-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000024-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000025-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000026-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000027-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000028-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000029-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000002a-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000002b-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000002c-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000002d-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000002e-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000002f-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000030-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000031-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000032-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000033-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000034-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000035-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000036-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000037-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000038-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000039-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000003a-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000003b-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000003c-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000003d-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000003e-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/000000000000003f-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000040-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000041-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000042-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000043-0000000000000001-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000044-0000000000000002-0000000000000001.ltx -> -
+b DELETE history/wal/0000000000000045-0000000000000003-0000000000000002.ltx -> -
+b DELETE history/wal/0000000000000046-0000000000000004-0000000000000003.ltx -> -
+b DELETE history/wal/0000000000000047-0000000000000004-0000000000000004.ltx -> -
+## the event after the delete starts from an empty database
+b PUT history/wal/0000000000000049-0000000000000004-0000000000000004.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=73..73 pre=C1 post=C2 wal=0/0/0/0 node=0 pages=[1:f0cd81077fde4783 2:aba4090d3815a457 3:d17caeda31c87567 5:bb64ce5d0ea3a9df 6:95c65f43137179dd 7:a8fb39d7dbf14ac6 8:dde6497f15c8df6d 9:e3451618c0354b3c 10:ff4c1b3b643a39d6])
+## delete-self-durable on b: the reset in the call, the actor given up
+b PUT history/wal/000000000000004a-0000000000000004-0000000000000004.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=4 txid=74..74 pre=C2 post=C1 wal=0/0/0/0 node=0 pages=[1:d722d9ee73335103 2:efcdff0134f58f5f 3:a9cef6bcf16738ac 4:cefabea8fa1219de])
+b PUT history/snapshot/000000000000004a-0000000000000004.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=4 txid=1..74 pre=- post=C1 wal=0/0/0/0 node=0 pages=[1:d722d9ee73335103 2:efcdff0134f58f5f 3:a9cef6bcf16738ac 4:cefabea8fa1219de])
+b LIST history/ -> -
+b DELETE history/snapshot/0000000000000048-0000000000000004.ltx -> -
+b DELETE history/wal/0000000000000048-0000000000000004-0000000000000004.ltx -> -
+b DELETE history/wal/0000000000000049-0000000000000004-0000000000000004.ltx -> -
+b PUT owner [update] -> ok holder=- generation=4
+## the event after it restores the empty database
+b PUT owner [update] -> ok holder=b generation=5
+b GET history/snapshot/000000000000004a-0000000000000004.ltx -> ok
+b LIST history/ -> -
+b PUT history/wal/000000000000004b-0000000000000005-0000000000000004.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=75..75 pre=C1 post=C72 wal=0/0/0/0 node=0 pages=[1:8336e863a47f5309 2:aba4090d3815a457 3:d17caeda31c87567 5:bb64ce5d0ea3a9df 6:95c65f43137179dd 7:a8fb39d7dbf14ac6 8:dde6497f15c8df6d 9:e3451618c0354b3c 10:ff4c1b3b643a39d6])
