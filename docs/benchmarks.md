@@ -1122,10 +1122,12 @@ These are workstation figures that prove the harness works, not fleet
 results: one desktop (16 cores) ran the node, moto and the load over
 loopback, with the node's data on tmpfs, 10 s of sending per cell and 10
 senders, in
-[`2026-11-15-44b4a95-room-workstation.csv`](../bench/results/2026-11-15-44b4a95-room-workstation.csv)
+[`2026-11-15-699ebec-room-workstation.csv`](../bench/results/2026-11-15-699ebec-room-workstation.csv)
 (on moto) and
-[`2026-11-15-df15d66-room-workstation-nobucket.csv`](../bench/results/2026-11-15-df15d66-room-workstation-nobucket.csv)
-(`ROOM_BUCKET=none`). What they show, in shape:
+[`2026-11-15-699ebec-room-workstation-nobucket.csv`](../bench/results/2026-11-15-699ebec-room-workstation-nobucket.csv)
+(`ROOM_BUCKET=none`), plus one cell with HTTP senders in
+[`2026-11-15-699ebec-room-workstation-http-senders.csv`](../bench/results/2026-11-15-699ebec-room-workstation-http-senders.csv).
+The node and the load shared the machine. What they show, in shape:
 
 - No cell lost, duplicated or reordered a message, and no acknowledged
   message was missing from the room's table.
@@ -1137,8 +1139,8 @@ senders, in
   message per bucket round trip, plain writes included. At 1,000 messages a second the rest queued in the
   senders' sockets (`outcome_stall`: unacknowledged, latency growing for
   the whole run). `batch` took every rate, about 30 ms of latency at the
-  median (half the 50 ms window) and under 100 ms at p99 in every cell but
-one (1,000 sockets at 100 a second, 178 ms).
+  median (half the 50 ms window) and under 70 ms at p99, about a million
+deliveries a second into 1,000 sockets at a third of a core.
 - Without a bucket (and with the data on tmpfs, where an fsync is free, so
   `durable` costs what `plain` does), the limit moves to the broadcast itself: a room of
   1,000 sockets kept up at 100 messages a second and fell behind at 1,000
@@ -1147,6 +1149,10 @@ one (1,000 sockets at 100 a second, 178 ms).
   per batch, did not.
 - 10,000 sockets: 1,000 accepted, 9,000 answered `503` (`refused`), as the
   limits above say. The workstation did not need any system change for it.
+- With 2,000 HTTP senders at 1,000 messages a second, more requests waited
+  than the actor's queue holds, and the node answered `429` (`http_429`,
+  `node_refused_overloaded`): a clean refusal, where WebSocket senders
+  only queue.
 
 ### Run it on one machine
 
