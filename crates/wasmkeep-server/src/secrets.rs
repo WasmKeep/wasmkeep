@@ -12,7 +12,7 @@ use std::path::Path;
 
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::hkdf;
-use ring::rand::{SecureRandom, SystemRandom};
+use ring::rand::SystemRandom;
 use sha2::{Digest, Sha256};
 
 /// The first line of a sealed object, and the start of the associated
@@ -82,10 +82,9 @@ impl SecretsKey {
 
     /// A new key from the system's random generator.
     pub fn generate() -> Result<Self, SecretsError> {
-        let mut bytes = [0u8; KEY_LEN];
-        SystemRandom::new()
-            .fill(&mut bytes)
-            .map_err(|_| SecretsError::Random)?;
+        let bytes = ring::rand::generate::<[u8; KEY_LEN]>(&SystemRandom::new())
+            .map_err(|_| SecretsError::Random)?
+            .expose();
         Ok(Self::from_bytes(bytes))
     }
 
