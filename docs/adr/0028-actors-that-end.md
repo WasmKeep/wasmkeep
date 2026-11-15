@@ -15,6 +15,7 @@
   listed with the other intents when `control/changed` changes, or every
   60 s, not every period. See "Note of 2026-11-14: fewer listings" at the
   end.
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a reset (every delete) is uploaded only at the acknowledged head with nothing in flight; a batched actor flushes first.
 - Date: 2026-11-14
 - Release: [0.4.2](../../ROADMAP.md#m4-operating-a-cluster)
 - Amends: [ADR 0002](0002-wasmkeep-actor-wit-v0.1.md) (one function added

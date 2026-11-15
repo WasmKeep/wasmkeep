@@ -7,6 +7,7 @@
   record says lease, read the actor's hold (`LeaseView`: the hold exists and
   the node lease is valid).
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): history keys move under the app's root, `state/<tenant>/<app>/`.
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): in a class with batched writes a segment carries the commits of several events, one segment is in flight per actor, and snapshots and resets are taken only at the acknowledged head with nothing in flight. The checkpoint sentence under Capture is corrected in place (2026-11-15), whatever becomes of that record.
 - Date: 2026-11-02
 - Milestone: [M2](../../ROADMAP.md#m2-cluster-and-durability)
 
@@ -33,9 +34,16 @@ Actor databases run in WAL mode with automatic checkpoints off. After each
 event commits, the replicator reads the WAL frames appended since its last
 position, keeps the last version of each page up to the last commit frame,
 and encodes one LTX file (ADR 0005) for the next transaction id. Pre- and
-post-apply checksums come from per-page checksums kept in memory. Once a
-segment is uploaded and the WAL holds only shipped frames, the replicator
-checkpoints (`TRUNCATE`).
+post-apply checksums come from per-page checksums kept in memory.
+*(Corrected 2026-11-15.)* The replicator checkpoints (`TRUNCATE`) after a
+capture, before the upload, once the WAL file reaches 4 MiB (or the WAL
+cap if lower) with no transaction open (`ActorDb::take_changes`), and
+before a snapshot reads every page. This text said it waited until the
+segment was uploaded; it never did. It is safe because a local file is
+trusted again only when its sidecar names the chain's head and the
+file's checksum is the sidecar's, so a file checkpointed ahead of the
+bucket is downloaded again ([ADR 0034](0034-batched-plain-writes.md),
+section 13).
 
 ### Keys: every segment names its parent
 

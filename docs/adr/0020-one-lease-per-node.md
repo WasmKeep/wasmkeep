@@ -35,6 +35,7 @@
   hello to its peers so they list at once ([ADR 0011](0011-node-to-node-mtls.md),
   amendment of the same day). See "Amendment of 2026-11-14: fewer
   listings of nodes/" at the end.
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 - Amends: [ADR 0007](0007-replication-protocol.md),

@@ -14,6 +14,7 @@
 - Amended 2026-11-14 (0.4.2): move keys are listed when `control/changed`
   changes, or every 60 s, not every period ([ADR 0014](0014-draining-a-node-and-moving-an-actor.md),
   amendment of 2026-11-14); see "Amendment of 2026-11-14" at the end.
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a move of a batched actor flushes before it records the move and releases, so the 30 s deadline starts after the flush.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster) (the part [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) left open)
 

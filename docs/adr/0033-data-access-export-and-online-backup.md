@@ -8,6 +8,7 @@
   restores refused once superseded by a later delete; the alarm index
   rebuilt from the committed alarm; a restore of a whole app fenced
   from node starts)
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): in a batched class a position is a segment of several events, stamped with its capture time; `--at` and `--txid` choose between segments.
 - Date: 2026-11-14
 - Milestone: [After that](../../ROADMAP.md#after-that), "operating
   without the author": inspect or export one actor, verify a bucket,
