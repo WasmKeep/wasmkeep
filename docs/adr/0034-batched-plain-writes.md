@@ -4,7 +4,14 @@
   a first sketch, which found it sound for durable writes and named what
   it lacked: barriers for snapshots and resets, a structural rule for
   ending a hold, and an opt-in rollout, since batching changes what the
-  docs promise about plain writes. Nothing here is built.
+  docs promise about plain writes. Revised the same day after an
+  adversarial review of this text against the code (alarm cleanup for an
+  actor without state judged on local state; captures cut by a wall;
+  failure seen mid-event; what "a barrier" can enforce in Rust; panics
+  and parking; the mailbox's drop step racing new jobs; the index's
+  requests per segment; the capability word's bootstrap; a mode change
+  on a resident actor; uncatchable verification variants; several
+  figures). Nothing here is built.
 - Date: 2026-11-15
 - Milestone: [After that](../../ROADMAP.md#after-that), "Faster, and
   compared": a plain write that does not hold its actor during the upload
@@ -15,8 +22,9 @@
   entry published once per segment, retired after the segment's
   acknowledgement, the fence judged on the acknowledged head),
   [ADR 0033](0033-data-access-export-and-online-backup.md) (positions
-  are segments), [ADR 0020](0020-one-lease-per-node.md) (sections 3
-  and 4: two ways to end a hold, a clean stop that flushes),
+  are segments), [ADR 0020](0020-one-lease-per-node.md) (its
+  sections 3 and 4, by this record's sections 6 and 10: two ways to end a
+  hold, a clean stop that flushes),
   [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) and
   [ADR 0017](0017-moving-one-actor.md) (a hand-over flushes before it
   releases), [ADR 0024](0024-socket-home.md) (a hold is parked only once
@@ -40,12 +48,13 @@ the actor's mailbox starts only once that returns. A plain `exec`
 answers its caller before the upload, but the actor itself waits, so:
 
 - **A busy actor makes about 17 writing events a second against a real
-  bucket** (derived: one event per round trip, and the durable write's
-  measured p50 next to the bucket is 47 to 57 ms in the
-  [soaks](../benchmarks.md#three-nodes-against-a-real-bucket)). Its
+  bucket** (derived: one event per round trip; the durable write's
+  measured p50 next to the bucket is 47 to 62 ms in the
+  [soaks](../benchmarks.md#three-nodes-against-a-real-bucket), 57 ms in
+  the 12-hour node-lease run, which gives about 17). Its
   plain writes go no faster than its durable ones.
 - **One PUT per writing event** (measured: 1.03 PUTs per durable write
-  over the 12-hour node-lease soak, every PUT included). On R2 and S3
+  over the 12-hour node-lease soak). On R2 and S3
   every PUT is billed.
 - **A room on a local bucket stops at a few hundred messages a second.**
   The room benchmark of
@@ -54,8 +63,12 @@ answers its caller before the upload, but the actor itself waits, so:
   offered 1,000 messages a second) acknowledged 4,039 to 4,228 messages
   in 10 s per room of 10 or 100 sockets in its `plain` mode, and 4,050 to
   4,163 in `durable`, with the node at 14 to 30 % of a core; rooms of
-  1,000 and 10,000 sockets (1,000 accepted) acknowledged 3,189 to 3,266. Without a bucket the same room of 10 or 100 sockets took all
-  10,000 at 0.09 to 0.26 ms p50.
+  1,000 and 10,000 sockets (1,000 accepted) acknowledged 3,189 to 3,266.
+  Without a bucket the same room of 10 or 100 sockets took all 10,000 at
+  0.09 to 0.26 ms p50. These figures are in that PR's
+  `bench/results/2026-11-15-699ebec-room-workstation*.csv`, not yet on
+  `main`; they are cited here from the PR and are to be cited from
+  `bench/results` once it merges.
 
 What the code already gives:
 
@@ -101,7 +114,13 @@ writes = "batched"
 and `deploy --writes rooms=batched` beside flags. A class without
 `writes` is `strict`, so every class deployed today keeps its behaviour,
 and an unnamed class stays strict through the release that brings this.
-The mode is part of the class's version, like `access`. On a single node
+The mode is part of the class's version, like `access`, but a hold
+reads it once, when it is acquired, and keeps it: a deploy that changes
+a class's mode reaches a resident actor only at its next hold, or at the
+next `Flushed` barrier (section 6), where the node switches it. Switching
+from batched to strict with a segment in flight would send the next
+event through strict's inline capture from the captured position, which
+the fork detector refuses. On a single node
 (no bucket) the mode changes nothing: writes commit locally as today.
 
 Strict stays 0.4.2's code path, inline upload included, so that a test
@@ -125,9 +144,20 @@ flight wait in the WAL, uncaptured, and the next segment takes them all.
 - **Capture when the uploader is idle.** At a boundary, if nothing is in
   flight and something is uncaptured, the node captures up to the last
   boundary within the byte cap, encodes the segment at the next txid on
-  the acknowledged head, publishes its alarm entry (section 9), and
-  starts the upload on a task of its own. The event's `finish` does not
-  wait for it: the actor takes its next job.
+  the acknowledged head, and hands it to an upload task of its own,
+  which first PUTs the segment's alarm entry when it has one to publish
+  (section 9) and then the segment. The event's `finish` does not wait
+  for it: the actor takes its next job.
+- **A capture is never cut half-way.** Capturing advances `WalCapture`
+  and may checkpoint, so a capture whose `Changes` were then dropped
+  would leave the next segment's pre-apply checksum wrong and fail the
+  replica. Capture, encoding and the hand-off to the upload task are
+  therefore one step on a blocking job that is not cancelled with the
+  guest call: a wall cut, a lease cut or `Cut::Replica` during a flush
+  ends the guest's wait, and the step still completes and hands its
+  segment over (or, if it fails, fails the replica as a failed capture
+  does today). The same step serves `finish`, the completion job and the
+  flush.
 - **Capture again when it lands.** The upload task checks the
   acknowledgement rule as soon as the PUT returns (as `put_bounded` does
   now) and records the outcome. Then whichever comes first applies it: a
@@ -137,16 +167,19 @@ flight wait in the WAL, uncaptured, and the next segment takes them all.
   writes the sidecar, runs the segment's retire list (section 9) and
   wakes the flushes it satisfies, then captures again if anything is
   uncaptured. Applying a failure fails the replica (section 8).
-- **The byte cap**, 1 MiB of pages (the pages the segment carries, page
-  count times page size, counted at each boundary during the capture). A
-  capture stops at the last boundary within it. An event that alone
-  writes more is one segment by itself, as it is today: batching never
-  makes a segment larger than strict would. The cap is a correctness
-  bound, not a tuning: an upload's attempts are bounded by 5 s plus a
-  second per started megabyte, its total by 20 s plus the same (21 s
-  under a megabyte), and the bucket client gives one request 30 s
-  (`replica.rs`, `UPLOAD_IDLE`). Without a cap a stalled minute of a
-  busy actor would become one segment no attempt can carry.
+- **The byte cap**, 1 MiB of encoded segment (estimated during the
+  capture at each boundary from the pages it would carry, page count
+  times page size plus LTX headers, a bound on the LZ4-compressed size
+  plus framing), so that `put_bounded`'s "per started megabyte" charges
+  one: 21 s. A capture stops at the last boundary within it. An event
+  that alone writes more is one segment by itself, as it is today:
+  batching never makes a segment larger than strict would. The cap is a
+  correctness bound, not a tuning: an upload's first attempt is given 5
+  s plus a second per started megabyte, later attempts twice as long
+  each, all of them within 20 s plus the same (`UPLOAD_IDLE`,
+  `UPLOAD_BUDGET_IDLES`), and the bucket client gives one request 30 s.
+  Without a cap a stalled minute of a busy actor would become one
+  segment no attempt can carry.
 - **Captured is in flight.** The captured position is always the end of
   the segment in flight, or the acknowledged head when nothing is in
   flight. Nothing is kept in memory between them but the one encoded
@@ -195,11 +228,15 @@ trip at the time and `e` the longest event:
 - with a healthy bucket, the writes of about the last one or two round
   trips (`r` to `2r`): at 1,000 events a second and `r` = 55 ms, about
   55 to 110 events (derived);
-- at worst, under a bucket that stalls, the writes committed within
-  `--max-unsent-age + e + r` before the stall began, since no event
-  starts after that;
-- in bytes, at most the cap in flight plus the cap and one event
-  uncaptured.
+- at worst, under a bucket that stalls, the writes committed from
+  about `r` before the stall began (the segment then in flight) to
+  `--max-unsent-age + e` after it, since no event starts after that;
+- in bytes, at most one segment in flight (the cap, or one event larger
+  than it) plus the cap and one event uncaptured.
+
+A segment that also publishes an alarm entry costs two PUTs in a row on
+its task (section 9), so for an actor whose every event changes its
+alarm, `r` above is two round trips.
 
 Strict loses at most the one event whose upload was under way. A
 batched class trades that for throughput, and says so (section 12).
@@ -251,7 +288,8 @@ flush: func() -> result<_, sql-error>;
 - **The event's wall**: a flush waits until the event's wall-clock limit
   less one second at most, then answers `internal` ("not known to be
   durable: still uploading"). Its uploads go on: they run on their task,
-  not in the guest call, so neither that deadline nor the wall's own cut
+  not in the guest call, and a capture under way completes as one step
+  (section 2), so neither that deadline nor the wall's own cut
   interrupts them, and the replica stays healthy. Today's marker ("an
   upload was interrupted", set around an inline upload so a cut fails
   the replica) applies to strict classes only.
@@ -261,12 +299,14 @@ flush: func() -> result<_, sql-error>;
   would change the WIT's enum (a breaking change, below); `internal`
   with a fixed message prefix (`not durable:`) says it.
 
-**Durable latency in a batched class**: one round trip when the uploader
-is idle, two when a segment is in flight (its landing, then the
+**Durable latency in a batched class**: one segment upload when the
+uploader is idle, two when a segment is in flight (its landing, then the
 flush's own), three at most when the uncaptured part was already full
-(the cap, then the flushing event's own segment). Its p50 lies between
-one and two round trips and its p99 is two (derived). A durable write of
-a strict class keeps one round trip.
+(the cap, then the flushing event's own segment). A segment upload is
+one round trip, or two when it also publishes an alarm entry (section
+9). Without alarm changes its p50 lies between one and two round trips
+and its p99 is two (derived). A durable write of a strict class keeps
+today's cost: one round trip, plus the entry's when the alarm changed.
 
 ### 5. Two positions, two tripwires
 
@@ -299,12 +339,19 @@ the acknowledged head is the local database) or `GaveUp(reason)`.
   failure, drop now instead; past the deadline, the site's own answer
   (below).
 
-The hold's release takes the `Barrier` by value, so a site that ends a
-hold without one does not compile. `Replica`'s `Drop` asserts in debug
-builds that nothing is pending unless it saw `GaveUp`; in release
-builds it counts the drop (`reason="unbarriered"`) and logs an error.
-Safety does not rest on it (the cell is emptied first either way): what
-the barrier protects is plain writes on clean hand-overs, and the
+What is enforced, since Rust cannot make dropping a value a compile
+error: today a hold ends by being dropped (`self.lease = None`, and
+`LeaseHold`'s `Drop` releases it). For a batched actor, dropping a
+`LeaseHold` empties its cell and puts it into the pending releases
+without parking it; only `release(Barrier)` and `park(Barrier)` end a
+hold otherwise, and parking requires `Flushed`. Every site in the table
+below calls one of them. A check in `./scripts/check.sh` refuses `lease
+= None` and `replica = None` outside the module that owns the two
+functions. `Replica`'s `Drop` counts a drop with anything pending and no
+`GaveUp` seen (`reason="unbarriered"`) and logs an error; in debug
+builds it also asserts, unless the thread is already panicking. Safety
+does not rest on any of this (the cell is emptied first either way):
+what the barrier protects is plain writes on clean hand-overs, and the
 snapshot, reset and alarm rules below.
 
 | Site (today's code) | Kind | Deadline | Past the deadline / on `GaveUp` |
@@ -313,10 +360,11 @@ snapshot, reset and alarm rules below.
 | `ensure_owner_with`, "whatever ran before may be stale" (`state.rs`): a hold that lapsed | drop now | none | counted `lapse` |
 | The node lease lost or fenced (ADR 0020, section 1: every hold dropped) | drop now | none | counted `lost_lease` |
 | `finish`, the database worker failed (`state.rs`) | drop now | none | counted `failure` |
-| A panic in an event (the mailbox's `CatchUnwind` drops the state) | drop now | none | counted `panic` |
+| A panic in an event (the mailbox's `CatchUnwind` drops the state) | drop now, never parked | none | counted `panic` |
+| `hand_over` and `move_out` finding the hold lapsed (`drain.rs`, `moving.rs`) | drop now | none | counted `lapse` |
 | The app deleted (`stop_actors`, 1001) | drop now | none | counted `app_deleted` |
-| A restore that failed (`ensure_owner_with`) | nothing pending | none | (a fresh replica) |
-| `alarm` for an actor without state (`alarm_delivery.rs`) | nothing pending | none | (no event ran) |
+| A restore that failed, or the previous connection still open (`ensure_owner_with`) | nothing pending | none | (a fresh hold, no event ran) |
+| `alarm` for an actor without state (`without_state`, `alarm_delivery.rs`), which also runs after a trapped event | flush, then clean up and release | one upload budget | on failure drop now, nothing cleared; past the deadline nothing cleared, the hold kept, tried again |
 | `delete_recorded` and `finish`'s durable delete, after the reset | `Flushed` by section 7 | none | the reset failed: drop now, `failure` |
 | Idle hibernation and capacity eviction (`run_actor`, `wasmkeep-runtime`) | flush, then release | one upload budget | stays resident; tried again at the next idle check, or another actor is evicted |
 | Parking with sockets open (`Drop for ActorState`, ADR 0024) | flush, then park | as hibernation | as hibernation |
@@ -327,10 +375,29 @@ snapshot, reset and alarm rules below.
 The mailbox in `wasmkeep-runtime` drops a state synchronously today
 (`run_actor` returns, and `Drop for ActorState` releases or parks). It
 gains an asynchronous step before that drop, run by the state, which
-returns whether it may be dropped: so the idle, eviction and close paths
-flush first. A batched actor idle for the idle timeout (30 s) has
-nothing pending unless its bucket is stalling, since the completion job
-captures and ships within a round trip of its last event.
+returns whether it may be dropped, ordered so that no second state can
+be built beside it:
+
+- the step runs **before** `run_actor`'s check that nothing is queued
+  (`rx.is_empty()` under the registry lock), with the actor still
+  registered;
+- a job that arrives during it wins: the hibernation is abandoned (the
+  uploads go on on their task), the job runs, and the idle wait starts
+  over; the check is made again after any step;
+- an actor with nothing pending passes the step at once, so a request
+  reaching an idle actor never waits for a flush that has nothing to do;
+- during a clean stop the mailboxes refuse new jobs (`enqueue` once
+  closed), so no completion job can be posted: the step applies the
+  completions itself, as a flush inside an event does;
+- `stop_actors` takes whether to flush (a clean stop) or drop (an app
+  deleted), since both use it.
+
+A panic drops the state from `CatchUnwind`, outside the step: `Drop for
+ActorState` then never parks a hold with anything pending (it empties
+the cell and counts `panic`), whatever sockets are open. A batched actor
+idle for the idle timeout (30 s) has nothing pending unless its bucket
+is stalling, since the completion job captures and ships within a round
+trip of its last event.
 
 A move records its target and deadline (`Move.until_ms`, 30 s) **after**
 the flush, so the flush does not use the routing window. `HAND_OVER_WAIT`
@@ -349,7 +416,10 @@ for good. So:
 - **`ship_snapshot` refuses** unless nothing is in flight and the
   snapshot's post-apply checksum equals the acknowledged checksum. The
   existing refusal of uncaptured frames (`ActorDb::snapshot`'s
-  `CaptureError::Pending`) stays as the second guard.
+  `CaptureError::Pending`) stays as the second guard. This applies to
+  the periodic snapshot and the one after a delete, which are labelled
+  at the head; the first snapshot (`SnapshotKind::First`) is at a new
+  position on an empty bucket and keeps today's rule.
 - **`snapshot_due` is asked only inside a barrier.** When a periodic
   snapshot is due (64 segments since the last, counted on acknowledged
   segments), the actor's next mailbox gap runs a flush and then the
@@ -370,10 +440,11 @@ for good. So:
 - **The first snapshot** (an actor new to the bucket, `start_replication`)
   is taken before any event, with nothing in flight, as today.
 
-Restores replay at most 64 segments after a snapshot, as now, but a
-segment now holds up to the cap: up to 64 MiB of segments, which ADR
-0007's "every 64 segments or 64 MB" (the second half never built)
-already allows.
+A restore replays every segment since the last snapshot, as now: 64
+while periodic snapshots succeed, more while they back off after
+failures (`PERIODIC_SNAPSHOT_IDLES`). Each segment now holds up to the
+cap, or one event larger than it, so the 64 are up to 64 MiB plus such
+events, where today they are 64 events.
 
 ### 8. A failed replica cuts the running event
 
@@ -382,12 +453,16 @@ fails while the next event runs, on a database ahead of anything that
 can now be acknowledged. That event must not answer as if it had
 succeeded, call other actors or send on sockets from that state:
 
+- The upload task publishes a failure at once, on a flag the event can
+  see (a watch beside the replica), separately from applying the outcome
+  (section 2), which waits for a boundary.
 - `limit` (`actor/host.rs`) gains a third arm beside the wall and
-  `Cut::Lease`: **`Cut::Replica`**, fired when the replica fails. The
+  `Cut::Lease`: **`Cut::Replica`**, which selects on that flag. The
   instance is discarded, as for any cut.
-- Every storage call refuses once the replica failed (`internal`,
-  "replication stopped"), as `exec-durable` alone does now: the cut is
-  asynchronous, and the refusal closes the gap before it.
+- Every call with an effect outside the actor checks the flag first and
+  refuses once it is set, since the cut is asynchronous: every storage
+  call (`internal`, "replication stopped", as `exec-durable` alone does
+  now), `actors.call` and `calls.call-many`, and socket sends.
 - No queued event starts before the actor is given up: the cut event's
   `finish` sees the failure and drops now (`abandon`). A failure applied
   while the actor is between events is handled by its completion job,
@@ -413,6 +488,14 @@ carries several events and only its end can be restored:
   failed PUT fails the replica (section 8), as ADR 0009 gives the actor
   up today when the index cannot be brought in line. So every state that
   can be restored, or land late, names an entry that exists.
+- **Where the requests run.** The entry's PUT runs on the segment's
+  upload task, before the segment's PUT and within the same upload
+  budget (today's `put_new_alarm_entry` has no bound of its own beyond
+  the client's 30 s per request; it gets the upload's). It is skipped
+  when the entry equals the one the captured position names (the
+  segment before it already published it). The retire list's DELETEs,
+  and `clear_stale_hint`'s LIST, run on the task after the
+  acknowledgement, off the actor's path.
 - **Retire after acknowledgement.** Each segment carries a retire list:
   the entry the acknowledged head named (when the segment names another)
   and, after an alarm delivered for a time no longer committed, that
@@ -420,6 +503,17 @@ carries several events and only its end can be restored:
   segment is acknowledged, with today's R2 and R3 checks; on a failure
   it is dropped (an extra entry is harmless: it is delivered and removed
   as unnamed).
+- **Every R2 decision uses the acknowledged head's entry.** What "the
+  replicated state names" is the entry the acknowledged head names, never
+  the local database's: `clear_stale_hint`, `entries_to_clear` and the
+  premise of `may_index` ("everything the actor's database records is in
+  the bucket") hold only at a `Flushed` barrier. So `without_state`,
+  which runs whenever there is no instance (also after a trapped event,
+  with the hold and a segment possibly in flight), flushes first and
+  judges then; if the flush fails it drops now and removes nothing.
+  Otherwise an alarm set by a trapped `on-init` and cleared by its retry
+  could have its entry removed while the acknowledged head still holds
+  the alarm.
 - **The fence on the acknowledged head.** `fence` answers "the history
   ends in my generation" from the acknowledged head only. When it must
   upload (`owner_fence`), it writes the row and flushes. A fence judged on
@@ -553,10 +647,11 @@ it, even if it never calls it; Rust, Go, C and Zig components import
 only what they call. 0.4.2 lived with this for `delete-self-durable`
 by documentation alone. This record proposes that `deploy` checks it:
 
-- A node that has `storage.flush` and batched classes announces the
-  capability word **`flush`** on its node lease's capability line (beside
-  `take`, `front`, `handoff`, `ends`; readers ignore words they do not
-  know).
+- A node whose binary has `storage.flush` and batched classes announces
+  the capability word **`flush`** on its node lease's capability line,
+  from the binary alone, whether or not it serves a batched class yet,
+  as `ends` and `front` are (beside `take`, `front`, `handoff`, `ends`;
+  readers ignore words they do not know).
 - `deploy` reads each component's imports (wasmtime's
   `Component::component_type`, as the front's link check does) and
   refuses a version in which a component imports `storage.flush`, or a
@@ -591,9 +686,9 @@ a measurement of it.
 
 | | Today (strict) | Batched |
 | --- | --- | --- |
-| Durable write p50 next to the bucket | 47 to 57 ms, measured (soaks, VPS) | 1 to 2 round trips, about 55 to 110 ms, derived |
+| Durable write p50 next to the bucket | 47 to 62 ms, measured (soaks, VPS) | 1 to 2 round trips, about 55 to 110 ms; one more per segment that publishes an alarm entry; derived |
 | Writing events a second, one busy actor, real bucket | about 17, derived from the durable p50 | bounded by the event's own cost, derived |
-| PUTs per writing event | 1.03, measured (12-hour node-lease soak) | one per segment: about one per round trip per busy actor, derived |
+| PUTs per writing event | 1.03, measured (12-hour node-lease soak) | one per segment, two when its alarm entry changes: about one per round trip per busy actor, derived |
 | Room of 10 or 100 sockets on moto, offered 1,000 msg/s | 404 to 423 acknowledged a second, measured (PR #134, workstation) | up to the 1,000 a second the same room took without a bucket, measured there; derived as the ceiling |
 | Room of 1,000 sockets | 326 to 327 a second on moto, measured | the broadcast is the limit: without a bucket it fell behind at 1,000 a second (measured), so no better than that |
 | App-level batching, 1,000 msg/s into 1,000 sockets | 36 ms p50, 66 ms p99, measured (`batch-` mode) | not needed for throughput; still for one frame per socket per batch |
@@ -605,7 +700,9 @@ a measurement of it.
 On the VPS, at 1,000 events a second for one actor, PUTs would fall
 from 1,000 a second (if the actor could keep up, which today it cannot)
 to about 18 (derived), the segment holding about 55 events of a few
-pages each, far under the cap.
+pages each, far under the cap. An actor whose every event changes its
+alarm makes two PUTs per segment in a row, so about 9 segments and 18
+PUTs a second, each segment holding about 110 events.
 
 ## Consequences
 
@@ -620,8 +717,10 @@ pages each, far under the cap.
 - Every end of a hold names its kind, in the type system.
 - A clean stop and every hand-over flush; a stop under a slow bucket
   counts what it drops.
-- Strict classes run 0.4.2's code; the new paths are reached only by a
-  class that names `batched`.
+- Strict classes behave as 0.4.2, which a test checks; they still pass
+  through the new plumbing (barriers at every release site, the
+  mailbox's step before a drop, `Cut::Replica`, `storage.flush`, the
+  deploy check), each a no-op for them.
 
 ## Alternatives
 
@@ -678,7 +777,12 @@ Invariants, checked over 200 seeds per push:
 - the plain writes lost per ownership change stay within section 3's
   bound;
 - no alarm in a restorable state without its index entry;
-- a deleted actor never comes back.
+- a deleted actor never comes back;
+- no plain write is lost on a clean hand-over (drain, move, hibernation,
+  park, clean stop) while the bucket is healthy;
+- no outward effect (an answer, a call to another actor that writes
+  durably from what it was told) happens after the replica's failure is
+  recorded.
 
 Each of these variants must be caught by some seed:
 
@@ -691,7 +795,13 @@ Each of these variants must be caught by some seed:
 - an alarm entry retired before its segment's acknowledgement;
 - the fence judged on the captured head;
 - two segments in flight;
-- an event started after the replica failed.
+- an event started after the replica failed (caught by the outward
+  effect invariant);
+- a release without a barrier (caught by the clean hand-over invariant);
+- a capture dropped half-way by a cut (the next segment's checksum);
+- a mode switched with a segment in flight;
+- `without_state` judging R2 on the local database with writes
+  pending.
 
 The test fails if late batched segments, or crashes with a segment in
 flight and commits uncaptured, stop occurring: it cannot pass
@@ -727,13 +837,22 @@ vacuously.
 - `delete-self`, `delete-self-durable` and ADR 0033's restore of one
   actor with a segment in flight.
 - A periodic snapshot under load, then a takeover.
+- A panic with sockets open and a segment in flight: the hold is not
+  parked, the drop is counted.
+- An idle actor hibernating while a request arrives during its step
+  before the drop: one state, the request served.
+- A wall cut during a flush's capture: the replica stays healthy and the
+  next segment follows.
+- A redeploy from batched to strict on a busy actor: the switch waits
+  for a `Flushed` barrier, nothing is given up.
 - A strict class behaves as 0.4.2 (the existing replication tests, run on
   a strict class).
 - `flush` inside a transaction, on a single node, with nothing pending,
   and after a failure.
 - A mixed cluster: a 0.4.2 node restores batched segments.
 - `deploy` refuses a component importing `flush`, and a batched class,
-  while a node without the word `flush` is live.
+  while a node without the word `flush` is live, and accepts the first
+  batched deploy on nodes that all have it.
 
 ### Soak
 
@@ -768,6 +887,7 @@ the API reference, and the WIT's own comments on `exec` and
 - Whether strict classes should move onto the uploader task once the
   "strict behaves as 0.4.2" tests exist, to keep one code path.
 - Whether the knob should be per class rather than per node.
+- The room figures, once PR #134 merges, cited from `bench/results`.
 
 ## Plan
 
