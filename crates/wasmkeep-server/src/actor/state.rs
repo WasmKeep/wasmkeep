@@ -202,6 +202,47 @@ impl Drop for ActorState {
 }
 
 impl ActorState {
+    /// The mailbox's step before this state is dropped (ADR 0034, section
+    /// 6): waits for the hold to reach its barrier, by the site's deadline.
+    /// A strict hold is there at once, so this is ready at once and the
+    /// drop goes on as before (`Drop for ActorState` releases or parks).
+    ///
+    /// Past a clean stop's deadline the hold gives up (`GaveUp(stop)`),
+    /// counted and released here; past a hibernation's, it stays resident.
+    /// An app deleted is not flushed: its holds end as they are, as before
+    /// (counted `app_deleted` once a hold can have anything pending).
+    pub(super) fn before_drop(&mut self, cause: DropCause) -> BoxFuture<'_, StepOutcome> {
+        let (deadline, stopping) = match cause {
+            DropCause::Stop { flush: false, .. } => {
+                return Box::pin(std::future::ready(StepOutcome::Ready));
+            }
+            DropCause::Stop { deadline, .. } => (deadline, true),
+            // No limit while a hold's flush is at once. The replica's
+            // upload budget once a batched hold has uploads of its own to
+            // wait for (S8): unbounded, an eviction step would never end.
+            _ => (None, false),
+        };
+        Box::pin(async move {
+            let Some(hold) = self.held.as_ref() else {
+                return StepOutcome::Ready;
+            };
+            match hold.flush(deadline).await {
+                Some(Barrier::Flushed) => StepOutcome::Ready,
+                Some(Barrier::GaveUp(reason)) => {
+                    self.drop_hold(reason);
+                    StepOutcome::GaveUp
+                }
+                None if stopping => {
+                    if let Some(hold) = self.held.take() {
+                        drop(hold.release(Barrier::GaveUp(Dropped::Stop)));
+                    }
+                    StepOutcome::GaveUp
+                }
+                None => StepOutcome::Keep,
+            }
+        })
+    }
+
     /// The actor's replication, while this node holds it restored.
     pub(super) fn replica(&self) -> Option<&SharedReplica> {
         self.held.as_ref()?.replica()

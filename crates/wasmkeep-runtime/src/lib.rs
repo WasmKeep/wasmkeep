@@ -20,6 +20,8 @@ pub use cache::ComponentCache;
 pub use config::RuntimeConfig;
 pub use cpu::{CpuBudgetExceeded, CpuMeter, cpu_budget_exceeded_total};
 pub use error::Error;
-pub use mailbox::{BoxError, BoxFuture, MailboxConfig, MailboxError, Mailboxes};
+pub use mailbox::{
+    BoxError, BoxFuture, DropCause, MailboxConfig, MailboxError, Mailboxes, StepOutcome,
+};
 pub use residency::{Residency, Retained};
 pub use runtime::Runtime;

@@ -135,8 +135,9 @@ impl ActorService {
         mailbox.max_resident = mailbox
             .max_resident
             .min(crate::fds::resident_limit(pool, front));
-        let mailboxes =
-            Mailboxes::new_with_residency(mailbox, move |address: ActorAddress, residency| {
+        let mailboxes = Mailboxes::new_with_step(
+            mailbox,
+            move |address: ActorAddress, residency| {
                 let class = read(&factory_classes).get(address.class()).cloned();
                 let (runtime, storage, alarms) = (
                     runtime.clone(),
@@ -185,7 +186,9 @@ impl ActorService {
                         moves: Arc::clone(&factory_moves),
                     })
                 }
-            });
+            },
+            ActorState::before_drop,
+        );
 
         let service = Self {
             inner: Arc::new(ServiceInner {

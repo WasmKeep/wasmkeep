@@ -27,6 +27,49 @@ type Factory<S> =
 /// A queued event. It receives the actor state, or the error that kept the
 /// state from being created, and reports to its caller either way.
 type Job<S> = Box<dyn for<'a> FnOnce(Result<&'a mut S, MailboxError>) -> BoxFuture<'a, ()> + Send>;
+/// The step before a drop: asked of the state, awaited before it is dropped.
+type Step<S> = dyn for<'a> Fn(&'a mut S, DropCause) -> BoxFuture<'a, StepOutcome> + Send + Sync;
+
+/// Why an actor's state is about to be dropped: what the step before the
+/// drop is told (ADR 0034, section 6). It picks its own deadline for an
+/// idle or evicted actor; a stop gives the stop's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DropCause {
+    /// Idle for the idle timeout.
+    Idle,
+    /// Asked to hibernate to make room ([`Mailboxes::hibernate`] or a
+    /// capacity eviction).
+    Evicted,
+    /// The mailboxes are closed: no event will reach this state again.
+    Stop {
+        /// When the stop gives up on the actor, if the stop set one
+        /// ([`Mailboxes::close_by`]). The step should end by then.
+        deadline: Option<tokio::time::Instant>,
+        /// Whether the stop wants the state flushed (a clean stop) or
+        /// dropped without waiting (an app deleted).
+        flush: bool,
+    },
+}
+
+/// What the step before a drop answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StepOutcome {
+    /// The state may be dropped: it has nothing pending.
+    Ready,
+    /// The state may be dropped: it gave up what it had pending, and has
+    /// already accounted for that itself. Outside a stop an event queued
+    /// as the step ended still keeps the state, which then serves it.
+    GaveUp,
+    /// The state should stay resident; the drop is tried again at the next
+    /// idle check, and an eviction looks for another actor (or asks this
+    /// one again at once if it is the only idle one: a step answers `Keep`
+    /// only after trying for its deadline). During a stop the state is
+    /// dropped anyway (no event can reach it); a `Keep` from a hibernation
+    /// step as a stop begins runs the stop's step instead.
+    Keep,
+}
 
 /// Mailbox settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,9 +152,16 @@ impl<S> std::fmt::Debug for Mailboxes<S> {
 struct Inner<S> {
     config: MailboxConfig,
     factory: Box<Factory<S>>,
+    /// Run before a state is dropped; none: dropped at once.
+    step: Option<Box<Step<S>>>,
     actors: Mutex<Registry<S>>,
     /// Set by `close`: actors finish what is queued, then drop their state.
     closed: tokio::sync::watch::Sender<bool>,
+    /// What the stop asked for (`close_by`), set before `closed`:
+    /// its deadline and whether to flush.
+    stop: Mutex<(Option<tokio::time::Instant>, bool)>,
+    /// Steps before a drop running now.
+    stepping: std::sync::atomic::AtomicUsize,
     /// One count per admitted actor, retained until its task, state and all
     /// cloned residencies have dropped (deregistration happens earlier).
     tasks: Arc<std::sync::atomic::AtomicUsize>,
@@ -144,6 +194,39 @@ impl<S: Send + 'static> Mailboxes<S> {
         F: Fn(ActorAddress, Residency) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
     {
+        Self::build(config, factory, None)
+    }
+
+    /// [`Self::new_with_residency`], with a step run before each drop of a
+    /// state (ADR 0034, section 6): when an actor is about to hibernate,
+    /// be evicted or stop, `step` is given its state and the cause, and the
+    /// state is dropped only once the step's future resolves.
+    ///
+    /// - The step runs with the actor still registered, before the check
+    ///   that nothing is queued, so no second state is built beside it.
+    /// - An event that arrives during the step wins: the step's future is
+    ///   dropped (it must be cancel-safe), the event runs on the same state
+    ///   and the idle wait starts over. The check is made again after any
+    ///   step, so an event queued as it ends also keeps the state.
+    /// - During a stop no event can arrive ([`Self::close`]), and
+    ///   [`StepOutcome::Keep`] is not honoured. A stop that begins during
+    ///   another cause's step drops that step's future and runs the step
+    ///   again with [`DropCause::Stop`].
+    /// - A panic in the step drops the state, as a panicking event does.
+    pub fn new_with_step<F, Fut, P>(config: MailboxConfig, factory: F, step: P) -> Self
+    where
+        F: Fn(ActorAddress, Residency) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
+        P: for<'a> Fn(&'a mut S, DropCause) -> BoxFuture<'a, StepOutcome> + Send + Sync + 'static,
+    {
+        Self::build(config, factory, Some(Box::new(step)))
+    }
+
+    fn build<F, Fut>(config: MailboxConfig, factory: F, step: Option<Box<Step<S>>>) -> Self
+    where
+        F: Fn(ActorAddress, Residency) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
+    {
         let capacity_changed = Arc::new(tokio::sync::Notify::new());
         let changed = Arc::clone(&capacity_changed);
         let residency_released = Arc::new(move || changed.notify_waiters());
@@ -151,8 +234,11 @@ impl<S: Send + 'static> Mailboxes<S> {
             inner: Arc::new(Inner {
                 config,
                 factory: Box::new(move |address, residency| Box::pin(factory(address, residency))),
+                step,
                 actors: Mutex::new(HashMap::new()),
                 closed: tokio::sync::watch::Sender::new(false),
+                stop: Mutex::new((None, true)),
+                stepping: std::sync::atomic::AtomicUsize::new(0),
                 tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 capacity_changed,
                 residency_released,
@@ -414,9 +500,32 @@ impl<S> Mailboxes<S> {
     /// then drops its state as hibernation does, without waiting for the
     /// idle timeout.
     pub fn close(&self) {
+        self.close_by(None, true);
+    }
+
+    /// [`Self::close`], telling each actor's step before its drop
+    /// ([`Self::new_with_step`]) the stop's `deadline` and whether to
+    /// `flush` ([`DropCause::Stop`]). Only the first close counts.
+    pub fn close_by(&self, deadline: Option<tokio::time::Instant>, flush: bool) {
         let _actors = lock(&self.inner);
+        if !*self.inner.closed.borrow() {
+            *self
+                .inner
+                .stop
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = (deadline, flush);
+        }
         self.inner.closed.send_replace(true);
         self.inner.capacity_changed.notify_waiters();
+    }
+
+    /// How many actors are in their step before a drop now. A stop that
+    /// reached its deadline with steps still running gives them a moment
+    /// to return.
+    pub fn steps_running(&self) -> usize {
+        self.inner
+            .stepping
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether `close` was called.
@@ -544,7 +653,7 @@ async fn run_actor<S: Send + 'static>(
     let task_residency = residency;
     let mut state: Option<S> = None;
     let mut closed = inner.closed.subscribe();
-    loop {
+    'events: loop {
         let next = tokio::select! {
             // Queued events first: closing finishes them.
             biased;
@@ -555,16 +664,76 @@ async fn run_actor<S: Send + 'static>(
             () = own.activity.evict.notified() => Err(true),
         };
         let job = match next {
-            Ok(Some(job)) => {
-                // Busy: never chosen for eviction while an event runs.
-                own.activity
-                    .last
-                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-                job
-            }
+            Ok(Some(job)) => job,
             // Every sender is gone: nothing can reach this actor any more.
             Ok(None) => return,
-            Err(evicted) => {
+            Err(evicted) => 'drop: {
+                // The step before the drop (ADR 0034, section 6), with the
+                // actor still registered: an event that arrives during it
+                // wins, and runs on this same state.
+                // Counted until the state is dropped or kept, so a stop
+                // waiting for the steps also waits for their drops.
+                let mut running = None;
+                let stepped = match (state.as_mut(), inner.step.as_deref()) {
+                    (Some(s), Some(step)) => {
+                        let mut cause = drop_cause(&inner, evicted);
+                        running = Some(Stepping::new(&inner.stepping));
+                        loop {
+                            let stopping = matches!(cause, DropCause::Stop { .. });
+                            let s = &mut *s;
+                            // Built inside the guard, so a panic while the
+                            // step is called is contained too.
+                            let stepping =
+                                CatchUnwind(Box::pin(async move { step(s, cause).await }));
+                            tokio::select! {
+                                biased;
+                                job = rx.recv() => break Stepped::Job(job),
+                                outcome = stepping => match outcome {
+                                    // Kept by a hibernation's step as a stop
+                                    // began: the stop's step runs instead.
+                                    Ok(StepOutcome::Keep)
+                                        if !stopping && *inner.closed.borrow() =>
+                                    {
+                                        cause = drop_cause(&inner, evicted);
+                                    }
+                                    outcome => break Stepped::Done(outcome),
+                                },
+                                // A stop during a hibernation's step: the
+                                // step starts over with the stop's deadline.
+                                _ = closed.wait_for(|c| *c), if !stopping => {
+                                    cause = drop_cause(&inner, evicted);
+                                }
+                            }
+                        }
+                    }
+                    _ => Stepped::Done(Ok(StepOutcome::Ready)),
+                };
+                match stepped {
+                    Stepped::Job(Some(job)) => {
+                        // As when a job races the drop below: an eviction
+                        // stays pending until the queue is drained.
+                        if evicted {
+                            own.activity.evict.notify_one();
+                        }
+                        break 'drop job;
+                    }
+                    Stepped::Job(None) => return,
+                    // Contained like a panicking event: the state goes.
+                    Stepped::Done(Err(())) => state = None,
+                    Stepped::Done(Ok(StepOutcome::Keep)) if !*inner.closed.borrow() => {
+                        // Stays resident: no longer on its way out, so an
+                        // admission evicts another actor instead.
+                        own.activity
+                            .evicting
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        own.activity
+                            .last
+                            .store(clock_ms(), std::sync::atomic::Ordering::Relaxed);
+                        inner.capacity_changed.notify_waiters();
+                        continue 'events;
+                    }
+                    Stepped::Done(Ok(_)) => {}
+                }
                 // Deregister under the lock that `enqueue` sends under, and
                 // only if nothing was queued meanwhile; otherwise keep going.
                 let mut actors = lock(&inner);
@@ -577,7 +746,10 @@ async fn run_actor<S: Send + 'static>(
                     {
                         actors.remove(&address);
                     }
-                    return; // drops `state`: hibernation
+                    drop(actors);
+                    drop(state.take()); // hibernation
+                    drop(running);
+                    return;
                 }
                 // A job raced the hibernation before we acquired the
                 // registry lock. An eviction stays pending while the biased
@@ -586,9 +758,13 @@ async fn run_actor<S: Send + 'static>(
                 if evicted {
                     own.activity.evict.notify_one();
                 }
-                continue;
+                continue 'events;
             }
         };
+        // Busy: never chosen for eviction while an event runs.
+        own.activity
+            .last
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
 
         if state.is_none() {
             // A panicking event may have left work holding the old state's
@@ -636,11 +812,52 @@ async fn run_actor<S: Send + 'static>(
     }
 }
 
-/// Runs a boxed future, turning a panic during any poll into `Err(())`.
-struct CatchUnwind<'a>(BoxFuture<'a, ()>);
+/// How the step before a drop ended.
+enum Stepped<S> {
+    /// An event arrived first (or every sender is gone).
+    Job(Option<Job<S>>),
+    /// The step's answer, or `Err` if it panicked.
+    Done(Result<StepOutcome, ()>),
+}
 
-impl Future for CatchUnwind<'_> {
-    type Output = Result<(), ()>;
+/// What the step before a drop is told: a stop whenever the mailboxes are
+/// closed, whatever woke the actor.
+fn drop_cause<S>(inner: &Inner<S>, evicted: bool) -> DropCause {
+    if *inner.closed.borrow() {
+        let (deadline, flush) = *inner
+            .stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        DropCause::Stop { deadline, flush }
+    } else if evicted {
+        DropCause::Evicted
+    } else {
+        DropCause::Idle
+    }
+}
+
+/// One step before a drop running, for as long as it lives (also when the
+/// step is abandoned for an event, or panics).
+struct Stepping<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Stepping<'a> {
+    fn new(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Stepping<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Runs a boxed future, turning a panic during any poll into `Err(())`.
+struct CatchUnwind<'a, T>(BoxFuture<'a, T>);
+
+impl<T> Future for CatchUnwind<'_, T> {
+    type Output = Result<T, ()>;
 
     fn poll(
         self: Pin<&mut Self>,
