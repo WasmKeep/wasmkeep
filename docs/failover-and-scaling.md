@@ -144,7 +144,7 @@ node.
 
 ### What does not happen today
 
-- **No rebalancing by load.** Nothing looks at how busy a node is. An
+- **No rebalancing by load.** Placement does not use node load. An
   actor in memory stays on its node until it hibernates, until it is moved
   with [`wasmkeep actor move`](cluster.md#moving-one-actor), until its
   node is drained with [`wasmkeep cluster drain`](cluster.md#draining-a-node),
@@ -158,7 +158,9 @@ node.
 - **No placement by region or by rule.** Any node of the app may take any
   of its actors.
 
-Load per node in the metrics, and placement, are on the
+Per-node load and saturation metrics are available, along with per-app
+metrics and load in `wasmkeep cluster status` ([monitoring](monitoring.md)).
+Automatic placement at wake-up and rebalancing remain on the
 [roadmap](../ROADMAP.md).
 
 ## Stateless components

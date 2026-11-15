@@ -6,7 +6,8 @@
   delete's outcome, stored headers overridden on download, indexes
   content-addressed, the fallback index the one served before)
 - Date: 2026-11-14
-- Milestone: [Now](../../ROADMAP.md#now), after data access
+- Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, after data access
+  and several apps per process in `0.5.0`
 - Follows: [ADR 0021](0021-the-app-model.md) (the app is the unit),
   [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (the
   app's root, `state/<tenant>/<app>/`), [ADR 0023](0023-the-front.md)

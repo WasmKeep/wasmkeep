@@ -1,7 +1,7 @@
 # 0033. Data access, export and online backup
 
-- Status: proposed (2026-11-14); revised after an adversarial review
-  (a destination keyed by content, since generations restart after an
+- Status: proposed (2026-11-14), not implemented; revised after an
+  adversarial review (a destination keyed by content, since generations restart after an
   app is recreated; prune excluded from a running backup; restore
   requests in the intents' fallback listing and ended as deletes are;
   resets labelled in the database instead of guessed from headers;
@@ -10,9 +10,10 @@
   from node starts)
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): in a batched class a position is a segment of several events, stamped with its capture time; `--at` and `--txid` choose between segments.
 - Date: 2026-11-14
-- Milestone: [After that](../../ROADMAP.md#after-that), "operating
-  without the author": inspect or export one actor, verify a bucket,
-  back a cluster's bucket up to another and restore it
+- Milestone: [Now](../../ROADMAP.md#now), `0.5.0`: actor export,
+  read-only SQL, verified online backup and single-actor point-in-time
+  restore, in that order. Whole-app point-in-time restore is
+  [later, on demand](../../ROADMAP.md#later-on-demand).
 - Follows: [ADR 0005](0005-replication-format-ltx-v3.md) (segments are
   LTX files), [ADR 0007](0007-replication-protocol.md) (the restore
   plan), [ADR 0012](0012-bucket-garbage-collection.md) (what collection

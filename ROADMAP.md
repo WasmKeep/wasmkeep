@@ -11,58 +11,107 @@ side projects and staging.
 
 ## Now
 
-**Data access**: an actor's data out of the cluster, and back in, while
-it runs (ADR 0033, being written). Export one actor's database as a
-plain SQLite file, at a point in time (`wasmkeep actor export`); query
-it read-only with `wasmkeep actor sql`; back up a cluster's bucket while
-the cluster runs, and restore an actor or an app to a point in time.
+`0.5.0`: **several apps, with recoverable state.** Finish the write
+path, give operators access to their data, then put trusted apps on
+the same nodes. Dates are not promised; this is the build order.
+Sizes are relative: S is a small change, M several related changes,
+and L several implementation and verification slices.
 
-Then **files and static assets**
-([ADR 0030](docs/adr/0030-files-and-static-assets.md), proposed): files
-for actors and the front in the app's part of the bucket, with links a
-browser uploads to and downloads from directly; static assets shipped
-with `wasmkeep deploy`, served by every node without waking any code,
-with a rule for paths that match no file (pass to the front, a
-single-page app's `index.html`, or a 404 page). Redirects and routes
-stay in the front's own code, with SDK helpers. The database client
-comes to the SDKs beyond Rust and TypeScript alongside.
+1. **Batched plain writes** (L), opt-in per class
+   ([ADR 0034](docs/adr/0034-batched-plain-writes.md)).
+   S0, the strict golden trace, S1, snapshot and reset guards, and
+   S2, `Held` and `Barrier`, are merged. Then come
+   the mailbox's pre-drop hook, deploy checks and manifest format 5,
+   the `flush` capability and strict `storage.flush`, the simulation
+   model, WAL boundaries, the uploader and wiring, alarms,
+   snapshots and deletes, clean stop, and strict-versus-batched
+   soaks. Strict stays the default. A plain response is not a
+   durable acknowledgement; explicit durable operations still wait
+   for the bucket while the hold is valid.
+2. **Data access** (L)
+   ([ADR 0033](docs/adr/0033-data-access-export-and-online-backup.md), proposed):
+   export an actor as SQLite, query it read-only, back up while the
+   cluster runs, then restore one actor to a retained point in time.
+   Tools report the position they read, verify the history and
+   distinguish a complete backup from an interrupted one. Whole-app
+   point-in-time restore comes later.
+3. **A big-room baseline and socket limits** (M): measure one room
+   before changing its topology. Make the current caps of 1,000
+   sockets per actor and 50,000 per node configurable, and count
+   sockets in the file-descriptor budget alongside internal
+   connections and files.
+4. **Several apps per process** (L): one supervisor owns the node's
+   three ports and routes by app, with an operator-managed hostname
+   table. Add per-app limits, accounting and suspension. This is for
+   one owner's apps and trusted tenants, not hostile-tenant isolation
+   ([security](docs/security.md)). The website moves onto the fleet
+   after this is demonstrated.
+5. **Rate limits** (M): declarative per-node limits in
+   `wasmkeep.toml`, with visible refusals and a worked rate-limiter
+   pattern. Flood and DDoS protection stay at the CDN.
+6. **A shorter path from code to a running app** (M): typed
+   TypeScript actor clients, structured errors, one framework
+   quickstart, and task-shaped inspection and recovery guides.
+   Write "What saved means" and "Designing for hot actors" alongside
+   the implementation.
 
-Then **a change feed**: the changes to actors' databases, in order, to
-DuckDB, Parquet files or PostgreSQL, for analytics across many actors.
+Correctness fixes are part of this work, especially
+bucket consistency checks, incomplete request bodies, execution
+deadlines and host-memory bounds. Each affected change carries a
+focused regression test.
 
-Each release's notes say whether its upgrade is rolling (one node at a
-time) or stops the cluster; `0.4.0` stopped it, once, for its migration,
-`0.4.1` rolls from `0.4.0`, and `0.4.2` from `0.4.1`.
+Before release: publish strict and batched soak results, latency and
+bucket-request measurements, a verified backup and single-actor
+restore, and the big-room baseline. Demonstrate app separation,
+three-port routing and bounded overload.
+
+CI stays small on each merge. The full suite runs nightly and before
+a release; real-bucket soaks and benchmarks qualify the release
+candidate. Release notes state whether upgrading rolls one node at a
+time or requires a coordinated restart.
 
 ## Next
 
-`0.5.0`: **several apps on the same nodes.** For one owner's apps and for
-tenants the operator trusts: the limits are protection against a noisy
-neighbour, not isolation from a hostile one
-([security](docs/security.md)).
+`0.6.0`: **files, analytics and larger rooms.** Build on the same
+multi-app runtime, in this order.
 
-1. **One socket for several actors**: a client opens one WebSocket and the
-   front subscribes it to several actors (its rooms, its notifications),
-   each a channel on that socket. Actors see ordinary sockets, and a slow
-   actor does not hold up the others.
-2. **Several apps per process**, and a table from hostname to app kept by
-   the operator.
-3. **Limits per app** on each node, and suspending an app.
-4. **Rebalancing, first at wake-up**: an actor wakes on a node with
-   room, not only where its request arrived, starting by moving actors
-   that are asleep. Most actors sleep most of the time, so this spreads
-   load without moving anything that is running.
-5. **Rebalancing running actors**: automatic moves, slowly and within
-   limits, if placement at wake-up is not enough. Until then a node that
-   joins or comes back fills up as actors sleep and wake, and an operator
-   moves an actor or drains a node ([how](docs/cluster.md)).
-6. **More buckets**: Google Cloud Storage and Azure Blob storage beside
-   S3-compatible stores, each checked by `cluster diagnose`
-   ([ADR 0031](docs/adr/0031-google-cloud-storage-and-azure-blob-buckets.md),
-   proposed).
+1. **Files and static assets** (L)
+   ([ADR 0030](docs/adr/0030-files-and-static-assets.md)): app-scoped
+   files, direct browser uploads and downloads, and static assets
+   shipped with `wasmkeep deploy`. Paths without a file pass to the
+   front, a single-page app's `index.html`, or a 404 page. Routing
+   and redirects stay in front code. File deletion, backup and
+   restoration are part of the feature.
+2. **A change feed** (L): resumable changes to actors' databases,
+   ordered within each actor, with explicit schema, retention,
+   deletion and restore behavior. Start with Parquet output and a
+   DuckDB guide. PostgreSQL is the next sink, or the first if a
+   concrete user needs it; all sinks are not a release requirement.
+3. **One directory for the scaling patterns** (L): start with
+   broadcast groups and fan-out trees whose layers grow and shrink
+   within configured limits. Measure them against the big-room
+   baseline, including slow clients, reconnects and failed nodes.
+   Aggregation trees and sharding with resharding will reuse this
+   directory, rather than each inventing another one.
+4. **Rebalancing, first at wake-up** (M): place an actor on a node
+   with room, accounting for app limits and sockets. Nodes that join
+   or return fill as actors sleep and wake. Running actors stay
+   where they are unless an operator moves them or drains a node
+   ([how](docs/cluster.md)).
+5. **Inspection and application clients** (M): an authenticated,
+   read-only inspector, typed Rust clients alongside TypeScript,
+   and a complete framework example with reconnect and recovery.
+   Extend "Designing for hot actors" with the measured scaling
+   patterns.
 
-An actor runs on one node at a time, by design: a single actor that is too
-busy is split into more actors by its application, not by the platform.
+An actor still runs on one node at a time. A hot application's work
+is split among actors by an explicit pattern, not by making one
+actor execute on several nodes.
+
+Before release: demonstrate file lifecycle and restoration, feed
+resume and gap detection, a measured large logical room, and useful
+wake-up placement. Publish throughput, latency, memory, file
+descriptors and failure behavior with the workload and limits.
 
 ## After that
 
@@ -80,8 +129,7 @@ Not before the releases above.
   cluster, and a new bucket format is written only once every node reads
   it.
 - **Faster, and compared.** Performance targets on dedicated hardware
-  with a stated scale envelope; a plain write that does not hold its
-  actor during the upload; the comparison with celld on a cloud bucket
+  with a stated scale envelope; the comparison with celld on a cloud bucket
   with a node per machine
   ([one machine is measured](docs/compared-with-celld.md)); a run against
   AWS S3.
@@ -90,8 +138,6 @@ Not before the releases above.
   ([tiers](docs/languages.md)). Java, Kotlin and PHP cannot produce an
   actor yet, and languages that need Wasm garbage collection wait on a
   decision of their own.
-- **Client libraries** for calling actors from existing native apps (Go,
-  Java, Python, Node, Rust).
 - Ideas, each needing a design first: encrypting actor state in the
   bucket, composing components
   at deploy time, and loading a component at run time (a user's plugin,
@@ -102,41 +148,41 @@ Not before the releases above.
 
 ## Later, on demand
 
-Each waits for a user who needs it.
+These do not block `0.5.0` or `0.6.0`. Each needs a concrete workload
+or an explicit owner decision.
 
-- **Multi-region**: a cluster and bucket per region, each actor with a home
-  region. Until then, keep a cluster in one region, close to its bucket
+- **The rest of the scaling family**: aggregation trees (M/L), and
+  sharding with controlled resharding (L), on the shared directory.
+  Automatic resharding follows only if needed.
+- **More change-feed sinks** (M): PostgreSQL and further DuckDB
+  integration, using the same ordering and resume contract.
+- **Automatic moves of running actors** (L), slowly and within
+  limits, only if placement at wake-up is not enough.
+- **One socket for several actors** (M/L), with independent
+  backpressure and reconnect behavior for each channel.
+- **External databases and brokers through `wasmkeep:connect`**
+  (L for the first connector): PostgreSQL, Redis or Valkey, MySQL
+  and NATS, when a user needs them
+  ([ADR 0032](docs/adr/0032-external-databases-and-brokers.md)).
+- **Google Cloud Storage and Azure Blob Storage** (L) are on hold
+  until the owner says otherwise
+  ([ADR 0031](docs/adr/0031-google-cloud-storage-and-azure-blob-buckets.md)).
+- **Isolation tiers per app** (L each): a sandboxed process per app,
+  then a launcher supplied by the operator for a microVM or another
+  isolation system. Both reuse the supervisor and the same three
+  ports, with local sockets between processes. WasmKeep does not
+  manage microVMs or choose a tenant's tier. Each tier documents
+  what it protects against.
+- **Whole-app point-in-time restore** (L), with an explicit
+  cross-actor consistency contract.
+- **Multi-region** (L): an actor's home region, a cluster and bucket
+  per region. Until then, keep a cluster near its bucket
   ([why](docs/deploy/three-nodes.md#one-region)).
-- **Native key-value and queue interfaces**, if the SDK patterns fall
-  short.
-- **Vector search** in an actor's SQLite database.
-- **External databases and brokers**: connectors from actors and fronts
-  to PostgreSQL, Redis or Valkey, MySQL and NATS servers the operator
-  runs, beyond what outbound HTTP reaches
-  ([ADR 0032](docs/adr/0032-external-databases-and-brokers.md), proposed).
-- **Cron triggers** (alarms cover them today) and optional built-ins: TLS
-  termination, a Helm chart. Until static assets ship, serve them from
-  the [front door](docs/deploy/front-door.md#static-files).
-- **Isolation tiers per app**, after `0.5.0`'s several apps on the same
-  nodes. The operator picks a tier per app, and actors and their API are
-  the same in every tier:
-  - **shared**: the default, every app's actors in one node process,
-    with per-app limits against a noisy neighbour;
-  - **a process per app**: each app in its own sandboxed WasmKeep
-    process (its own user, seccomp, namespaces), with its own bucket
-    prefix and credentials;
-  - **a launcher**: the node starts an app's process through a command
-    the operator provides, so an app can run inside a microVM
-    (Firecracker), Kata Containers or gVisor.
-
-  WasmKeep does not manage microVMs, and does not decide which tenant
-  gets which tier: that belongs to whatever platform runs it.
-  Every tier uses the node's same three ports: the node routes to an
-  app's process over local sockets, so isolating an app opens no new
-  port. Each tier will come with what it does and does not protect
-  against in [security](docs/security.md).
-- **M5, raw Linux workloads**: tenants that need a Linux program rather
-  than a component, behind the same routing and storage API.
+- **Other demand-led work** (S–L): additional client and guest
+  languages, native key-value or queue interfaces, vector search,
+  cron triggers, built-in TLS and a Helm chart.
+- **M5, raw Linux workloads** (L): programs rather than components,
+  behind the same routing and storage API.
 
 ## Not planned
 

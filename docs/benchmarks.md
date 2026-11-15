@@ -943,12 +943,14 @@ From [`…-0f2986f-soak-r2.csv`](../bench/results/2026-11-07-0f2986f-soak-r2.csv
   30 minutes, and a cluster's bill grew with how long actors stay in
   memory, not with what they do. OVHcloud does not bill requests.
   [ADR 0020](adr/0020-one-lease-per-node.md) replaced them with one lease
-  per node; request counts since are not measured.
+  per node. That R2 workload has not been remeasured with node leases;
+  later OVHcloud runs above report PUT counts, and the idle measurement
+  below records requests separately.
 
 ### Bucket requests at rest
 
-The same three VPS and bucket, on `0bf0547` (the 0.4.1 code), with no
-requests for ten minutes (602 s), read from
+**Measured on 0.4.1.** The same three VPS and bucket, on `0bf0547`
+(the 0.4.1 code), with no requests for ten minutes (602 s), read from
 `wasmkeep_bucket_requests_total` on each node
 ([`…-0bf0547-idle-bucket-requests-ovh-bhs-3vps-10min.csv`](../bench/results/2026-11-14-0bf0547-idle-bucket-requests-ovh-bhs-3vps-10min.csv)).
 Per node and second: 0.334 PUT (the node lease), 1.10 LIST and 1.33 GET.
@@ -962,10 +964,21 @@ and reads each node's record, and lists the drain and move intents, every
 The secrets read was not counted when this was measured, so the GETs
 requested were about 1.67 per second; it is counted since.
 
-Three nodes at rest therefore make about 2.6 million PUTs, 8.6 million
-LISTs and 13 million GETs in a 30-day month. A bucket that bills per
-request bills a LIST like a PUT, so this is a floor under the bill before
-any traffic; a bucket that does not bill requests charges nothing for it.
+Extrapolating this 0.4.1 scenario to three nodes at rest gives about
+2.6 million PUTs, 8.6 million LISTs and 13 million GETs in a 30-day month.
+A bucket that bills per request bills a LIST like a PUT, so this is a
+floor under the bill before
+any traffic in that version and scenario; a bucket that does not bill
+requests charges nothing for it.
+
+**Modeled for 0.4.2, not remeasured here.** The
+[documented cadence](cluster.md#what-an-idle-cluster-asks-of-the-bucket)
+for an idle three-node, one-app cluster implies approximately 0.333 PUT,
+0.1 LIST and 2.333 GET per node-second, excluding the optional idle-expiry
+scan. These are derived rates, not observations from the CSV above.
+The roughly thirteenfold reduction in LIST cadence is a model comparison,
+not a new measurement obtained by dividing the old result. A measurement
+of the released binary is still needed to validate these cost inputs.
 
 ## The allocator: system against mimalloc
 
@@ -1016,8 +1029,8 @@ Native is `cargo build --release` on the workstation (it needs glibc
 
 - **The glibc 2.28 build is as fast as the native one**, on every row
   within the rounds' spread, and runs on any x86_64 Linux with glibc 2.28
-  or newer (RHEL 8, Debian 10, Ubuntu 20.04 and later). It is the
-  candidate for release binaries.
+  or newer (RHEL 8, Debian 10, Ubuntu 20.04 and later). Release binaries
+  use this glibc 2.28-compatible build.
 - **A static musl build is slower**: 2.3 times the CPU per request, under
   half the throughput, twice the startup. musl's own allocator is most of
   it: with mimalloc the gap narrows to 14% more CPU per request and 13%

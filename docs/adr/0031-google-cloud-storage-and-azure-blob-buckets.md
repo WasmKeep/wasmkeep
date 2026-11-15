@@ -6,7 +6,8 @@
   read on 2026-11-14. Only the real test in Verification, run from
   inside each provider's network, can accept it.
 - Date: 2026-11-14
-- Milestone: [Next](../../ROADMAP.md#next), `0.5.0`, item 6, "More buckets"
+- Milestone: [Later, on demand](../../ROADMAP.md#later-on-demand),
+  on hold until the owner authorizes it; not part of `0.5.0` or `0.6.0`
 - Follows: [ADR 0005](0005-replication-format-ltx-v3.md) and
   [ADR 0007](0007-replication-protocol.md) (replication),
   [ADR 0009](0009-alarms-in-a-cluster.md) (the alarm index),
