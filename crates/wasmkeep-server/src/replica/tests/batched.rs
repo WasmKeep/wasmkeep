@@ -76,7 +76,7 @@ fn write(db: &mut ActorDb, v: &str) -> WalBoundary {
 async fn start(r: &mut Replica, db: &mut ActorDb, budget: &UploadBudget) -> SegmentId {
     let plan = db.next_bounded_capture().unwrap();
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
-    r.prepare(plan, permit).unwrap().hand_off(db).unwrap()
+    r.prepare(plan, permit).await.unwrap().hand_off(db).unwrap()
 }
 
 /// Waits for the segment in flight to land, then applies it.
@@ -172,12 +172,12 @@ async fn segments_are_acknowledged_in_order_and_chain() {
             write(&mut db, "first");
         }
         let b = write(&mut db, &format!("row {i}"));
-        let mut waiter = Box::pin(r.wait_acknowledged(b.sequence));
+        let mut waiter = Box::pin(r.wait_acknowledged(b));
         let id = start(&mut r, &mut db, &budget).await;
         assert_eq!(id.txid, last.txid + 1);
         assert_eq!(r.captured().0, id, "captured position: the segment's end");
         assert_eq!(r.acknowledged_position().0, last, "acknowledged: before it");
-        assert!(!r.acknowledged_covers(b.sequence));
+        assert!(!r.acknowledged_covers(b));
         // Landed or not, the waiter waits for the acknowledgement.
         tokio::time::timeout(PATIENCE, r.landed()).await.unwrap();
         assert!(pending(&mut waiter).await, "woken at capture");
@@ -186,7 +186,7 @@ async fn segments_are_acknowledged_in_order_and_chain() {
         last = r.head();
         assert_eq!(r.head(), id);
         assert_eq!(r.captured(), r.acknowledged_position());
-        assert!(r.acknowledged_covers(b.sequence));
+        assert!(r.acknowledged_covers(b));
         waiter.await.unwrap();
         assert_eq!(bucket_head(&r).await, id);
         assert!(r.uploader_idle());
@@ -203,7 +203,7 @@ async fn segments_are_acknowledged_in_order_and_chain() {
     let plan = db.next_bounded_capture().unwrap();
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
     assert!(matches!(
-        r.prepare(plan, permit),
+        r.prepare(plan, permit).await,
         Err(ReplicaError::Refused(m)) if m.contains("in flight")
     ));
     assert!(r.failed().is_some());
@@ -235,7 +235,7 @@ async fn a_cut_never_interrupts_the_hand_off() {
     write(&mut db, "cut");
     let plan = db.next_bounded_capture().unwrap();
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
-    let ticket = r.prepare(plan, permit).unwrap();
+    let ticket = r.prepare(plan, permit).await.unwrap();
     // As `ActorHost::with_db`: the step runs on the database's worker, and
     // the event's wait for it is what a cut cancels.
     let mut step = tokio::task::spawn_blocking(move || {
@@ -282,14 +282,20 @@ async fn a_put_landing_after_a_cut_is_late() {
     let sidecar = sidecar_of(&r);
     store.gate_next.store(1, SeqCst);
     let b = write(&mut db, "late");
-    let waiter = r.wait_acknowledged(b.sequence);
+    let waiter = r.wait_acknowledged(b);
     let mut flag = r.failure_flag();
     start(&mut r, &mut db, &budget).await;
     // The hold is cut while the PUT is in flight; then the PUT lands.
     validity.invalidate();
     store.open_gate();
     flag.wait_for(Option::is_some).await.unwrap();
-    assert_eq!(*flag.borrow(), Some(UploadFailure::Late));
+    assert_eq!(
+        *flag.borrow(),
+        Some(crate::replica::batched::Stop {
+            reason: UploadFailure::Late,
+            batched: true
+        })
+    );
     assert!(waiter.await.is_err(), "a waiter fails with the upload");
     assert!(matches!(land(&mut r).await, Err(ReplicaError::Late)));
     assert_eq!(r.head(), head, "not acknowledged");
@@ -326,23 +332,29 @@ async fn an_upload_failure_drops_what_is_pending() {
     let sidecar = sidecar_of(&r);
     store.fail_next.store(u32::MAX, SeqCst);
     let a = write(&mut db, "a");
-    let wa = r.wait_acknowledged(a.sequence);
+    let wa = r.wait_acknowledged(a);
     start(&mut r, &mut db, &budget).await;
     let b = write(&mut db, "b");
-    let wb = r.wait_acknowledged(b.sequence);
+    let wb = r.wait_acknowledged(b);
     let mut flag = r.failure_flag();
     tokio::time::timeout(PATIENCE, flag.wait_for(Option::is_some))
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(*flag.borrow(), Some(UploadFailure::Bucket(_))));
+    assert!(matches!(
+        *flag.borrow(),
+        Some(crate::replica::batched::Stop {
+            reason: UploadFailure::Bucket(_),
+            batched: true
+        })
+    ));
     assert!(wa.await.is_err());
     assert!(wb.await.is_err());
     // Not applied yet, and still no capture.
     let plan = db.next_bounded_capture().unwrap();
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
     assert!(matches!(
-        r.prepare(plan, permit),
+        r.prepare(plan, permit).await,
         Err(ReplicaError::Local(m)) if m.contains("replication stopped")
     ));
     assert!(db.has_pending_boundaries(), "nothing captured");
@@ -350,7 +362,7 @@ async fn an_upload_failure_drops_what_is_pending() {
     assert!(r.failed().is_some());
     assert!(!r.uploader_idle());
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
-    assert!(r.prepare(plan, permit).is_err());
+    assert!(r.prepare(plan, permit).await.is_err());
     assert_eq!(r.head(), head);
     assert_eq!(sidecar_of(&r), sidecar);
     assert_eq!(budget.available(), budget.total(), "its bytes are freed");
@@ -382,7 +394,7 @@ async fn a_completion_after_a_reacquire_does_not_apply() {
     let (head, sum) = old.acknowledged_position();
     store.gate_next.store(1, SeqCst);
     let b = write(&mut db, "old hold");
-    let waiter = old.wait_acknowledged(b.sequence);
+    let waiter = old.wait_acknowledged(b);
     let mut old_flag = old.failure_flag();
     start(&mut old, &mut db, &budget).await;
     // Abandoned: the old hold's lease view lapses, its replica dropped.
@@ -408,13 +420,19 @@ async fn a_completion_after_a_reacquire_does_not_apply() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(*old_flag.borrow(), Some(UploadFailure::Late));
+    assert_eq!(
+        *old_flag.borrow(),
+        Some(crate::replica::batched::Stop {
+            reason: UploadFailure::Late,
+            batched: true
+        })
+    );
     assert_eq!(new.apply().await.unwrap(), Applied::Nothing);
     assert_eq!(new.acknowledged_position(), (head, sum));
     assert_eq!(sidecar_of(&new), sidecar);
     assert!(new.uploader_idle());
     assert!(new.failure_flag().borrow().is_none());
-    assert!(!new.acknowledged_covers(b.sequence));
+    assert!(!new.acknowledged_covers(b));
     drop(hold);
     drop(db);
 }
@@ -489,7 +507,11 @@ async fn an_oversize_segment_charges_the_cap_until_its_put_ends() {
     store.gate_next.store(1, SeqCst);
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
     assert_eq!(permit.charged(), 1024, "the cap, not its size");
-    r.prepare(plan, permit).unwrap().hand_off(&mut db).unwrap();
+    r.prepare(plan, permit)
+        .await
+        .unwrap()
+        .hand_off(&mut db)
+        .unwrap();
     assert!(r.in_flight_oversize());
     assert_eq!(r.in_flight_events(), 1);
     assert_eq!(budget.available(), budget.total() - 1024);
@@ -691,7 +713,7 @@ async fn a_ticket_dropped_before_its_capture_takes_nothing() {
     let b = write(&mut db, "row");
     let plan = db.next_bounded_capture().unwrap();
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
-    drop(r.prepare(plan, permit).unwrap());
+    drop(r.prepare(plan, permit).await.unwrap());
     assert_eq!(budget.available(), budget.total());
     assert_eq!(r.apply().await.unwrap(), Applied::Abandoned);
     assert!(r.uploader_idle());
@@ -699,11 +721,11 @@ async fn a_ticket_dropped_before_its_capture_takes_nothing() {
     assert!(db.has_pending_boundaries(), "nothing consumed");
     // Dropped again, then a prepare without an apply in between.
     let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
-    drop(r.prepare(plan, permit).unwrap());
+    drop(r.prepare(plan, permit).await.unwrap());
     let id = start(&mut r, &mut db, &budget).await;
     assert_eq!(id.txid, head.txid + 1);
     assert_eq!(land(&mut r).await.unwrap(), Applied::Acknowledged(id));
-    assert!(r.acknowledged_covers(b.sequence));
+    assert!(r.acknowledged_covers(b));
     assert_eq!(restored(&r, dir.path()).await, r.acknowledged_position().1);
     drop(hold);
     drop(db);
@@ -739,7 +761,7 @@ async fn a_capture_that_does_not_chain_is_refused() {
         };
         let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
         let flag = r.failure_flag();
-        let handed = r.prepare(plan, permit).unwrap().hand_off(&mut db);
+        let handed = r.prepare(plan, permit).await.unwrap().hand_off(&mut db);
         let why = match handed {
             Err(ReplicaError::Local(m)) => m,
             other => panic!("stale {stale}: {other:?}"),
@@ -777,7 +799,7 @@ async fn a_segment_that_landed_unanswered_is_acknowledged_once() {
     assert_eq!(land(&mut r).await.unwrap(), Applied::Acknowledged(id));
     assert_eq!(store.puts.load(SeqCst), 2, "sent again once");
     assert_eq!(r.apply().await.unwrap(), Applied::Nothing, "applied once");
-    assert!(r.acknowledged_covers(b.sequence));
+    assert!(r.acknowledged_covers(b));
     assert_eq!(sidecar_of(&r), names_head(&r));
     drop(hold);
     drop(db);
@@ -788,39 +810,42 @@ async fn a_segment_that_landed_unanswered_is_acknowledged_once() {
 /// a time) and wakes them. The sidecar is never ahead meanwhile.
 ///
 /// Model: `Switch::SidecarBeforeAck` (`Violation::SidecarAhead`).
-#[tokio::test]
-async fn an_apply_cut_while_writing_the_sidecar_is_finished_by_the_next() {
-    let dir = tempfile::tempdir().unwrap();
-    let Actor {
-        mut r,
-        store: _store,
-        mut db,
-        hold,
-    } = actor(dir.path(), 1 << 30).await;
-    let budget = UploadBudget::node();
-    let before = sidecar_of(&r);
-    let b = write(&mut db, "row");
-    let waiter = r.wait_acknowledged(b.sequence);
-    let id = start(&mut r, &mut db, &budget).await;
-    tokio::time::timeout(PATIENCE, r.landed()).await.unwrap();
-    // Polled once, then cut: usually at the sidecar write.
-    if tokio::time::timeout(Duration::ZERO, r.apply())
-        .await
-        .is_err()
-    {
-        assert_eq!(r.head(), id, "the head moved before the write");
-        assert!(!r.uploader_idle(), "the sidecar is still due");
-        assert!(!r.acknowledged_covers(b.sequence));
-        let side = sidecar_of(&r);
-        assert!(side == before || side == names_head(&r), "{side:?}");
-    }
-    assert_eq!(r.apply().await.unwrap(), Applied::Nothing);
-    assert!(r.uploader_idle());
-    assert!(r.acknowledged_covers(b.sequence));
-    assert_eq!(sidecar_of(&r), names_head(&r));
-    waiter.await.unwrap();
-    drop(hold);
-    drop(db);
+#[test]
+fn an_apply_cut_while_writing_the_sidecar_is_finished_by_the_next() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let Actor {
+                mut r,
+                store: _store,
+                mut db,
+                hold,
+            } = actor(dir.path(), 1 << 30).await;
+            let budget = UploadBudget::node();
+            let before = sidecar_of(&r);
+            let b = write(&mut db, "row");
+            let waiter = r.wait_acknowledged(b);
+            let id = start(&mut r, &mut db, &budget).await;
+            tokio::time::timeout(PATIENCE, r.landed()).await.unwrap();
+            cut_apply(&mut r).await;
+            assert_eq!(r.head(), id);
+            assert_eq!(r.captured_sequence(), Some(b));
+            assert!(!r.uploader_idle());
+            assert!(!r.acknowledged_covers(b));
+            let side = sidecar_of(&r);
+            assert!(side == before || side == names_head(&r));
+            assert_eq!(r.apply().await.unwrap(), Applied::Nothing);
+            assert!(r.uploader_idle());
+            assert!(r.acknowledged_covers(b));
+            assert_eq!(sidecar_of(&r), names_head(&r));
+            waiter.await.unwrap();
+            drop(hold);
+            drop(db);
+        });
 }
 
 /// A waiter fails when replication stops for any reason, not only a failed
@@ -835,7 +860,8 @@ async fn a_waiter_fails_when_a_guard_stops_replication() {
         hold,
     } = actor(dir.path(), 1 << 30).await;
     let b = write(&mut db, "row");
-    let waiter = r.wait_acknowledged(b.sequence);
+    let waiter = r.wait_acknowledged(b);
+    let flag = r.failure_flag();
     let moved = super::changes(DbChecksum::from_value(1));
     assert!(matches!(
         r.ship_snapshot(&moved, SnapshotKind::Periodic).await,
@@ -847,65 +873,338 @@ async fn a_waiter_fails_when_a_guard_stops_replication() {
             .unwrap()
             .is_err()
     );
+    assert!(flag.borrow().as_ref().unwrap().batched);
     drop(hold);
     drop(db);
 }
 
-/// Boundary sequences start over when the capture restarts: a replica
-/// told so counts in a new epoch (a waiter of the old one resolves only on
-/// what the old one acknowledged); one not told refuses the first plan
-/// whose sequence it already acknowledged, rather than letting a waiter
-/// take an old acknowledgement for a new boundary.
+/// Storage stamps each restarted capture with a new session. Neither an
+/// unseen multi-boundary restart nor two restarts can confuse old waiters.
 ///
 /// Model: `Switch::FlushCaptured`'s rule, that a flush resolves only on
 /// its own acknowledgement (`Violation::DurableLost`).
 #[tokio::test]
 async fn a_capture_restarted_counts_boundaries_again() {
-    for told in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let Actor {
-            mut r,
-            store: _store,
-            mut db,
-            hold,
-        } = actor(dir.path(), 1 << 30).await;
-        let budget = UploadBudget::node();
-        let a = write(&mut db, "a");
-        let old = r.wait_acknowledged(a.sequence);
-        let never = r.wait_acknowledged(a.sequence + 1);
-        start(&mut r, &mut db, &budget).await;
-        land(&mut r).await.unwrap();
-        // A `Flushed` barrier, then the capture starts again.
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        mut db,
+        hold,
+        ..
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let a = write(&mut db, "a");
+    let old = r.wait_acknowledged(a);
+    let never = r.wait_acknowledged(WalBoundary {
+        sequence: a.sequence + 1,
+        ..a
+    });
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    let mut hold = hold;
+    for n in 0..2 {
         db.finish_batched_capture().unwrap();
         drop(hold);
         db.start_capture().unwrap();
-        let hold = CaptureHold::default();
+        hold = CaptureHold::default();
         db.enable_batched_capture(&hold).unwrap();
         let b = write(&mut db, "b");
-        assert!(b.sequence <= a.sequence, "sequences started over");
-        let plan = db.next_bounded_capture().unwrap();
-        let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
-        if !told {
-            assert!(matches!(
-                r.prepare(plan, permit),
-                Err(ReplicaError::Refused(m)) if m.contains("already acknowledged")
-            ));
-            drop(hold);
-            drop(db);
-            continue;
-        }
-        r.capture_restarted().unwrap();
-        old.await.unwrap();
-        assert!(never.await.is_err(), "never acknowledged in its epoch");
-        assert!(!r.acknowledged_covers(b.sequence));
-        let mut waiter = Box::pin(r.wait_acknowledged(b.sequence));
-        let id = r.prepare(plan, permit).unwrap().hand_off(&mut db).unwrap();
-        tokio::time::timeout(PATIENCE, r.landed()).await.unwrap();
-        assert!(pending(&mut waiter).await);
-        assert_eq!(r.apply().await.unwrap(), Applied::Acknowledged(id));
+        write(&mut db, "c");
+        assert_ne!(a.session, b.session);
+        assert!(!r.acknowledged_covers(b));
+        let mut waiter = Box::pin(r.wait_acknowledged(b));
+        assert!(pending(&mut waiter).await, "restart {n}");
+        assert_eq!(db.next_bounded_capture().unwrap().boundaries, 2);
+        start(&mut r, &mut db, &budget).await;
+        land(&mut r).await.unwrap();
         waiter.await.unwrap();
-        assert_eq!(restored(&r, dir.path()).await, r.acknowledged_position().1);
+    }
+    old.await.unwrap();
+    assert!(never.await.is_err());
+    drop(hold);
+    drop(db);
+}
+
+#[tokio::test]
+async fn hand_off_after_stop_or_lapse_consumes_nothing() {
+    for lapse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let Actor {
+            mut r,
+            mut db,
+            hold,
+            store,
+        } = actor(dir.path(), 1 << 30).await;
+        let (view, validity) = LeaseView::lapsable(1);
+        r.lease = view;
+        write(&mut db, "row");
+        let plan = db.next_bounded_capture().unwrap();
+        let budget = UploadBudget::node();
+        let ticket = r
+            .prepare(
+                plan,
+                budget.reserve(plan.boundary.estimated_bytes).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let puts = store.puts.load(SeqCst);
+        if lapse {
+            validity.invalidate();
+        } else {
+            r.fail("stopped before capture");
+        }
+        assert!(ticket.hand_off(&mut db).is_err());
+        assert_eq!(db.next_bounded_capture(), Some(plan));
+        assert_eq!(r.apply().await.unwrap(), Applied::Abandoned);
+        assert_eq!(store.puts.load(SeqCst), puts);
+        assert_eq!(budget.available(), budget.total());
         drop(hold);
         drop(db);
     }
+}
+
+#[tokio::test]
+async fn permit_is_freed_when_landed_without_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        mut db,
+        hold,
+        ..
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    write(&mut db, "row");
+    start(&mut r, &mut db, &budget).await;
+    r.landed().await;
+    assert_eq!(budget.available(), budget.total());
+    assert!(!r.uploader_idle());
+    drop(hold);
+    drop(db);
+}
+
+#[tokio::test]
+async fn prepare_checks_snapshot_and_permit_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        mut db,
+        hold,
+        ..
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    write(&mut db, "row");
+    let plan = db.next_bounded_capture().unwrap();
+    r.needs_snapshot = true;
+    assert!(
+        r.prepare(
+            plan,
+            budget.reserve(plan.boundary.estimated_bytes).await.unwrap()
+        )
+        .await
+        .is_err()
+    );
+    r.needs_snapshot = false;
+    assert!(
+        r.prepare(plan, budget.reserve(1).await.unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(db.next_bounded_capture(), Some(plan));
+    assert!(r.uploader_idle());
+    drop(hold);
+    drop(db);
+}
+
+#[tokio::test]
+async fn apply_after_stop_does_not_acknowledge() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        mut db,
+        hold,
+        ..
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let b = write(&mut db, "row");
+    let before = sidecar_of(&r);
+    start(&mut r, &mut db, &budget).await;
+    r.landed().await;
+    r.fail("stopped before apply");
+    assert!(r.apply().await.is_err());
+    assert_eq!(sidecar_of(&r), before);
+    assert!(!r.acknowledged_covers(b));
+    assert!(r.wait_acknowledged(b).await.is_err());
+    drop(hold);
+    drop(db);
+}
+
+#[test]
+fn every_guard_finishes_a_cut_sidecar() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            for guard in ["prepare", "snapshot", "reset", "strict", "restart"] {
+                let dir = tempfile::tempdir().unwrap();
+                let Actor {
+                    mut r,
+                    mut db,
+                    hold,
+                    ..
+                } = actor(dir.path(), 1 << 30).await;
+                let budget = UploadBudget::node();
+                let b = write(&mut db, "row");
+                start(&mut r, &mut db, &budget).await;
+                r.landed().await;
+                cut_apply(&mut r).await;
+                assert_eq!(r.captured_sequence(), Some(b));
+                let all = db.snapshot().unwrap();
+                match guard {
+                    "prepare" => {
+                        write(&mut db, "next");
+                        let plan = db.next_bounded_capture().unwrap();
+                        drop(
+                            r.prepare(
+                                plan,
+                                budget.reserve(plan.boundary.estimated_bytes).await.unwrap(),
+                            )
+                            .await
+                            .unwrap(),
+                        );
+                    }
+                    "snapshot" => {
+                        r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap();
+                    }
+                    "reset" => {
+                        r.ship_reset(all).await.unwrap();
+                    }
+                    "strict" => {
+                        let changes = wasmkeep_storage::wal::Changes {
+                            pre_apply: r.checksum,
+                            ..all
+                        };
+                        r.ship(&changes).await.unwrap();
+                    }
+                    _ => {
+                        r.capture_restarted().await.unwrap();
+                    }
+                }
+                assert!(r.acknowledged_covers(b), "{guard}");
+                r.settle_abandoned();
+                assert!(r.uploader_idle());
+                assert_eq!(sidecar_of(&r), names_head(&r));
+                assert!(r.failed().is_none());
+                drop(hold);
+                drop(db);
+            }
+        });
+}
+
+#[tokio::test]
+async fn panic_inside_capture_fails_instead_of_abandoning() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        mut db,
+        hold,
+        ..
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    write(&mut db, "row");
+    let plan = db.next_bounded_capture().unwrap();
+    let ticket = r
+        .prepare(
+            plan,
+            budget.reserve(plan.boundary.estimated_bytes).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    let flag = r.failure_flag();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ticket.hand_off_with(|| {
+            db.take_bounded_changes(plan).unwrap();
+            panic!("capture consumed WAL, then panicked");
+        })
+    }));
+    assert!(panic.is_err());
+    assert!(flag.borrow().is_some());
+    assert!(r.apply().await.is_err());
+    assert_eq!(budget.available(), budget.total());
+    drop(hold);
+    drop(db);
+}
+
+#[tokio::test]
+async fn fork_tripwire_refuses_a_capture_ahead_of_acknowledged_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        mut db,
+        hold,
+        ..
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    write(&mut db, "row");
+    let plan = db.next_bounded_capture().unwrap();
+    let mut ticket = r
+        .prepare(
+            plan,
+            budget.reserve(plan.boundary.estimated_bytes).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    // A second capture started against the captured position before that
+    // position was acknowledged: the chain matches, but the fork guard must fail.
+    ticket.acknowledged = DbChecksum::from_value(r.checksum.value() ^ 1);
+    assert!(
+        matches!(ticket.hand_off(&mut db), Err(ReplicaError::Local(m)) if m.contains("acknowledged head"))
+    );
+    assert!(r.failure_flag().borrow().is_some());
+    assert_eq!(bucket_head(&r).await, r.head());
+    drop(hold);
+    drop(db);
+}
+
+#[tokio::test]
+async fn an_acknowledged_plan_cannot_be_prepared_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        mut db,
+        hold,
+        ..
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    write(&mut db, "row");
+    let plan = db.next_bounded_capture().unwrap();
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    assert!(
+        matches!(r.prepare(plan, budget.reserve(plan.boundary.estimated_bytes).await.unwrap()).await,
+        Err(ReplicaError::Refused(m)) if m.contains("already acknowledged"))
+    );
+    drop(hold);
+    drop(db);
+}
+
+/// Queue the sidecar behind a blocked worker so a single poll always cuts
+/// apply at the join, even when the filesystem completes writes immediately.
+async fn cut_apply(r: &mut Replica) {
+    let (release, wait) = std::sync::mpsc::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let blocker = tokio::task::spawn_blocking(move || {
+        started.send(()).unwrap();
+        wait.recv().unwrap();
+    });
+    ready.await.unwrap();
+    let mut apply = Box::pin(r.apply());
+    let pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(apply.as_mut().poll(cx).is_pending()))
+            .await;
+    drop(apply);
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    assert!(pending, "apply was cut at the sidecar write");
 }

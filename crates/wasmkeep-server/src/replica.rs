@@ -1055,6 +1055,7 @@ impl Replica {
         all: &Changes,
         kind: SnapshotKind,
     ) -> Result<bool, ReplicaError> {
+        self.finish_sidecar().await?;
         let position = match kind {
             SnapshotKind::First => SegmentId {
                 generation: self.generation,
@@ -1101,22 +1102,23 @@ impl Replica {
                 }
             };
         }
-        self.failed = Some("an upload was interrupted".into());
+        self.fail("an upload was interrupted");
         if let Err(e) = self.put_bounded(&key, bytes, "snapshot").await {
             if !matches!(e, ReplicaError::Exists) {
                 crate::metrics::inc(&crate::metrics::METRICS.snapshot_upload_failures);
             }
-            self.failed = Some(e.to_string());
+            self.fail(e.to_string());
             return Err(e);
         }
         self.head = position;
         self.needs_snapshot = false;
         self.snapshot_taken();
         if let Err(e) = self.record(all.post_apply).await {
-            self.failed = Some(e.to_string());
+            self.fail(e.to_string());
             return Err(e);
         }
         self.failed = None;
+        self.batched.shared.failure.send_replace(None);
         Ok(true)
     }
 
@@ -1155,6 +1157,11 @@ impl Replica {
 
     /// Stops replication; the actor must be given up.
     pub(crate) fn fail(&mut self, reason: impl Into<String>) {
+        // An inline upload's provisional interruption marker is replaced by
+        // its actual error; an established failure keeps its original cause.
+        if self.failed.as_deref() == Some("an upload was interrupted") {
+            self.failed = None;
+        }
         let reason = self.failed.get_or_insert_with(|| reason.into());
         // Only batched waiters listen (ADR 0034, section 4).
         self.batched.stopped(reason);
@@ -1163,6 +1170,7 @@ impl Replica {
     /// Uploads one transaction. `Ok` means durable. Refuses changes that do
     /// not follow the current head, and anything after a failure.
     pub(crate) async fn ship(&mut self, changes: &Changes) -> Result<(), ReplicaError> {
+        self.finish_sidecar().await?;
         if let Some(reason) = &self.failed {
             return Err(ReplicaError::Local(format!(
                 "replication stopped: {reason}"
@@ -1197,23 +1205,24 @@ impl Replica {
         // Marked failed until the upload is known to have succeeded, so a
         // cancelled upload (the event was cut mid-way) stops replication;
         // and in flight until it ends, which a cancelled one never does.
-        self.failed = Some("an upload was interrupted".into());
+        self.fail("an upload was interrupted");
         self.in_flight = Some(segment.id);
         let sent = self
             .put_bounded(&segment_key(&segment), bytes, "segment")
             .await;
         self.in_flight = None;
         if let Err(e) = sent {
-            self.failed = Some(e.to_string());
+            self.fail(e.to_string());
             return Err(e);
         }
         self.head = segment.id;
         self.since_snapshot += 1;
         if let Err(e) = self.record(changes.post_apply).await {
-            self.failed = Some(e.to_string());
+            self.fail(e.to_string());
             return Err(e);
         }
         self.failed = None;
+        self.batched.shared.failure.send_replace(None);
         Ok(())
     }
 
@@ -1226,6 +1235,7 @@ impl Replica {
     /// It needs no checksum guard: it chains on the acknowledged head's
     /// checksum by construction, whatever the database it replaces.
     pub(crate) async fn ship_reset(&mut self, all: Changes) -> Result<(), ReplicaError> {
+        self.finish_sidecar().await?;
         if let Some(reason) = &self.failed {
             return Err(ReplicaError::Local(format!(
                 "replication stopped: {reason}"

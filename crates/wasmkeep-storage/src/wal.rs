@@ -132,6 +132,7 @@ pub struct WalCapture {
     header: Option<WalHeader>,
     /// Running checksum after the last frame consumed.
     running: (u32, u32),
+    session: u64,
     scan: batched::BoundaryScan,
 }
 
@@ -175,7 +176,16 @@ impl WalCapture {
         }
         let mut wal_path = db_path.as_os_str().to_owned();
         wal_path.push("-wal");
+        static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let session = NEXT_SESSION
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_add(1),
+            )
+            .map_err(|_| CaptureError::Lost("capture sessions exhausted"))?;
         Ok(Self {
+            session,
             db_path: db_path.to_owned(),
             wal_path: PathBuf::from(wal_path).into(),
             page_size,

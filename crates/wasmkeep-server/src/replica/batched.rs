@@ -54,7 +54,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use wasmkeep_cluster::replication::{Segment, SegmentId, segment_key};
 use wasmkeep_storage::ActorDb;
 use wasmkeep_storage::ltx::DbChecksum;
-use wasmkeep_storage::wal::{BoundaryPlan, DEFAULT_SEGMENT_BYTES};
+use wasmkeep_storage::wal::{BoundaryPlan, DEFAULT_SEGMENT_BYTES, WalBoundary};
 
 use super::{Replica, ReplicaError, UploadTarget};
 
@@ -214,19 +214,28 @@ enum Slot {
 /// The flag is raised by every batched failure: the upload task's, a
 /// failed hand-off, and the uploader's own refusals and failed applies
 /// (a completion that is not this hold's, a sidecar that cannot be
-/// written). Strict's inline failures never raise it.
+/// written). Strict inline stops use the same watch with `batched: false`.
 #[derive(Debug)]
-struct Shared {
+pub(super) struct Shared {
+    active: std::sync::atomic::AtomicBool,
     slot: watch::Sender<Slot>,
     /// Set by the upload task (or the hand-off) the moment a segment fails,
     /// before anyone applies it, for `Cut::Replica` (ADR 0034, section 8)
-    /// and the waiters. Strict's inline failures never touch it.
-    failure: watch::Sender<Option<UploadFailure>>,
+    /// and the waiters. Strict inline stops are distinguished by the tag.
+    pub(super) failure: watch::Sender<Option<Stop>>,
+}
+
+/// One stop notification for waiters and the batched cut signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stop {
+    pub(crate) reason: UploadFailure,
+    pub(crate) batched: bool,
 }
 
 impl Shared {
     fn new() -> Self {
         Self {
+            active: std::sync::atomic::AtomicBool::new(false),
             slot: watch::Sender::new(Slot::Idle),
             failure: watch::Sender::new(None),
         }
@@ -239,7 +248,10 @@ impl Shared {
             if f.is_some() {
                 return false;
             }
-            *f = Some(failure.clone());
+            *f = Some(Stop {
+                reason: failure.clone(),
+                batched: true,
+            });
             true
         });
         self.slot.send_replace(Slot::Landed {
@@ -255,7 +267,7 @@ impl Shared {
 struct Flight {
     id: SegmentId,
     /// The last boundary it carries (`WalBoundary::sequence`).
-    sequence: u64,
+    sequence: WalBoundary,
     /// Whole events (boundaries) it carries.
     events: usize,
     /// One event alone over the byte cap: uploaded strict-style, its
@@ -263,27 +275,18 @@ struct Flight {
     oversize: bool,
 }
 
-/// What the acknowledged head covers: the last boundary sequence of the
-/// capture session `epoch`. Boundary sequences start at 1 in each capture
-/// session (`WalCapture::start`), so 0 covers nothing, and a capture
-/// restarted under the same replica ([`Replica::capture_restarted`])
-/// starts a new epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Acknowledged prefixes for every capture session seen by this hold.
+#[derive(Debug, Clone, Default)]
 struct Acked {
-    epoch: u64,
-    sequence: u64,
-    /// The last sequence the previous epoch acknowledged.
-    before: u64,
+    prefixes: std::collections::BTreeMap<u64, u64>,
+    current: Option<u64>,
+    closed: std::collections::BTreeSet<u64>,
 }
-
 impl Acked {
-    /// Whether this covers boundary `sequence` of session `epoch`.
-    fn covers(self, epoch: u64, sequence: u64) -> bool {
-        if self.epoch == epoch {
-            self.sequence >= sequence
-        } else {
-            self.epoch == epoch + 1 && self.before >= sequence
-        }
+    fn covers(&self, boundary: WalBoundary) -> bool {
+        self.prefixes
+            .get(&boundary.session)
+            .is_some_and(|s| *s >= boundary.sequence)
     }
 }
 
@@ -293,7 +296,7 @@ type SidecarWrite = (SegmentId, tokio::task::JoinHandle<Result<(), ReplicaError>
 /// A replica's batched state. Idle, and never used, in a strict class.
 #[derive(Debug)]
 pub(super) struct Uploads {
-    shared: Arc<Shared>,
+    pub(super) shared: Arc<Shared>,
     flight: Option<Flight>,
     /// What the acknowledged head covers, published once its sidecar is
     /// written.
@@ -301,13 +304,12 @@ pub(super) struct Uploads {
     /// An acknowledged boundary whose sidecar is not written yet (an apply
     /// cancelled while writing it): the next apply finishes the write,
     /// then publishes it.
-    sidecar_due: Option<u64>,
+    sidecar_due: Option<WalBoundary>,
     /// The sidecar write under way, kept across a cancelled apply so that
     /// two writes of the sidecar never run at once.
     sidecar_write: Option<SidecarWrite>,
-    /// Why replication stopped, published whatever stopped it
-    /// ([`Replica::fail`], a refusal, a failed upload), for the waiters.
-    stopped: watch::Sender<Option<String>>,
+    /// Last captured boundary, retained while a cut apply finishes its sidecar.
+    captured: Option<WalBoundary>,
 }
 
 impl Default for Uploads {
@@ -318,20 +320,25 @@ impl Default for Uploads {
             acked: watch::Sender::new(Acked::default()),
             sidecar_due: None,
             sidecar_write: None,
-            stopped: watch::Sender::new(None),
+            captured: None,
         }
     }
 }
 
 impl Uploads {
-    /// Replication stopped, for `reason`: waiters fail. Not the failure
-    /// flag of section 8, which only batched failures raise.
+    /// Publish the reason to all waiters, identifying batched holds for Cut::Replica.
     pub(super) fn stopped(&self, reason: &str) {
-        self.stopped.send_if_modified(|r| {
-            if r.is_some() {
+        self.shared.failure.send_if_modified(|r| {
+            if r.as_ref().is_some_and(|s| s.batched) {
                 return false;
             }
-            *r = Some(reason.to_owned());
+            *r = Some(Stop {
+                reason: UploadFailure::Local(reason.to_owned()),
+                batched: self
+                    .shared
+                    .active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            });
             true
         });
     }
@@ -390,29 +397,27 @@ impl Replica {
     /// The last boundary the captured position covers: the segment in
     /// flight's, or the acknowledged head's. A flush with nothing left
     /// uncaptured waits for this one ([`Self::wait_acknowledged`]).
-    pub(crate) fn captured_sequence(&self) -> u64 {
-        self.batched
-            .flight
-            .map_or(self.batched.acked.borrow().sequence, |f| f.sequence)
+    pub(crate) fn captured_sequence(&self) -> Option<WalBoundary> {
+        match *self.batched.shared.slot.borrow() {
+            Slot::Uploading { .. } | Slot::Landed { .. } => self.batched.flight.map(|f| f.sequence),
+            _ => self.batched.captured,
+        }
     }
 
-    /// The capture was started again under this replica (`start_capture`
-    /// after a reset, at a `Flushed` barrier): boundary sequences start
-    /// over, so what is acknowledged is counted in a new epoch. Refused,
-    /// and replication stopped, unless the uploader is idle.
-    pub(crate) fn capture_restarted(&mut self) -> Result<(), ReplicaError> {
+    /// Optional barrier notification; storage owns capture identities.
+    pub(crate) async fn capture_restarted(&mut self) -> Result<(), ReplicaError> {
+        self.finish_sidecar().await?;
         self.settle_abandoned();
         if !self.uploader_idle() {
             return Err(self
                 .refuse_batched("a capture restarted with a segment in flight or failed".into()));
         }
         self.batched.acked.send_modify(|a| {
-            *a = Acked {
-                epoch: a.epoch + 1,
-                sequence: 0,
-                before: a.sequence,
-            };
+            if let Some(session) = a.current.take() {
+                a.closed.insert(session);
+            }
         });
+        self.batched.captured = None;
         Ok(())
     }
 
@@ -437,8 +442,12 @@ impl Replica {
 
     /// The failure flag (ADR 0034, section 8): set the moment a batched
     /// upload or capture fails, before the outcome is applied. Only this
-    /// module sets it, never strict's inline failures.
-    pub(crate) fn failure_flag(&self) -> watch::Receiver<Option<UploadFailure>> {
+    /// module marks batched stops; strict inline stops carry `batched: false`.
+    pub(crate) fn failure_flag(&self) -> watch::Receiver<Option<Stop>> {
+        self.batched
+            .shared
+            .active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.batched.shared.failure.subscribe()
     }
 
@@ -453,11 +462,16 @@ impl Replica {
     /// outside a runtime. Refused, and replication stopped, with a segment
     /// already in flight: one in flight keeps the chain a chain, and a
     /// caller that starts a second is a bug (ask [`Self::uploader_idle`]).
-    pub(crate) fn prepare(
+    pub(crate) async fn prepare(
         &mut self,
         plan: BoundaryPlan,
         permit: BudgetPermit,
     ) -> Result<Ticket, ReplicaError> {
+        self.batched
+            .shared
+            .active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.finish_sidecar().await?;
         self.settle_abandoned();
         if let Some(reason) = &self.failed {
             return Err(ReplicaError::Local(format!(
@@ -466,7 +480,8 @@ impl Replica {
         }
         if let Some(failure) = &*self.batched.shared.failure.borrow() {
             return Err(ReplicaError::Local(format!(
-                "replication stopped: {failure}"
+                "replication stopped: {:?}",
+                failure.reason
             )));
         }
         if self.needs_snapshot {
@@ -482,13 +497,8 @@ impl Replica {
                 self.refuse_batched("a segment while an outcome waits to be applied".into())
             );
         }
-        if plan.boundary.sequence <= self.batched.acked.borrow().sequence {
-            // Sequences restart with the capture: one restarted without
-            // saying so would let a waiter count an old acknowledgement.
-            return Err(self.refuse_batched(format!(
-                "boundary {} is already acknowledged: a capture restarted unseen",
-                plan.boundary.sequence
-            )));
+        if self.batched.acked.borrow().covers(plan.boundary) {
+            return Err(self.refuse_batched("boundary is already acknowledged".into()));
         }
         if permit.charged < plan.boundary.estimated_bytes.clamp(1, permit.cap) {
             return Err(ReplicaError::Local(format!(
@@ -511,10 +521,17 @@ impl Replica {
         // same checksum, kept apart as the two rules of section 5.
         let (captured_id, captured) = self.captured();
         debug_assert_eq!(captured_id, self.head, "nothing in flight");
+        self.batched.acked.send_modify(|a| {
+            if a.current != Some(plan.boundary.session)
+                && let Some(session) = a.current.replace(plan.boundary.session)
+            {
+                a.closed.insert(session);
+            }
+        });
         self.in_flight = Some(segment.id);
         self.batched.flight = Some(Flight {
             id: segment.id,
-            sequence: plan.boundary.sequence,
+            sequence: plan.boundary,
             events: plan.boundaries,
             oversize: plan.oversize,
         });
@@ -595,10 +612,16 @@ impl Replica {
                 self.head = id;
                 self.checksum = post_apply;
                 self.since_snapshot += 1;
+                self.batched.captured = Some(flight.sequence);
                 self.batched.sidecar_due = Some(flight.sequence);
                 Applied::Acknowledged(id)
             }
         };
+        self.finish_sidecar().await?;
+        Ok(applied)
+    }
+
+    pub(super) async fn finish_sidecar(&mut self) -> Result<(), ReplicaError> {
         while let Some(sequence) = self.batched.sidecar_due {
             if self.batched.sidecar_write.is_none() {
                 let (path, head, sum) = (self.db_path.clone(), self.head, self.checksum);
@@ -624,13 +647,12 @@ impl Replica {
             if written == self.head {
                 self.batched.sidecar_due = None;
                 self.batched.acked.send_if_modified(|acked| {
-                    let moved = sequence > acked.sequence;
-                    acked.sequence = acked.sequence.max(sequence);
-                    moved
+                    let previous = acked.prefixes.insert(sequence.session, sequence.sequence);
+                    previous != Some(sequence.sequence)
                 });
             }
         }
-        Ok(applied)
+        Ok(())
     }
 
     /// Ends the flight `id` the cell names: checked against this replica's
@@ -664,71 +686,55 @@ impl Replica {
     /// Stops a batched replica: `failed` set, the failure flag raised, and
     /// with it every waiter failed. Nothing is captured again.
     fn stop_batched(&mut self, failure: UploadFailure) {
-        self.fail(failure.to_string());
         self.batched.shared.failure.send_if_modified(|f| {
             if f.is_some() {
                 return false;
             }
-            *f = Some(failure);
+            *f = Some(Stop {
+                reason: failure.clone(),
+                batched: true,
+            });
             true
         });
+        self.fail(failure.to_string());
     }
 
     /// Whether the acknowledged head covers the boundary `sequence`
     /// (`WalBoundary::sequence`): every commit up to it is in the bucket,
     /// uploaded while this hold was valid, and the sidecar says so.
-    pub(crate) fn acknowledged_covers(&self, sequence: u64) -> bool {
-        let acked = *self.batched.acked.borrow();
-        acked.covers(acked.epoch, sequence)
+    pub(crate) fn acknowledged_covers(&self, boundary: WalBoundary) -> bool {
+        self.batched.acked.borrow().covers(boundary)
     }
 
-    /// Waits until the acknowledged head covers the boundary `sequence`:
-    /// what `flush` and a batched `exec-durable` wait for (S9). Never on
-    /// the captured position. Fails at once when a batched upload fails
-    /// (the failure flag), when replication had already stopped, and when
-    /// this replica (the hold) is dropped. Borrows nothing; something else
-    /// must apply the outcomes ([`Self::apply`]) for it to resolve.
     pub(crate) fn wait_acknowledged(
         &self,
-        sequence: u64,
+        boundary: WalBoundary,
     ) -> impl Future<Output = Result<(), ReplicaError>> + Send + 'static {
+        self.batched
+            .shared
+            .active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut acked = self.batched.acked.subscribe();
-        let epoch = acked.borrow().epoch;
-        let mut failure = self.batched.shared.failure.subscribe();
-        let mut stopped = self.batched.stopped.subscribe();
-        let failed = self.failed.clone();
+        let mut stopped = self.batched.shared.failure.subscribe();
         async move {
             loop {
-                if acked.borrow_and_update().covers(epoch, sequence) {
+                if acked.borrow_and_update().covers(boundary) {
                     return Ok(());
                 }
-                if acked.borrow().epoch > epoch && !acked.borrow().covers(epoch, sequence) {
-                    // Only at a `Flushed` barrier: never seen unless the
-                    // caller restarted with this boundary unacknowledged.
-                    return Err(ReplicaError::Local(
-                        "replication stopped: the capture restarted before this boundary was acknowledged"
-                            .into(),
-                    ));
+                if acked.borrow().closed.contains(&boundary.session) {
+                    return Err(ReplicaError::Local("replication stopped: the capture restarted before this boundary was acknowledged".into()));
                 }
-                if let Some(reason) = &failed {
+                if let Some(stop) = &*stopped.borrow_and_update() {
                     return Err(ReplicaError::Local(format!(
-                        "replication stopped: {reason}"
-                    )));
-                }
-                if let Some(f) = &*failure.borrow_and_update() {
-                    return Err(ReplicaError::Local(format!("replication stopped: {f}")));
-                }
-                if let Some(reason) = &*stopped.borrow_and_update() {
-                    return Err(ReplicaError::Local(format!(
-                        "replication stopped: {reason}"
+                        "replication stopped: {}",
+                        stop.reason
                     )));
                 }
                 let ended = tokio::select! {
                     r = acked.changed() => r.is_err(),
-                    r = failure.changed() => r.is_err(),
                     r = stopped.changed() => r.is_err(),
                 };
-                if ended && !acked.borrow().covers(epoch, sequence) {
+                if ended && !acked.borrow().covers(boundary) {
                     return Err(ReplicaError::Local(
                         "replication stopped: the hold ended".into(),
                     ));
@@ -750,7 +756,7 @@ pub(crate) struct Ticket {
     captured: DbChecksum,
     /// The acknowledged head's checksum: the segment's pre-apply checksum
     /// must be it when its upload starts (the fork detector).
-    acknowledged: DbChecksum,
+    pub(super) acknowledged: DbChecksum,
     target: UploadTarget,
     shared: Arc<Shared>,
     runtime: tokio::runtime::Handle,
@@ -777,12 +783,34 @@ impl Ticket {
     ///
     /// A failure of any kind fails the replica: the failure flag is raised
     /// now, and the outcome waits in the cell for [`Replica::apply`].
-    pub(crate) fn hand_off(mut self, db: &mut ActorDb) -> Result<SegmentId, ReplicaError> {
+    pub(crate) fn hand_off(self, db: &mut ActorDb) -> Result<SegmentId, ReplicaError> {
+        {
+            let plan = self.plan;
+            self.hand_off_with(|| db.take_bounded_changes(plan))
+        }
+    }
+
+    pub(super) fn hand_off_with(
+        mut self,
+        capture: impl FnOnce() -> Result<
+            wasmkeep_storage::wal::BoundaryChanges,
+            wasmkeep_storage::wal::CaptureError,
+        >,
+    ) -> Result<SegmentId, ReplicaError> {
         let id = self.segment.id;
+        if let Some(stop) = &*self.shared.failure.borrow() {
+            return Err(ReplicaError::Local(format!(
+                "replication stopped: {}",
+                stop.reason
+            )));
+        }
+        if !self.target.lease.is_valid() {
+            return Err(ReplicaError::Late);
+        }
         // Before the call: a panic inside it may come after the WAL was
         // consumed, and must fail the replica, not abandon the segment.
         self.consumed = true;
-        let got = match db.take_bounded_changes(self.plan) {
+        let got = match capture() {
             Ok(got) => got,
             Err(e) => return Err(self.fail(format!("capture: {e}"))),
         };
@@ -805,10 +833,6 @@ impl Ticket {
         let Some(permit) = self.permit.take() else {
             return Err(self.fail("a ticket without its budget permit".into()));
         };
-        self.shared
-            .slot
-            .send_replace(Slot::Uploading { id, post_apply });
-        self.reported = true;
         let key = segment_key(&self.segment);
         let target = self.target.clone();
         // Moved into the task: dropped without an outcome (the task
@@ -819,6 +843,10 @@ impl Ticket {
             post_apply,
             recorded: false,
         };
+        self.shared
+            .slot
+            .send_replace(Slot::Uploading { id, post_apply });
+        self.reported = true;
         self.runtime.spawn(async move {
             let sent = target.put_bounded(&key, bytes, "segment").await;
             // The PUT future has ended: its bytes leave the node's budget
@@ -899,5 +927,40 @@ impl Drop for Ticket {
                 .slot
                 .send_replace(Slot::Abandoned(self.segment.id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_unrun_upload_records_failure() {
+        let shared = Arc::new(Shared::new());
+        let id = SegmentId {
+            generation: 1,
+            txid: 2,
+        };
+        let outcome = Outcome {
+            shared: Arc::clone(&shared),
+            id,
+            post_apply: DbChecksum::default(),
+            recorded: false,
+        };
+        shared.slot.send_replace(Slot::Uploading {
+            id,
+            post_apply: DbChecksum::default(),
+        });
+        // The runtime may discard a spawned future without polling it.
+        let task = async move {
+            let _outcome = outcome;
+            std::future::pending::<()>().await;
+        };
+        drop(task);
+        assert!(shared.failure.borrow().as_ref().unwrap().batched);
+        assert!(matches!(
+            *shared.slot.borrow(),
+            Slot::Landed { result: Err(_), .. }
+        ));
     }
 }

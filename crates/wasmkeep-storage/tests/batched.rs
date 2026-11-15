@@ -1038,3 +1038,35 @@ fn pressure_starts_exactly_at_threshold_and_batched_quota_names_drain() {
         drop(hold);
     }
 }
+
+#[test]
+fn capture_session_survives_checkpoint_but_not_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let (conn, mut capture) = raw(&path);
+    conn.execute_batch("INSERT INTO t VALUES (1, X'01')")
+        .unwrap();
+    let first = capture.mark_boundary().unwrap().unwrap();
+    let plan = capture.next_capture(DEFAULT_SEGMENT_BYTES).unwrap();
+    capture.capture_plan(plan).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    capture.wal_truncated();
+    conn.execute_batch("INSERT INTO t VALUES (2, X'02')")
+        .unwrap();
+    let second = capture.mark_boundary().unwrap().unwrap();
+    assert_eq!(first.session, second.session);
+    assert!(second.sequence > first.sequence);
+    let plan = capture.next_capture(DEFAULT_SEGMENT_BYTES).unwrap();
+    capture.capture_plan(plan).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let mut restarted = WalCapture::start(&path, 4096).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (3, X'03')")
+        .unwrap();
+    let third = restarted.mark_boundary().unwrap().unwrap();
+    assert_ne!(third.session, first.session);
+    assert_eq!(third.sequence, first.sequence);
+    assert!(restarted.capture_plan(plan).is_err());
+    assert!(restarted.has_pending_boundaries());
+}

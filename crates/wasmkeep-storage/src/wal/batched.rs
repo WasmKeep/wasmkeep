@@ -9,6 +9,8 @@ pub const DEFAULT_SEGMENT_BYTES: u64 = 1 << 20;
 /// position when returned; call `boundaries` again after a partial capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalBoundary {
+    /// Process-local capture identity, stable across checkpoints and unique across restarts.
+    pub session: u64,
     /// Identity within this capture session; never resets at a checkpoint.
     pub sequence: u64,
     /// WAL byte offset immediately after a commit frame.
@@ -267,6 +269,7 @@ impl WalCapture {
         for event in &mut self.scan.events {
             pages.extend(event.pages.iter().map(|(&p, &at)| (p, at)));
             event.boundary = boundary_for(
+                self.session,
                 self.page_size,
                 event.boundary.sequence,
                 event.cursor.offset,
@@ -296,7 +299,14 @@ impl WalCapture {
         commit: u32,
         pages: &BTreeMap<u32, u64>,
     ) -> WalBoundary {
-        boundary_for(self.page_size, sequence, offset, commit, pages)
+        boundary_for(
+            self.session,
+            self.page_size,
+            sequence,
+            offset,
+            commit,
+            pages,
+        )
     }
 
     // Read only appended frames. Keep speculative frames local: a rollback
@@ -375,6 +385,7 @@ impl WalCapture {
 type Scanned = (BTreeMap<u32, u64>, u32, Cursor);
 
 fn boundary_for(
+    session: u64,
     page_size: u32,
     sequence: u64,
     offset: u64,
@@ -386,6 +397,7 @@ fn boundary_for(
         .filter(|(p, _)| **p != lock_pgno(page_size))
         .count();
     WalBoundary {
+        session,
         sequence,
         offset,
         commit,
