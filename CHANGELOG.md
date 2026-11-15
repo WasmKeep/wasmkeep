@@ -11,6 +11,11 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.2, in no release yet.
 
+- **SQL result limits now account for retained memory.** The 16 MiB
+  budget includes row and cell overhead, vector spare capacity, allocation
+  allowances and column names once, as well as text/blob payloads. Queries
+  with many empty values or large aliases now fail with `quota-exceeded`
+  when they exceed it; names and payloads are checked before copying.
 - **`cluster diagnose` requires listings that are strongly consistent
   after a write.** A node taking an actor over plans its restore from one
   listing of the actor's history, and after a voluntary hand-over it may

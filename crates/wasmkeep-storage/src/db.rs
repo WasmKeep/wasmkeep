@@ -10,6 +10,19 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use crate::path::encode_segment;
 use crate::{Rows, SqlError, SqlValue, StorageError};
 
+// Conservative retained-result accounting, not an allocator/RSS measurement.
+// Allow two machine words for allocation metadata/alignment per allocation.
+const RESULT_ALLOCATION_OVERHEAD: usize = 2 * size_of::<usize>();
+// Rows owns the two outer vectors, each with a possible heap allocation.
+const RESULT_BASE_OVERHEAD: usize = size_of::<Rows>() + 2 * RESULT_ALLOCATION_OVERHEAD;
+// The row index grows explicitly from one slot by doubling (see query), so
+// charge two Vec headers per row to cover spare capacity, plus its allocation.
+const RESULT_ROW_OVERHEAD: usize = 2 * size_of::<Vec<SqlValue>>() + RESULT_ALLOCATION_OVERHEAD;
+// Row/column vectors reserve their exact width. SqlValue already includes the
+// discriminant and inline scalar or String/Vec header; payloads are additional.
+const RESULT_CELL_OVERHEAD: usize = size_of::<SqlValue>() + RESULT_ALLOCATION_OVERHEAD;
+const RESULT_COLUMN_OVERHEAD: usize = size_of::<String>() + RESULT_ALLOCATION_OVERHEAD;
+
 /// Storage settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageConfig {
@@ -25,7 +38,9 @@ pub struct StorageConfig {
     pub max_statement_time: Duration,
     /// Largest text or blob value (SQLite's `SQLITE_LIMIT_LENGTH`).
     pub max_value_bytes: usize,
-    /// Largest result a `query` may return, all rows together.
+    /// Largest result a `query` may return, all rows together (default: 16 MiB).
+    /// Counts text/blob payloads, column names once, and conservative overhead
+    /// for the result, rows, cells, allocations and vector spare capacity.
     pub max_result_bytes: usize,
     /// Largest the write-ahead log may grow between two captures (while
     /// replicating, committed pages stay in it until the host captures them
@@ -876,31 +891,70 @@ impl ActorDb {
         self.guest(|conn| {
             let stmt = conn.prepare(sql)?;
             let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), stmt)?;
-            let columns: Vec<String> = stmt.column_names().map(String::from).collect();
-            let width = columns.len();
+            let mut remaining = max;
+            let mut charge = |bytes: usize| {
+                remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                    SqlError::new(
+                        crate::SqlErrorKind::QuotaExceeded,
+                        format!("result larger than {max} bytes; select less or page through it"),
+                    )
+                })?;
+                Ok::<_, SqlError>(())
+            };
+            // Check borrowed names before allocating either the vector or its
+            // strings. Even an empty result retains its column names.
+            charge(RESULT_BASE_OVERHEAD)?;
+            for name in stmt.column_names() {
+                charge(RESULT_COLUMN_OVERHEAD)?;
+                charge(name.len())?;
+            }
+            let width = stmt.column_count();
+            let mut columns = Vec::with_capacity(width);
+            columns.extend(stmt.column_names().map(String::from));
             let mut rows = stmt.query(bind(params))?;
             let mut values = Vec::new();
-            // Counted as rows are read, so a huge result is refused before
-            // it is held in memory.
-            let mut size = 0usize;
             while let Some(row) = rows.next()? {
+                charge(RESULT_ROW_OVERHEAD)?;
+                for _ in 0..width {
+                    charge(RESULT_CELL_OVERHEAD)?;
+                }
                 let mut out = Vec::with_capacity(width);
                 for i in 0..width {
-                    let value = SqlValue::from(row.get_ref(i)?);
-                    size = size.saturating_add(match &value {
-                        SqlValue::Text(t) => t.len(),
-                        SqlValue::Blob(b) => b.len(),
-                        _ => 8,
-                    });
-                    if size > max {
-                        return Err(SqlError::new(
-                            crate::SqlErrorKind::QuotaExceeded,
-                            format!(
-                                "result larger than {max} bytes; select less or page through it"
-                            ),
-                        ));
-                    }
+                    use rusqlite::types::ValueRef;
+                    let value = row.get_ref(i)?;
+                    let value = match value {
+                        ValueRef::Text(text) => {
+                            // Preserve lossy UTF-8 conversion, but charge its
+                            // expanded length before copying and reserve exactly
+                            // that length so conversion cannot leave spare space.
+                            let mut len = 0;
+                            for chunk in text.utf8_chunks() {
+                                let bytes = chunk.valid().len()
+                                    + if chunk.invalid().is_empty() { 0 } else { 3 };
+                                charge(bytes)?;
+                                len += bytes;
+                            }
+                            let mut owned = String::with_capacity(len);
+                            for chunk in text.utf8_chunks() {
+                                owned.push_str(chunk.valid());
+                                if !chunk.invalid().is_empty() {
+                                    owned.push('\u{fffd}');
+                                }
+                            }
+                            SqlValue::Text(owned)
+                        }
+                        ValueRef::Blob(blob) => {
+                            charge(blob.len())?;
+                            SqlValue::Blob(blob.to_vec())
+                        }
+                        _ => SqlValue::from(value),
+                    };
                     out.push(value);
+                }
+                // Avoid Vec's minimum initial capacity of four; explicit
+                // doubling keeps spare row slots within RESULT_ROW_OVERHEAD.
+                if values.len() == values.capacity() {
+                    values.reserve_exact(values.len().max(1));
                 }
                 values.push(out);
             }

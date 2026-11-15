@@ -78,8 +78,11 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   host tables); virtual tables limited to fts3/fts4/fts5/rtree;
   pragmas from an allow-list; defensive mode; `trusted_schema=OFF`.
 - Host tables (`_wasmkeep_*`) invisible to guests.
-- 1 GB per database; 16 MB per value and per query result; a statement
-  stopped at the event's wall clock.
+- 1 GB per database; 16 MiB per value and per query result. The result
+  budget counts text/blob payloads after UTF-8 replacement, column names
+  once, and conservative result/row/cell, allocation and vector-capacity
+  overhead, including empty values ([details](concepts.md#storage)). A statement
+  is stopped at the event's wall clock.
 - 256 MB of write-ahead log between two captures: past it, statements that
   write fail until the event ends (reads, commit and rollback still run).
   Capture reads the log frame by frame and holds only the newest version of

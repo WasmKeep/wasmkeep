@@ -246,8 +246,13 @@ Each actor owns one SQLite database. Nothing else can read or write it.
   nothing in a transaction is durable before its commit.
 - A database is capped at 1 GB by default; past that, writes fail with
   `quota-exceeded` and reads still work.
-- Values (text and blobs) are capped at 16 MB, and so is everything one
-  `query` returns; past that, `quota-exceeded`. Page through big results.
+- Values (text and blobs) are capped at 16 MiB. Each `query` also has a
+  16 MiB result budget: text/blob payload bytes (after text's UTF-8
+  replacement), column names once per result, and conservative overhead
+  for the result, rows, cells, allocations and vector spare capacity.
+  Empty values still cost space. This bounds retained result memory; it
+  is not an exact allocator/RSS measurement or a limit on SQLite's working
+  memory. Past the budget, `quota-exceeded`. Page through big results.
 - A statement runs at most as long as the event may (30 s by default);
   past that it is stopped with `quota-exceeded`.
 - One event may write about 256 MB (counting every rewrite of a page);
