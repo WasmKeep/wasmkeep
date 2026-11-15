@@ -21,6 +21,20 @@
 use crate::lease::{BucketError, Clock};
 use crate::node_lease::{NodeLeaseObject, NodeState};
 
+/// Version-line feature stamp for nodes that fence whole-app restores.
+/// Keep it in semver build metadata, including on git-stamped development builds.
+pub fn heartbeat_version() -> String {
+    format!(
+        "{}{}restore1",
+        crate::VERSION,
+        if crate::VERSION.contains('+') {
+            "."
+        } else {
+            "+"
+        }
+    )
+}
+
 /// Listing heartbeats (and, in tests, writing them unconditionally).
 #[allow(async_fn_in_trait)]
 pub trait Directory {
@@ -572,7 +586,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             clock,
             id: id.to_owned(),
             address: address.into(),
-            version: crate::VERSION.to_owned(),
+            version: heartbeat_version(),
             app: String::new(),
             cluster_address: None,
             tls_pins: Vec::new(),

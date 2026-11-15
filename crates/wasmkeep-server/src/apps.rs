@@ -35,6 +35,7 @@ use crate::access::AccessRules;
 use crate::actor::FRONT_CLASS as FRONT;
 use crate::env::Vars;
 pub use collect::KEEP_PREVIOUS;
+pub use delete::fence_app_nodes;
 pub use delete::{DeleteApp, LATE_WRITES, delete_app};
 
 /// Why a deploy, rollback or update failed.
@@ -481,7 +482,12 @@ impl AppRef {
     pub async fn check_not_deleted(&self) -> Result<(), DeployError> {
         match self.tombstone().await? {
             Some(_) => Err(DeployError::Deleted(self.name())),
-            None => Ok(()),
+            None => {
+                if self.get("restoring").await?.is_some() {
+                    return Err(DeployError::Deleted(format!("{} (restoring)", self.name())));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -646,15 +652,25 @@ impl AppRef {
             remove("the app was deleted")?;
             return Err(DeployError::Deleted(self.name()));
         }
-        let Some((marker, _)) = self.get(RECREATED).await? else {
-            return Ok(());
-        };
-        let mine = local.join(RECREATED_LOCAL);
-        if std::fs::read(&mine).ok().as_deref() != Some(marker.as_slice()) {
-            remove("the app was deleted and created again since this node last ran it")?;
-            std::fs::create_dir_all(local)
-                .and_then(|()| std::fs::write(&mine, &marker))
-                .map_err(|e| DeployError::Bucket(format!("writing {}: {e}", mine.display())))?;
+        self.check_not_deleted().await?;
+        // Read both before removing the directory; writing one marker and then
+        // removing it for the other would invalidate the next start forever.
+        let markers = [
+            (RECREATED_LOCAL, self.get(RECREATED).await?),
+            (".restored", self.get("restored").await?),
+        ];
+        if markers.iter().any(|(file, value)| {
+            value.as_ref().is_some_and(|(body, _)| {
+                std::fs::read(local.join(file)).ok().as_deref() != Some(body.as_slice())
+            })
+        }) {
+            remove("the app was recreated or restored since this node last ran it")?;
+            std::fs::create_dir_all(local).map_err(bucket)?;
+            for (file, value) in markers {
+                if let Some((body, _)) = value {
+                    std::fs::write(local.join(file), body).map_err(bucket)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1471,13 +1487,17 @@ impl AppRef {
     /// `local`: no tombstone, and no `--recreate` since it prepared them
     /// ([`Self::prepare_local`] wrote the marker it compares).
     async fn still_ours(&self, local: &std::path::Path) -> Result<bool, DeployError> {
-        if self.tombstone().await?.is_some() {
+        if self.tombstone().await?.is_some() || self.get("restoring").await?.is_some() {
             return Ok(false);
         }
-        let Some((marker, _)) = self.get(RECREATED).await? else {
-            return Ok(true);
-        };
-        Ok(std::fs::read(local.join(RECREATED_LOCAL)).ok().as_deref() == Some(marker.as_slice()))
+        for (remote, file) in [(RECREATED, RECREATED_LOCAL), ("restored", ".restored")] {
+            if let Some((marker, _)) = self.get(remote).await?
+                && std::fs::read(local.join(file)).ok().as_deref() != Some(marker.as_slice())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// One check of `current`; swaps classes in if it changed.
@@ -1485,6 +1505,9 @@ impl AppRef {
         // The app deleted (ADR 0028, section 5): checked at every version
         // check, before `current`.
         self.check_not_deleted().await?;
+        if !self.still_ours(service.local_app_dir()).await? {
+            return Err(DeployError::Deleted(format!("{} (restored)", self.name())));
+        }
         let Some(current) = self.current().await? else {
             return Ok(false);
         };

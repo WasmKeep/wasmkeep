@@ -234,6 +234,19 @@ pub fn backup_alarm(path: &Path) -> Result<(Option<i64>, Option<String>), SqlErr
     Ok((alarm, indexed))
 }
 
+/// Original address recorded by the host, including names shortened in keys.
+pub fn backup_address(path: &Path) -> Result<Option<String>, SqlError> {
+    use rusqlite::OptionalExtension;
+    let conn = immutable(path)?;
+    Ok(conn
+        .query_row(
+            "SELECT value FROM _wasmkeep_meta WHERE key='address'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

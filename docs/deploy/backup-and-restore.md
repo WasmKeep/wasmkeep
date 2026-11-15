@@ -108,7 +108,7 @@ Deploys (current plus five predecessors) and sealed secrets are copied after
 actor history, with current pointers checked again. Owners, leases, node
 heartbeats, cluster secrets, alarms and operator intents are excluded.
 The manifest records each database's pending alarm and indexed tag for the
-future restore command. Keep the secrets decryption key separately.
+restore command. Keep the secrets decryption key separately.
 
 Collection continues normally. A missing link/object causes a fresh actor
 listing, up to eight attempts; checksum failures are terminal. Set
@@ -123,10 +123,73 @@ and `--cache` keeps content, raw databases and checksum sidecars. When the cache
 head is on the new replay plan, only its new segments are applied after checking
 the cached database checksum. A new snapshot beyond the cached head starts a
 fresh replay. Destination reads therefore exceed ADR 0033's optimized estimates. Existing or concurrent
-prune markers refuse completion conservatively. `backup prune`, archive
-`backup restore`, and actor restore are later plan steps; a verified archive
-is not yet an automated restore procedure. The stopped-cluster copy and drill
-below remain available today.
+prune markers refuse completion conservatively. `backup prune` and single-actor
+restore remain later plan steps. The stopped-cluster copy and drill below
+remain available too.
+
+## Restore an online archive
+
+Stop the selected app's nodes first; other apps can keep running. Restore
+always verifies the entire selected run, even if a sampled verification
+previously passed. Partial or corrupt runs and tombstoned apps are refused.
+
+```bash
+wasmkeep backup restore --from s3://archive/prod --run RUN_ID \
+  --app acme/shop --bucket s3://live/recovery
+# Replace existing state, keeping the current code and secrets:
+wasmkeep backup restore --from s3://archive/prod --run RUN_ID \
+  --app acme/shop --bucket s3://live/prod --in-place
+```
+
+Without `--in-place`, the app's state root must be empty. Deploy and sealed
+secrets default to `--deploy backup`; in place they default to `--deploy keep`.
+Either choice can be explicit. Keeping a deploy requires an existing current
+version. Secrets sealed for a different prefix need `wasmkeep secrets reset`.
+The implicit `default/default` app is refused because its nodes do not follow
+deploy checks. The archive and target must have disjoint bucket/prefix locations;
+this first restore CLI uses the same AWS environment for both.
+
+All app nodes, including offline ones still listed under `nodes/`, must
+advertise the restore-aware heartbeat version `0.4.2+restore1`
+(or `0.4.2+<commit>.restore1` for a development build; introduced
+by this change; older 0.4.2 builds are not sufficient). A later build must
+retain the `restore1` build-metadata component. `--force` bypasses only this old-version check:
+it never permits a live app node, a tombstone, a partial selected run or a
+partial undo backup. Stop and upgrade old nodes before restarting them.
+
+The command creates `apps/<tenant>/<app>/restoring` before changing state.
+Nodes refuse it on start and stop at their next deploy check. A unique
+`restored` marker invalidates their old local files, including actors absent
+from the backup. Expired node leases are fenced; the command waits 40 seconds
+after the restore fence and the latest heartbeat or lease fence before writing
+history. It rebuilds generation floors and the alarm index, then installs
+versions and current pointers, and removes `restoring` last.
+
+In place, a fully verified ordinary backup of the old state is made first.
+The archive's `before-restore/<operation-id>` object names its run; the
+restore journal also records `before_restore`. Restore that run to undo.
+Generation floors for old actors are journaled before deletion, including
+actors absent from the selected run.
+
+After an error, rerun with the same options; the journal pins the run even
+if `latest` moved. A process killed while holding
+`apps/<tenant>/<app>/restore-lock` requires an operator to confirm that the
+old restore process is stopped, wait at least 40 seconds for its outstanding
+requests, delete **only that lock**, and rerun. An unlocked lock record is
+reused conditionally. Ordinary exits settle pending requests for 40 seconds
+before releasing the lock, so a late deletion cannot remove a later restore
+fence. If `restoring` is already absent, the restore finished; clear an orphaned
+lock without repeating the restore.
+Do not remove `restoring` to expose incomplete state. The journal remains
+through interrupted clearing and copying. Serialize restore, app deletion,
+deploy, secrets updates and archive maintenance; concurrent operator mutations
+are not a supported workflow. Archive write access is needed for full
+verification and the undo run.
+
+Each actor returns to its own backed-up moment. Due alarms may fire again;
+external effects can repeat, sockets reconnect, and old operator intents and
+ownership records are not restored. A restore drill is still required to
+validate your infrastructure and operational procedure.
 
 ## Inspect one actor
 

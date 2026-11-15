@@ -17,7 +17,7 @@ fn app_ref(store: &Arc<dyn ObjectStore>) -> AppRef {
     AppRef::new(Arc::clone(store), "", TENANT, APP)
 }
 
-async fn deploy(store: &Arc<dyn ObjectStore>) -> Result<(), DeployError> {
+pub(super) async fn deploy(store: &Arc<dyn ObjectStore>) -> Result<(), DeployError> {
     app_ref(store)
         .deploy(
             &deploy_runtime(),
@@ -34,7 +34,7 @@ async fn deploy(store: &Arc<dyn ObjectStore>) -> Result<(), DeployError> {
 /// prepared against the bucket first (refused for a deleted app), then
 /// the deployed version, following the app every 200 ms. With the task
 /// that follows it: a node stopped for good has none.
-async fn app_node_following(
+pub(super) async fn app_node_following(
     id: &str,
     data: &Path,
     store: &Arc<dyn ObjectStore>,

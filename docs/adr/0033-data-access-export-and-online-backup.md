@@ -3,8 +3,10 @@
 - Status: partially implemented (2026-11-15): actor export and read-only
   actor SQL and history listing are built. Online backup create/list/verify
   have an initial implementation; the [backup guide](../deploy/backup-and-restore.md)
-  records its cache, concurrency and prune-coordination limits. Live restore
-  remains proposed. The [first-slice guide](../actor-data-access.md) records its
+  records its cache, concurrency and prune-coordination limits. Whole-app
+  backup restore (plan step 6) is implemented; the guide records its recovery
+  journal, restore-aware node version and stricter force limits. Single-actor
+  live restore remains proposed. The [first-slice guide](../actor-data-access.md) records its
   positional app syntax, limits and deferred options. Revised after an
   adversarial review (a destination keyed by content, since generations restart after an
   app is recreated; prune excluded from a running backup; restore

@@ -34,6 +34,7 @@ pub(crate) enum Command {
     Create(Create),
     List(From),
     Verify(Verify),
+    Restore(Restore),
 }
 #[derive(Debug, Args)]
 pub(crate) struct Create {
@@ -75,6 +76,32 @@ pub(crate) struct Verify {
     run: Option<String>,
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     sample: Option<u64>,
+}
+mod restore;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DeployChoice {
+    Backup,
+    Keep,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct Restore {
+    #[arg(long)]
+    from: String,
+    #[arg(long)]
+    run: Option<String>,
+    #[arg(long, value_parser = crate::parse_app)]
+    app: (String, String),
+    #[arg(long)]
+    bucket: String,
+    #[arg(long)]
+    in_place: bool,
+    #[arg(long, value_enum)]
+    deploy: Option<DeployChoice>,
+    /// Override only the refusal of old node versions; never a live node.
+    #[arg(long)]
+    force: bool,
 }
 struct LimitedWriter {
     bytes: Vec<u8>,
@@ -366,6 +393,23 @@ fn disjoint(source: (&str, &str, &str), dest: (&str, &str, &str)) -> anyhow::Res
 pub(crate) fn run(command: &Command) -> anyhow::Result<()> {
     crate::actor_read::run(async {
         match command {
+            Command::Restore(args) => {
+                let (archive, ap, ae) = configured(&args.from, None, None)?;
+                let (target, tp, te) = configured(&args.bucket, None, None)?;
+                disjoint(
+                    (&ae, crate::parse_bucket(&args.from)?.0, &ap),
+                    (&te, crate::parse_bucket(&args.bucket)?.0, &tp),
+                )?;
+                restore::execute(
+                    args,
+                    &archive,
+                    &ap,
+                    &target,
+                    &tp,
+                    wasmkeep_server::apps::LATE_WRITES,
+                )
+                .await
+            }
             Command::Create(args) => {
                 let (source, sp, se) = configured(&args.bucket, None, None)?;
                 let (dest, dp, de) = configured(
@@ -377,7 +421,7 @@ pub(crate) fn run(command: &Command) -> anyhow::Result<()> {
                     (&se, crate::parse_bucket(&args.bucket)?.0, &sp),
                     (&de, crate::parse_bucket(&args.to)?.0, &dp),
                 )?;
-                create(args, &source, &sp, &dest, &dp).await
+                create(args, &source, &sp, &dest, &dp).await.map(drop)
             }
             Command::List(args) => {
                 let (store, prefix) = crate::open_bucket_unchecked(&args.from)?;
@@ -1578,7 +1622,7 @@ async fn create(
     sp: &str,
     dest: &Store,
     dp: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let nonce = tempfile::tempdir()?;
     let seconds = i64::try_from(now_ms()? / 1000)?;
     let stamp = chrono::DateTime::from_timestamp(seconds, 0)
@@ -1820,7 +1864,7 @@ async fn create(
         failures.is_empty(),
         "partial backup; failed actors are recorded, verification will refuse it"
     );
-    Ok(())
+    Ok(id)
 }
 
 /// Verify the deploy's referenced files, not merely whichever entries a damaged
