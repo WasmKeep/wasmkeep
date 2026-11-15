@@ -19,6 +19,7 @@ use std::sync::LazyLock;
 
 use super::*;
 use crate::replica::UploadBudget;
+use wasmkeep_cluster::alarm_index::{self, Entry};
 use wasmkeep_storage::CaptureHold;
 use wasmkeep_storage::wal::WalBoundary;
 
@@ -146,16 +147,31 @@ fn completion_job(state: &mut ActorState) -> BoxFuture<'_, ()> {
 /// Turns batched capture on for `db` under `token`, starting capture first
 /// if it has not (a database opened without an event, for an alarm's check
 /// for state: nothing uncaptured under this hold yet).
-fn enable_batched(db: &mut ActorDb, token: &CaptureHold) -> Result<(), String> {
+///
+/// Enabled now, it returns the alarm entry the database names
+/// (`ALARM_INDEXED_KEY`): at a barrier, so the acknowledged head's (ADR
+/// 0034, section 9). `None`: it was enabled already.
+fn enable_batched(db: &mut ActorDb, token: &CaptureHold) -> Result<Option<Option<Entry>>, String> {
     if db.batched_capture_enabled() {
-        return Ok(());
+        return Ok(None);
     }
     if db.captured_checksum().is_none() {
         db.start_capture()
             .map_err(|e| format!("start capture: {e}"))?;
     }
+    let named = named_entry(db)?;
     db.enable_batched_capture(token)
-        .map_err(|e| format!("batched capture: {e}"))
+        .map_err(|e| format!("batched capture: {e}"))?;
+    Ok(Some(named))
+}
+
+/// The alarm entry `db`'s committed state names.
+fn named_entry(db: &mut ActorDb) -> Result<Option<Entry>, String> {
+    Ok(db
+        .meta(ALARM_INDEXED_KEY)
+        .map_err(|e| format!("alarm index entry: {e}"))?
+        .as_deref()
+        .and_then(alarm_index::parse_meta))
 }
 
 impl ActorHost {
@@ -164,7 +180,7 @@ impl ActorHost {
     pub(super) async fn ensure_batched_capture(
         &mut self,
         token: &CaptureHold,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Option<Entry>>, String> {
         self.drain_db().await.map_err(|e| format!("{e:#}"))?;
         let db = self
             .db
@@ -179,22 +195,26 @@ impl ActorHost {
 async fn mark(slot: &SharedReplica, db: &mut DbAt<'_>) -> Result<Option<WalBoundary>, String> {
     let marked = db
         .run(|db| {
-            if db.batched_capture_enabled() {
-                db.mark_boundary()
-            } else {
-                Ok(None)
+            if !db.batched_capture_enabled() {
+                return Ok::<_, String>(None);
+            }
+            // The entry the state at the boundary names, read with it: what
+            // a segment ending there lists (ADR 0034, section 9).
+            let marked = db.mark_boundary().map_err(|e| format!("boundary: {e}"))?;
+            match marked {
+                Some(b) => Ok(Some((b, named_entry(db)?))),
+                None => Ok(None),
             }
         })
         .await?
-        .transpose()
-        .map_err(|e| format!("boundary: {e}"))?
+        .transpose()?
         .flatten();
-    if let Some(boundary) = marked {
+    if let Some((boundary, named)) = &marked {
         slot.lock()
             .await
-            .note_boundary(boundary, std::time::Instant::now());
+            .note_named_boundary(*boundary, std::time::Instant::now(), named.clone());
     }
-    Ok(marked)
+    Ok(marked.map(|(b, _)| b))
 }
 
 /// Applies an outcome that landed, then, if nothing is in flight and
@@ -560,13 +580,26 @@ impl ActorState {
             return Ok(());
         };
         let token = held.capture_token();
-        if let Some(live) = self.live.as_mut() {
-            return live.store.data_mut().ensure_batched_capture(token).await;
+        let enabled = if let Some(live) = self.live.as_mut() {
+            live.store.data_mut().ensure_batched_capture(token).await?
+        } else {
+            match self.db.as_mut() {
+                Some(db) => enable_batched(db, token)?,
+                None => None,
+            }
+        };
+        // Enabled at a barrier: from here this hold's segments list and
+        // retire their alarm entries, starting from the one the
+        // acknowledged head names (ADR 0034, section 9).
+        if let (Some(named), Some(cluster), Some(slot)) =
+            (enabled, self.cluster.clone(), self.batched_replica())
+        {
+            slot.lock().await.set_alarm_index(
+                crate::replica::AlarmIndex::of(cluster, self.address.clone()),
+                named,
+            );
         }
-        match self.db.as_mut() {
-            Some(db) => enable_batched(db, token),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// A deploy changed the class's mode of writes: the hold switches at a

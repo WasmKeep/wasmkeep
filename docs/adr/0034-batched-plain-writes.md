@@ -1321,6 +1321,16 @@ names batched as strict: in a cluster of mixed builds the same class is
 batched on some nodes and strict on others, which is data-safe (keys,
 LTX and the chain are the same, and each hold keeps the mode it was
 acquired under), though only the batched nodes give the class batched
-behaviour. Until S10, a batched hold lists each event's alarm entry
-inline before the segment that carries it (as `exec-durable` does) and
-retires none; until S11 it takes no periodic snapshot.
+behaviour. Until S11 a batched hold takes no periodic snapshot.
+
+**As built in S10 (2026-11-15).** A batched hold names an alarm entry at
+each event's end (and at a flush point) without writing it; the replica
+records the entry each boundary's state names, and a segment carries the
+one its end boundary names and the one the acknowledged head names. Its
+upload task lists the first, when it differs, before the segment within
+the segment's budget (a failed or late PUT fails the replica), and
+retires the second only after the segment is acknowledged, never one of
+a newer generation. Stale-hint clearing flushes to a barrier (one upload
+budget) and judges R2 on the acknowledged entry read there; the model
+checks that one read before the hold wrote on is refused
+(`ClearOldAcknowledged`).

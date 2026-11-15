@@ -669,3 +669,204 @@ async fn a_batched_room_parks_only_once_flushed() {
         }
     }
 }
+
+/// The actor's alarm index entries in the bucket now.
+async fn entries(p: &Pair) -> Vec<String> {
+    let store: Arc<dyn ObjectStore> = p.flaky.clone();
+    bucket_keys(&store)
+        .await
+        .into_iter()
+        .filter(|k| k.starts_with(&test_key(Family::Alarms, "")))
+        .collect()
+}
+
+/// An alarm moved by every event (ADR 0034, section 9): entries are named
+/// at each event and listed with the segment that carries them, so an
+/// entry named only inside a segment is never written; the entry the
+/// acknowledged head named stays until the segment replacing it is
+/// acknowledged, then goes. One entry is left, for the last time, and the
+/// next owner fires it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alarm_moved_by_every_event_keeps_one_entry_retired_after_acknowledgement() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    let base = now_ms() + 600_000;
+    let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={base}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let first = entries(&p).await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    p.flaky.delay_wal_ms.store(800, Ordering::SeqCst);
+    for i in 1..=5u64 {
+        let at = base + i * 1_000;
+        let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={at}"), "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let during = entries(&p).await;
+    assert!(
+        during.contains(&first[0]),
+        "the acknowledged entry went before its replacement was acknowledged: {during:?}"
+    );
+    assert!(
+        during.len() <= 2,
+        "entries named inside a segment were listed: {during:?}"
+    );
+    p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let after = entries(&p).await;
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert!(
+        after[0].contains(&format!("{:015}", base + 5_000)),
+        "{after:?}"
+    );
+    let r = b_answers(&p, "/actor/t/x/alarm").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, (base + 5_000).to_string().as_str(), Some("b")),
+        "{}",
+        r.body
+    );
+}
+
+/// The actor's entries due at `at` (ms), by their key.
+fn due_at(keys: &[String], at: u64) -> usize {
+    let at = format!("/{at:015}/");
+    keys.iter().filter(|k| k.contains(&at)).count()
+}
+
+/// What the actor's handler counted firing, on `addr`.
+async fn fired(addr: SocketAddr) -> String {
+    send(addr, "GET", "/actor/t/x/fired", "")
+        .await
+        .body
+        .trim()
+        .to_owned()
+}
+
+/// Recording a batched hold's new alarm entry in its database fails: the
+/// replica fails before any boundary ships, so no acknowledged state holds
+/// an alarm that no entry lists; the next owner finds either both or
+/// neither (ADR 0034, section 9; ADR 0009, R4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_entry_record_stops_replication_before_the_alarm_ships() {
+    let p = batched_pair(Duration::from_secs(30), |_| {}).await;
+    warmed(&p).await;
+    let due = now_ms() + 600_000;
+    wasmkeep_storage::faults::fail_next("set_meta:alarm_indexed");
+    let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={due}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let listed = due_at(&entries(&p).await, due);
+    let r = b_answers(&p, "/actor/t/x/alarm").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("b")),
+        "{}",
+        r.body
+    );
+    if r.body.trim() == due.to_string() {
+        assert!(listed > 0, "the next owner has an alarm no entry lists");
+    } else {
+        assert_eq!(r.body.trim(), "none", "{}", r.body);
+    }
+}
+
+/// The owner dies with its segment's entry PUT in flight: the segment
+/// never lands, the next owner has no alarm, and the entry that lands late
+/// is removed by the sweep without firing anything (ADR 0034, section 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_dying_with_its_entry_put_in_flight_fires_nothing() {
+    let p = batched_pair(Duration::from_secs(30), |_| {}).await;
+    warmed(&p).await;
+    let due = now_ms() + 2_500;
+    p.flaky.delay_alarm_puts_ms.store(1_000, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={due}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    p.flaky.down.store(true, Ordering::SeqCst);
+    let r = b_answers(&p, "/actor/t/x/alarm").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "none", Some("b")),
+        "{}",
+        r.body
+    );
+    let shared: Arc<dyn ObjectStore> = Arc::clone(&p.flaky.inner);
+    eventually("the late entry is swept away", async || {
+        due_at(&bucket_keys(&shared).await, due) == 0
+    })
+    .await;
+    assert_eq!(fired(p.b.addr).await, "0");
+}
+
+/// The owner dies with the segment PUT in flight, its entry already
+/// listed: the segment lands late, the next owner restores the alarm, and
+/// the sweep fires it there (ADR 0034, section 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_dying_with_its_segment_in_flight_leaves_an_alarm_the_sweep_fires() {
+    let p = batched_pair(Duration::from_secs(30), |_| {}).await;
+    warmed(&p).await;
+    let due = now_ms() + 4_000;
+    p.flaky.delay_wal_ms.store(1_000, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={due}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let shared: Arc<dyn ObjectStore> = Arc::clone(&p.flaky.inner);
+    eventually("the entry is listed before the segment", async || {
+        due_at(&bucket_keys(&shared).await, due) == 1
+    })
+    .await;
+    // Cut off now: the segment PUT already sent lands late.
+    p.flaky.down.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    eventually("the sweep fires the alarm on b", async || {
+        fired(p.b.addr).await == "1"
+    })
+    .await;
+}
+
+/// An alarm delivered for a time a trapped event moved: the local database
+/// names the new entry, the acknowledged head still the old one, its
+/// segment in flight. The stale entry is cleared only at a barrier, once
+/// the head names the new one; until then it stays (ADR 0034, section 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_entry_after_a_trapped_event_is_cleared_only_at_a_barrier() {
+    let p = batched_pair(Duration::from_secs(30), |_| {}).await;
+    warmed(&p).await;
+    let old = now_ms() + 1_500;
+    let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={old}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let shared: Arc<dyn ObjectStore> = Arc::clone(&p.flaky.inner);
+    eventually("the first entry is acknowledged", async || {
+        due_at(&bucket_keys(&shared).await, old) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let new = now_ms() + 600_000;
+    p.flaky.delay_wal_ms.store(2_500, Ordering::SeqCst);
+    let r = send(
+        p.a.addr,
+        "POST",
+        &format!("/actor/t/x/alarm-then-trap?at={new}"),
+        "",
+    )
+    .await;
+    assert_eq!(r.status, 500, "{}", r.body);
+    // The old time comes due while the segment naming the new one flies.
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    let keys = bucket_keys(&shared).await;
+    assert_eq!(
+        due_at(&keys, old),
+        1,
+        "cleared before the head moved: {keys:?}"
+    );
+    p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    eventually("the stale entry is cleared at the barrier", async || {
+        let keys = bucket_keys(&shared).await;
+        due_at(&keys, old) == 0 && due_at(&keys, new) == 1
+    })
+    .await;
+    assert_eq!(fired(p.a.addr).await, "0", "the moved alarm did not fire");
+}

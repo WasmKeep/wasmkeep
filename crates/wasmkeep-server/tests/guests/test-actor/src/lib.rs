@@ -335,6 +335,15 @@ impl http::Guest for TestActor {
                 "ok".to_owned()
             }
             (Method::Post, "/trap") => panic!("trap requested"),
+            // A committed alarm, then a trap: the event ends trapped with
+            // its alarm write committed (ADR 0034, section 9).
+            (Method::Post, "/alarm-then-trap") => {
+                let at = query_param(&full, "at")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                alarms::set_alarm(at);
+                panic!("trap requested after setting the alarm")
+            }
             (Method::Post, "/call") => {
                 let to = query_param(&full, "to")
                     .map(|t| percent_decode(&t))

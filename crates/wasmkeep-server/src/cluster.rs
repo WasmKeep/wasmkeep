@@ -807,26 +807,47 @@ impl Cluster {
         at: u64,
         generation: u64,
     ) -> Result<Entry, object_store::Error> {
+        let entry = self.name_alarm_entry(at, generation)?;
+        self.put_alarm_entry(address, &entry).await.map(|()| entry)
+    }
+
+    /// A fresh entry for an alarm due at `at`, as written by the owner
+    /// holding lease `generation` (R1), without writing it: a batched hold
+    /// names it at the event and lists it with the segment that carries
+    /// it (ADR 0034, section 9).
+    pub(crate) fn name_alarm_entry(
+        &self,
+        at: u64,
+        generation: u64,
+    ) -> Result<Entry, object_store::Error> {
         // `nonce()` is lowercase hex, unique in this process; the generation
         // is this process's alone.
-        let entry =
-            Entry::owned(at, generation, self.nonce()).ok_or(object_store::Error::Generic {
-                store: "alarm index",
-                source: "invalid nonce".into(),
-            })?;
-        let key = self.alarm_key(address, &entry);
+        Entry::owned(at, generation, self.nonce()).ok_or(object_store::Error::Generic {
+            store: "alarm index",
+            source: "invalid nonce".into(),
+        })
+    }
+
+    /// Lists `entry` of `address` in the bucket's index. Tried twice (the
+    /// only time a key is written twice).
+    pub(crate) async fn put_alarm_entry(
+        &self,
+        address: &ActorAddress,
+        entry: &Entry,
+    ) -> Result<(), object_store::Error> {
+        let key = self.alarm_key(address, entry);
         if self
             .store
             .put(&key, object_store::PutPayload::new())
             .await
             .is_ok()
         {
-            return Ok(entry);
+            return Ok(());
         }
         self.store
             .put(&key, object_store::PutPayload::new())
             .await
-            .map(|_| entry)
+            .map(|_| ())
     }
 
     /// Removes exactly `entry` of `address` from the index (absent is fine).

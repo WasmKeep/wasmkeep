@@ -30,7 +30,8 @@ mod batched;
     reason = "wired to actors with batched writes in S9 (ADR 0034, plan)"
 )]
 pub(crate) use batched::{
-    Applied, BudgetPermit, NODE_UPLOAD_BYTES, Stop, Ticket, UploadBudget, UploadFailure, stopped,
+    AlarmIndex, Applied, BudgetPermit, NODE_UPLOAD_BYTES, Stop, Ticket, UploadBudget,
+    UploadFailure, stopped,
 };
 
 /// What `failed` says while an inline upload is under way, so a cut that
@@ -1479,6 +1480,28 @@ impl UploadTarget {
         bytes: Vec<u8>,
         what: &'static str,
     ) -> Result<(), ReplicaError> {
+        self.put_bounded_by(key, bytes, what, None).await
+    }
+
+    /// The upload's budget for `len` bytes: its base idle bounds plus a
+    /// second per started megabyte (what [`Self::put_bounded`] allows).
+    fn budget_for(&self, len: usize) -> std::time::Duration {
+        let megabytes = u32::try_from(len.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+        self.upload_idle
+            .saturating_mul(UPLOAD_BUDGET_IDLES)
+            .saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
+    }
+
+    /// [`Self::put_bounded`], ending by `cap` at the latest: a batched
+    /// segment whose alarm entry went first, within the same budget (ADR
+    /// 0034, section 9).
+    async fn put_bounded_by(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        what: &'static str,
+        cap: Option<tokio::time::Instant>,
+    ) -> Result<(), ReplicaError> {
         use tokio::time::{Instant, timeout_at};
         let location = StorePath::from(format!("{}{key}", self.prefix));
         // Shared, not copied, by each attempt.
@@ -1491,6 +1514,7 @@ impl UploadTarget {
                 .upload_idle
                 .saturating_mul(UPLOAD_BUDGET_IDLES)
                 .saturating_add(per_size);
+        let deadline = cap.map_or(deadline, |cap| deadline.min(cap));
         let mut last: String;
         // Attempts given up unanswered; a refusal with nothing there does
         // not count (the attempt it raced may be about to land), it is

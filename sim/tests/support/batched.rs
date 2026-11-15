@@ -69,6 +69,10 @@ pub(crate) enum Switch {
     DoubleMaxUnsent,
     ModeWithoutBarrier,
     CaptureAfterFailure,
+    /// A stale-hint LIST resumed against an acknowledged entry read before
+    /// the same hold wrote on, instead of returning to the barrier and
+    /// reading it again (ADR 0034, section 9).
+    ClearOldAcknowledged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1685,7 +1689,7 @@ pub(crate) fn seeds() -> u64 {
 pub(crate) fn simulate(seed: u64, rule: Switch, batching: bool) -> Outcome {
     Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(async {
         let mut result = Outcome::default();
-        for scenario in 0..31 {
+        for scenario in 0..32 {
             let mut w = World::new(seed.wrapping_mul(31) + scenario, rule, batching);
             // Start with acknowledged data and an alarm in all three actors.
             for a in 0..ACTORS {
@@ -2041,6 +2045,30 @@ pub(crate) fn simulate(seed: u64, rule: Switch, batching: bool) -> Outcome {
                     assert_eq!(w.outcome.counts.healthy_handoffs[0], before + 1);
                 }
                 21 => w.random_workload().await,
+                31 => {
+                    // Clearing waits for a drained barrier and judges R2 on
+                    // the entry the acknowledged head names there. One read
+                    // before the same hold wrote on is stale: the head now
+                    // names another entry, which that read would clear.
+                    w.event(a, Some(2000)).await;
+                    w.flush(a).await;
+                    let Some(h) = w.actors[a].hold.as_ref() else {
+                        continue;
+                    };
+                    let (generation, earlier) = (h.generation, h.acknowledged.alarm.clone());
+                    w.event(a, Some(1000)).await;
+                    w.flush(a).await;
+                    let Some(h) = w.actors[a].hold.as_ref() else {
+                        continue;
+                    };
+                    let indexed = if w.rule == Switch::ClearOldAcknowledged {
+                        earlier
+                    } else {
+                        h.acknowledged.alarm.clone()
+                    };
+                    w.clear_stale_hints(a, indexed.as_ref(), generation);
+                    w.check();
+                }
                 _ => {
                     // Every waiting path is interrupted by both node death and
                     // lease loss. These rare seeds supplement the random stream.
