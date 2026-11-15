@@ -225,8 +225,8 @@ impl ActorState {
             }
             return MoveOut::Busy;
         }
-        if !self.lease.as_ref().is_some_and(LeaseHold::is_valid) {
-            self.lease = None;
+        if !self.held.as_ref().is_some_and(Held::is_valid) {
+            self.drop_hold(Dropped::Lapse);
             return MoveOut::NotHeld;
         }
         let Ok(alarm) = self.alarm_from_database().await else {
@@ -242,12 +242,12 @@ impl ActorState {
             .insert(self.address.clone(), drain::Move { target, until_ms });
         self.live = None;
         self.db = None;
-        self.replica = None;
-        let Some(hold) = self.lease.take() else {
+        let Some(hold) = self.held.take() else {
             self.end_move();
             return MoveOut::NotHeld;
         };
-        match hold.release().await {
+        let barrier = hold.barrier();
+        match hold.release(barrier).returned().await {
             LeaseReturn::Released | LeaseReturn::Superseded => MoveOut::Released { alarm },
             LeaseReturn::Pending => {
                 self.end_move();

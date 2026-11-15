@@ -86,16 +86,16 @@ pub(super) struct ActorState {
     pub(super) live: Option<Live>,
     /// The node's cluster, if it is in one.
     pub(super) cluster: Option<Arc<Cluster>>,
-    /// This node's lease on the actor; released when the state is dropped
-    /// (hibernation).
-    pub(super) lease: Option<LeaseHold>,
+    /// This node's hold on the actor: its lease and, once restored, its
+    /// replication to the bucket. Ended only through [`Held`]'s `release`,
+    /// `park` or `drop_now` (ADR 0034, section 6); released, or parked
+    /// with sockets open, when the state is dropped (hibernation).
+    pub(super) held: Option<Held>,
     /// Another node's lease seen on the bucket: (owner, expiry in ms).
     pub(super) owner_hint: Option<(String, u64)>,
     /// The last `ensure_ready` failed because the actor already ran a newer
     /// deploy than this node has: a temporary refusal (503), not an error.
     pub(super) behind_deploy: bool,
-    /// Replication to the bucket, while this node holds the lease.
-    pub(super) replica: Option<SharedReplica>,
     /// What the actor's outbound HTTP may reach.
     pub(super) egress: Arc<crate::egress::EgressPolicy>,
     /// Where the instance's stdout and stderr go.
@@ -164,13 +164,14 @@ impl Drop for Live {
 /// which case the hold is parked (ADR 0024): the record keeps naming this
 /// node, so the next event for the actor, wherever it lands, wakes it
 /// here, where its sockets are. Never while this node drains, moves the
-/// actor or cannot open the app's secrets: those give the actor up. Every
-/// other end of a hold (`self.lease = None`) releases it as before.
+/// actor or cannot open the app's secrets: those give the actor up. Both
+/// at the hold's barrier (ADR 0034, section 6).
 impl Drop for ActorState {
     fn drop(&mut self) {
-        let Some(hold) = self.lease.take() else {
+        let Some(hold) = self.held.take() else {
             return;
         };
+        let barrier = hold.barrier();
         let parkable = hold.is_valid()
             && self.cluster.as_ref().is_some_and(|c| !c.draining())
             && !self
@@ -183,7 +184,7 @@ impl Drop for ActorState {
                 .contains_key(&self.address)
             && self.sockets.has_open(&self.address);
         if parkable {
-            hold.park(&self.address);
+            hold.park(barrier, &self.address);
             // The last socket's slot may have gone between the check above
             // and the park, its nudge finding nothing parked yet.
             if !self.sockets.has_open(&self.address)
@@ -194,11 +195,34 @@ impl Drop for ActorState {
                     cluster.release_parked(&address, "last_socket").await;
                 });
             }
+        } else {
+            hold.release(barrier);
         }
     }
 }
 
 impl ActorState {
+    /// The actor's replication, while this node holds it restored.
+    pub(super) fn replica(&self) -> Option<&SharedReplica> {
+        self.held.as_ref()?.replica()
+    }
+
+    /// Ends the hold, if any, now ([`Held::drop_now`]).
+    pub(super) fn drop_hold(&mut self, reason: Dropped) {
+        if let Some(hold) = self.held.take() {
+            hold.drop_now(reason);
+        }
+    }
+
+    /// Ends the hold, if any, at its barrier, the lease released in the
+    /// background ([`Held::release`]).
+    pub(super) fn release_hold(&mut self) {
+        if let Some(hold) = self.held.take() {
+            let barrier = hold.barrier();
+            hold.release(barrier);
+        }
+    }
+
     /// A request event: runs it if this node owns the actor, otherwise hands
     /// the request back with the owner's id.
     pub(super) async fn owned_request<B>(
@@ -328,7 +352,7 @@ impl ActorState {
     pub(super) async fn exists(&mut self) -> Result<bool, String> {
         if self.live.is_some()
             || self.db.is_some()
-            || self.lease.as_ref().is_some_and(LeaseHold::is_valid)
+            || self.held.as_ref().is_some_and(Held::is_valid)
         {
             return Ok(true);
         }
@@ -378,7 +402,7 @@ impl ActorState {
             }
             return Ok(());
         };
-        if listed.is_none() && self.lease.as_ref().is_some_and(LeaseHold::is_valid) {
+        if listed.is_none() && self.held.as_ref().is_some_and(Held::is_valid) {
             // Held, but this node cannot open the app's current secrets:
             // never run the actor with an older set. The drain hands it
             // over; until then its events are refused (ADR 0016).
@@ -400,8 +424,7 @@ impl ActorState {
         }
         // Whatever ran before may be stale now: close it all. The database
         // is rebuilt from the bucket unless it is already current.
-        self.lease = None;
-        self.replica = None;
+        self.drop_hold(Dropped::Lapse);
         self.live = None;
         self.db = None;
         // A move under way (ADR 0017): as a drain of this one actor, with the
@@ -436,7 +459,7 @@ impl ActorState {
             Ok(hold) => {
                 self.owner_hint = None;
                 let (view, generation) = (hold.view(), hold.generation().unwrap_or(0));
-                self.lease = Some(hold);
+                self.held = Some(Held::new(hold));
                 let path = self
                     .storage
                     .db_path(self.address.class(), self.address.name());
@@ -445,7 +468,7 @@ impl ActorState {
                 let deadline = std::time::Instant::now() + self.limits.wall;
                 while self.storage.is_open(&path) {
                     if std::time::Instant::now() > deadline {
-                        self.lease = None;
+                        self.release_hold();
                         return Err(OwnershipError::Unavailable(
                             "the actor's previous database connection is still open".into(),
                         ));
@@ -463,12 +486,14 @@ impl ActorState {
                 .await
                 {
                     Ok(replica) => {
-                        self.replica = Some(Arc::new(tokio::sync::Mutex::new(replica)));
+                        if let Some(hold) = self.held.as_mut() {
+                            hold.restored(Arc::new(tokio::sync::Mutex::new(replica)));
+                        }
                         Ok(())
                     }
                     Err(e) => {
                         tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "restore failed");
-                        self.lease = None; // release: another node may try
+                        self.release_hold(); // another node may try
                         // The bucket not answering is temporary; a history
                         // that cannot be restored, or local file trouble,
                         // is not.
@@ -579,7 +604,13 @@ impl ActorState {
                 }
             }
         };
-        let result = match limit(self.limits.wall, self.lease.as_ref(), outcome).await {
+        let result = match limit(
+            self.limits.wall,
+            self.held.as_ref().map(Held::lease),
+            outcome,
+        )
+        .await
+        {
             Ok(r) => r.map_err(|e| format!("{e:#}")),
             Err(cut) => Err(format!("event {cut}")),
         };
@@ -639,7 +670,7 @@ impl ActorState {
     /// In a cluster, makes sure the database is being captured, and uploads
     /// the first snapshot if the bucket had nothing for this actor.
     pub(super) async fn start_replication(&mut self, db: ResidentDb) -> Result<ResidentDb, String> {
-        let Some(slot) = self.replica.clone() else {
+        let Some(slot) = self.replica().cloned() else {
             return Ok(db);
         };
         let needs_snapshot = slot.lock().await.needs_snapshot();
@@ -690,7 +721,7 @@ impl ActorState {
     /// If replication failed, here or during the event, the actor stops: the
     /// lease is released and the next event restores from the bucket.
     pub(super) async fn replicate(&mut self) {
-        let Some(slot) = self.replica.clone() else {
+        let Some(slot) = self.replica().cloned() else {
             return;
         };
         let Some(live) = self.live.as_mut() else {
@@ -767,7 +798,7 @@ impl ActorState {
         operator_delete: Option<String>,
         erase_now: bool,
     ) -> Result<(), String> {
-        let Some(slot) = self.replica.clone() else {
+        let Some(slot) = self.replica().cloned() else {
             return Ok(());
         };
         let storage = self.storage.clone();
@@ -868,7 +899,7 @@ impl ActorState {
     /// 0028): the snapshot of the empty database at it, then the erase,
     /// at once (the actor is given up right after).
     async fn after_durable_delete(&mut self, empty: wasmkeep_storage::wal::Changes) {
-        let Some(slot) = self.replica.clone() else {
+        let Some(slot) = self.replica().cloned() else {
             return;
         };
         let mut replica = slot.lock().await;
@@ -924,7 +955,7 @@ impl ActorState {
             tokio::task::spawn_blocking(move || storage.delete(a.class(), a.name())).await;
         let files_removed = matches!(removed, Ok(Ok(())));
         if !files_removed {
-            if self.replica.is_some() {
+            if self.replica().is_some() {
                 tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; the bucket records it empty anyway");
             } else {
                 tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; its data stays on this node");
@@ -940,10 +971,11 @@ impl ActorState {
             // next event restores from the bucket, which sets them
             // aside (their sidecar no longer matches) instead of
             // serving them.
-            self.replica = None;
             self.live = None;
             self.db = None;
-            self.lease = None; // releases
+            // Flushed: the reset is the acknowledged head (ADR 0034,
+            // section 7), or recording it failed and the hold is gone.
+            self.release_hold();
         }
         recorded
     }
@@ -952,10 +984,9 @@ impl ActorState {
     /// be ahead of the bucket, so it is closed and rebuilt on the next event.
     pub(super) fn abandon(&mut self, reason: &str) {
         tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %reason, "replication failed; giving the actor up");
-        self.replica = None;
         self.live = None;
         self.db = None;
-        self.lease = None; // releases
+        self.drop_hold(Dropped::Failure);
     }
 
     /// No old code on newer data (ADR 0008): an actor whose database a newer
@@ -1069,7 +1100,7 @@ impl ActorState {
             };
             let db = self.start_replication(db).await?;
             let mut host = ActorHost::new(db, Arc::clone(&self.sockets));
-            host.replica = self.replica.clone();
+            host.replica = self.replica().cloned();
             host.deleter = Some((self.storage.clone(), self.address.clone()));
             host.egress = crate::egress::EgressHooks::new(Arc::clone(&self.egress));
             host.wasi = self.guest_log.wasi(
@@ -1135,7 +1166,7 @@ impl ActorState {
         live.start_event("init");
         let init = limit(
             self.limits.wall,
-            self.lease.as_ref(),
+            self.held.as_ref().map(Held::lease),
             live.core.call_on_init(&mut live.store),
         )
         .await;
@@ -1190,8 +1221,7 @@ impl ActorState {
             tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "database worker failed");
             self.live = None;
             self.db = None;
-            self.replica = None;
-            self.lease = None;
+            self.drop_hold(Dropped::Failure);
             return None;
         }
         // Host bookkeeping, microseconds on the actor's own connection:
@@ -1289,10 +1319,11 @@ impl ActorState {
                             .await;
                     self.after_durable_delete(empty).await;
                     self.retire_alarm_entry(stale).await;
-                    self.replica = None;
                     self.live = None;
                     self.db = None;
-                    self.lease = None; // releases
+                    // Flushed: the reset is the acknowledged head (ADR
+                    // 0034, section 7).
+                    self.release_hold();
                 }
                 // One node: the files went in the call (or, if that failed,
                 // now).

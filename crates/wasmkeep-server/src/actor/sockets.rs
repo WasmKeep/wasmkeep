@@ -53,7 +53,7 @@ impl ActorState {
         live.store.data_mut().opening = Some(conn);
         let run = limit(
             self.limits.wall,
-            self.lease.as_ref(),
+            self.held.as_ref().map(Held::lease),
             live.core
                 .call_on_websocket_open(&mut live.store, conn, &path),
         )
@@ -90,7 +90,7 @@ impl ActorState {
         };
         let run = limit(
             self.limits.wall,
-            self.lease.as_ref(),
+            self.held.as_ref().map(Held::lease),
             live.core
                 .call_on_websocket_message(&mut live.store, conn, &msg),
         )
@@ -112,7 +112,7 @@ impl ActorState {
         };
         let run = limit(
             self.limits.wall,
-            self.lease.as_ref(),
+            self.held.as_ref().map(Held::lease),
             live.core
                 .call_on_websocket_close(&mut live.store, conn, code, &reason),
         )

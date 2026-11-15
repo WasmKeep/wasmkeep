@@ -51,6 +51,7 @@ mod deploys;
 mod disk;
 mod drain;
 mod expiry;
+mod held;
 mod host;
 mod load;
 mod moving;
@@ -70,6 +71,8 @@ use self::{
     alarm_delivery::*, classes::*, collection::*, disk::*, host::*, routing::*, sockets::*,
     state::*,
 };
+
+use self::held::{Dropped, Held};
 
 pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};

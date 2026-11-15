@@ -275,6 +275,11 @@ pub(crate) struct Metrics {
     /// Parked records released, by `reason` (`last_socket`, `drain`,
     /// `move`, `lapse`, `stop`).
     pub(crate) parked_releases: Family<AtomicU64>,
+    /// Events whose writes were committed but not acknowledged when a
+    /// batched hold ended without a flush, by `reason`
+    /// ([`PLAIN_DROP_REASONS`], ADR 0034, section 10). A strict hold never
+    /// counts here.
+    pub(crate) plain_events_dropped: Family<AtomicU64>,
     /// Front requests (ADR 0023), by outcome (`ok`, `busy`,
     /// `unconfigured`, `cpu_budget`, `wall`, `guest_error`); rendered with
     /// the node's tenant and app.
@@ -386,6 +391,17 @@ pub(crate) fn parked_released(reason: &str, n: usize) {
     }
 }
 
+/// Counts `n` events dropped for `reason`
+/// ([`Metrics::plain_events_dropped`]).
+pub(crate) fn plain_events_dropped(reason: &str, n: u64) {
+    if n > 0 {
+        METRICS
+            .plain_events_dropped
+            .get(&[("reason", reason)])
+            .fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 impl Family<AtomicU64> {
     /// The sum over every label set.
     pub(crate) fn total(&self) -> u64 {
@@ -443,6 +459,17 @@ pub(crate) const SWEEP_UNREADABLE_READS: [&str; 2] = ["owner", "parked"];
 /// `reason` of `wasmkeep_parked_releases_total`.
 pub(crate) const PARKED_RELEASE_REASONS: [&str; 5] =
     ["last_socket", "drain", "move", "lapse", "stop"];
+/// `reason` of `wasmkeep_plain_events_dropped_total` (ADR 0034, section
+/// 10).
+pub(crate) const PLAIN_DROP_REASONS: [&str; 7] = [
+    "stop",
+    "failure",
+    "lapse",
+    "lost_lease",
+    "panic",
+    "app_deleted",
+    "unbarriered",
+];
 /// `outcome` of `wasmkeep_front_requests_total`.
 pub(crate) const FRONT_REQUEST_OUTCOMES: [&str; 8] = [
     "ok",
@@ -520,6 +547,7 @@ impl Metrics {
             &SWEEP_UNREADABLE_READS,
         );
         one(&m.parked_releases, "reason", &PARKED_RELEASE_REASONS);
+        one(&m.plain_events_dropped, "reason", &PLAIN_DROP_REASONS);
         one(&m.front_requests, "outcome", &FRONT_REQUEST_OUTCOMES);
         one(&m.front_calls, "outcome", &FRONT_CALL_OUTCOMES);
         m
@@ -905,6 +933,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_parked_releases_total",
         "Parked ownership records released, by reason.",
         &m.parked_releases,
+    );
+    family(
+        &mut out,
+        "wasmkeep_plain_events_dropped_total",
+        "Events whose writes were committed but not acknowledged when a batched hold ended without a flush, by reason.",
+        &m.plain_events_dropped,
     );
     let app_family = |out: &mut String, name: &str, help: &str, f: &Family<AtomicU64>| {
         head(out, name, "counter", help);
@@ -1332,6 +1366,11 @@ mod tests {
                 "wasmkeep_parked_releases_total",
                 "reason",
                 &PARKED_RELEASE_REASONS[..],
+            ),
+            (
+                "wasmkeep_plain_events_dropped_total",
+                "reason",
+                &PLAIN_DROP_REASONS[..],
             ),
         ] {
             for v in values {

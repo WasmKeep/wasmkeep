@@ -118,7 +118,8 @@ included), `wasmkeep_admission_refused_total`,
 `wasmkeep_signatures_refused_full_total`,
 `wasmkeep_websocket_owner_closes_total`,
 `wasmkeep_websocket_sweep_unreadable_total`,
-`wasmkeep_parked_releases_total` and the front's two counters. So a
+`wasmkeep_parked_releases_total`, `wasmkeep_plain_events_dropped_total`
+and the front's two counters. So a
 query or a rule can be checked against the page before anything
 happened, and `increase()` counts the first event. Series with a `class`
 label appear at that class's first event, and the front's histogram at
@@ -172,6 +173,7 @@ its first request.
 | `wasmkeep_expiry_kept_total{reason}` | counter | Candidates not deleted, by `reason`: `changed` (the record changed since the listing: woken meanwhile, or held, as a long-resident actor is), `alarm` (its database holds a pending alarm), `socket` (a WebSocket is open), `active` (resident or parked here, or a name that cannot be told back) and `failed` (the bucket or the restore; tried again on a later pass). A record found changed or held is not tried again until it is written again. |
 | `wasmkeep_parked_wakes_total` | counter | Wakes of a parked room on this node, each an acquisition at a new generation (the record's read and write). |
 | `wasmkeep_parked_releases_total{reason}` | counter | Parked records given up, counted when the release is sent (one that does not land waits in the pending releases, retried), by `reason`: `last_socket` (the room's last socket here went), `drain`, `move`, `lapse` (this node's lease ran out: the release is pending, retried) and `stop` (a clean stop). |
+| `wasmkeep_plain_events_dropped_total{reason}` | counter | Events whose writes were committed but not acknowledged when a hold ended without a flush ([ADR 0034](adr/0034-batched-plain-writes.md), sections 6 and 10), by `reason`: `stop` (a clean stop's deadline passed), `failure` (an upload, a capture or the database worker failed), `lapse` (the hold lapsed), `lost_lease` (the node lease was lost or fenced), `panic` (an event panicked), `app_deleted` and `unbarriered` (a hold dropped without a barrier: a bug). It counts batched holds only: a strict class uploads each event's writes before the next starts, so it never counts here (a failed upload is reported where it fails), and nothing counts yet while no class can be batched. |
 
 Not there yet: `tenant` and `app` on the series without a class (one app
 per process for now: join on `wasmkeep_info`), traps by reason
@@ -238,6 +240,7 @@ every metric above except `wasmkeep_classes`, the guest log counters
 the history collection counters (`wasmkeep_history_collected_total`,
 `wasmkeep_history_collect_failures_total`),
 `wasmkeep_snapshot_upload_failures_total`,
+`wasmkeep_plain_events_dropped_total`,
 the delete counters (`wasmkeep_actor_deletes_total`,
 `wasmkeep_actor_delete_failures_total`), the expiry counters
 (`wasmkeep_expiry_passes_total`, `wasmkeep_expiry_candidates_total`,

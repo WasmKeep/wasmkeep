@@ -106,9 +106,8 @@ impl ActorState {
                 // idle timeout would route client requests here, and the
                 // first would create the actor empty, while the node that
                 // holds its data may be about to upload it.
-                self.replica = None;
                 self.db = None;
-                self.lease = None; // releases
+                self.release_hold();
             }
             return;
         }
@@ -170,7 +169,7 @@ impl ActorState {
         live.start_event("alarm");
         let run = limit(
             self.limits.wall,
-            self.lease.as_ref(),
+            self.held.as_ref().map(Held::lease),
             live.core.call_on_alarm(&mut live.store),
         )
         .await;
@@ -247,16 +246,13 @@ impl ActorState {
         &self,
     ) -> impl std::future::Future<Output = Option<(Arc<Cluster>, u64)>> + Send + 'static {
         let parts = (|| {
-            let (cluster, lease) = (self.cluster.as_ref()?, self.lease.as_ref()?);
+            let (cluster, hold) = (self.cluster.as_ref()?, self.held.as_ref()?);
+            let lease = hold.lease();
             let held = lease.generation()?;
             if !lease.is_valid() {
                 return None;
             }
-            Some((
-                Arc::clone(cluster),
-                Arc::clone(self.replica.as_ref()?),
-                held,
-            ))
+            Some((Arc::clone(cluster), Arc::clone(hold.replica()?), held))
         })();
         async move {
             let (cluster, replica, held) = parts?;
@@ -356,7 +352,7 @@ impl ActorState {
     /// re-tags a legacy entry already listing the time, nothing is at risk:
     /// a failure there leaves an extra entry, which costs one wake-up.
     pub(super) async fn publish_alarm(&mut self, at: Option<u64>) -> Option<Published> {
-        if self.cluster.is_none() || self.replica.is_none() {
+        if self.cluster.is_none() || self.replica().is_none() {
             return None;
         }
         let Some(previous) = self.indexed_entry().await else {
@@ -471,7 +467,7 @@ impl ActorState {
         &self,
         reason: &str,
     ) -> impl std::future::Future<Output = Option<Published>> + Send + 'static {
-        let (replica, reason) = (self.replica.clone(), reason.to_owned());
+        let (replica, reason) = (self.replica().cloned(), reason.to_owned());
         async move {
             if let Some(replica) = replica {
                 replica
@@ -576,7 +572,7 @@ impl ActorState {
     /// whether the history now ends in this generation (`false`:
     /// replication stopped, or the fence could not be written).
     pub(super) async fn fence(&mut self) -> bool {
-        let Some(slot) = self.replica.clone() else {
+        let Some(slot) = self.replica().cloned() else {
             return false;
         };
         let generation = {
@@ -648,7 +644,7 @@ impl ActorState {
         } else {
             return false;
         }
-        let Some(slot) = self.replica.clone() else {
+        let Some(slot) = self.replica().cloned() else {
             return false;
         };
         let replica = slot.lock().await;
