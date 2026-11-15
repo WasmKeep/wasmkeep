@@ -430,6 +430,9 @@ pub(super) struct Uploads {
     /// snapshot, and the bound past which one is due (ADR 0034, section 7).
     pub(super) bytes_since_snapshot: u64,
     snapshot_bytes: u64,
+    /// A failed snapshot's wait a restore set aside (fewer than 64
+    /// segments restored), for a batched hold due by bytes.
+    pub(super) set_aside_wait: Option<super::SnapshotWait>,
 }
 
 impl Default for Uploads {
@@ -448,11 +451,17 @@ impl Default for Uploads {
             flight_named: None,
             bytes_since_snapshot: 0,
             snapshot_bytes: SNAPSHOT_BYTES,
+            set_aside_wait: None,
         }
     }
 }
 
 impl Uploads {
+    /// The bytes bound of a snapshot due by bytes.
+    pub(super) fn snapshot_bytes(&self) -> u64 {
+        self.snapshot_bytes
+    }
+
     /// Publish the reason to all waiters, identifying batched holds for Cut::Replica.
     pub(super) fn stopped(&self, reason: &str) {
         self.shared.failure.send_if_modified(|r| {
@@ -619,9 +628,13 @@ impl Replica {
     /// bytes ([`SNAPSHOT_BYTES`]), under the same backoff after a failed
     /// one (ADR 0034, section 7). Asked only at a mailbox gap.
     pub(crate) fn batched_snapshot_due(&self) -> bool {
-        self.snapshot_due()
-            || (self.batched.bytes_since_snapshot >= self.batched.snapshot_bytes
-                && self.since_snapshot >= self.snapshot_retry_at)
+        let reached = self.since_snapshot >= super::SNAPSHOT_EVERY
+            || self.batched.bytes_since_snapshot >= self.batched.snapshot_bytes;
+        // Both gates of a failed snapshot's backoff, whichever bound came.
+        reached
+            && self.since_snapshot >= self.snapshot_retry_at
+            && (self.snapshot_failures == 0
+                || tokio::time::Instant::now() >= self.snapshot_retry_after)
     }
 
     /// The bytes bound of [`Self::batched_snapshot_due`] (tests shorten it).

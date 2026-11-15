@@ -656,10 +656,14 @@ impl ActorState {
         if let (Some(named), Some(cluster), Some(slot)) =
             (enabled, self.cluster.clone(), self.batched_replica())
         {
-            slot.lock().await.set_alarm_index(
+            let mut replica = slot.lock().await;
+            replica.set_alarm_index(
                 crate::replica::AlarmIndex::of(cluster, self.address.clone()),
                 named,
             );
+            // A failed snapshot's wait a restore set aside, the hold due
+            // by bytes all the same (ADR 0034, section 7).
+            replica.resume_batched_snapshot_wait();
         }
         Ok(())
     }

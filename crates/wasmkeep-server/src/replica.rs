@@ -38,6 +38,26 @@ pub(crate) use batched::{
 /// interrupts it stops replication.
 const INTERRUPTED: &str = "an upload was interrupted";
 
+/// The encoded bytes of the segments a restore replays after its snapshot,
+/// from the listing's sizes: what a batched hold counts toward a snapshot
+/// by bytes when it is acquired again (ADR 0034, section 7).
+fn history_bytes(
+    plan: &wasmkeep_cluster::replication::Plan,
+    keys: &[String],
+    sizes: &std::collections::HashMap<String, u64>,
+) -> u64 {
+    let wanted: std::collections::HashSet<SegmentId> = plan.segments.iter().copied().collect();
+    keys.iter()
+        .filter(|k| {
+            Listing::from_keys([k.as_str()])
+                .segments
+                .first()
+                .is_some_and(|s| wanted.contains(&s.id))
+        })
+        .map(|k| sizes.get(k).copied().unwrap_or(0))
+        .fold(0, u64::saturating_add)
+}
+
 /// Upload a snapshot after this many segments, so restores stay short.
 const SNAPSHOT_EVERY: u64 = 64;
 
@@ -764,6 +784,7 @@ impl Replica {
             batched: batched::Uploads::default(),
             upload_idle: UPLOAD_IDLE,
         };
+        replica.batched.bytes_since_snapshot = history_bytes(&plan, &keys, &sizes);
         replica.resume_snapshot_wait();
         if plan.head() == EMPTY {
             // Nothing in the bucket yet: the local database (possibly from
@@ -1349,6 +1370,10 @@ impl Replica {
         };
         if self.since_snapshot < SNAPSHOT_EVERY {
             self.snapshot_waits.forget(&self.address);
+            // Kept aside for a batched hold, due by bytes all the same.
+            if self.batched.bytes_since_snapshot >= self.batched.snapshot_bytes() {
+                self.batched.set_aside_wait = Some(wait);
+            }
             return;
         }
         self.snapshot_failures = wait.failures;
@@ -1356,6 +1381,23 @@ impl Replica {
             .since_snapshot
             .saturating_add(wait.txid.saturating_sub(self.head.txid));
         self.snapshot_retry_after = wait.after;
+    }
+
+    /// For a batched hold, once its mode is known: takes up a wait that
+    /// [`Self::resume_snapshot_wait`] set aside because fewer than
+    /// [`SNAPSHOT_EVERY`] segments were restored, when the restored
+    /// segments' bytes make a snapshot due by bytes all the same (ADR 0034,
+    /// section 7). A strict hold never asks, and keeps its rule.
+    pub(crate) fn resume_batched_snapshot_wait(&mut self) {
+        let Some(wait) = self.batched.set_aside_wait.take() else {
+            return;
+        };
+        self.snapshot_failures = wait.failures;
+        self.snapshot_retry_at = self
+            .since_snapshot
+            .saturating_add(wait.txid.saturating_sub(self.head.txid));
+        self.snapshot_retry_after = wait.after;
+        self.snapshot_waits.set(&self.address, wait);
     }
 
     /// A periodic snapshot failed (or is starting): when the next try is
@@ -2753,6 +2795,89 @@ mod tests {
         assert!(!r.snapshot_due());
         r.since_snapshot += 1;
         assert!(r.snapshot_due(), "one segment later");
+    }
+
+    /// A batched hold's snapshot due by bytes keeps both gates of a
+    /// failed snapshot's backoff, as one due by segments does: the
+    /// segments to wait for and the time (ADR 0034, section 7).
+    #[tokio::test]
+    async fn a_byte_triggered_snapshot_waits_out_the_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.set_snapshot_bytes(1_000);
+        r.batched.bytes_since_snapshot = 5_000;
+        r.since_snapshot = 3;
+        assert!(r.batched_snapshot_due());
+        r.snapshot_failed();
+        r.since_snapshot += 1;
+        assert!(!r.batched_snapshot_due(), "before the time");
+        r.snapshot_retry_after = tokio::time::Instant::now();
+        assert!(r.batched_snapshot_due(), "after the time, a segment on");
+        r.since_snapshot -= 1;
+        assert!(!r.batched_snapshot_due(), "not before its segment");
+    }
+
+    /// The bytes a restore counts toward a batched snapshot are the chain's
+    /// segments' since its snapshot, from the listing's sizes: 40 MiB, then
+    /// 40 more, make it due across a hibernation, and a byte-triggered
+    /// wait left on this node is taken up by a batched hold below 64
+    /// segments, never by a strict one (ADR 0034, section 7).
+    #[tokio::test]
+    async fn a_reacquired_hold_counts_its_restored_bytes_and_keeps_its_wait() {
+        use wasmkeep_cluster::replication::{Segment, segment_key, snapshot_key};
+        let id = |txid| SegmentId {
+            generation: 1,
+            txid,
+        };
+        let seg = |txid| {
+            segment_key(&Segment {
+                id: id(txid),
+                parent_generation: 1,
+            })
+        };
+        let keys = vec![snapshot_key(id(1)), seg(2), seg(3)];
+        let sizes = std::collections::HashMap::from([
+            (keys[0].clone(), 900 << 20),
+            (keys[1].clone(), 40 << 20),
+            (keys[2].clone(), 40 << 20),
+        ]);
+        let plan = plan_restore(&Listing::from_keys(keys.iter().map(String::as_str))).unwrap();
+        assert_eq!(
+            history_bytes(&plan, &keys, &sizes),
+            80 << 20,
+            "not the snapshot"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.since_snapshot = 1;
+        r.batched.bytes_since_snapshot = 40 << 20;
+        assert!(!r.batched_snapshot_due());
+        r.batched.bytes_since_snapshot = 80 << 20;
+        assert!(r.batched_snapshot_due());
+        r.snapshot_failed();
+        let waits = Arc::clone(&r.snapshot_waits);
+        let reacquired = async || {
+            let mut next = replica(dir.path()).await;
+            next.snapshot_waits = Arc::clone(&waits);
+            next.since_snapshot = 2;
+            next.batched.bytes_since_snapshot = 80 << 20;
+            next.resume_snapshot_wait();
+            next
+        };
+        let mut batched = reacquired().await;
+        batched.resume_batched_snapshot_wait();
+        assert_eq!(batched.snapshot_failures, 1, "the wait is taken up");
+        assert!(!batched.batched_snapshot_due(), "before its time");
+        batched.snapshot_retry_after = tokio::time::Instant::now();
+        assert!(!batched.batched_snapshot_due(), "not before its segment");
+        batched.since_snapshot += 1;
+        assert!(batched.batched_snapshot_due(), "after both");
+        // A strict hold restored the same way forgets it, as before.
+        r.snapshot_failed();
+        let strict = reacquired().await;
+        assert_eq!(strict.snapshot_failures, 0, "a strict hold is as before");
+        assert!(strict.snapshot_waits.get(&strict.address).is_none());
     }
 
     /// The wait after a failed periodic snapshot is the node's, not the
