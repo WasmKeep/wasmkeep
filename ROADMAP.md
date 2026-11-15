@@ -131,8 +131,10 @@ Each waits for a user who needs it.
 
   WasmKeep does not manage microVMs, and does not decide which tenant
   gets which tier: that belongs to whatever platform runs it.
-  Each tier will come with what it does and does not protect against in
-  [security](docs/security.md).
+  Every tier uses the node's same three ports: the node routes to an
+  app's process over local sockets, so isolating an app opens no new
+  port. Each tier will come with what it does and does not protect
+  against in [security](docs/security.md).
 - **M5, raw Linux workloads**: tenants that need a Linux program rather
   than a component, behind the same routing and storage API.
 
