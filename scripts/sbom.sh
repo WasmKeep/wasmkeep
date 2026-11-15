@@ -19,7 +19,7 @@ target=${1:-$(rustc -vV | sed -n 's/^host: //p')}
 out=target/sbom/wasmkeep-$target.cdx.json
 # cargo-cyclonedx writes one <bin>_bin.cdx.json next to every binary crate's
 # manifest in the workspace; keep the wasmkeep one, remove the others.
-cleanup() { rm -f crates/*/*_bin.cdx.json sim/*_bin.cdx.json bench/compare/*_bin.cdx.json; }
+cleanup() { rm -f crates/*/*_bin.cdx.json sim/*_bin.cdx.json bench/compare/*_bin.cdx.json bench/roomload/*_bin.cdx.json; }
 trap cleanup EXIT
 cleanup
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) cargo cyclonedx --quiet \

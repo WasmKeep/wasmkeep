@@ -250,6 +250,13 @@ class PublicationPaths(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_websocket_urls_are_urls(self):
+        self.stage("docs/example.md", "ws://HOST:PORT/actor/room/NAME\nwss://example.invalid/home/example\n")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.stage("docs/example.md", "ws://HOST:PORT /home/alice/x\n")
+        self.assertEqual(self.check().returncode, 1)
+
     def test_relative_globs_templates_and_url_templates_are_publishable(self):
         self.stage(
             "docs/example.md",

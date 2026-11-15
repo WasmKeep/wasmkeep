@@ -1049,6 +1049,171 @@ Failover is set by the node lease timings (15 to about 21 s after the
 node's last heartbeat) plus a restore; see
 [Running a cluster](cluster.md#how-it-works).
 
+## One big room
+
+How far one room actor goes, to size a fan-out pattern (several rooms
+relaying to each other) before anyone writes one. `./bench/room.sh`
+writes `bench/results/<date>-<commit>-room-<label>.csv` in the columns
+above, a row per measure, named `room/n<sockets>/<mode>/r<rate>/<measure>`.
+
+**The room** (`bench/room`, an actor for this benchmark only) accepts every
+socket, numbers each message it is sent (`seq`), stores it and broadcasts
+`<seq> <text>` to every socket. It sends nothing else (no history, no
+join notices: those make a ramp-up of N sockets cost N² sends, which
+`examples/chat-room` does). Its name says how it stores a message:
+`plain-` with `exec`, `durable-` with `exec-durable` (in the bucket before
+it is broadcast), `batch-` in memory, committed with one `exec-durable` 50
+ms after the first, then broadcast as one frame per socket. Every mode runs
+on the same one-node cluster on a bucket (moto through `uvx` locally, as
+`scripts/s3-suites.sh` does, or `WASMKEEP_ROOM_BUCKET` and `AWS_*`), so
+they differ only in how the room writes. `GET` on the room returns its
+counters, sends dropped for backpressure included.
+
+Clients connect at `/actor/room/<name>`, not through a front: the front
+runs only when a socket opens ([ADR 0027](adr/0027-sockets-through-the-front.md));
+after the hand-off the socket belongs to the host as any other
+([ADR 0003](adr/0003-websockets-wit-v0.2.md)), so broadcasting costs the same
+either way, and the plain address leaves the front's slots out of the
+ramp-up.
+
+**The load** (`bench/roomload`): `roomload run` opens N sockets, at most
+`--ramp` new ones a second, over the `--source-ip` addresses; its first
+`--senders` sockets send `--rate` messages a second in all, about 200 bytes
+each, carrying the sender and the send time. The sends are open loop
+(message k is due at k / rate, whatever the room answers), so a room that
+cannot keep up shows as latency and unacknowledged messages, not as a lower
+offered rate. Every socket checks the numbers it receives for gaps,
+duplicates and order. `roomload sample` reads the node's CPU time, memory
+and descriptors from `/proc` and its open sockets and refusals from the
+[metrics page](monitoring.md#metrics). `roomload merge` takes, for each
+message, the last socket to receive it over every process, and prints:
+
+| Rows | Meaning |
+| --- | --- |
+| `latency_last_p50`, `_p99`, `_max` | From the send to the last socket's receipt, over the messages delivered |
+| `latency_first_p50` | To the first socket's receipt |
+| `delivered_per_s` | Receipts per second, over all sockets, from the first send to the last receipt |
+| `sent`, `acked`, `unacked` | Messages sent; acknowledged (seen back by their sender, stored and broadcast, or with HTTP senders answered 200 or 202); not acknowledged before the end |
+| `late_messages`, `late_start` | Messages the last socket had more than a second after they were sent (the room fell behind, even if it caught up in the drain); processes that were still connecting at the start time |
+| `lost_deliveries`, `duplicates`, `reordered`, `incomplete_messages` | Per socket, numbers it should have had and did not; received twice; out of order; messages some open socket missed |
+| `lost_acked` | Acknowledged numbers past the highest the room stored, plus holes in what it stored |
+| `room_backpressure` | The room's sends dropped because a client fell 256 messages (or 4 MiB) behind ([WebSockets](concepts.md#websockets)) |
+| `handshake_<status>`, `server_close_<code>`, `http_<status>` | Upgrades by answer (`101`, `503` past a limit), closes from the server (`1013`, `1011`), and `POST` answers with `ROOM_HTTP_SENDERS=1` (`429` when the actor's queue is full) |
+| `node_cpu_pct`, `node_rss_peak`, `node_fds_peak`, `node_websockets_open_peak`, `node_refused_*` | The node, from `/proc` and its metrics page |
+| `load_cpu_pct` | The load processes' own CPU: near a core per process, they measure themselves |
+| `outcome_<kind>` | `ok`, or how it broke: `refused` (a 503, 1013, 429: documented limits), `stall` (unacknowledged or undelivered messages, client queues full, 1011), `loss` (a gap, a duplicate, an acknowledged message not stored) or `crash` (the node exited) |
+
+The actor's queue depth is not on the metrics page; a socket's messages
+never fill it anyway (its reader waits for each message's event before
+reading the next frame), so overload from WebSocket senders shows as
+latency and unacknowledged messages. Only `POST` senders can be answered
+429.
+
+**Limits that decide the large sizes.** A node takes at most 1,000 sockets
+per actor and 50,000 in all ([WebSockets](concepts.md#websockets)), fixed in
+the server: a room of 10,000 or 100,000 sockets today accepts 1,000 and
+answers the rest `503`, which the rows record as `handshake_503`. Measuring
+one room past 1,000 needs those limits raised first, a server change of its
+own.
+
+### A workstation trial
+
+These are workstation figures that prove the harness works, not fleet
+results: one desktop (16 cores) ran the node, moto and the load over
+loopback, with the node's data on tmpfs, 10 s of sending per cell and 10
+senders, in
+[`2026-11-15-699ebec-room-workstation.csv`](../bench/results/2026-11-15-699ebec-room-workstation.csv)
+(on moto) and
+[`2026-11-15-699ebec-room-workstation-nobucket.csv`](../bench/results/2026-11-15-699ebec-room-workstation-nobucket.csv)
+(`ROOM_BUCKET=none`), plus one cell with HTTP senders in
+[`2026-11-15-699ebec-room-workstation-http-senders.csv`](../bench/results/2026-11-15-699ebec-room-workstation-http-senders.csv).
+The node and the load shared the machine. What they show, in shape:
+
+- No cell lost, duplicated or reordered a message, and no acknowledged
+  message was missing from the room's table.
+- On a bucket, the room's `plain` and `durable` modes both stopped at a
+  few hundred messages a second, whatever the room's size (10 sockets as
+  1,000) and with the node mostly idle (15% of a core with 10 sockets),
+  while the same room without a bucket took 1,000 a second: on a bucket,
+  as observed, a room that writes on every message runs about one
+  message per bucket round trip, plain writes included. At 1,000 messages a second the rest queued in the
+  senders' sockets (`outcome_stall`: unacknowledged, latency growing for
+  the whole run). `batch` took every rate, about 30 ms of latency at the
+  median (half the 50 ms window) and under 70 ms at p99, about a million
+deliveries a second into 1,000 sockets at a third of a core.
+- Without a bucket (and with the data on tmpfs, where an fsync is free, so
+  `durable` costs what `plain` does), the limit moves to the broadcast itself: a room of
+  1,000 sockets kept up at 100 messages a second and fell behind at 1,000
+  (its sends to 1,000 sockets per message: about 800,000 deliveries a
+  second, latency growing to seconds), where `batch`, one frame per socket
+  per batch, did not.
+- 10,000 sockets: 1,000 accepted, 9,000 answered `503` (`refused`), as the
+  limits above say. The workstation did not need any system change for it.
+- With 2,000 HTTP senders at 1,000 messages a second, more requests waited
+  than the actor's queue holds, and the node answered `429` (`http_429`,
+  `node_refused_overloaded`): a clean refusal, where WebSocket senders
+  only queue.
+
+### Run it on one machine
+
+```bash
+ROOM_LABEL=workstation BENCH_HOST=workstation ./bench/room.sh
+ROOM_SIZES="10 100 1000" ROOM_RATES="100 1000" ROOM_MODES="plain durable batch" \
+  ROOM_SECS=10 ROOM_LABEL=workstation ./bench/room.sh
+```
+
+Each cell (a size, a mode, a rate) gets a fresh node and a fresh room. The
+script checks the soft descriptor limit first (about four per socket on the
+node, and one per socket for the load) and changes no system setting.
+
+### Run it on several machines
+
+One load machine reaches one node address with at most its ephemeral port
+range per source address (about 28,000 with the default
+`net.ipv4.ip_local_port_range` of `32768 60999`), and every socket costs a
+descriptor on both sides. For 10,000 sockets and more, set on every
+machine, as root and deliberately (these change the system):
+
+```bash
+sysctl -w fs.file-max=2097152 fs.nr_open=2097152
+sysctl -w net.ipv4.ip_local_port_range="10240 65535"   # load machines
+sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535   # the node
+ulimit -Hn 1048576; ulimit -Sn 1048576   # in the shell that runs the script
+```
+
+and give each load machine several source addresses (`ROOM_SOURCE_IPS`)
+when one machine opens more than about 25,000 sockets. Clocks must agree:
+latency is measured across machines, so run NTP (chrony) everywhere and
+check `chronyc tracking`; its offset is the error on every latency row.
+
+With one node and two load machines, for 10,000 and 100,000 sockets (the
+same `ROOM_*` values on every machine; `ROOM_T0` one Unix time, in seconds,
+a few minutes ahead, computed once and given to both load machines):
+
+```bash
+# node machine
+WASMKEEP_ROOM_BUCKET=s3://BUCKET/PREFIX ROOM_LISTEN=0.0.0.0:8080 ROOM_ADVERTISE=http://NODE:8080 \
+  ROOM_SIZES="10000 100000" ROOM_RUN=r1 ROOM_DIR=room-r1 ./bench/room.sh node
+# each load machine, ROOM_CLIENT=0 and ROOM_CLIENT=1
+ROOM_URL=ws://NODE:8080 ROOM_SECS=60 ROOM_CLIENTS=2 ROOM_CLIENT=0 ROOM_PROCS=4 \
+  ROOM_SIZES="10000 100000" ROOM_RATES="1 10 100 1000" ROOM_RUN=r1 \
+  ROOM_T0=T0 ROOM_DIR=room-r1 ./bench/room.sh client
+# then, on one machine, with every client's cell directories and the
+# node's sample.txt copied into room-r1
+ROOM_SIZES="10000 100000" ROOM_RATES="1 10 100 1000" ROOM_DIR=room-r1 \
+  ROOM_LABEL=fleet-3 ./bench/room.sh merge
+```
+
+Each machine takes its share of the sockets, senders and rate
+(`ROOM_CLIENTS` times `ROOM_PROCS` processes), and the cells start on a
+schedule from `ROOM_T0` (`ROOM_CELL_SECS` apart), so every process of a cell
+sends at the same moment (`late_start` counts processes that were not
+connected in time: raise `ROOM_START_DELAY`). Use the same `ROOM_SECS` on
+every machine, long enough that the lowest rate gives each cell a few
+hundred messages. The node serves every cell, in rooms named by
+`ROOM_RUN`; `merge` counts only the node's samples from each cell's
+ramp-up to its last receipt.
+
 ## Reproduce
 
 Both entry points require Bash. Full comparisons and `bench/run.sh` require

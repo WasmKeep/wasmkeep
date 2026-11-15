@@ -23,7 +23,7 @@ SYSTEM_DEVICES = {"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev
 BARE_MARKERS = {"~/", "/tmp", "/tmp/"}
 # A URL ends where a path list or a query begins: what follows a delimiter,
 # or the query and fragment, is scanned like any other text.
-URL = re.compile(r"(?:https?|s3|gs|az)://[^\s<>\"'`|,;()?#]+", re.IGNORECASE)
+URL = re.compile(r"(?:https?|wss?|s3|gs|az)://[^\s<>\"'`|,;()?#]+", re.IGNORECASE)
 FILE_URI = re.compile(r"\bfile:(?://[^/\s<>\"'`]*)?", re.IGNORECASE)
 UNICODE_ESCAPE = re.compile(r"\\u([0-9a-f]{4})", re.IGNORECASE)
 ESCAPED_WHITESPACE = re.compile(r"(?<!\\)((?:\\\\)*)\\[nrt]")
@@ -73,6 +73,7 @@ REVIEWED_PATHS = {
         "/actor/counter/{name}", "/counter/{name}",
         "/actor/ledger/{name}", "/ledger/{name}",
     },
+    "bench/room/src/lib.rs": {"/actor/room/{name}"},
     "bench/celld/cluster.js": {"/ledger/", "/ledger/{name}"},
     "bench/workerd/config.capnp": {"/workerd/workerd.capnp"},
     "bench/workerd/counter.js": {"/counter/", "/counter/{name}"},
@@ -127,6 +128,11 @@ REVIEWED_LITERALS = {
     ),
     # The same reviewed expressions in the one-node bucket comparison's runner.
     "bench/bucket.sh": (
+        "'s/^Model name: *//p'",
+        '$(dirname "$0")/..',
+    ),
+    # The same reviewed expressions in the big room's runner.
+    "bench/room.sh": (
         "'s/^Model name: *//p'",
         '$(dirname "$0")/..',
     ),

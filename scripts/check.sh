@@ -88,7 +88,7 @@ for path in "${changed[@]}"; do
   case "$path" in
     Cargo.toml|Cargo.lock|rust-toolchain.toml|.cargo/*|examples/*|sdks/*|wit/*|crates/wasmkeep-wit/*)
       rust=true; everything=true ;;
-    crates/*/*|bench/compare/*)
+    crates/*/*|bench/compare/*|bench/roomload/*)
       rust=true
       dir=$(cut -d/ -f1-2 <<<"$path")
       if [ ! -f "$dir/Cargo.toml" ]; then everything=true; continue; fi
