@@ -1,6 +1,13 @@
 # 0033. Data access, export and online backup
 
-- Status: proposed (2026-11-14)
+- Status: proposed (2026-11-14); revised after an adversarial review
+  (a destination keyed by content, since generations restart after an
+  app is recreated; prune excluded from a running backup; restore
+  requests in the intents' fallback listing and ended as deletes are;
+  resets labelled in the database instead of guessed from headers;
+  restores refused once superseded by a later delete; the alarm index
+  rebuilt from the committed alarm; a restore of a whole app fenced
+  from node starts)
 - Date: 2026-11-14
 - Milestone: [After that](../../ROADMAP.md#after-that), "operating
   without the author": inspect or export one actor, verify a bucket,
@@ -47,7 +54,11 @@ What the code gives us to build on:
   per committed transaction, and `snapshot/<txid>-<generation>.ltx`, the
   whole database at one position, every 64 segments (`R` is the app's
   root, `state/<tenant>/<app>/`, ADR 0022). Every key is created once,
-  conditionally, and never rewritten: a key names one content for good.
+  conditionally, and never rewritten while it exists. A key does **not**
+  name one content for good: `app delete` removes the app's ownership
+  records and lease markers with its history (ADR 0028, section 5), so
+  after `deploy --recreate` generations start again at 1
+  (`seed_generation`) and the same key can come back with other bytes.
 - **The restore plan is a pure function of key names**
   (`wasmkeep_cluster::replication::plan_restore`): the head is the
   newest segment of the highest generation, and the plan walks back by
@@ -83,14 +94,17 @@ What the code gives us to build on:
 - **An actor's first generation** comes from its lease marker
   (`R leases/<class>/<name>`, `wasmkeep-lease 2`) and from the highest
   generation its history keys carry, whichever is higher
-  (`mark_old_lease`, ADR 0020, section 6). A prefix with history but no
-  ownership record is safe to start on, as long as its markers are right.
+  (`mark_old_lease`, called by `seed_generation`, ADR 0020, section 6).
+  A prefix with history but no ownership record is safe to start on:
+  without a marker the seed comes from the keys. A marker matters only to
+  lift the seed above generations the keys no longer show.
 - **The alarm index is derivable.** Each database records the exact
   entry it is indexed under (`alarm_indexed` in `_wasmkeep_meta`,
   ADR 0009), and its alarm in `_wasmkeep_alarm`.
-- **Requests at rest cost money** ([benchmarks](../benchmarks.md#bucket-requests-at-rest)):
-  on R2 and S3 a LIST is billed like a PUT, and listings page by 1,000
-  keys. Whatever a tool lists per actor, per run, multiplies by the
+- **Requests at rest cost money** ([benchmarks](../benchmarks.md#bucket-requests-at-rest),
+  measured on 0.4.1, before ADR 0014's amendment of 2026-11-14 cut the
+  intents' listings; not measured since): on R2 and S3 a LIST is billed
+  like a PUT, and listings page by 1,000 keys. Whatever a tool lists per actor, per run, multiplies by the
   number of actors.
 
 **One premise of this work needs correcting.** It is tempting to say
@@ -170,13 +184,25 @@ skew bound between the nodes' clocks and the bucket's.
   next delete. So each delete that happens while an actor is being read
   costs at most one more attempt.
 
-`d` is a few seconds (at most 64 objects of an actor, read 8 at a time,
-ADR 0007's read rules). With `W = 0`, a busy actor can keep a reader
+`d` counts from the read of the listing the plan came from to the last
+read of the plan, so a tool must not let plans wait in a queue: it plans
+an actor only when it can start reading it (section 4 applies
+back-pressure to its listing). The reads themselves are bounded as a
+restore's are (ADR 0007, step 7: 30 s, plus a second per started
+megabyte and a second per eight objects), which is seconds for a small
+actor and about 17 minutes for a database of 1 GiB. A plan can hold more
+than 65 objects when periodic snapshots keep failing (ADR 0012, "What
+can still go wrong"), and the same deadline grows with it. With `W = 0`, a busy actor can keep a reader
 retrying until the 8 attempts are spent. The tool then fails that actor
 and names the cause ("collected faster than read: raise
 `--history-retention-secs`"). It never returns a wrong database. The
-docs ask for `W` of at least five minutes on a cluster that is backed up
-or exported, which the default of an hour is.
+docs ask for `W` above twice the read deadline of the largest actor,
+plus the skew bound, on a cluster that is backed up or exported: 35
+minutes for actors at the 1 GiB cap, which the default of an hour
+covers. (`last_modified` is taken here as the time the upload
+completed. If a provider reports when a multipart upload started, the
+bound shifts by at most one upload's time. This changes liveness only,
+not safety.)
 
 **Which past positions remain.** A position `X` on the current chain
 can be replayed if the listing holds a snapshot at or below `X` on the
@@ -190,9 +216,9 @@ chain and every segment from it to `X`. After collection that is:
 - more for an actor that stopped writing: collection follows writes
   (ADR 0012, open question 3), so an idle actor keeps its last
   interval and what was younger than the window at its last pass;
-- nothing before the newest reset in the chain: a delete erases at once
-  (ADR 0012, "Deleted actors"), and a restore of section 6 keeps the
-  window.
+- nothing before the newest delete in the chain: a delete erases at
+  once (ADR 0012, "Deleted actors"). A restore of section 6 keeps the
+  window, and with `W = 0` keeps nothing before it either.
 
 So the live bucket offers point-in-time reads over roughly the last
 `--history-retention-secs`. A longer window keeps more, at the cost of
@@ -206,21 +232,36 @@ the chain, carries an LTX `timestamp_ms` at or before `T`. That is commit
 time on the writing node's clock, which survives a copy and is not
 delayed by a late landing. Along one chain the stamps rise except for
 skew between successive owners (up to `ε`), hence "and every segment
-before it". Positions on abandoned branches are never chosen: `--at`
+before it". A snapshot's own stamp is when it was taken, not when its
+position was committed, so a snapshot at `P` is dated by the segment at
+`P`, which collection keeps beside it. A relative time (`--at -15m`) is
+counted on the operator's clock, which the nodes' skew bound does not
+cover; the output prints the resolved position and its stamp. Positions on abandoned branches are never chosen: `--at`
 and `--txid` both walk the current chain only. To find the position the
 tool narrows with the listing's `last_modified` (live bucket) or the
 run manifest's recorded stamps (backup), then reads the headers of the
 segments it replays anyway. A `T` before the oldest position that can
 be replayed is an error that prints the range.
 
-**Resets.** A reset (`ship_reset`, ADR 0028) and the replacement of
-section 6 are both one segment that rewrites the whole database: its
-LTX header's `commit` equals the number of pages it holds, starting at
-page 1. The tool labels such a position "replaced", and "deleted" when
-the database after it has no table outside `_wasmkeep_*`. A replay of a
-deleted actor's head gives the empty database (with its host meta),
-and says so. `--txid` below the newest reset is refused with "erased
-by a delete at txid r; restore it from a backup".
+**Deletes and replacements are labelled, not guessed.** A reset
+(`ship_reset`, ADR 0028) and the replacement of section 6 are both one
+segment holding a whole database, but neither the key nor the LTX
+header tells them from an ordinary commit that rewrote every page (a
+small database), and a database past 1 GiB never holds every page
+anyway (the lock page is left out). So every delete routine and every
+restore writes a host meta key in the database it uploads, `replaced =
+delete <txid> <time>` or `replaced = restore <txid> <T> <id>`, naming
+the txid of the segment that carries it (the holder knows it: the head's
+txid plus one). The row stays in the database until the next delete or
+restore replaces it, so one read of the replayed database names the
+newest replacement at or below that position. A database without the key (a delete by a node from
+before this record) is labelled only when it is empty of app tables,
+and the output says "probably deleted". Labels need a replay, so `actor
+history` shows them only with `--deep`. A replay of a deleted actor's
+head gives the empty database (with its host meta), and says so. A
+position before the newest delete is not replayable (its objects are
+erased), and the error says so: "erased by a delete at txid r; restore
+it from a backup".
 
 ### 2. `wasmkeep actor history` and `wasmkeep actor export`
 
@@ -238,10 +279,11 @@ for that actor is exactly what is read.
 
 **`actor history`** lists the prefix once and prints, without reading
 an object: the head (generation, txid, landed at), the oldest position
-that can be replayed, the snapshots on the chain, the replaced and
-deleted positions, the objects and bytes under the prefix, and how many
-objects are off the chain (late uploads, not yet collected). `--json`
-for scripts. It is what an operator runs before `--at` or `actor
+that can be replayed, the snapshots on the chain, the objects and bytes
+under the prefix, and how many objects are off the chain (late uploads,
+not yet collected). `--deep` replays the head and adds the newest delete
+or restore and the commit times from the LTX headers. `--json` for
+scripts. It is what an operator runs before `--at` or `actor
 restore`.
 
 **`actor export`** writes a plain SQLite file:
@@ -294,8 +336,11 @@ Read-only SQL on one replayed snapshot, run on the operator's machine:
 
 - **The database** is the export of section 2 at the position asked,
   into a temporary file removed on exit, or into `--cache DIR`, which
-  keeps one file per actor with a sidecar naming its position and
-  checksum (as a node's `.replica` sidecar does). With a cache, a second
+  keeps one file per actor, with the raw bytes as replayed (WAL mode, so
+  that later segments' pre-apply checksums still follow it) and a
+  sidecar naming its position and checksum (as a node's `.replica`
+  sidecar does). It is opened with `immutable=1`, which needs no `-shm`
+  file and no write access. With a cache, a second
   query lists the prefix and replays only the segments since the cached
   position when they follow it on the chain; otherwise it builds the
   file again.
@@ -357,7 +402,8 @@ idempotent by design).
 **The source is only read.** `backup create` needs LIST and GET on the
 source and nothing else, never a node, never a write: a credential
 that can read but not write or delete the bucket is enough. The
-destination needs PUT (create only, `If-None-Match: *`). Only `prune`
+destination needs PUT: objects are created with `If-None-Match: *`,
+and only `latest` and `runs/<id>/verified` are ever replaced. Only `prune`
 needs DELETE there, and is meant to run with another credential. The
 destination's credentials come from `--to-env FILE` (the variables
 `object_store` reads, in an env file), so that the nodes' credentials
@@ -368,11 +414,13 @@ backup guide already asks.
 
 | Keys | What |
 | --- | --- |
-| `data/<source key>` | Copies of source objects, under the key they have in the source (`data/state/acme/shop/actors/...`, `data/apps/acme/shop/<version>/...`). Each is created once and never rewritten, as at the source. |
-| `runs/<run id>/actors/<chunk>` | The run's manifest, 1,000 actors per chunk (below). |
+| `data/<sha-256>` | Copies of source objects, keyed by the SHA-256 of their bytes, so a key names one content for good whatever happened at the source (an app recreated, two source prefixes backed up into one destination). Each is created once and never rewritten. |
+| `runs/<run id>/started` | Written first, with the source bucket and prefix (no credential) and the app's `recreated` marker as read at the start. |
+| `runs/<run id>/actors/<chunk>` | The run's manifest, 1,000 actors per chunk (below): for each object, its source key and its digest. |
 | `runs/<run id>/app/<tenant>/<app>` | The deploy version and the secrets version the run copied for that app, with their keys. |
 | `runs/<run id>/complete` | Written last: the run's summary and the SHA-256 of every chunk. A run is **restorable** only if this object exists and its chunks match it. |
-| `latest` | The id of the newest complete run (the one mutable key; a hint, `backup list` lists `runs/`). |
+| `latest` | The id of the newest complete run (a hint; `backup list` lists `runs/`). |
+| `prunes/<id>` | Written by `prune` before it deletes anything (below). |
 
 A run id is the start time (UTC, to the second) and 8 random hex
 digits, so two runs never share one. The destination is an archive,
@@ -398,9 +446,10 @@ plan (section 1), in this order:
 
 Each object is read from the source, checked (its size against the
 listing, its LTX trailer checksum), applied to the actor's replay, and
-written to the destination with `If-None-Match: *`. A conflict there
-means the object was already copied (keys name one content), and the
-run reads it back only if `verify` is asked. The tool always streams
+written to the destination under its digest with `If-None-Match: *`.
+A conflict there means those very bytes are already there, since the
+key is their digest. The manifest maps the source key to the digest, and
+a restore writes each object back under its source key. The tool always streams
 objects through itself rather than asking the provider to copy them on
 the server side: it needs their bytes for the replay, and source and
 destination are meant to be in different accounts.
@@ -416,9 +465,11 @@ section 1.
 **One listing for the app, not one per actor.** The run lists
 `R actors/` recursively, by pages of 1,000 keys. Keys of one actor are
 contiguous (its `snapshot/` keys, then its `wal/` keys), and each actor
-is planned when its last key has been listed, then copied while the
-listing goes on (bounded: 16 actors at a time, the restore read limits
-of ADR 0007 per actor). Such a listing is not taken at one moment: an
+is planned when its last key has been listed and a copy slot is free,
+then copied while the listing goes on (16 actors at a time, the restore
+read limits of ADR 0007 per actor). The listing waits for a slot rather
+than queueing plans: a plan's time `d` (section 1) counts from its
+listing, so a queue would spend the window. Such a listing is not taken at one moment: an
 actor whose keys span two pages may be planned from keys read at two
 times. That can only make the plan miss objects (a snapshot created
 after its page, segments collected before theirs), never contain a
@@ -434,8 +485,8 @@ delete, and a pass whose deletes land late cannot mark a broken actor as
 copied; at worst they make the run retry or fail that actor. Liveness:
 section 1's bound applies per actor, with `d` the time to copy one
 actor, not the whole run. A run of 100,000 actors that takes hours is
-fine with the default hour, because no actor's copy takes more than
-seconds. This is what the backup guide's "two passes within the window"
+fine with the default hour, because one actor's copy is bounded by its
+read deadline (seconds for a small one). This is what the backup guide's "two passes within the window"
 lacked: the window must cover one actor's copy, not the copy of the
 bucket.
 
@@ -474,8 +525,10 @@ app is done:
   version its own `current` names. The secrets key (`--secrets-key`)
   is not in the bucket and is not copied.
 - **A tombstone** (`apps/<t>/<a>/deleted`, ADR 0028) found at the start
-  or the end: the app's run fails, since its state is being removed
-  under it.
+  or the end, or an `apps/<t>/<a>/recreated` marker that differs from
+  the one `started` recorded (a delete and a `--recreate` within the
+  run): the app's run fails, since its actors may have been copied from
+  two incarnations of the app.
 
 **Not copied, on purpose**:
 
@@ -497,20 +550,34 @@ names. That is left to that record (Not decided here).
 incremental in what it moves:
 
 - The previous complete run's manifest (or `--cache DIR`, which also
-  keeps each actor's replayed database at its last head) says which
+  keeps each actor's replayed database at its last head, raw) says which
   objects the destination already holds. An actor whose head has not
-  moved costs no GET and no PUT: its manifest entry is carried over,
-  after its keys appeared in this run's listing.
-- An actor that moved needs only the objects it does not have: with a
-  cache, the new segments are applied to the cached database (they
-  follow its head on the chain), so even a new snapshot needs no replay
-  from it. Without a cache, a new snapshot is read and replayed from.
+  moved costs no GET and no PUT: its manifest entry is carried over, but
+  only if this run's listing shows each of its plan's keys with the
+  same size and `ETag` as the run that read it recorded. Anything else
+  (a key gone, or back with other bytes after the app was recreated) is
+  copied again.
+- An actor that moved needs only the objects it does not have. With a
+  cache whose head is on the new chain, the new segments are applied to
+  the cached database. A new snapshot `S` at `P` is then read and copied,
+  and accepted only if its trailer's post-apply checksum equals the
+  replay's checksum at `P`; the manifest names it as the plan's start, so
+  plans do not grow across runs. Without a cache, or when its head is not
+  on the chain, the actor is replayed from its new plan's snapshot.
 - Objects are never deleted from the destination by `create`.
 
 **`--history head` (the default) or `all`.** `head` copies what each
 actor's head needs: a busy actor costs one snapshot and up to 64
 segments per run, however much it wrote since the last one. `all`
-copies every history object the source still has. If the time between
+copies every history object the source still has, and the manifest of
+each run names, for each actor, every object any earlier kept run named
+for it as well as its own (from the previous manifest, carried over).
+That set is one tree of positions within one incarnation of the app,
+since a recreated app fails the run, as above, and it includes the
+segment at each snapshot's position. So planning a past position over it
+is planning over a superset of a listing the source once had, which is
+what section 1 reads. A restore writes back only the objects the plan
+for its chosen position needs. If the time between
 two runs' listings of an actor stays under `W - ε`, every object the
 actor ever had is in the destination (each lives at least `W - ε` in
 the source), and the backup offers every position since its first run
@@ -538,9 +605,17 @@ checked. `create` has already replayed what it read from the source;
 reads.
 
 **`backup prune --keep-runs N`** deletes runs beyond the newest `N`
-complete ones (manifests first, then `complete` last, so a pruned run
-is never half-listed as restorable). It then deletes the `data/` objects
-that no kept run names. That listing of every kept manifest is the
+complete ones: `complete` and `verified` first, so a run being pruned is
+never listed as restorable, then its chunks and `started`. It then
+deletes the `data/` objects that no kept run names. **Prune and create
+exclude each other.** Prune writes `prunes/<id>` before it deletes
+anything. It refuses while any run has `started` without `complete`
+and is younger than 24 hours. Older ones are abandoned, and are pruned
+like any other. It also deletes only `data/` objects older than 24
+hours. Before writing `complete`, a run lists `prunes/`. If a prune
+started after the run's `started`, the run checks with a HEAD each
+object it carried over or skipped as present, and copies again any
+that is gone. That listing of every kept manifest is the
 costly part (section 8). Pruning is also how a delete reaches the
 backups: a deleted actor's data stays in the runs from before its
 delete until they are pruned. The docs say so beside `actor delete`.
@@ -570,9 +645,25 @@ target prefix must hold nothing, no live node may serve the app there
 (the command reads `nodes/` as `app delete` does), and the app must
 have no tombstone. Then, in this order:
 
+0. **Fence node starts first.** Write `apps/<t>/<a>/restoring`, holding
+   the run id, and `apps/<t>/<a>/restored` with a body no writer used
+   before. A node refuses to start serving the app while `restoring`
+   exists, as it refuses a tombstone, and stops if it sees it at its
+   next deploy check. A node whose own copy of `restored` differs
+   removes its local files of the app (`<data_dir>/state/<t>/<a>/`)
+   before it serves, as it does for `recreated` after `app delete
+   --recreate` (ADR 0028, section 5). Without this, an actor created
+   after the backup and absent from it would come back from a node's
+   disk as its first snapshot, as the backup guide warns today. A node
+   from before this record ignores both markers, so the command refuses
+   while `nodes/` shows any node of the app, live or not, of an earlier
+   version (from its heartbeat's version line), unless `--force`, and
+   the docs name the minimum version.
 1. **History.** For each actor of the run, copy the manifest's objects
-   from `data/` to the target key, `If-None-Match: *`: the snapshot, the
-   segment at `P`, the segments. Every actor's prefix then plans to the
+   from `data/<digest>` to its source key, `If-None-Match: *`: the
+   snapshot, the segment at `P`, the segments (for `--history all`, the
+   plan of the position chosen with `--at`, and the segment at its
+   snapshot). Every actor's prefix then plans to the
    head the manifest recorded, and to nothing else.
 2. **Generations.** Write each actor's lease marker,
    `R leases/<class>/<name>`, `wasmkeep-lease 2`, with the highest
@@ -580,27 +671,33 @@ have no tombstone. Then, in this order:
    first node to acquire the actor seeds from the marker and the keys,
    whichever is higher, and acquires at that + 1 (`mark_old_lease`): no
    generation already in the history is ever used again.
-3. **Alarms.** For each actor whose manifest records an alarm, create
-   the entry its database names (`alarm_indexed`), exactly that key,
-   with its generation and nonce. ADR 0009's R1 to R3 hold as written:
-   the entry is the one the durable state names, and its generation is
-   below any holder's to come, so the first holder may retire it when it
-   moves the alarm. An actor whose database has an alarm but no
-   `alarm_indexed` (written before tags) gets a fresh entry at its time
-   with generation 0, which any holder may retire.
+3. **Alarms**, from the committed alarm, not only from the entry the
+   database names. For each actor whose database holds an alarm at `a`:
+   create the entry its `alarm_indexed` names, exactly that key (a
+   tagged key with its generation and nonce, or a legacy key as a
+   legacy key); and if that entry's time is not `a`, or there is none,
+   also create a fresh tagged entry at `a`, generation 0, new nonce.
+   ADR 0009 documents states whose named entry is at another time than
+   the committed alarm (a new entry written but not yet named when the
+   event was replicated): rebuilding the named entry alone would leave
+   that alarm unlisted, never fired until something woke the actor.
+   Writing an entry the history once named, a key an earlier request may
+   have deleted, would break R1 in a live root. Here it is safe: the root
+   is empty or cleared, and no writer of that root is live (step 0, and
+   `LATE_WRITES` in place). Both entries' generations are at or below the
+   marker's seed, so any holder to come may retire them (R3). An entry
+   whose alarm has moved since is delivered to an actor without that
+   alarm, which runs nothing (ADR 0028's `er04`).
 4. **Deploy and secrets**, with `--deploy backup` (the default here):
    the run's version directories, then `apps/<t>/<a>/current`; the
    sealed secrets version, then its `current`. A sealed secret opens
    only under the prefix, tenant and app it was sealed for (ADR 0016):
    under another prefix the command says to run `wasmkeep secrets
    reset`.
-5. **Local files.** Write `apps/<t>/<a>/restored` with a body no
-   writer used before. A node whose own copy of that marker differs
-   removes its local files of the app (`<data_dir>/state/<t>/<a>/`)
-   before it serves, as it does for `recreated` after `app delete
-   --recreate` (ADR 0028, section 5). Without this, an actor created
-   after the backup and absent from it would come back from a node's
-   disk as its first snapshot, as the backup guide warns today.
+5. **Open the app.** Delete `apps/<t>/<a>/restoring`, last. A
+   restore cut short leaves it, so no node serves a half-restored app;
+   running the command again resumes (every write is a create, and an
+   existing object with the same bytes is not an error).
 6. Print the command that starts the nodes, and what the restored app is
    (below).
 
@@ -614,15 +711,20 @@ prefix, while the cluster's other apps run.
    node lands within that window or never.
 2. **The state being replaced is backed up first**, by an ordinary
    `backup create` run into the same destination, marked
-   `before-restore`. A wrong restore can then be undone by restoring
-   that run.
-3. The command reads, for each actor, the generation of its ownership
-   record and the highest generation its current history keys carry.
+   `before-restore`. The command goes on only if that run completed with
+   no failed actor (`--force` accepts a partial one). A wrong restore
+   can then be undone by restoring that run.
+3. The command reads, for **every actor seen under the old root** (its
+   history, its ownership record or its marker), whether the run holds it
+   or not, the generation of its ownership record, its marker's seed,
+   and the highest generation its history keys carry.
 4. It deletes every key under `state/<t>/<a>/` (as `app delete`,
    step 2, without the tombstone), and lists until a listing is empty.
-5. It runs the steps above, except that each marker carries the
-   highest of the run's keys, the old record and the old keys, plus
-   one. No generation the prefix ever used comes back: the local files'
+5. It runs the steps above, except that markers are written for every
+   actor of step 3 too, not only the run's, each carrying the highest of
+   the run's keys, the old record, the old marker and the old keys,
+   plus one. An actor absent from the run then starts empty, at a
+   generation above everything its old history used. No generation the prefix ever used comes back: the local files'
    sidecars, alarm entries in older backups and the logs all keep
    meaning one hold each. `--deploy keep` (the default in place) leaves
    the app's current deploy and secrets as they are, since the code may
@@ -667,8 +769,9 @@ of an empty one. It is fenced by what fences every write. Only a
 holder writes (ADR 0007, 0020). The job runs in the holder's mailbox,
 after the events queued before it. A previous holder lost its hold
 before this one acquired, and its late uploads are on no chain this one
-builds. A restore is therefore also undoable: the history before it is
-kept for the retention window like any other, and `actor restore --txid
+builds. A restore is therefore also undoable, for as long as the history before
+it is kept: the retention window, like any other history (nothing with
+`W = 0`), or for good in a backup taken before. `actor restore --txid
 <the head before>` brings it back.
 
 **The command** (bucket credentials only, as `actor delete`):
@@ -681,14 +784,19 @@ kept for the retention window like any other, and `actor restore --txid
    0.4.0's, or if the actor has no history in the bucket ("no such
    actor": restoring an address the bucket never knew, or knows no
    more, is not decided here).
-3. **Stages** the database as one LTX snapshot file at
+3. **Stages** the database, the raw replay in WAL mode (never the
+   rollback-journal copy `actor export` hands out), as one LTX snapshot
+   file at
    `R restores/<class>/<name hex>/<id>.ltx` (multipart for a large one),
    `<id>` being 16 random hex digits, then writes the **request**
    `R restores/<class>/<name hex>/<id>` with
    `wasmkeep-restore 1`, where the state came from (the live bucket and
    position, or the backup run and position; never a credential), the
-   staged object's size and post-apply checksum, and `--if-head` when
-   given. Then it writes `control/changed` (ADR 0014's marker, amendment
+   staged object's size, page size and post-apply checksum, and
+   `--if-head` when given. Under `R restores/<class>/<name hex>/`, a key
+   of 16 hex digits is a request, `<id>.ltx` its staged database, and
+   `<id>.done`, `.conflict`, `.refused`, `.absent` and `.superseded` its
+   outcomes; anything else is ignored. Then it writes `control/changed` (ADR 0014's marker, amendment
    of 2026-11-14), so the app's nodes list `restores/` within a heartbeat
    period. A request whose marker write failed is taken back and the
    command fails.
@@ -700,40 +808,70 @@ kept for the retention window like any other, and `actor restore --txid
 `deletes/`). The owner queues the job; nobody's actor is acquired by
 one serving node, conditionally; a moving actor's job runs on the
 target; a parked actor with sockets is woken by its parking node (ADR
-0024). Nodes list `restores/` only when `control/changed` changes and
-when they start, never at rest (a restore always writes the marker; no
-older command writes restore requests). Requests expire after an hour
-by the bucket's clock, their staged object with them. A node that ends
-a request deletes both.
+0024). Nodes list `restores/` with the other intents (ADR 0014,
+amendment of 2026-11-14): when `control/changed` changes, at their first
+period, and in the 60 s fallback listing, which is what retries a
+refused request and expires an old one. One prefix more in that
+listing is one LIST per node per 60 s at rest. Requests expire after an
+hour by the bucket's clock, and the node that lists an expired one
+deletes it with its staged object. A node that ends a request (its
+outcome written) deletes the request and its staged object, rewrites
+`control/changed`, and keeps the request out of its own copy until it
+would expire, exactly as `end_delete_request` does for deletes, so that
+other nodes stop acting on their copies within a period.
 
 **The restore job**, in the actor's mailbox, no guest code:
 
 1. Forget any learned owner. `ensure_owner`: acquire and restore, or
-   nothing if held. Refused: the request stays for a later pass.
-2. **Replays.** The host meta `operator_restore` holds `<T> <id>` of the
-   last restore request carried out. If it is this request, or a later
-   one, the job **fences** (ADR 0028, section 3, step 3: what a restore
-   read is the state only once this hold's upload is in) and reports
-   done.
-3. **`--if-head`**: if the current head is not the one given, the
-   outcome is `<id>.conflict` with the current head, and nothing
-   changes. Without it, the restore replaces whatever was written
-   since the operator looked, which the history keeps (undo, above).
-4. **Read the staged object** (GET), check its LTX trailer and its
-   post-apply checksum against the request, and its size against the
-   node's `--max-db-bytes`. A refusal writes `<id>.refused` with why.
-5. **Sockets**: any open or closing are closed with **1012** ("service
-   restart"): the actor goes on existing, rewound, and clients should
-   reconnect, unlike a delete's 1000. Their close events run in the
-   mailbox first, on the state being replaced: their writes are in the
-   history before the replacement, not after. The job answers `Busy`
-   and is queued again, waiting up to 5 s, as a delete's is.
-6. **Build the replacement.** The staged database, with its host meta
+   nothing if held. Refused: the request stays for a later pass. If the
+   bucket holds nothing for the actor (the restore found an empty head,
+   `needs_snapshot`: the app recreated or the actor gone since the
+   command checked), the outcome is `<id>.absent` and nothing is
+   written: a first upload must be a snapshot, which this job does not
+   make.
+2. **Replays and supersession.** The host meta `operator_restore` holds
+   `<T> <id>` of the last restore request carried out. If it is this
+   request, the job **fences** (ADR 0028, section 3, step 3: what a
+   restore read is the state only once this hold's upload is in) and
+   reports done. If it is a later one, or if the newest delete in the
+   database (`replaced = delete <txid> <time>`, section 1) is later than
+   this request's `T`, the job fences and writes `<id>.superseded`:
+   a restore asked for before a delete that has since been reported
+   never brings the data back, which keeps ADR 0028's promise that a
+   "Deleted" is not followed by the data returning. The delete's time
+   is a node's clock and `T` the bucket's, so the comparison is good to
+   the skew bound. An operator who means to undo that delete asks again.
+3. **Sockets, first.** While a restore job is queued for an actor, the
+   node answers WebSocket upgrades for it with 503 and `Retry-After: 1`,
+   relayed or not, so no new socket opens on the state being replaced.
+   Sockets already open or closing are closed with **1012** ("service
+   restart"), once: the actor goes on existing, rewound, and clients
+   should reconnect, unlike a delete's 1000, which exists so that an
+   open class is not recreated by the reconnect. Their close events run
+   in the mailbox first, on the state being replaced, so their writes are
+   in the history before the replacement. The job answers `Busy` and is
+   queued again, waiting up to 5 s, as a delete's is. If sockets are
+   still open after three such waits, the outcome is `<id>.refused`.
+4. **`--if-head`**, checked now that the close events have run: if the
+   current head is not the one given, the outcome is `<id>.conflict`
+   with the current head, and nothing changes. Without it, the restore
+   replaces whatever was written since the operator looked, which the
+   history keeps for the window (undo, above).
+5. **Read the staged object** (GET), check its LTX trailer, its
+   post-apply checksum against the request, its size against the node's
+   `--max-db-bytes`, that its header says WAL mode, and that its page
+   size is the current database's: a replay refuses a change of page
+   size (`Restorer::begin`), so an acknowledged replacement of another
+   page size would leave the actor unrestorable. A refusal writes
+   `<id>.refused` with why.
+6. **Build the replacement**, in scratch space beside the database (as
+   `delete-self-durable` builds its empty database). The staged database, with its host meta
    set for this actor now, not then:
    - `operator_delete`: the current database's value, carried over, so
      a delete request left behind never deletes the restored actor
      (ADR 0028, section 3, step 5);
-   - `operator_restore = <T> <id>`;
+   - `operator_restore = <T> <id>`, and `replaced = restore <txid> <T>
+     <id>` with the txid this upload will have;
    - the alarm: if the restored database has one at `a`, first **create
      a fresh index entry** for `a` (this hold's generation, a new nonce,
      R1) and set `alarm_indexed` to it; if not, clear `alarm_indexed`.
@@ -742,22 +880,28 @@ a request deletes both.
      cleaned as such;
    - `alarm_failures` cleared: the restored alarm starts a fresh backoff.
 7. **Upload** it as one segment on the current head (`ship_reset`'s
-   path), acknowledged only if it completed while the hold was valid.
+   path, which a database of another number of pages replays correctly:
+   the header's page count resizes the file), acknowledged only if it
+   completed while the hold was valid.
    Not acknowledged: the actor is given up as after a failed
    `exec-durable`, and the request stays. The next attempt restores
    whatever the bucket holds and finds out, by the replay marker,
    whether it happened.
-8. **After the acknowledgement**: retire the index entry the replaced
-   state named (R2: the durable state no longer names it); arm the
-   node's timer with `a` (an alarm already overdue fires soon, and one
-   that fired before the restored point fires again: at least once);
-   upload a snapshot at the replacement's position (a new kind,
-   `AfterRestore`, collected with the window like a periodic one, never
-   erased); write `<id>.done` with the new head; delete the request and
-   the staged object; drop the instance and hibernate the stub, so the
-   next event opens the restored database (the local file is at the
-   head, by its sidecar). `on-init` does not run again unless the
-   restored state never ran it.
+8. **After the acknowledgement**, in this order: write `<id>.done`
+   with the new head (the restore is done once the replacement is
+   recorded, as a delete is done once its reset is); retire the index
+   entry the replaced state named (R2: the durable state no longer names
+   it); cancel the node's timer for the replaced alarm and arm it with
+   `a` (an alarm already overdue fires soon, and one that fired before
+   the restored point fires again: at least once); end the request as
+   above; then give the actor up as `delete-self` does when it cannot
+   remove its files: the local database is not the replacement, so the
+   next event restores from the bucket, which sets the old file aside
+   (its sidecar no longer matches). In the background, upload a snapshot at the
+   replacement's position (a new kind, `AfterRestore`, collected with the
+   window like a periodic one, never erased); its failure only delays
+   collection, as a periodic snapshot's does. `on-init` does not run
+   again unless the restored state never ran it.
 
 **Every delete carries `operator_restore` over**, as it carries
 `operator_delete` (`delete-self`, `delete-self-durable`, the operator
@@ -768,11 +912,12 @@ whose key could not be deleted can then run again on an actor such a
 node deleted. The same caveat is ADR 0028's for deletes.
 
 **Ordering with other requests.** Deletes and restores of one actor
-run in the order their jobs reach the mailbox. Each is checked against
-its own marker, so a delete after a restore deletes, and a restore after
-a delete brings the data back, from the live bucket only if the
-position is after the reset (section 1), otherwise from a backup. A move
-moves the restored actor.
+run in the order their jobs reach the mailbox, and each is checked
+against the markers (step 2, and ADR 0028's for deletes). A delete
+after a restore deletes. A restore asked for after a delete brings the
+data back: from the live bucket only if the position is after the
+delete (section 1), otherwise from a backup. A restore asked for before
+a delete that ran first is superseded. A move moves the restored actor.
 
 **Files of ADR 0030 (proposed).** A restored database names the files
 of its own time. A restore to a point before a delete brings back an
@@ -782,7 +927,8 @@ this one.
 
 **The command's answers**: `.done` prints "Restored to txid N of
 generation G, now txid M" and removes the outcome; `.conflict` prints
-the head found, non-zero; `.refused` prints why, non-zero; no outcome
+the head found, non-zero; `.refused` prints why, non-zero; `.absent`
+and `.superseded` say so, non-zero; no outcome
 and no request (expired): "dropped", non-zero; still there: "requested;
 the cluster keeps trying until T + 1 h". As for deletes, only the
 outcome acknowledges: it is written after the replacement was recorded.
@@ -838,12 +984,16 @@ between actors of one class, and how many actors one feed follows.
 Counts per operation, from the code's request patterns, with `n` the
 objects under an actor's prefix (at most about 65 at rest after
 collection, plus write rate times `W` for a busy actor), `s` the
-segments replayed (at most 63 while periodic snapshots succeed), `A` an
+segments replayed (at most 64 while periodic snapshots succeed: the
+snapshot follows the 64th segment), `A` an
 app's actors and `K` its history objects. A listing is one LIST per
 1,000 keys. These are derived from the code, not measured. The
-measured floor they add to is three idle nodes making 8.6 million LISTs
-and 13 million GETs a month
-([at rest](../benchmarks.md#bucket-requests-at-rest)).
+measured floor they add to is three idle nodes of 0.4.1 making 8.6
+million LISTs and 13 million GETs a month
+([at rest](../benchmarks.md#bucket-requests-at-rest)). 0.4.2 lists the
+intents far less (ADR 0014, amendment of 2026-11-14) and has not been
+measured at rest, so the shares of that floor given below are lower
+bounds: against 0.4.2's floor these tools weigh more.
 
 | Operation | LIST | GET | PUT | DELETE |
 | --- | --- | --- | --- | --- |
@@ -851,13 +1001,13 @@ and 13 million GETs a month
 | `actor export` / first `actor sql` | ⌈n/1000⌉ | 1 + s, +1 for the record hint | 0 | 0 |
 | `actor sql` with a warm cache | ⌈n/1000⌉ | new segments only | 0 | 0 |
 | A retry after collection (section 1) | +⌈n/1000⌉ | up to +64 | 0 | 0 |
-| `backup create`, first run, `head` | ⌈K/1000⌉ | Σ (2 + s) over actors, + deploy and secrets objects | the same, in the destination, + ⌈A/1000⌉ + 3 | 0 |
-| `backup create`, later run, `head` | ⌈K/1000⌉ | per moved actor: new objects of its plan | the same, + ⌈A/1000⌉ + 3 | 0 |
+| `backup create`, first run, `head` | ⌈K/1000⌉ + 1 (`prunes/`) | Σ (2 + s) over actors, + deploy and secrets objects | the same, in the destination, + ⌈A/1000⌉ + 4 | 0 |
+| `backup create`, later run, `head` | ⌈K/1000⌉ + 1 | per moved actor: new objects of its plan (+ one HEAD per carried object if a prune ran meanwhile) | the same, + ⌈A/1000⌉ + 4 | 0 |
 | `backup create`, `all` | ⌈K/1000⌉ | one per object written since the last run | the same | 0 |
 | `backup verify` | 0 (manifest) | Σ (2 + s) in the destination, or for the sample | 1 | 0 |
-| `backup restore` | 2 (nodes, empty check) | Σ (2 + s) from the destination | Σ (2 + s) + A markers + one per alarm + deploy | in place: K + the old keys |
+| `backup restore` | 2 (nodes, empty check); in place, + a backup run's and ⌈old keys/1000⌉ per listing until empty | Σ (2 + s) from the destination; in place, + one record read per old actor | Σ (2 + s) + one marker per actor + one or two per alarm + deploy + `restoring` and `restored` | 1 (`restoring`); in place, + every old key |
 | `actor restore`, the command | export's | export's + one per second waited | staged (1, or its parts) + request + `control/changed` | 1 (outcome) |
-| `actor restore`, the nodes | 1 per node per `control/changed` change; the owner's restore listing | acquire and restore as usual, + staged object | entry, replacement, snapshot, outcome, release | old entry, request, staged |
+| `actor restore`, the nodes | 1 per node per `control/changed` change, and 1 per node per 60 s at rest for the prefix; the owner's restore listing | acquire and restore as usual, + staged object | entry, replacement, outcome, `control/changed`, release, snapshot | old entry, request, staged |
 | change feed, per poll | ⌈K/1000⌉ | one per new segment | 0 in the bucket | 0 |
 
 What follows from it:
@@ -870,9 +1020,9 @@ What follows from it:
   actor's prefix instead would be 10,000 LISTs a run, fifty times more.
 - **An idle actor costs a later run nothing** but its share of the
   listing.
-- **`--history all` doubles a busy app's requests**: each write, one
+- **`--history all` adds a GET and a PUT per write**: each write, one
   PUT at the source, adds a GET at the source and a PUT at the
-  destination. `head` costs at most one snapshot and 64 segments per
+  destination, with the manifest growing by one entry per write kept. `head` costs at most one snapshot and 64 segments per
   actor per run.
 - **Pruning** reads every kept manifest (⌈A/1000⌉ GETs per kept run)
   and lists `data/`, ⌈objects/1000⌉ LISTs.
@@ -889,15 +1039,19 @@ What follows from it:
   up and restore an app, without stopping the cluster or touching a
   node. A team evaluating WasmKeep gets a yes to both questions, with
   the cross-actor limit stated.
-- The read-only tools are the restore path without the hold, so they
-  share its code and its tests: `plan_restore`, `wal::Restorer`, the
-  checksums. The command line gains a dependency on `wasmkeep-storage`'s
+- The read-only tools are the restore path without the hold. They share
+  `plan_restore`, `wal::Restorer` and the checksums as they stand. The
+  bounded reads (`download`, `bounded_get`, `list_sized`) are private to
+  `wasmkeep-server` and move to a crate the command line can use, or are
+  written again for it. The command line gains a dependency on `wasmkeep-storage`'s
   restorer and SQLite (already built for the server).
 - The backup guide changes its central rule (section 4), and a
   `backup create` copy becomes the recommended backup. `rclone` stays as
   the stopped-cluster method.
-- One server change on the write path: the restore job and its
-  replacement segment, the `restores/` family and two host meta keys.
+- Server changes: on the write path, the restore job and its
+  replacement segment, the `restores/` family, and the host meta keys
+  `operator_restore` and `replaced` written by every delete and restore;
+  off it, the `restoring` and `restored` markers a node obeys.
   Per CLAUDE.md it needs its simulation cases, cluster tests and an
   adversarial review before it merges.
 - Backups keep deleted actors' data until pruned: "a delete erases" is
@@ -943,26 +1097,29 @@ What follows from it:
 
 ## Not decided here
 
-1. **Restoring an address the bucket does not know** (never created, or
+1. **The minimum node version** for `restoring` and `restored`, and
+   whether a node of an earlier version should be detected by its
+   heartbeat's capability words rather than its version line.
+2. **Restoring an address the bucket does not know** (never created, or
    its app recreated): the first upload would have to be a snapshot of
    the staged database at a fresh position. Refused until asked for.
-2. **Importing a database not from history** (`actor restore --file
+3. **Importing a database not from history** (`actor restore --file
    fixed.db`): the job of section 6 accepts any staged database, so
    the mechanism exists. Whether operators may write state no actor
    wrote, and how its schema is checked, is a product question.
-3. **Two credentials in one command** (`--to-env FILE`), or a profile
+4. **Two credentials in one command** (`--to-env FILE`), or a profile
    file shared with the other commands.
-4. **Files of ADR 0030**, if it lands: copy order, and whether a run
+5. **Files of ADR 0030**, if it lands: copy order, and whether a run
    records which incarnations its databases name.
-5. **`wasmkeep bucket verify`** for the live bucket (the roadmap's
+6. **`wasmkeep bucket verify`** for the live bucket (the roadmap's
    "verify a bucket"): section 1's replay over every actor, writing
    nothing. It falls out of `backup create` without the destination.
    Its cost is a backup's GETs.
-6. **A node with no bucket** (`serve` with a data directory only): its
+7. **A node with no bucket** (`serve` with a data directory only): its
    databases are local files, and SQLite's online backup API would
    export them. It is not part of this record.
-7. **The change feed's discovery, schema drift and scale** (section 7).
-8. **Pruning runs that share objects across apps** with `--all`, and a
+8. **The change feed's discovery, schema drift and scale** (section 7).
+9. **Pruning runs that share objects across apps** with `--all`, and a
    retention rule for `before-restore` runs.
 
 ## Tests (to build)
@@ -976,8 +1133,11 @@ What follows from it:
   pre-delete segments are present plans to the pre-delete head);
 - `--at` resolution walks the current chain only, uses the LTX stamps,
   and handles a stamp lower than its parent's within the skew;
-- resets and replacements are recognised by their headers;
-- `--txid` below the newest reset is refused.
+- deletes and restores are found by the `replaced` meta, and an
+  unlabelled delete only as "probably";
+- a position before the newest delete reports as erased, not missing;
+- the destination's carry-over refuses a plan key whose size or `ETag`
+  changed (a recreated app's keys come back with other bytes).
 
 **Simulation** (`sim/tests/madsim_backup.rs`, new). Backup ordering
 against collection is the kind of interleaving CLAUDE.md asks a
@@ -1001,8 +1161,9 @@ Unsafe variants some seed must catch: copying the plan without the
 segment at `P` (with incremental runs and deletes); marking an actor
 copied from the listing without the replay; no re-listing after a 404 or
 a missing link; reading `wal/` and `snapshot/` from different listings
-and trusting the plan; copying segments before their snapshot with a run
-stopped half-way and restored from the union. The test also fails if
+and trusting the plan; keying the destination by source key (with an
+app deleted and recreated between runs, so generations restart); a
+prune that ignores a running create. The test also fails if
 no seed makes a reader retry (it cannot pass vacuously), and with
 retention 0 it counts starved actors rather than failing.
 
@@ -1044,12 +1205,21 @@ variant is the entry written after the upload.
   serving throughout. Old generations are not reused, local files of
   the app are removed by the `restored` marker, and the `before-restore`
   run restores the replaced state.
+- **Backup across a recreated app**: `app delete`, `deploy --recreate`
+  and new writes between two runs; the second run copies the new bytes
+  and a restore of either run gives that run's data. A delete and a
+  recreate within one run fail it.
 - **Single-actor restore**: while writes go on, with an open socket
-  (closed 1012, its close event run before the replacement), with a
-  pending alarm (fires after the restore, old entry gone), the owner
-  killed mid-job (the request completes once, by the marker), a
-  `--if-head` conflict, a delete request left behind (not re-run, by the
-  carried marker), a moving actor, and an undo by `--txid`.
+  (closed 1012, its close event run before the replacement, new upgrades
+  answered 503 meanwhile), with a pending alarm (fires after the
+  restore, old entry gone, old timer cancelled), the owner killed
+  mid-job (the request completes once, by the marker), a `--if-head`
+  conflict after a close event wrote, a delete request left behind (not
+  re-run, by the carried marker), a restore asked for before a delete
+  that ran first (superseded), the app recreated before the job
+  (absent), a staged database of another page size (refused), a refused
+  request retried by the fallback listing and an expired one removed
+  with its staged object, a moving actor, and an undo by `--txid`.
 
 **A restore drill**, scripted (`scripts/drills/backup-restore.sh`),
 run by `check.sh --s3` against moto or a real bucket, and once by hand
