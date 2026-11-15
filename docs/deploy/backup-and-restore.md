@@ -21,8 +21,9 @@ wasmkeep backup verify --from s3://archive/prod
 `backup.env` contains destination `AWS_*` settings as `NAME=value`, one per
 line. Bucket overrides (`AWS_BUCKET`, `AWS_BUCKET_NAME`, `bucket`, and
 `bucket_name`) are rejected in both source and destination settings. The CLI
-bucket is applied after configuration; overlapping prefixes in the same
-effective endpoint and bucket are refused. Source credentials need only LIST and GET; no lease, owner request,
+bucket is applied after configuration; overlapping prefixes with the same
+bucket name are refused unless both endpoints identify distinct, well-known AWS
+partitions (AWS and AWS China). Source credentials need only LIST and GET; no lease, owner request,
 source write or running-node connection is made. The destination needs
 LIST, GET and PUT. Use a separate bucket and account. Keep credentials,
 archives and the local plaintext cache private. `--all` discovers deployed
@@ -44,9 +45,11 @@ endpoints are supported, including Cloudflare R2
 Bucket-hosted AWS URLs and hosts beginning with the configured bucket name
 are refused. A destination host beginning with the source bucket's DNS label
 (or full bucket name for dotted names) is also refused. These checks apply
-before any backup requests. The same normalized endpoint origin and bucket
-cannot use equal or overlapping source/destination prefixes; AWS regional
-service endpoints are treated as the same effective AWS endpoint.
+before any backup requests. With the same bucket name, equal or overlapping source/destination prefixes
+are refused for any custom endpoint, even when the hostnames differ: aliases
+can reach the same store. Choose a different bucket name or a non-overlapping
+prefix. AWS regional service endpoints identify the same AWS partition; only
+distinct known partitions (AWS and AWS China) prove separation.
 Configure a path-style service endpoint; do not use a bucket-hosted URL.
 
 `--history head` keeps the snapshot, its boundary segment and the segments

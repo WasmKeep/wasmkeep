@@ -266,6 +266,8 @@ struct ReadOnly {
     inner: Store,
     gets: std::sync::atomic::AtomicUsize,
     collect: std::sync::Mutex<Option<(Key, Key, Vec<u8>)>>,
+    collect_after: usize,
+    fail_collect: bool,
 }
 impl std::fmt::Display for ReadOnly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -294,9 +296,8 @@ impl ObjectStore for ReadOnly {
         path: &Key,
         opts: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
-        assert!(path.as_ref().starts_with("state/") || path.as_ref().starts_with("apps/"));
-        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let collect = if path.as_ref().starts_with("state/") {
+        let count = self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let collect = if path.as_ref().starts_with("state/") && count >= self.collect_after {
             self.collect.lock().unwrap().take()
         } else {
             None
@@ -306,6 +307,12 @@ impl ObjectStore for ReadOnly {
                 .put_opts(&new, bytes.into(), PutOptions::default())
                 .await?;
             self.inner.delete(&old).await?;
+            if self.fail_collect {
+                return Err(object_store::Error::NotFound {
+                    path: path.to_string(),
+                    source: "injected later GET failure".into(),
+                });
+            }
         }
         self.inner.get_opts(path, opts).await
     }
@@ -344,6 +351,8 @@ async fn source_is_list_get_only_and_idle_actor_costs_no_gets() {
         inner: f.source.clone(),
         gets: Default::default(),
         collect: Default::default(),
+        collect_after: 0,
+        fail_collect: false,
     });
     let source: Store = readonly.clone();
     let dest = f.dest.clone();
@@ -474,6 +483,8 @@ async fn collector_between_listing_and_get_forces_a_fresh_plan() {
         inner: f.source.clone(),
         gets: Default::default(),
         collect: std::sync::Mutex::new(Some((old, new, bytes))),
+        collect_after: 0,
+        fail_collect: false,
     });
     let copier = Copier {
         source: &source,
@@ -636,6 +647,8 @@ async fn history_all_reports_listed_get_miss() {
         inner: f.source.clone(),
         gets: Default::default(),
         collect: std::sync::Mutex::new(Some((old, new, bytes))),
+        collect_after: 0,
+        fail_collect: false,
     });
     let copier = Copier {
         source: &source,
@@ -715,11 +728,13 @@ fn effective_store_identity_refuses_prefix_overlap() {
         ("https://s3.example", "live", "other"),
     )
     .unwrap();
-    disjoint(
-        ("https://one.example", "live", "prod"),
-        ("https://two.example", "live", "prod"),
-    )
-    .unwrap();
+    assert!(
+        disjoint(
+            ("https://one.example", "live", "prod"),
+            ("https://two.example", "live", "prod"),
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -823,6 +838,8 @@ async fn historical_get_gap_splits_ranges_and_requires_opt_out() {
             inner: f.source.clone(),
             gets: Default::default(),
             collect: std::sync::Mutex::new(Some((missing, snapshot, bytes))),
+            collect_after: 0,
+            fail_collect: false,
         });
         let mut args = f.args();
         args.require_continuous = Some(continuous);
@@ -1065,6 +1082,8 @@ async fn rereview_retry_observations_include_vanished_non_head() {
         inner: f.source.clone(),
         gets: Default::default(),
         collect: std::sync::Mutex::new(Some((old, new, bytes))),
+        collect_after: 0,
+        fail_collect: false,
     });
     let missing = segment_key(&Segment {
         id: SegmentId {
@@ -1218,4 +1237,209 @@ async fn rereview_old_two_app_run_cannot_drop_failed_app() {
             .to_string()
             .contains("started membership")
     );
+}
+
+#[test]
+fn fix4_unproven_endpoint_aliases_are_refused() {
+    for (a, b) in [
+        ("https://one.example", "https://two.example"),
+        ("aws", "https://custom.example"),
+        ("aws", "aws"),
+    ] {
+        for tail in ["", "prod", "prod/archive"] {
+            let error = disjoint((a, "live", "prod"), (b, "live", tail)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("different bucket name or a non-overlapping prefix")
+            );
+        }
+        disjoint((a, "live", "prod"), (b, "live", "archive")).unwrap();
+        disjoint((a, "live", "prod"), (b, "backup", "prod")).unwrap();
+    }
+    disjoint(("aws", "live", "prod"), ("aws-cn", "live", "prod")).unwrap();
+}
+
+#[tokio::test]
+async fn fix4_retry_preserves_copied_reference_after_expiry() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    let first = snapshot_key(SegmentId {
+        generation: 1,
+        txid: 1,
+    });
+    let new = snapshot_key(SegmentId {
+        generation: 1,
+        txid: 2,
+    });
+    let source: Store = Arc::new(ReadOnly {
+        inner: f.source.clone(),
+        gets: Default::default(),
+        collect_after: 1,
+        fail_collect: true,
+        collect: std::sync::Mutex::new(Some((
+            Key::from(format!("{prefix}{first}")),
+            Key::from(format!("{prefix}{new}")),
+            f.db.snapshot().unwrap().to_ltx(1, 2, 200).unwrap(),
+        ))),
+    });
+    let copier = Copier {
+        source: &source,
+        dest: &f.dest,
+        dp: "",
+        cache: None,
+        all: true,
+    };
+    let actor = copier
+        .actor(prefix, list_bounded(&source, prefix).await.unwrap(), None)
+        .await
+        .unwrap();
+    assert!(
+        actor["objects"].get(&first).is_some(),
+        "validated copy lost on retry"
+    );
+    assert!(!array(&actor, "gaps").unwrap().contains(&json!(first)));
+    assert!(array(&actor, "gaps").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fix4_range_reads_are_linear() {
+    let mut f = Fixture::new().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    for txid in 2..=24 {
+        f.db.exec("UPDATE counts SET n=n+1", &[]).unwrap();
+        let bytes =
+            f.db.take_changes()
+                .unwrap()
+                .unwrap()
+                .to_ltx(txid, txid, txid as i64)
+                .unwrap();
+        let name = segment_key(&Segment {
+            id: SegmentId {
+                generation: 1,
+                txid,
+            },
+            parent_generation: 1,
+        });
+        put(&f.source, &format!("{prefix}{name}"), bytes, false)
+            .await
+            .unwrap();
+    }
+    let id = f.create().await;
+    let actor = disk_actor(&load(&f.dest, "", &id).await.unwrap().actors[0]).unwrap();
+    let counted = Arc::new(ReadOnly {
+        inner: f.dest.clone(),
+        gets: Default::default(),
+        collect: Default::default(),
+        collect_after: 0,
+        fail_collect: false,
+    });
+    let store: Store = counted.clone();
+    verify_ranges(&store, "", &actor).await.unwrap();
+    let reads = counted.gets.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(reads <= 50, "24 positions needed {reads} reads");
+}
+
+#[tokio::test]
+async fn fix4_retry_references_require_current_size_etag_and_version() {
+    for field in ["size", "etag", "version"] {
+        let f = Fixture::new().await;
+        let prefix = "state/acme/shop/actors/counter/alice/";
+        let name = snapshot_key(SegmentId {
+            generation: 1,
+            txid: 1,
+        });
+        let listed = list_bounded(&f.source, prefix).await.unwrap();
+        let meta = &listed[&name];
+        let bytes = history::get(&f.source, &meta.location, Some(meta), MAX)
+            .await
+            .unwrap();
+        let mut entry = save_blob(
+            &f.dest,
+            "",
+            meta.location.as_ref(),
+            bytes.to_vec(),
+            Some(meta),
+            None,
+        )
+        .await
+        .unwrap();
+        let expected = entry.clone();
+        entry[field] = if field == "size" {
+            json!(0)
+        } else {
+            json!("different")
+        };
+        let mut validated = serde_json::Map::from_iter([(name.clone(), entry)]);
+        let counted = Arc::new(ReadOnly {
+            inner: f.source.clone(),
+            gets: Default::default(),
+            collect: Default::default(),
+            collect_after: 0,
+            fail_collect: false,
+        });
+        let source: Store = counted.clone();
+        let copier = Copier {
+            source: &source,
+            dest: &f.dest,
+            dp: "",
+            cache: None,
+            all: true,
+        };
+        let actor = copier
+            .attempt(prefix, &listed, None, &mut validated)
+            .await
+            .unwrap();
+        assert!(
+            counted.gets.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "reused changed {field}"
+        );
+        assert_eq!(actor["objects"][&name][field], expected[field]);
+    }
+}
+
+#[tokio::test]
+async fn fix4_range_verification_follows_generation_branches() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    // Two children of the same retained base, one after an ownership change.
+    let original = segment_key(&Segment {
+        id: SegmentId {
+            generation: 1,
+            txid: 2,
+        },
+        parent_generation: 1,
+    });
+    let branch = segment_key(&Segment {
+        id: SegmentId {
+            generation: 2,
+            txid: 2,
+        },
+        parent_generation: 1,
+    });
+    let bytes = history::get(
+        &f.source,
+        &Key::from(format!("{prefix}{original}")),
+        None,
+        MAX,
+    )
+    .await
+    .unwrap();
+    put(
+        &f.source,
+        &format!("{prefix}{branch}"),
+        bytes.to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    let id = f.create().await;
+    let actor = disk_actor(&load(&f.dest, "", &id).await.unwrap().actors[0]).unwrap();
+    assert_eq!(
+        actor["ranges"],
+        json!([{"generation":1,"start":1,"end":2},{"generation":2,"start":2,"end":2}])
+    );
+    verify_ranges(&f.dest, "", &actor).await.unwrap();
 }

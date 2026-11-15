@@ -323,7 +323,9 @@ fn endpoint_identity(endpoint: &str) -> anyhow::Result<String> {
     }
     let host = url.host_str().context("S3 endpoint has no host")?;
     // AWS bucket names identify the same bucket across regional S3 endpoints.
-    if (host == "s3.amazonaws.com" || host.starts_with("s3.") || host.starts_with("s3-"))
+    if url.scheme() == "https"
+        && url.port().is_none()
+        && (host == "s3.amazonaws.com" || host.starts_with("s3.") || host.starts_with("s3-"))
         && (host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn"))
     {
         return Ok(if host.ends_with(".cn") {
@@ -351,11 +353,13 @@ fn disjoint(source: (&str, &str, &str), dest: (&str, &str, &str)) -> anyhow::Res
         a.is_empty() || a == b || b.starts_with(&format!("{}/", a.trim_end_matches('/')))
     };
     ensure!(
-        source.0 != dest.0
+        (matches!(source.0, "aws" | "aws-cn")
+            && matches!(dest.0, "aws" | "aws-cn")
+            && source.0 != dest.0)
             || source.1 != dest.1
             || !(overlap(source_prefix.as_ref(), dest_prefix.as_ref())
                 || overlap(dest_prefix.as_ref(), source_prefix.as_ref())),
-        "source and destination overlap"
+        "source and destination may overlap; choose a different bucket name or a non-overlapping prefix"
     );
     Ok(())
 }
@@ -717,61 +721,44 @@ async fn replay(dest: &Store, dp: &str, actor: &Value) -> anyhow::Result<history
     );
     Ok(result)
 }
-fn plan_target(
-    listing: &Listing,
-    target: wasmkeep_cluster::replication::SegmentId,
-) -> anyhow::Result<wasmkeep_cluster::replication::Plan> {
-    if listing.snapshots.contains(&target) {
-        return Ok(wasmkeep_cluster::replication::Plan {
-            snapshot: Some(target),
-            segments: Vec::new(),
-        });
+// Index recoverability once in transaction order. Parents always have a lower
+// txid; generation ordering must also satisfy the historical target subset.
+fn reachable_positions(listing: &Listing) -> BTreeSet<wasmkeep_cluster::replication::SegmentId> {
+    use wasmkeep_cluster::replication::EMPTY;
+    let mut reachable: BTreeSet<_> = listing.snapshots.iter().copied().collect();
+    let mut segments = listing.segments.clone();
+    segments.sort_by_key(|s| (s.id.txid, s.id.generation));
+    for segment in segments {
+        if segment.parent() == EMPTY
+            || (segment.parent() <= segment.id && reachable.contains(&segment.parent()))
+        {
+            reachable.insert(segment.id);
+        }
     }
-    let plan = plan_restore(listing)?;
-    ensure!(plan.head() == target, "range target is not recoverable");
-    Ok(plan)
+    reachable
 }
 fn recoverable_ranges(actor: &Value) -> anyhow::Result<Vec<Value>> {
     let objects = actor["objects"].as_object().context("missing objects")?;
     let listing = Listing::from_keys(objects.keys().map(String::as_str));
-    let positions: BTreeSet<_> = listing
-        .snapshots
-        .iter()
-        .copied()
-        .chain(listing.segments.iter().map(|s| s.id))
-        .collect();
     let mut ranges: Vec<Value> = Vec::new();
-    for target in positions {
-        let subset = Listing {
-            snapshots: listing
-                .snapshots
-                .iter()
-                .copied()
-                .filter(|id| *id <= target)
-                .collect(),
-            segments: listing
-                .segments
-                .iter()
-                .copied()
-                .filter(|s| s.id <= target)
-                .collect(),
-        };
-        if plan_target(&subset, target).is_ok() {
-            if let Some(last) = ranges.last_mut()
-                && last["generation"] == target.generation
-                && last["end"].as_u64().and_then(|n| n.checked_add(1)) == Some(target.txid)
-            {
-                last["end"] = json!(target.txid);
-            } else {
-                ranges.push(
-                    json!({"generation":target.generation,"start":target.txid,"end":target.txid}),
-                );
-            }
+    for target in reachable_positions(&listing) {
+        if let Some(last) = ranges.last_mut()
+            && last["generation"] == target.generation
+            && last["end"].as_u64().and_then(|n| n.checked_add(1)) == Some(target.txid)
+        {
+            last["end"] = json!(target.txid);
+        } else {
+            ranges.push(
+                json!({"generation":target.generation,"start":target.txid,"end":target.txid}),
+            );
         }
     }
     Ok(ranges)
 }
+
 async fn verify_ranges(store: &Store, prefix: &str, actor: &Value) -> anyhow::Result<()> {
+    use wasmkeep_cluster::replication::{EMPTY, segment_key, snapshot_key};
+    use wasmkeep_storage::{ltx, readonly, wal};
     let ranges = recoverable_ranges(actor)?;
     ensure!(
         actor["ranges"] == json!(ranges),
@@ -779,61 +766,118 @@ async fn verify_ranges(store: &Store, prefix: &str, actor: &Value) -> anyhow::Re
     );
     let objects = actor["objects"].as_object().context("missing objects")?;
     let listing = Listing::from_keys(objects.keys().map(String::as_str));
-    // Plan every advertised position explicitly. A snapshot is independently
-    // recoverable even when its boundary is absent and older segments remain.
-    for range in &ranges {
-        for txid in number(range, "start")?..=number(range, "end")? {
-            let target = wasmkeep_cluster::replication::SegmentId {
-                generation: number(range, "generation")?,
-                txid,
-            };
-            let subset = Listing {
-                snapshots: listing
-                    .snapshots
-                    .iter()
-                    .copied()
-                    .filter(|id| *id <= target)
-                    .collect(),
-                segments: listing
-                    .segments
-                    .iter()
-                    .copied()
-                    .filter(|s| s.id <= target)
-                    .collect(),
-            };
-            replay_range(store, prefix, &subset, objects, target).await?;
-            // A newer snapshot must not hide a corrupt chain from an older
-            // retained base. Replay that chain too whenever it is complete.
-            if subset.snapshots.contains(&target) {
-                let older = Listing {
-                    snapshots: subset
-                        .snapshots
-                        .iter()
-                        .copied()
-                        .filter(|id| *id < target)
-                        .collect(),
-                    segments: subset.segments.clone(),
-                };
-                if plan_restore(&older).is_ok_and(|plan| plan.head() == target) {
-                    replay_range(store, prefix, &older, objects, target).await?;
-                }
+    let reachable = reachable_positions(&listing);
+    let segments: BTreeMap<_, _> = listing.segments.iter().map(|s| (s.id, *s)).collect();
+    ensure!(
+        segments.len() == listing.segments.len(),
+        "ambiguous history position"
+    );
+    let snapshots: BTreeSet<_> = listing.snapshots.iter().copied().collect();
+    let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut pending = Vec::new();
+    for id in &reachable {
+        if let Some(segment) = segments.get(id)
+            && segment.parent() <= *id
+            && (segment.parent() == EMPTY || reachable.contains(&segment.parent()))
+        {
+            if segment.parent() == EMPTY {
+                pending.push((*id, None));
+            } else {
+                children.entry(segment.parent()).or_default().push(*id);
             }
+        } else {
+            pending.push((*id, None));
         }
     }
-    // Each intermediate snapshot also has to agree with its boundary and
-    // reconstruct a valid database, even when the range replay didn't use it.
-    for snapshot in &listing.snapshots {
-        let subset = Listing {
-            snapshots: vec![*snapshot],
-            segments: listing
-                .segments
-                .iter()
-                .copied()
-                .filter(|s| s.id == *snapshot)
-                .collect(),
-        };
-        replay_range(store, prefix, &subset, objects, *snapshot).await?;
+    let tmp = tempfile::tempdir()?;
+    let mut sequence = 0u64;
+    let mut checked = 0;
+    while let Some((id, parent)) = pending.pop() {
+        let path = tmp.path().join(format!("{sequence}.db"));
+        sequence += 1;
+        let mut chain_checksum = None;
+        if parent.is_some() || segments.get(&id).is_some_and(|s| s.parent() == EMPTY) {
+            let mut restorer = if let Some((parent_path, checksum)) = parent {
+                std::fs::rename(parent_path, &path)?;
+                wal::Restorer::resume(&path, MAX, checksum)?
+            } else {
+                wal::Restorer::create(&path, MAX)?
+            };
+            let name = segment_key(segments.get(&id).context("range link missing")?);
+            let bytes = blob(
+                store,
+                prefix,
+                objects.get(&name).context("range object missing")?,
+            )
+            .await?;
+            check_range_header(&bytes, id, false)?;
+            restorer.apply(&bytes)?;
+            let checksum = restorer.finish()?.value();
+            wal::Restorer::resume(&path, MAX, checksum)?.finish()?;
+            readonly::verify(&path)?;
+            chain_checksum = Some(checksum);
+        }
+        if snapshots.contains(&id) {
+            let name = snapshot_key(id);
+            let bytes = blob(
+                store,
+                prefix,
+                objects.get(&name).context("snapshot missing")?,
+            )
+            .await?;
+            check_range_header(&bytes, id, true)?;
+            let snapshot_path = tmp.path().join("snapshot.db");
+            let mut restorer = wal::Restorer::create(&snapshot_path, MAX)?;
+            restorer.apply(&bytes)?;
+            let checksum = restorer.finish()?.value();
+            wal::Restorer::resume(&snapshot_path, MAX, checksum)?.finish()?;
+            readonly::verify(&snapshot_path)?;
+            if let Some(chain) = chain_checksum {
+                ensure!(
+                    chain == checksum,
+                    "snapshot differs from its boundary segment checksum"
+                );
+                std::fs::remove_file(snapshot_path)?;
+            } else {
+                // Even an unrecoverable boundary segment must agree with the snapshot.
+                if let Some(segment) = segments.get(&id) {
+                    let name = segment_key(segment);
+                    let bytes = blob(
+                        store,
+                        prefix,
+                        objects.get(&name).context("boundary missing")?,
+                    )
+                    .await?;
+                    check_range_header(&bytes, id, false)?;
+                    let (_, trailer) = ltx::visit(&bytes, |_| Ok::<_, ()>(()), |_, _| Ok(()))
+                        .map_err(|e| anyhow::anyhow!("invalid boundary LTX: {e:?}"))?;
+                    ensure!(
+                        trailer.post_apply_checksum == checksum,
+                        "snapshot differs from its boundary segment checksum"
+                    );
+                }
+                std::fs::rename(snapshot_path, &path)?;
+                chain_checksum = Some(checksum);
+            }
+        }
+        let checksum = chain_checksum.context("range position has no base")?;
+        checked += 1;
+        // Branches get private raw files; linear history reuses the same file.
+        let next = children.remove(&id).unwrap_or_default();
+        for (index, child) in next.iter().enumerate() {
+            let child_path = tmp.path().join(format!("pending-{sequence}-{index}.db"));
+            if index + 1 == next.len() {
+                std::fs::rename(&path, &child_path)?;
+            } else {
+                std::fs::copy(&path, &child_path)?;
+            }
+            pending.push((*child, Some((child_path, checksum))));
+        }
+        if next.is_empty() {
+            std::fs::remove_file(path)?;
+        }
     }
+    ensure!(checked == reachable.len(), "range positions omitted");
     println!(
         "{} recoverable ranges: {}",
         text(actor, "prefix")?,
@@ -842,36 +886,19 @@ async fn verify_ranges(store: &Store, prefix: &str, actor: &Value) -> anyhow::Re
     Ok(())
 }
 
-async fn replay_range(
-    store: &Store,
-    prefix: &str,
-    listing: &Listing,
-    objects: &serde_json::Map<String, Value>,
-    target: wasmkeep_cluster::replication::SegmentId,
+fn check_range_header(
+    bytes: &[u8],
+    id: wasmkeep_cluster::replication::SegmentId,
+    snapshot: bool,
 ) -> anyhow::Result<()> {
-    let plan = plan_target(listing, target)?;
-    let keys = history::copy_keys(listing, &plan)?;
-    check_boundary(store, prefix, &keys, objects).await?;
-    let tmp = tempfile::tempdir()?;
-    let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
-        tmp.path(),
-    )?);
-    for name in keys {
-        put(
-            &local,
-            &name,
-            blob(
-                store,
-                prefix,
-                objects.get(&name).context("range object missing")?,
-            )
-            .await?,
-            false,
-        )
-        .await?;
-    }
-    let restored = history::replay(&local, "", &tmp.path().join("range.db"), MAX).await?;
-    ensure!(restored.position == target, "range chain changed target");
+    use wasmkeep_storage::ltx;
+    let header = ltx::Header::decode(bytes.get(..ltx::HEADER_SIZE).context("short range LTX")?)?;
+    ensure!(
+        !header.no_checksum()
+            && header.max_txid == id.txid
+            && header.min_txid == if snapshot { 1 } else { id.txid },
+        "range LTX header does not match position"
+    );
     Ok(())
 }
 async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> anyhow::Result<()> {
@@ -1004,10 +1031,12 @@ impl Copier<'_> {
         let mut objects = initial;
         let mut reason = String::new();
         let mut expected: BTreeSet<_> = objects.keys().cloned().collect();
+        let mut validated = serde_json::Map::new();
         for attempt in 0..8 {
             if attempt > 0 {
                 objects = list_bounded(self.source, prefix).await?;
             }
+            validated.retain(|k, entry| objects.get(k).is_none_or(|meta| same(meta, entry)));
             expected.extend(objects.keys().cloned());
             let mut observed_bytes = 0;
             for name in &expected {
@@ -1027,9 +1056,12 @@ impl Copier<'_> {
                     .saturating_add(bytes.div_ceil(1 << 20))
                     .saturating_add((objects.len() as u64).div_ceil(8)),
             );
-            match tokio::time::timeout(deadline, self.attempt(prefix, &objects, previous))
-                .await
-                .context("backup actor copy deadline exceeded")?
+            match tokio::time::timeout(
+                deadline,
+                self.attempt(prefix, &objects, previous, &mut validated),
+            )
+            .await
+            .context("backup actor copy deadline exceeded")?
             {
                 Ok(mut actor) => {
                     let copied = actor["objects"].as_object().context("missing objects")?;
@@ -1165,6 +1197,7 @@ impl Copier<'_> {
         prefix: &str,
         listed: &BTreeMap<String, ObjectMeta>,
         previous: Option<&Value>,
+        validated: &mut serde_json::Map<String, Value>,
     ) -> anyhow::Result<Value> {
         let listing = Listing::from_keys(listed.keys().map(String::as_str));
         let plan = plan_restore(&listing)?;
@@ -1181,6 +1214,7 @@ impl Copier<'_> {
                 .is_some_and(|(m, o)| same(m, o))
         });
         if unchanged
+            && validated.is_empty()
             && (!self.all
                 || listed
                     .iter()
@@ -1193,6 +1227,10 @@ impl Copier<'_> {
         } else {
             serde_json::Map::new()
         };
+        // A disappeared key keeps its validated reference; a key observed with
+        // a new identity must never inherit the earlier bytes, even if GET fails.
+        validated.retain(|k, entry| listed.get(k).is_none_or(|meta| same(meta, entry)));
+        copied.extend(validated.clone());
         let mut wanted = keys.clone();
         if self.all {
             for k in listed.keys() {
@@ -1203,7 +1241,11 @@ impl Copier<'_> {
         }
         for k in &wanted {
             let meta = listed.get(k).context("plan key missing from listing")?;
-            if let Some(entry) = old.and_then(|o| o.get(k)).filter(|o| same(meta, o)) {
+            if let Some(entry) = validated
+                .get(k)
+                .or_else(|| old.and_then(|o| o.get(k)))
+                .filter(|o| same(meta, o))
+            {
                 copied.insert(k.clone(), entry.clone());
                 continue;
             }
@@ -1236,6 +1278,7 @@ impl Copier<'_> {
             )
             .await?;
             entry["timestamp_ms"] = json!(header.timestamp_ms);
+            validated.insert(k.clone(), entry.clone());
             copied.insert(k.clone(), entry);
         }
         check_boundary(self.dest, self.dp, &keys, &copied).await?;
