@@ -251,7 +251,8 @@ enum ClusterCommand {
     /// deletes, large objects, last-modified times and the clock. Runs
     /// through the nodes' own bucket code, writing only under a scratch
     /// prefix it requires to be empty and deletes afterwards. One line per
-    /// check, then a verdict. Exits with 0 when safe, 1 when not safe, 2
+    /// check, then a verdict. Exits with 0 when every check observed the
+    /// required behaviour (not a proof of safety), 1 when one did not, 2
     /// when it could not run or finish.
     Diagnose(diagnose::DiagnoseArgs),
 }

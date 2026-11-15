@@ -380,10 +380,15 @@ ignores the conditions) would let two nodes own one actor, so the node
 logs why, stays not ready and `wasmkeep serve` exits. A bucket that does
 not answer yet is tried again, as at any start. Cloudflare R2 and
 OVHcloud Object Storage pass it (tested); AWS S3 and MinIO document both
-conditions. `wasmkeep cluster diagnose --bucket s3://BUCKET` checks the rest of
+conditions. The bucket's listings must also be strongly consistent
+after a write: a node that takes an actor over plans its restore from one
+listing of the actor's history, at once after a voluntary hand-over, so a
+segment the listing omits would restore an older head and fork the
+history. `wasmkeep cluster diagnose --bucket s3://BUCKET` checks the rest of
 what a cluster needs from a bucket (listings, deletes, large objects,
 last-modified times, the clock) under a scratch prefix it deletes
-afterwards, and says whether it is safe for WasmKeep
+afterwards, and says whether these checks observed the required
+behaviour; it samples the bucket, it does not prove it safe
 ([buckets](deploy/buckets.md)). For a quick local try,
 [moto](https://github.com/getmoto/moto)'s S3 server is enough (it keeps
 everything in memory):
@@ -1070,8 +1075,8 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
 
 To check the bucket itself rather than the nodes, `wasmkeep cluster
 diagnose --bucket s3://wasmkeep-demo` runs WasmKeep's bucket conformance
-checks under a scratch prefix and prints a verdict: safe for WasmKeep
-(exit 0), not safe (1), or no verdict (2). See [Buckets](deploy/buckets.md).
+checks under a scratch prefix and prints a verdict: required behaviour
+observed by these checks (exit 0), not safe (1), or no verdict (2). See [Buckets](deploy/buckets.md).
 
 ## Draining a node
 

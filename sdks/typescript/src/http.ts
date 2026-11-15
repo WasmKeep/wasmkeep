@@ -27,6 +27,7 @@ import {
 } from "wasi:http/types@0.2.12";
 import { poll, type Pollable } from "wasi:io/poll@0.2.12";
 import type { InputStream } from "wasi:io/streams@0.2.12";
+import { describe, describeStreamError as describeStreamErrorOf, dispose, streamErrorTag } from "./stream-error";
 import { FetchError, splitUrl } from "./url";
 
 export { FetchError } from "./url";
@@ -74,52 +75,9 @@ const METHODS: Record<string, Method["tag"]> = {
   OPTIONS: "options",
 };
 
-function describe(e: unknown): string {
-  // A WIT error: jco throws an Error whose `payload` is the error value
-  // (its message only says to look there), or the value itself.
-  const payload = typeof e === "object" && e !== null && "payload" in e ? (e as { payload: unknown }).payload : e;
-  if (typeof payload === "object" && payload !== null && "tag" in payload) {
-    const { tag, val } = payload as { tag: string; val?: unknown };
-    return val === undefined ? tag : `${tag}: ${JSON.stringify(val, (_k, v) => (typeof v === "bigint" ? `${v}` : v))}`;
-  }
-  if (e instanceof Error) return e.message;
-  return String(e);
-}
-
-/** The tag of a `stream-error` thrown by a stream read (`closed` or
- * `last-operation-failed`), however the engine wraps it. */
-function streamErrorTag(e: unknown): string | undefined {
-  const payload = typeof e === "object" && e !== null && "payload" in e ? (e as { payload: unknown }).payload : e;
-  if (typeof payload === "object" && payload !== null && "tag" in payload) {
-    return (payload as { tag: string }).tag;
-  }
-  return undefined;
-}
-
-/** A broken stream's cause: the HTTP error code when the host gives one,
- * else its debug text. */
+/** A broken stream's cause, with its HTTP error code when there is one. */
 function describeStreamError(e: unknown): string {
-  const payload = typeof e === "object" && e !== null && "payload" in e ? (e as { payload: unknown }).payload : e;
-  const val = typeof payload === "object" && payload !== null ? (payload as { val?: unknown }).val : undefined;
-  if (typeof val === "object" && val !== null && "toDebugString" in val) {
-    const error = val as Parameters<typeof httpErrorCode>[0];
-    try {
-      const code = httpErrorCode(error);
-      if (code !== undefined && code !== null) return describe(code);
-    } catch {
-      // No code: the debug text below.
-    }
-    return error.toDebugString();
-  }
-  return describe(e);
-}
-
-/** Drops a WIT resource handle now (wasi:http refuses to finish a body
- * whose stream is still open). */
-function dispose(handle: unknown): void {
-  const h = handle as Record<symbol, (() => void) | undefined>;
-  const key = typeof Symbol.dispose === "symbol" ? Symbol.dispose : Symbol.for("dispose");
-  (h[key] ?? h[Symbol.for("dispose")])?.call(handle);
+  return describeStreamErrorOf(e, httpErrorCode);
 }
 
 /** Sends a request and waits for its response. Throws [`FetchError`] when

@@ -122,6 +122,57 @@ in_every_language!(
     the_operator_s_motd_greets_each_newcomer,
 );
 
+/// A body that breaks before its end is an error in the SDKs whose body
+/// accessors tell a broken stream from its end. Not run here: the C, Zig,
+/// D and MoonBit SDKs still read a broken body as a shorter one, and the
+/// Go room reads `Body()`, which gives what arrived (`ReadBody()` gives
+/// the error).
+mod a_broken_body {
+    macro_rules! rooms {
+        ($($module:ident: $room:expr),* $(,)?) => {$(
+            #[tokio::test(flavor = "multi_thread")]
+            async fn $module() {
+                if let Some(room) = $room {
+                    super::a_body_cut_short_is_not_a_message(room).await;
+                }
+            }
+        )*};
+    }
+    rooms!(
+        rust_room: Some(super::rust_room()),
+        typescript_room: super::ts_room(),
+        typescript_starlingmonkey_room: super::ts_starlingmonkey_room(),
+        python_room: super::py_room(),
+    );
+}
+
+/// A POST whose client closes after 5 of the 100 bytes it declared: the
+/// room must not take the 5 as a message.
+async fn a_body_cut_short_is_not_a_message(chat: Vec<u8>) {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _svc, _stop) = start(chat, data.path(), Duration::from_secs(30)).await;
+    assert_eq!(http_post(addr, "/actor/chat/lobby", "whole").await, 200);
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"POST /actor/chat/lobby HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\nhello")
+        .await
+        .unwrap();
+    s.shutdown().await.unwrap();
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut raw)).await;
+    let raw = String::from_utf8_lossy(&raw);
+    assert!(
+        !raw.starts_with("HTTP/1.1 200"),
+        "a cut body was taken: {raw}"
+    );
+    // Only the whole message is in the history.
+    let mut ws = connect(addr, "lobby").await;
+    assert_eq!(next_text(&mut ws).await, "whole");
+    assert_eq!(
+        next_text(&mut ws).await,
+        "* someone joined #lobby (1 online)"
+    );
+}
+
 async fn start(
     chat: Vec<u8>,
     data: &std::path::Path,

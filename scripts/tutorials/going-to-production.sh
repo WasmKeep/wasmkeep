@@ -86,7 +86,7 @@ run diagnose
 expect_status 0
 expect '^pass +create-if-absent '
 expect '^pass +replace-if-match '
-expect '^safe for WasmKeep$'
+expect '^required behaviour observed by these checks \(not a proof of safety\)$'
 
 # 3. Pins. (ACTORS lags a heartbeat, so it is not checked.)
 run status
