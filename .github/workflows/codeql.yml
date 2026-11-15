@@ -9,12 +9,8 @@ name: CodeQL
 # scanned (tests) and why.
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "bench/results/**"
+  # Weekly and by hand only: the Rust analysis takes about ten minutes,
+  # and alerts on main need no faster answer than that.
   schedule:
     - cron: "41 4 * * 1"
   workflow_dispatch:

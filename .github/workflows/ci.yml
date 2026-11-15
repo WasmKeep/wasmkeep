@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # To run main's suites again on a commit whose run a later merge
+  # cancelled, before tagging it.
+  workflow_dispatch:
   pull_request:
     # A draft starts nothing but the job "draft", which asks whether it is
     # still one (see that job and the jobs' conditions): marking it ready
@@ -18,15 +21,14 @@ defaults:
   run:
     shell: bash
 
-# A newer commit on the same pull request replaces the run in progress:
-# only its latest commit's result matters. A push to main is never
-# replaced, nor left waiting where a later push could replace it: each such
-# run has a group of its own (its run id), so runs on main overlap and
-# every commit of main keeps a finished run. A release needs a passing run
-# on its commit (release.yml).
+# A newer commit on the same branch replaces the run in progress, on a pull
+# request and on main alike: only the latest commit's result matters. A
+# release needs a passing run on its tagged commit (release.yml): if a
+# later merge cancelled that run, start it again by hand (workflow_dispatch)
+# before tagging.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
