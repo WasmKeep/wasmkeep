@@ -116,8 +116,24 @@ Each waits for a user who needs it.
 - **Cron triggers** (alarms cover them today) and optional built-ins: TLS
   termination, a Helm chart. Until static assets ship, serve them from
   the [front door](docs/deploy/front-door.md#static-files).
-- **M5, an escape hatch**: a microVM tier (Firecracker) for tenants that
-  need raw Linux, behind the same routing and storage API.
+- **Isolation tiers per app**, after `0.5.0`'s several apps on the same
+  nodes. The operator picks a tier per app, and actors and their API are
+  the same in every tier:
+  - **shared**: the default, every app's actors in one node process,
+    with per-app limits against a noisy neighbour;
+  - **a process per app**: each app in its own sandboxed WasmKeep
+    process (its own user, seccomp, namespaces), with its own bucket
+    prefix and credentials;
+  - **a launcher**: the node starts an app's process through a command
+    the operator provides, so an app can run inside a microVM
+    (Firecracker), Kata Containers or gVisor.
+
+  WasmKeep does not manage microVMs, and does not decide which tenant
+  gets which tier: that belongs to whatever platform runs it.
+  [Security](docs/security.md) says what each tier does and does not
+  protect against.
+- **M5, raw Linux workloads**: tenants that need a Linux program rather
+  than a component, behind the same routing and storage API.
 
 ## Not planned
 
