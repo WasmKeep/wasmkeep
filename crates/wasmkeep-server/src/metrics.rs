@@ -391,6 +391,12 @@ pub(crate) fn parked_released(reason: &str, n: usize) {
     }
 }
 
+/// Every event counted by `wasmkeep_plain_events_dropped_total` in this
+/// process, whatever its reason (ADR 0034, section 10).
+pub fn plain_events_dropped_total() -> u64 {
+    METRICS.plain_events_dropped.total()
+}
+
 /// Counts `n` events dropped for `reason`
 /// ([`Metrics::plain_events_dropped`]).
 pub(crate) fn plain_events_dropped(reason: &str, n: u64) {

@@ -315,3 +315,112 @@ async fn a_delete_at_the_events_end_flushes_then_resets() {
         r.body
     );
 }
+
+/// How long the event after a plain write takes to start: with a slow
+/// bucket, a strict hold's write waits for its upload, a batched one's
+/// does not.
+async fn next_after_a_write(addr: SocketAddr) -> Duration {
+    let r = send(addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let started = std::time::Instant::now();
+    let r = send(addr, "GET", "/actor/t/x/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    started.elapsed()
+}
+
+/// A redeploy from batched to strict reaches a resident actor at a
+/// `Flushed` barrier before its next event, and its writes go up inline
+/// from then on; nothing is given up (ADR 0034, section 1). Strict to
+/// batched needs no flush.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mode_switch_waits_for_a_flushed_barrier() {
+    use wasmkeep_server::apps::{Changes, Writes};
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let store: Arc<dyn ObjectStore> = Arc::clone(&flaky) as Arc<dyn ObjectStore>;
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    let deploy = |writes| Changes {
+        classes: Some(vec![("t".to_owned(), test_actor_wasm().to_vec())]),
+        writes: vec![("t".into(), writes)],
+        ..Changes::default()
+    };
+    app.deploy_changes(&rt, deploy(Writes::Batched))
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (node, service) = node_app(
+        "a",
+        dir.path(),
+        &store,
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+    )
+    .await;
+    let r = send_runnable(node.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    flaky.delay_wal_ms.store(400, Ordering::SeqCst);
+    let batched = next_after_a_write(node.addr).await;
+    assert!(batched < Duration::from_millis(300), "batched: {batched:?}");
+
+    // A segment in flight as the version turns strict.
+    let r = send(node.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let done = app
+        .deploy_changes(&rt, deploy(Writes::Strict))
+        .await
+        .unwrap();
+    runs_deploy(&service, done.current.seq).await;
+    let strict = next_after_a_write(node.addr).await;
+    assert!(strict >= Duration::from_millis(350), "strict: {strict:?}");
+    let r = send(node.addr, "GET", "/actor/t/x/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "4"), "{}", r.body);
+    assert_eq!(
+        wasmkeep_server::metrics::plain_events_dropped_total(),
+        0,
+        "nothing given up"
+    );
+
+    // And back: no flush needed.
+    let done = app
+        .deploy_changes(&rt, deploy(Writes::Batched))
+        .await
+        .unwrap();
+    runs_deploy(&service, done.current.seq).await;
+    let again = next_after_a_write(node.addr).await;
+    assert!(
+        again < Duration::from_millis(300),
+        "batched again: {again:?}"
+    );
+}
+
+/// An idle batched actor's step before the drop flushes it: nothing it
+/// wrote is lost when it hibernates with uploads pending, and a takeover
+/// finds every write (ADR 0034, section 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn hibernation_flushes_first() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.mailbox.idle_timeout = Duration::from_millis(300);
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(700, Ordering::SeqCst);
+    for _ in 0..3 {
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    eventually("hibernated", async || p.a.service.resident() == 0).await;
+    p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    let r = b_answers(&p, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "4", Some("b")),
+        "{}",
+        r.body
+    );
+}

@@ -148,6 +148,10 @@ fi
 if $full || $rust || $simulation; then
   step fmt; cargo fmt --all --check
   step clippy; cargo clippy --workspace --all-targets --locked -- -D warnings
+  # Batched plain writes are built only with this feature (ADR 0034,
+  # section 15): lint that build too.
+  step 'clippy (batched-writes)'
+  cargo clippy -p wasmkeep-server --all-targets --locked --features batched-writes -- -D warnings
 fi
 if $full || $rust; then
   step tests
@@ -166,6 +170,11 @@ if $full || $rust; then
     cargo nextest run --workspace --locked -E "$filter - binary(cluster_over_tls)"
     skip 'the cluster suite over TLS (cluster_over_tls): --full'
   fi
+  # The batched build (ADR 0034, section 15): the server's unit tests and
+  # the cluster cases that need it, beside the default build's above.
+  step 'tests (batched-writes)'
+  cargo nextest run -p wasmkeep-server --locked --features batched-writes \
+    -E 'kind(lib) | (binary(cluster) & (test(/^batched::/) | test(/^writes_deploys::/)))'
 elif $preflight; then
   cargo nextest run -p wasmkeep-compare --test preflight --locked
 fi

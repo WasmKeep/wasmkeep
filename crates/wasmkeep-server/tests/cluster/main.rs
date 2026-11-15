@@ -1690,6 +1690,9 @@ async fn node_app(
     let mut config = ActorConfig::new(data);
     config.access = version.access;
     config.config = version.config;
+    // As `serve --app` does: the classes the version makes batched (strict
+    // unless the binary has `batched-writes`).
+    config.batched = version.batched;
     config.mailbox.idle_timeout = idle;
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
