@@ -4,7 +4,8 @@
 
 mod actor_read;
 mod app_delete;
-mod backup;
+use wasmkeep_cli::backup;
+use wasmkeep_cli::{open_bucket_unchecked, parse_app, parse_bucket};
 mod dev;
 mod dev_project;
 mod diagnose;
@@ -2730,15 +2731,6 @@ fn parse_requires(s: &str) -> Result<(String, std::collections::BTreeSet<String>
     Ok((class.to_owned(), set))
 }
 
-/// Parses `TENANT/APP`.
-pub(crate) fn parse_app(s: &str) -> Result<(String, String), String> {
-    let (tenant, app) = s
-        .split_once('/')
-        .filter(|(t, a)| !t.is_empty() && !a.is_empty() && !a.contains('/'))
-        .ok_or_else(|| format!("expected TENANT/APP, got {s:?}"))?;
-    Ok((tenant.to_owned(), app.to_owned()))
-}
-
 /// Opens `s3://BUCKET[/PREFIX]`, configured from the AWS_* environment,
 /// for a command that writes: refused while `cluster migrate` holds the
 /// prefix (ADR 0022). Only reads.
@@ -2748,20 +2740,6 @@ pub(crate) fn open_bucket(
     let (store, prefix) = open_bucket_unchecked(url)?;
     refuse_locked(url, &store, &prefix)?;
     Ok((store, prefix))
-}
-
-/// [`open_bucket`] without the check: `cluster status` and `cluster
-/// migrate`.
-pub(crate) fn open_bucket_unchecked(
-    url: &str,
-) -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)> {
-    let (bucket, prefix) = parse_bucket(url)?;
-    let store = object_store::aws::AmazonS3Builder::from_env()
-        .with_bucket_name(bucket)
-        .build()
-        .with_context(|| format!("opening bucket {url}"))?;
-    let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(store);
-    Ok((store, prefix.to_owned()))
 }
 
 /// Runs `check` on a thread of its own (callers may hold a runtime of
@@ -2830,16 +2808,6 @@ pub(crate) fn check_layout(
         )),
         Some(Ok(migrated)) => Ok(migrated),
     }
-}
-
-/// Splits `s3://BUCKET[/PREFIX]` into the bucket and the key prefix.
-fn parse_bucket(url: &str) -> anyhow::Result<(&str, &str)> {
-    let rest = url
-        .strip_prefix("s3://")
-        .with_context(|| format!("--bucket must look like s3://BUCKET[/PREFIX], got {url:?}"))?;
-    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-    anyhow::ensure!(!bucket.is_empty(), "--bucket has no bucket name: {url:?}");
-    Ok((bucket, prefix.trim_matches('/')))
 }
 
 #[cfg(test)]

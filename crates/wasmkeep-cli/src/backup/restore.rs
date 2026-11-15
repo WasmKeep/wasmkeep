@@ -125,12 +125,7 @@ async fn nodes(args: &Restore, store: &Store, prefix: &str) -> anyhow::Result<()
     );
     for node in wasmkeep_cluster::membership::all_heartbeats(&bucket).await? {
         ensure!(
-            node.app != format!("{tenant}/{app}")
-                || node
-                    .version
-                    .split_once('+')
-                    .is_some_and(|(_, meta)| meta.split('.').any(|part| part == "restore1"))
-                || args.force,
+            node.app != format!("{tenant}/{app}") || node.can_restore || args.force,
             "node {} version {} ignores restore fences (including offline nodes); upgrade or use --force after stopping it",
             node.id,
             node.version
@@ -239,6 +234,83 @@ async fn alarm_address(
     Ok((original_class.into(), original_name.into()))
 }
 
+async fn verify_undo(archive: &Store, ap: &str, id: &str, force: bool) -> anyhow::Result<()> {
+    let run = load(archive, ap, id).await?;
+    let missing = array(&run.complete, "failed")?
+        .iter()
+        .map(|f| text(f, "actor"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if !missing.is_empty() {
+        let warning = format!("partial undo: actors not covered: {}", missing.join(", "));
+        ensure!(
+            force,
+            "{warning}; use --force to proceed without their undo coverage"
+        );
+        eprintln!("WARNING: {warning}; these actors cannot be recovered by undo (--force)");
+    }
+    verify_mode(archive, ap, id, None, force, false).await
+}
+
+async fn verify_target(
+    run: &Run,
+    source_root: &str,
+    target: &Store,
+    state: &str,
+) -> anyhow::Result<()> {
+    let mut expected = BTreeSet::new();
+    for path in &run.actors {
+        let actor = disk_actor(path)?;
+        if actor["status"] == "failed" {
+            continue;
+        }
+        let prefix = text(&actor, "prefix")?;
+        if !prefix.starts_with(source_root) {
+            continue;
+        }
+        let name = actor_name(prefix, source_root)?;
+        expected.insert(name.to_owned());
+        let prefix = format!("{}/", key(state, &format!("actors/{name}")));
+        let listing = list_bounded(target, &prefix).await?;
+        let plan = plan_restore(&Listing::from_keys(listing.keys().map(String::as_str)))?;
+        ensure!(
+            plan.head().generation == number(&actor, "generation")?
+                && plan.head().txid == number(&actor, "txid")?,
+            "restored actor {name} has an unexpected head"
+        );
+        let tmp = tempfile::tempdir()?;
+        let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
+            tmp.path(),
+        )?);
+        for tail in history::copy_keys(
+            &Listing::from_keys(listing.keys().map(String::as_str)),
+            &plan,
+        )? {
+            let bytes = history::get(
+                target,
+                &Key::parse(key(&prefix, &tail))?,
+                None,
+                MAX + (MAX / 16) + (1 << 20),
+            )
+            .await?;
+            put(&local, &tail, bytes.to_vec(), false).await?;
+        }
+        let result = history::replay(&local, "", &tmp.path().join("verify.db"), MAX).await?;
+        ensure!(
+            result.position == plan.head() && result.raw_checksum == number(&actor, "checksum")?,
+            "restored actor {name} checksum differs"
+        );
+    }
+    let root = format!("{}/", key(state, "actors"));
+    let mut groups = actor_groups(target, &root);
+    while let Some((prefix, _)) = groups.try_next().await? {
+        ensure!(
+            expected.contains(actor_name(&prefix, &root)?),
+            "unexpected restored actor: {prefix}"
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn execute(
     args: &Restore,
     archive: &Store,
@@ -260,6 +332,41 @@ pub(super) async fn execute(
         Some(bytes) => serde_json::from_slice(bytes).context("invalid restore journal")?,
         None => Value::Null,
     };
+    if args.abort {
+        ensure!(
+            existing.is_some() && journal["phase"] == "prepare",
+            "--abort is only safe in prepare; clear/copy must restore the pinned before_restore run with --in-place --deploy backup"
+        );
+        nodes(args, target, tp).await?;
+        let lock = key(&base, "restore-lock");
+        let (version, nonce) = acquire_lock(target, &lock, &journal["binding"]).await?;
+        let result = async {
+            ensure!(
+                optional(target, &fence).await? == existing,
+                "restore changed while acquiring lock"
+            );
+            tokio::time::sleep(late).await;
+            nodes(args, target, tp).await?;
+            target.delete(&Key::from(fence.as_str())).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        tokio::time::sleep(late).await;
+        let unlocked = target
+            .put_opts(
+                &Key::from(lock),
+                format!("unlocked {nonce}").into_bytes().into(),
+                PutOptions {
+                    mode: PutMode::Update(version),
+                    ..Default::default()
+                },
+            )
+            .await;
+        result?;
+        unlocked?;
+        println!("Aborted prepare for {name}; original bucket state retained");
+        return Ok(());
+    }
     let id = match (&args.run, journal.get("run").and_then(Value::as_str)) {
         (Some(id), _) => id.clone(),
         (None, Some(id)) => id.to_owned(),
@@ -268,7 +375,12 @@ pub(super) async fn execute(
     // Full verification is mandatory even on resume, before any target write.
     let root_key = key(ap, &format!("runs/{id}/root"));
     let root = read(archive, &root_key, META_MAX).await?;
-    verify(archive, ap, &id, None).await?;
+    let partial_undo = journal["before_restore"].as_str() == Some(id.as_str());
+    if partial_undo {
+        verify_undo(archive, ap, &id, args.force).await?;
+    } else {
+        verify_mode(archive, ap, &id, None, false, false).await?;
+    }
     let run = load(archive, ap, &id).await?;
     ensure!(
         read(archive, &root_key, META_MAX).await? == root,
@@ -320,6 +432,9 @@ pub(super) async fn execute(
     let mut address_bytes = 0;
     for path in &run.actors {
         let actor = disk_actor(path)?;
+        if actor["status"] == "failed" {
+            continue;
+        }
         let prefix = text(&actor, "prefix")?;
         if prefix.starts_with(&source_root) {
             let address = actor_name(prefix, &source_root)?;
@@ -337,12 +452,21 @@ pub(super) async fn execute(
             }
         }
     }
+    let undoing = existing.is_some()
+        && journal["before_restore"].as_str() == Some(id.as_str())
+        && journal["run"] != id;
     let binding = json!({"run":id,"root":digest(&root),"from":args.from,"bucket":args.bucket,
         "app":name,"in_place":args.in_place,"deploy":format!("{choice:?}")});
     nodes(args, target, tp).await?;
     if existing.is_some() {
         ensure!(
-            journal["binding"] == binding,
+            journal["binding"] == binding
+                || (undoing
+                    && args.in_place
+                    && choice == DeployChoice::Backup
+                    && ["from", "bucket", "app"]
+                        .iter()
+                        .all(|k| journal["binding"][k] == binding[k])),
             "another restore is fenced here; resume its exact options"
         );
     } else {
@@ -359,6 +483,14 @@ pub(super) async fn execute(
         if existing.is_none() {
             ensure!(args.in_place || list_bounded(target, &state).await?.is_empty(),
                 "non-empty app root requires --in-place");
+        }
+        if undoing {
+            ensure!(journal["phase"] == "clear" || journal["phase"] == "copy", "use --abort to cancel prepare");
+            journal["binding"] = binding.clone();
+            journal["run"] = json!(id);
+            journal["phase"] = json!("clear");
+            journal["undoing"] = json!(true);
+            save_journal(target, &fence, &journal).await?;
         }
         if existing.is_none() {
             journal = json!({"run":id,"binding":binding,"phase":"prepare",
@@ -382,15 +514,16 @@ pub(super) async fn execute(
                     let create_args = Create { bucket: args.bucket.clone(), to: args.from.clone(),
                         app: Some(args.app.clone()), all: false, history: History::Head,
                         require_continuous: Some(true), cache: None, to_env: None };
-                    let undo = create(&create_args, target, tp, archive, ap).await?;
-                    verify(archive, ap, &undo, None).await?;
+                    let fence_bytes = read(target, &fence, META_MAX).await?;
+                    let undo = create_undo(&create_args, target, tp, archive, ap, Some(&fence_bytes)).await?;
+                    verify_undo(archive, ap, &undo, args.force).await?;
                     journal["before_restore"] = json!(undo);
                     // Persist before publishing the undo label: a retry must
                     // never replace the label with a different run.
                     save_journal(target, &fence, &journal).await?;
                 }
                 let undo = text(&journal, "before_restore")?;
-                verify(archive, ap, undo, None).await?;
+                verify_undo(archive, ap, undo, args.force).await?;
                 same_or_create(archive, &key(ap, &format!("before-restore/{}", text(&journal, "nonce")?)),
                     undo.as_bytes().to_vec()).await?;
             }
@@ -421,6 +554,7 @@ pub(super) async fn execute(
             }
             for path in &run.actors {
                 let actor = disk_actor(path)?;
+        if actor["status"] == "failed" { continue; }
                 let prefix = text(&actor, "prefix")?;
                 if !prefix.starts_with(&source_root) { continue; }
                 let name = actor_name(prefix, &source_root)?;
@@ -439,6 +573,13 @@ pub(super) async fn execute(
         }
         if journal["phase"] == "clear" {
             nodes(args, target, tp).await?;
+            if journal["undoing"] == true {
+                for (tail, meta) in list_bounded(target, &format!("{base}/")).await? {
+                    if !["restoring", "restored", "restore-lock", "recreated", "deleted"].contains(&tail.as_str()) {
+                        target.delete(&meta.location).await?;
+                    }
+                }
+            }
             for _ in 0..10 {
                 let keys = list_bounded(target, &state).await?;
                 if keys.is_empty() { break; }
@@ -454,6 +595,7 @@ pub(super) async fn execute(
         // never the rest of an --history all archive.
         for path in &run.actors {
             let actor = disk_actor(path)?;
+        if actor["status"] == "failed" { continue; }
             let prefix = text(&actor, "prefix")?;
             if !prefix.starts_with(&source_root) { continue; }
             let name = actor_name(prefix, &source_root)?;
@@ -471,6 +613,7 @@ pub(super) async fn execute(
         // Then the alarm index derived from the verified committed databases.
         for path in &run.actors {
             let actor = disk_actor(path)?;
+        if actor["status"] == "failed" { continue; }
             let prefix = text(&actor, "prefix")?;
             if !prefix.starts_with(&source_root) { continue; }
             let name = actor_name(prefix, &source_root)?;
@@ -516,6 +659,7 @@ pub(super) async fn execute(
             }
         }
         nodes(args, target, tp).await?;
+        verify_target(&run, &source_root, target, &state).await?;
         // Last: any failure above leaves the fence and journal for a retry.
         target.delete(&Key::from(fence.as_str())).await?;
         println!("Restored {name} from {id}; each actor at its own moment. Due alarms may fire again; no ownership or intents restored.");

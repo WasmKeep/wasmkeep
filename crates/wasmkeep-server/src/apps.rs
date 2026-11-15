@@ -475,6 +475,17 @@ impl AppRef {
             .map(|(bytes, _)| String::from_utf8_lossy(&bytes).into_owned()))
     }
 
+    /// Refuse destructive app operations while a restore holds its fence.
+    pub(super) async fn check_not_restoring(&self) -> Result<(), DeployError> {
+        if self.get("restoring").await?.is_some() {
+            return Err(DeployError::Refused(format!(
+                "{} is restoring",
+                self.name()
+            )));
+        }
+        Ok(())
+    }
+
     /// [`DeployError::Deleted`] if the app has a tombstone.
     ///
     /// # Errors
@@ -498,6 +509,7 @@ impl AppRef {
     /// # Errors
     /// The bucket did not answer.
     pub async fn write_tombstone(&self, body: &str) -> Result<bool, DeployError> {
+        self.check_not_restoring().await?;
         let opts = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
@@ -528,6 +540,7 @@ impl AppRef {
     /// # Errors
     /// The bucket did not answer.
     pub async fn app_keys(&self) -> Result<Vec<String>, DeployError> {
+        self.check_not_restoring().await?;
         use futures_util::TryStreamExt as _;
         let tombstone = self.path(TOMBSTONE);
         let mut out = Vec::new();
@@ -557,6 +570,7 @@ impl AppRef {
     /// # Errors
     /// The bucket did not answer for one of them.
     pub async fn delete_keys(&self, keys: &[String]) -> Result<(), DeployError> {
+        self.check_not_restoring().await?;
         use futures_util::StreamExt as _;
         let results: Vec<Result<(), DeployError>> = futures_util::stream::iter(keys)
             .map(|k| async move {
@@ -583,6 +597,7 @@ impl AppRef {
     /// # Errors
     /// Something is left (run `app delete` again), too soon, or the bucket.
     pub async fn recreate(&self, late: Duration) -> Result<bool, DeployError> {
+        self.check_not_restoring().await?;
         let Some(body) = self.tombstone().await? else {
             return Ok(false);
         };
@@ -1504,7 +1519,6 @@ impl AppRef {
     pub async fn update(&self, service: &ActorService) -> Result<bool, DeployError> {
         // The app deleted (ADR 0028, section 5): checked at every version
         // check, before `current`.
-        self.check_not_deleted().await?;
         if !self.still_ours(service.local_app_dir()).await? {
             return Err(DeployError::Deleted(format!("{} (restored)", self.name())));
         }

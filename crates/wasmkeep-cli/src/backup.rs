@@ -30,14 +30,14 @@ fn charge(used: &mut u64, bytes: u64, limit: u64, label: &str) -> anyhow::Result
 }
 type Store = Arc<dyn ObjectStore>;
 #[derive(Debug, Subcommand)]
-pub(crate) enum Command {
+pub enum Command {
     Create(Create),
     List(From),
     Verify(Verify),
     Restore(Restore),
 }
 #[derive(Debug, Args)]
-pub(crate) struct Create {
+pub struct Create {
     #[arg(long)]
     bucket: String,
     #[arg(long)]
@@ -64,12 +64,12 @@ enum History {
     All,
 }
 #[derive(Debug, Args)]
-pub(crate) struct From {
+pub struct From {
     #[arg(long)]
     from: String,
 }
 #[derive(Debug, Args)]
-pub(crate) struct Verify {
+pub struct Verify {
     #[arg(long)]
     from: String,
     #[arg(long)]
@@ -86,7 +86,7 @@ enum DeployChoice {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct Restore {
+pub struct Restore {
     #[arg(long)]
     from: String,
     #[arg(long)]
@@ -97,9 +97,12 @@ pub(crate) struct Restore {
     bucket: String,
     #[arg(long)]
     in_place: bool,
+    /// Cancel a restore still in prepare; later phases require the pinned undo run.
+    #[arg(long, conflicts_with = "run")]
+    abort: bool,
     #[arg(long, value_enum)]
     deploy: Option<DeployChoice>,
-    /// Override only the refusal of old node versions; never a live node.
+    /// Allow old nodes and a partial undo backup, with a warning; never live nodes.
     #[arg(long)]
     force: bool,
 }
@@ -132,7 +135,7 @@ fn encode_bounded(value: &Value, limit: u64) -> anyhow::Result<Vec<u8>> {
 async fn list_bounded(store: &Store, prefix: &str) -> anyhow::Result<BTreeMap<String, ObjectMeta>> {
     let mut objects = BTreeMap::new();
     let mut used = 0;
-    let mut stream = store.list(Some(&Key::from(prefix.trim_end_matches('/'))));
+    let mut stream = store.list(Some(&Key::parse(prefix.trim_end_matches('/'))?));
     while let Some(meta) = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
         .await
         .context("backup listing stalled")?
@@ -390,8 +393,8 @@ fn disjoint(source: (&str, &str, &str), dest: (&str, &str, &str)) -> anyhow::Res
     );
     Ok(())
 }
-pub(crate) fn run(command: &Command) -> anyhow::Result<()> {
-    crate::actor_read::run(async {
+pub fn run(command: &Command) -> anyhow::Result<()> {
+    crate::run_async(async {
         match command {
             Command::Restore(args) => {
                 let (archive, ap, ae) = configured(&args.from, None, None)?;
@@ -946,9 +949,20 @@ fn check_range_header(
     Ok(())
 }
 async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> anyhow::Result<()> {
+    verify_mode(store, prefix, id, sample, false, true).await
+}
+
+async fn verify_mode(
+    store: &Store,
+    prefix: &str,
+    id: &str,
+    sample: Option<u64>,
+    partial: bool,
+    record: bool,
+) -> anyhow::Result<()> {
     let run = load(store, prefix, id).await?;
     ensure!(
-        array(&run.complete, "failed")?.is_empty(),
+        partial || array(&run.complete, "failed")?.is_empty(),
         "partial run: verification refuses failed actors"
     );
     let (_, source_prefix) = crate::parse_bucket(text(&run.complete, "source")?)?;
@@ -987,12 +1001,17 @@ async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> a
     let nonce = tempfile::tempdir()?;
     let mut actors: Vec<_> = run.actors.iter().collect();
     actors.sort_by_key(|a| digest(format!("{}{}", nonce.path().display(), a.display()).as_bytes()));
-    let count = sample.map_or(actors.len(), |n| {
+    let selected = sample.map_or(actors.len(), |n| {
         usize::try_from(n).unwrap_or(usize::MAX).min(actors.len())
     });
-    for actor in actors.into_iter().take(count) {
+    let mut count = 0;
+    for actor in actors.into_iter().take(selected) {
         let actor = disk_actor(actor)?;
+        if partial && actor["status"] == "failed" {
+            continue;
+        }
         replay(store, prefix, &actor).await?;
+        count += 1;
         verify_ranges(store, prefix, &actor).await?;
         // `all` also promises retained history, not only the head's plan.
         for object in actor["objects"]
@@ -1005,13 +1024,15 @@ async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> a
                 .map_err(|e| anyhow::anyhow!("invalid archived LTX: {e:?}"))?;
         }
     }
-    json_put(
-        store,
-        &key(prefix, &format!("runs/{id}/verified")),
-        &json!({"checked":count,"total":run.actors.len(),"sample":sample,"at_ms":now_ms()?}),
-        true,
-    )
-    .await?;
+    if record {
+        json_put(
+            store,
+            &key(prefix, &format!("runs/{id}/verified")),
+            &json!({"checked":count,"total":run.actors.len(),"sample":sample,"at_ms":now_ms()?}),
+            true,
+        )
+        .await?;
+    }
     println!(
         "Verified {count}/{} actors in {id}{}",
         run.actors.len(),
@@ -1382,12 +1403,30 @@ impl Copier<'_> {
         Ok(actor)
     }
 }
+#[cfg(test)]
 async fn incarnation(source: &Store, base: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    incarnation_for(source, base, None).await
+}
+async fn incarnation_for(
+    source: &Store,
+    base: &str,
+    undo_fence: Option<&[u8]>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    ensure!(
+        optional(source, &key(base, "restoring")).await?.as_deref() == undo_fence,
+        "app is restoring (or undo fence changed)"
+    );
     ensure!(
         optional(source, &key(base, "deleted")).await?.is_none(),
         "app is deleted"
     );
-    let marker = optional(source, &key(base, "recreated")).await?;
+    let recreated = optional(source, &key(base, "recreated")).await?;
+    let restored = optional(source, &key(base, "restored")).await?;
+    let marker = if recreated.is_none() && restored.is_none() {
+        None
+    } else {
+        Some(encode_bounded(&json!([recreated, restored]), 64 << 10)?)
+    };
     ensure!(
         marker.as_ref().is_none_or(|bytes| bytes.len() <= 64 << 10),
         "backup incarnation memory budget exceeded (64 KiB)"
@@ -1623,6 +1662,17 @@ async fn create(
     dest: &Store,
     dp: &str,
 ) -> anyhow::Result<String> {
+    create_undo(args, source, sp, dest, dp, None).await
+}
+
+async fn create_undo(
+    args: &Create,
+    source: &Store,
+    sp: &str,
+    dest: &Store,
+    dp: &str,
+    undo_fence: Option<&[u8]>,
+) -> anyhow::Result<String> {
     let nonce = tempfile::tempdir()?;
     let seconds = i64::try_from(now_ms()? / 1000)?;
     let stamp = chrono::DateTime::from_timestamp(seconds, 0)
@@ -1652,7 +1702,8 @@ async fn create(
     let mut starts_bytes = 0;
     for (t, a) in &apps {
         let name = format!("{t}/{a}");
-        let marker = incarnation(source, &key(sp, &format!("apps/{t}/{a}"))).await?;
+        let marker =
+            incarnation_for(source, &key(sp, &format!("apps/{t}/{a}")), undo_fence).await?;
         charge(
             &mut starts_bytes,
             name.len() as u64 + marker.as_ref().map_or(4, |m| m.len() as u64 * 4) + 256,
@@ -1791,7 +1842,7 @@ async fn create(
         app["actors"] = json!(actor_count - app_start);
         app["members"] = json!(members);
         ensure!(
-            incarnation(source, &key(sp, &format!("apps/{t}/{a}"))).await?
+            incarnation_for(source, &key(sp, &format!("apps/{t}/{a}")), undo_fence).await?
                 == starts[&format!("{t}/{a}")],
             "app recreated during backup"
         );
@@ -1821,7 +1872,8 @@ async fn create(
     // before a later app took a long time.
     for (app, started) in &starts {
         ensure!(
-            incarnation(source, &key(sp, &format!("apps/{app}"))).await? == *started,
+            incarnation_for(source, &key(sp, &format!("apps/{app}")), undo_fence).await?
+                == *started,
             "app deleted or recreated before completion"
         );
     }
@@ -1861,7 +1913,7 @@ async fn create(
         failures.len()
     );
     ensure!(
-        failures.is_empty(),
+        failures.is_empty() || undo_fence.is_some(),
         "partial backup; failed actors are recorded, verification will refuse it"
     );
     Ok(id)
@@ -1970,3 +2022,23 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
 
 #[cfg(test)]
 mod tests;
+
+/// Execute a create or restore against already opened stores. This is the
+/// same path as the CLI; callers supply the production late-write deadline
+/// (tests may shorten it for an in-memory store).
+pub async fn execute_with_stores(
+    command: &Command,
+    source: &Store,
+    sp: &str,
+    target: &Store,
+    tp: &str,
+    late: std::time::Duration,
+) -> anyhow::Result<Option<String>> {
+    match command {
+        Command::Create(args) => create(args, source, sp, target, tp).await.map(Some),
+        Command::Restore(args) => restore::execute(args, source, sp, target, tp, late)
+            .await
+            .map(|()| None),
+        _ => bail!("only create and restore accept opened stores"),
+    }
+}

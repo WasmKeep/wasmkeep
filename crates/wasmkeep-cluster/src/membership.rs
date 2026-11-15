@@ -21,20 +21,6 @@
 use crate::lease::{BucketError, Clock};
 use crate::node_lease::{NodeLeaseObject, NodeState};
 
-/// Version-line feature stamp for nodes that fence whole-app restores.
-/// Keep it in semver build metadata, including on git-stamped development builds.
-pub fn heartbeat_version() -> String {
-    format!(
-        "{}{}restore1",
-        crate::VERSION,
-        if crate::VERSION.contains('+') {
-            "."
-        } else {
-            "+"
-        }
-    )
-}
-
 /// Listing heartbeats (and, in tests, writing them unconditionally).
 #[allow(async_fn_in_trait)]
 pub trait Directory {
@@ -121,6 +107,8 @@ pub struct NodeInfo {
     /// node announcing it runs a batched class's events as strict ones,
     /// which keeps every promise a batched class makes.
     pub can_flush: bool,
+    /// Honours whole-app restore fences (capability word `restore`).
+    pub can_restore: bool,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which
     /// each notices in its next listing. `None` from nodes that predate it.
@@ -424,6 +412,7 @@ impl NodeInfo {
             can_handoff: words.can_handoff,
             can_end: words.can_end,
             can_flush: words.can_flush,
+            can_restore: words.can_restore,
             instance: lease.instance,
             lease: Some(lease.state),
             load,
@@ -433,7 +422,7 @@ impl NodeInfo {
 
 impl NodeInfo {
     /// The capability words this node announces on line 11, in order
-    /// (`take`, `front`, `handoff`, `ends`, `flush`). Readers ignore words
+    /// (`take`, `front`, `handoff`, `ends`, `flush`, `restore`). Readers ignore words
     /// they do not know.
     fn capabilities(&self) -> impl Iterator<Item = &'static str> {
         [
@@ -442,6 +431,7 @@ impl NodeInfo {
             (self.can_handoff, "handoff"),
             (self.can_end, "ends"),
             (self.can_flush, "flush"),
+            (self.can_restore, "restore"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -471,6 +461,7 @@ impl NodeInfo {
             can_handoff: words.contains(&"handoff"),
             can_end: words.contains(&"ends"),
             can_flush: words.contains(&"flush"),
+            can_restore: words.contains(&"restore"),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
                 let ok = !token.is_empty()
@@ -586,7 +577,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             clock,
             id: id.to_owned(),
             address: address.into(),
-            version: heartbeat_version(),
+            version: crate::VERSION.to_owned(),
             app: String::new(),
             cluster_address: None,
             tls_pins: Vec::new(),
@@ -718,6 +709,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_handoff: true,
             can_end: true,
             can_flush: true,
+            can_restore: true,
             instance: self.instance.clone(),
             lease: None,
             load,
@@ -948,6 +940,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_restore: false,
             instance: None,
             lease: None,
             load: None,
@@ -985,6 +978,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_restore: false,
             instance: None,
             lease: None,
             load: None,
@@ -1058,6 +1052,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_restore: false,
             instance: None,
             lease: None,
             load: None,
@@ -1432,6 +1427,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_restore: false,
             instance: lease.instance,
             lease: Some(lease.state),
             load: None,
@@ -1547,9 +1543,31 @@ mod tests {
         let payload = String::from_utf8(a.lease_payload()).unwrap();
         assert_eq!(
             payload.lines().nth(8),
-            Some("take front handoff ends flush"),
+            Some("take front handoff ends flush restore"),
             "{payload}"
         );
+    }
+
+    #[test]
+    fn restore_capability_round_trips_without_changing_version() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let membership = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
+        let node = membership.info();
+        assert_eq!(node.version, crate::VERSION);
+        assert!(node.can_restore);
+        assert!(
+            NodeInfo::decode(&format3(&node, NodeState::Live, "beef"))
+                .unwrap()
+                .can_restore
+        );
+        assert!(NodeInfo::decode(&node.encode()).unwrap().can_restore);
+        let legacy = NodeInfo {
+            version: "0.4.2+restore1".into(),
+            can_restore: false,
+            ..node
+        };
+        assert!(!NodeInfo::decode(&legacy.encode()).unwrap().can_restore);
     }
 
     /// ADR 0034, section 15: `flush`, last, from the binary alone; a node
@@ -1561,12 +1579,13 @@ mod tests {
             can_handoff: true,
             can_end: true,
             can_flush: true,
+            can_restore: true,
             ..loaded_node()
         };
         let payload = String::from_utf8(node.payload()).unwrap();
         assert_eq!(
             payload.lines().nth(8),
-            Some("take front handoff ends flush")
+            Some("take front handoff ends flush restore")
         );
         let read = NodeInfo::decode(&format3(&node, NodeState::Live, "beef")).unwrap();
         assert!(read.can_end && read.can_flush);
@@ -1582,6 +1601,7 @@ mod tests {
         // Without `flush`, the line is as a node of 0.4.2 writes it.
         let before = NodeInfo {
             can_flush: false,
+            can_restore: false,
             ..node
         };
         let payload = String::from_utf8(before.payload()).unwrap();

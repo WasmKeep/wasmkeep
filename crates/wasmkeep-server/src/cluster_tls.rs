@@ -733,6 +733,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_restore: false,
             instance: None,
             lease: None,
             load: None,

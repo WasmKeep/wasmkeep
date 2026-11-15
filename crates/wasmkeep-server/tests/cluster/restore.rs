@@ -2,17 +2,40 @@
 use super::app_delete::{app_node_following, deploy};
 use super::deletes::read;
 use super::*;
-use futures_util::TryStreamExt;
 use object_store::{ObjectStoreExt, path::Path as Key};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_fence_stops_nodes_and_invalidates_offline_files() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     deploy(&store).await.unwrap();
+    let archive: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let offline = tempfile::tempdir().unwrap();
     let (old, old_follow) = app_node_following("offline", offline.path(), &store)
         .await
         .unwrap();
+    assert_eq!(read(old.addr, "saved").await, "0");
+    assert_eq!(
+        send(old.addr, "POST", "/actor/t/saved/durable", "")
+            .await
+            .body
+            .trim(),
+        "1"
+    );
+    let run = archive_command(
+        &[
+            "create",
+            "--bucket",
+            "s3://live",
+            "--to",
+            "s3://archive",
+            "--app",
+            "default/shop",
+        ],
+        &store,
+        &archive,
+    )
+    .await
+    .unwrap();
     assert_eq!(read(old.addr, "absent").await, "0");
     assert_eq!(
         send(old.addr, "POST", "/actor/t/absent/durable", "")
@@ -61,27 +84,46 @@ async fn restore_fence_stops_nodes_and_invalidates_offline_files() {
     std::fs::write(local.join("stale.db"), b"must disappear").unwrap();
     let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
     assert!(app.prepare_local(&local).await.is_err());
-    store
-        .put(
-            &Key::from("apps/default/shop/restored"),
-            b"unique-restore".to_vec().into(),
-        )
-        .await
-        .unwrap();
-    // The absent actor's bucket history disappears in an in-place restore.
-    // The offline node still has its database; it must not resurrect it.
-    let keys: Vec<_> = store
-        .list(Some(&Key::from("state/default/shop")))
-        .try_collect()
-        .await
-        .unwrap();
-    for meta in keys {
-        store.delete(&meta.location).await.unwrap();
-    }
+    // The hand-written fence above tests a running node's stop path. Remove
+    // that synthetic request, then drive the real CLI executor end to end.
     store
         .delete(&Key::from("apps/default/shop/restoring"))
         .await
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !wasmkeep_server::apps::live_nodes(store.clone(), "", "default", "shop")
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    archive_command(
+        &[
+            "restore",
+            "--from",
+            "s3://archive",
+            "--bucket",
+            "s3://live",
+            "--app",
+            "default/shop",
+            "--in-place",
+            "--run",
+            &run,
+        ],
+        &archive,
+        &store,
+    )
+    .await;
+    assert!(
+        store
+            .get(&Key::from("apps/default/shop/restoring"))
+            .await
+            .is_err()
+    );
     app.prepare_local(&local).await.unwrap();
     assert!(!local.join("stale.db").exists());
     std::fs::write(local.join("keep"), b"same incarnation").unwrap();
@@ -90,6 +132,11 @@ async fn restore_fence_stops_nodes_and_invalidates_offline_files() {
     let (restarted, follow) = app_node_following("offline", offline.path(), &store)
         .await
         .unwrap();
+    assert_eq!(
+        read(restarted.addr, "saved").await,
+        "1",
+        "archived actor lost"
+    );
     assert_eq!(
         read(restarted.addr, "absent").await,
         "0",
@@ -101,4 +148,28 @@ async fn restore_fence_stops_nodes_and_invalidates_offline_files() {
         "other app was interrupted"
     );
     follow.abort();
+}
+
+async fn archive_command(
+    args: &[&str],
+    source: &Arc<dyn ObjectStore>,
+    target: &Arc<dyn ObjectStore>,
+) -> Option<String> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: wasmkeep_cli::backup::Command,
+    }
+    let cli = Cli::parse_from(std::iter::once("backup").chain(args.iter().copied()));
+    wasmkeep_cli::backup::execute_with_stores(
+        &cli.command,
+        source,
+        "",
+        target,
+        "",
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap()
 }

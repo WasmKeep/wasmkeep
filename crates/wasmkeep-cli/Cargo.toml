@@ -44,6 +44,7 @@ rustix = { workspace = true, features = ["thread"] }
 toml.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Enforce a LIST/GET-only source in backup race tests; already in workspace.
 async-trait = "=0.1.92"
 tempfile.workspace = true

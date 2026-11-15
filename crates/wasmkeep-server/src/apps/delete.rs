@@ -73,6 +73,7 @@ pub async fn delete_app(
          prefixes (state/default/default/) yourself"
     );
     let app = super::AppRef::new(Arc::clone(&store), prefix, tenant, name);
+    app.check_not_restoring().await?;
     let shown = app.name();
     let existed = app.tombstone().await?;
     // A node of a version before ADR 0028 ignores a tombstone: it would
