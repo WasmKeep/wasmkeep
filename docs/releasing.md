@@ -28,12 +28,16 @@ registry.
    manifest, `publish = true` in `crates/wasmkeep-sdk/Cargo.toml` (it stays
    so from then on), the release's section in `CHANGELOG.md` (it becomes the
    release text), and install commands in the docs at the new version.
-   Merge it, and wait for CI to pass on that commit of `main`.
+   Merge it, then start the full suite on that commit of `main` by hand
+   (`gh workflow run ci.yml --ref main`: tests on Linux x86_64, arm64 and
+   macOS, the S3 suites, every language) and wait for it to pass. A push
+   runs the fast jobs only.
 2. **Tag.** Two signed tags on that commit: `v<version>`, and
-   `sdks/go/v<version>` for the Go module. `release.yml` waits for CI on the
-   commit, builds and signs everything, pushes the image and opens a
-   **draft** release. A tag on a commit CI did not pass on fails here: run
-   CI again on the commit, then the workflow again. Never move or delete a
+   `sdks/go/v<version>` for the Go module. `release.yml` waits for a full CI
+   run on the commit (by hand or nightly), builds and signs everything,
+   pushes the image and opens a **draft** release. A tag on a commit the
+   full suite did not pass on fails here: run it on the commit, then the
+   workflow again. Never move or delete a
    tag: the module proxy and the registries keep what they saw.
 3. **Publish the draft.** Read it, then publish it. That starts
    `publish.yml`.

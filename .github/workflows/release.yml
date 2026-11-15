@@ -101,11 +101,13 @@ jobs:
         run: |
           [ "$REF_TYPE" = tag ] || { echo "not a tag: nothing to wait for"; exit 0; }
           for _ in $(seq 160); do
-            # The latest CI run on main for this commit (a re-run replaces
-            # its conclusion).
+            # The latest full CI run on main for this commit: started by
+            # hand (workflow_dispatch) before tagging, or the nightly one.
+            # Runs on push are the fast jobs only and do not count. A
+            # re-run replaces its conclusion.
             read -r status conclusion < <(gh run list --workflow ci.yml --commit "$SHA" \
-              --branch main --event push --limit 1 --json status,conclusion \
-              --jq '.[0] | "\(.status) \(.conclusion)"') || true
+              --branch main --limit 20 --json event,status,conclusion \
+              --jq '[.[] | select(.event == "workflow_dispatch" or .event == "schedule")][0] | "\(.status) \(.conclusion)"') || true
             echo "CI on $SHA: $status $conclusion"
             if [ "$status" = completed ]; then
               [ "$conclusion" = success ] && exit 0
@@ -114,7 +116,7 @@ jobs:
             fi
             sleep 30
           done
-          echo "::error::no finished CI run on main for $SHA: a release tag belongs on a commit of main"
+          echo "::error::no finished full CI run on main for $SHA: run gh workflow run ci.yml --ref main on it before tagging"
           exit 1
 
   # The example components a release carries: the counter of the README's

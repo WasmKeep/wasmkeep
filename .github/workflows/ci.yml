@@ -3,14 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
-  # To run main's suites again on a commit whose run a later merge
-  # cancelled, before tagging it.
+  # The full suite (tests on Linux x86_64, arm64 and macOS, the S3 suites,
+  # every language) runs nightly, and by hand on the commit to tag before a
+  # release (release.yml waits for that run). Pushes and pull requests run
+  # the fast jobs only.
+  schedule:
+    - cron: "17 6 * * *"
   workflow_dispatch:
   pull_request:
     # A draft starts nothing but the job "draft", which asks whether it is
     # still one (see that job and the jobs' conditions): marking it ready
-    # for review starts the run.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # for review starts the run. `labeled`: the label `bench` starts the
+    # benchmark comparison.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 permissions:
   contents: read
@@ -22,12 +27,11 @@ defaults:
     shell: bash
 
 # A newer commit on the same branch replaces the run in progress, on a pull
-# request and on main alike: only the latest commit's result matters. A
-# release needs a passing run on its tagged commit (release.yml): if a
-# later merge cancelled that run, start it again by hand (workflow_dispatch)
-# before tagging.
+# request and on main alike: only the latest commit's result matters. The
+# group includes the event, so a merge never cancels a full run started by
+# hand or by the nightly schedule.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -213,7 +217,7 @@ jobs:
     name: test (ubuntu-latest)
     timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -231,7 +235,7 @@ jobs:
     name: test (ubuntu-24.04-arm)
     timeout-minutes: 45
     needs: changes
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -254,7 +258,7 @@ jobs:
     name: test (macos-latest)
     timeout-minutes: 60
     needs: changes
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -289,7 +293,7 @@ jobs:
     # shared runners are too noisy to compare with numbers from another run.
     name: benchmark regression (base vs this change)
     needs: changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench') && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -350,7 +354,7 @@ jobs:
     name: leases on an S3 API (moto)
     timeout-minutes: 25
     needs: changes
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: test
@@ -421,7 +425,7 @@ jobs:
     name: every language passes the same tests
     timeout-minutes: 40
     needs: changes
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-24.04
     env:
       WASMKEEP_REQUIRE_LANGS: "1"
