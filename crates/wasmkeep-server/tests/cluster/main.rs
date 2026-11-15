@@ -49,6 +49,9 @@ mod alarms;
 mod app_delete;
 #[path = "apps.rs"]
 mod apps;
+#[cfg(feature = "batched-writes")]
+#[path = "batched.rs"]
+mod batched;
 #[path = "bucket.rs"]
 mod bucket;
 #[path = "deletes.rs"]

@@ -658,6 +658,14 @@ struct ServeArgs {
     #[arg(long, value_name = "N")]
     max_front_requests: Option<usize>,
 
+    /// How long a committed write of a batched class may wait unsent behind
+    /// the segment in flight, in milliseconds, before its actor stops
+    /// starting events (ADR 0034, section 3): 100 to 5000. Hidden while
+    /// batched writes need a build with `batched-writes`.
+    #[arg(long = "max-unsent-age", value_name = "MS", default_value_t = 500, hide = true,
+          value_parser = clap::value_parser!(u64).range(100..=5000))]
+    max_unsent_age_ms: u64,
+
     /// The front's CPU time per request, in milliseconds (apart from
     /// --cpu-budget-ms, the actors'). Past it, the request answers 500.
     #[arg(long, value_name = "MS", default_value_t = 50,
@@ -1526,6 +1534,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         config.mailbox.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
         config.mailbox.max_resident = resident_cap;
         config.max_front_requests = Some(front_requests);
+        config.max_unsent_age = std::time::Duration::from_millis(args.max_unsent_age_ms);
         config.front_env = front_env.clone();
         if let (Some(node_id), Some(advertise), Some(bucket)) =
             (&args.node_id, &args.advertise, &args.bucket)

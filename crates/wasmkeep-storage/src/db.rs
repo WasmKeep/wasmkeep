@@ -671,6 +671,13 @@ impl ActorDb {
         Ok(())
     }
 
+    /// Whether batched capture is on, under a hold that still lives.
+    pub fn batched_capture_enabled(&self) -> bool {
+        self.batch_hold
+            .as_ref()
+            .is_some_and(|h| h.strong_count() != 0)
+    }
+
     /// Configure the conservative encoded-byte cap (default 1 MiB). Even a
     /// zero cap makes progress: each writing event is then oversize alone.
     pub fn set_segment_byte_cap(&mut self, bytes: u64) {

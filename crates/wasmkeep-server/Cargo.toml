@@ -42,6 +42,12 @@ thiserror.workspace = true
 # Implementing object_store's async trait (the request-counting bucket); already in the tree through object_store.
 async-trait = "=0.1.92"
 
+[features]
+# ADR 0034, slices S9 to S12: batched plain writes run only in a binary
+# built with this; without it a deploy refuses `writes = "batched"` and a
+# class named batched runs strict, as every release before.
+batched-writes = []
+
 [dev-dependencies]
 serde_json.workspace = true
 tracing-subscriber.workspace = true

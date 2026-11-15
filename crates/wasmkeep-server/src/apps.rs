@@ -194,6 +194,12 @@ impl Writes {
     }
 }
 
+/// Whether this binary runs batched plain writes (ADR 0034, section 15):
+/// built with the `batched-writes` feature. Without it a deploy refuses a
+/// batched class ([`DeployError::BatchedNotYet`]) and a class a version
+/// names batched runs strict, so a default build behaves as before.
+pub const BATCHED_BUILT: bool = cfg!(feature = "batched-writes");
+
 /// What a deploy that names a batched class answers, while batched writes
 /// are not built (ADR 0034, slices S7 to S12).
 pub const BATCHED_NOT_YET: &str = "writes = \"batched\" is not yet available in this release \
@@ -1178,9 +1184,9 @@ impl AppRef {
                 }
             }
         }
-        // Not built yet (ADR 0034, slices S7 to S12): refused before
-        // anything is written.
-        if let Some(class) = batched.first() {
+        // Not built into this binary (ADR 0034, section 15): refused
+        // before anything is written.
+        if !BATCHED_BUILT && let Some(class) = batched.first() {
             return Err(DeployError::BatchedNotYet(class.clone()));
         }
         let mut manifest = Manifest {

@@ -167,6 +167,17 @@ impl ActorHost {
                 .await?;
             return Ok(r.map_err(from_db_error));
         };
+        // A batched hold: `exec` and then `flush` (ADR 0034, section 4).
+        if let Some(slot) = self.batched_slot() {
+            let changed = self
+                .with_db(move |db| db.exec_commit(&sql, &params))
+                .await?;
+            let changed = match changed {
+                Ok(n) => n,
+                Err(e) => return Ok(Err(from_db_error(e))),
+            };
+            return Ok(self.flush_batched(slot).await.map(|()| changed));
+        }
         // In a cluster, durable means uploaded while the lease was valid:
         // the commit is not fsynced locally as well. A node trusts a local
         // file again only if it is exactly the bucket's head
@@ -267,6 +278,9 @@ impl ActorHost {
             let r = self.with_db(ActorDb::sync_committed).await?;
             return Ok(r.map_err(from_db_error));
         };
+        if let Some(slot) = self.batched_slot() {
+            return Ok(self.flush_batched(slot).await);
+        }
         let mut replica = slot.lock().await;
         let outcome = self
             .with_db(|db| {
@@ -343,6 +357,76 @@ impl ActorHost {
         Ok(Ok(()))
     }
 
+    /// A batched hold's `flush` (ADR 0034, section 4), and the flush of its
+    /// `exec-durable` once the statement committed: a pending alarm listed
+    /// in the bucket's index first (its PUT returns before any segment
+    /// naming it is captured; the entry it replaces is not retired, slice
+    /// S10), then every commit so far flushed through the uploader, until
+    /// the event's wall less one second. Refused inside a transaction.
+    async fn flush_batched(&mut self, slot: SharedReplica) -> Result<(), SqlError> {
+        let read = self
+            .with_db(|db| {
+                db.flushable()?;
+                let alarm = db.alarm()?;
+                let indexed = db
+                    .meta(ALARM_INDEXED_KEY)?
+                    .as_deref()
+                    .and_then(alarm_index::parse_meta);
+                Ok((alarm, indexed))
+            })
+            .await
+            .map_err(|e| uploads::FlushError::Stopped(format!("{e:#}")).to_sql())?;
+        let (alarm, indexed) = read.map_err(from_db_error)?;
+        if let Some((cluster, address)) = self.alarm_index.clone()
+            && alarm_index::needs_publish(indexed.as_ref(), alarm)
+        {
+            let generation = slot.lock().await.generation();
+            let entry = match alarm {
+                Some(at) => match cluster.put_new_alarm_entry(&address, at, generation).await {
+                    Ok(entry) => Some(entry),
+                    Err(e) => {
+                        slot.lock().await.fail(format!("alarm index: {e}"));
+                        return Err(
+                            uploads::FlushError::Stopped(format!("alarm index: {e}")).to_sql()
+                        );
+                    }
+                },
+                None => None,
+            };
+            let value = alarm_index::to_meta(entry.as_ref());
+            let wrote = self
+                .with_db(move |db| db.set_meta(ALARM_INDEXED_KEY, &value))
+                .await;
+            if !matches!(wrote, Ok(Ok(()))) {
+                slot.lock()
+                    .await
+                    .fail("alarm index: recording the entry failed");
+                return Err(uploads::FlushError::Stopped(
+                    "alarm index: recording the entry failed".into(),
+                )
+                .to_sql());
+            }
+        }
+        let (until, completion) = match &self.batched {
+            Some(b) => (b.flush_until, Some(b.completion.clone())),
+            None => (tokio::time::Instant::now(), None),
+        };
+        uploads::flush_through(
+            &slot,
+            &mut uploads::DbAt::Host(self),
+            completion.as_ref(),
+            until,
+        )
+        .await
+        .map_err(|e| e.to_sql())
+    }
+
+    /// The batched hold's replica, if the running event's hold is batched.
+    fn batched_slot(&self) -> Option<SharedReplica> {
+        self.batched.as_ref()?;
+        self.replica.clone()
+    }
+
     pub(super) fn new(db: ResidentDb, sockets: Arc<Sockets>) -> Self {
         Self {
             checked_seq: None,
@@ -362,6 +446,7 @@ impl ActorHost {
             replica: None,
             replica_stop: None,
             alarm_index: None,
+            batched: None,
             egress: crate::egress::EgressHooks::default(),
             env: Arc::default(),
         }
@@ -434,8 +519,7 @@ pub(crate) const REPLICATION_STOPPED: &str = "replication stopped";
 
 /// How a batched class's `storage.flush` starts its `internal` when the
 /// event's wall ran out while the upload went on (ADR 0034, section 4).
-/// Reserved: a strict class never answers it, its upload being inline.
-#[allow(dead_code, reason = "a batched flush's wall case (ADR 0034, slice S9)")]
+/// A strict class never answers it, its upload being inline.
 pub(crate) const STILL_UPLOADING: &str = "not durable: still uploading";
 
 /// A durable delete not known to be durable.
@@ -480,6 +564,26 @@ impl ActorHost {
             self.delete_retry = true;
             return Ok(self.remove_files_durably().await);
         };
+        // A batched hold resets only at its acknowledged head (ADR 0034,
+        // section 7): everything committed so far is flushed first; a flush
+        // that fails or runs out answers `internal`, and calling this again
+        // is safe.
+        if let Some(batched) = self.batched_slot() {
+            let (until, completion) = match &self.batched {
+                Some(b) => (b.flush_until, Some(b.completion.clone())),
+                None => (tokio::time::Instant::now(), None),
+            };
+            let flushed = uploads::flush_through(
+                &batched,
+                &mut uploads::DbAt::Host(self),
+                completion.as_ref(),
+                until,
+            )
+            .await;
+            if let Err(e) = flushed {
+                return Ok(Err(not_durable(e.to_sql().message)));
+            }
+        }
         let mut replica = slot.lock().await;
         if let Some(reason) = replica.failed() {
             return Ok(Err(not_durable(format!("replication stopped ({reason})"))));

@@ -316,6 +316,10 @@ pub(super) struct Uploads {
     sidecar_write: Option<SidecarWrite>,
     /// Last captured boundary, retained while a cut apply finishes its sidecar.
     captured: Option<WalBoundary>,
+    /// Boundaries marked and not captured yet, oldest first, with when they
+    /// were marked: what the event-start rule (ADR 0034, section 3) and the
+    /// drop counter (section 10) read. Pruned when a segment is prepared.
+    marked: std::collections::VecDeque<(WalBoundary, std::time::Instant)>,
 }
 
 impl Default for Uploads {
@@ -327,6 +331,7 @@ impl Default for Uploads {
             sidecar_due: None,
             sidecar_write: None,
             captured: None,
+            marked: std::collections::VecDeque::new(),
         }
     }
 }
@@ -424,6 +429,7 @@ impl Replica {
             }
         });
         self.batched.captured = None;
+        self.batched.marked.clear();
         Ok(())
     }
 
@@ -444,6 +450,71 @@ impl Replica {
     /// The events (boundaries) the segment in flight carries.
     pub(crate) fn in_flight_events(&self) -> usize {
         self.batched.flight.map_or(0, |f| f.events)
+    }
+
+    /// Records a boundary the database marked (`ActorDb::mark_boundary`),
+    /// at `at`. The same boundary again (nothing committed since) is not
+    /// counted twice.
+    pub(crate) fn note_boundary(&mut self, boundary: WalBoundary, at: std::time::Instant) {
+        let known =
+            self.batched.marked.back().is_some_and(|(b, _)| {
+                b.session == boundary.session && b.sequence >= boundary.sequence
+            });
+        let captured = self.batched.flight.is_some_and(|f| {
+            f.sequence.session == boundary.session && f.sequence.sequence >= boundary.sequence
+        }) || self.acknowledged_covers(boundary);
+        if !known && !captured {
+            self.batched.marked.push_back((boundary, at));
+        }
+    }
+
+    /// Forgets every boundary marked and not captured: the database has
+    /// nothing left to capture (its own count is the one that holds).
+    pub(crate) fn forget_marked(&mut self) {
+        self.batched.marked.clear();
+    }
+
+    /// When the oldest boundary not captured yet was marked: the age the
+    /// event-start rule bounds (ADR 0034, section 3).
+    pub(crate) fn oldest_unsent(&self) -> Option<std::time::Instant> {
+        self.batched.marked.front().map(|(_, at)| *at)
+    }
+
+    /// The last boundary marked under this hold: the one a flush waits to
+    /// see acknowledged. `None`: nothing was ever committed in this
+    /// capture session.
+    pub(crate) fn last_marked(&self) -> Option<WalBoundary> {
+        self.batched
+            .marked
+            .back()
+            .map(|(b, _)| *b)
+            .or_else(|| self.captured_sequence())
+    }
+
+    /// The events committed and not acknowledged: marked and not captured,
+    /// plus those of the segment in flight. What a hold that ends without
+    /// a flush drops (ADR 0034, section 10).
+    pub(crate) fn unacknowledged_events(&self) -> u64 {
+        let marked = self.batched.marked.len();
+        u64::try_from(marked + self.in_flight_events()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether this hold is at its `Flushed` barrier as far as the replica
+    /// knows: nothing marked and uncaptured, nothing in flight, nothing to
+    /// apply, nothing failed (ADR 0034, section 6). The database's own
+    /// uncaptured commits are the caller's to check.
+    pub(crate) fn nothing_pending(&self) -> bool {
+        self.batched.marked.is_empty() && self.uploader_idle()
+    }
+
+    /// One upload's budget at the byte cap: the longest a segment's upload
+    /// task runs (ADR 0034, section 2), 21 s at the defaults. The deadline
+    /// of a hibernation's flush and of a mode switch's (sections 1 and 6).
+    pub(crate) fn upload_budget(&self) -> std::time::Duration {
+        let megabytes = u32::try_from(DEFAULT_SEGMENT_BYTES.div_ceil(1 << 20)).unwrap_or(1);
+        self.upload_idle
+            .saturating_mul(super::UPLOAD_BUDGET_IDLES)
+            .saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
     }
 
     /// The failure flag (ADR 0034, section 8): set the moment a batched
@@ -533,6 +604,9 @@ impl Replica {
             {
                 a.closed.insert(session);
             }
+        });
+        self.batched.marked.retain(|(b, _)| {
+            b.session == plan.boundary.session && b.sequence > plan.boundary.sequence
         });
         self.in_flight = Some(segment.id);
         self.batched.flight = Some(Flight {

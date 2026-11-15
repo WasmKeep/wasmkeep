@@ -85,6 +85,25 @@ impl ActorState {
                 .set_if_earlier(self.address.clone(), now_ms().saturating_add(wait));
             return;
         }
+        // A batched hold judges R2 only on its acknowledged head (ADR 0034,
+        // section 9): with no instance (after a trapped event, say) it
+        // flushes first, with one upload budget. Past it the alarm comes
+        // back later; on a failure the actor is given up, nothing cleared.
+        if self.live.is_none() && self.batched_replica().is_some() {
+            let deadline = self.upload_deadline().await;
+            match self.flush_to_barrier(Some(deadline)).await {
+                Some(Barrier::Flushed) => {}
+                Some(Barrier::GaveUp(_)) => {
+                    self.abandon("replication stopped before an alarm");
+                    self.retry_alarm().await;
+                    return;
+                }
+                None => {
+                    self.retry_alarm().await;
+                    return;
+                }
+            }
+        }
         // An entry left for an actor that was deleted since (or never
         // committed anything) has nothing to deliver: running the actor for
         // it would only create it again. Its entries at the hint go instead.
@@ -105,7 +124,9 @@ impl ActorState {
                 // And let the actor go at once: holding its lease until the
                 // idle timeout would route client requests here, and the
                 // first would create the actor empty, while the node that
-                // holds its data may be about to upload it.
+                // holds its data may be about to upload it. A batched hold
+                // was flushed above: its capture ends at that barrier.
+                self.end_capture_at_barrier().await;
                 self.db = None;
                 self.release_hold();
             }
@@ -501,6 +522,13 @@ impl ActorState {
         let Some(stale) = stale else {
             return;
         };
+        // A batched hold's event is not acknowledged when it ends: only an
+        // acknowledged segment may retire the entry it stopped naming (ADR
+        // 0034, section 9, slice S10). Kept: an extra entry costs one
+        // wake-up, and is removed as unnamed then.
+        if self.batched_replica().is_some() {
+            return;
+        }
         let Some((cluster, generation)) = self.may_index().await else {
             return;
         };
@@ -538,6 +566,15 @@ impl ActorState {
         let (Some(hint), Some(indexed)) = (hint, indexed) else {
             return true;
         };
+        // A batched hold clears only at a `Flushed` barrier, where its
+        // database is its acknowledged head (ADR 0034, section 9). Its
+        // events' ends pass no entry here (`finish`); without state, the
+        // alarm flushed it first.
+        if let Some(slot) = self.batched_replica()
+            && !slot.lock().await.nothing_pending()
+        {
+            return true;
+        }
         // R2 relies on the replicated state being this owner's; until its
         // own upload ends the history, an earlier owner's late upload can
         // still become it (a late commit) and name an entry removed here.
@@ -598,7 +635,33 @@ impl ActorState {
             replica.generation()
         };
         let value = generation.to_string();
-        if let Some(live) = self.live.as_mut() {
+        // A batched hold fences through its uploader, in both paths (ADR
+        // 0034, section 9): the row written, then flushed to its barrier,
+        // judged on the acknowledged head below.
+        if self.batched_replica().is_some() {
+            let wrote = match (self.live.as_mut(), self.db.as_mut()) {
+                (Some(live), _) => matches!(
+                    with_db(&mut live.store, move |db| db
+                        .set_meta(OWNER_FENCE_KEY, &value))
+                    .await,
+                    Ok(Ok(()))
+                ),
+                (None, Some(db)) => db.set_meta(OWNER_FENCE_KEY, &value).is_ok(),
+                (None, None) => false,
+            };
+            if !wrote {
+                return false;
+            }
+            let deadline = self.upload_deadline().await;
+            match self.flush_to_barrier(Some(deadline)).await {
+                Some(Barrier::Flushed) => {}
+                Some(Barrier::GaveUp(_)) => {
+                    self.abandon("fencing before clearing alarm entries: replication stopped");
+                    return false;
+                }
+                None => return false,
+            }
+        } else if let Some(live) = self.live.as_mut() {
             let wrote = with_db(&mut live.store, move |db| {
                 db.set_meta(OWNER_FENCE_KEY, &value)
             })
