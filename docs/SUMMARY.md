@@ -87,3 +87,4 @@ are designs, not available capabilities. -->
 - [0032 External databases and brokers (proposed)](adr/0032-external-databases-and-brokers.md)
 - [0033 Data access, export and online backup (proposed)](adr/0033-data-access-export-and-online-backup.md)
 - [0034 Batched plain writes (proposed)](adr/0034-batched-plain-writes.md)
+- [0035 A recorded head on hand-over (proposed)](adr/0035-a-recorded-head-on-hand-over.md)
