@@ -16,6 +16,8 @@
 # Guide
 
 - [Concepts](concepts.md)
+- [What saved means](what-saved-means.md)
+- [Designing for hot actors](designing-for-hot-actors.md)
 - [Running a cluster](cluster.md)
 - [The project file](project-file.md)
 - [When a node dies, and how it scales](failover-and-scaling.md)
