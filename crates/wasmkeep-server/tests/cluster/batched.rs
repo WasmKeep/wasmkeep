@@ -612,3 +612,60 @@ async fn a_drain_flushes_a_batched_actor_before_handing_it_over() {
     );
     assert_eq!(wasmkeep_server::metrics::plain_events_dropped_total(), 0);
 }
+
+/// A batched room hibernating with a socket open parks only once flushed:
+/// its step before the drop flushes the segment in flight and the writes
+/// behind it, then the record keeps naming its node, nothing is given up,
+/// and the room wakes there for the socket's next message (ADR 0024; ADR
+/// 0034, section 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batched_room_parks_only_once_flushed() {
+    use super::websockets::{chat_holder, join_lobby, lobby_parked};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let store: Arc<dyn ObjectStore> = Arc::clone(&flaky) as Arc<dyn ObjectStore>;
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_configured(
+        "a",
+        dir.path(),
+        &store,
+        Duration::from_millis(300),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        |c| {
+            c.batched.insert("chat".into());
+            c.max_unsent_age = Duration::from_secs(5);
+        },
+    )
+    .await;
+    settle().await;
+    let mut client = join_lobby(a.addr).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A message whose write is still uploading as the room goes idle.
+    flaky.delay_wal_ms.store(800, Ordering::SeqCst);
+    client.send(Message::text("before")).await.unwrap();
+    lobby_parked(&store, &a).await;
+    assert_eq!(chat_holder(&store, "lobby").await.as_deref(), Some("a"));
+    assert_eq!(
+        wasmkeep_server::metrics::plain_events_dropped_total(),
+        0,
+        "parked with nothing given up"
+    );
+    flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    client.send(Message::text("after")).await.unwrap();
+    let mut seen = Vec::new();
+    while !seen.iter().any(|t: &String| t.contains("after")) {
+        match tokio::time::timeout(Duration::from_secs(5), client.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => seen.push(t.to_string()),
+            Ok(Some(Ok(_))) => {}
+            other => panic!("no message after the wake: {other:?} after {seen:?}"),
+        }
+    }
+}

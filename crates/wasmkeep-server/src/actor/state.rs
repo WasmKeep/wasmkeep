@@ -181,7 +181,9 @@ impl Drop for ActorState {
         // after a panic (the mailbox's `CatchUnwind` drops the state outside
         // the step), whatever its marks say, since the panicked event may
         // have committed after them. A strict hold is always flushed.
-        let unmarked = if self.batched_replica().is_some() {
+        // Judged on the hold just taken: `self.held` is empty now.
+        let batched = hold.writes() == crate::apps::Writes::Batched && hold.replica().is_some();
+        let unmarked = if batched {
             self.unmarked_commits()
         } else {
             Some(false)

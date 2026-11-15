@@ -662,7 +662,7 @@ impl Replica {
     /// Resolves once the segment in flight has an outcome to apply (or at
     /// once when none is in flight). Borrows nothing: the caller awaits it
     /// without holding the replica, then calls [`Self::apply`].
-    pub(crate) fn landed(&self) -> impl Future<Output = ()> + Send + 'static {
+    pub(crate) fn landed(&self) -> impl Future<Output = ()> + Send + use<> {
         let mut slot = self.batched.shared.slot.subscribe();
         async move {
             let _ = slot

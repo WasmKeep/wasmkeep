@@ -90,6 +90,15 @@ impl DbAt<'_> {
                 let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| {
                     h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
                 });
+                // The server always runs on a multi-threaded runtime (`serve`
+                // builds one, and so do the cluster tests of batched holds);
+                // only this crate's unit tests take the inline branch, whose
+                // work blocks their single thread for the length of one
+                // capture of at most the cap, or one checkpoint.
+                debug_assert!(
+                    multi || cfg!(test),
+                    "batched database work off an instance needs a multi-threaded runtime"
+                );
                 Ok(Some(if multi {
                     tokio::task::block_in_place(|| f(db))
                 } else {
@@ -195,7 +204,7 @@ async fn mark(slot: &SharedReplica, db: &mut DbAt<'_>) -> Result<Option<WalBound
 /// budget without holding the replica, and only until `deadline`:
 /// `Ok(false)` if it passed first (nothing captured). `Err`: replication
 /// stopped, and the caller gives the actor up.
-async fn pump(
+pub(super) async fn pump(
     slot: &SharedReplica,
     db: &mut DbAt<'_>,
     completion: Option<&Completion>,
@@ -236,25 +245,56 @@ async fn pump(
         None => reserve.await,
     }
     .map_err(|e| e.to_string())?;
-    let mut replica = slot.lock().await;
-    if !replica.uploader_idle() {
-        return Ok(true);
+    // The reservation can win the race just past the deadline: nothing is
+    // started then, and what follows is bounded by it too. Capture,
+    // encoding and the hand-off themselves are never cut: once started on
+    // the database they complete (the instance's worker keeps them, a
+    // resident database runs them synchronously, at most the cap), and
+    // only the wait for them ends at the deadline.
+    let past = |at: &tokio::time::Instant| tokio::time::Instant::now() >= *at;
+    if deadline.as_ref().is_some_and(past) {
+        return Ok(false);
     }
-    let ticket = replica
-        .prepare(plan, permit)
-        .await
-        .map_err(|e| e.to_string())?;
-    let landed = replica.landed();
-    let handed = db.run(move |db| ticket.hand_off(db)).await?;
+    let prepared = async {
+        let mut replica = slot.lock().await;
+        if !replica.uploader_idle() {
+            return Ok(None);
+        }
+        let ticket = replica
+            .prepare(plan, permit)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(Some((ticket, replica.landed())))
+    };
+    // Cancel-safe: a ticket dropped before its capture takes nothing.
+    let prepared = match deadline {
+        Some(at) => match tokio::time::timeout_at(at, prepared).await {
+            Ok(p) => p?,
+            Err(_) => return Ok(false),
+        },
+        None => prepared.await?,
+    };
+    let Some((ticket, landed)) = prepared else {
+        return Ok(true);
+    };
+    // Before the hand-off: if the wait for it ends at the deadline, the
+    // segment's outcome is still driven to the mailbox.
+    if let Some(completion) = completion {
+        completion.spawn(landed);
+    }
+    let hand_off = db.run(move |db| ticket.hand_off(db));
+    let handed = match deadline {
+        Some(at) => match tokio::time::timeout_at(at, hand_off).await {
+            Ok(h) => h?,
+            Err(_) => return Ok(false),
+        },
+        None => hand_off.await?,
+    };
     match handed {
         Some(Ok(_)) => {}
         Some(Err(e)) => return Err(e.to_string()),
         // Unreachable: a closed database has no plan.
         None => return Err("no database to capture from".into()),
-    }
-    drop(replica);
-    if let Some(completion) = completion {
-        completion.spawn(landed);
     }
     Ok(true)
 }

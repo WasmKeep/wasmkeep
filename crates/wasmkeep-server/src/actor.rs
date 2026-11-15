@@ -912,3 +912,5 @@ mod tests;
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod batched_state_tests;
