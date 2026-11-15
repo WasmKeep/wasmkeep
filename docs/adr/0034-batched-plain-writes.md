@@ -701,20 +701,22 @@ carries several events and only its end can be restored:
   request (`host.rs:128-141`, `alarm_delivery.rs:391-399`), and a strict
   class keeps that (section 1). It is skipped when the entry equals the
   one the captured position names (the segment before it already
-  published it). The retire list's DELETEs, and `clear_stale_hint`'s
-  LIST, run on the task after the acknowledgement, off the actor's
-  path.
-- **Retire after acknowledgement.** Each segment carries a retire list:
-  the entry the acknowledged head named (when the segment names another)
-  and, after an alarm delivered for a time no longer committed, that
-  time's stale entries (`clear_stale_hint`). The list runs only when the
-  segment is acknowledged, with today's R2 and R3 checks; on a failure
-  it is dropped, never run (an extra entry is harmless: it is delivered
-  and removed as unnamed).
-- **`clear_stale_hint` without a segment.** When nothing is uncaptured
-  and nothing is in flight there is no segment to carry it: it then runs
-  at once, since that is a `Flushed` point. Otherwise it waits on the
-  next segment's list.
+  published it). Exact-key retirement DELETEs run on the task after
+  acknowledgement, off the actor's path. LIST-based clearing is a
+  separate barrier operation, described below.
+- **Retire after acknowledgement.** Each segment carries the exact entry
+  the acknowledged head named, when the segment names another. Only an
+  acknowledged segment retires that key; on failure it drops the retire
+  request (an extra entry is harmless: it is delivered and removed as
+  unnamed). Retirement never expands that identity through a LIST of its
+  due time. Fresh keys (R1) prevent later states from reusing it.
+- **`clear_stale_hint` at a barrier.** After an alarm delivered for a time
+  no longer committed, clearing waits until nothing is uncaptured and
+  nothing is in flight. At that `Flushed` point, it selects stale entries
+  through `entries_to_clear`, using the acknowledged entry for R2 and the
+  hold's generation for R3. LIST and candidate selection are serialized
+  with the hold's next event; the selected exact-key DELETEs may finish
+  off the actor's path.
 - **Every R2 decision uses the acknowledged head's entry.** What "the
   replicated state names" is the entry the acknowledged head names, never
   the local database's: `clear_stale_hint`, `entries_to_clear` and the
@@ -740,6 +742,22 @@ carries several events and only its end can be restored:
   event's end, as today. So an alarm set by an event whose segment never
   lands may fire on this node, and its `on-alarm` run, before its node
   dies and the setting is lost with it. This is listed in section 12.
+
+**As modelled, 2026-11-15 (S6):** plain retirement deletes exactly the
+fresh key the acknowledged predecessor named and the new segment stopped
+naming. It does not LIST a due time or retire other entries found there.
+The captured identity remains safe to delete after later events or ownership
+changes because R1 never reuses it. Failed or unacknowledged segments do not
+retire it. There is no additional same-hold exception.
+
+LIST-based `clear_stale_hint` is a separate operation admitted at a drained
+`Flushed` barrier, using that hold's acknowledged entry and generation in
+`entries_to_clear` (R2/R3). Candidate selection is serialized with this hold's
+next event; the exact-key DELETEs may finish later. If the hold ends while the
+LIST waits, R3 still excludes a successor's entries. A deferred LIST must not
+resume against an old acknowledged entry after the same hold has continued
+writing: it must return to the barrier and re-read the acknowledged entry.
+An ordinary segment's retire job never performs that LIST.
 
 ### 10. Clean stop, rolling upgrades and the drop counter
 

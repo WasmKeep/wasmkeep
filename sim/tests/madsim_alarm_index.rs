@@ -936,3 +936,74 @@ fn the_aimed_first_upload_fault_loses_no_entry_with_the_rules() {
         seeds()
     );
 }
+
+// ADR 0034: unlike the strict model above, commit, capture, entry PUT,
+// segment PUT and acknowledgement can be separated by a crash or lease cut.
+// Share the split model so the alarm and replication rules cannot drift.
+#[path = "support/batched.rs"]
+mod batched;
+
+#[test]
+fn batched_retiring_before_acknowledgement_is_caught() {
+    batched::caught(
+        batched::Switch::RetireBeforeAck,
+        batched::Violation::AlarmMissing,
+    );
+}
+
+#[test]
+fn batched_running_retire_list_on_failure_is_caught() {
+    batched::caught(
+        batched::Switch::RetireOnFailure,
+        batched::Violation::AlarmMissing,
+    );
+}
+
+#[test]
+fn batched_segment_before_entry_put_returns_is_caught() {
+    batched::caught(
+        batched::Switch::SegmentBeforeEntry,
+        batched::Violation::AlarmMissing,
+    );
+}
+
+#[test]
+fn batched_fence_on_captured_head_is_caught() {
+    batched::caught(
+        batched::Switch::FenceCaptured,
+        batched::Violation::AlarmMissing,
+    );
+}
+
+#[test]
+fn batched_without_state_judging_local_pending_state_is_caught() {
+    batched::caught(
+        batched::Switch::WithoutStateLocal,
+        batched::Violation::AlarmMissing,
+    );
+}
+
+#[test]
+fn batched_publishing_intermediate_entry_is_caught() {
+    batched::caught(
+        batched::Switch::IntermediateEntry,
+        batched::Violation::AlarmMissing,
+    );
+}
+#[test]
+fn batched_removing_r3_is_caught() {
+    batched::caught(batched::Switch::NoR3, batched::Violation::AlarmMissing);
+}
+#[test]
+fn strict_split_alarm_mutations_are_caught() {
+    for rule in [
+        batched::Switch::RetireBeforeAck,
+        batched::Switch::RetireOnFailure,
+        batched::Switch::SegmentBeforeEntry,
+        batched::Switch::FenceCaptured,
+        batched::Switch::WithoutStateLocal,
+        batched::Switch::NoR3,
+    ] {
+        batched::caught_mode(rule, batched::Violation::AlarmMissing, false);
+    }
+}
