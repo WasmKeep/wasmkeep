@@ -1070,3 +1070,29 @@ fn capture_session_survives_checkpoint_but_not_restart() {
     assert!(restarted.capture_plan(plan).is_err());
     assert!(restarted.has_pending_boundaries());
 }
+
+/// The event-start rule's second clause reads the database's own cap, not
+/// the default one (ADR 0034, section 3): with a small cap configured, a
+/// few marked events already fill the next segment, and nothing marked
+/// never does. Unmarked commits are visible too, for a drop that must not
+/// trust the marks alone.
+#[test]
+fn the_next_segment_is_full_at_the_configured_cap_and_unmarked_commits_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, hold) = actor(dir.path(), 1 << 30);
+    assert!(!db.next_segment_full());
+    assert!(!db.has_unmarked_commits().unwrap());
+    db.exec("INSERT INTO t VALUES (randomblob(20000))", &[])
+        .unwrap();
+    assert!(db.has_unmarked_commits().unwrap(), "committed, not marked");
+    db.mark_boundary().unwrap().unwrap();
+    assert!(!db.has_unmarked_commits().unwrap());
+    assert!(!db.next_segment_full(), "under the default 1 MiB");
+    db.set_segment_byte_cap(estimated_segment_bytes(4096, 2));
+    assert!(db.next_segment_full(), "over a cap of two pages");
+    let plan = db.next_bounded_capture().unwrap();
+    db.take_bounded_changes(plan).unwrap();
+    assert!(!db.next_segment_full(), "nothing left uncaptured");
+    drop(hold);
+    drop(db);
+}

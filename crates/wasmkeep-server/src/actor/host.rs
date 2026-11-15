@@ -380,11 +380,29 @@ impl ActorHost {
         if let Some((cluster, address)) = self.alarm_index.clone()
             && alarm_index::needs_publish(indexed.as_ref(), alarm)
         {
-            let generation = slot.lock().await.generation();
+            let (generation, budget) = {
+                let r = slot.lock().await;
+                (r.generation(), r.upload_budget())
+            };
+            // Bounded by the flush's deadline and one upload budget (ADR
+            // 0034, section 9): past them the commit stays unmarked, so no
+            // segment carries it before its entry exists; an entry landing
+            // later is an extra one, delivered and removed as unnamed.
+            let until = self
+                .batched
+                .as_ref()
+                .map_or_else(tokio::time::Instant::now, |b| b.flush_until)
+                .min(tokio::time::Instant::now() + budget);
             let entry = match alarm {
-                Some(at) => match cluster.put_new_alarm_entry(&address, at, generation).await {
-                    Ok(entry) => Some(entry),
-                    Err(e) => {
+                Some(at) => match tokio::time::timeout_at(
+                    until,
+                    cluster.put_new_alarm_entry(&address, at, generation),
+                )
+                .await
+                {
+                    Err(_) => return Err(uploads::FlushError::StillUploading.to_sql()),
+                    Ok(Ok(entry)) => Some(entry),
+                    Ok(Err(e)) => {
                         slot.lock().await.fail(format!("alarm index: {e}"));
                         return Err(
                             uploads::FlushError::Stopped(format!("alarm index: {e}")).to_sql()
@@ -565,24 +583,14 @@ impl ActorHost {
             return Ok(self.remove_files_durably().await);
         };
         // A batched hold resets only at its acknowledged head (ADR 0034,
-        // section 7): everything committed so far is flushed first; a flush
-        // that fails or runs out answers `internal`, and calling this again
-        // is safe.
-        if let Some(batched) = self.batched_slot() {
-            let (until, completion) = match &self.batched {
-                Some(b) => (b.flush_until, Some(b.completion.clone())),
-                None => (tokio::time::Instant::now(), None),
-            };
-            let flushed = uploads::flush_through(
-                &batched,
-                &mut uploads::DbAt::Host(self),
-                completion.as_ref(),
-                until,
-            )
-            .await;
-            if let Err(e) = flushed {
-                return Ok(Err(not_durable(e.to_sql().message)));
-            }
+        // section 7): everything committed so far is flushed first, a
+        // pending alarm listed in the index before it (as `flush` does); a
+        // flush that fails or runs out answers `internal`, and calling this
+        // again is safe.
+        if let Some(batched) = self.batched_slot()
+            && let Err(e) = self.flush_batched(batched).await
+        {
+            return Ok(Err(not_durable(e.message)));
         }
         let mut replica = slot.lock().await;
         if let Some(reason) = replica.failed() {

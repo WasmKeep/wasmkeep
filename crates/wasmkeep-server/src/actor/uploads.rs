@@ -19,10 +19,20 @@ use std::sync::LazyLock;
 
 use super::*;
 use crate::replica::UploadBudget;
-use wasmkeep_storage::wal::DEFAULT_SEGMENT_BYTES;
+use wasmkeep_storage::CaptureHold;
+use wasmkeep_storage::wal::WalBoundary;
 
 /// The node's budget of batched segments in flight (ADR 0034, section 2).
 static NODE_BUDGET: LazyLock<UploadBudget> = LazyLock::new(UploadBudget::node);
+
+/// Takes the whole node budget of batched uploads until the guard is
+/// dropped, as a node whose budget is full: for tests, in a binary built
+/// with `batched-writes`.
+#[cfg(feature = "batched-writes")]
+#[doc(hidden)]
+pub fn hold_node_upload_budget() -> impl Drop + Send {
+    NODE_BUDGET.hold_all()
+}
 
 /// How far a batched flush got by its deadline (ADR 0034, section 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,9 +65,11 @@ pub(super) enum DbAt<'a> {
     /// cancelled wait ([`ActorHost::with_db`]), so a capture under way
     /// completes and hands its segment over whatever happens to the wait.
     Host(&'a mut ActorHost),
-    /// The database while no instance holds it: run on this thread, so no
-    /// cancellation can part it from the state. A capture here is at most
-    /// the cap: an event over it is waited for at its own end.
+    /// The database while no instance holds it: run synchronously, so no
+    /// cancellation can part it from the state, and on a multi-threaded
+    /// runtime through `block_in_place`, so its I/O (a capture of at most
+    /// the cap, a checkpoint, an fsync) does not stall the worker's other
+    /// tasks.
     Resident(&'a mut ActorDb),
     /// No database open: nothing local to capture.
     Closed,
@@ -74,7 +86,16 @@ impl DbAt<'_> {
                 .await
                 .map(Some)
                 .map_err(|e| format!("{e:#}")),
-            Self::Resident(db) => Ok(Some(f(db))),
+            Self::Resident(db) => {
+                let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                    h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                });
+                Ok(Some(if multi {
+                    tokio::task::block_in_place(|| f(db))
+                } else {
+                    f(db)
+                }))
+            }
             Self::Closed => Ok(None),
         }
     }
@@ -113,9 +134,40 @@ fn completion_job(state: &mut ActorState) -> BoxFuture<'_, ()> {
     state.complete_uploads()
 }
 
+/// Turns batched capture on for `db` under `token`, starting capture first
+/// if it has not (a database opened without an event, for an alarm's check
+/// for state: nothing uncaptured under this hold yet).
+fn enable_batched(db: &mut ActorDb, token: &CaptureHold) -> Result<(), String> {
+    if db.batched_capture_enabled() {
+        return Ok(());
+    }
+    if db.captured_checksum().is_none() {
+        db.start_capture()
+            .map_err(|e| format!("start capture: {e}"))?;
+    }
+    db.enable_batched_capture(token)
+        .map_err(|e| format!("batched capture: {e}"))
+}
+
+impl ActorHost {
+    /// [`enable_batched`] on the instance's database, recovered first from
+    /// database work a cancelled step left running (`pending_db`).
+    pub(super) async fn ensure_batched_capture(
+        &mut self,
+        token: &CaptureHold,
+    ) -> Result<(), String> {
+        self.drain_db().await.map_err(|e| format!("{e:#}"))?;
+        let db = self
+            .db
+            .as_mut()
+            .ok_or_else(|| "actor database unavailable".to_owned())?;
+        enable_batched(db, token)
+    }
+}
+
 /// Marks a boundary at the last commit and records it with the replica.
 /// A database not capturing in batched mode has nothing to mark.
-async fn mark(slot: &SharedReplica, db: &mut DbAt<'_>) -> Result<(), String> {
+async fn mark(slot: &SharedReplica, db: &mut DbAt<'_>) -> Result<Option<WalBoundary>, String> {
     let marked = db
         .run(|db| {
             if db.batched_capture_enabled() {
@@ -133,26 +185,29 @@ async fn mark(slot: &SharedReplica, db: &mut DbAt<'_>) -> Result<(), String> {
             .await
             .note_boundary(boundary, std::time::Instant::now());
     }
-    Ok(())
+    Ok(marked)
 }
 
 /// Applies an outcome that landed, then, if nothing is in flight and
 /// something is uncaptured, starts the next segment: reserve its room in
 /// the node budget, prepare it, and capture, encode and hand it off in one
-/// step on the database. Never waits for an upload. `Err`: replication
+/// step on the database. Never waits for an upload. Waits for room in the
+/// budget without holding the replica, and only until `deadline`:
+/// `Ok(false)` if it passed first (nothing captured). `Err`: replication
 /// stopped, and the caller gives the actor up.
 async fn pump(
     slot: &SharedReplica,
     db: &mut DbAt<'_>,
     completion: Option<&Completion>,
-) -> Result<(), String> {
+    deadline: Option<tokio::time::Instant>,
+) -> Result<bool, String> {
     let mut replica = slot.lock().await;
     replica.apply().await.map_err(|e| e.to_string())?;
     if let Some(reason) = replica.failed() {
         return Err(format!("{REPLICATION_STOPPED}: {reason}"));
     }
     if !replica.uploader_idle() {
-        return Ok(());
+        return Ok(true);
     }
     let plan = db
         .run(|db| {
@@ -165,14 +220,26 @@ async fn pump(
     let Some(plan) = plan else {
         // The database has nothing left to capture: its count holds.
         replica.forget_marked();
-        return Ok(());
+        return Ok(true);
     };
     // Waits for room in FIFO order, the actor held meanwhile (ADR 0034,
-    // section 3, rule 3, applied at once rather than past the age bound).
-    let permit = NODE_BUDGET
-        .reserve(plan.boundary.estimated_bytes)
-        .await
-        .map_err(|e| e.to_string())?;
+    // section 3, rule 3, applied at once rather than past the age bound),
+    // the replica free for the completions and the deadline kept.
+    drop(replica);
+    let reserve = NODE_BUDGET.reserve(plan.boundary.estimated_bytes);
+    let permit = match deadline {
+        Some(at) => tokio::select! {
+            biased;
+            permit = reserve => permit,
+            () = tokio::time::sleep_until(at) => return Ok(false),
+        },
+        None => reserve.await,
+    }
+    .map_err(|e| e.to_string())?;
+    let mut replica = slot.lock().await;
+    if !replica.uploader_idle() {
+        return Ok(true);
+    }
     let ticket = replica
         .prepare(plan, permit)
         .await
@@ -189,7 +256,7 @@ async fn pump(
     if let Some(completion) = completion {
         completion.spawn(landed);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The wait at an event's end (ADR 0034, sections 2 and 3): an event over
@@ -215,21 +282,14 @@ async fn hold_at_event_end(
             )
         };
         let (full, pressure) = db
-            .run(|db| {
-                (
-                    db.boundaries()
-                        .last()
-                        .is_some_and(|b| b.estimated_bytes >= DEFAULT_SEGMENT_BYTES),
-                    db.wal_wants_checkpoint(),
-                )
-            })
+            .run(|db| (db.next_segment_full(), db.wal_wants_checkpoint()))
             .await?
             .unwrap_or((false, false));
         if !(oversize || old || full || pressure) {
             return Ok(());
         }
         if idle {
-            pump(slot, db, Some(completion)).await?;
+            pump(slot, db, Some(completion), None).await?;
             if slot.lock().await.uploader_idle() {
                 // Nothing left to capture: relieve the WAL if it asks.
                 if pressure {
@@ -240,7 +300,7 @@ async fn hold_at_event_end(
             continue;
         }
         landed.await;
-        pump(slot, db, Some(completion)).await?;
+        pump(slot, db, Some(completion), None).await?;
     }
 }
 
@@ -256,14 +316,17 @@ pub(super) async fn flush_through(
     completion: Option<&Completion>,
     deadline: tokio::time::Instant,
 ) -> Result<(), FlushError> {
-    mark(slot, db).await.map_err(FlushError::Stopped)?;
-    let Some(target) = slot.lock().await.last_marked() else {
+    let marked = mark(slot, db).await.map_err(FlushError::Stopped)?;
+    let Some(target) = slot.lock().await.flush_target(marked) else {
         return Ok(());
     };
     loop {
-        pump(slot, db, completion)
+        let started = pump(slot, db, completion, Some(deadline))
             .await
             .map_err(FlushError::Stopped)?;
+        if !started {
+            return Err(FlushError::StillUploading);
+        }
         let landed = {
             let r = slot.lock().await;
             if r.acknowledged_covers(target) {
@@ -291,8 +354,10 @@ async fn to_barrier(
         return Some(Barrier::GaveUp(Dropped::Failure));
     }
     loop {
-        if pump(slot, db, completion).await.is_err() {
-            return Some(Barrier::GaveUp(Dropped::Failure));
+        match pump(slot, db, completion, deadline).await {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(_) => return Some(Barrier::GaveUp(Dropped::Failure)),
         }
         let (done, landed) = {
             let r = slot.lock().await;
@@ -349,11 +414,12 @@ impl ActorState {
     /// to the owner record, which is what idle expiry reads, ADR 0028).
     pub(super) fn complete_uploads(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            self.stepped = false;
             let Some(slot) = self.batched_replica() else {
                 return;
             };
             let completion = self.completion();
-            let pumped = pump(&slot, &mut self.db_at(), Some(&completion)).await;
+            let pumped = pump(&slot, &mut self.db_at(), Some(&completion), None).await;
             if let Err(e) = pumped {
                 self.abandon(&e);
             }
@@ -370,7 +436,7 @@ impl ActorState {
         let mut db = self.db_at();
         let done = async {
             mark(&slot, &mut db).await?;
-            pump(&slot, &mut db, Some(&completion)).await?;
+            pump(&slot, &mut db, Some(&completion), None).await?;
             hold_at_event_end(&slot, &mut db, &completion, max_unsent).await
         }
         .await;
@@ -392,12 +458,14 @@ impl ActorState {
         // A job that skips `prepare` (a hand-over, a delete, an alarm) may
         // find capture ended by a step before a drop that an event cut
         // short: enabled again first, as before an event.
-        if let Err(e) = self.ensure_batched_capture() {
+        if let Err(e) = self.ensure_batched_capture().await {
             tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "batched capture could not start");
             return Some(Barrier::GaveUp(Dropped::Failure));
         }
-        let completion = self.completion();
-        to_barrier(&slot, &mut self.db_at(), Some(&completion), deadline).await
+        // No completion jobs: the step before a drop applies them itself,
+        // and a job it posted would cut it short (the mailbox serves a job
+        // that arrives during the step first).
+        to_barrier(&slot, &mut self.db_at(), None, deadline).await
     }
 
     /// One upload's budget from now: the deadline of a hibernation's flush
@@ -444,7 +512,7 @@ impl ActorState {
     /// Before an event of a batched hold, and before any flush to its
     /// barrier: its database captures in batched mode, under the hold's
     /// token. A strict hold, or one not restored, has nothing to do.
-    pub(super) fn ensure_batched_capture(&mut self) -> Result<(), String> {
+    pub(super) async fn ensure_batched_capture(&mut self) -> Result<(), String> {
         if self.batched_replica().is_none() {
             return Ok(());
         }
@@ -452,28 +520,13 @@ impl ActorState {
             return Ok(());
         };
         let token = held.capture_token();
-        let db: &mut ActorDb = if let Some(live) = self.live.as_mut() {
-            match live.store.data_mut().db.as_mut() {
-                Some(db) => db,
-                None => return Err("actor database unavailable".into()),
-            }
-        } else if let Some(db) = self.db.as_mut() {
-            db
-        } else {
-            return Ok(());
-        };
-        if db.batched_capture_enabled() {
-            return Ok(());
+        if let Some(live) = self.live.as_mut() {
+            return live.store.data_mut().ensure_batched_capture(token).await;
         }
-        // A database opened without an event (an alarm's check for state)
-        // has not started capturing: it starts as strict does, with
-        // nothing uncaptured under this hold yet.
-        if db.captured_checksum().is_none() {
-            db.start_capture()
-                .map_err(|e| format!("start capture: {e}"))?;
+        match self.db.as_mut() {
+            Some(db) => enable_batched(db, token),
+            None => Ok(()),
         }
-        db.enable_batched_capture(token)
-            .map_err(|e| format!("batched capture: {e}"))
     }
 
     /// A deploy changed the class's mode of writes: the hold switches at a

@@ -1309,4 +1309,18 @@ which it now does.
 - **S11. Snapshots in a mailbox gap, deletes, and ADR 0033's restore
   with a flush** (section 7).
 - **S12. The clean stop** (section 10), the metrics, the cluster tests,
-  the soak with both modes; the flag removed; the docs above.
+  the soak with both modes; the flag removed; the docs above. The flag
+  may not go before S11: until then a batched hold takes no periodic
+  snapshot (section 7 asks for them only inside a barrier), so its
+  restores replay every segment since its first snapshot.
+
+**As built in S9 (2026-11-15).** Batched writes run only in a binary
+built with the `batched-writes` feature of `wasmkeep-server`. A
+default-built node refuses a batched deploy, and runs a class a version
+names batched as strict: in a cluster of mixed builds the same class is
+batched on some nodes and strict on others, which is data-safe (keys,
+LTX and the chain are the same, and each hold keeps the mode it was
+acquired under), though only the batched nodes give the class batched
+behaviour. Until S10, a batched hold lists each event's alarm entry
+inline before the segment that carries it (as `exec-durable` does) and
+retires none; until S11 it takes no periodic snapshot.

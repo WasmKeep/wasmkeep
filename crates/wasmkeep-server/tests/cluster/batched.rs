@@ -495,3 +495,120 @@ async fn an_event_over_the_cap_waits_for_its_segment() {
         started.elapsed()
     );
 }
+
+const STILL: &str = "err:SqlErrorKind::Internal:not durable: still uploading";
+
+/// A flush whose capture waits for room in a full node budget still
+/// answers by its deadline, the wall less one second, and the write goes
+/// up once there is room (ADR 0034, sections 2 and 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_behind_a_full_node_budget_answers_by_its_deadline() {
+    let p = batched_pair(Duration::from_secs(3), |_| {}).await;
+    warmed(&p).await;
+    let full = wasmkeep_server::hold_node_upload_budget();
+    let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=1", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, STILL), "{}", r.body);
+    drop(full);
+    let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=0", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "ok:2"), "{}", r.body);
+}
+
+/// An alarm entry PUT slower than the flush's deadline does not hold the
+/// flush past it (ADR 0034, section 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_behind_a_slow_alarm_entry_answers_by_its_deadline() {
+    let p = batched_pair(Duration::from_secs(3), |_| {}).await;
+    warmed(&p).await;
+    p.flaky.delay_alarm_puts_ms.store(5_000, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=1&alarm=600000", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, STILL), "{}", r.body);
+}
+
+/// `delete-self-durable` lists a pending alarm in the bucket's index before
+/// the flush that uploads it, as `flush` does: no restorable state names an
+/// alarm without its entry (ADR 0034, section 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_delete_lists_the_alarm_it_flushes_first() {
+    let p = batched_pair(Duration::from_secs(30), |_| {}).await;
+    warmed(&p).await;
+    let r = send(
+        p.a.addr,
+        "POST",
+        "/actor/t/x/delete-durable?alarm=600000",
+        "",
+    )
+    .await;
+    assert_eq!((r.status, r.body.trim()), (200, "deleted"), "{}", r.body);
+    let store: Arc<dyn ObjectStore> = p.flaky.clone();
+    let entries = bucket_keys(&store)
+        .await
+        .iter()
+        .filter(|k| k.starts_with(&test_key(Family::Alarms, "")))
+        .count();
+    assert!(entries > 0, "the flushed alarm has no entry");
+}
+
+/// A completion job refused by a full mailbox is dropped; its outcome waits
+/// in the replica and is applied at the next boundary, and nothing is lost
+/// (ADR 0034, section 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completion_dropped_by_a_full_mailbox_is_applied_at_the_next_boundary() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.mailbox.queue_capacity = 1;
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(400, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    // The actor busy, its one queue slot taken, as the segment lands.
+    let addr = p.a.addr;
+    let busy =
+        tokio::spawn(async move { send(addr, "POST", "/actor/t/x/sleep?ms=1500", "").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let queued = tokio::spawn(async move { send(addr, "GET", "/actor/t/x/plain", "").await });
+    assert_eq!(busy.await.unwrap().status, 200);
+    let r = queued.await.unwrap();
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "3"), "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let r = b_answers(&p, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "3", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
+/// A drain's hand-over of a batched actor flushes first: the peer that
+/// takes it finds every write (ADR 0034, section 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_flushes_a_batched_actor_before_handing_it_over() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(600, Ordering::SeqCst);
+    for _ in 0..3 {
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let store: Arc<dyn ObjectStore> = p.flaky.clone();
+    drain(&store, "a").await;
+    eventually("a handed the actor over", async || {
+        lease_holder(&store, "x").await.as_deref() != Some("a")
+    })
+    .await;
+    let r = poll_get(p.b.addr, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "4", Some("b")),
+        "{}",
+        r.body
+    );
+    assert_eq!(wasmkeep_server::metrics::plain_events_dropped_total(), 0);
+}

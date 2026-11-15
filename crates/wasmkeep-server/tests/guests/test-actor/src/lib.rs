@@ -679,6 +679,29 @@ impl http::Guest for TestActor {
                 let second = tag(storage::delete_self_durable());
                 format!("first={first} second={second}")
             }
+            // A durable write that fails, then a plain one in the same
+            // event: a strict event runs on to its end (ADR 0034, section 8).
+            (Method::Post, "/durable-then-plain") => {
+                let durable = storage::exec_durable(
+                    "INSERT INTO config (key, value) VALUES ('durable', 1)
+                     ON CONFLICT (key) DO UPDATE SET value = value + 1",
+                    &[],
+                );
+                let plain = storage::exec(
+                    "INSERT INTO config (key, value) VALUES ('plain', 1)
+                     ON CONFLICT (key) DO UPDATE SET value = value + 1",
+                    &[],
+                );
+                let word = |ok: bool| if ok { "ok" } else { "err" };
+                format!("durable={} plain={}", word(durable.is_ok()), word(plain.is_ok()))
+            }
+            (Method::Post, "/delete-durable") if query_param(&full, "alarm").is_some() => {
+                alarms::set_alarm(now_ms() + u64::try_from(num("alarm")).unwrap_or(0));
+                match storage::delete_self_durable() {
+                    Ok(()) => "deleted".to_owned(),
+                    Err(e) => format!("err:{:?}:{}", e.kind, e.message),
+                }
+            }
             (Method::Post, "/delete-durable") => match storage::delete_self_durable() {
                 Ok(()) if query_param(&full, "then").as_deref() == Some("sql") => {
                     match storage::query("SELECT 1", &[]) {

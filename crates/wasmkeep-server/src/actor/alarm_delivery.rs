@@ -640,7 +640,7 @@ impl ActorState {
         // judged on the acknowledged head below.
         if self.batched_replica().is_some() {
             // Capturing before the row is written, so its segment has it.
-            if self.ensure_batched_capture().is_err() {
+            if self.ensure_batched_capture().await.is_err() {
                 return false;
             }
             let wrote = match (self.live.as_mut(), self.db.as_mut()) {

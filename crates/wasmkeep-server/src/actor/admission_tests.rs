@@ -654,3 +654,47 @@ async fn response_outparam_checks_failure_when_set_and_does_not_recall_an_answer
         assert!(matches!(rx.await.unwrap(), Err(ErrorCode::HttpRequestDenied)));
     })).await.unwrap();
 }
+
+/// A step before a drop cut while its database work runs leaves the
+/// connection with that work (`pending_db`), not in the host: the next
+/// event's capture check recovers it rather than finding the database
+/// "unavailable" and giving a healthy hold up (ADR 0034, section 6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_capture_is_enabled_after_a_cancelled_database_step() {
+    let f = fixture(Duration::from_secs(60));
+    let (release, held) = mpsc::channel::<()>();
+    let enabled = f
+        .mailboxes
+        .submit(&address("step"), move |host| {
+            Box::pin(async move {
+                host.with_db(|db| {
+                    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+                    db.start_capture().unwrap();
+                })
+                .await
+                .unwrap();
+                let cut = tokio::time::timeout(
+                    Duration::from_millis(30),
+                    host.with_db(move |_db| {
+                        let _ = held.recv();
+                    }),
+                )
+                .await;
+                assert!(cut.is_err(), "the step was cut");
+                assert!(host.db.is_none(), "the connection is with the cut work");
+                release.send(()).unwrap();
+                let token = wasmkeep_storage::CaptureHold::default();
+                let enabled = host.ensure_batched_capture(&token).await;
+                let on = host
+                    .with_db(|db| db.batched_capture_enabled())
+                    .await
+                    .unwrap();
+                // The token goes before the database it guards.
+                drop(token);
+                (enabled, on)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(enabled, (Ok(()), true));
+}

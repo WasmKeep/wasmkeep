@@ -166,6 +166,27 @@ impl Held {
         }
     }
 
+    /// The barrier a state's drop finds (ADR 0034, section 6). A batched
+    /// hold is flushed there only if the step before the drop found it so
+    /// (`stepped`), its replica has nothing pending, and its database has
+    /// no commit after the last boundary (`unmarked`, `None`: cannot tell,
+    /// the connection being with work cut short). Otherwise it gives up:
+    /// `panic` without a step (the mailbox drops a panicked state outside
+    /// it), `unbarriered` with one. A strict hold is always flushed.
+    pub(super) fn barrier_at_drop(&self, stepped: bool, unmarked: Option<bool>) -> Barrier {
+        if self.writes == Writes::Strict {
+            return Barrier::Flushed;
+        }
+        if stepped && unmarked == Some(false) && self.pending() == Some(false) {
+            return Barrier::Flushed;
+        }
+        Barrier::GaveUp(if stepped {
+            Dropped::Unbarriered
+        } else {
+            Dropped::Panic
+        })
+    }
+
     /// [`Self::barrier_or`], a hold not flushed counted `unbarriered`.
     pub(super) fn barrier(&self) -> Barrier {
         self.barrier_or(Dropped::Unbarriered)
@@ -226,7 +247,13 @@ impl Held {
     /// release sent in the background, then what the hold had not
     /// acknowledged is counted as dropped.
     pub(super) fn drop_now(self, reason: Dropped) {
-        let dropped = self.unacknowledged();
+        self.drop_now_with(reason, 0);
+    }
+
+    /// [`Self::drop_now`], counting `unmarked` more events: committed after
+    /// the last boundary, so known to no mark.
+    pub(super) fn drop_now_with(self, reason: Dropped, unmarked: u64) {
+        let dropped = self.unacknowledged().saturating_add(unmarked);
         let Self {
             lease,
             replica,
@@ -332,6 +359,44 @@ mod tests {
         assert!(hold.switch_writes(Writes::Strict, barrier));
         assert_eq!(hold.writes(), Writes::Strict);
         drop(hold.release(Barrier::Flushed));
+        released(&a, &x).await;
+    }
+
+    /// A state's drop (ADR 0034, section 6): a batched hold parks only when
+    /// its step found it flushed and its database has no commit the marks
+    /// miss; otherwise it gives up, as a panic's unless a step had found it
+    /// flushed. A strict hold is always flushed.
+    #[tokio::test]
+    async fn a_dropped_state_parks_a_batched_hold_only_when_nothing_is_unmarked() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let a = node(&store).await;
+        let x = ActorAddress::new("t", "c", "x").unwrap();
+        let strict = held(&a, &x).await;
+        for unmarked in [None, Some(true), Some(false)] {
+            assert_eq!(strict.barrier_at_drop(false, unmarked), Barrier::Flushed);
+        }
+        drop(strict.release(Barrier::Flushed));
+        released(&a, &x).await;
+        let batched = Held::new(LeaseHold::acquire(&a, &x).await.unwrap(), Writes::Batched);
+        let gave_up = |reason| Barrier::GaveUp(reason);
+        assert_eq!(
+            batched.barrier_at_drop(false, Some(false)),
+            gave_up(Dropped::Panic)
+        );
+        assert_eq!(
+            batched.barrier_at_drop(false, None),
+            gave_up(Dropped::Panic)
+        );
+        assert_eq!(
+            batched.barrier_at_drop(true, None),
+            gave_up(Dropped::Unbarriered)
+        );
+        assert_eq!(
+            batched.barrier_at_drop(true, Some(true)),
+            gave_up(Dropped::Unbarriered)
+        );
+        assert_eq!(batched.barrier_at_drop(true, Some(false)), Barrier::Flushed);
+        drop(batched.release(Barrier::Flushed));
         released(&a, &x).await;
     }
 

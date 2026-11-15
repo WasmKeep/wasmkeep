@@ -36,7 +36,8 @@ tower-service.workspace = true
 rcgen.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
-tokio.workspace = true
+# block_in_place for a batched capture off an instance (ADR 0034); no new crate.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 thiserror.workspace = true
 # Implementing object_store's async trait (the request-counting bucket); already in the tree through object_store.

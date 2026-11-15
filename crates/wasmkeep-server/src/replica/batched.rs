@@ -117,6 +117,15 @@ impl UploadBudget {
         })
     }
 
+    /// Takes every byte not reserved now, until the guard is dropped: a
+    /// node budget a test fills.
+    pub(crate) fn hold_all(&self) -> OwnedSemaphorePermit {
+        let free = u32::try_from(self.permits.available_permits()).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .try_acquire_many_owned(free)
+            .unwrap_or_else(|_| unreachable!("a semaphore of this node is never closed"))
+    }
+
     /// The bytes not reserved now.
     pub(crate) fn available(&self) -> u64 {
         u64::try_from(self.permits.available_permits()).unwrap_or(u64::MAX)
@@ -460,10 +469,7 @@ impl Replica {
             self.batched.marked.back().is_some_and(|(b, _)| {
                 b.session == boundary.session && b.sequence >= boundary.sequence
             });
-        let captured = self.batched.flight.is_some_and(|f| {
-            f.sequence.session == boundary.session && f.sequence.sequence >= boundary.sequence
-        }) || self.acknowledged_covers(boundary);
-        if !known && !captured {
+        if !known && !self.acknowledged_covers(boundary) {
             self.batched.marked.push_back((boundary, at));
         }
     }
@@ -475,9 +481,28 @@ impl Replica {
     }
 
     /// When the oldest boundary not captured yet was marked: the age the
-    /// event-start rule bounds (ADR 0034, section 3).
+    /// event-start rule bounds (ADR 0034, section 3). Boundaries the
+    /// segment in flight carries are captured; a ticket dropped before its
+    /// capture captured nothing.
     pub(crate) fn oldest_unsent(&self) -> Option<std::time::Instant> {
-        self.batched.marked.front().map(|(_, at)| *at)
+        let captured = match *self.batched.shared.slot.borrow() {
+            Slot::Uploading { .. } | Slot::Landed { .. } => self.batched.flight.map(|f| f.sequence),
+            _ => None,
+        };
+        self.batched
+            .marked
+            .iter()
+            .find(|(b, _)| {
+                captured.is_none_or(|c| b.session != c.session || b.sequence > c.sequence)
+            })
+            .map(|(_, at)| *at)
+    }
+
+    /// What a flush waits to see acknowledged when the database marked
+    /// nothing new (ADR 0034, section 4): the boundary the database
+    /// returned, else the segment in flight's, else nothing.
+    pub(crate) fn flush_target(&self, marked: Option<WalBoundary>) -> Option<WalBoundary> {
+        marked.or_else(|| self.batched.flight.map(|f| f.sequence))
     }
 
     /// The last boundary marked under this hold: the one a flush waits to
@@ -491,12 +516,11 @@ impl Replica {
             .or_else(|| self.captured_sequence())
     }
 
-    /// The events committed and not acknowledged: marked and not captured,
-    /// plus those of the segment in flight. What a hold that ends without
-    /// a flush drops (ADR 0034, section 10).
+    /// The events committed and not acknowledged: every boundary marked
+    /// and not acknowledged yet, in flight or not. What a hold that ends
+    /// without a flush drops (ADR 0034, section 10).
     pub(crate) fn unacknowledged_events(&self) -> u64 {
-        let marked = self.batched.marked.len();
-        u64::try_from(marked + self.in_flight_events()).unwrap_or(u64::MAX)
+        u64::try_from(self.batched.marked.len()).unwrap_or(u64::MAX)
     }
 
     /// Whether this hold is at its `Flushed` barrier as far as the replica
@@ -605,9 +629,11 @@ impl Replica {
                 a.closed.insert(session);
             }
         });
-        self.batched.marked.retain(|(b, _)| {
-            b.session == plan.boundary.session && b.sequence > plan.boundary.sequence
-        });
+        // Kept until acknowledged: a ticket dropped before its capture
+        // leaves them uncaptured. Only another capture session's go.
+        self.batched
+            .marked
+            .retain(|(b, _)| b.session == plan.boundary.session);
         self.in_flight = Some(segment.id);
         self.batched.flight = Some(Flight {
             id: segment.id,
@@ -689,6 +715,9 @@ impl Replica {
                 result: Ok(()),
             } => {
                 let flight = self.end_flight(id)?;
+                self.batched.marked.retain(|(b, _)| {
+                    b.session != flight.sequence.session || b.sequence > flight.sequence.sequence
+                });
                 self.head = id;
                 self.checksum = post_apply;
                 self.since_snapshot += 1;

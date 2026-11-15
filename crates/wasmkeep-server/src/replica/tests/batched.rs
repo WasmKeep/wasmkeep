@@ -1208,3 +1208,42 @@ async fn cut_apply(r: &mut Replica) {
     blocker.await.unwrap();
     assert!(pending, "apply was cut at the sidecar write");
 }
+
+/// A ticket dropped before its capture leaves its boundaries uncaptured,
+/// and the replica says so: a flush after it targets them, not the last
+/// acknowledged boundary, and their age still counts for the event-start
+/// rule (ADR 0034, sections 3 and 4).
+#[tokio::test]
+async fn an_abandoned_ticket_leaves_its_boundaries_marked() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let first = write(&mut db, "one");
+    r.note_boundary(first, std::time::Instant::now());
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    assert!(r.acknowledged_covers(first));
+    let second = write(&mut db, "two");
+    r.note_boundary(second, std::time::Instant::now());
+    let plan = db.next_bounded_capture().unwrap();
+    let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
+    drop(r.prepare(plan, permit).await.unwrap());
+    assert_eq!(r.last_marked(), Some(second), "still to flush");
+    assert!(r.oldest_unsent().is_some(), "still unsent");
+    assert_eq!(r.unacknowledged_events(), 1);
+    assert_eq!(r.apply().await.unwrap(), Applied::Abandoned);
+    assert_eq!(r.last_marked(), Some(second));
+    let id = start(&mut r, &mut db, &budget).await;
+    assert_eq!(r.last_marked(), Some(second), "in flight, not acknowledged");
+    assert!(r.oldest_unsent().is_none(), "captured");
+    assert_eq!(land(&mut r).await.unwrap(), Applied::Acknowledged(id));
+    assert!(r.acknowledged_covers(second));
+    assert_eq!(r.unacknowledged_events(), 0);
+    drop(hold);
+    drop(db);
+}

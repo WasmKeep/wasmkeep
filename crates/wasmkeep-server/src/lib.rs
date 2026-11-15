@@ -31,6 +31,9 @@ pub mod secrets;
 mod websocket;
 
 pub use access::{Access, AccessRules};
+#[cfg(feature = "batched-writes")]
+#[doc(hidden)]
+pub use actor::hold_node_upload_budget;
 pub use actor::{ActorConfig, ActorService};
 pub use cluster::{
     ClusterConfig, ClusterPlaintext, ClusterTlsConfig, DEFAULT_HEARTBEAT, IMPLICIT_APP_NAME,

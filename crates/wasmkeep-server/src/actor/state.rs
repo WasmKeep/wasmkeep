@@ -176,18 +176,22 @@ impl Drop for ActorState {
         let Some(hold) = self.held.take() else {
             return;
         };
-        // A batched hold with anything pending is never parked: dropped now,
+        // A batched hold is parked or released only at the barrier its step
+        // before the drop found; otherwise it is dropped now, never parked:
         // after a panic (the mailbox's `CatchUnwind` drops the state outside
-        // the step) or a drop past its step. A strict hold is always
-        // flushed.
-        let reason = if self.stepped {
-            Dropped::Unbarriered
+        // the step), whatever its marks say, since the panicked event may
+        // have committed after them. A strict hold is always flushed.
+        let unmarked = if self.batched_replica().is_some() {
+            self.unmarked_commits()
         } else {
-            Dropped::Panic
+            Some(false)
         };
-        let barrier = hold.barrier_or(reason);
+        let barrier = hold.barrier_at_drop(self.stepped, unmarked);
         if let Barrier::GaveUp(reason) = barrier {
-            hold.drop_now(reason);
+            if reason == Dropped::Unbarriered {
+                tracing::error!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "a batched hold dropped without a barrier; its pending writes are given up");
+            }
+            hold.drop_now_with(reason, u64::from(unmarked != Some(false)));
             return;
         }
         let parkable = hold.is_valid()
@@ -264,6 +268,22 @@ impl ActorState {
                 None => StepOutcome::Keep,
             }
         })
+    }
+
+    /// Whether the actor's database holds commits after its last boundary,
+    /// read where it is now; `None` if it cannot tell (the connection is
+    /// with database work cut short, or the read failed).
+    fn unmarked_commits(&self) -> Option<bool> {
+        match (self.live.as_ref(), self.db.as_ref()) {
+            (Some(live), _) => live
+                .store
+                .data()
+                .db
+                .as_deref()
+                .and_then(|db| db.has_unmarked_commits().ok()),
+            (None, Some(db)) => db.has_unmarked_commits().ok(),
+            (None, None) => Some(false),
+        }
     }
 
     /// The actor's replication, while this node holds it restored.
@@ -1175,6 +1195,7 @@ impl ActorState {
     /// (`admit`, or `refresh_class` for alarms): never a newer one, whose
     /// rules the event did not check.
     pub(super) async fn prepare(&mut self) -> Result<Result<(), String>, String> {
+        self.stepped = false;
         self.switch_writes().await?;
         if self.live.is_none() {
             let db = match self.db.take() {
@@ -1256,7 +1277,7 @@ impl ActorState {
         {
             self.check_deploy_seq().await?;
         }
-        if let Err(e) = self.ensure_batched_capture() {
+        if let Err(e) = self.ensure_batched_capture().await {
             self.abandon(&e);
             return Err(e);
         }
