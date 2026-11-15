@@ -56,7 +56,8 @@ neighbour, not isolation from a hostile one
    placement at wake-up is not enough. Until then an operator moves an
    actor or drains a node ([how](docs/cluster.md)).
 6. **More buckets**: Google Cloud Storage and Azure Blob storage beside
-   S3-compatible stores, each checked by `cluster diagnose` (ADR 0031,
+   S3-compatible stores, each checked by `cluster diagnose`
+   ([ADR 0031](docs/adr/0031-google-cloud-storage-and-azure-blob-buckets.md),
    proposed).
 
 An actor runs on one node at a time, by design: a single actor that is too
@@ -110,7 +111,8 @@ Each waits for a user who needs it.
 - **Vector search** in an actor's SQLite database.
 - **External databases and brokers**: connectors from actors and fronts
   to PostgreSQL, Redis or Valkey, MySQL and NATS servers the operator
-  runs, beyond what outbound HTTP reaches (ADR 0032, proposed).
+  runs, beyond what outbound HTTP reaches
+  ([ADR 0032](docs/adr/0032-external-databases-and-brokers.md), proposed).
 - **Cron triggers** (alarms cover them today) and optional built-ins: TLS
   termination, a Helm chart. Until static assets ship, serve them from
   the [front door](docs/deploy/front-door.md#static-files).
