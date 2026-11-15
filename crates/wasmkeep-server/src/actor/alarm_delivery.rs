@@ -430,9 +430,23 @@ impl ActorState {
                 })
                 .await
             }
+            None if batched && !listed => {
+                return self
+                    .index_missed("no database to record the entry in")
+                    .await;
+            }
             None => return kept,
         };
         if !matches!(recorded, Ok(Ok(()))) {
+            // A batched hold has written no entry yet: one named but not
+            // recorded is listed by no segment, so the alarm would reach
+            // the bucket unindexed. Replication stops before any boundary
+            // ships (ADR 0034, section 9).
+            if batched && !listed {
+                return self
+                    .index_missed("recording the alarm's entry failed")
+                    .await;
+            }
             // The database still names `previous`; the new entry (if any)
             // lists the alarm but is named by nothing, so it is removed
             // when it comes due.
