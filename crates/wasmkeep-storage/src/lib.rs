@@ -13,12 +13,14 @@ mod db;
 mod error;
 #[cfg(feature = "fault-injection")]
 pub mod faults;
+mod local;
 pub mod ltx;
 mod path;
 mod value;
 pub mod wal;
 
-pub use db::{ActorDb, PendingAlarms, StateDir, Storage, StorageConfig};
+pub use db::{ActorDb, CaptureHold, PendingAlarms, StateDir, Storage, StorageConfig};
 pub use error::{SqlError, SqlErrorKind, StorageError};
+pub use local::local_is_at;
 pub use path::{decode_segment, encode_segment};
 pub use value::{Rows, SqlValue};
