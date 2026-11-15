@@ -1151,8 +1151,8 @@ The node and the load shared the machine. What they show, in shape:
   as observed, a room that writes on every message runs about one
   message per bucket round trip, plain writes included. At 1,000 messages a second the rest queued in the
   senders' sockets (`outcome_stall`: unacknowledged, latency growing for
-  the whole run). `batch` took every rate, about 30 ms of latency at the
-  median (half the 50 ms window) and under 70 ms at p99, about a million
+  the whole run). `batch` took every rate, 32 to 36 ms of latency at the
+  median (within its 50 ms window) and under 70 ms at p99, about a million
 deliveries a second into 1,000 sockets at a third of a core.
 - Without a bucket (and with the data on tmpfs, where an fsync is free, so
   `durable` costs what `plain` does), the limit moves to the broadcast itself: a room of
