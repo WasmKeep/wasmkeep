@@ -333,9 +333,16 @@ pub(super) async fn execute(
         None => Value::Null,
     };
     if args.abort {
+        // Trust the persisted mode, never the invocation's --in-place flag.
+        let empty_root = journal["binding"]["in_place"] == false;
         ensure!(
-            existing.is_some() && journal["phase"] == "prepare",
-            "--abort is only safe in prepare; clear/copy must restore the pinned before_restore run with --in-place --deploy backup"
+            existing.is_some()
+                && (journal["phase"] == "prepare"
+                    || (empty_root
+                        && ["clear", "copy", "abort"]
+                            .iter()
+                            .any(|phase| journal["phase"] == *phase))),
+            "--abort for in-place restores is only safe in prepare; clear/copy must restore the pinned before_restore run with --in-place --deploy backup"
         );
         nodes(args, target, tp).await?;
         let lock = key(&base, "restore-lock");
@@ -347,6 +354,42 @@ pub(super) async fn execute(
             );
             tokio::time::sleep(late).await;
             nodes(args, target, tp).await?;
+            if empty_root {
+                // Persist cancellation before deleting anything: a failed cleanup
+                // must be retried with --abort, never resumed as a partial copy.
+                journal["phase"] = json!("abort");
+                save_journal(target, &fence, &journal).await?;
+                let state = format!("{}/", key(tp, &format!("state/{name}")));
+                for _ in 0..10 {
+                    let keys = list_bounded(target, &state).await?;
+                    if keys.is_empty() {
+                        break;
+                    }
+                    for meta in keys.values() {
+                        target.delete(&meta.location).await?;
+                    }
+                }
+                ensure!(
+                    list_bounded(target, &state).await?.is_empty(),
+                    "state keeps appearing; fence retained"
+                );
+                if journal["binding"]["deploy"] == "Backup" {
+                    for (tail, meta) in list_bounded(target, &format!("{base}/")).await? {
+                        if ![
+                            "restoring",
+                            "restored",
+                            "restore-lock",
+                            "recreated",
+                            "deleted",
+                        ]
+                        .contains(&tail.as_str())
+                        {
+                            target.delete(&meta.location).await?;
+                        }
+                    }
+                }
+                nodes(args, target, tp).await?;
+            }
             target.delete(&Key::from(fence.as_str())).await?;
             Ok::<_, anyhow::Error>(())
         }
@@ -364,9 +407,20 @@ pub(super) async fn execute(
             .await;
         result?;
         unlocked?;
-        println!("Aborted prepare for {name}; original bucket state retained");
+        println!(
+            "Aborted restore for {name}; {}",
+            if empty_root {
+                "app state root emptied"
+            } else {
+                "original bucket state retained"
+            }
+        );
         return Ok(());
     }
+    ensure!(
+        journal["phase"] != "abort",
+        "cleanup in progress; rerun --abort"
+    );
     let id = match (&args.run, journal.get("run").and_then(Value::as_str)) {
         (Some(id), _) => id.clone(),
         (None, Some(id)) => id.to_owned(),

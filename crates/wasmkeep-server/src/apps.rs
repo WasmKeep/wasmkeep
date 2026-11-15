@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
+use wasmkeep_cluster::restore_fence::{marker_matches, start_allowed};
 
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
@@ -477,7 +478,7 @@ impl AppRef {
 
     /// Refuse destructive app operations while a restore holds its fence.
     pub(super) async fn check_not_restoring(&self) -> Result<(), DeployError> {
-        if self.get("restoring").await?.is_some() {
+        if !start_allowed(false, self.get("restoring").await?.is_some()) {
             return Err(DeployError::Refused(format!(
                 "{} is restoring",
                 self.name()
@@ -494,7 +495,7 @@ impl AppRef {
         match self.tombstone().await? {
             Some(_) => Err(DeployError::Deleted(self.name())),
             None => {
-                if self.get("restoring").await?.is_some() {
+                if !start_allowed(false, self.get("restoring").await?.is_some()) {
                     return Err(DeployError::Deleted(format!("{} (restoring)", self.name())));
                 }
                 Ok(())
@@ -676,7 +677,10 @@ impl AppRef {
         ];
         if markers.iter().any(|(file, value)| {
             value.as_ref().is_some_and(|(body, _)| {
-                std::fs::read(local.join(file)).ok().as_deref() != Some(body.as_slice())
+                !marker_matches(
+                    Some(body.as_slice()),
+                    std::fs::read(local.join(file)).ok().as_deref(),
+                )
             })
         }) {
             remove("the app was recreated or restored since this node last ran it")?;
@@ -1502,12 +1506,18 @@ impl AppRef {
     /// `local`: no tombstone, and no `--recreate` since it prepared them
     /// ([`Self::prepare_local`] wrote the marker it compares).
     async fn still_ours(&self, local: &std::path::Path) -> Result<bool, DeployError> {
-        if self.tombstone().await?.is_some() || self.get("restoring").await?.is_some() {
+        if !start_allowed(
+            self.tombstone().await?.is_some(),
+            self.get("restoring").await?.is_some(),
+        ) {
             return Ok(false);
         }
         for (remote, file) in [(RECREATED, RECREATED_LOCAL), ("restored", ".restored")] {
             if let Some((marker, _)) = self.get(remote).await?
-                && std::fs::read(local.join(file)).ok().as_deref() != Some(marker.as_slice())
+                && !marker_matches(
+                    Some(marker.as_slice()),
+                    std::fs::read(local.join(file)).ok().as_deref(),
+                )
             {
                 return Ok(false);
             }

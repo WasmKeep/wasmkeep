@@ -48,4 +48,5 @@ pub mod node_lease;
 #[cfg(feature = "object-store")]
 pub mod object_store;
 pub mod replication;
+pub mod restore_fence;
 pub mod state_root;

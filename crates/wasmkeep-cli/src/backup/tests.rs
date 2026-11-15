@@ -2524,3 +2524,246 @@ async fn review2_partial_pinned_undo_recovers_only_covered_actors() {
             .is_none()
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn restore_abort_empty_root_every_phase_without_archive() {
+    for phase in ["prepare", "clear", "copy", "abort"] {
+        for fail in [usize::MAX, 1, 3] {
+            let target: Store = Arc::new(object_store::memory::InMemory::new());
+            let archive: Store = Arc::new(object_store::memory::InMemory::new());
+            json_put(
+                &target,
+                "apps/acme/shop/restoring",
+                &json!({
+                    "phase":phase, "run":"lost", "binding":{"in_place":false, "deploy":"Backup"}
+                }),
+                false,
+            )
+            .await
+            .unwrap();
+            for path in [
+                "state/acme/shop/actors/counter/a/snapshot",
+                "state/acme/shop/leases/counter/a",
+                "state/acme/shop/alarms/a",
+                "apps/acme/shop/current",
+                "apps/acme/shop/v1/manifest",
+                "apps/acme/shop/secrets/current",
+                "apps/acme/shop/restored",
+                "state/acme/shop2/keep",
+                "apps/acme/shop2/current",
+                "apps/acme/shop/recreated",
+            ] {
+                put(&target, path, b"keep-or-clean".to_vec(), false)
+                    .await
+                    .unwrap();
+            }
+            let faulty: Store = Arc::new(FailMutation {
+                inner: target.clone(),
+                count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail,
+                lost: false,
+                stray: false,
+            });
+            let mut args = restore_args("lost", false);
+            args.run = None;
+            args.abort = true;
+            let started = tokio::time::Instant::now();
+            let result = restore::execute(
+                &args,
+                &archive,
+                "",
+                &faulty,
+                "",
+                std::time::Duration::from_secs(40),
+            )
+            .await;
+            if fail != usize::MAX {
+                assert!(result.is_err());
+                assert!(
+                    optional(&target, "apps/acme/shop/restoring")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "cleanup failure must retain fence"
+                );
+                restore::execute(
+                    &args,
+                    &archive,
+                    "",
+                    &target,
+                    "",
+                    std::time::Duration::from_secs(40),
+                )
+                .await
+                .unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert!(started.elapsed() >= std::time::Duration::from_secs(80));
+            assert!(
+                list_bounded(&target, "state/acme/shop/")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            for path in [
+                "apps/acme/shop/current",
+                "apps/acme/shop/v1/manifest",
+                "apps/acme/shop/secrets/current",
+                "apps/acme/shop/restoring",
+            ] {
+                assert!(
+                    optional(&target, path).await.unwrap().is_none(),
+                    "{phase}: {path}"
+                );
+            }
+            for path in [
+                "apps/acme/shop/restored",
+                "apps/acme/shop/recreated",
+                "state/acme/shop2/keep",
+                "apps/acme/shop2/current",
+            ] {
+                assert!(
+                    optional(&target, path).await.unwrap().is_some(),
+                    "{phase}: {path}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn restore_abort_in_place_after_prepare_refuses_even_without_flag() {
+    for phase in ["clear", "copy"] {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        json_put(
+            &store,
+            "apps/acme/shop/restoring",
+            &json!({"phase":phase, "binding":{"in_place":true}}),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut args = restore_args("lost", false);
+        args.abort = true;
+        let err = restore::execute(&args, &store, "", &store, "", std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pinned before_restore"), "{err}");
+        assert!(
+            optional(&store, "apps/acme/shop/restoring")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn restore_abort_checks_live_nodes_after_quiet_and_excludes_competing_restore() {
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    json_put(
+        &target,
+        "apps/acme/shop/restoring",
+        &json!({"phase":"copy", "binding":{"in_place":false,"deploy":"Backup"}}),
+        false,
+    )
+    .await
+    .unwrap();
+    put(
+        &target,
+        "state/acme/shop/partial",
+        b"retain".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut args = restore_args("lost", false);
+    args.abort = true;
+    args.force = true;
+    let late = std::time::Duration::from_secs(40);
+    let intruder = async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let err = restore::execute(&args, &target, "", &target, "", late)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("locked"), "{err}");
+        let stamp = now_ms().unwrap();
+        put(
+            &target,
+            "nodes/live",
+            format!("wasmkeep-node 2\nlive\nhttp://127.0.0.1:9\n0.4.2\n{stamp}\nacme/shop\n")
+                .into_bytes(),
+            false,
+        )
+        .await
+        .unwrap();
+    };
+    let (result, ()) = tokio::join!(
+        restore::execute(&args, &target, "", &target, "", late),
+        intruder
+    );
+    assert!(result.unwrap_err().to_string().contains("live nodes"));
+    assert!(
+        optional(&target, "state/acme/shop/partial")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        optional(&target, "apps/acme/shop/restoring")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn restore_abort_failed_copy_with_stray_history_and_lost_archive() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    let faulty: Store = Arc::new(FailMutation {
+        inner: target.clone(),
+        count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fail: usize::MAX,
+        lost: false,
+        stray: true,
+    });
+    let mut args = restore_args(&id, false);
+    let err = restore::execute(&args, &f.dest, "", &faulty, "", std::time::Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unexpected head"), "{err}");
+    let journal: Value = serde_json::from_slice(
+        &read(&target, "apps/acme/shop/restoring", META_MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(journal["phase"], "copy");
+    let missing: Store = Arc::new(object_store::memory::InMemory::new());
+    args.abort = true;
+    args.run = None;
+    restore::execute(&args, &missing, "", &target, "", std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(
+        list_bounded(&target, "state/acme/shop/")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        optional(&target, "apps/acme/shop/current")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        optional(&target, "apps/acme/shop/restoring")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

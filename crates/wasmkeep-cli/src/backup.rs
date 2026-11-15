@@ -97,7 +97,7 @@ pub struct Restore {
     bucket: String,
     #[arg(long)]
     in_place: bool,
-    /// Cancel a restore still in prepare; later phases require the pinned undo run.
+    /// Cancel an empty-root restore before opening; in-place restores only in prepare.
     #[arg(long, conflicts_with = "run")]
     abort: bool,
     #[arg(long, value_enum)]

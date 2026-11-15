@@ -204,9 +204,10 @@ above before any recovery command.
 | Phase | Supported recovery |
 | --- | --- |
 | No journal | No restore is pending, or it finished. Inspect state before starting a new operation. Clear only an orphaned lock after stopping its holder and waiting 40 seconds. |
-| `prepare` | Original state has not been cleared. Retry the original options after fixing archive permissions/corrupt actors, optionally `--force` for explicitly accepted missing undo coverage. Or run `backup restore --abort --from ARCHIVE --bucket TARGET --app TENANT/APP`; it needs no archive reads or writes and keeps original bucket state. It refuses later phases. |
-| `clear` | State may be partly deleted. Retry the original options, or restore the pinned `before_restore` run with `--in-place --deploy backup`. The fence stays closed. |
-| `copy` | State or deploy may be partial, including conflicting stray keys. Retry after repairing a transient error, or select the pinned undo run as below. Undo returns the journal to `clear`, removes failed-copy state and deploy payloads, preserves generation floors, and copies the undo under the same fence. |
+| `prepare` | Original state has not been cleared. Retry the original options after fixing archive permissions/corrupt actors, optionally `--force` for explicitly accepted missing undo coverage. Or run `backup restore --abort --from ARCHIVE --bucket TARGET --app TENANT/APP`; it needs no archive reads or writes and keeps original bucket state. For an empty-root restore it instead cleans partial state and restored deploy/secrets, as in later phases. |
+| `clear` | For an empty-root restore, run `backup restore --abort --from ARCHIVE --bucket TARGET --app TENANT/APP` to return to an empty state root. For an in-place restore, state may be partly deleted. Retry the original options, or restore the pinned `before_restore` run with `--in-place --deploy backup`. The fence stays closed. |
+| `copy` | State or deploy may be partial, including conflicting stray keys. An empty-root restore can always use `--abort`, even if its archive run is lost; it has no undo run. For an in-place restore, abort is refused. Retry after repairing a transient error, or select the pinned undo run as below. Undo returns the journal to `clear`, removes failed-copy state and deploy payloads, preserves generation floors, and copies the undo under the same fence. |
+| `abort` | Empty-root cleanup was interrupted. Rerun `--abort`; normal resume is refused. Cleanup is idempotent and the fence remains until it completes. |
 | Undo `clear` / `copy` | Rerun the exact undo options. The journal now pins the undo run and resumes that operation. Partial undo again requires `--force`; actors not covered remain absent. |
 
 ```bash
@@ -215,8 +216,16 @@ wasmkeep backup restore --from s3://archive/prod --bucket s3://live/prod \
 ```
 
 Only the journal's pinned undo run may replace an unfinished restore; an
-unrelated run is refused. An empty-root restore has no undo backup: preserve
-its fence and repair the archive/conflicting objects to resume. Never expose
+unrelated run is refused. An empty-root restore has no undo backup: repair
+its archive/conflicting objects to resume, or use `--abort` before the fence
+opens. Abort uses the mode recorded in the journal, regardless of the supplied
+`--in-place` flag. Under the exclusive restore lock it waits 40 seconds and
+checks for live nodes again before deleting the selected `state/<tenant>/<app>/`
+contents and, for `--deploy backup`, its deploy and secrets. `--deploy keep`
+preserves the existing deploy and secrets. The `restored` cache invalidation
+marker and app lifecycle markers remain. It removes `restoring` last and holds
+the lock for another 40 seconds before release. No archive access is needed.
+After the fence opens, abort is no longer available. Never expose
 partly copied state by deleting `restoring`. If an in-place undo archive is
 unavailable after clearing, restore its access or recover the missing archive
 objects first; neither `--abort` nor `--force` can reconstruct missing data.
