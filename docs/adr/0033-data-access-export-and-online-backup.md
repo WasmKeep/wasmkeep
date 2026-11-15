@@ -3,8 +3,11 @@
 - Status: partially implemented (2026-11-15): actor export and read-only
   actor SQL and history listing are built. Online backup create/list/verify
   have an initial implementation; the [backup guide](../deploy/backup-and-restore.md)
-  records its cache, concurrency and prune-coordination limits. Live restore
-  remains proposed. The [first-slice guide](../actor-data-access.md) records its
+  records its cache, concurrency and prune-coordination limits. Whole-app
+  backup restore (plan step 6) is implemented; the guide records its recovery
+  journal, `restore` heartbeat capability, partial-undo force warning and
+  phase-specific abort/undo recovery. Single-actor
+  live restore remains proposed. The [first-slice guide](../actor-data-access.md) records its
   positional app syntax, limits and deferred options. Revised after an
   adversarial review (a destination keyed by content, since generations restart after an
   app is recreated; prune excluded from a running backup; restore
@@ -673,8 +676,8 @@ have no tombstone. Then, in this order:
    disk as its first snapshot, as the backup guide warns today. A node
    from before this record ignores both markers, so the command refuses
    while `nodes/` shows any node of the app, live or not, of an earlier
-   version (from its heartbeat's version line), unless `--force`, and
-   the docs name the minimum version.
+   build without `restore` on its heartbeat capability line, unless
+   `--force`. The heartbeat version line remains unchanged.
 1. **History.** For each actor of the run, copy the manifest's objects
    from `data/<digest>` to its source key, `If-None-Match: *`: the
    snapshot, the segment at `P`, the segments (for `--history all`, the
@@ -710,7 +713,9 @@ have no tombstone. Then, in this order:
    only under the prefix, tenant and app it was sealed for (ADR 0016):
    under another prefix the command says to run `wasmkeep secrets
    reset`.
-5. **Open the app.** Delete `apps/<t>/<a>/restoring`, last. A
+5. **Open the app.** List and plan every restored actor, replay its head,
+   and compare its position and database checksum with the manifest. Refuse
+   unexpected actors or heads. Delete `apps/<t>/<a>/restoring`, last. A
    restore cut short leaves it, so no node serves a half-restored app;
    running the command again resumes (every write is a create, and an
    existing object with the same bytes is not an error).

@@ -73,6 +73,7 @@ pub async fn delete_app(
          prefixes (state/default/default/) yourself"
     );
     let app = super::AppRef::new(Arc::clone(&store), prefix, tenant, name);
+    app.check_not_restoring().await?;
     let shown = app.name();
     let existed = app.tombstone().await?;
     // A node of a version before ADR 0028 ignores a tombstone: it would
@@ -202,7 +203,9 @@ fn now() -> u64 {
 /// Fences every node lease of `tenant/app` still written live (ADR 0020,
 /// as `cluster fence` does), and returns the latest time any of the app's
 /// nodes wrote its heartbeat (ms, its clock), or 0.
-async fn fence_app_nodes(
+/// # Errors
+/// Returns an error if listing or fencing a node fails.
+pub async fn fence_app_nodes(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
     tenant: &str,
@@ -234,10 +237,11 @@ async fn fence_app_nodes(
             continue;
         }
         let key = format!("{NODES_PREFIX}{}", node.id);
-        if let OperatorFence::Fenced { .. } = operator_fence(&bucket, &Wall, &key)
+        if let OperatorFence::Fenced { written_at_ms, .. } = operator_fence(&bucket, &Wall, &key)
             .await
             .map_err(super::bucket)?
         {
+            last = last.max(written_at_ms);
             say(format!(
                 "fenced node {} (its lease was still written live)",
                 node.id

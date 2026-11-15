@@ -137,33 +137,7 @@ async fn read(source: &Source, output: &Path) -> anyhow::Result<history::Export>
 }
 
 // Returning from select drops the export future and its TempDirs before exit.
-pub(crate) fn run(
-    work: impl std::future::Future<Output = anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let result = runtime.block_on(async {
-        #[cfg(unix)]
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let interrupt = tokio::signal::ctrl_c();
-        let terminate = async {
-            #[cfg(unix)]
-            term.recv().await;
-            #[cfg(not(unix))]
-            std::future::pending::<()>().await;
-        };
-        tokio::select! {
-            biased;
-            signal = interrupt => { signal?; anyhow::bail!("interrupted; scratch copy removed") },
-            () = terminate => anyhow::bail!("terminated; scratch copy removed"),
-            result = work => result,
-        }
-    });
-    // A cancelled SQL/output worker must not hold up signal-driven exit.
-    runtime.shutdown_background();
-    result
-}
+pub(crate) use wasmkeep_cli::run_async as run;
 
 pub(crate) fn finish(result: anyhow::Result<()>) -> anyhow::Result<()> {
     if let Err(error) = &result
