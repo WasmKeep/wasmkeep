@@ -55,6 +55,8 @@ pub(super) struct EventLimits {
     pub(super) wall: Duration,
     pub(super) retry_initial: Duration,
     pub(super) retry_max: Duration,
+    /// `--max-unsent-age` (ADR 0034, section 3).
+    pub(super) max_unsent_age: Duration,
 }
 
 /// Per-actor state owned by its mailbox task.
@@ -105,6 +107,9 @@ pub(super) struct ActorState {
     /// The actor's garbage collection (ADR 0012): one pass at a time, and
     /// one pending request while it runs.
     pub(super) collecting: Arc<Collection>,
+    /// The step before a drop last found the hold at its barrier: a drop
+    /// with anything still pending is then `unbarriered`, not a panic's.
+    pub(super) stepped: bool,
 }
 
 /// The database drops before its reservation, including on a blocking thread
@@ -171,7 +176,26 @@ impl Drop for ActorState {
         let Some(hold) = self.held.take() else {
             return;
         };
-        let barrier = hold.barrier();
+        // A batched hold is parked or released only at the barrier its step
+        // before the drop found; otherwise it is dropped now, never parked:
+        // after a panic (the mailbox's `CatchUnwind` drops the state outside
+        // the step), whatever its marks say, since the panicked event may
+        // have committed after them. A strict hold is always flushed.
+        // Judged on the hold just taken: `self.held` is empty now.
+        let batched = hold.writes() == crate::apps::Writes::Batched && hold.replica().is_some();
+        let unmarked = if batched {
+            self.unmarked_commits()
+        } else {
+            Some(false)
+        };
+        let barrier = hold.barrier_at_drop(self.stepped, unmarked);
+        if let Barrier::GaveUp(reason) = barrier {
+            if reason == Dropped::Unbarriered {
+                tracing::error!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "a batched hold dropped without a barrier; its pending writes are given up");
+            }
+            hold.drop_now_with(reason, u64::from(unmarked != Some(false)));
+            return;
+        }
         let parkable = hold.is_valid()
             && self.cluster.as_ref().is_some_and(|c| !c.draining())
             && !self
@@ -212,22 +236,27 @@ impl ActorState {
     /// An app deleted is not flushed: its holds end as they are, as before
     /// (counted `app_deleted` once a hold can have anything pending).
     pub(super) fn before_drop(&mut self, cause: DropCause) -> BoxFuture<'_, StepOutcome> {
-        let (deadline, stopping) = match cause {
-            DropCause::Stop { flush: false, .. } => {
-                return Box::pin(std::future::ready(StepOutcome::Ready));
-            }
-            DropCause::Stop { deadline, .. } => (deadline, true),
-            // No limit while a hold's flush is at once. The replica's
-            // upload budget once a batched hold has uploads of its own to
-            // wait for (S8): unbounded, an eviction step would never end.
-            _ => (None, false),
-        };
         Box::pin(async move {
-            let Some(hold) = self.held.as_ref() else {
+            self.stepped = false;
+            if self.batched_replica().is_none() {
                 return StepOutcome::Ready;
+            }
+            let (deadline, stopping) = match cause {
+                // An app deleted: its holds end as they are, counted.
+                DropCause::Stop { flush: false, .. } => {
+                    self.drop_hold(Dropped::AppDeleted);
+                    return StepOutcome::Ready;
+                }
+                DropCause::Stop { deadline, .. } => (deadline, true),
+                // A hibernation or an eviction: one upload budget.
+                _ => (Some(self.upload_deadline().await), false),
             };
-            match hold.flush(deadline).await {
-                Some(Barrier::Flushed) => StepOutcome::Ready,
+            match self.flush_to_barrier(deadline).await {
+                Some(Barrier::Flushed) => {
+                    self.end_capture_at_barrier().await;
+                    self.stepped = true;
+                    StepOutcome::Ready
+                }
                 Some(Barrier::GaveUp(reason)) => {
                     self.drop_hold(reason);
                     StepOutcome::GaveUp
@@ -241,6 +270,22 @@ impl ActorState {
                 None => StepOutcome::Keep,
             }
         })
+    }
+
+    /// Whether the actor's database holds commits after its last boundary,
+    /// read where it is now; `None` if it cannot tell (the connection is
+    /// with database work cut short, or the read failed).
+    fn unmarked_commits(&self) -> Option<bool> {
+        match (self.live.as_ref(), self.db.as_ref()) {
+            (Some(live), _) => live
+                .store
+                .data()
+                .db
+                .as_deref()
+                .and_then(|db| db.has_unmarked_commits().ok()),
+            (None, Some(db)) => db.has_unmarked_commits().ok(),
+            (None, None) => Some(false),
+        }
     }
 
     /// The actor's replication, while this node holds it restored.
@@ -604,7 +649,7 @@ impl ActorState {
             let _ = response_tx.send(outcome);
             return;
         }
-        self.install_call_context();
+        self.install_call_context().await;
         let Some(live) = self.live.as_mut() else {
             let _ = response_tx.send(Outcome::Failed("actor not ready".into()));
             return;
@@ -618,7 +663,7 @@ impl ActorState {
                 .http()
                 .new_incoming_request(Scheme::Http, crate::http::CappedBody::of(req))?;
             let (out_tx, out_rx) = oneshot::channel();
-            let out = live.store.data_mut().http().new_response_outparam(out_tx)?;
+            let out = live.store.data_mut().response_outparam(out_tx)?;
             let forward = async move {
                 let result = match out_rx.await {
                     Ok(Ok(response)) => Outcome::Served(response),
@@ -647,13 +692,7 @@ impl ActorState {
                 }
             }
         };
-        let result = match limit(
-            self.limits.wall,
-            self.held.as_ref().map(Held::lease),
-            outcome,
-        )
-        .await
-        {
+        let result = match limit(self.limits.wall, self.held.as_ref(), outcome).await {
             Ok(r) => r.map_err(|e| format!("{e:#}")),
             Err(cut) => Err(format!("event {cut}")),
         };
@@ -692,24 +731,15 @@ impl ActorState {
             self.class = current;
         }
         // A deploy that changed the class's mode reaches a resident hold
-        // at a `Flushed` barrier, never at each use (ADR 0034, section 1).
-        // A strict hold is always flushed; a batched one seen under a
-        // strict version flushes first (slice S9).
-        if let Some(held) = self.held.as_mut()
-            && held.writes() != self.class.writes
-        {
-            let barrier = held.barrier();
-            if held.switch_writes(self.class.writes, barrier) {
-                tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), writes = self.class.writes.as_str(), "the hold now runs the class's new mode of writes");
-            }
-        }
+        // at a `Flushed` barrier, never at each use (ADR 0034, section 1):
+        // `prepare` switches it before the next event (`switch_writes`).
         Ok(())
     }
 
     /// Gives the instance what `actors.call` needs for the current event,
     /// which starts now: its calls give up while the margin of its wall
     /// remains, before the wall cuts the event.
-    pub(super) fn install_call_context(&mut self) {
+    pub(super) async fn install_call_context(&mut self) {
         let wall = self.limits.wall;
         let ctx = CallContext {
             service: self.service.get().cloned(),
@@ -717,8 +747,33 @@ impl ActorState {
             chain: Arc::clone(&self.chain),
             deadline: tokio::time::Instant::now() + (wall - super::call_margin(wall)),
         };
+        // The gate follows the hold's mode at every event, including a
+        // redeploy which reused this instance. Never carry a batched gate
+        // into a strict event or miss it when the hold switches to batched.
+        let stop = if self
+            .held
+            .as_ref()
+            .is_some_and(|h| h.writes() == crate::apps::Writes::Batched)
+        {
+            match self.replica() {
+                Some(replica) => Some(replica.lock().await.failure_flag()),
+                None => None,
+            }
+        } else {
+            None
+        };
+        // A batched flush waits until the wall less one second at most
+        // (ADR 0034, section 4).
+        let batched = stop.is_some().then(|| BatchedEvent {
+            flush_until: tokio::time::Instant::now() + wall.saturating_sub(Duration::from_secs(1)),
+            completion: self.completion(),
+        });
         if let Some(live) = self.live.as_mut() {
-            live.store.data_mut().call = Some(ctx);
+            let host = live.store.data_mut();
+            host.call = Some(ctx);
+            host.replica_stop = stop.clone();
+            host.egress.replica_stop = stop;
+            host.batched = batched;
         }
     }
 
@@ -779,6 +834,13 @@ impl ActorState {
         let Some(slot) = self.replica().cloned() else {
             return;
         };
+        // A batched hold uploads off the actor's path (ADR 0034, section
+        // 2), and asks for no periodic snapshot outside a barrier (section
+        // 7, slice S11): its restores replay every segment until then.
+        if let Some(slot) = self.batched_replica() {
+            self.replicate_batched(slot).await;
+            return;
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -1000,6 +1062,18 @@ impl ActorState {
         operator_delete: Option<String>,
         erase_now: bool,
     ) -> Result<(), String> {
+        // A batched hold resets only at its acknowledged head (ADR 0034,
+        // section 7): flushed first, with one upload budget; otherwise the
+        // delete is not recorded, and the actor is given up.
+        if self.batched_replica().is_some() {
+            let deadline = self.upload_deadline().await;
+            if self.flush_to_barrier(Some(deadline)).await != Some(Barrier::Flushed) {
+                let reason = "the delete's flush did not reach its barrier";
+                self.abandon(reason);
+                return Err(reason.into());
+            }
+            self.end_capture_at_barrier().await;
+        }
         if let Some(mut live) = self.live.take() {
             let _ = live.store.data_mut().drain_db().await;
         }
@@ -1039,9 +1113,11 @@ impl ActorState {
     /// be ahead of the bucket, so it is closed and rebuilt on the next event.
     pub(super) fn abandon(&mut self, reason: &str) {
         tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %reason, "replication failed; giving the actor up");
+        // The hold first: a batched hold's capture token goes before the
+        // database it guards closes (ADR 0034, section 2).
+        self.drop_hold(Dropped::Failure);
         self.live = None;
         self.db = None;
-        self.drop_hold(Dropped::Failure);
     }
 
     /// No old code on newer data (ADR 0008): an actor whose database a newer
@@ -1121,6 +1197,8 @@ impl ActorState {
     /// (`admit`, or `refresh_class` for alarms): never a newer one, whose
     /// rules the event did not check.
     pub(super) async fn prepare(&mut self) -> Result<Result<(), String>, String> {
+        self.stepped = false;
+        self.switch_writes().await?;
         if self.live.is_none() {
             let db = match self.db.take() {
                 Some(db) => db,
@@ -1201,8 +1279,12 @@ impl ActorState {
         {
             self.check_deploy_seq().await?;
         }
+        if let Err(e) = self.ensure_batched_capture().await {
+            self.abandon(&e);
+            return Err(e);
+        }
 
-        self.install_call_context();
+        self.install_call_context().await;
         let live = self.live.as_mut().ok_or("actor not ready")?;
         // Known for this instance: on-init already ran (or was found done)
         // for this version. The database does not change under a live
@@ -1221,7 +1303,7 @@ impl ActorState {
         live.start_event("init");
         let init = limit(
             self.limits.wall,
-            self.held.as_ref().map(Held::lease),
+            self.held.as_ref(),
             live.core.call_on_init(&mut live.store),
         )
         .await;
@@ -1274,9 +1356,9 @@ impl ActorState {
         // another event can open this database again.
         if let Err(e) = live.store.data_mut().drain_db().await {
             tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "database worker failed");
+            self.drop_hold(Dropped::Failure);
             self.live = None;
             self.db = None;
-            self.drop_hold(Dropped::Failure);
             return None;
         }
         // Host bookkeeping, microseconds on the actor's own connection:
@@ -1359,7 +1441,21 @@ impl ActorState {
         {
             self.db = live.store.data_mut().db.take();
         }
+        // The alarm entry a batched hold's database names is not the
+        // replicated state's until its segment is acknowledged (ADR 0034,
+        // section 9): nothing may be cleared on it (slice S10).
+        if !delete && self.batched_replica().is_some() {
+            named = None;
+        }
         if delete {
+            // The reset is uploaded at the acknowledged head: a durable
+            // delete flushed in its call; `delete_recorded` flushes first.
+            // Past that, the database goes: so does the capture token.
+            if durable.is_some()
+                && let Some(held) = self.held.as_mut()
+            {
+                held.end_capture();
+            }
             match durable {
                 // Recorded in the call: the snapshot at the reset and the
                 // erase, the alarm entry, the files; then the actor is

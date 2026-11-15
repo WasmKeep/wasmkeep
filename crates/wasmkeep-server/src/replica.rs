@@ -30,8 +30,12 @@ mod batched;
     reason = "wired to actors with batched writes in S9 (ADR 0034, plan)"
 )]
 pub(crate) use batched::{
-    Applied, BudgetPermit, NODE_UPLOAD_BYTES, Ticket, UploadBudget, UploadFailure,
+    Applied, BudgetPermit, NODE_UPLOAD_BYTES, Stop, Ticket, UploadBudget, UploadFailure, stopped,
 };
+
+/// What `failed` says while an inline upload is under way, so a cut that
+/// interrupts it stops replication.
+const INTERRUPTED: &str = "an upload was interrupted";
 
 /// Upload a snapshot after this many segments, so restores stay short.
 const SNAPSHOT_EVERY: u64 = 64;
@@ -1104,7 +1108,7 @@ impl Replica {
                 }
             };
         }
-        self.fail("an upload was interrupted");
+        self.fail(INTERRUPTED);
         if let Err(e) = self.put_bounded(&key, bytes, "snapshot").await {
             if !matches!(e, ReplicaError::Exists) {
                 crate::metrics::inc(&crate::metrics::METRICS.snapshot_upload_failures);
@@ -1161,10 +1165,18 @@ impl Replica {
     pub(crate) fn fail(&mut self, reason: impl Into<String>) {
         // An inline upload's provisional interruption marker is replaced by
         // its actual error; an established failure keeps its original cause.
-        if self.failed.as_deref() == Some("an upload was interrupted") {
+        if self.failed.as_deref() == Some(INTERRUPTED) {
             self.failed = None;
         }
         let reason = self.failed.get_or_insert_with(|| reason.into());
+        // The provisional marker of an inline upload under way (a reset or
+        // a snapshot) is not a stop: the upload replaces it with its
+        // outcome. Published, it would cut a batched hold's running event
+        // for an upload that then succeeds. Left behind by a cancelled
+        // upload, `failed` still stops the hold at its next boundary.
+        if reason == INTERRUPTED {
+            return;
+        }
         // Only batched waiters listen (ADR 0034, section 4).
         self.batched.stopped(reason);
     }
@@ -1207,7 +1219,7 @@ impl Replica {
         // Marked failed until the upload is known to have succeeded, so a
         // cancelled upload (the event was cut mid-way) stops replication;
         // and in flight until it ends, which a cancelled one never does.
-        self.fail("an upload was interrupted");
+        self.fail(INTERRUPTED);
         self.in_flight = Some(segment.id);
         let sent = self
             .put_bounded(&segment_key(&segment), bytes, "segment")

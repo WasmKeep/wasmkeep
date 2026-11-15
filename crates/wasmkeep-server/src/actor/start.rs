@@ -100,6 +100,7 @@ impl ActorService {
             wall: config.wall_per_event,
             retry_initial: config.alarm_retry_initial,
             retry_max: config.alarm_retry_max,
+            max_unsent_age: config.max_unsent_age.clamp(MIN_UNSENT_AGE, MAX_UNSENT_AGE),
         };
 
         // The timer fires through a weak reference, so it does not keep the
@@ -184,6 +185,7 @@ impl ActorService {
                         guest_log,
                         residency,
                         collecting: Arc::default(),
+                        stepped: false,
                         secrets_blocked,
                         moves: Arc::clone(&factory_moves),
                     })

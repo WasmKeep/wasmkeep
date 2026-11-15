@@ -13,11 +13,15 @@
 //! ends: its barrier is always `Flushed`, and ending it does what dropping
 //! the lease did before (a release in the background, or a park). Only a
 //! batched hold can end with writes committed but not acknowledged; those
-//! are what `wasmkeep_plain_events_dropped_total` counts (section 10).
+//! are what `wasmkeep_plain_events_dropped_total` counts (section 10). A
+//! batched hold also keeps its database's capture token
+//! ([`CaptureHold`]): while it lives, the database may not close or
+//! restart its capture (section 2). Ending the hold drops it first.
 
 use super::{ActorAddress, LeaseHold, SharedReplica};
 use crate::apps::Writes;
 use crate::cluster::LeaseReturn;
+use wasmkeep_storage::CaptureHold;
 
 /// How far a hold got before it ends (ADR 0034, section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,13 +47,10 @@ pub(super) enum Dropped {
     #[allow(dead_code, reason = "a batched hold's end (ADR 0034, section 6)")]
     LostLease,
     /// An event panicked.
-    #[allow(dead_code, reason = "a batched hold's end (ADR 0034, section 6)")]
     Panic,
     /// The app was deleted.
-    #[allow(dead_code, reason = "a batched hold's end (ADR 0034, section 6)")]
     AppDeleted,
     /// The hold was dropped without a barrier.
-    #[allow(dead_code, reason = "a batched hold's end (ADR 0034, section 6)")]
     Unbarriered,
 }
 
@@ -77,6 +78,9 @@ pub(super) struct Held {
     /// 1): the class's mode when the hold was acquired, changed only at a
     /// `Flushed` barrier, never read from the class at each use.
     writes: Writes,
+    /// A batched hold's capture token, while its database captures in
+    /// batched mode. Dropped before the lease and the replica.
+    capture: Option<CaptureHold>,
 }
 
 impl Held {
@@ -87,7 +91,26 @@ impl Held {
             lease,
             replica: None,
             writes,
+            capture: None,
         }
+    }
+
+    /// The capture token the database's batched capture is enabled under,
+    /// made the first time it is asked for.
+    pub(super) fn capture_token(&mut self) -> &CaptureHold {
+        self.capture.get_or_insert_with(CaptureHold::default)
+    }
+
+    /// Whether the hold keeps a capture token.
+    pub(super) fn captures(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Drops the capture token: at a `Flushed` barrier, once the database
+    /// left batched capture, or before a database that is being deleted
+    /// closes.
+    pub(super) fn end_capture(&mut self) {
+        self.capture = None;
     }
 
     /// The hold's mode of writes.
@@ -129,24 +152,54 @@ impl Held {
         self.replica.as_ref()
     }
 
-    /// The barrier this hold has reached now. A strict hold's uploads end
-    /// with their events, so it is always [`Barrier::Flushed`].
-    #[allow(
-        clippy::unused_self,
-        reason = "a batched hold's barrier depends on its uploads (ADR 0034, section 6)"
-    )]
-    pub(super) fn barrier(&self) -> Barrier {
-        Barrier::Flushed
+    /// The barrier this hold has reached now, without waiting: `Flushed`
+    /// with nothing pending, otherwise given up for `reason`. A strict
+    /// hold's uploads end with their events, so it is always
+    /// [`Barrier::Flushed`]. A batched hold is flushed when its replica has
+    /// nothing marked, in flight or to apply (a replica in use is not); the
+    /// wait for it is `ActorState::flush_to_barrier`.
+    pub(super) fn barrier_or(&self, reason: Dropped) -> Barrier {
+        if self.writes == Writes::Strict || self.pending() == Some(false) {
+            Barrier::Flushed
+        } else {
+            Barrier::GaveUp(reason)
+        }
     }
 
-    /// Waits for the hold to reach a barrier, until `deadline` (none: no
-    /// limit): `None` if the deadline passes first. A strict hold has
-    /// nothing pending, so it is at its barrier at once, whatever the
-    /// deadline. Cancel-safe: the mailbox drops this future when an event
-    /// arrives first.
-    pub(super) async fn flush(&self, deadline: Option<tokio::time::Instant>) -> Option<Barrier> {
-        let _ = deadline;
-        Some(self.barrier())
+    /// The barrier a state's drop finds (ADR 0034, section 6). A batched
+    /// hold is flushed there only if the step before the drop found it so
+    /// (`stepped`), its replica has nothing pending, and its database has
+    /// no commit after the last boundary (`unmarked`, `None`: cannot tell,
+    /// the connection being with work cut short). Otherwise it gives up:
+    /// `panic` without a step (the mailbox drops a panicked state outside
+    /// it), `unbarriered` with one. A strict hold is always flushed.
+    pub(super) fn barrier_at_drop(&self, stepped: bool, unmarked: Option<bool>) -> Barrier {
+        if self.writes == Writes::Strict {
+            return Barrier::Flushed;
+        }
+        if stepped && unmarked == Some(false) && self.pending() == Some(false) {
+            return Barrier::Flushed;
+        }
+        Barrier::GaveUp(if stepped {
+            Dropped::Unbarriered
+        } else {
+            Dropped::Panic
+        })
+    }
+
+    /// [`Self::barrier_or`], a hold not flushed counted `unbarriered`.
+    pub(super) fn barrier(&self) -> Barrier {
+        self.barrier_or(Dropped::Unbarriered)
+    }
+
+    /// Whether a batched hold has anything not acknowledged: `None` when
+    /// its replica is in use and cannot tell now. A hold not restored has
+    /// nothing.
+    fn pending(&self) -> Option<bool> {
+        match &self.replica {
+            None => Some(false),
+            Some(r) => r.try_lock().ok().map(|r| !r.nothing_pending()),
+        }
     }
 
     /// Ends the hold and releases the lease: [`Releasing`] dropped releases
@@ -157,7 +210,13 @@ impl Held {
         if let Barrier::GaveUp(reason) = barrier {
             self.count(reason);
         }
-        let Self { lease, replica, .. } = self;
+        let Self {
+            lease,
+            replica,
+            capture,
+            ..
+        } = self;
+        drop(capture);
         drop(replica);
         Releasing(lease)
     }
@@ -169,7 +228,13 @@ impl Held {
     pub(super) fn park(self, barrier: Barrier, address: &ActorAddress) {
         match barrier {
             Barrier::Flushed => {
-                let Self { lease, replica, .. } = self;
+                let Self {
+                    lease,
+                    replica,
+                    capture,
+                    ..
+                } = self;
+                drop(capture);
                 lease.park(address);
                 drop(replica);
             }
@@ -182,27 +247,43 @@ impl Held {
     /// release sent in the background, then what the hold had not
     /// acknowledged is counted as dropped.
     pub(super) fn drop_now(self, reason: Dropped) {
-        let Self { lease, replica, .. } = self;
+        self.drop_now_with(reason, 0);
+    }
+
+    /// [`Self::drop_now`], counting `unmarked` more events: committed after
+    /// the last boundary, so known to no mark.
+    pub(super) fn drop_now_with(self, reason: Dropped, unmarked: u64) {
+        let dropped = self.unacknowledged().saturating_add(unmarked);
+        let Self {
+            lease,
+            replica,
+            capture,
+            ..
+        } = self;
+        drop(capture);
         drop(lease);
-        count(reason, replica.as_ref());
+        drop(replica);
+        crate::metrics::plain_events_dropped(reason.label(), dropped);
     }
 
     /// Counts the events this hold committed and had not acknowledged.
     fn count(&self, reason: Dropped) {
-        count(reason, self.replica.as_ref());
+        crate::metrics::plain_events_dropped(reason.label(), self.unacknowledged());
     }
-}
 
-/// Counts the events committed under a hold and not acknowledged by its
-/// replica, as dropped for `reason`.
-fn count(reason: Dropped, replica: Option<&SharedReplica>) {
-    crate::metrics::plain_events_dropped(reason.label(), unacknowledged(replica));
-}
-
-/// The events whose writes are committed and not acknowledged. A strict
-/// hold acknowledges each event before the next starts: none.
-fn unacknowledged(_replica: Option<&SharedReplica>) -> u64 {
-    0
+    /// The events whose writes are committed and not acknowledged. A
+    /// strict hold acknowledges each event before the next starts: none.
+    /// A batched one's replica counts them (marked and uncaptured, and in
+    /// flight); one in use at the moment counts as one.
+    fn unacknowledged(&self) -> u64 {
+        if self.writes == Writes::Strict {
+            return 0;
+        }
+        match &self.replica {
+            None => 0,
+            Some(r) => r.try_lock().map_or(1, |r| r.unacknowledged_events()),
+        }
+    }
 }
 
 /// A hold that has ended, its lease on the way back. Dropped, the lease is
@@ -281,6 +362,44 @@ mod tests {
         released(&a, &x).await;
     }
 
+    /// A state's drop (ADR 0034, section 6): a batched hold parks only when
+    /// its step found it flushed and its database has no commit the marks
+    /// miss; otherwise it gives up, as a panic's unless a step had found it
+    /// flushed. A strict hold is always flushed.
+    #[tokio::test]
+    async fn a_dropped_state_parks_a_batched_hold_only_when_nothing_is_unmarked() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let a = node(&store).await;
+        let x = ActorAddress::new("t", "c", "x").unwrap();
+        let strict = held(&a, &x).await;
+        for unmarked in [None, Some(true), Some(false)] {
+            assert_eq!(strict.barrier_at_drop(false, unmarked), Barrier::Flushed);
+        }
+        drop(strict.release(Barrier::Flushed));
+        released(&a, &x).await;
+        let batched = Held::new(LeaseHold::acquire(&a, &x).await.unwrap(), Writes::Batched);
+        let gave_up = |reason| Barrier::GaveUp(reason);
+        assert_eq!(
+            batched.barrier_at_drop(false, Some(false)),
+            gave_up(Dropped::Panic)
+        );
+        assert_eq!(
+            batched.barrier_at_drop(false, None),
+            gave_up(Dropped::Panic)
+        );
+        assert_eq!(
+            batched.barrier_at_drop(true, None),
+            gave_up(Dropped::Unbarriered)
+        );
+        assert_eq!(
+            batched.barrier_at_drop(true, Some(true)),
+            gave_up(Dropped::Unbarriered)
+        );
+        assert_eq!(batched.barrier_at_drop(true, Some(false)), Barrier::Flushed);
+        drop(batched.release(Barrier::Flushed));
+        released(&a, &x).await;
+    }
+
     /// A count lands on its reason's series, and only a positive one.
     #[test]
     fn a_drop_is_counted_under_its_reason() {
@@ -332,16 +451,15 @@ mod tests {
     }
 
     /// The step before a drop finds a strict hold at its barrier at once,
-    /// even with a deadline already past (ADR 0034, section 10).
+    /// whatever the reason it would give up for (ADR 0034, section 10).
     #[tokio::test]
-    async fn a_strict_hold_flushes_at_once_whatever_the_deadline() {
+    async fn a_strict_hold_is_at_its_barrier_at_once() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let a = node(&store).await;
         let x = ActorAddress::new("t", "c", "x").unwrap();
         let hold = held(&a, &x).await;
-        let past = tokio::time::Instant::now();
-        for deadline in [None, Some(past)] {
-            assert_eq!(hold.flush(deadline).await, Some(Barrier::Flushed));
+        for reason in ALL {
+            assert_eq!(hold.barrier_or(reason), Barrier::Flushed);
         }
         drop(hold.release(Barrier::Flushed));
         released(&a, &x).await;

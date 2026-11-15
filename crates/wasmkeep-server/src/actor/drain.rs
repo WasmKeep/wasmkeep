@@ -63,6 +63,10 @@ pub(super) struct Move {
 /// Moves under way on a node, by actor.
 pub(super) type Moves = Arc<std::sync::Mutex<HashMap<ActorAddress, Move>>>;
 
+/// How long a hand-over's flush may take (ADR 0034, section 6): 20 s from
+/// the job's start.
+pub(super) const HAND_OVER_FLUSH: Duration = Duration::from_secs(20);
+
 impl ActorState {
     /// The target of a move under way, if one is and its deadline has not
     /// passed (a passed one is cleared).
@@ -102,10 +106,25 @@ impl ActorState {
             self.drop_hold(Dropped::Lapse);
             return HandOver::NotHeld;
         }
+        // A batched hold flushes first, within 20 s from the job's start
+        // (ADR 0034, section 6): past it the hold stays, and the next pass
+        // tries again; on a failure it is given up.
+        match self
+            .flush_to_barrier(Some(tokio::time::Instant::now() + HAND_OVER_FLUSH))
+            .await
+        {
+            Some(Barrier::Flushed) | None if self.batched_replica().is_none() => {}
+            Some(Barrier::Flushed) => self.end_capture_at_barrier().await,
+            Some(Barrier::GaveUp(reason)) => {
+                self.drop_hold(reason);
+                return HandOver::NotHeld;
+            }
+            None => return HandOver::Busy,
+        }
         let alarm = self.committed_alarm().await;
-        // Every event before this job finished with its upload: nothing
-        // is left to replicate. Close the instance and the database before
-        // giving the lease up.
+        // Every event before this job finished with its upload (a batched
+        // hold's flushed above): nothing is left to replicate. Close the
+        // instance and the database before giving the lease up.
         self.live = None;
         self.db = None;
         let Some(hold) = self.held.take() else {

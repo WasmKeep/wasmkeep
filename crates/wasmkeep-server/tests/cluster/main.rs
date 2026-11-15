@@ -49,6 +49,9 @@ mod alarms;
 mod app_delete;
 #[path = "apps.rs"]
 mod apps;
+#[cfg(feature = "batched-writes")]
+#[path = "batched.rs"]
+mod batched;
 #[path = "bucket.rs"]
 mod bucket;
 #[path = "deletes.rs"]
@@ -824,6 +827,8 @@ struct Flaky {
     fail_wal: Arc<std::sync::atomic::AtomicU32>,
     /// Delay segment uploads by this many ms (applied before writing).
     delay_wal_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Delay alarm index entry uploads (`alarms/`) by this many ms.
+    delay_alarm_puts_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The next this-many segment (`/wal/`) reads never answer: a request
     /// the bucket accepted and then left hanging.
     hang_wal_gets: Arc<std::sync::atomic::AtomicU32>,
@@ -932,6 +937,7 @@ impl Flaky {
             down,
             fail_wal: Arc::default(),
             delay_wal_ms: Arc::default(),
+            delay_alarm_puts_ms: Arc::default(),
             hang_wal_gets: Arc::default(),
             fail_wal_gets: Arc::default(),
             hang_history_gets: Arc::default(),
@@ -1085,6 +1091,12 @@ impl ObjectStore for Flaky {
                     store: "flaky",
                     source: "snapshot upload failed".into(),
                 });
+            }
+        }
+        if location.as_ref().starts_with(&test_key(Family::Alarms, "")) {
+            let delay = self.delay_alarm_puts_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
         }
         if location.as_ref().contains("/wal/") {
@@ -1687,6 +1699,9 @@ async fn node_app(
     let mut config = ActorConfig::new(data);
     config.access = version.access;
     config.config = version.config;
+    // As `serve --app` does: the classes the version makes batched (strict
+    // unless the binary has `batched-writes`).
+    config.batched = version.batched;
     config.mailbox.idle_timeout = idle;
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();

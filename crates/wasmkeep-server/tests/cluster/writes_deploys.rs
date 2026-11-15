@@ -1,6 +1,6 @@
 //! A class's mode of writes and the deploy's import check (ADR 0034,
-//! sections 1 and 15). Batched writes are not built yet: a deploy refuses
-//! them. A strict class, said or not, is written exactly as before; a
+//! sections 1 and 15). Batched writes run only in a binary built with
+//! `batched-writes`: without it a deploy refuses them. A strict class, said or not, is written exactly as before; a
 //! component that imports `storage.flush` (or `storage.delete-self-durable`)
 //! is refused while a live node of the app lacks it.
 
@@ -92,14 +92,15 @@ async fn a_strict_class_keeps_the_manifest_bytes() {
     assert!(again.unchanged);
 }
 
-/// Batched writes are not built yet: refused before anything is written,
-/// naming the class.
+/// Batched writes run only in a binary built with `batched-writes` (ADR
+/// 0034, section 15). Without it a deploy refuses them before anything is
+/// written, naming the class; with it the version is written in format 5.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_batched_class_is_refused_for_now() {
+async fn a_batched_class_is_refused_unless_built_with_the_flag() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let rt = deploy_runtime();
     let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
-    let e = app
+    let deployed = app
         .deploy_changes(
             &rt,
             Changes {
@@ -108,8 +109,15 @@ async fn a_batched_class_is_refused_for_now() {
                 ..Changes::default()
             },
         )
-        .await
-        .unwrap_err();
+        .await;
+    if wasmkeep_server::apps::BATCHED_BUILT {
+        let done = deployed.unwrap();
+        let text = manifest_text(&store, "shop", &done.current.version).await;
+        assert!(text.starts_with("wasmkeep-manifest 5\n"), "{text}");
+        assert!(text.contains("writes c batched\n"), "{text}");
+        return;
+    }
+    let e = deployed.unwrap_err();
     assert!(
         matches!(&e, DeployError::BatchedNotYet(c) if c == "c"),
         "{e}"

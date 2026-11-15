@@ -161,3 +161,20 @@ async fn a_failed_flush_stops_replication_and_says_so() {
         r.body
     );
 }
+
+/// A strict event whose durable write failed runs on to its end: its plain
+/// `exec` after it answers, and the actor is given up when the event ends
+/// (ADR 0034, section 8, which concerns batched holds only).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strict_event_runs_to_its_end_after_a_failed_durable_write() {
+    let p = pair(Duration::from_secs(30), Duration::from_secs(30)).await;
+    warmed(&p).await;
+    p.flaky.fail_wal.store(3, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", "/actor/t/x/durable-then-plain", "").await;
+    assert_eq!(
+        (r.status, r.body.trim()),
+        (200, "durable=err plain=ok"),
+        "{}",
+        r.body
+    );
+}

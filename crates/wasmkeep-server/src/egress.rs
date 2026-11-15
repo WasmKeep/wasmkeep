@@ -330,6 +330,7 @@ pub(crate) fn guest_wasi_builder() -> wasmtime_wasi::WasiCtxBuilder {
 /// One per store (actor instance): it carries that store's request budget.
 #[derive(Debug, Clone)]
 pub struct EgressHooks {
+    pub(crate) replica_stop: Option<tokio::sync::watch::Receiver<Option<crate::replica::Stop>>>,
     policy: Arc<EgressPolicy>,
     requests: Arc<tokio::sync::Semaphore>,
 }
@@ -345,6 +346,7 @@ impl EgressHooks {
     pub fn new(policy: Arc<EgressPolicy>) -> Self {
         Self {
             policy,
+            replica_stop: None,
             requests: Arc::new(tokio::sync::Semaphore::new(PER_ACTOR_REQUESTS)),
         }
     }
@@ -363,6 +365,11 @@ impl WasiHttpHooks for EgressHooks {
         fut: Box<dyn Future<Output = Result<(), Error>> + Send>,
     ) -> Box<dyn Future<Output = SendResult> + Send> {
         drop(fut);
+        if crate::replica::stopped(self.replica_stop.as_ref()) {
+            return Box::new(async {
+                Err(Error::InternalError(Some("replication stopped".into())))
+            });
+        }
         let policy = Arc::clone(&self.policy);
         // Both budgets are taken now, or the request fails at once; they are
         // held until the connection is done (the response body read or
@@ -724,6 +731,37 @@ mod tests {
         Pin::from(hooks.send_request(req, None, Box::new(async { Ok(()) })))
             .await
             .err()
+    }
+
+    #[tokio::test]
+    async fn batched_failure_refuses_outgoing_http_but_strict_failure_keeps_policy() {
+        use crate::replica::{Stop, UploadFailure};
+        for batched in [true, false] {
+            let (_sender, flag) = tokio::sync::watch::channel(Some(Stop {
+                reason: UploadFailure::Late,
+                batched,
+            }));
+            let mut hooks = EgressHooks {
+                replica_stop: Some(flag),
+                ..EgressHooks::default()
+            };
+            let req = ::http::Request::builder()
+                .uri("http://127.0.0.1:25/")
+                .body(
+                    http_body_util::Empty::<Bytes>::new()
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                )
+                .unwrap();
+            let result = Pin::from(hooks.send_request(req, None, Box::new(async { Ok(()) }))).await;
+            if batched {
+                assert!(
+                    matches!(result, Err(Error::InternalError(Some(message))) if message == "replication stopped")
+                );
+            } else {
+                assert!(matches!(result, Err(Error::HttpRequestDenied)));
+            }
+        }
     }
 
     #[tokio::test]

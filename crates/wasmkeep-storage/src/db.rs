@@ -671,6 +671,32 @@ impl ActorDb {
         Ok(())
     }
 
+    /// Whether batched capture is on, under a hold that still lives.
+    pub fn batched_capture_enabled(&self) -> bool {
+        self.batch_hold
+            .as_ref()
+            .is_some_and(|h| h.strong_count() != 0)
+    }
+
+    /// Whether the uncaptured part already fills a segment at this
+    /// database's cap ([`Self::set_segment_byte_cap`]): ADR 0034's
+    /// event-start rule 2, judged at the last boundary.
+    pub fn next_segment_full(&self) -> bool {
+        self.boundaries()
+            .last()
+            .is_some_and(|b| b.estimated_bytes >= self.segment_byte_cap)
+    }
+
+    /// Whether something was committed after the last boundary marked (or
+    /// the captured position): what a drop cannot account for from the
+    /// marks. `false` when not capturing.
+    pub fn has_unmarked_commits(&self) -> Result<bool, CaptureError> {
+        match &self.capture {
+            Some(c) => c.has_unmarked_commits(),
+            None => Ok(false),
+        }
+    }
+
     /// Configure the conservative encoded-byte cap (default 1 MiB). Even a
     /// zero cap makes progress: each writing event is then oversize alone.
     pub fn set_segment_byte_cap(&mut self, bytes: u64) {

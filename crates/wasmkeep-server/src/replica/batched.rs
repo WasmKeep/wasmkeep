@@ -117,6 +117,15 @@ impl UploadBudget {
         })
     }
 
+    /// Takes every byte not reserved now, until the guard is dropped: a
+    /// node budget a test fills.
+    pub(crate) fn hold_all(&self) -> OwnedSemaphorePermit {
+        let free = u32::try_from(self.permits.available_permits()).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .try_acquire_many_owned(free)
+            .unwrap_or_else(|_| unreachable!("a semaphore of this node is never closed"))
+    }
+
     /// The bytes not reserved now.
     pub(crate) fn available(&self) -> u64 {
         u64::try_from(self.permits.available_permits()).unwrap_or(u64::MAX)
@@ -232,6 +241,12 @@ pub(crate) struct Stop {
     pub(crate) batched: bool,
 }
 
+/// A cheap, synchronous gate for effects after an asynchronous upload failed.
+/// Strict inline stops deliberately do not close this gate.
+pub(crate) fn stopped(flag: Option<&watch::Receiver<Option<Stop>>>) -> bool {
+    flag.is_some_and(|flag| flag.borrow().as_ref().is_some_and(|stop| stop.batched))
+}
+
 impl Shared {
     fn new() -> Self {
         Self {
@@ -310,6 +325,10 @@ pub(super) struct Uploads {
     sidecar_write: Option<SidecarWrite>,
     /// Last captured boundary, retained while a cut apply finishes its sidecar.
     captured: Option<WalBoundary>,
+    /// Boundaries marked and not captured yet, oldest first, with when they
+    /// were marked: what the event-start rule (ADR 0034, section 3) and the
+    /// drop counter (section 10) read. Pruned when a segment is prepared.
+    marked: std::collections::VecDeque<(WalBoundary, std::time::Instant)>,
 }
 
 impl Default for Uploads {
@@ -321,6 +340,7 @@ impl Default for Uploads {
             sidecar_due: None,
             sidecar_write: None,
             captured: None,
+            marked: std::collections::VecDeque::new(),
         }
     }
 }
@@ -418,6 +438,7 @@ impl Replica {
             }
         });
         self.batched.captured = None;
+        self.batched.marked.clear();
         Ok(())
     }
 
@@ -438,6 +459,86 @@ impl Replica {
     /// The events (boundaries) the segment in flight carries.
     pub(crate) fn in_flight_events(&self) -> usize {
         self.batched.flight.map_or(0, |f| f.events)
+    }
+
+    /// Records a boundary the database marked (`ActorDb::mark_boundary`),
+    /// at `at`. The same boundary again (nothing committed since) is not
+    /// counted twice.
+    pub(crate) fn note_boundary(&mut self, boundary: WalBoundary, at: std::time::Instant) {
+        let known =
+            self.batched.marked.back().is_some_and(|(b, _)| {
+                b.session == boundary.session && b.sequence >= boundary.sequence
+            });
+        if !known && !self.acknowledged_covers(boundary) {
+            self.batched.marked.push_back((boundary, at));
+        }
+    }
+
+    /// Forgets every boundary marked and not captured: the database has
+    /// nothing left to capture (its own count is the one that holds).
+    pub(crate) fn forget_marked(&mut self) {
+        self.batched.marked.clear();
+    }
+
+    /// When the oldest boundary not captured yet was marked: the age the
+    /// event-start rule bounds (ADR 0034, section 3). Boundaries the
+    /// segment in flight carries are captured; a ticket dropped before its
+    /// capture captured nothing.
+    pub(crate) fn oldest_unsent(&self) -> Option<std::time::Instant> {
+        let captured = match *self.batched.shared.slot.borrow() {
+            Slot::Uploading { .. } | Slot::Landed { .. } => self.batched.flight.map(|f| f.sequence),
+            _ => None,
+        };
+        self.batched
+            .marked
+            .iter()
+            .find(|(b, _)| {
+                captured.is_none_or(|c| b.session != c.session || b.sequence > c.sequence)
+            })
+            .map(|(_, at)| *at)
+    }
+
+    /// What a flush waits to see acknowledged when the database marked
+    /// nothing new (ADR 0034, section 4): the boundary the database
+    /// returned, else the segment in flight's, else nothing.
+    pub(crate) fn flush_target(&self, marked: Option<WalBoundary>) -> Option<WalBoundary> {
+        marked.or_else(|| self.batched.flight.map(|f| f.sequence))
+    }
+
+    /// The last boundary marked under this hold: the one a flush waits to
+    /// see acknowledged. `None`: nothing was ever committed in this
+    /// capture session.
+    pub(crate) fn last_marked(&self) -> Option<WalBoundary> {
+        self.batched
+            .marked
+            .back()
+            .map(|(b, _)| *b)
+            .or_else(|| self.captured_sequence())
+    }
+
+    /// The events committed and not acknowledged: every boundary marked
+    /// and not acknowledged yet, in flight or not. What a hold that ends
+    /// without a flush drops (ADR 0034, section 10).
+    pub(crate) fn unacknowledged_events(&self) -> u64 {
+        u64::try_from(self.batched.marked.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether this hold is at its `Flushed` barrier as far as the replica
+    /// knows: nothing marked and uncaptured, nothing in flight, nothing to
+    /// apply, nothing failed (ADR 0034, section 6). The database's own
+    /// uncaptured commits are the caller's to check.
+    pub(crate) fn nothing_pending(&self) -> bool {
+        self.batched.marked.is_empty() && self.uploader_idle()
+    }
+
+    /// One upload's budget at the byte cap: the longest a segment's upload
+    /// task runs (ADR 0034, section 2), 21 s at the defaults. The deadline
+    /// of a hibernation's flush and of a mode switch's (sections 1 and 6).
+    pub(crate) fn upload_budget(&self) -> std::time::Duration {
+        let megabytes = u32::try_from(DEFAULT_SEGMENT_BYTES.div_ceil(1 << 20)).unwrap_or(1);
+        self.upload_idle
+            .saturating_mul(super::UPLOAD_BUDGET_IDLES)
+            .saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
     }
 
     /// The failure flag (ADR 0034, section 8): set the moment a batched
@@ -528,6 +629,11 @@ impl Replica {
                 a.closed.insert(session);
             }
         });
+        // Kept until acknowledged: a ticket dropped before its capture
+        // leaves them uncaptured. Only another capture session's go.
+        self.batched
+            .marked
+            .retain(|(b, _)| b.session == plan.boundary.session);
         self.in_flight = Some(segment.id);
         self.batched.flight = Some(Flight {
             id: segment.id,
@@ -556,7 +662,7 @@ impl Replica {
     /// Resolves once the segment in flight has an outcome to apply (or at
     /// once when none is in flight). Borrows nothing: the caller awaits it
     /// without holding the replica, then calls [`Self::apply`].
-    pub(crate) fn landed(&self) -> impl Future<Output = ()> + Send + 'static {
+    pub(crate) fn landed(&self) -> impl Future<Output = ()> + Send + use<> {
         let mut slot = self.batched.shared.slot.subscribe();
         async move {
             let _ = slot
@@ -609,6 +715,9 @@ impl Replica {
                 result: Ok(()),
             } => {
                 let flight = self.end_flight(id)?;
+                self.batched.marked.retain(|(b, _)| {
+                    b.session != flight.sequence.session || b.sequence > flight.sequence.sequence
+                });
                 self.head = id;
                 self.checksum = post_apply;
                 self.since_snapshot += 1;

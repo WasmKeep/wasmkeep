@@ -149,6 +149,21 @@ impl WalCapture {
             .is_some())
     }
 
+    /// Whether a commit follows the last boundary (or, with none pending,
+    /// the captured position): committed and not marked yet.
+    pub fn has_unmarked_commits(&self) -> Result<bool, CaptureError> {
+        let cursor = if self.scan.events.is_empty() {
+            Cursor {
+                offset: self.offset,
+                header: self.header,
+                running: self.running,
+            }
+        } else {
+            self.scan.cursor
+        };
+        Ok(self.scan_since(cursor)?.is_some())
+    }
+
     /// Plan the next capped capture without consuming WAL or reading pages.
     pub fn next_capture(&self, byte_cap: u64) -> Option<BoundaryPlan> {
         let mut count: usize = 0;

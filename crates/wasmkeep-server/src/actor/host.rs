@@ -12,12 +12,15 @@ pub(super) enum Cut {
     /// This node's lease on the actor ran out while it ran: another node
     /// may own the actor now, so this one must stop.
     Lease,
+    /// An asynchronous batched upload failed during this event.
+    Replica,
 }
 
 impl std::fmt::Display for Cut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Wall(d) => write!(f, "exceeded the {d:?} wall-clock limit"),
+            Self::Replica => f.write_str("stopped: replication stopped"),
             Self::Lease => f.write_str("stopped: this node's lease on the actor ran out"),
         }
     }
@@ -28,20 +31,51 @@ impl std::fmt::Display for Cut {
 /// guest; callers treat a cut like a trap and discard the instance.
 pub(super) async fn limit<F: std::future::Future>(
     wall: Duration,
-    lease: Option<&LeaseHold>,
+    held: Option<&Held>,
     f: F,
 ) -> Result<F::Output, Cut> {
-    let expiry = lease.map(LeaseHold::expiry);
+    let expiry = held.map(|h| h.lease().expiry());
+    let flag = match held.filter(|h| h.writes() == crate::apps::Writes::Batched) {
+        Some(h) => match h.replica() {
+            Some(r) => Some(r.lock().await.failure_flag()),
+            None => None,
+        },
+        None => None,
+    };
     let lease_gone = async move {
         match expiry {
             Some(e) => e.await,
             None => std::future::pending().await,
         }
     };
+    limit_with_failure(wall, lease_gone, flag, f).await
+}
+
+async fn limit_with_failure<F: std::future::Future>(
+    wall: Duration,
+    lease_gone: impl std::future::Future<Output = ()>,
+    flag: Option<tokio::sync::watch::Receiver<Option<crate::replica::Stop>>>,
+    f: F,
+) -> Result<F::Output, Cut> {
+    let replica_stopped = async move {
+        if let Some(mut flag) = flag
+            && flag
+                .wait_for(|s| s.as_ref().is_some_and(|s| s.batched))
+                .await
+                .is_ok()
+        {
+            return;
+        }
+        std::future::pending::<()>().await;
+    };
     let cut = |reason: &str| {
         crate::metrics::inc(&crate::metrics::METRICS.cuts.get(&[("reason", reason)]));
     };
     tokio::select! {
+        () = replica_stopped => {
+            cut("replica");
+            Err(Cut::Replica)
+        }
         r = tokio::time::timeout(wall, f) => r.map_err(|_| {
             cut("wall");
             Cut::Wall(wall)
@@ -76,7 +110,50 @@ pub(super) async fn with_db<T: Send + 'static>(
     store.data_mut().with_db(f).await
 }
 
+type ResponseResult =
+    Result<Response<HyperOutgoingBody>, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>;
+
 impl ActorHost {
+    pub(super) fn response_outparam(
+        &mut self,
+        sender: oneshot::Sender<ResponseResult>,
+    ) -> wasmtime::Result<
+        wasmtime::component::Resource<wasmtime_wasi_http::p2::types::HostResponseOutparam>,
+    > {
+        let stop = self.replica_stop.clone();
+        self.http()
+            .new_response_outparam_from_callback(move |response| {
+                let response = if crate::replica::stopped(stop.as_ref()) {
+                    Err(
+                        wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::InternalError(
+                            Some("replication stopped".into()),
+                        ),
+                    )
+                } else {
+                    response
+                };
+                let _ = sender.send(response);
+            })
+    }
+
+    fn replication_stopped(&self) -> bool {
+        crate::replica::stopped(self.replica_stop.as_ref())
+    }
+
+    fn check_replication(&self) -> wasmtime::Result<()> {
+        if self.replication_stopped() {
+            wasmtime::bail!("replication stopped");
+        }
+        Ok(())
+    }
+
+    fn stopped_sql(&self) -> Option<SqlError> {
+        self.replication_stopped().then(|| SqlError {
+            kind: SqlErrorKind::Internal,
+            message: REPLICATION_STOPPED.into(),
+        })
+    }
+
     /// `exec-durable` without the timing (see the `storage::Host` impl).
     pub(super) async fn exec_durable_untimed(
         &mut self,
@@ -90,6 +167,17 @@ impl ActorHost {
                 .await?;
             return Ok(r.map_err(from_db_error));
         };
+        // A batched hold: `exec` and then `flush` (ADR 0034, section 4).
+        if let Some(slot) = self.batched_slot() {
+            let changed = self
+                .with_db(move |db| db.exec_commit(&sql, &params))
+                .await?;
+            let changed = match changed {
+                Ok(n) => n,
+                Err(e) => return Ok(Err(from_db_error(e))),
+            };
+            return Ok(self.flush_batched(slot).await.map(|()| changed));
+        }
         // In a cluster, durable means uploaded while the lease was valid:
         // the commit is not fsynced locally as well. A node trusts a local
         // file again only if it is exactly the bucket's head
@@ -190,6 +278,9 @@ impl ActorHost {
             let r = self.with_db(ActorDb::sync_committed).await?;
             return Ok(r.map_err(from_db_error));
         };
+        if let Some(slot) = self.batched_slot() {
+            return Ok(self.flush_batched(slot).await);
+        }
         let mut replica = slot.lock().await;
         let outcome = self
             .with_db(|db| {
@@ -266,6 +357,94 @@ impl ActorHost {
         Ok(Ok(()))
     }
 
+    /// A batched hold's `flush` (ADR 0034, section 4), and the flush of its
+    /// `exec-durable` once the statement committed: a pending alarm listed
+    /// in the bucket's index first (its PUT returns before any segment
+    /// naming it is captured; the entry it replaces is not retired, slice
+    /// S10), then every commit so far flushed through the uploader, until
+    /// the event's wall less one second. Refused inside a transaction.
+    async fn flush_batched(&mut self, slot: SharedReplica) -> Result<(), SqlError> {
+        let read = self
+            .with_db(|db| {
+                db.flushable()?;
+                let alarm = db.alarm()?;
+                let indexed = db
+                    .meta(ALARM_INDEXED_KEY)?
+                    .as_deref()
+                    .and_then(alarm_index::parse_meta);
+                Ok((alarm, indexed))
+            })
+            .await
+            .map_err(|e| uploads::FlushError::Stopped(format!("{e:#}")).to_sql())?;
+        let (alarm, indexed) = read.map_err(from_db_error)?;
+        if let Some((cluster, address)) = self.alarm_index.clone()
+            && alarm_index::needs_publish(indexed.as_ref(), alarm)
+        {
+            let (generation, budget) = {
+                let r = slot.lock().await;
+                (r.generation(), r.upload_budget())
+            };
+            // Bounded by the flush's deadline and one upload budget (ADR
+            // 0034, section 9): past them the commit stays unmarked, so no
+            // segment carries it before its entry exists; an entry landing
+            // later is an extra one, delivered and removed as unnamed.
+            let until = self
+                .batched
+                .as_ref()
+                .map_or_else(tokio::time::Instant::now, |b| b.flush_until)
+                .min(tokio::time::Instant::now() + budget);
+            let entry = match alarm {
+                Some(at) => match tokio::time::timeout_at(
+                    until,
+                    cluster.put_new_alarm_entry(&address, at, generation),
+                )
+                .await
+                {
+                    Err(_) => return Err(uploads::FlushError::StillUploading.to_sql()),
+                    Ok(Ok(entry)) => Some(entry),
+                    Ok(Err(e)) => {
+                        slot.lock().await.fail(format!("alarm index: {e}"));
+                        return Err(
+                            uploads::FlushError::Stopped(format!("alarm index: {e}")).to_sql()
+                        );
+                    }
+                },
+                None => None,
+            };
+            let value = alarm_index::to_meta(entry.as_ref());
+            let wrote = self
+                .with_db(move |db| db.set_meta(ALARM_INDEXED_KEY, &value))
+                .await;
+            if !matches!(wrote, Ok(Ok(()))) {
+                slot.lock()
+                    .await
+                    .fail("alarm index: recording the entry failed");
+                return Err(uploads::FlushError::Stopped(
+                    "alarm index: recording the entry failed".into(),
+                )
+                .to_sql());
+            }
+        }
+        let (until, completion) = match &self.batched {
+            Some(b) => (b.flush_until, Some(b.completion.clone())),
+            None => (tokio::time::Instant::now(), None),
+        };
+        uploads::flush_through(
+            &slot,
+            &mut uploads::DbAt::Host(self),
+            completion.as_ref(),
+            until,
+        )
+        .await
+        .map_err(|e| e.to_sql())
+    }
+
+    /// The batched hold's replica, if the running event's hold is batched.
+    fn batched_slot(&self) -> Option<SharedReplica> {
+        self.batched.as_ref()?;
+        self.replica.clone()
+    }
+
     pub(super) fn new(db: ResidentDb, sockets: Arc<Sockets>) -> Self {
         Self {
             checked_seq: None,
@@ -283,7 +462,9 @@ impl ActorHost {
             call: None,
             sockets,
             replica: None,
+            replica_stop: None,
             alarm_index: None,
+            batched: None,
             egress: crate::egress::EgressHooks::default(),
             env: Arc::default(),
         }
@@ -356,8 +537,7 @@ pub(crate) const REPLICATION_STOPPED: &str = "replication stopped";
 
 /// How a batched class's `storage.flush` starts its `internal` when the
 /// event's wall ran out while the upload went on (ADR 0034, section 4).
-/// Reserved: a strict class never answers it, its upload being inline.
-#[allow(dead_code, reason = "a batched flush's wall case (ADR 0034, slice S9)")]
+/// A strict class never answers it, its upload being inline.
 pub(crate) const STILL_UPLOADING: &str = "not durable: still uploading";
 
 /// A durable delete not known to be durable.
@@ -402,6 +582,16 @@ impl ActorHost {
             self.delete_retry = true;
             return Ok(self.remove_files_durably().await);
         };
+        // A batched hold resets only at its acknowledged head (ADR 0034,
+        // section 7): everything committed so far is flushed first, a
+        // pending alarm listed in the index before it (as `flush` does); a
+        // flush that fails or runs out answers `internal`, and calling this
+        // again is safe.
+        if let Some(batched) = self.batched_slot()
+            && let Err(e) = self.flush_batched(batched).await
+        {
+            return Ok(Err(not_durable(e.message)));
+        }
         let mut replica = slot.lock().await;
         if let Some(reason) = replica.failed() {
             return Ok(Err(not_durable(format!("replication stopped ({reason})"))));
@@ -478,6 +668,9 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<u64, SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -491,6 +684,9 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<u64, SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -509,6 +705,9 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<Rows, SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -526,15 +725,22 @@ impl storage::Host for ActorHost {
     }
 
     async fn delete_self(&mut self) -> wasmtime::Result<()> {
+        self.check_replication()?;
         self.delete_requested = true;
         Ok(())
     }
 
     async fn delete_self_durable(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         self.delete_durably().await
     }
 
     async fn flush(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -544,6 +750,7 @@ impl storage::Host for ActorHost {
 
 impl alarms::Host for ActorHost {
     async fn set_alarm(&mut self, at: u64) -> wasmtime::Result<()> {
+        self.check_replication()?;
         if self.deleted.is_some() || self.delete_retry {
             return Ok(()); // the actor was deleted in this event
         }
@@ -556,6 +763,7 @@ impl alarms::Host for ActorHost {
     }
 
     async fn get_alarm(&mut self) -> wasmtime::Result<Option<u64>> {
+        self.check_replication()?;
         if self.deleted.is_some() || self.delete_retry {
             return Ok(None);
         }
@@ -565,6 +773,7 @@ impl alarms::Host for ActorHost {
     }
 
     async fn clear_alarm(&mut self) -> wasmtime::Result<()> {
+        self.check_replication()?;
         if self.deleted.is_some() || self.delete_retry {
             return Ok(());
         }
@@ -583,6 +792,7 @@ impl actors::Host for ActorHost {
         address: String,
         request: CallRequest,
     ) -> wasmtime::Result<Result<CallResponse, CallError>> {
+        self.check_replication()?;
         let Some(ctx) = self.call.clone() else {
             return Ok(Err(CallError::Failed("no call context".into())));
         };
@@ -636,6 +846,7 @@ impl calls::Host for ActorHost {
         &mut self,
         calls: Vec<(String, CallRequest)>,
     ) -> wasmtime::Result<Vec<Result<CallResponse, CallError>>> {
+        self.check_replication()?;
         if let Some(refused) = refuse_batch(&calls) {
             return Ok(refused);
         }
@@ -684,6 +895,7 @@ impl websockets::Host for ActorHost {
         conn: u64,
         msg: WsMessageWit,
     ) -> wasmtime::Result<Result<(), WsSendError>> {
+        self.check_replication()?;
         let Some(me) = self.call.as_ref().map(|c| c.me.clone()) else {
             return Ok(Err(WsSendError::UnknownConnection));
         };
@@ -701,6 +913,7 @@ impl websockets::Host for ActorHost {
     }
 
     async fn close(&mut self, conn: u64, code: u16, reason: String) -> wasmtime::Result<()> {
+        self.check_replication()?;
         if let Some(me) = self.call.as_ref().map(|c| c.me.clone()) {
             self.sockets.close(&me, conn, code, truncate_reason(reason));
         }
@@ -752,5 +965,61 @@ pub(super) fn from_db_error(e: wasmkeep_storage::SqlError) -> SqlError {
     SqlError {
         kind,
         message: e.message,
+    }
+}
+
+#[cfg(test)]
+mod batched_failure_tests {
+    use super::*;
+    use crate::replica::{Stop, UploadFailure};
+
+    #[tokio::test]
+    async fn a_batched_failure_cuts_a_running_event_without_applying_it() {
+        let (sender, flag) = tokio::sync::watch::channel(None);
+        let event = async move {
+            sender.send_replace(Some(Stop {
+                reason: UploadFailure::Late,
+                batched: true,
+            }));
+            std::future::pending::<()>().await;
+        };
+        assert!(matches!(
+            limit_with_failure(
+                Duration::from_secs(1),
+                std::future::pending(),
+                Some(flag),
+                event
+            )
+            .await,
+            Err(Cut::Replica)
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_failure_and_closed_watch_do_not_cut_an_event() {
+        for close in [false, true] {
+            let (sender, flag) = tokio::sync::watch::channel(Some(Stop {
+                reason: UploadFailure::Late,
+                batched: false,
+            }));
+            if close {
+                drop(sender);
+            }
+            let event = async {
+                tokio::task::yield_now().await;
+                42
+            };
+            assert_eq!(
+                limit_with_failure(
+                    Duration::from_secs(1),
+                    std::future::pending(),
+                    Some(flag),
+                    event
+                )
+                .await
+                .unwrap(),
+                42
+            );
+        }
     }
 }

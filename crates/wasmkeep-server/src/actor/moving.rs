@@ -229,6 +229,21 @@ impl ActorState {
             self.drop_hold(Dropped::Lapse);
             return MoveOut::NotHeld;
         }
+        // A batched hold flushes first, within 20 s, and the move is
+        // recorded after it (ADR 0034, section 6): past it the move is
+        // tried again; on a failure the hold is given up.
+        match self
+            .flush_to_barrier(Some(tokio::time::Instant::now() + drain::HAND_OVER_FLUSH))
+            .await
+        {
+            Some(Barrier::Flushed) | None if self.batched_replica().is_none() => {}
+            Some(Barrier::Flushed) => self.end_capture_at_barrier().await,
+            Some(Barrier::GaveUp(reason)) => {
+                self.drop_hold(reason);
+                return MoveOut::NotHeld;
+            }
+            None => return MoveOut::Busy,
+        }
         let Ok(alarm) = self.alarm_from_database().await else {
             return MoveOut::Busy; // read again on the next attempt
         };

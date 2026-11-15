@@ -63,6 +63,7 @@ mod sockets;
 mod start;
 mod state;
 mod upgrade;
+mod uploads;
 
 #[allow(
     clippy::wildcard_imports,
@@ -77,6 +78,15 @@ use self::held::{Barrier, Dropped, Held};
 
 pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};
+#[cfg(feature = "batched-writes")]
+pub use self::uploads::hold_node_upload_budget;
+
+/// `--max-unsent-age`'s default and bounds (ADR 0034, section 3).
+pub(crate) const DEFAULT_UNSENT_AGE: Duration = Duration::from_millis(500);
+/// The shortest `--max-unsent-age`.
+pub(crate) const MIN_UNSENT_AGE: Duration = Duration::from_millis(100);
+/// The longest `--max-unsent-age`.
+pub(crate) const MAX_UNSENT_AGE: Duration = Duration::from_secs(5);
 
 /// How long a node trusts "node X holds this actor" without asking the
 /// bucket again.
@@ -143,8 +153,14 @@ pub struct ActorConfig {
     /// only; classes not listed never expire).
     pub expire_after_idle: std::collections::BTreeMap<String, Duration>,
     /// The classes whose writes are batched (ADR 0034, section 1): the
-    /// deployed version's; every other class is strict.
+    /// deployed version's; every other class is strict. Batched only in a
+    /// binary built with `batched-writes` ([`crate::apps::BATCHED_BUILT`]).
     pub batched: std::collections::BTreeSet<String>,
+    /// `--max-unsent-age` (ADR 0034, section 3): how long a committed write
+    /// of a batched actor may wait unsent behind the segment in flight
+    /// before the actor stops starting events. 500 ms; kept within 100 ms
+    /// and 5 s.
+    pub max_unsent_age: Duration,
     /// Who may reach each class from outside (ADR 0010): the deployed
     /// version's rules, or `--access` for classes not from a deploy.
     pub access: crate::access::AccessRules,
@@ -202,6 +218,7 @@ impl ActorConfig {
             requires: std::collections::BTreeMap::new(),
             expire_after_idle: std::collections::BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            max_unsent_age: DEFAULT_UNSENT_AGE,
             access: crate::access::AccessRules::default(),
             flag_access: None,
             deploy_seq: 0,
@@ -819,6 +836,7 @@ struct ActorHost {
     sockets: Arc<Sockets>,
     /// Replication, so `exec-durable` can wait for the bucket.
     replica: Option<SharedReplica>,
+    replica_stop: Option<tokio::sync::watch::Receiver<Option<crate::replica::Stop>>>,
     /// Sends the guest's outbound HTTP under the node's egress policy.
     egress: crate::egress::EgressHooks,
     /// The class's `env` values.
@@ -826,6 +844,16 @@ struct ActorHost {
     /// In a cluster: where to list a pending alarm before `exec-durable`
     /// ships it, so no alarm reaches the bucket unindexed.
     alarm_index: Option<(Arc<Cluster>, ActorAddress)>,
+    /// The running event's, when its hold is batched (ADR 0034): where
+    /// `flush` stops waiting, and whom its uploads tell when they land.
+    batched: Option<BatchedEvent>,
+}
+
+/// What a batched hold's event gives its `flush` (ADR 0034, section 4).
+struct BatchedEvent {
+    /// The event's wall less one second.
+    flush_until: tokio::time::Instant,
+    completion: uploads::Completion,
 }
 
 type ServiceSlot = Arc<std::sync::OnceLock<std::sync::Weak<ServiceInner>>>;
@@ -884,3 +912,5 @@ mod tests;
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod batched_state_tests;
