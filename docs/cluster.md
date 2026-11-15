@@ -3,10 +3,10 @@
 > **Pre-alpha.** Ownership, forwarding, replication, failover and deploys
 > work and are tested (simulations in `sim/` and multi-node tests), and have run
 > against Cloudflare R2 and OVHcloud Object Storage, with nodes killed
-> under load and nothing lost
-> ([measured](benchmarks.md#three-nodes-against-a-real-bucket)), but not
-> yet under production load or against AWS S3. Do not trust a cluster with
-> data you care about yet (see the [roadmap](../ROADMAP.md)).
+> under load and no acknowledged durable writes lost
+> ([measured](benchmarks.md#three-nodes-against-a-real-bucket)). Plain writes
+> may be lost. Not yet under production load or against AWS S3. Do not
+> trust a cluster with data you care about yet (see the [roadmap](../ROADMAP.md)).
 
 Nodes share one S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, ...) that
 supports conditional writes (`If-None-Match` / `If-Match`). There is nothing

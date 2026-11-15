@@ -20,7 +20,9 @@ Each actor:
    messages and alarms queue up in the actor's mailbox. Inside an actor you
    never need a lock.
 2. **Owns a private SQLite database.** Nothing else can read or write it.
-   Committed writes survive restarts.
+   Use `exec-durable` for acknowledgement after fsync on a standalone node
+   or replication to the bucket in a cluster, while the hold is valid.
+   Plain writes may be lost on failure.
 3. **Hibernates when idle.** Its code leaves memory after a timeout (30 s by
    default) and is brought back by the next event, in about a millisecond.
    Data, the pending alarm and open WebSockets all survive this.
@@ -80,7 +82,8 @@ Next: [Concepts](concepts.md) for how actors behave, or
 - **Interface**: a [WIT world](../crates/wasmkeep-wit/wit/actor.wit) on top of
   the standard `wasi:http/proxy`, so the request handler is ordinary WASI
   HTTP, plus WasmKeep's storage, alarms, actor calls and WebSockets.
-- **Languages**: anything that builds a WASI 0.2 component. Rust,
+- **Languages**: toolchains that build WASI 0.2 components implementing
+  WasmKeep's interfaces. SDK capabilities and runtime tradeoffs vary. Rust,
   TypeScript, Python, C, Zig and Go (TinyGo) have SDKs and pass the same
   tests; D and MoonBit have experimental SDKs, and standard Go and C#
   each build a counter (see [languages](languages.md)).
@@ -89,7 +92,9 @@ Next: [Concepts](concepts.md) for how actors behave, or
 - **Clustering**: each actor's changes stream to an S3-compatible bucket;
   several nodes share the bucket and use it to decide, with conditional
   writes, which node owns each actor. If a node dies, another takes its
-  actors over. No consensus cluster to run: if the bucket is up, WasmKeep is up.
+  actors over. No separate consensus service is required. Availability
+  depends on live nodes, network access, valid leases and the bucket;
+  actors pause during takeover and restore.
 
 Design details and the reasoning behind each decision are in
 [`docs/adr`](adr/); [Concepts](concepts.md) and [Running a cluster](cluster.md)

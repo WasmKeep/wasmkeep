@@ -11,7 +11,9 @@
   and parking; the mailbox's drop step racing new jobs; the index's
   requests per segment; the capability word's bootstrap; a mode change
   on a resident actor; uncatchable verification variants; several
-  figures). Nothing here is built.
+  figures). The strict-only foundations S0 (golden trace), S1
+  (snapshot and reset guards) and S2 (`Held` and `Barrier`) are merged.
+  Batched behavior is not enabled.
 - Revised after the sign-off review (2026-11-15). That review signed the
   design off with conditions: the strict-only slices S0 to S5 of the
   plan may start; nothing that changes a batched class's behaviour
@@ -28,8 +30,8 @@
   is its slice plan. Line numbers cited here are those of `main` at
   `947f92c`.
 - Date: 2026-11-15
-- Milestone: [After that](../../ROADMAP.md#after-that), "Faster, and
-  compared": a plain write that does not hold its actor during the upload
+- Milestone: [Now](../../ROADMAP.md#now), `0.5.0`: opt-in batched
+  plain writes, with strict behavior the default.
 - Amends, if accepted: [ADR 0007](0007-replication-protocol.md) (a
   segment carries the commits of several events; snapshots and resets
   only at the acknowledged head; the checkpoint sentence, corrected

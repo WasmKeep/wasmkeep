@@ -1,7 +1,7 @@
 # WasmKeep
 
-**Run many tiny stateful actors, written in any language that compiles to
-WebAssembly, on servers you own.**
+**Run many tiny stateful actors on servers you own, using languages whose
+toolchains support WasmKeep's WASI 0.2 component interfaces.**
 
 WasmKeep is a self-hosted platform for *actors*: small programs that each own a
 piece of state (a chat room, a user's session, a game lobby, a rate limit, a
@@ -22,10 +22,10 @@ own machines.**
 > to about 21 s after its last write, then the restore;
 > [how it works](docs/cluster.md#how-it-works)), and `wasmkeep deploy` for new versions of
 > an app. Soaked against Cloudflare R2 and OVHcloud Object Storage with
-> nodes killed under load, nothing lost
-> ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)), but
-> not yet carrying real users' traffic: not production-ready. See
-> [Status](#status) and the [roadmap](ROADMAP.md).
+> nodes killed under load, no acknowledged durable writes lost
+> ([measured](docs/benchmarks.md#three-nodes-against-a-real-bucket)). Plain
+> writes may be lost. Not yet carrying real users' traffic: not
+> production-ready. See [Status](#status) and the [roadmap](ROADMAP.md).
 >
 > **Scale, as measured so far** (one workstation, data in RAM, in-memory
 > bucket; [benchmarks](docs/benchmarks.md#restart-and-alarm-recovery-against-actor-count)):
@@ -49,10 +49,11 @@ own machines.**
   disk, plus a little host state for any open WebSocket. It wakes in about
   a millisecond, with its data, its pending alarm and even its open
   WebSockets.
-- **Any language.** The runtime is language-agnostic: actors are standard
-  WASI 0.2 components, and an app can be polyglot, its actors in
-  different languages calling each other. Rust,
-  TypeScript, Python, C, Zig and Go (TinyGo) have SDKs and pass the same
+- **Languages with WASI 0.2 component toolchains.** Actors implement
+  WasmKeep's component interfaces; an app can be polyglot, its actors in
+  different languages calling each other. SDK capabilities and runtime
+  tradeoffs vary. Rust, TypeScript, Python, C, Zig and Go (TinyGo)
+  have SDKs and pass the same
   tests; standard Go, D and MoonBit are experimental, and a C# counter
   builds through componentize-dotnet; more are next ([languages](docs/languages.md)). An
   actor imports WasmKeep's own interfaces (`wasmkeep:actor`, for storage,
@@ -85,7 +86,8 @@ own machines.**
   old history and deploys are garbage-collected
   ([running a cluster](docs/cluster.md)).
 - **Yours to run.** One binary on a VPS is a complete deployment. Apache-2.0.
-  No account, no vendor, no egress fees to someone else's network.
+  No WasmKeep account or service fee. You pay your provider's compute,
+  storage, request and network charges.
 
 ## Who it is for
 
@@ -295,17 +297,20 @@ WasmKeep is young and **pre-alpha**: its releases so far, `0.1.0`,
 - **Measured on real infrastructure**: three-node soaks against Cloudflare
   R2 and OVHcloud Object Storage, from a desktop and from three VPS next
   to the bucket, 36 nodes killed under load without losing or duplicating
-  a write ([benchmarks](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
+  an acknowledged durable write
+  ([benchmarks](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
 - **On node leases** (one lease per node, which replaced one per actor:
   [ADR 0020](docs/adr/0020-one-lease-per-node.md)): a twelve-hour soak
-  with nothing lost or duplicated over 35 kills, writable again in 18.2 s
-  at the median, 24.4 s at p99. Not passed yet: one actor was writable
-  again only 90 s after the kill (most of it a 56 s restore), and
-  durable writes are slower in the tail than with per-actor leases (p99
-  about 1.7 times, measured side by side). Those runs predate
-  the fixes since (bounded segment uploads and restore reads), which
-  still need a soak of their own
+  with no acknowledged durable writes lost or duplicated over 35 kills,
+  writable again in 18.2 s at the median, 24.4 s at p99. Those historical
+  runs included a 90 s recovery (most of it a 56 s restore) and durable
+  write p99 about 1.7 times that of per-actor leases, measured side by side
   ([benchmarks](docs/benchmarks.md#three-nodes-against-a-real-bucket)).
+  After the upload and restore fixes, the 0.4.2 candidate
+  (`563cb94`) ran for two hours: 39 kills, 378,472 acknowledged durable
+  writes, none lost or duplicated; writable again at 17.4 s median,
+  22.5 s p99 and 29.0 s maximum. One plain write was lost, as the contract
+  permits ([result CSV](bench/results/2026-11-14-563cb94-soak-ovh-bhs-3vps-2h-0.4.2-rc.csv)).
 - **Not yet**: weeks of real traffic, a run against AWS S3. What is left is on the [roadmap](ROADMAP.md).
 
 Do not trust it with data you care about yet.
@@ -341,9 +346,9 @@ WasmKeep is not affiliated with or endorsed by any of them.
 ## History and use of AI
 
 I wanted a Durable Objects-style platform I could run myself, with actors
-in any language and their data in a bucket I own, without a per-request
-bill. WasmKeep is that,
-and it is also an experiment: how far infrastructure software can go when
+in languages with WASI 0.2 component toolchains and their data in a bucket
+I own, without a WasmKeep service fee. WasmKeep is that, and it is also an
+experiment: how far infrastructure software can go when
 AI writes most of the code under a human's design and review.
 
 It started from a design document I wrote: the architecture, the

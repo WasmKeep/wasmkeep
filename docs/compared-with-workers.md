@@ -14,18 +14,22 @@ Workers strong is the platform, not the runtime.
 - **Durable actors on your own servers, with failover.** Each actor's
   SQLite database is replicated to any S3-compatible bucket, and when a
   node dies another takes its actors over. With one lease per node
-  ([ADR 0020](adr/0020-one-lease-per-node.md)), over twelve hours and 35
-  kills under load next to the bucket: writable again 18.2 s after the
-  kill at the median, 24.4 s at p99, with nothing acknowledged lost; one
-  actor was writable again only 90 s after the kill, most of it a restore
-  whose total time nothing bounds yet
-  ([measured](benchmarks.md#three-nodes-against-a-real-bucket)). workerd
+  ([ADR 0020](adr/0020-one-lease-per-node.md)), the 0.4.2 candidate
+  (`563cb94`) ran for two hours on three VPS next to the bucket: writable
+  again at 17.4 s median, 22.5 s p99 and 29.0 s maximum. Across 39 kills,
+  no acknowledged durable writes were lost or duplicated; one plain write
+  was lost ([result CSV](../bench/results/2026-11-14-563cb94-soak-ovh-bhs-3vps-2h-0.4.2-rc.csv)).
+  The older twelve-hour run (18.2 s median, 24.4 s p99 and a 90 s
+  recovery) predates the upload and
+  restore-read bounds; it remains a historical measurement
+  ([benchmarks](benchmarks.md#three-nodes-against-a-real-bucket)). workerd
   runs Durable Objects on one machine, without replication or failover
   between machines; that is the hosted platform's.
-- **Any language, as an equal.** Actors are standard WebAssembly
-  components run by Wasmtime: Rust, TypeScript, Python, C, Zig and Go
-  (TinyGo) ([languages](languages.md)). Workers are built around JavaScript; other
-  languages run as WebAssembly inside a JavaScript isolate, with
+- **Languages with WASI 0.2 component toolchains.** Actors implement
+  WasmKeep's component interfaces and run on Wasmtime: Rust, TypeScript,
+  Python, C, Zig and Go (TinyGo). SDK capabilities and runtime tradeoffs
+  vary ([languages](languages.md)). Workers are built around JavaScript;
+  other languages run as WebAssembly inside a JavaScript isolate, with
   JavaScript glue.
 - **Less CPU for compiled languages.** On the same counter, WasmKeep with
   Rust used 104 µs of server CPU per request against workerd's 128 µs on
@@ -37,9 +41,9 @@ Workers strong is the platform, not the runtime.
   engine in between.
 - **Your data, your bill.** The data is SQLite files and a documented
   replication format ([ADR 0007](adr/0007-replication-protocol.md)) in a
-  bucket you own. There is no per-request price: a cluster costs its
-  servers and its bucket (on R2, its requests too:
-  [measured](benchmarks.md#three-nodes-against-a-real-bucket)).
+  bucket you own. There is no WasmKeep service fee; you pay your
+  provider's compute, storage, request and network charges
+  ([measured bucket requests](benchmarks.md#bucket-requests-at-rest)).
 - **Durable workflows as a library**, on actors and alarms, in Rust and
   TypeScript with clients in the Go, Python, C and Zig SDKs ([workflows](workflows.md)).
 
@@ -69,8 +73,8 @@ Workers strong is the platform, not the runtime.
 
 WasmKeep is the better fit for stateful, self-hosted apps, especially in
 compiled languages, where the data should live in your own bucket and the
-cost should be your servers. Workers is the better fit for
-JavaScript-first apps that want a global edge and a mature ecosystem
+cost should be your infrastructure and provider charges. Workers is the
+better fit for JavaScript-first apps that want a global edge and a mature ecosystem
 today. The two programming models are close: an app designed around one
 actor per room, user or document keeps its design on either, though its
 code has to be ported to the other's APIs.
