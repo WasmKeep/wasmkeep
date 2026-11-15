@@ -639,6 +639,10 @@ impl ActorState {
         // 0034, section 9): the row written, then flushed to its barrier,
         // judged on the acknowledged head below.
         if self.batched_replica().is_some() {
+            // Capturing before the row is written, so its segment has it.
+            if self.ensure_batched_capture().is_err() {
+                return false;
+            }
             let wrote = match (self.live.as_mut(), self.db.as_mut()) {
                 (Some(live), _) => matches!(
                     with_db(&mut live.store, move |db| db

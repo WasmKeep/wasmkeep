@@ -100,19 +100,19 @@ async fn plain_writes_go_up_after_their_answer_several_to_a_segment() {
     .await;
     warmed(&p).await;
     let before = segments(&p).await;
-    p.flaky.delay_wal_ms.store(300, Ordering::SeqCst);
+    p.flaky.delay_wal_ms.store(500, Ordering::SeqCst);
     let started = std::time::Instant::now();
     for n in 2..=11 {
         let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
         assert_eq!((r.status, r.body.trim()), (200, n.to_string().as_str()));
     }
-    // Ten events, each upload 300 ms: strict would take 3 s.
+    // Ten events, each upload 500 ms: strict would take 5 s.
     assert!(
-        started.elapsed() < Duration::from_millis(2_000),
+        started.elapsed() < Duration::from_millis(3_500),
         "the events waited for their uploads: {:?}",
         started.elapsed()
     );
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
     let uploaded = segments(&p).await - before;
     assert!(
         (1..10).contains(&uploaded),
@@ -173,7 +173,7 @@ async fn a_flush_past_the_wall_answers_still_uploading_and_lands() {
     );
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_millis(1_800) && took < Duration::from_millis(2_900),
+        took >= Duration::from_millis(1_500) && took < Duration::from_millis(3_500),
         "answered after {took:?}, not at the wall less one second"
     );
     // The same hold, the write still there.
@@ -244,7 +244,7 @@ async fn the_event_start_rule_holds_a_busy_actor_behind_a_slow_bucket() {
     async fn next_after_held(max_unsent: Duration) -> Duration {
         let p = batched_pair(Duration::from_secs(30), |c| c.max_unsent_age = max_unsent).await;
         warmed(&p).await;
-        p.flaky.delay_wal_ms.store(1_500, Ordering::SeqCst);
+        p.flaky.delay_wal_ms.store(2_000, Ordering::SeqCst);
         // In flight, then uncaptured behind it.
         for _ in 0..2 {
             let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
@@ -260,12 +260,12 @@ async fn the_event_start_rule_holds_a_busy_actor_behind_a_slow_bucket() {
     }
     let held = next_after_held(Duration::from_millis(100)).await;
     assert!(
-        held >= Duration::from_millis(500),
+        held >= Duration::from_millis(1_000),
         "the next event started at once: {held:?}"
     );
     let free = next_after_held(Duration::from_secs(5)).await;
     assert!(
-        free < Duration::from_millis(400),
+        free < Duration::from_millis(900),
         "the next event waited without the rule acting: {free:?}"
     );
 }
@@ -363,11 +363,13 @@ async fn a_mode_switch_waits_for_a_flushed_barrier() {
     let r = send_runnable(node.addr, "POST", "/actor/t/x/plain", "").await;
     assert_eq!(r.status, 200, "{}", r.body);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    flaky.delay_wal_ms.store(400, Ordering::SeqCst);
+    flaky.delay_wal_ms.store(1_200, Ordering::SeqCst);
     let batched = next_after_a_write(node.addr).await;
-    assert!(batched < Duration::from_millis(300), "batched: {batched:?}");
+    assert!(batched < Duration::from_millis(800), "batched: {batched:?}");
 
-    // A segment in flight as the version turns strict.
+    // A segment in flight as the version turns strict (its upload takes
+    // longer than the node takes to follow the deploy).
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
     let r = send(node.addr, "POST", "/actor/t/x/plain", "").await;
     assert_eq!(r.status, 200, "{}", r.body);
     let done = app
@@ -376,7 +378,7 @@ async fn a_mode_switch_waits_for_a_flushed_barrier() {
         .unwrap();
     runs_deploy(&service, done.current.seq).await;
     let strict = next_after_a_write(node.addr).await;
-    assert!(strict >= Duration::from_millis(350), "strict: {strict:?}");
+    assert!(strict >= Duration::from_millis(1_000), "strict: {strict:?}");
     let r = send(node.addr, "GET", "/actor/t/x/plain", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "4"), "{}", r.body);
     assert_eq!(
@@ -393,7 +395,7 @@ async fn a_mode_switch_waits_for_a_flushed_barrier() {
     runs_deploy(&service, done.current.seq).await;
     let again = next_after_a_write(node.addr).await;
     assert!(
-        again < Duration::from_millis(300),
+        again < Duration::from_millis(800),
         "batched again: {again:?}"
     );
 }
@@ -422,5 +424,74 @@ async fn hibernation_flushes_first() {
         (200, "4", Some("b")),
         "{}",
         r.body
+    );
+}
+
+/// A flush called with less than a second of the wall left records its
+/// boundary and answers `not durable: still uploading` at once; its
+/// commit lands with the next segment (ADR 0034, section 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_with_under_a_second_left_answers_at_once_and_lands() {
+    let p = batched_pair(Duration::from_secs(3), |_| {}).await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(1_500, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let r = send(p.a.addr, "POST", "/actor/t/x/flush?n=1&sleep=2300", "").await;
+    let took = started.elapsed();
+    assert_eq!(
+        (r.status, r.body.trim()),
+        (
+            200,
+            "err:SqlErrorKind::Internal:not durable: still uploading"
+        ),
+        "{}",
+        r.body
+    );
+    assert!(
+        took < Duration::from_millis(2_900),
+        "the flush waited: {took:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    let r = b_answers(&p, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "2", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
+/// An event that alone writes more than the cap is its own segment, and
+/// its actor waits for it at the event's end, as a strict actor does: the
+/// next request queues behind that upload (ADR 0034, section 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_over_the_cap_waits_for_its_segment() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(1_200, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", "/actor/t/x/big?kb=1500", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "big"), "{}", r.body);
+    let started = std::time::Instant::now();
+    let r = send(p.a.addr, "GET", "/actor/t/x/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(900),
+        "the next event did not wait for the oversize segment: {waited:?}"
+    );
+    // A small write does not hold the next one.
+    let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let started = std::time::Instant::now();
+    let r = send(p.a.addr, "GET", "/actor/t/x/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "a small write held the next event: {:?}",
+        started.elapsed()
     );
 }

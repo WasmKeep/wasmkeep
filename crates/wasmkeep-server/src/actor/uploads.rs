@@ -114,9 +114,16 @@ fn completion_job(state: &mut ActorState) -> BoxFuture<'_, ()> {
 }
 
 /// Marks a boundary at the last commit and records it with the replica.
+/// A database not capturing in batched mode has nothing to mark.
 async fn mark(slot: &SharedReplica, db: &mut DbAt<'_>) -> Result<(), String> {
     let marked = db
-        .run(ActorDb::mark_boundary)
+        .run(|db| {
+            if db.batched_capture_enabled() {
+                db.mark_boundary()
+            } else {
+                Ok(None)
+            }
+        })
         .await?
         .transpose()
         .map_err(|e| format!("boundary: {e}"))?
@@ -382,6 +389,13 @@ impl ActorState {
         let Some(slot) = self.batched_replica() else {
             return Some(hold.barrier());
         };
+        // A job that skips `prepare` (a hand-over, a delete, an alarm) may
+        // find capture ended by a step before a drop that an event cut
+        // short: enabled again first, as before an event.
+        if let Err(e) = self.ensure_batched_capture() {
+            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "batched capture could not start");
+            return Some(Barrier::GaveUp(Dropped::Failure));
+        }
         let completion = self.completion();
         to_barrier(&slot, &mut self.db_at(), Some(&completion), deadline).await
     }
@@ -427,9 +441,9 @@ impl ActorState {
         }
     }
 
-    /// Before an event of a batched hold: its database captures in batched
-    /// mode, under the hold's token. A strict hold, or one not restored,
-    /// has nothing to do.
+    /// Before an event of a batched hold, and before any flush to its
+    /// barrier: its database captures in batched mode, under the hold's
+    /// token. A strict hold, or one not restored, has nothing to do.
     pub(super) fn ensure_batched_capture(&mut self) -> Result<(), String> {
         if self.batched_replica().is_none() {
             return Ok(());
@@ -450,6 +464,13 @@ impl ActorState {
         };
         if db.batched_capture_enabled() {
             return Ok(());
+        }
+        // A database opened without an event (an alarm's check for state)
+        // has not started capturing: it starts as strict does, with
+        // nothing uncaptured under this hold yet.
+        if db.captured_checksum().is_none() {
+            db.start_capture()
+                .map_err(|e| format!("start capture: {e}"))?;
         }
         db.enable_batched_capture(token)
             .map_err(|e| format!("batched capture: {e}"))

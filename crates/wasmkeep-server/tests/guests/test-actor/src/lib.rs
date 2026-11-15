@@ -417,6 +417,19 @@ impl http::Guest for TestActor {
                 }
             }
             (Method::Get, "/plain") => get("plain").to_string(),
+            // One event writing `kb` KiB at once: over a batched segment's
+            // cap when large (ADR 0034, section 2).
+            (Method::Post, "/big") => {
+                let blob = vec![0x41; usize::try_from(num("kb")).unwrap_or(0) * 1024];
+                match storage::exec(
+                    "INSERT INTO config (key, value) VALUES ('big', ?)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    &[Value::Blob(blob)],
+                ) {
+                    Ok(_) => "big".to_owned(),
+                    Err(e) => format!("err:{:?}", e.kind),
+                }
+            }
             (Method::Post, "/flush") => {
                 for _ in 0..num("n") {
                     let _ = storage::exec(
@@ -427,6 +440,11 @@ impl http::Guest for TestActor {
                 }
                 if query_param(&full, "alarm").is_some() {
                     alarms::set_alarm(now_ms() + u64::try_from(num("alarm")).unwrap_or(0));
+                }
+                // Most of the wall gone before the flush (ADR 0034, section 4).
+                if query_param(&full, "sleep").is_some() {
+                    let ns = u64::try_from(num("sleep")).unwrap_or(0) * 1_000_000;
+                    wasmkeep_sdk::wasi::clocks::monotonic_clock::subscribe_duration(ns).block();
                 }
                 let tx = query_param(&full, "tx").is_some();
                 if tx {
