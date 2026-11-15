@@ -4,6 +4,7 @@
 
 mod actor_read;
 mod app_delete;
+mod backup;
 mod dev;
 mod dev_project;
 mod diagnose;
@@ -37,6 +38,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create and verify lease-free online archives.
+    #[command(subcommand)]
+    Backup(backup::Command),
     /// Serve actors (/actor/<class>/<name>/...) and/or a front: a stateless
     /// wasi:http component (one instance per request) for every other path,
     /// which calls the actors. Over HTTP/1.1.
@@ -107,6 +111,8 @@ struct AppDeleteArgs {
 
 #[derive(Debug, Subcommand)]
 enum ActorCommand {
+    /// List retained history without taking ownership.
+    History(actor_read::HistoryArgs),
     /// Export a verified, portable SQLite database from bucket history. No node or hold.
     Export(actor_read::ExportArgs),
     /// Run one read-only SQL statement on a temporary, verified actor export.
@@ -1151,6 +1157,8 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Backup(args) => backup::run(&args),
+        Command::Actor(ActorCommand::History(args)) => actor_read::history(&args),
         Command::Actor(ActorCommand::Export(args)) => actor_read::finish(actor_read::export(&args)),
         Command::Actor(ActorCommand::Sql(args)) => actor_read::finish(actor_read::sql(&args)),
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),

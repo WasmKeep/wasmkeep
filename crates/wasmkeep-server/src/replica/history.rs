@@ -162,7 +162,7 @@ pub async fn export_with_options(
     let staged = scratch.path().join("verified.db");
     let mut last = String::new();
     for attempt in 1..=8 {
-        match attempt_export(store, &prefix, point, &staged, options.max_bytes).await {
+        match attempt_export(store, &prefix, point, &staged, options.max_bytes, false).await {
             Ok(mut result) => {
                 result.attempts = attempt;
                 // A hint only. Read-only credentials may deliberately omit owners/.
@@ -205,6 +205,7 @@ async fn attempt_export(
     point: Point,
     output: &Path,
     max: u64,
+    raw: bool,
 ) -> Result<Export, Error> {
     let objects = list_objects(store, prefix).await?;
     let sizes: BTreeMap<_, _> = objects
@@ -316,7 +317,11 @@ async fn attempt_export(
         ));
     }
     drop(capture);
-    let verification = readonly::verify_and_make_portable(&path)?;
+    let verification = if raw {
+        readonly::verify(&path)?
+    } else {
+        readonly::verify_and_make_portable(&path)?
+    };
     let file = std::fs::File::open(&path)?;
     file.sync_all()?;
     let bytes = file.metadata()?.len();
@@ -411,7 +416,7 @@ fn page_size(path: &Path) -> Result<u32, Error> {
 
 /// Walk past newer snapshots too: filtering keys globally by txid could pick
 /// an orphan generation. A missing parent bounds retained ancestry.
-fn ancestry(listing: &Listing, head: SegmentId) -> Vec<SegmentId> {
+pub fn ancestry(listing: &Listing, head: SegmentId) -> Vec<SegmentId> {
     let parents: BTreeMap<_, _> = listing
         .segments
         .iter()
@@ -585,12 +590,16 @@ fn checked_header(bytes: &[u8], id: SegmentId, snapshot: bool) -> Result<ltx::He
 
 /// Keep identity from the same listing as the keys. An app recreation can
 /// reuse a history key with different bytes, even at the same length.
-async fn list_objects(
+pub async fn list_objects(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
 ) -> Result<BTreeMap<String, ObjectMeta>, Error> {
     let base = StorePath::from(prefix.trim_end_matches('/'));
-    let encoded = format!("{}/", base.as_ref());
+    let encoded = if base.as_ref().is_empty() {
+        String::new()
+    } else {
+        format!("{}/", base.as_ref())
+    };
     'attempts: for _ in 0..super::READ_ATTEMPTS {
         let mut stream = store.list(Some(&base));
         let mut objects = BTreeMap::new();
@@ -612,7 +621,7 @@ async fn list_objects(
 
 /// Bounded read with typed missing/stale errors for replanning. A lying body
 /// cannot allocate past the cap, even if its metadata understates its length.
-async fn get(
+pub async fn get(
     store: &Arc<dyn ObjectStore>,
     path: &StorePath,
     listed: Option<&ObjectMeta>,
@@ -683,6 +692,32 @@ async fn get(
         }
     }
     Err(Error::Bucket(format!("{path}: {last}")))
+}
+
+/// Replay an isolated manifest-backed store. The caller must populate only
+/// the named actor objects and compare the returned head with its manifest.
+pub async fn replay(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    output: &Path,
+    max: u64,
+) -> Result<Export, Error> {
+    attempt_export(store, prefix, Point::Head, output, max, true).await
+}
+
+/// Snapshot, boundary segment and ascending replay segments, without duplicates.
+pub fn copy_keys(listing: &Listing, plan: &Plan) -> Result<Vec<String>, Error> {
+    let mut keys = Vec::new();
+    if let Some(id) = plan.snapshot {
+        keys.push(snapshot_key(id));
+        if let Ok(key) = key_for(listing, id) {
+            keys.push(key);
+        }
+    }
+    for id in &plan.segments {
+        keys.push(key_for(listing, *id)?);
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]

@@ -1,8 +1,10 @@
 # 0033. Data access, export and online backup
 
 - Status: partially implemented (2026-11-15): actor export and read-only
-  actor SQL are built; history listing, online backup and live restore remain
-  proposed. The [first-slice guide](../actor-data-access.md) records its
+  actor SQL and history listing are built. Online backup create/list/verify
+  have an initial implementation; the [backup guide](../deploy/backup-and-restore.md)
+  records its cache, concurrency and prune-coordination limits. Live restore
+  remains proposed. The [first-slice guide](../actor-data-access.md) records its
   positional app syntax, limits and deferred options. Revised after an
   adversarial review (a destination keyed by content, since generations restart after an
   app is recreated; prune excluded from a running backup; restore
