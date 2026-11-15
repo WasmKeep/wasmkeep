@@ -45,7 +45,7 @@ impl ActorState {
             }
         }
         self.ensure_ready().await?;
-        self.install_call_context();
+        self.install_call_context().await;
         let live = self.live.as_mut().ok_or("actor not ready")?;
         live.start_event("websocket");
         // During its own open event the guest may send to the new socket
@@ -53,7 +53,7 @@ impl ActorState {
         live.store.data_mut().opening = Some(conn);
         let run = limit(
             self.limits.wall,
-            self.held.as_ref().map(Held::lease),
+            self.held.as_ref(),
             live.core
                 .call_on_websocket_open(&mut live.store, conn, &path),
         )
@@ -90,7 +90,7 @@ impl ActorState {
         };
         let run = limit(
             self.limits.wall,
-            self.held.as_ref().map(Held::lease),
+            self.held.as_ref(),
             live.core
                 .call_on_websocket_message(&mut live.store, conn, &msg),
         )
@@ -112,7 +112,7 @@ impl ActorState {
         };
         let run = limit(
             self.limits.wall,
-            self.held.as_ref().map(Held::lease),
+            self.held.as_ref(),
             live.core
                 .call_on_websocket_close(&mut live.store, conn, code, &reason),
         )
@@ -216,7 +216,7 @@ impl ActorState {
             );
             return false;
         }
-        self.install_call_context();
+        self.install_call_context().await;
         match self.live.as_mut() {
             Some(live) => {
                 live.start_event("websocket");

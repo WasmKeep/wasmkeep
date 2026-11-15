@@ -518,3 +518,139 @@ async fn a_call_to_an_actor_whose_state_cannot_start_fails_as_unavailable() {
     assert_eq!(refusals("unavailable") - before, 1);
     assert_eq!(refusals("overloaded"), 0);
 }
+
+/// The watch is checked at the host boundary, even before `limit` gets
+/// another poll. No guest SQL or outward effect runs after a batched stop.
+#[tokio::test]
+async fn batched_failure_refuses_storage_and_outward_calls() {
+    use crate::replica::{Stop, UploadFailure};
+    use wasmkeep_wit::wasmkeep::actor::{actors, alarms, calls, storage, websockets};
+    let f = fixture(Duration::from_secs(60));
+    f.mailboxes
+        .submit(&address("failed"), |host| {
+            Box::pin(async move {
+                let (sender, flag) = tokio::sync::watch::channel(Some(Stop {
+                    reason: UploadFailure::Late,
+                    batched: true,
+                }));
+                host.replica_stop = Some(flag);
+                let sql = "CREATE TABLE forbidden(x)".to_owned();
+                for error in [
+                    storage::Host::exec(host, sql.clone(), vec![])
+                        .await
+                        .unwrap()
+                        .unwrap_err(),
+                    storage::Host::exec_durable(host, sql, vec![])
+                        .await
+                        .unwrap()
+                        .unwrap_err(),
+                    storage::Host::query(host, "SELECT 1".into(), vec![])
+                        .await
+                        .unwrap()
+                        .unwrap_err(),
+                    storage::Host::flush(host).await.unwrap().unwrap_err(),
+                    storage::Host::delete_self_durable(host)
+                        .await
+                        .unwrap()
+                        .unwrap_err(),
+                ] {
+                    assert!(matches!(
+                        error.kind,
+                        wasmkeep_wit::wasmkeep::actor::types::SqlErrorKind::Internal
+                    ));
+                    assert!(error.message.starts_with("replication stopped"));
+                }
+                assert!(storage::Host::delete_self(host).await.is_err());
+                assert!(!host.delete_requested);
+                assert!(alarms::Host::set_alarm(host, 10).await.is_err());
+                assert!(alarms::Host::clear_alarm(host).await.is_err());
+                assert!(alarms::Host::get_alarm(host).await.is_err());
+                let request = actors::Request {
+                    method: "GET".into(),
+                    path: "/".into(),
+                    headers: vec![],
+                    body: vec![],
+                };
+                assert!(
+                    actors::Host::call(host, "class/other".into(), request.clone())
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    calls::Host::call_many(host, vec![("class/other".into(), request)])
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    websockets::Host::send(host, 1, websockets::Message::Text("x".into()))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    websockets::Host::close(host, 1, 1000, String::new())
+                        .await
+                        .is_err()
+                );
+                // An inline strict failure does not close any of these new gates.
+                sender.send_replace(Some(Stop {
+                    reason: UploadFailure::Late,
+                    batched: false,
+                }));
+                assert!(
+                    storage::Host::exec(host, "CREATE TABLE allowed(x)".into(), vec![])
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                assert!(
+                    storage::Host::query(host, "SELECT * FROM allowed".into(), vec![])
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                assert!(alarms::Host::set_alarm(host, 10).await.is_ok());
+                assert!(
+                    websockets::Host::send(host, 1, websockets::Message::Text("x".into()))
+                        .await
+                        .is_ok()
+                );
+                assert!(
+                    host.with_db(|db| db.query(
+                        "SELECT name FROM sqlite_master WHERE name = 'forbidden'",
+                        &[]
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .values
+                    .is_empty()
+                );
+            })
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn response_outparam_checks_failure_when_set_and_does_not_recall_an_answer() {
+    use crate::replica::{Stop, UploadFailure};
+    use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+    let f = fixture(Duration::from_secs(60));
+    f.mailboxes.submit(&address("response"), |host| Box::pin(async move {
+        let (sender, flag) = tokio::sync::watch::channel(None);
+        host.replica_stop = Some(flag);
+        let (tx, rx) = oneshot::channel();
+        let out = host.response_outparam(tx).unwrap();
+        sender.send_replace(Some(Stop { reason: UploadFailure::Late, batched: true }));
+        let callback = host.table.delete(out).unwrap();
+        (callback.send)(Err(ErrorCode::HttpRequestDenied));
+        assert!(matches!(rx.await.unwrap(), Err(ErrorCode::InternalError(Some(message))) if message == "replication stopped"));
+        sender.send_replace(Some(Stop { reason: UploadFailure::Late, batched: false }));
+        let (tx, rx) = oneshot::channel();
+        let out = host.response_outparam(tx).unwrap();
+        let callback = host.table.delete(out).unwrap();
+        (callback.send)(Err(ErrorCode::HttpRequestDenied));
+        sender.send_replace(Some(Stop { reason: UploadFailure::Late, batched: true }));
+        assert!(matches!(rx.await.unwrap(), Err(ErrorCode::HttpRequestDenied)));
+    })).await.unwrap();
+}

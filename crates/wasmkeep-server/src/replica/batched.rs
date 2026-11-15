@@ -232,6 +232,12 @@ pub(crate) struct Stop {
     pub(crate) batched: bool,
 }
 
+/// A cheap, synchronous gate for effects after an asynchronous upload failed.
+/// Strict inline stops deliberately do not close this gate.
+pub(crate) fn stopped(flag: Option<&watch::Receiver<Option<Stop>>>) -> bool {
+    flag.is_some_and(|flag| flag.borrow().as_ref().is_some_and(|stop| stop.batched))
+}
+
 impl Shared {
     fn new() -> Self {
         Self {

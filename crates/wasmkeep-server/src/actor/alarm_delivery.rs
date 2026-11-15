@@ -152,7 +152,7 @@ impl ActorState {
         }
         let at = at.unwrap_or_default();
 
-        self.install_call_context();
+        self.install_call_context().await;
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -169,7 +169,7 @@ impl ActorState {
         live.start_event("alarm");
         let run = limit(
             self.limits.wall,
-            self.held.as_ref().map(Held::lease),
+            self.held.as_ref(),
             live.core.call_on_alarm(&mut live.store),
         )
         .await;

@@ -30,7 +30,7 @@ mod batched;
     reason = "wired to actors with batched writes in S9 (ADR 0034, plan)"
 )]
 pub(crate) use batched::{
-    Applied, BudgetPermit, NODE_UPLOAD_BYTES, Ticket, UploadBudget, UploadFailure,
+    Applied, BudgetPermit, NODE_UPLOAD_BYTES, Stop, Ticket, UploadBudget, UploadFailure, stopped,
 };
 
 /// Upload a snapshot after this many segments, so restores stay short.

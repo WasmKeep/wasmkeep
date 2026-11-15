@@ -819,6 +819,7 @@ struct ActorHost {
     sockets: Arc<Sockets>,
     /// Replication, so `exec-durable` can wait for the bucket.
     replica: Option<SharedReplica>,
+    replica_stop: Option<tokio::sync::watch::Receiver<Option<crate::replica::Stop>>>,
     /// Sends the guest's outbound HTTP under the node's egress policy.
     egress: crate::egress::EgressHooks,
     /// The class's `env` values.

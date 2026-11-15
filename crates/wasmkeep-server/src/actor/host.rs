@@ -12,12 +12,15 @@ pub(super) enum Cut {
     /// This node's lease on the actor ran out while it ran: another node
     /// may own the actor now, so this one must stop.
     Lease,
+    /// An asynchronous batched upload failed during this event.
+    Replica,
 }
 
 impl std::fmt::Display for Cut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Wall(d) => write!(f, "exceeded the {d:?} wall-clock limit"),
+            Self::Replica => f.write_str("stopped: replication stopped"),
             Self::Lease => f.write_str("stopped: this node's lease on the actor ran out"),
         }
     }
@@ -28,20 +31,51 @@ impl std::fmt::Display for Cut {
 /// guest; callers treat a cut like a trap and discard the instance.
 pub(super) async fn limit<F: std::future::Future>(
     wall: Duration,
-    lease: Option<&LeaseHold>,
+    held: Option<&Held>,
     f: F,
 ) -> Result<F::Output, Cut> {
-    let expiry = lease.map(LeaseHold::expiry);
+    let expiry = held.map(|h| h.lease().expiry());
+    let flag = match held.filter(|h| h.writes() == crate::apps::Writes::Batched) {
+        Some(h) => match h.replica() {
+            Some(r) => Some(r.lock().await.failure_flag()),
+            None => None,
+        },
+        None => None,
+    };
     let lease_gone = async move {
         match expiry {
             Some(e) => e.await,
             None => std::future::pending().await,
         }
     };
+    limit_with_failure(wall, lease_gone, flag, f).await
+}
+
+async fn limit_with_failure<F: std::future::Future>(
+    wall: Duration,
+    lease_gone: impl std::future::Future<Output = ()>,
+    flag: Option<tokio::sync::watch::Receiver<Option<crate::replica::Stop>>>,
+    f: F,
+) -> Result<F::Output, Cut> {
+    let replica_stopped = async move {
+        if let Some(mut flag) = flag
+            && flag
+                .wait_for(|s| s.as_ref().is_some_and(|s| s.batched))
+                .await
+                .is_ok()
+        {
+            return;
+        }
+        std::future::pending::<()>().await;
+    };
     let cut = |reason: &str| {
         crate::metrics::inc(&crate::metrics::METRICS.cuts.get(&[("reason", reason)]));
     };
     tokio::select! {
+        () = replica_stopped => {
+            cut("replica");
+            Err(Cut::Replica)
+        }
         r = tokio::time::timeout(wall, f) => r.map_err(|_| {
             cut("wall");
             Cut::Wall(wall)
@@ -76,7 +110,50 @@ pub(super) async fn with_db<T: Send + 'static>(
     store.data_mut().with_db(f).await
 }
 
+type ResponseResult =
+    Result<Response<HyperOutgoingBody>, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>;
+
 impl ActorHost {
+    pub(super) fn response_outparam(
+        &mut self,
+        sender: oneshot::Sender<ResponseResult>,
+    ) -> wasmtime::Result<
+        wasmtime::component::Resource<wasmtime_wasi_http::p2::types::HostResponseOutparam>,
+    > {
+        let stop = self.replica_stop.clone();
+        self.http()
+            .new_response_outparam_from_callback(move |response| {
+                let response = if crate::replica::stopped(stop.as_ref()) {
+                    Err(
+                        wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::InternalError(
+                            Some("replication stopped".into()),
+                        ),
+                    )
+                } else {
+                    response
+                };
+                let _ = sender.send(response);
+            })
+    }
+
+    fn replication_stopped(&self) -> bool {
+        crate::replica::stopped(self.replica_stop.as_ref())
+    }
+
+    fn check_replication(&self) -> wasmtime::Result<()> {
+        if self.replication_stopped() {
+            wasmtime::bail!("replication stopped");
+        }
+        Ok(())
+    }
+
+    fn stopped_sql(&self) -> Option<SqlError> {
+        self.replication_stopped().then(|| SqlError {
+            kind: SqlErrorKind::Internal,
+            message: REPLICATION_STOPPED.into(),
+        })
+    }
+
     /// `exec-durable` without the timing (see the `storage::Host` impl).
     pub(super) async fn exec_durable_untimed(
         &mut self,
@@ -283,6 +360,7 @@ impl ActorHost {
             call: None,
             sockets,
             replica: None,
+            replica_stop: None,
             alarm_index: None,
             egress: crate::egress::EgressHooks::default(),
             env: Arc::default(),
@@ -478,6 +556,9 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<u64, SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -491,6 +572,9 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<u64, SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -509,6 +593,9 @@ impl storage::Host for ActorHost {
         sql: String,
         params: Vec<Value>,
     ) -> wasmtime::Result<Result<Rows, SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -526,15 +613,22 @@ impl storage::Host for ActorHost {
     }
 
     async fn delete_self(&mut self) -> wasmtime::Result<()> {
+        self.check_replication()?;
         self.delete_requested = true;
         Ok(())
     }
 
     async fn delete_self_durable(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         self.delete_durably().await
     }
 
     async fn flush(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
+        if let Some(error) = self.stopped_sql() {
+            return Ok(Err(error));
+        }
         if self.deleted.is_some() || self.delete_retry {
             return Ok(Err(deleted_in_this_event()));
         }
@@ -544,6 +638,7 @@ impl storage::Host for ActorHost {
 
 impl alarms::Host for ActorHost {
     async fn set_alarm(&mut self, at: u64) -> wasmtime::Result<()> {
+        self.check_replication()?;
         if self.deleted.is_some() || self.delete_retry {
             return Ok(()); // the actor was deleted in this event
         }
@@ -556,6 +651,7 @@ impl alarms::Host for ActorHost {
     }
 
     async fn get_alarm(&mut self) -> wasmtime::Result<Option<u64>> {
+        self.check_replication()?;
         if self.deleted.is_some() || self.delete_retry {
             return Ok(None);
         }
@@ -565,6 +661,7 @@ impl alarms::Host for ActorHost {
     }
 
     async fn clear_alarm(&mut self) -> wasmtime::Result<()> {
+        self.check_replication()?;
         if self.deleted.is_some() || self.delete_retry {
             return Ok(());
         }
@@ -583,6 +680,7 @@ impl actors::Host for ActorHost {
         address: String,
         request: CallRequest,
     ) -> wasmtime::Result<Result<CallResponse, CallError>> {
+        self.check_replication()?;
         let Some(ctx) = self.call.clone() else {
             return Ok(Err(CallError::Failed("no call context".into())));
         };
@@ -636,6 +734,7 @@ impl calls::Host for ActorHost {
         &mut self,
         calls: Vec<(String, CallRequest)>,
     ) -> wasmtime::Result<Vec<Result<CallResponse, CallError>>> {
+        self.check_replication()?;
         if let Some(refused) = refuse_batch(&calls) {
             return Ok(refused);
         }
@@ -684,6 +783,7 @@ impl websockets::Host for ActorHost {
         conn: u64,
         msg: WsMessageWit,
     ) -> wasmtime::Result<Result<(), WsSendError>> {
+        self.check_replication()?;
         let Some(me) = self.call.as_ref().map(|c| c.me.clone()) else {
             return Ok(Err(WsSendError::UnknownConnection));
         };
@@ -701,6 +801,7 @@ impl websockets::Host for ActorHost {
     }
 
     async fn close(&mut self, conn: u64, code: u16, reason: String) -> wasmtime::Result<()> {
+        self.check_replication()?;
         if let Some(me) = self.call.as_ref().map(|c| c.me.clone()) {
             self.sockets.close(&me, conn, code, truncate_reason(reason));
         }
@@ -752,5 +853,61 @@ pub(super) fn from_db_error(e: wasmkeep_storage::SqlError) -> SqlError {
     SqlError {
         kind,
         message: e.message,
+    }
+}
+
+#[cfg(test)]
+mod batched_failure_tests {
+    use super::*;
+    use crate::replica::{Stop, UploadFailure};
+
+    #[tokio::test]
+    async fn a_batched_failure_cuts_a_running_event_without_applying_it() {
+        let (sender, flag) = tokio::sync::watch::channel(None);
+        let event = async move {
+            sender.send_replace(Some(Stop {
+                reason: UploadFailure::Late,
+                batched: true,
+            }));
+            std::future::pending::<()>().await;
+        };
+        assert!(matches!(
+            limit_with_failure(
+                Duration::from_secs(1),
+                std::future::pending(),
+                Some(flag),
+                event
+            )
+            .await,
+            Err(Cut::Replica)
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_failure_and_closed_watch_do_not_cut_an_event() {
+        for close in [false, true] {
+            let (sender, flag) = tokio::sync::watch::channel(Some(Stop {
+                reason: UploadFailure::Late,
+                batched: false,
+            }));
+            if close {
+                drop(sender);
+            }
+            let event = async {
+                tokio::task::yield_now().await;
+                42
+            };
+            assert_eq!(
+                limit_with_failure(
+                    Duration::from_secs(1),
+                    std::future::pending(),
+                    Some(flag),
+                    event
+                )
+                .await
+                .unwrap(),
+                42
+            );
+        }
     }
 }

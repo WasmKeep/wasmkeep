@@ -604,7 +604,7 @@ impl ActorState {
             let _ = response_tx.send(outcome);
             return;
         }
-        self.install_call_context();
+        self.install_call_context().await;
         let Some(live) = self.live.as_mut() else {
             let _ = response_tx.send(Outcome::Failed("actor not ready".into()));
             return;
@@ -618,7 +618,7 @@ impl ActorState {
                 .http()
                 .new_incoming_request(Scheme::Http, crate::http::CappedBody::of(req))?;
             let (out_tx, out_rx) = oneshot::channel();
-            let out = live.store.data_mut().http().new_response_outparam(out_tx)?;
+            let out = live.store.data_mut().response_outparam(out_tx)?;
             let forward = async move {
                 let result = match out_rx.await {
                     Ok(Ok(response)) => Outcome::Served(response),
@@ -647,13 +647,7 @@ impl ActorState {
                 }
             }
         };
-        let result = match limit(
-            self.limits.wall,
-            self.held.as_ref().map(Held::lease),
-            outcome,
-        )
-        .await
-        {
+        let result = match limit(self.limits.wall, self.held.as_ref(), outcome).await {
             Ok(r) => r.map_err(|e| format!("{e:#}")),
             Err(cut) => Err(format!("event {cut}")),
         };
@@ -709,7 +703,7 @@ impl ActorState {
     /// Gives the instance what `actors.call` needs for the current event,
     /// which starts now: its calls give up while the margin of its wall
     /// remains, before the wall cuts the event.
-    pub(super) fn install_call_context(&mut self) {
+    pub(super) async fn install_call_context(&mut self) {
         let wall = self.limits.wall;
         let ctx = CallContext {
             service: self.service.get().cloned(),
@@ -717,8 +711,26 @@ impl ActorState {
             chain: Arc::clone(&self.chain),
             deadline: tokio::time::Instant::now() + (wall - super::call_margin(wall)),
         };
+        // The gate follows the hold's mode at every event, including a
+        // redeploy which reused this instance. Never carry a batched gate
+        // into a strict event or miss it when the hold switches to batched.
+        let stop = if self
+            .held
+            .as_ref()
+            .is_some_and(|h| h.writes() == crate::apps::Writes::Batched)
+        {
+            match self.replica() {
+                Some(replica) => Some(replica.lock().await.failure_flag()),
+                None => None,
+            }
+        } else {
+            None
+        };
         if let Some(live) = self.live.as_mut() {
-            live.store.data_mut().call = Some(ctx);
+            let host = live.store.data_mut();
+            host.call = Some(ctx);
+            host.replica_stop = stop.clone();
+            host.egress.replica_stop = stop;
         }
     }
 
@@ -1202,7 +1214,7 @@ impl ActorState {
             self.check_deploy_seq().await?;
         }
 
-        self.install_call_context();
+        self.install_call_context().await;
         let live = self.live.as_mut().ok_or("actor not ready")?;
         // Known for this instance: on-init already ran (or was found done)
         // for this version. The database does not change under a live
@@ -1221,7 +1233,7 @@ impl ActorState {
         live.start_event("init");
         let init = limit(
             self.limits.wall,
-            self.held.as_ref().map(Held::lease),
+            self.held.as_ref(),
             live.core.call_on_init(&mut live.store),
         )
         .await;
