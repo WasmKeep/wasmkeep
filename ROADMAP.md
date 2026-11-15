@@ -48,13 +48,14 @@ neighbour, not isolation from a hostile one
 2. **Several apps per process**, and a table from hostname to app kept by
    the operator.
 3. **Limits per app** on each node, and suspending an app.
-4. **Placement when an actor wakes**: on a node with room, not only where
-   its request arrived, starting by moving actors that are asleep. Most
-   actors sleep most of the time, so this spreads load without moving
-   anything that is running.
-5. **Automatic moves of running actors**, slowly and within limits, if
-   placement at wake-up is not enough. Until then an operator moves an
-   actor or drains a node ([how](docs/cluster.md)).
+4. **Rebalancing, first at wake-up**: an actor wakes on a node with
+   room, not only where its request arrived, starting by moving actors
+   that are asleep. Most actors sleep most of the time, so this spreads
+   load without moving anything that is running.
+5. **Rebalancing running actors**: automatic moves, slowly and within
+   limits, if placement at wake-up is not enough. Until then a node that
+   joins or comes back fills up as actors sleep and wake, and an operator
+   moves an actor or drains a node ([how](docs/cluster.md)).
 6. **More buckets**: Google Cloud Storage and Azure Blob storage beside
    S3-compatible stores, each checked by `cluster diagnose`
    ([ADR 0031](docs/adr/0031-google-cloud-storage-and-azure-blob-buckets.md),
@@ -130,8 +131,8 @@ Each waits for a user who needs it.
 
   WasmKeep does not manage microVMs, and does not decide which tenant
   gets which tier: that belongs to whatever platform runs it.
-  [Security](docs/security.md) says what each tier does and does not
-  protect against.
+  Each tier will come with what it does and does not protect against in
+  [security](docs/security.md).
 - **M5, raw Linux workloads**: tenants that need a Linux program rather
   than a component, behind the same routing and storage API.
 
