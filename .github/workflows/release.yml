@@ -54,7 +54,6 @@ on:
       - scripts/notices.sh
       - about.toml
       - about.hbs
-      - Cargo.lock
       - scripts/release-notes.sh
       - deploy/Dockerfile
       - deploy/toolchain/**
@@ -64,15 +63,6 @@ on:
       - scripts/componentize-core.sh
       - scripts/runtime-notices.sh
       - deploy/notices/**
-      - sdks/typescript/**
-      - sdks/python/**
-      - sdks/go/**
-      - examples/ts-counter/**
-      - examples/py-counter/**
-      - examples/go-counter/**
-      - examples/c-counter/**
-      - examples/zig-counter/**
-      - crates/wasmkeep-wit/wit/**
 
 permissions:
   contents: read
