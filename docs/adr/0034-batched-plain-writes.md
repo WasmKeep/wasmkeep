@@ -1321,7 +1321,7 @@ names batched as strict: in a cluster of mixed builds the same class is
 batched on some nodes and strict on others, which is data-safe (keys,
 LTX and the chain are the same, and each hold keeps the mode it was
 acquired under), though only the batched nodes give the class batched
-behaviour. Until S11 a batched hold takes no periodic snapshot.
+behaviour.
 
 **As built in S10 (2026-11-15).** A batched hold names an alarm entry at
 each event's end (and at a flush point) without writing it; the replica
@@ -1334,3 +1334,17 @@ a newer generation. Stale-hint clearing flushes to a barrier (one upload
 budget) and judges R2 on the acknowledged entry read there; the model
 checks that one read before the hold wrote on is refused
 (`ClearOldAcknowledged`).
+
+**As built in S11 (2026-11-15).** A batched hold asks whether a periodic
+snapshot is due only in the mailbox gap after an event: by 64 segments,
+as a strict hold, or by 64 MiB of acknowledged segments (the replica adds
+each segment's encoded size when it is acknowledged), under the same
+backoff after a failed one. It then flushes to its barrier with one
+upload budget, past which the snapshot waits for a later gap, and
+snapshots at the acknowledged head; collection follows as for a strict
+hold. Deletes (`delete-self` at the event's end, the operator delete's
+job and idle expiry, through `delete_recorded`; `delete-self-durable` in
+its call) flush first since S9. ADR 0033's restore of one actor is not
+built yet; `ship_reset`'s guard refuses it with a segment in flight, and
+it is to flush first when it is. The model checks that a snapshot over
+uncaptured commits is caught (`SnapshotUncaptured`).

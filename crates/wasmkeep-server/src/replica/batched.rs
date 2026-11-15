@@ -135,6 +135,11 @@ struct SegmentAlarm {
     generation: u64,
 }
 
+/// A batched hold's periodic snapshot is due once its acknowledged segments
+/// since the last one hold this many encoded bytes, if 64 segments did not
+/// make it due first (ADR 0034, section 7).
+pub(crate) const SNAPSHOT_BYTES: u64 = 64 << 20;
+
 /// The node-wide budget of batched segments in flight, in encoded bytes
 /// (ADR 0034, section 2), as one node's restores are bounded.
 pub(crate) const NODE_UPLOAD_BYTES: u64 = 256 << 20;
@@ -309,6 +314,10 @@ pub(super) struct Shared {
     /// before anyone applies it, for `Cut::Replica` (ADR 0034, section 8)
     /// and the waiters. Strict inline stops are distinguished by the tag.
     pub(super) failure: watch::Sender<Option<Stop>>,
+    /// The encoded bytes of the segment in flight, set at its hand-off:
+    /// what its acknowledgement adds toward a snapshot by bytes (ADR 0034,
+    /// section 7). One segment in flight, so one value.
+    in_flight_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// One stop notification for waiters and the batched cut signal.
@@ -330,6 +339,7 @@ impl Shared {
             active: std::sync::atomic::AtomicBool::new(false),
             slot: watch::Sender::new(Slot::Idle),
             failure: watch::Sender::new(None),
+            in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -416,6 +426,13 @@ pub(super) struct Uploads {
     acked_entry: Option<Option<Entry>>,
     /// The entry the segment in flight's end names, if known.
     flight_named: Option<Option<Entry>>,
+    /// The encoded bytes of the segments acknowledged since the last
+    /// snapshot, and the bound past which one is due (ADR 0034, section 7).
+    pub(super) bytes_since_snapshot: u64,
+    snapshot_bytes: u64,
+    /// A failed snapshot's wait a restore set aside (fewer than 64
+    /// segments restored), for a batched hold due by bytes.
+    pub(super) set_aside_wait: Option<super::SnapshotWait>,
 }
 
 impl Default for Uploads {
@@ -432,11 +449,19 @@ impl Default for Uploads {
             index: None,
             acked_entry: None,
             flight_named: None,
+            bytes_since_snapshot: 0,
+            snapshot_bytes: SNAPSHOT_BYTES,
+            set_aside_wait: None,
         }
     }
 }
 
 impl Uploads {
+    /// The bytes bound of a snapshot due by bytes.
+    pub(super) fn snapshot_bytes(&self) -> u64 {
+        self.snapshot_bytes
+    }
+
     /// Publish the reason to all waiters, identifying batched holds for Cut::Replica.
     pub(super) fn stopped(&self, reason: &str) {
         self.shared.failure.send_if_modified(|r| {
@@ -596,6 +621,25 @@ impl Replica {
     /// section 9).
     pub(crate) fn acknowledged_entry(&self) -> Option<Option<Entry>> {
         self.batched.acked_entry.clone()
+    }
+
+    /// Whether a batched hold's periodic snapshot is due: by segments, as
+    /// [`Replica::snapshot_due`] says, or by the acknowledged segments'
+    /// bytes ([`SNAPSHOT_BYTES`]), under the same backoff after a failed
+    /// one (ADR 0034, section 7). Asked only at a mailbox gap.
+    pub(crate) fn batched_snapshot_due(&self) -> bool {
+        let reached = self.since_snapshot >= super::SNAPSHOT_EVERY
+            || self.batched.bytes_since_snapshot >= self.batched.snapshot_bytes;
+        // Both gates of a failed snapshot's backoff, whichever bound came.
+        reached
+            && self.since_snapshot >= self.snapshot_retry_at
+            && (self.snapshot_failures == 0
+                || tokio::time::Instant::now() >= self.snapshot_retry_after)
+    }
+
+    /// The bytes bound of [`Self::batched_snapshot_due`] (tests shorten it).
+    pub(crate) fn set_snapshot_bytes(&mut self, bytes: u64) {
+        self.batched.snapshot_bytes = bytes.max(1);
     }
 
     /// Forgets every boundary marked and not captured: the database has
@@ -883,6 +927,13 @@ impl Replica {
                 self.batched
                     .names
                     .retain(|(s, q), _| *s != end.0 || *q > end.1);
+                self.batched.bytes_since_snapshot =
+                    self.batched.bytes_since_snapshot.saturating_add(
+                        self.batched
+                            .shared
+                            .in_flight_bytes
+                            .swap(0, std::sync::atomic::Ordering::Relaxed),
+                    );
                 if let Some(named) = self.batched.flight_named.take() {
                     self.batched.acked_entry = Some(named);
                 }
@@ -1108,6 +1159,10 @@ impl Ticket {
             Ok(bytes) => bytes,
             Err(e) => return Err(self.fail(format!("encode: {e}"))),
         };
+        self.shared.in_flight_bytes.store(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let post_apply = changes.post_apply;
         let Some(permit) = self.permit.take() else {
             return Err(self.fail("a ticket without its budget permit".into()));

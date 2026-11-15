@@ -73,6 +73,10 @@ pub(crate) enum Switch {
     /// the same hold wrote on, instead of returning to the barrier and
     /// reading it again (ADR 0034, section 9).
     ClearOldAcknowledged,
+    /// A periodic snapshot taken in a gap without flushing first: nothing
+    /// in flight, but commits not yet captured are in it, labelled at the
+    /// acknowledged head (ADR 0034, section 7).
+    SnapshotUncaptured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1173,10 +1177,12 @@ impl World {
     fn snapshot(&mut self, actor: usize) {
         let a = &mut self.actors[actor];
         let Some(h) = &a.hold else { return };
-        if h.head == EMPTY || !h.pending.is_empty() {
+        let unflushed = self.rule == Switch::SnapshotUncaptured && h.flights.is_empty();
+        if h.head == EMPTY || (!h.pending.is_empty() && !unflushed) {
             return;
         }
         if self.rule != Switch::SnapshotInFlight
+            && !unflushed
             && (!h.flights.is_empty() || h.local != h.acknowledged)
         {
             return;
