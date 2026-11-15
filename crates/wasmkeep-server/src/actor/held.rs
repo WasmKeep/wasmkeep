@@ -16,6 +16,7 @@
 //! are what `wasmkeep_plain_events_dropped_total` counts (section 10).
 
 use super::{ActorAddress, LeaseHold, SharedReplica};
+use crate::apps::Writes;
 use crate::cluster::LeaseReturn;
 
 /// How far a hold got before it ends (ADR 0034, section 6).
@@ -72,15 +73,39 @@ impl Dropped {
 pub(super) struct Held {
     lease: LeaseHold,
     replica: Option<SharedReplica>,
+    /// How this hold's plain writes reach the bucket (ADR 0034, section
+    /// 1): the class's mode when the hold was acquired, changed only at a
+    /// `Flushed` barrier, never read from the class at each use.
+    writes: Writes,
 }
 
 impl Held {
-    /// A hold just acquired: nothing restored yet.
-    pub(super) fn new(lease: LeaseHold) -> Self {
+    /// A hold just acquired, under the class's mode of writes: nothing
+    /// restored yet.
+    pub(super) fn new(lease: LeaseHold, writes: Writes) -> Self {
         Self {
             lease,
             replica: None,
+            writes,
         }
+    }
+
+    /// The hold's mode of writes.
+    pub(super) fn writes(&self) -> Writes {
+        self.writes
+    }
+
+    /// Switches the hold to `writes` (a deploy changed the class's mode)
+    /// if `barrier` is [`Barrier::Flushed`]: nothing is then in flight or
+    /// uncaptured, so the next event may run under either mode. Returns
+    /// whether it switched; a hold that gave up keeps its mode until it
+    /// ends.
+    pub(super) fn switch_writes(&mut self, writes: Writes, barrier: Barrier) -> bool {
+        if barrier != Barrier::Flushed {
+            return false;
+        }
+        self.writes = writes;
+        true
     }
 
     /// The actor restored under this hold: its replication from now on.
@@ -132,7 +157,7 @@ impl Held {
         if let Barrier::GaveUp(reason) = barrier {
             self.count(reason);
         }
-        let Self { lease, replica } = self;
+        let Self { lease, replica, .. } = self;
         drop(replica);
         Releasing(lease)
     }
@@ -144,7 +169,7 @@ impl Held {
     pub(super) fn park(self, barrier: Barrier, address: &ActorAddress) {
         match barrier {
             Barrier::Flushed => {
-                let Self { lease, replica } = self;
+                let Self { lease, replica, .. } = self;
                 lease.park(address);
                 drop(replica);
             }
@@ -157,7 +182,7 @@ impl Held {
     /// release sent in the background, then what the hold had not
     /// acknowledged is counted as dropped.
     pub(super) fn drop_now(self, reason: Dropped) {
-        let Self { lease, replica } = self;
+        let Self { lease, replica, .. } = self;
         drop(lease);
         count(reason, replica.as_ref());
     }
@@ -229,7 +254,31 @@ mod tests {
     }
 
     async fn held(node: &Arc<Cluster>, x: &ActorAddress) -> Held {
-        Held::new(LeaseHold::acquire(node, x).await.unwrap())
+        Held::new(LeaseHold::acquire(node, x).await.unwrap(), Writes::Strict)
+    }
+
+    /// The mode is the hold's, set at acquire, and changes only at a
+    /// `Flushed` barrier (ADR 0034, section 1).
+    #[tokio::test]
+    async fn a_hold_keeps_its_mode_until_a_flushed_barrier() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let a = node(&store).await;
+        let x = ActorAddress::new("t", "c", "x").unwrap();
+        let mut hold = held(&a, &x).await;
+        assert_eq!(hold.writes(), Writes::Strict);
+        assert!(!hold.switch_writes(Writes::Batched, Barrier::GaveUp(Dropped::Failure)));
+        assert_eq!(
+            hold.writes(),
+            Writes::Strict,
+            "not past a hold that gave up"
+        );
+        assert!(hold.switch_writes(Writes::Batched, Barrier::Flushed));
+        assert_eq!(hold.writes(), Writes::Batched);
+        let barrier = hold.barrier();
+        assert!(hold.switch_writes(Writes::Strict, barrier));
+        assert_eq!(hold.writes(), Writes::Strict);
+        drop(hold.release(Barrier::Flushed));
+        released(&a, &x).await;
     }
 
     /// A count lands on its reason's series, and only a positive one.

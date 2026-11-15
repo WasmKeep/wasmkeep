@@ -65,6 +65,8 @@ mod expiry;
 mod failover;
 #[path = "failover_wait.rs"]
 mod failover_wait;
+#[path = "flush.rs"]
+mod flush;
 #[path = "front.rs"]
 mod front;
 #[path = "front_deploys.rs"]
@@ -89,6 +91,8 @@ mod signed_calls;
 mod snapshots;
 #[path = "websockets.rs"]
 mod websockets;
+#[path = "writes_deploys.rs"]
+mod writes_deploys;
 
 fn counter_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();

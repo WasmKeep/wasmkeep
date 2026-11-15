@@ -185,6 +185,27 @@ by its next event, and calling this again is safe.
 | --- | --- | --- | --- | --- |
 | `storage::delete_self_durable` | `storage.deleteSelfDurable` | not yet | not yet | not yet |
 
+### `flush`
+
+```wit
+flush: func() -> result<_, sql-error>;
+```
+
+Returns once every write this actor committed before the call is
+durable: in the bucket, uploaded while this node held the actor, when
+the node has one; fsynced locally when it does not. Refused with
+`not-allowed` inside an open transaction. `internal` means what was
+committed since the last durable point is not known to be durable:
+fail the request. A message starting `not durable: still uploading`
+means the wait ran out while the upload went on: the writes stay
+committed here, later events see them, and they usually become
+durable soon after. Any other `internal` means replication stopped:
+the actor's state is then whatever the bucket holds.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `storage::flush` | `storage.flush` | not yet | not yet | not yet |
+
 ## Interface `alarms`
 
 One pending alarm per actor. Alarms survive restarts and fire at least

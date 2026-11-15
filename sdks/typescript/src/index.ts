@@ -144,6 +144,17 @@ export const storage = {
   deleteSelfDurable(): void {
     sql(() => wkStorage.deleteSelfDurable());
   },
+  /** Returns once every write this actor committed before the call is
+   * durable (in the cluster's bucket, or fsynced on a single node), without
+   * running a statement. Throws a `SqlError`: `not-allowed` inside a
+   * transaction, `internal` when those writes are not known to be durable
+   * (fail the request; a message starting `not durable: still uploading`
+   * means the writes stay committed and usually become durable soon after).
+   * Needs a node of the same release: a component built with this SDK
+   * imports it even when it never calls it. */
+  flush(): void {
+    sql(() => wkStorage.flush());
+  },
 };
 
 // ----------------------------------------------------------------- alarms

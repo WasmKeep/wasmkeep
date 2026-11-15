@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use wasmkeep_server::apps::{Changes, DeployError, Diff, Part};
+use wasmkeep_server::apps::{Changes, DeployError, Diff, Part, Writes};
 
 use super::front_deploys::{front_app_node, front_wasm};
 use super::*;
@@ -23,6 +23,7 @@ fn file_changes(with_d: bool) -> Changes {
         config: None,
         requires: BTreeSet::new(),
         expire: None,
+        writes: Writes::Strict,
     };
     let mut classes = vec![("c".to_owned(), "open".to_owned(), part(counter_wasm()))];
     if with_d {
@@ -249,6 +250,7 @@ async fn a_file_with_a_front_and_an_added_open_class() {
         config: None,
         requires: requires.iter().map(|s| (*s).to_owned()).collect(),
         expire: None,
+        writes: Writes::Strict,
     };
     let changes = Changes::whole(
         Some(Part {

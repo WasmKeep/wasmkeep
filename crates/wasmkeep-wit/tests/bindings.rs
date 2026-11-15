@@ -106,6 +106,10 @@ impl storage::Host for Fake {
     async fn delete_self_durable(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
         Ok(Ok(()))
     }
+
+    async fn flush(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
+        Ok(Ok(()))
+    }
 }
 
 impl alarms::Host for Fake {

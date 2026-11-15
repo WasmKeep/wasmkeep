@@ -81,6 +81,17 @@ fn rules(project: &Project) -> anyhow::Result<wasmkeep_server::AccessRules> {
     Ok(rules)
 }
 
+/// The classes whose writes the file makes batched (ADR 0034): on one node
+/// the mode changes nothing, and it is carried as a deploy carries it.
+fn batched(project: &Project) -> std::collections::BTreeSet<String> {
+    project
+        .classes
+        .iter()
+        .filter(|(_, c)| c.writes == wasmkeep_server::apps::Writes::Batched)
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
 fn requires(project: &Project) -> BTreeMap<String, std::collections::BTreeSet<String>> {
     project
         .classes
@@ -118,6 +129,7 @@ pub(crate) fn run(project: Project, options: Options) -> anyhow::Result<()> {
     config.access = rules.clone();
     config.config = loaded.config.clone();
     config.requires = requires(&project);
+    config.batched = batched(&project);
     config.front = loaded.front.clone();
     let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
     let front_requests = wasmkeep_server::fds::default_front_requests(pool).max(1);
@@ -314,6 +326,7 @@ async fn watch(
             &rules,
             &loaded.config,
             &requires,
+            &batched(&project),
             loaded.front.as_ref(),
         ) {
             Ok(()) => tracing::info!("reloaded"),

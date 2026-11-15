@@ -406,14 +406,27 @@ interface between a component and the host
 ([`actor.wit`](../crates/wasmkeep-wit/wit/actor.wit)), and changes only when
 what it already has changes. An addition keeps it: `0.4.0` added the
 worlds `front` and `front-core` and the interface `calls` under
-`wasmkeep:actor@0.2.0`, and `0.4.2` the function
-`storage.delete-self-durable`; a component built before links as it did
+`wasmkeep:actor@0.2.0`, `0.4.2` the function
+`storage.delete-self-durable`, and the next release the function
+`storage.flush`; a component built before links as it did
 ([ADR 0023](adr/0023-the-front.md),
 [ADR 0025](adr/0025-calling-several-actors-at-once.md),
-[ADR 0028](adr/0028-actors-that-end.md)). A component that imports an
+[ADR 0028](adr/0028-actors-that-end.md),
+[ADR 0034](adr/0034-batched-plain-writes.md)). A component that imports an
 addition needs a host that has it: TypeScript and Python components
 import the whole `storage` interface, so those built with the `0.4.2`
-SDK need a `0.4.2` node even when they never call the new function.
+SDK need a `0.4.2` node even when they never call the new function, and
+those built with the next SDK a node of that release. Rust, Go, C and Zig
+components import only what they call.
+
+From the next release on, `wasmkeep deploy` checks this before it
+writes anything: it reads each component it is given, and refuses one
+that imports `storage.flush` while a live node of the app does not
+announce the capability word `flush`, or one that imports
+`storage.delete-self-durable` while a live node does not announce `ends`
+(nodes of `0.4.1` and before), naming those nodes. Upgrade every node of
+the app, then deploy. What the check cannot see is in
+[cluster](cluster.md#rolling-upgrades-and-new-storage-functions).
 
 `wasmkeep new` (from `0.4.2` on) writes Rust and TypeScript
 projects, pinned to its own version

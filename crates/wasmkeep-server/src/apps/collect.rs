@@ -179,6 +179,7 @@ mod tests {
                 config: BTreeMap::new(),
                 requires: BTreeMap::new(),
                 expire: BTreeMap::new(),
+                batched: std::collections::BTreeSet::new(),
             };
             put(format!("apps/acme/shop/v{i}/manifest"), manifest.format()).await;
             put(format!("apps/acme/shop/v{i}/counter.wasm"), "wasm".into()).await;
@@ -333,6 +334,7 @@ mod tests {
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
+            batched: std::collections::BTreeSet::new(),
         };
         put(&store, "apps/acme/shop/v1/manifest", &manifest.format()).await;
         assert_eq!(app.collect_versions(5, Duration::ZERO).await.unwrap(), 1);

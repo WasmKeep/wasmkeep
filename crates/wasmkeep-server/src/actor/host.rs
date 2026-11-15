@@ -178,6 +178,95 @@ impl ActorHost {
         Ok(Ok(changed))
     }
 
+    /// `storage.flush` (ADR 0034, section 4) for a strict class and a
+    /// single node. A strict class uploads every event's writes before the
+    /// next event starts, so what is not yet durable is this event's writes
+    /// so far: shipped here in one upload, as `exec-durable` ships them
+    /// after its commit (a pending alarm listed in the index first), or
+    /// nothing at all when there are none. On a single node the WAL is
+    /// fsynced, plain commits included. Refused inside an open transaction.
+    pub(super) async fn flush_untimed(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
+        let Some(slot) = self.replica.clone() else {
+            let r = self.with_db(ActorDb::sync_committed).await?;
+            return Ok(r.map_err(from_db_error));
+        };
+        let mut replica = slot.lock().await;
+        let outcome = self
+            .with_db(|db| {
+                if db.in_transaction() {
+                    return Ok(None);
+                }
+                let alarm = db.alarm().map_err(from_db_error)?;
+                let indexed = db
+                    .meta(ALARM_INDEXED_KEY)
+                    .map_err(from_db_error)?
+                    .as_deref()
+                    .and_then(alarm_index::parse_meta);
+                Ok(Some((alarm, indexed)))
+            })
+            .await?;
+        let (alarm, indexed) = match outcome {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(Err(flush_in_transaction())),
+            Err(e) => return Ok(Err(e)),
+        };
+        if let Some(reason) = replica.failed() {
+            // The local database may be ahead of the bucket: nothing is
+            // shipped until the actor is restored.
+            return Ok(Err(SqlError {
+                kind: SqlErrorKind::Internal,
+                message: format!("{REPLICATION_STOPPED} ({reason}); retry"),
+            }));
+        }
+        let stopped = |e: &dyn std::fmt::Display| SqlError {
+            kind: SqlErrorKind::Internal,
+            message: format!("{REPLICATION_STOPPED}: {e}"),
+        };
+        // As `exec-durable`: a pending alarm is listed in the bucket's
+        // index before the upload that carries it, under a fresh key and
+        // this replica's generation, and the upload records that.
+        let mut retired = None;
+        if let Some((cluster, address)) = self.alarm_index.clone()
+            && alarm_index::needs_publish(indexed.as_ref(), alarm)
+        {
+            let generation = replica.generation();
+            let entry = match alarm {
+                Some(at) => match cluster.put_new_alarm_entry(&address, at, generation).await {
+                    Ok(entry) => Some(entry),
+                    Err(e) => {
+                        replica.fail(format!("alarm index: {e}"));
+                        return Ok(Err(stopped(&format_args!("alarm index: {e}"))));
+                    }
+                },
+                None => None,
+            };
+            let value = alarm_index::to_meta(entry.as_ref());
+            self.with_db(move |db| db.set_meta(ALARM_INDEXED_KEY, &value))
+                .await?
+                .map_err(|e| wasmtime::format_err!("alarm index: {e}"))?;
+            retired = indexed.map(|p| (cluster, address, p, generation));
+        }
+        let captured = self.with_db(|db| db.take_changes()).await?;
+        let shipped = match captured {
+            Ok(None) => Ok(()),
+            Ok(Some(changes)) => replica.ship(&changes).await,
+            Err(e) => {
+                replica.fail(format!("capture: {e}"));
+                Err(ReplicaError::Local(format!("capture: {e}")))
+            }
+        };
+        if let Err(e) = shipped {
+            return Ok(Err(stopped(&e)));
+        }
+        if let Some((cluster, address, previous, generation)) = retired
+            && alarm_index::may_delete(&previous, generation)
+            && let Err(e) = cluster.delete_alarm_entry(&address, &previous).await
+        {
+            tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = %e, "removing a stale alarm entry failed");
+        }
+        Ok(Ok(()))
+    }
+
     pub(super) fn new(db: ResidentDb, sockets: Arc<Sockets>) -> Self {
         Self {
             checked_seq: None,
@@ -258,6 +347,25 @@ fn deleted_in_this_event() -> SqlError {
     SqlError {
         kind: SqlErrorKind::NotAllowed,
         message: "the actor was deleted in this event".into(),
+    }
+}
+
+/// How every `internal` from `storage.flush` starts once replication has
+/// stopped (ADR 0034, section 4), as `exec-durable`'s refusal after a
+/// failure starts.
+pub(crate) const REPLICATION_STOPPED: &str = "replication stopped";
+
+/// How a batched class's `storage.flush` starts its `internal` when the
+/// event's wall ran out while the upload went on (ADR 0034, section 4).
+/// Reserved: a strict class never answers it, its upload being inline.
+#[allow(dead_code, reason = "a batched flush's wall case (ADR 0034, slice S9)")]
+pub(crate) const STILL_UPLOADING: &str = "not durable: still uploading";
+
+/// `storage.flush` inside an open transaction.
+fn flush_in_transaction() -> SqlError {
+    SqlError {
+        kind: SqlErrorKind::NotAllowed,
+        message: "flush inside a transaction: commit or roll back first".into(),
     }
 }
 
@@ -433,6 +541,13 @@ impl storage::Host for ActorHost {
 
     async fn delete_self_durable(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
         self.delete_durably().await
+    }
+
+    async fn flush(&mut self) -> wasmtime::Result<Result<(), SqlError>> {
+        if self.deleted.is_some() || self.delete_retry {
+            return Ok(Err(deleted_in_this_event()));
+        }
+        self.flush_untimed().await
     }
 }
 

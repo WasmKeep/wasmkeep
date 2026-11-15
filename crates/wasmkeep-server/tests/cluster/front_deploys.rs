@@ -696,12 +696,13 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
         app.current().await.unwrap().unwrap().version,
         v2.current.version
     );
-    // Without a front, deploys go on.
+    // Without a front, deploys go on (of a component the old node can
+    // link: test-actor imports `storage.flush`, which it lacks, ADR 0034).
     let v3 = app
         .deploy_changes(
             &rt,
             Changes {
-                classes: Some(vec![("c".into(), test_actor_wasm().to_vec())]),
+                classes: Some(vec![("c".into(), chat_wasm().to_vec())]),
                 ..Changes::default()
             },
         )

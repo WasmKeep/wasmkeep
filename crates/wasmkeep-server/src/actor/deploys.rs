@@ -104,17 +104,30 @@ impl ActorService {
         config: &std::collections::BTreeMap<String, crate::env::Vars>,
         requires: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     ) -> Result<(), (String, Error)> {
-        self.apply_deployed(seq, classes, rules, config, requires, None)
+        self.apply_deployed(
+            seq,
+            classes,
+            rules,
+            config,
+            requires,
+            &std::collections::BTreeSet::new(),
+            None,
+        )
     }
 
-    /// [`Self::apply_version_with`] with the version's front (ADR 0023),
-    /// swapped in with its classes under the same lock; `None` removes the
-    /// node's front (requests outside `/actor/` answer 404). A front that
-    /// does not link is refused like a class that does not link (as
-    /// `_front`): nothing changes.
+    /// [`Self::apply_version_with`] with the classes whose writes are
+    /// batched (ADR 0034, section 1; every other class is strict) and the
+    /// version's front (ADR 0023), swapped in with its classes under the
+    /// same lock; `None` removes the node's front (requests outside
+    /// `/actor/` answer 404). A front that does not link is refused like a
+    /// class that does not link (as `_front`): nothing changes.
     ///
     /// # Errors
     /// The first class (or `_front`) that does not link, with why.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a version's parts, swapped in together under one lock"
+    )]
     pub fn apply_deployed(
         &self,
         seq: u64,
@@ -122,6 +135,7 @@ impl ActorService {
         rules: &crate::access::AccessRules,
         config: &std::collections::BTreeMap<String, crate::env::Vars>,
         requires: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        batched: &std::collections::BTreeSet<String>,
         front: Option<&crate::front::DeployedFront>,
     ) -> Result<(), (String, Error)> {
         // Linking is slow: done before taking the lock, the front's too.
@@ -172,6 +186,7 @@ impl ActorService {
                 secrets.class(&name),
             );
             let required = Arc::new(requires.get(&name).cloned().unwrap_or_default());
+            let writes = writes_of(batched, &name);
             built.insert(
                 name,
                 Arc::new(ActorClass {
@@ -179,6 +194,7 @@ impl ActorService {
                     rules: Arc::clone(&rules),
                     env,
                     requires: required,
+                    writes,
                     ..class
                 }),
             );

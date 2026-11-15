@@ -16,6 +16,42 @@ Since 0.4.2, in no release yet.
   allowances and column names once, as well as text/blob payloads. Queries
   with many empty values or large aliases now fail with `quota-exceeded`
   when they exceed it; names and payloads are checked before copying.
+- **`storage.flush`: make the writes so far durable without a
+  statement** ([ADR 0034](docs/adr/0034-batched-plain-writes.md),
+  section 4). Added to `wasmkeep:actor@0.2.0` (components built before
+  link as they did) and to the Rust (`storage::flush`) and TypeScript
+  (`storage.flush()`) SDKs. It returns once every write the actor
+  committed before the call is durable, plain `exec` included: in a
+  cluster this event's writes so far go to the bucket in one upload (an
+  alarm set meanwhile listed first, as `exec-durable` does), or nothing is
+  sent when nothing is pending; on a single node the WAL is fsynced. It
+  is refused with `not-allowed` inside a transaction. An `internal`
+  starting `replication stopped` means the writes are not known to be
+  durable and the actor is restored from the bucket, as after a failed
+  `exec-durable`, and every later `flush` of the event answers it at once
+  ([concepts](docs/concepts.md#storage)). `exec-durable` is unchanged.
+  TypeScript and Python components built with this SDK import it whether
+  or not they call it, so they need a node of this release.
+- **`deploy` refuses a component a live node could not link**
+  ([cluster](docs/cluster.md#rolling-upgrades-and-new-storage-functions)).
+  Nodes now announce the heartbeat word `flush`. `deploy` reads the
+  imports of each component it is given and refuses, before writing
+  anything and without `--force`, one that imports `storage.flush` while
+  a live node of the app lacks `flush`, or one that imports
+  `storage.delete-self-durable` while a live node lacks `ends` (a node of
+  0.4.1). The second is new for every class: 0.4.2 accepted that deploy
+  and the 0.4.1 node stayed not ready on it. The classes a deploy keeps and
+  the version a rollback brings back are checked too. The check cannot
+  see a node started without `--node-id`, or a node that starts after
+  the deploy. Upgrade every node, then deploy.
+- **A class's `writes` in `wasmkeep.toml`** (ADR 0034, section 1):
+  `"strict"`, the default and every release's behaviour, or `"batched"`,
+  which `deploy` refuses for now ("not yet available"). `"strict"`
+  written or not makes the same version, byte for byte. A version with a
+  batched class will be written as manifest format 5, which this release
+  reads and a deploy holds back while a live node lacks `flush`; each
+  hold keeps the mode it was acquired with until its writes are flushed
+  ([project file](docs/project-file.md)).
 - **`cluster diagnose` requires listings that are strongly consistent
   after a write.** A node taking an actor over plans its restore from one
   listing of the actor's history, and after a voluntary hand-over it may

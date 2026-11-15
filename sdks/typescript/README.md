@@ -70,6 +70,7 @@ after `npm ci` in `sdks/typescript`).
 | `storage.query(sql, ...params)` | rows as objects; integers beyond 2^53 come back as `bigint` |
 | `storage.deleteSelf()` | delete this actor when the event ends |
 | `storage.deleteSelfDurable()` | delete this actor now; returns once the delete is durable (throws `SqlError`) |
+| `storage.flush()` | returns once every write committed so far is durable (throws `SqlError`) |
 | `alarms.set(at)`, `alarms.get()`, `alarms.clear()` | the actor's alarm (ms since epoch or a `Date`) |
 | `env.get(name)` | the class's configuration value or secret (`deploy --config`, `secrets set`, `serve --env`; last wins; see [`env`](https://github.com/WasmKeep/wasmkeep/blob/v0.4.2/docs/reference/api.md#interface-env)), or `undefined` |
 | `actors.self()` | this actor's address: `{ tenant, class, name }` |

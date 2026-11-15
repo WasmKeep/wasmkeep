@@ -1347,8 +1347,10 @@ is upgraded:
   the app runs 0.4.1. [`actor delete`](#deleting-one-actor) requests wait
   until a 0.4.2 node holds the actor, or finds it free.
 - A component that imports `storage.delete-self-durable` cannot be
-  loaded by a 0.4.1 node, and the deploy does not check for it: that node
-  stays not ready on the version ("cannot apply the deployed version").
+  loaded by a 0.4.1 node, and the 0.4.2 deploy does not check for it:
+  that node stays not ready on the version ("cannot apply the deployed
+  version"). The next release's deploy refuses it
+  ([below](#rolling-upgrades-and-new-storage-functions)).
   Every TypeScript and Python component built with the 0.4.2 SDK imports
   it, called or not, as do Rust, Go, C and Zig components that call it.
   Deploy them once every node runs 0.4.2.
@@ -1429,6 +1431,50 @@ for the rule; there may be others nobody has listed):
 
 Rolling upgrades of WasmKeep across mixed versions are planned
 ([ROADMAP](../ROADMAP.md)).
+
+### Rolling upgrades and new storage functions
+
+From the release after 0.4.2, every node announces the heartbeat word
+`flush`: it has `storage.flush`
+([ADR 0034](adr/0034-batched-plain-writes.md)), which a node of 0.4.2
+or before cannot link. `wasmkeep deploy` reads the imports of each
+component it is given, before it writes anything, and refuses the
+deploy, naming the nodes and the classes, while a live node of the app
+lacks what a component imports:
+
+- a component importing `storage.flush` needs every live node to
+  announce `flush`;
+- a component importing `storage.delete-self-durable` needs every live
+  node to announce `ends` (0.4.2 and later). 0.4.2 accepted that deploy,
+  and a 0.4.1 node stayed not ready on it; this refusal is new, for every
+  class.
+
+There is no `--force`: such a node would stay not ready on the version.
+TypeScript and Python components import the whole `storage` interface,
+so every one built with the SDK of that release imports `flush`, called
+or not; Rust, Go, C and Zig components import what they call.
+**Upgrade every node of the app, then deploy.**
+
+What the check does not cover, during a rolling upgrade:
+
+- It runs in `deploy`, from the heartbeats in the bucket, not on the
+  nodes. A node started without `--node-id` writes no heartbeat, so the
+  check cannot see it, nor a node that starts after the deploy.
+- It reads only the components the deploy is given: a class it keeps
+  (a deploy that changes only rules or values) was checked when it was
+  given, or not at all if an older CLI deployed it, and `--rollback`
+  reads no component.
+- A node that misses it cannot link the component and stays not ready on
+  the version ("cannot apply the deployed version"), but it still takes
+  actors: their events are refused until it is upgraded. The data is
+  safe (it uploads nothing it could not run); availability is not.
+
+A class's `writes` (`strict`, the default, or `batched`) is part of its
+version: `strict`, written or not, makes the same version and manifest
+as before. `batched` is refused by `deploy` for now; once it is built, a
+version with a batched class is written as manifest format 5, which a
+deploy refuses while a live node lacks `flush` (and, as for formats 4
+and 3, `ends` and `front`).
 
 ## History in the bucket
 

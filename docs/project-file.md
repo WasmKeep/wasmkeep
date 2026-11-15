@@ -74,6 +74,7 @@ least one class.
 | `config` | optional | a file of `NAME=value` lines, plain configuration (stored in the bucket in the clear: never secrets) |
 | `requires` | optional | names that must be set (by the configuration, the app's secrets or a node's `--env`) before the class or front runs |
 | `expire-after-idle` | classes only | how long an actor of the class may stay idle before it is deleted: a whole number and one unit, `s`, `m`, `h` or `d` (`"7d"`, `"36h"`), at least `"1h"`; none by default (actors are kept). In a cluster only ([idle expiry](cluster.md#idle-expiry)) |
+| `writes` | classes only | how the class's plain writes reach the bucket: `"strict"` (the default, every release's behaviour: an event's writes are uploaded before the next event starts) or `"batched"`, reserved for [ADR 0034](adr/0034-batched-plain-writes.md) and refused by `deploy` for now ("not yet available"). `"strict"` written or not makes the same version, byte for byte |
 | `build` | optional | a command for the system shell (`sh -c`, `cmd.exe` on Windows), run in the file's directory before `component` is read |
 | `watch` | optional | files or directories of sources; `wasmkeep dev` runs `build` again when one changes (name sources, not what the build writes) |
 

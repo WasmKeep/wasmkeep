@@ -25,6 +25,10 @@
 //! - `POST /plain`: adds 1 to `plain` with a plain `exec` (uploaded after
 //!   the answer: lost with its node if not uploaded yet); answers the new
 //!   value; `GET /plain`
+//! - `POST /flush?n=N[&alarm=MS][&tx][&twice]`: N plain `exec` increments
+//!   of `plain` (default none), an alarm MS from now with `alarm`, then
+//!   `flush` (inside BEGIN ... ROLLBACK with `tx`; twice with `twice`);
+//!   answers each as `ok:PLAIN` or `err:KIND:MESSAGE`, joined by ` | `
 //! - `POST /durable-twice`: two `exec-durable` increments in one event;
 //!   answers `first=ok|err second=ok|err`
 //! - `POST /durable-in-tx`: `exec-durable` inside BEGIN/ROLLBACK; answers
@@ -411,6 +415,37 @@ impl http::Guest for TestActor {
                 }
             }
             (Method::Get, "/plain") => get("plain").to_string(),
+            (Method::Post, "/flush") => {
+                for _ in 0..num("n") {
+                    let _ = storage::exec(
+                        "INSERT INTO config (key, value) VALUES ('plain', 1)
+                         ON CONFLICT (key) DO UPDATE SET value = value + 1",
+                        &[],
+                    );
+                }
+                if query_param(&full, "alarm").is_some() {
+                    alarms::set_alarm(now_ms() + u64::try_from(num("alarm")).unwrap_or(0));
+                }
+                let tx = query_param(&full, "tx").is_some();
+                if tx {
+                    let _ = storage::exec("BEGIN", &[]);
+                }
+                let mut answers = vec![storage::flush()];
+                if query_param(&full, "twice").is_some() {
+                    answers.push(storage::flush());
+                }
+                if tx {
+                    let _ = storage::exec("ROLLBACK", &[]);
+                }
+                answers
+                    .into_iter()
+                    .map(|r| match r {
+                        Ok(()) => format!("ok:{}", get("plain")),
+                        Err(e) => format!("err:{:?}:{}", e.kind, e.message),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            }
             (Method::Post, "/durable-in-tx") => {
                 let _ = storage::exec("BEGIN", &[]);
                 let r = storage::exec_durable(

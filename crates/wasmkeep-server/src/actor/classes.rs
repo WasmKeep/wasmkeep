@@ -25,6 +25,10 @@ pub(super) struct ActorClass {
     /// Whether a missing required name was already logged for this class
     /// version (once, not per event).
     pub(super) warned: Arc<std::sync::atomic::AtomicBool>,
+    /// How its plain writes reach the bucket (ADR 0034, section 1), as
+    /// deployed. A hold takes it when it is acquired and changes it only
+    /// at a `Flushed` barrier ([`super::held::Held::switch_writes`]).
+    pub(super) writes: crate::apps::Writes,
 }
 
 impl ActorClass {
@@ -103,7 +107,21 @@ pub(super) fn build_class(
         env: Arc::default(),
         requires: Arc::default(),
         warned: Arc::default(),
+        writes: crate::apps::Writes::Strict,
     })
+}
+
+/// A class's mode of writes (ADR 0034, section 1): batched if the version
+/// says so, else strict.
+pub(super) fn writes_of(
+    batched: &std::collections::BTreeSet<String>,
+    class: &str,
+) -> crate::apps::Writes {
+    if batched.contains(class) {
+        crate::apps::Writes::Batched
+    } else {
+        crate::apps::Writes::Strict
+    }
 }
 
 /// `class`'s values, by name, last wins: the deployed configuration, the

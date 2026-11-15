@@ -99,6 +99,12 @@ pub struct NodeInfo {
     /// that predate it, which cannot read such a version and would keep
     /// serving a deleted app.
     pub can_end: bool,
+    /// It has `storage.flush` and reads manifest format 5 (`writes`
+    /// lines, ADR 0034, section 15) (heartbeat line 11, `flush`); `false`
+    /// from nodes that predate it, which cannot link a component that
+    /// imports `storage.flush` nor read such a version. Announced from the
+    /// binary alone.
+    pub can_flush: bool,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which
     /// each notices in its next listing. `None` from nodes that predate it.
@@ -401,6 +407,7 @@ impl NodeInfo {
             can_front: words.can_front,
             can_handoff: words.can_handoff,
             can_end: words.can_end,
+            can_flush: words.can_flush,
             instance: lease.instance,
             lease: Some(lease.state),
             load,
@@ -410,13 +417,15 @@ impl NodeInfo {
 
 impl NodeInfo {
     /// The capability words this node announces on line 11, in order
-    /// (`take`, `front`, `handoff`). Readers ignore words they do not know.
+    /// (`take`, `front`, `handoff`, `ends`, `flush`). Readers ignore words
+    /// they do not know.
     fn capabilities(&self) -> impl Iterator<Item = &'static str> {
         [
             (self.can_take, "take"),
             (self.can_front, "front"),
             (self.can_handoff, "handoff"),
             (self.can_end, "ends"),
+            (self.can_flush, "flush"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -445,6 +454,7 @@ impl NodeInfo {
             can_front: words.contains(&"front"),
             can_handoff: words.contains(&"handoff"),
             can_end: words.contains(&"ends"),
+            can_flush: words.contains(&"flush"),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
                 let ok = !token.is_empty()
@@ -691,6 +701,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_front: true,
             can_handoff: true,
             can_end: true,
+            can_flush: true,
             instance: self.instance.clone(),
             lease: None,
             load,
@@ -920,6 +931,7 @@ mod tests {
             can_front: false,
             can_handoff: false,
             can_end: false,
+            can_flush: false,
             instance: None,
             lease: None,
             load: None,
@@ -956,6 +968,7 @@ mod tests {
             can_front: false,
             can_handoff: false,
             can_end: false,
+            can_flush: false,
             instance: None,
             lease: None,
             load: None,
@@ -1028,6 +1041,7 @@ mod tests {
             can_front: false,
             can_handoff: false,
             can_end: false,
+            can_flush: false,
             instance: None,
             lease: None,
             load: None,
@@ -1401,6 +1415,7 @@ mod tests {
             can_front: false,
             can_handoff: false,
             can_end: false,
+            can_flush: false,
             instance: lease.instance,
             lease: Some(lease.state),
             load: None,
@@ -1516,9 +1531,45 @@ mod tests {
         let payload = String::from_utf8(a.lease_payload()).unwrap();
         assert_eq!(
             payload.lines().nth(8),
-            Some("take front handoff ends"),
+            Some("take front handoff ends flush"),
             "{payload}"
         );
+    }
+
+    /// ADR 0034, section 15: `flush`, last, from the binary alone; a node
+    /// without it reads as unable, and the version before ignores it.
+    #[test]
+    fn line_11_says_the_node_has_flush_and_older_readers_ignore_it() {
+        let node = NodeInfo {
+            can_front: true,
+            can_handoff: true,
+            can_end: true,
+            can_flush: true,
+            ..loaded_node()
+        };
+        let payload = String::from_utf8(node.payload()).unwrap();
+        assert_eq!(
+            payload.lines().nth(8),
+            Some("take front handoff ends flush")
+        );
+        let read = NodeInfo::decode(&format3(&node, NodeState::Live, "beef")).unwrap();
+        assert!(read.can_end && read.can_flush);
+        let read = NodeInfo::decode(&node.encode()).unwrap();
+        assert!(read.can_end && read.can_flush);
+        let body = "wasmkeep-node 3\nlive beef\n5\na\nhttp://a\n1\nacme/shop\n\n\nserving\n\ntake front handoff ends\n";
+        let read = NodeInfo::decode(body.as_bytes()).unwrap();
+        assert!(read.can_end && !read.can_flush);
+        assert!(
+            decode_before_load(&format3(&node, NodeState::Live, "beef"))
+                .is_some_and(|n| n.can_take)
+        );
+        // Without `flush`, the line is as a node of 0.4.2 writes it.
+        let before = NodeInfo {
+            can_flush: false,
+            ..node
+        };
+        let payload = String::from_utf8(before.payload()).unwrap();
+        assert_eq!(payload.lines().nth(8), Some("take front handoff ends"));
     }
 
     #[test]
