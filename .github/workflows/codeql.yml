@@ -1,0 +1,79 @@
+name: CodeQL
+
+# Code scanning, advanced setup: replaces the repository's default setup,
+# which must be turned off when this file lands (both cannot run). Every
+# push to main, once a week, and by hand; not on pull requests, so a
+# pull request waits for no scan. Each language keeps the category default
+# setup gave it (`/language:<lang>`), so its alerts and their dismissals
+# carry over. .github/codeql/codeql-config.yml says which paths are not
+# scanned (tests) and why.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "bench/results/**"
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# `bash` by name runs every step with `-eo pipefail`: a failure on the left
+# of a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+# A newer push to main replaces the scan in progress: only the latest
+# commit's alerts matter, and the next one scans everything again.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: c-cpp
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: actions
+            build-mode: none
+          - language: go
+            build-mode: autobuild
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - if: ${{ matrix.language == 'go' }}
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: sdks/go/go.mod
+          cache: false
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+      - if: ${{ matrix.build-mode == 'autobuild' }}
+        uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}

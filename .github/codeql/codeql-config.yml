@@ -1,0 +1,23 @@
+# CodeQL configuration for .github/workflows/codeql.yml.
+#
+# Scanned: everything that ships or that someone copies, the crates, the
+# SDKs, the CLI, the scripts, the workflows and examples/ (examples are
+# starting points for applications, so a weakness there gets copied).
+#
+# Not scanned: tests alone. Test code builds fixtures on purpose, fixed
+# keys, fixed nonces, throwaway servers, plain-text secrets, and its alerts
+# are noise that hides the ones that matter. That covers the integration
+# test directories, the in-crate test modules kept in their own files
+# (tests.rs, *_tests.rs), the guest SDKs' test directories, the
+# simulations (sim/), the benchmark harness (bench/), the LTX conformance
+# suite (conformance/) and the Python tests of the scripts. Nothing here
+# filters queries: every alert outside these paths is reported.
+paths-ignore:
+  - "**/tests/**"
+  - "**/tests.rs"
+  - "**/*_tests.rs"
+  - "**/test/**"
+  - "sim/**"
+  - "bench/**"
+  - "conformance/**"
+  - "scripts/test_*.py"
