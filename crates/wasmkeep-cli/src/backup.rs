@@ -15,6 +15,19 @@ use wasmkeep_server::history;
 
 const MAX: u64 = 2 << 30;
 const META_MAX: u64 = 64 << 20;
+// Serialized budgets bound JSON expansion as well as resident indexes. Oversize
+// archives fail explicitly; they are never silently truncated.
+const ACTOR_MAX: u64 = 8 << 20;
+const SPOOL_MAX: u64 = 1 << 30;
+const INDEX_MAX: u64 = 64 << 20;
+fn charge(used: &mut u64, bytes: u64, limit: u64, label: &str) -> anyhow::Result<()> {
+    *used = used.checked_add(bytes).context("backup budget overflow")?;
+    ensure!(
+        *used <= limit,
+        "backup {label} budget exceeded ({limit} bytes)"
+    );
+    Ok(())
+}
 type Store = Arc<dyn ObjectStore>;
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
@@ -62,6 +75,54 @@ pub(crate) struct Verify {
     run: Option<String>,
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     sample: Option<u64>,
+}
+struct LimitedWriter {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+impl std::io::Write for LimitedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
+            return Err(std::io::Error::other(
+                "backup serialized memory budget exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn encode_bounded(value: &Value, limit: u64) -> anyhow::Result<Vec<u8>> {
+    let mut writer = LimitedWriter {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.bytes)
+}
+async fn list_bounded(store: &Store, prefix: &str) -> anyhow::Result<BTreeMap<String, ObjectMeta>> {
+    let mut objects = BTreeMap::new();
+    let mut used = 0;
+    let mut stream = store.list(Some(&Key::from(prefix.trim_end_matches('/'))));
+    while let Some(meta) = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+        .await
+        .context("backup listing stalled")?
+    {
+        let meta = meta?;
+        let Some(relative) = meta.location.as_ref().strip_prefix(prefix) else {
+            continue;
+        };
+        charge(
+            &mut used,
+            relative.len() as u64 + meta.location.as_ref().len() as u64 + 512,
+            INDEX_MAX,
+            "listing memory",
+        )?;
+        objects.insert(relative.to_owned(), meta);
+    }
+    Ok(objects)
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -138,7 +199,7 @@ async fn json_put(
     value: &Value,
     replace: bool,
 ) -> anyhow::Result<String> {
-    let bytes = serde_json::to_vec(value)?;
+    let bytes = encode_bounded(value, META_MAX - 1)?;
     ensure!(
         (bytes.len() as u64) < META_MAX,
         "metadata exceeds loader cap: {path}"
@@ -157,11 +218,16 @@ fn setting(name: &str) -> anyhow::Result<object_store::aws::AmazonS3ConfigKey> {
         config != object_store::aws::AmazonS3ConfigKey::Bucket,
         "bucket override forbidden: {name}"
     );
+    ensure!(
+        config != object_store::aws::AmazonS3ConfigKey::VirtualHostedStyleRequest,
+        "virtual-hosted addressing is forbidden for online backup: {name}"
+    );
     Ok(config)
 }
 fn configured(
     url: &str,
     file: Option<&std::path::Path>,
+    source_bucket: Option<&str>,
 ) -> anyhow::Result<(Store, String, String)> {
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey as C};
     let (bucket, prefix) = crate::parse_bucket(url)?;
@@ -197,12 +263,64 @@ fn configured(
         .get_config_value(&C::S3Endpoint)
         .or_else(|| builder.get_config_value(&C::Endpoint))
         .unwrap_or_else(|| "https://s3.amazonaws.com".into());
+    let parsed = reqwest::Url::parse(&endpoint).context("invalid S3 endpoint")?;
+    let host = parsed
+        .host_str()
+        .context("S3 endpoint has no host")?
+        .trim_end_matches('.');
+    let service_host = host
+        .strip_suffix(".amazonaws.com.cn")
+        .or_else(|| host.strip_suffix(".amazonaws.com"));
+    let region = |r: &str| {
+        r.split('-').count() >= 3
+            && r.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && r.rsplit('-')
+                .next()
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let service = service_host.is_some_and(|h| {
+        h == "s3"
+            || h.strip_prefix("s3.").is_some_and(region)
+            || h.strip_prefix("s3-").is_some_and(region)
+            || h.strip_prefix("s3.dualstack.").is_some_and(region)
+    });
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "invalid S3 endpoint scheme"
+    );
+    let embeds_bucket = |bucket: &str| {
+        host.eq_ignore_ascii_case(bucket)
+            || host
+                .to_ascii_lowercase()
+                .starts_with(&format!("{}.", bucket.to_ascii_lowercase()))
+    };
+    ensure!(
+        (service_host.is_none() || service)
+            && !embeds_bucket(bucket)
+            && !source_bucket.is_some_and(embeds_bucket),
+        "bucket-hosted S3 endpoint forbidden; use a path-style service endpoint"
+    );
+    ensure!(
+        parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+            && parsed.username().is_empty()
+            && parsed.password().is_none(),
+        "S3 endpoint must be an origin without path or credentials"
+    );
     let endpoint = endpoint_identity(&endpoint)?;
     let store = builder.with_bucket_name(bucket).build()?;
     Ok((Arc::new(store), prefix.to_owned(), endpoint))
 }
 fn endpoint_identity(endpoint: &str) -> anyhow::Result<String> {
-    let url = reqwest::Url::parse(endpoint).context("invalid S3 endpoint")?;
+    let mut url = reqwest::Url::parse(endpoint).context("invalid S3 endpoint")?;
+    let host = url.host_str().context("S3 endpoint has no host")?;
+    if host.ends_with('.') {
+        let host = host.trim_end_matches('.').to_owned();
+        url.set_host(Some(&host))
+            .context("invalid S3 endpoint host")?;
+    }
     let host = url.host_str().context("S3 endpoint has no host")?;
     // AWS bucket names identify the same bucket across regional S3 endpoints.
     if (host == "s3.amazonaws.com" || host.starts_with("s3.") || host.starts_with("s3-"))
@@ -219,7 +337,11 @@ fn endpoint_identity(endpoint: &str) -> anyhow::Result<String> {
 }
 #[cfg(test)]
 fn destination(args: &Create) -> anyhow::Result<(Store, String)> {
-    let (store, prefix, _) = configured(&args.to, args.to_env.as_deref())?;
+    let (store, prefix, _) = configured(
+        &args.to,
+        args.to_env.as_deref(),
+        Some(crate::parse_bucket(&args.bucket)?.0),
+    )?;
     Ok((store, prefix))
 }
 fn disjoint(source: (&str, &str, &str), dest: (&str, &str, &str)) -> anyhow::Result<()> {
@@ -241,8 +363,12 @@ pub(crate) fn run(command: &Command) -> anyhow::Result<()> {
     crate::actor_read::run(async {
         match command {
             Command::Create(args) => {
-                let (source, sp, se) = configured(&args.bucket, None)?;
-                let (dest, dp, de) = configured(&args.to, args.to_env.as_deref())?;
+                let (source, sp, se) = configured(&args.bucket, None, None)?;
+                let (dest, dp, de) = configured(
+                    &args.to,
+                    args.to_env.as_deref(),
+                    Some(crate::parse_bucket(&args.bucket)?.0),
+                )?;
                 disjoint(
                     (&se, crate::parse_bucket(&args.bucket)?.0, &sp),
                     (&de, crate::parse_bucket(&args.to)?.0, &dp),
@@ -251,8 +377,7 @@ pub(crate) fn run(command: &Command) -> anyhow::Result<()> {
             }
             Command::List(args) => {
                 let (store, prefix) = crate::open_bucket_unchecked(&args.from)?;
-                let objects =
-                    history::list_objects(&store, &format!("{}/", key(&prefix, "runs"))).await?;
+                let objects = list_bounded(&store, &format!("{}/", key(&prefix, "runs"))).await?;
                 for path in objects.keys().filter(|p| p.ends_with("/started")) {
                     let id = path.trim_end_matches("/started");
                     safe_id(id)?;
@@ -305,22 +430,69 @@ async fn checked_json(store: &Store, path: &str, hash: &str) -> anyhow::Result<V
     Ok(serde_json::from_slice(&bytes)?)
 }
 async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
+    load_with_budget(store, prefix, id, SPOOL_MAX, INDEX_MAX).await
+}
+async fn load_with_budget(
+    store: &Store,
+    prefix: &str,
+    id: &str,
+    spool_limit: u64,
+    index_limit: u64,
+) -> anyhow::Result<Run> {
     safe_id(id)?;
     let base = key(prefix, &format!("runs/{id}"));
-    let complete: Value =
-        serde_json::from_slice(&read(store, &key(&base, "complete"), META_MAX).await?)?;
+    let root: Value = serde_json::from_slice(&read(store, &key(&base, "root"), META_MAX).await?)?;
+    ensure!(root["run"] == id, "run root mismatch");
+    let complete = checked_json(store, &key(&base, "complete"), text(&root, "sha256")?).await?;
+    let started = checked_json(
+        store,
+        &key(&base, "started"),
+        text(&complete, "started_sha256")?,
+    )
+    .await?;
+    ensure!(
+        started["run"] == id
+            && started["incarnations"] == complete["incarnations"]
+            && started["source"] == complete["source"],
+        "started membership mismatch"
+    );
     ensure!(
         complete["format"] == 1 && complete["run"] == id,
         "unknown or inconsistent backup format"
     );
+    ensure!(
+        encode_bounded(&complete, INDEX_MAX)?.len() as u64 <= index_limit,
+        "backup resident index budget exceeded"
+    );
     let spool = tempfile::tempdir()?;
     let mut actors = Vec::new();
-    let mut pending = String::new();
+    let mut pending: Option<std::fs::File> = None;
+    let mut actor_bytes = 0;
+    let mut disk_bytes = 0;
+    let mut index_bytes = 0;
+    charge(
+        &mut index_bytes,
+        encode_bounded(&complete, INDEX_MAX)?.len() as u64,
+        index_limit,
+        "resident index",
+    )?;
+    charge(
+        &mut index_bytes,
+        encode_bounded(&started, INDEX_MAX)?.len() as u64,
+        index_limit,
+        "resident index",
+    )?;
     let mut part = 0;
     let mut apps = Vec::new();
     let mut seen = BTreeSet::new();
     for chunk in array(&complete, "chunks")? {
         let path = text(chunk, "key")?;
+        charge(
+            &mut index_bytes,
+            path.len() as u64 + 128,
+            index_limit,
+            "resident index",
+        )?;
         ensure!(
             path.starts_with(&format!("{base}/actors/")) && seen.insert(path.to_owned()),
             "invalid/duplicate chunk"
@@ -328,17 +500,43 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
         let value = checked_json(store, path, text(chunk, "sha256")?).await?;
         for fragment in value.as_array().context("actor chunk is not an array")? {
             ensure!(
-                number(fragment, "part")? == if pending.is_empty() { 0 } else { part },
+                number(fragment, "part")? == if pending.is_none() { 0 } else { part },
                 "actor fragment order mismatch"
             );
-            pending.push_str(text(fragment, "json")?);
+            let fragment_bytes = text(fragment, "json")?.as_bytes();
+            charge(
+                &mut actor_bytes,
+                fragment_bytes.len() as u64,
+                ACTOR_MAX,
+                "actor memory",
+            )?;
+            charge(
+                &mut disk_bytes,
+                fragment_bytes.len() as u64,
+                spool_limit,
+                "spool disk",
+            )?;
+            let path = spool.path().join(format!("{:08}.json", actors.len()));
+            if pending.is_none() {
+                pending = Some(std::fs::File::create(&path)?);
+            }
+            std::io::Write::write_all(pending.as_mut().context("missing spool")?, fragment_bytes)?;
             part += 1;
             if fragment["last"] == true {
-                let actor: Value = serde_json::from_str(&pending)?;
-                let path = spool.path().join(format!("{:08}.json", actors.len()));
-                std::fs::write(&path, &pending)?;
+                drop(pending.take());
+                let actor = disk_actor(&path)?;
+                ensure!(
+                    actor["run"] == id && actor["started_sha256"] == complete["started_sha256"],
+                    "actor run binding mismatch"
+                );
+                charge(
+                    &mut index_bytes,
+                    path.as_os_str().len() as u64 + text(&actor, "prefix")?.len() as u64 + 256,
+                    index_limit,
+                    "resident index",
+                )?;
                 actors.push(path);
-                pending.clear();
+                actor_bytes = 0;
                 part = 0;
                 ensure!(
                     actor["status"] == "copied" || actor["status"] == "failed",
@@ -347,7 +545,7 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
             }
         }
     }
-    ensure!(pending.is_empty(), "unfinished actor fragments");
+    ensure!(pending.is_none(), "unfinished actor fragments");
     ensure!(
         actors.len() as u64 == number(&complete, "actors")?,
         "actor count mismatch"
@@ -361,6 +559,12 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
             "duplicate actor"
         );
         if actor["status"] == "failed" {
+            charge(
+                &mut index_bytes,
+                encode_bounded(&actor["failure"], ACTOR_MAX)?.len() as u64,
+                index_limit,
+                "resident index",
+            )?;
             failures.push(actor["failure"].clone());
         }
     }
@@ -374,9 +578,34 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
             path.starts_with(&format!("{base}/app/")) && seen.insert(path.to_owned()),
             "invalid/duplicate app record"
         );
-        apps.push(checked_json(store, path, text(app, "sha256")?).await?);
+        let app = checked_json(store, path, text(app, "sha256")?).await?;
+        charge(
+            &mut index_bytes,
+            serde_json::to_vec(&app)?.len() as u64,
+            index_limit,
+            "resident index",
+        )?;
+        ensure!(
+            app["run"] == id && app["started_sha256"] == complete["started_sha256"],
+            "app run binding mismatch"
+        );
+        apps.push(app);
     }
     ensure!(!apps.is_empty(), "missing app records");
+    let mut membership = BTreeSet::new();
+    for app in &apps {
+        ensure!(
+            membership.insert(text(app, "app")?),
+            "duplicate app membership"
+        );
+    }
+    let incarnations = complete["incarnations"]
+        .as_object()
+        .context("invalid incarnations")?;
+    ensure!(
+        membership == incarnations.keys().map(String::as_str).collect(),
+        "app incarnation membership mismatch"
+    );
     array(&complete, "failed")?;
     Ok(Run {
         complete,
@@ -386,7 +615,12 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
     })
 }
 fn disk_actor(path: &std::path::Path) -> anyhow::Result<Value> {
-    Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
+    let file = std::fs::File::open(path)?;
+    ensure!(
+        file.metadata()?.len() <= ACTOR_MAX,
+        "backup actor memory budget exceeded"
+    );
+    Ok(serde_json::from_reader(std::io::BufReader::new(file))?)
 }
 async fn blob(store: &Store, prefix: &str, object: &Value) -> anyhow::Result<Vec<u8>> {
     let hash = text(object, "sha256")?;
@@ -483,6 +717,20 @@ async fn replay(dest: &Store, dp: &str, actor: &Value) -> anyhow::Result<history
     );
     Ok(result)
 }
+fn plan_target(
+    listing: &Listing,
+    target: wasmkeep_cluster::replication::SegmentId,
+) -> anyhow::Result<wasmkeep_cluster::replication::Plan> {
+    if listing.snapshots.contains(&target) {
+        return Ok(wasmkeep_cluster::replication::Plan {
+            snapshot: Some(target),
+            segments: Vec::new(),
+        });
+    }
+    let plan = plan_restore(listing)?;
+    ensure!(plan.head() == target, "range target is not recoverable");
+    Ok(plan)
+}
 fn recoverable_ranges(actor: &Value) -> anyhow::Result<Vec<Value>> {
     let objects = actor["objects"].as_object().context("missing objects")?;
     let listing = Listing::from_keys(objects.keys().map(String::as_str));
@@ -508,7 +756,7 @@ fn recoverable_ranges(actor: &Value) -> anyhow::Result<Vec<Value>> {
                 .filter(|s| s.id <= target)
                 .collect(),
         };
-        if plan_restore(&subset).is_ok_and(|p| p.head() == target) {
+        if plan_target(&subset, target).is_ok() {
             if let Some(last) = ranges.last_mut()
                 && last["generation"] == target.generation
                 && last["end"].as_u64().and_then(|n| n.checked_add(1)) == Some(target.txid)
@@ -531,32 +779,46 @@ async fn verify_ranges(store: &Store, prefix: &str, actor: &Value) -> anyhow::Re
     );
     let objects = actor["objects"].as_object().context("missing objects")?;
     let listing = Listing::from_keys(objects.keys().map(String::as_str));
-    // Replay each whole range from its first recoverable base, not from the
-    // newest snapshot (which would hide corrupt older segment chains).
+    // Plan every advertised position explicitly. A snapshot is independently
+    // recoverable even when its boundary is absent and older segments remain.
     for range in &ranges {
-        let start = wasmkeep_cluster::replication::SegmentId {
-            generation: number(range, "generation")?,
-            txid: number(range, "start")?,
-        };
-        let target = wasmkeep_cluster::replication::SegmentId {
-            generation: start.generation,
-            txid: number(range, "end")?,
-        };
-        let subset = Listing {
-            snapshots: listing
-                .snapshots
-                .iter()
-                .copied()
-                .filter(|id| *id <= start)
-                .collect(),
-            segments: listing
-                .segments
-                .iter()
-                .copied()
-                .filter(|s| s.id <= target)
-                .collect(),
-        };
-        replay_range(store, prefix, &subset, objects, target).await?;
+        for txid in number(range, "start")?..=number(range, "end")? {
+            let target = wasmkeep_cluster::replication::SegmentId {
+                generation: number(range, "generation")?,
+                txid,
+            };
+            let subset = Listing {
+                snapshots: listing
+                    .snapshots
+                    .iter()
+                    .copied()
+                    .filter(|id| *id <= target)
+                    .collect(),
+                segments: listing
+                    .segments
+                    .iter()
+                    .copied()
+                    .filter(|s| s.id <= target)
+                    .collect(),
+            };
+            replay_range(store, prefix, &subset, objects, target).await?;
+            // A newer snapshot must not hide a corrupt chain from an older
+            // retained base. Replay that chain too whenever it is complete.
+            if subset.snapshots.contains(&target) {
+                let older = Listing {
+                    snapshots: subset
+                        .snapshots
+                        .iter()
+                        .copied()
+                        .filter(|id| *id < target)
+                        .collect(),
+                    segments: subset.segments.clone(),
+                };
+                if plan_restore(&older).is_ok_and(|plan| plan.head() == target) {
+                    replay_range(store, prefix, &older, objects, target).await?;
+                }
+            }
+        }
     }
     // Each intermediate snapshot also has to agree with its boundary and
     // reconstruct a valid database, even when the range replay didn't use it.
@@ -587,7 +849,7 @@ async fn replay_range(
     objects: &serde_json::Map<String, Value>,
     target: wasmkeep_cluster::replication::SegmentId,
 ) -> anyhow::Result<()> {
-    let plan = plan_restore(listing)?;
+    let plan = plan_target(listing, target)?;
     let keys = history::copy_keys(listing, &plan)?;
     check_boundary(store, prefix, &keys, objects).await?;
     let tmp = tempfile::tempdir()?;
@@ -613,7 +875,6 @@ async fn replay_range(
     Ok(())
 }
 async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> anyhow::Result<()> {
-    latest(store, prefix).await?;
     let run = load(store, prefix, id).await?;
     ensure!(
         array(&run.complete, "failed")?.is_empty(),
@@ -742,10 +1003,20 @@ impl Copier<'_> {
     ) -> anyhow::Result<Value> {
         let mut objects = initial;
         let mut reason = String::new();
-        let expected: BTreeSet<_> = objects.keys().cloned().collect();
+        let mut expected: BTreeSet<_> = objects.keys().cloned().collect();
         for attempt in 0..8 {
             if attempt > 0 {
-                objects = history::list_objects(self.source, prefix).await?;
+                objects = list_bounded(self.source, prefix).await?;
+            }
+            expected.extend(objects.keys().cloned());
+            let mut observed_bytes = 0;
+            for name in &expected {
+                charge(
+                    &mut observed_bytes,
+                    name.len() as u64 + 256,
+                    ACTOR_MAX,
+                    "actor observations memory",
+                )?;
             }
             let bytes = objects
                 .values()
@@ -1029,7 +1300,27 @@ async fn incarnation(source: &Store, base: &str) -> anyhow::Result<Option<Vec<u8
         optional(source, &key(base, "deleted")).await?.is_none(),
         "app is deleted"
     );
-    optional(source, &key(base, "recreated")).await
+    let marker = optional(source, &key(base, "recreated")).await?;
+    ensure!(
+        marker.as_ref().is_none_or(|bytes| bytes.len() <= 64 << 10),
+        "backup incarnation memory budget exceeded (64 KiB)"
+    );
+    Ok(marker)
+}
+fn insert_metadata(
+    objects: &mut BTreeMap<String, Value>,
+    used: &mut u64,
+    name: String,
+    value: Value,
+) -> anyhow::Result<()> {
+    charge(
+        used,
+        name.len() as u64 + encode_bounded(&value, ACTOR_MAX)?.len() as u64 + 128,
+        INDEX_MAX,
+        "app metadata memory",
+    )?;
+    objects.insert(name, value);
+    Ok(())
 }
 async fn app_metadata(
     source: &Store,
@@ -1042,6 +1333,7 @@ async fn app_metadata(
     use wasmkeep_server::apps::{Current, Manifest};
     let base = key(sp, &format!("apps/{tenant}/{app}"));
     let mut objects = BTreeMap::new();
+    let mut metadata_bytes = 0;
     for family in ["", "secrets/"] {
         let current_key = key(&base, &format!("{family}current"));
         let mut settled = false;
@@ -1064,36 +1356,44 @@ async fn app_metadata(
                         let manifest_bytes = read(source, &manifest_key, META_MAX).await?;
                         let manifest = Manifest::parse(std::str::from_utf8(&manifest_bytes)?)
                             .context("invalid deploy manifest")?;
-                        objects.insert(
+                        insert_metadata(
+                            &mut objects,
+                            &mut metadata_bytes,
                             manifest_key.clone(),
                             save_blob(dest, dp, &manifest_key, manifest_bytes, None, None).await?,
-                        );
+                        )?;
                         for (class, hash) in &manifest.classes {
                             let path = key(&vp, &format!("{class}.wasm"));
                             let bytes = read(source, &path, MAX).await?;
                             ensure!(digest(&bytes) == *hash, "component digest mismatch");
-                            objects.insert(
+                            insert_metadata(
+                                &mut objects,
+                                &mut metadata_bytes,
                                 path.clone(),
                                 save_blob(dest, dp, &path, bytes, None, None).await?,
-                            );
+                            )?;
                         }
                         if let Some(hash) = &manifest.front {
                             let path = key(&vp, "_front.wasm");
                             let bytes = read(source, &path, MAX).await?;
                             ensure!(digest(&bytes) == *hash, "front digest mismatch");
-                            objects.insert(
+                            insert_metadata(
+                                &mut objects,
+                                &mut metadata_bytes,
                                 path.clone(),
                                 save_blob(dest, dp, &path, bytes, None, None).await?,
-                            );
+                            )?;
                         }
                         for (class, hash) in &manifest.config {
                             let path = key(&vp, &format!("{class}.config"));
                             let bytes = read(source, &path, META_MAX).await?;
                             ensure!(digest(&bytes) == *hash, "config digest mismatch");
-                            objects.insert(
+                            insert_metadata(
+                                &mut objects,
+                                &mut metadata_bytes,
                                 path.clone(),
                                 save_blob(dest, dp, &path, bytes, None, None).await?,
-                            );
+                            )?;
                         }
                         version = manifest.previous;
                     }
@@ -1105,15 +1405,19 @@ async fn app_metadata(
                     );
                     let path = key(&base, &format!("secrets/{version}"));
                     let body = read(source, &path, MAX).await?;
-                    objects.insert(
+                    insert_metadata(
+                        &mut objects,
+                        &mut metadata_bytes,
                         path.clone(),
                         save_blob(dest, dp, &path, body, None, None).await?,
-                    );
+                    )?;
                 }
-                objects.insert(
+                insert_metadata(
+                    &mut objects,
+                    &mut metadata_bytes,
                     current_key.clone(),
                     save_blob(dest, dp, &current_key, bytes.clone(), None, None).await?,
-                );
+                )?;
             } else if family.is_empty() {
                 bail!("app has no deploy current");
             }
@@ -1136,11 +1440,15 @@ async fn flush_chunk(
         return Ok(());
     }
     for actor in actors.iter() {
-        let encoded = serde_json::to_string(actor)?;
+        let encoded = String::from_utf8(encode_bounded(actor, ACTOR_MAX)?)?;
+        ensure!(
+            encoded.len() as u64 <= ACTOR_MAX,
+            "backup actor memory budget exceeded"
+        );
         let mut rest = encoded.as_str();
         let mut part = 0;
         while !rest.is_empty() {
-            let mut end = rest.len().min((META_MAX / 8) as usize);
+            let mut end = rest.len().min(1 << 20);
             while !rest.is_char_boundary(end) {
                 end -= 1;
             }
@@ -1173,6 +1481,7 @@ fn actor_groups(
         |(mut list, mut pending, prefix)| async move {
             let mut group = BTreeMap::new();
             let mut actor_prefix = String::new();
+            let mut group_bytes = 0;
             loop {
                 let meta = match pending.take() {
                     Some(meta) => meta,
@@ -1202,6 +1511,12 @@ fn actor_groups(
                     break;
                 }
                 actor_prefix = next;
+                charge(
+                    &mut group_bytes,
+                    tail.len() as u64 + meta.location.as_ref().len() as u64 + 1024,
+                    ACTOR_MAX,
+                    "actor listing memory",
+                )?;
                 group.insert(tail, meta);
             }
             if group.is_empty() {
@@ -1236,7 +1551,7 @@ async fn create(
         apps.insert((t.clone(), a.clone()));
     } else {
         let root = format!("{}/", key(sp, "apps"));
-        for path in history::list_objects(source, &root).await?.keys() {
+        for path in list_bounded(source, &root).await?.keys() {
             let parts: Vec<_> = path.split('/').collect();
             if parts.len() == 3 && parts[2] == "current" {
                 crate::parse_app(&format!("{}/{}", parts[0], parts[1]))
@@ -1247,20 +1562,26 @@ async fn create(
     }
     ensure!(!apps.is_empty(), "no apps found");
     let mut starts = BTreeMap::new();
+    let mut starts_bytes = 0;
     for (t, a) in &apps {
-        starts.insert(
-            format!("{t}/{a}"),
-            incarnation(source, &key(sp, &format!("apps/{t}/{a}"))).await?,
-        );
+        let name = format!("{t}/{a}");
+        let marker = incarnation(source, &key(sp, &format!("apps/{t}/{a}"))).await?;
+        charge(
+            &mut starts_bytes,
+            name.len() as u64 + marker.as_ref().map_or(4, |m| m.len() as u64 * 4) + 256,
+            INDEX_MAX,
+            "incarnations memory",
+        )?;
+        starts.insert(name, marker);
     }
-    json_put(
+    let started_hash = json_put(
         dest,
         &key(&base, "started"),
-        &json!({"source":args.bucket,"started_ms":now_ms()?,"incarnations":starts}),
+        &json!({"source":args.bucket,"started_ms":now_ms()?,"run":id,"incarnations":starts}),
         false,
     )
     .await?;
-    let prunes = history::list_objects(dest, &format!("{}/", key(dp, "prunes"))).await?;
+    let prunes = list_bounded(dest, &format!("{}/", key(dp, "prunes"))).await?;
     let previous = match optional(dest, &key(dp, "latest")).await? {
         Some(_) => Some(
             load(
@@ -1297,6 +1618,14 @@ async fn create(
     let mut chunks = Vec::new();
     let mut failures = Vec::new();
     let mut app_records = Vec::new();
+    let mut run_index_bytes = 0;
+    charge(
+        &mut run_index_bytes,
+        encode_bounded(&json!(starts), META_MAX - 1)?.len() as u64 + 512,
+        INDEX_MAX,
+        "resident index",
+    )?;
+    let mut run_disk_bytes = 0;
     for (t, a) in apps {
         let app_start = actor_count;
         let mut members = BTreeMap::new();
@@ -1317,7 +1646,7 @@ async fn create(
             })
             .try_buffer_unordered(16);
         while let Some((actor_prefix, result)) = copying.try_next().await? {
-            let actor = match result {
+            let mut actor = match result {
                 Ok(mut actor) => {
                     actor["status"] = json!("copied");
                     if !array(&actor, "gaps")?.is_empty() {
@@ -1341,12 +1670,37 @@ async fn create(
                     json!({"prefix":actor_prefix,"status":"failed","failure":failure})
                 }
             };
+            if actor["status"] == "failed" {
+                charge(
+                    &mut run_index_bytes,
+                    encode_bounded(&actor["failure"], ACTOR_MAX)?.len() as u64,
+                    INDEX_MAX,
+                    "resident index",
+                )?;
+            }
+            actor["run"] = json!(id);
+            actor["started_sha256"] = json!(started_hash);
+            let encoded = encode_bounded(&actor, ACTOR_MAX)?;
+            charge(
+                &mut run_disk_bytes,
+                encoded.len() as u64,
+                SPOOL_MAX,
+                "spool disk",
+            )?;
+            charge(
+                &mut run_index_bytes,
+                actor_prefix.len() as u64 + 2048 + (encoded.len() as u64 / (1 << 20)) * 512,
+                INDEX_MAX,
+                "resident index",
+            )?;
             members.insert(actor_prefix, actor["status"].clone());
             actor_count += 1;
             actors.push(actor);
             flush_chunk(dest, &base, &mut chunks, &mut actors).await?;
         }
         let mut app = app_metadata(source, sp, dest, dp, &t, &a).await?;
+        app["run"] = json!(id);
+        app["started_sha256"] = json!(started_hash);
         app["actors"] = json!(actor_count - app_start);
         app["members"] = json!(members);
         ensure!(
@@ -1354,12 +1708,18 @@ async fn create(
                 == starts[&format!("{t}/{a}")],
             "app recreated during backup"
         );
+        charge(
+            &mut run_index_bytes,
+            encode_bounded(&app, META_MAX - 1)?.len() as u64,
+            INDEX_MAX,
+            "resident index",
+        )?;
         let path = key(&base, &format!("app/{t}/{a}"));
         let hash = json_put(dest, &path, &app, false).await?;
         app_records.push(json!({"key":path,"sha256":hash}));
     }
     flush_chunk(dest, &base, &mut chunks, &mut actors).await?;
-    let after = history::list_objects(dest, &format!("{}/", key(dp, "prunes"))).await?;
+    let after = list_bounded(dest, &format!("{}/", key(dp, "prunes"))).await?;
     ensure!(
         prunes.keys().eq(after.keys()),
         "prune started during create; refusing completion, retry the run"
@@ -1378,8 +1738,29 @@ async fn create(
             "app deleted or recreated before completion"
         );
     }
-    let complete = json!({"format":1,"run":id,"source":args.bucket,"incarnations":starts,"actors":actor_count,"chunks":chunks,"apps":app_records,"failed":failures,"history":if args.history==History::All{"all"}else{"head"}});
+    let complete = json!({"format":1,"started_sha256":started_hash,"run":id,"source":args.bucket,"incarnations":starts,"actors":actor_count,"chunks":chunks,"apps":app_records,"failed":failures,"history":if args.history==History::All{"all"}else{"head"}});
+    charge(
+        &mut run_index_bytes,
+        encode_bounded(&complete, META_MAX - 1)?.len() as u64,
+        INDEX_MAX,
+        "resident index",
+    )?;
+    for chunk in array(&complete, "chunks")? {
+        charge(
+            &mut run_index_bytes,
+            text(chunk, "key")?.len() as u64 + 128,
+            INDEX_MAX,
+            "resident index",
+        )?;
+    }
     let hash = json_put(dest, &key(&base, "complete"), &complete, false).await?;
+    json_put(
+        dest,
+        &key(&base, "root"),
+        &json!({"run":id,"sha256":hash}),
+        false,
+    )
+    .await?;
     json_put(
         dest,
         &key(dp, "latest"),

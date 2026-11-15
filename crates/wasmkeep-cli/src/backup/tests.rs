@@ -660,7 +660,7 @@ async fn chunks_stay_below_loader_cap() {
     let dest: Store = Arc::new(object_store::memory::InMemory::new());
     let mut chunks = Vec::new();
     let mut actors = vec![
-        json!({"prefix":"large", "objects": {"one": "x".repeat(34 << 20), "two": "y".repeat(34 << 20)}}),
+        json!({"prefix":"large", "objects": {"one": "x".repeat(3 << 20), "two": "y".repeat(3 << 20)}}),
     ];
     flush_chunk(&dest, "runs/test", &mut chunks, &mut actors)
         .await
@@ -739,7 +739,7 @@ async fn latest_digest_and_protected_app_membership_are_checked() {
             .to_string()
             .contains("digest mismatch")
     );
-    // Even if the convenience root is refreshed, chunk membership cannot be
+    // Even if both mutable roots are refreshed, chunk membership cannot be
     // removed by editing just the completion record.
     complete = run.complete;
     complete["actors"] = json!(0);
@@ -750,6 +750,14 @@ async fn latest_digest_and_protected_app_membership_are_checked() {
     json_put(&f.dest, "latest", &json!({"run":id,"sha256":hash}), true)
         .await
         .unwrap();
+    json_put(
+        &f.dest,
+        &format!("runs/{id}/root"),
+        &json!({"run":id,"sha256":hash}),
+        true,
+    )
+    .await
+    .unwrap();
     assert!(
         verify(&f.dest, "", &id, None)
             .await
@@ -886,4 +894,328 @@ async fn newer_snapshot_cannot_hide_a_broken_historical_chain() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("checksum"), "{error:#}");
+}
+
+#[tokio::test]
+async fn rereview_destination_refuses_ambiguous_addressing() {
+    let f = Fixture::new().await;
+    for settings in [
+        "AWS_VIRTUAL_HOSTED_STYLE_REQUEST=true\nAWS_ENDPOINT=https://source.s3.us-east-1.amazonaws.com",
+        "AWS_ENDPOINT=https://source.s3.us-east-1.amazonaws.com",
+        "AWS_ENDPOINT=https://destination.storage.example.com",
+        "AWS_ENDPOINT=https://source.storage.example.com",
+        "AWS_ENDPOINT=https://SOURCE.storage.example.com./",
+        "AWS_ENDPOINT=https://other.s3.us-east-1.amazonaws.com",
+        "AWS_ENDPOINT=https://minio.example.com/bucket",
+        "AWS_ENDPOINT=https://minio.example.com/?bucket=source",
+        "AWS_ENDPOINT=https://user:password@minio.example.com",
+        "AWS_ENDPOINT=https://minio.example.com/#bucket",
+        "AWS_ENDPOINT=https://s3.s3.us-east-1.amazonaws.com",
+        "AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false",
+    ] {
+        let file = f._dir.path().join("destination.env");
+        std::fs::write(&file, format!("AWS_REGION=us-east-1\n{settings}\n")).unwrap();
+        let mut args = f.args();
+        args.to_env = Some(file);
+        assert!(destination(&args).is_err(), "accepted {settings}");
+    }
+}
+
+#[tokio::test]
+async fn destination_accepts_path_style_custom_dns_endpoints() {
+    let f = Fixture::new().await;
+    for endpoint in [
+        "https://account.r2.cloudflarestorage.com",
+        "https://s3.ca-east-tor.io.cloud.ovh.net",
+        "https://minio.example.com",
+        "https://source-backup.example.com",
+    ] {
+        let file = f._dir.path().join("destination.env");
+        std::fs::write(
+            &file,
+            format!("AWS_REGION=us-east-1\nAWS_ENDPOINT={endpoint}\n"),
+        )
+        .unwrap();
+        let mut args = f.args();
+        args.to_env = Some(file.clone());
+        destination(&args).unwrap_or_else(|e| panic!("refused {endpoint}: {e:#}"));
+        let (_, _, source_endpoint) = configured(&args.bucket, Some(&file), None).unwrap();
+        let (_, _, dest_endpoint) = configured(&args.to, Some(&file), Some("source")).unwrap();
+        disjoint(
+            (&source_endpoint, "source", ""),
+            (&dest_endpoint, "destination", ""),
+        )
+        .unwrap();
+        for prefix in ["", "prod", "prod/archive"] {
+            assert!(
+                disjoint(
+                    (&source_endpoint, "source", "prod"),
+                    (&dest_endpoint, "source", prefix),
+                )
+                .is_err()
+            );
+        }
+        disjoint(
+            (&source_endpoint, "source", "prod"),
+            (&dest_endpoint, "source", "archive"),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        endpoint_identity("https://MINIO.example.com.:443/").unwrap(),
+        endpoint_identity("https://minio.example.com").unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn rereview_old_run_complete_has_own_digest() {
+    let f = Fixture::new().await;
+    let first = f.create().await;
+    let mut complete = load(&f.dest, "", &first).await.unwrap().complete;
+    f.create().await;
+    complete["incarnations"] = json!({"acme/other":null});
+    json_put(&f.dest, &format!("runs/{first}/complete"), &complete, true)
+        .await
+        .unwrap();
+    assert!(verify(&f.dest, "", &first, None).await.is_err());
+}
+
+#[test]
+fn rereview_snapshot_without_boundary_is_recoverable() {
+    let objects = BTreeMap::from([
+        (
+            snapshot_key(SegmentId {
+                generation: 1,
+                txid: 64,
+            }),
+            json!({}),
+        ),
+        (
+            segment_key(&Segment {
+                id: SegmentId {
+                    generation: 1,
+                    txid: 2,
+                },
+                parent_generation: 1,
+            }),
+            json!({}),
+        ),
+    ]);
+    assert_eq!(
+        recoverable_ranges(&json!({"objects":objects})).unwrap(),
+        vec![json!({"generation":1,"start":64,"end":64})]
+    );
+}
+
+#[tokio::test]
+async fn rereview_actor_memory_budget_is_enforced() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let mut complete = load(&f.dest, "", &id).await.unwrap().complete;
+    let path = text(&complete["chunks"][0], "key").unwrap().to_owned();
+    let mut actor = disk_actor(&load(&f.dest, "", &id).await.unwrap().actors[0]).unwrap();
+    actor["oversize"] = json!("x".repeat(8 * 1024 * 1024));
+    let encoded = serde_json::to_string(&actor).unwrap();
+    let fragments: Vec<_> = encoded.as_bytes().chunks(1024 * 1024).enumerate().map(|(part, bytes)|
+        json!({"part":part,"last":(part+1)*1024*1024>=encoded.len(),"json":std::str::from_utf8(bytes).unwrap()})).collect();
+    let hash = json_put(&f.dest, &path, &json!(fragments), true)
+        .await
+        .unwrap();
+    complete["chunks"][0]["sha256"] = json!(hash);
+    let hash = json_put(&f.dest, &format!("runs/{id}/complete"), &complete, true)
+        .await
+        .unwrap();
+    json_put(
+        &f.dest,
+        &format!("runs/{id}/root"),
+        &json!({"run":id,"sha256":hash}),
+        true,
+    )
+    .await
+    .unwrap();
+    let result = load(&f.dest, "", &id).await;
+    assert!(result.is_err(), "unbounded actor accepted");
+    assert!(result.err().unwrap().to_string().contains("budget"));
+}
+
+#[tokio::test]
+async fn rereview_retry_observations_include_vanished_non_head() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    let old = Key::from(format!(
+        "{prefix}{}",
+        snapshot_key(SegmentId {
+            generation: 1,
+            txid: 1
+        })
+    ));
+    let new = Key::from(format!(
+        "{prefix}{}",
+        snapshot_key(SegmentId {
+            generation: 1,
+            txid: 2
+        })
+    ));
+    let bytes = f.db.snapshot().unwrap().to_ltx(1, 2, 500).unwrap();
+    put(&f.source, new.as_ref(), bytes.clone(), false)
+        .await
+        .unwrap();
+    let source: Store = Arc::new(ReadOnly {
+        inner: f.source.clone(),
+        gets: Default::default(),
+        collect: std::sync::Mutex::new(Some((old, new, bytes))),
+    });
+    let missing = segment_key(&Segment {
+        id: SegmentId {
+            generation: 1,
+            txid: 3,
+        },
+        parent_generation: 1,
+    });
+    let initial = BTreeMap::from([(
+        missing.clone(),
+        ObjectMeta {
+            location: Key::from(format!("{prefix}{missing}")),
+            last_modified: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            size: 1,
+            e_tag: None,
+            version: None,
+        },
+    )]);
+    let copier = Copier {
+        source: &source,
+        dest: &f.dest,
+        dp: "",
+        cache: None,
+        all: true,
+    };
+    let actor = copier.actor(prefix, initial, None).await.unwrap();
+    assert!(
+        array(&actor, "gaps")
+            .unwrap()
+            .contains(&json!(snapshot_key(SegmentId {
+                generation: 1,
+                txid: 1
+            })))
+    );
+}
+
+#[tokio::test]
+async fn rereview_spool_and_index_budgets_fail_explicitly() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    for (disk, memory, label) in [
+        (1, INDEX_MAX, "spool disk"),
+        (SPOOL_MAX, 1, "resident index"),
+    ] {
+        let result = load_with_budget(&f.dest, "", &id, disk, memory).await;
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains(label));
+    }
+}
+
+#[tokio::test]
+async fn rereview_old_two_app_run_cannot_drop_failed_app() {
+    let f = Fixture::new().await;
+    for (tail, body) in [
+        ("current", b"v1 1 3\n".to_vec()),
+        ("v1/manifest", b"wasmkeep-manifest 1\n".to_vec()),
+    ] {
+        put(&f.source, &format!("apps/acme/other/{tail}"), body, false)
+            .await
+            .unwrap();
+    }
+    put(
+        &f.source,
+        &format!(
+            "state/acme/other/actors/counter/bob/{}",
+            snapshot_key(SegmentId {
+                generation: 1,
+                txid: 1
+            })
+        ),
+        b"broken".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut args = f.args();
+    args.all = true;
+    args.app = None;
+    assert!(create(&args, &f.source, "", &f.dest, "").await.is_err());
+    let old = latest(&f.dest, "").await.unwrap().unwrap();
+    let mut complete = load(&f.dest, "", &old).await.unwrap().complete;
+    assert!(create(&args, &f.source, "", &f.dest, "").await.is_err());
+    assert_ne!(latest(&f.dest, "").await.unwrap().unwrap(), old);
+    let mut retained = Vec::new();
+    for chunk in array(&complete, "chunks").unwrap() {
+        let value = checked_json(
+            &f.dest,
+            text(chunk, "key").unwrap(),
+            text(chunk, "sha256").unwrap(),
+        )
+        .await
+        .unwrap();
+        if text(&value[0], "json")
+            .unwrap()
+            .contains("state/acme/shop/")
+        {
+            retained.push(chunk.clone());
+        }
+    }
+    complete["chunks"] = json!(retained);
+    complete["apps"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|app| text(app, "key").unwrap().ends_with("/acme/shop"));
+    complete["actors"] = json!(1);
+    complete["failed"] = json!([]);
+    let hash = json_put(&f.dest, &format!("runs/{old}/complete"), &complete, true)
+        .await
+        .unwrap();
+    assert!(
+        verify(&f.dest, "", &old, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("digest mismatch")
+    );
+    json_put(
+        &f.dest,
+        &format!("runs/{old}/root"),
+        &json!({"run":old,"sha256":hash}),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        verify(&f.dest, "", &old, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("incarnation membership")
+    );
+    complete["incarnations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("acme/other");
+    let hash = json_put(&f.dest, &format!("runs/{old}/complete"), &complete, true)
+        .await
+        .unwrap();
+    json_put(
+        &f.dest,
+        &format!("runs/{old}/root"),
+        &json!({"run":old,"sha256":hash}),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        verify(&f.dest, "", &old, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("started membership")
+    );
 }

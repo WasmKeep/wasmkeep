@@ -35,6 +35,20 @@ A copied head includes writes acknowledged before that actor's listing;
 it may include unacknowledged tips. **There is no consistent point across
 actors.** Reconcile cross-actor business invariants after restoring.
 
+Online create refuses all virtual-hosted-style settings (including an explicit
+false value) and bucket overrides. Explicit endpoint URLs must be origins
+without paths, queries, fragments or credentials. Path-style custom DNS
+endpoints are supported, including Cloudflare R2
+(`https://<account>.r2.cloudflarestorage.com`), OVHcloud
+(`https://s3.<region>.io.cloud.ovh.net`) and MinIO behind a hostname.
+Bucket-hosted AWS URLs and hosts beginning with the configured bucket name
+are refused. A destination host beginning with the source bucket's DNS label
+(or full bucket name for dotted names) is also refused. These checks apply
+before any backup requests. The same normalized endpoint origin and bucket
+cannot use equal or overlapping source/destination prefixes; AWS regional
+service endpoints are treated as the same effective AWS endpoint.
+Configure a path-style service endpoint; do not use a bucket-hosted URL.
+
 `--history head` keeps the snapshot, its boundary segment and the segments
 to the head. `--history all` also retains the available historical objects
 and the previous compatible run's objects. Deletes erase live history
@@ -49,13 +63,31 @@ the default for `--history all`. Use `--require-continuous false` to explicitly
 accept a partial historical range; full verify replays every position within
 each recorded range and reports those ranges. Runs closer than the retention
 window alone do not guarantee continuous history: a read can cross expiry.
+Every retry adds its observed keys to gap accounting. A retained snapshot
+restores its own position even if its boundary segment has disappeared.
 Objects already erased before listing cannot be promised by this archive.
 
 The archive uses immutable `data/<sha256>` objects and checksummed actor
 manifest chunks bounded by serialized bytes below the 64 MiB loader cap;
-large actor records span multiple ordered fragments. `runs/<id>/complete` is published after
-the chunks and deploy/secrets records; `latest` records the run ID and the
-completion record SHA-256. Verification checks that reference.
+actor records span ordered 1 MiB fragments. The loader streams fragments to a
+private temporary file, without concatenating them in memory, and parses one
+bounded actor at a time. Limits are 8 MiB serialized metadata per actor,
+64 MiB per metadata object and accounted resident index, and 1 GiB of actor
+metadata spool per run (incarnation markers are capped at 64 KiB each). Listing indexes and create use the same bounded policy;
+exceeding a budget is an explicit error, not a truncated backup. These are
+metadata budgets, not an RSS limit: JSON trees and allocator overhead add
+memory, and LTX bodies/database replay have the separate 2 GiB database cap.
+Temporary manifest files are removed on success or error. Split large runs by
+app if a run budget is exceeded; oversized individual histories need a future
+streaming history format.
+
+`started` binds the run ID, source and expected app incarnations. Each app
+record references that run and the started digest and binds actor membership
+and status. `complete` references these records and the started digest;
+`runs/<id>/root`, written after completion, references its completion digest.
+Every load, including `verify --run ID`, checks that run's own root and
+reconciles app membership with the incarnations. `latest` is only a convenience
+pointer. Archives predating the per-run root must be recreated.
 Never start nodes against this layout. `backup list` distinguishes incomplete
 runs from complete runs and reports failed actors. A partial run exits nonzero,
 and verification refuses it. A missing object, invalid chunk, corrupted LTX
@@ -66,7 +98,7 @@ records partial verification. Use full verification before a restore drill.
 Threat model: verify detects corruption and inconsistent edits. Protected
 chunk and app records bind expected actor membership and copied/failed status.
 There is no key and no signature: an attacker who can rewrite the whole archive,
-including all digests and the latest reference, can forge a consistent archive.
+including all digests and per-run roots, can forge a consistent archive.
 These hashes do not authenticate the archive or provide an externally trusted root.
 
 Deploys (current plus five predecessors) and sealed secrets are copied after

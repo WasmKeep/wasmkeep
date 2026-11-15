@@ -13,6 +13,7 @@ const PREFIX: &str = "actors/t/c/a/";
 enum Unsafe {
     None,
     OmitBoundary,
+    TruncatedSnapshot,
     NoReplay,
     NoRetry,
     SplitListing,
@@ -37,7 +38,9 @@ struct Reader {
     fetching: Option<Vec<String>>,
     manifest: BTreeMap<String, String>,
     destination: BTreeMap<String, Vec<u8>>,
-    runs: Vec<(Manifest, Bodies)>,
+    runs: Vec<(Manifest, Bodies, OwnerHistory, Vec<SegmentId>)>,
+    owners: OwnerHistory,
+    acked: Vec<SegmentId>,
     expected: BTreeMap<String, Vec<u8>>,
     retries: usize,
     pages: usize,
@@ -107,7 +110,7 @@ fn run(seed: u64, broken: Unsafe) -> Reader {
     let observer = reader.clone();
     replication::backup_simulation(
         seed,
-        Box::new(move |store, _acked| {
+        Box::new(move |store, acked, owners| {
             let mut r = observer.lock().unwrap();
             r.tick += 1;
             // Delayed GETs and separate LIST pages, while owners keep running.
@@ -135,7 +138,13 @@ fn run(seed: u64, broken: Unsafe) -> Reader {
                         r.expected.clear();
                         return;
                     };
-                    r.expected.insert(key.clone(), body.clone());
+
+                    if broken == Unsafe::TruncatedSnapshot
+                        && key.starts_with("snapshot/")
+                        && let Some(comma) = body.iter().position(|b| *b == b',')
+                    {
+                        body = body[comma + 1..].to_vec();
+                    }
                     if broken == Unsafe::NoReplay {
                         body = b"corrupt".to_vec();
                     }
@@ -163,10 +172,18 @@ fn run(seed: u64, broken: Unsafe) -> Reader {
                     if broken == Unsafe::Prune {
                         r.destination.clear();
                     }
-                    match oracle(&manifest, &r.destination, &r.expected) {
+                    match oracle_history(
+                        &manifest,
+                        &r.destination,
+                        &r.expected,
+                        &r.owners,
+                        &r.acked,
+                    ) {
                         Ok(()) => {
                             let expected = r.expected.clone();
-                            r.runs.push((manifest, expected));
+                            let owners = r.owners.clone();
+                            let acked = r.acked.clone();
+                            r.runs.push((manifest, expected, owners, acked));
                         }
                         Err(e) => {
                             r.failure = Some(e);
@@ -179,6 +196,10 @@ fn run(seed: u64, broken: Unsafe) -> Reader {
                 r.cursor.clear();
                 r.listed.clear();
             } else {
+                if r.cursor.is_empty() {
+                    r.acked = acked.to_vec();
+                }
+                r.owners = owners.clone();
                 let page: Vec<_> = store
                     .lock()
                     .unwrap()
@@ -191,16 +212,17 @@ fn run(seed: u64, broken: Unsafe) -> Reader {
                 r.pages += 1;
                 if let Some(last) = page.last() {
                     r.cursor = last.clone();
+                    for name in &page {
+                        if let Some(body) = owner_body(name, owners) {
+                            r.expected.insert(name.clone(), body);
+                        }
+                    }
                     r.listed.extend(page);
                 } else if !r.listed.is_empty() {
                     let mut keys = std::mem::take(&mut r.listed);
                     if broken == Unsafe::SplitListing
                         && let Some(k) = keys.iter().find(|k| k.starts_with("wal/")).cloned()
                     {
-                        if let Some((body, _)) = store.lock().unwrap().get(&format!("{PREFIX}{k}"))
-                        {
-                            r.expected.insert(k.clone(), body.clone());
-                        }
                         keys.retain(|key| *key != k);
                     }
                     r.fetching = Some(keys);
@@ -223,11 +245,20 @@ fn concurrent_archive_reader() {
     for seed in 0..seeds() {
         let r = run(seed, Unsafe::None);
         assert_eq!(r.failure, None, "seed {seed}");
-        assert!(r.pages > 0 && r.gets > 0);
+        assert!(
+            r.pages > 0 && r.gets > 0 && !r.runs.is_empty() && r.retries > 0,
+            "vacuous seed {seed}: runs={} retries={}",
+            r.runs.len(),
+            r.retries
+        );
+        assert!(
+            r.runs.iter().any(|(_, _, _, acked)| !acked.is_empty()),
+            "no listing-time acknowledgements for seed {seed}"
+        );
         runs += r.runs.len();
         retries += r.retries;
-        for (manifest, expected) in &r.runs {
-            oracle(manifest, &r.destination, expected).unwrap();
+        for (manifest, expected, owners, acked) in &r.runs {
+            oracle_history(manifest, &r.destination, expected, owners, acked).unwrap();
         }
     }
     assert!(runs > 0 && retries > 0, "runs={runs} retries={retries}");
@@ -236,6 +267,7 @@ fn concurrent_archive_reader() {
 fn unsafe_readers_fail_for_the_expected_reason() {
     for (variant, reason) in [
         (Unsafe::OmitBoundary, Failure::Boundary),
+        (Unsafe::TruncatedSnapshot, Failure::Content),
         (Unsafe::NoReplay, Failure::Body),
         (Unsafe::NoRetry, Failure::Retry),
         (Unsafe::Prune, Failure::Missing),
@@ -334,4 +366,146 @@ fn source_key_reuse_across_incarnations_is_content_failure() {
             }
         );
     }
+}
+
+// Owner state is supplied separately from all reader LIST/GET results.
+type OwnerHistory = BTreeMap<SegmentId, (std::collections::BTreeSet<SegmentId>, bool)>;
+fn owner_body(name: &str, owners: &OwnerHistory) -> Option<Vec<u8>> {
+    let listing = Listing::from_keys([name]);
+    if let Some(id) = listing.snapshots.first() {
+        let (positions, _) = owners.get(id)?;
+        Some(
+            positions
+                .iter()
+                .map(|p| format!("{}:{}", p.generation, p.txid))
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes(),
+        )
+    } else {
+        let (_, reset) = owners.get(&listing.segments.first()?.id)?;
+        Some(if *reset {
+            b"reset".to_vec()
+        } else {
+            b"x".to_vec()
+        })
+    }
+}
+fn oracle_history(
+    manifest: &Manifest,
+    destination: &Bodies,
+    expected: &Bodies,
+    owners: &OwnerHistory,
+    acked: &[SegmentId],
+) -> Result<(), Failure> {
+    oracle(manifest, destination, expected)?;
+    let listing = Listing::from_keys(manifest.keys().map(String::as_str));
+    let head = plan_restore(&listing).map_err(|_| Failure::Split)?.head();
+    let positions: std::collections::BTreeSet<_> = listing
+        .snapshots
+        .iter()
+        .copied()
+        .chain(listing.segments.iter().map(|s| s.id))
+        .collect();
+    for target in positions {
+        let subset = Listing {
+            snapshots: listing
+                .snapshots
+                .iter()
+                .copied()
+                .filter(|p| *p <= target)
+                .collect(),
+            segments: listing
+                .segments
+                .iter()
+                .copied()
+                .filter(|s| s.id <= target)
+                .collect(),
+        };
+        let plan = if subset.snapshots.contains(&target) {
+            wasmkeep_cluster::replication::Plan {
+                snapshot: Some(target),
+                segments: vec![],
+            }
+        } else {
+            let Ok(plan) = plan_restore(&subset) else {
+                continue;
+            };
+            if plan.head() != target {
+                continue;
+            }
+            plan
+        };
+        let mut restored = std::collections::BTreeSet::new();
+        if let Some(id) = plan.snapshot {
+            let body = destination
+                .get(manifest.get(&snapshot_key(id)).ok_or(Failure::Missing)?)
+                .ok_or(Failure::Missing)?;
+            let body = std::str::from_utf8(body).map_err(|_| Failure::Body)?;
+            for position in body.split(',').filter(|p| !p.is_empty()) {
+                let (g, t) = position.split_once(':').ok_or(Failure::Body)?;
+                restored.insert(SegmentId {
+                    generation: g.parse().map_err(|_| Failure::Body)?,
+                    txid: t.parse().map_err(|_| Failure::Body)?,
+                });
+            }
+        }
+        for id in plan.segments {
+            let segment = listing
+                .segments
+                .iter()
+                .find(|s| s.id == id)
+                .ok_or(Failure::Missing)?;
+            let body = destination
+                .get(
+                    manifest
+                        .get(&segment_key(segment))
+                        .ok_or(Failure::Missing)?,
+                )
+                .ok_or(Failure::Missing)?;
+            if body == b"reset" {
+                restored.clear();
+            }
+            restored.insert(id);
+        }
+        let (truth, _) = owners.get(&target).ok_or(Failure::Content)?;
+        if restored != *truth {
+            return Err(Failure::Content);
+        }
+        if target == head {
+            // Listing-time acknowledged writes must survive, except those
+            // removed by a reset on this independently reconstructed chain.
+            let reset = truth
+                .iter()
+                .filter(|id| owners.get(id).is_some_and(|(_, r)| *r))
+                .max();
+            for id in acked {
+                if reset.is_none_or(|reset| id > reset) && !restored.contains(id) {
+                    return Err(Failure::Content);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+#[test]
+fn rereview_truncated_valid_snapshot_is_not_owner_history() {
+    let first = SegmentId {
+        generation: 1,
+        txid: 1,
+    };
+    let head = SegmentId {
+        generation: 1,
+        txid: 2,
+    };
+    let name = snapshot_key(head);
+    let manifest = BTreeMap::from([(name.clone(), "body".into())]);
+    let bodies = BTreeMap::from([("body".into(), b"1:2".to_vec())]);
+    // Both the GET and archive agree, but the owner acknowledged two writes.
+    let fetched = BTreeMap::from([(name, b"1:2".to_vec())]);
+    let owners = BTreeMap::from([(head, ([first, head].into(), false))]);
+    assert_eq!(
+        oracle_history(&manifest, &bodies, &fetched, &owners, &[first, head]),
+        Err(Failure::Content)
+    );
 }
