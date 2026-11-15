@@ -9,35 +9,29 @@ import {
   OutgoingResponse,
   ResponseOutparam,
   type IncomingRequest,
+  httpErrorCode,
 } from "wasi:http/types@0.2.12";
-import { Body, type BodySource } from "./body";
+import { poll, type Pollable } from "wasi:io/poll@0.2.12";
+import { Body, incomingSource, type BodySource } from "./body";
 import type { ActorRequest, ActorResponse } from "./request";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** `request`'s body, as {@link Body} reads it. */
+/** `request`'s body, as {@link Body} reads it: only the stream's `closed`
+ * error ends it, and then only if the trailers say it ended well; any
+ * other failure throws. The stream, then the body (its parent), are
+ * released whether the body was read to its end or not: a resource left
+ * open past the response makes the host fail the request once it ends
+ * ("resource has children"), and discard the instance. */
 function bodyOf(request: IncomingRequest): BodySource {
   const body = request.consume();
-  const stream = body.stream();
-  return {
-    read(max: number): Uint8Array | undefined {
-      try {
-        return stream.blockingRead(BigInt(max));
-      } catch {
-        return undefined; // closed: the body has ended
-      }
-    },
-    // Release the stream, then the body (its parent), whether the body was
-    // read to its end or not: a resource left open past the response makes
-    // the host fail the request once it ends ("resource has children"),
-    // and discard the instance.
-    close(): void {
-      (stream as unknown as Disposable)[Symbol.dispose]?.();
-      const trailers = IncomingBody.finish(body);
-      (trailers as unknown as Disposable)[Symbol.dispose]?.();
-    },
-  };
+  return incomingSource({
+    stream: body.stream(),
+    finish: () => IncomingBody.finish(body),
+    wait: (pollable) => void poll([pollable as Pollable]),
+    codeOf: httpErrorCode,
+  });
 }
 
 function methodName(m: ReturnType<IncomingRequest["method"]>): string {

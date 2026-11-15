@@ -14,7 +14,7 @@ those guarantees on a bucket before you trust a cluster to it.
 | **Create if absent** (`PUT` with `If-None-Match: *`) is refused when the key exists, and exactly one of several simultaneous creates wins | The first ownership record of an actor, the alarm index, deploys: two nodes must never both believe they created the same record |
 | **Replace if the version matches** (`PUT` with `If-Match: <etag>`) is refused on a stale version, a deleted object or a version from before a plain overwrite, accepted with the current version, whether it came from the write or from a read, and exactly one of several simultaneous replaces of one version wins | Node leases and ownership records ([ADR 0020](../adr/0020-one-lease-per-node.md)): a renewal, a hand-over or a fence lands only if nothing was written in between, and two nodes taking over one lease at once cannot both win |
 | **Read after write**: a read right after a create, replace, overwrite or delete sees it | A node reads its own lease, records and snapshots back |
-| **Listings** show a new key and stop showing a deleted one within seconds, and return every key past the first page (S3: 1,000 keys) | Heartbeats and peer discovery, the alarm index, garbage collection, `cluster migrate` |
+| **Listings are strongly consistent after a write**: a listing that starts after a write was acknowledged shows it, every time. They stop showing a deleted key within seconds, and return every key past the first page (S3: 1,000 keys) | Restores: a node taking an actor over plans its restore from one listing of the actor's history, and after a voluntary hand-over it may list at once. A segment missing from that listing would make it restore an older head and fork the actor's history. Also heartbeats and peer discovery, the alarm index, garbage collection, `cluster migrate` |
 | **Deleting an absent key** succeeds and removes nothing else | Garbage collection and the alarm index delete keys that may already be gone |
 | **Large objects** (one `PUT` of a database snapshot) come back whole | Restores |
 | **Last-modified times**, whole seconds at least, later for a write a second after another, the same in a head and a listing | `cluster migrate` compares them to tell writes after its commit from writes before; `cluster fence` checks this machine's clock against the bucket's |
@@ -62,7 +62,7 @@ pass   replace-if-match      current version (written or read) accepted; stale a
 pass   concurrent-replaces   5 races of 8 simultaneous replaces of one version: one won each
 pass   read-after-write      5 of 5 reads right after a create were current (2 ms per write and read)
 pass   read-after-overwrite  10 of 10 reads right after a replace or overwrite were current; an overwrite made the version before it stale
-pass   list-new-key          listed after 1 ms
+pass   list-new-key          5 of 5 new keys in the first listing after their write (slowest listing 1 ms)
 pass   list-deleted-key      gone from the listing after 1 ms
 pass   delete-absent         absent keys delete without error; a deleted key reads absent at once
 pass   large-object          16 MiB round trip intact (write 0.0 s, read 0.0 s)
@@ -71,20 +71,20 @@ pass   clock-skew            bucket minus this machine between -0.0 s and +1.0 s
 pass   list-paging           1001 of 1001 keys listed
 
 cleanup: s3://wasmkeep-demo/diagnose/run-1794637469714-478230/ is empty again
-safe for WasmKeep
+required behaviour observed by these checks (not a proof of safety)
 ```
 
 Each line is one check: `pass`, `warn` (it holds, with a value worth
-knowing, such as a listing that lags more than a second), `FAIL` (a
+knowing, such as a deleted key listed for more than a second), `FAIL` (a
 guarantee is broken), `error` (the check could not finish: no answer, an
 unexpected error) or `skip`. The last line is the verdict:
 
 | Exit code | Verdict | Meaning |
 | --- | --- | --- |
-| 0 | `safe for WasmKeep` | Every check passed (warnings included), and the scratch prefix is empty again |
+| 0 | `required behaviour observed by these checks (not a proof of safety)` | Every check passed (warnings included), and the scratch prefix is empty again. The checks sample the bucket's behaviour on a few keys; they cannot prove that it always behaves so |
 | 1 | `not safe: <checks> failed` | The bucket broke a guarantee: do not run a cluster on it |
 | 2 | `could not finish: ...`, or an error before any check | No verdict: the bucket did not answer, refused the credentials, or the scratch prefix was not empty. Try again |
-| 2 | `safe for WasmKeep` after `cleanup FAILED` | Safe, but objects are left under the scratch prefix: delete them by hand |
+| 2 | `required behaviour observed ...` after `cleanup FAILED` | As for exit 0, but objects are left under the scratch prefix: delete them by hand |
 
 A bucket that does not answer is never reported as unsafe. The races
 (`concurrent-creates`, `concurrent-replaces`) first open eight
@@ -94,10 +94,14 @@ gets a 5xx, 429 or 408; if the first attempt had landed, the retry of a
 conditional write gets a 412. Each check that expects a write to succeed
 reads the object back after a 412: holding the body just sent, the
 write landed (a pass, with a note); holding the old body, it was
-refused (`FAIL`); anything else is an `error`. A listing that shows a
-write only after more than a second is a warning in every check that
-lists (`list-new-key`, `large-object`, `last-modified`), and a failure
-only past ten seconds. Two writes back to back may list out of order by
+refused (`FAIL`); anything else is an `error`. Every check that lists after writing (`list-new-key`, five fresh keys
+one at a time, `large-object`, `last-modified` and `list-paging`) needs
+the first listing that starts after the writes were acknowledged to show
+them: one that answers without them is a `FAIL` (not compatible), with
+how much later a listing showed them. A listing that is slow but shows
+them passes, and one that fails or does not answer within the check's
+time is an `error` (no verdict), never a `FAIL`. A deleted key still
+listed after a second is a warning, and a failure past ten seconds. Two writes back to back may list out of order by
 less than the allowed clock skew (a warning: a store's servers stamp
 them); the order that counts is that of writes more than a second
 apart. The clock
@@ -108,7 +112,8 @@ the HTTP `Date` header is not read). It fails only when the whole
 interval is beyond the allowed skew, warns when part of it is, and then the clock
 to fix may be this machine's: run it again from another. `--json`
 prints the same as one object: `checks` (`name`, `status`, `value`),
-`cleanup`, `verdict` (`safe`, `unsafe`, `incomplete`), `summary` and
+`cleanup`, `verdict` (`safe` for exit 0, kept for scripts, `unsafe`,
+`incomplete`), `summary` and
 `exit_code`.
 
 Checking that each live node answers on its health and cluster ports is
@@ -118,7 +123,9 @@ not part of it yet; `cluster status` shows the nodes the bucket knows.
 
 Each row is a run of `cluster diagnose` (all checks, paging included)
 from the WasmKeep version shown. Other providers may well work; they
-have not been checked this way yet.
+have not been checked this way yet. These runs predate the rule that
+the first listing after a write must show it (0.4.0 accepted a listing
+up to ten seconds late), so they are to be run again.
 
 | Provider | Date | WasmKeep | Verdict |
 | --- | --- | --- | --- |

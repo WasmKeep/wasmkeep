@@ -101,12 +101,14 @@ pass   clock-skew            bucket minus this machine between -0.1 s and +0.2 s
 pass   list-paging           1001 of 1001 keys listed
 
 cleanup: s3://demo/diagnose/run-1794641388473-1943513/ is empty again
-safe for WasmKeep
+required behaviour observed by these checks (not a proof of safety)
 ```
 
-Anything but `safe for WasmKeep` (exit 0) stops here: `not safe` (1) is a
-bucket that breaks a guarantee, and no verdict (2) is a bucket that did
-not answer. What each check means:
+Anything but `required behaviour observed by these checks (not a proof of safety)`
+(exit 0) stops here: `not safe` (1) is a bucket that breaks a guarantee,
+and no verdict (2) is a bucket that did not answer. Exit 0 means only
+that these checks saw the required behaviour this time: they sample a
+bucket, they do not prove it safe. What each check means:
 [Running `cluster diagnose`](../deploy/buckets.md#running-cluster-diagnose).
 Run it again from another node: the clock check also tests that
 machine's clock.

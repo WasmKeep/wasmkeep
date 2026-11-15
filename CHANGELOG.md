@@ -11,6 +11,32 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.2, in no release yet.
 
+- **`cluster diagnose` requires listings that are strongly consistent
+  after a write.** A node taking an actor over plans its restore from one
+  listing of the actor's history, and after a voluntary hand-over it may
+  list at once: a segment that listing omits would make it restore an
+  older head and fork the history. 0.4.2 passed a listing that showed a
+  write up to a second late, and only warned up to ten seconds. Now the
+  first listing that starts after a write was acknowledged must show it
+  (`list-new-key`, now five fresh keys, `large-object`, `last-modified`,
+  `list-paging`), or the check fails and the bucket is reported not safe;
+  a listing that fails or does not answer is still an `error` (no
+  verdict). The verdict for exit 0 now reads `required behaviour observed
+  by these checks (not a proof of safety)`: the checks sample a bucket,
+  they do not prove it safe. The `--json` field `verdict` keeps `safe`
+  for exit 0 ([buckets](docs/deploy/buckets.md)).
+- **The TypeScript SDK no longer reads a broken request body as a whole
+  one.** The incoming body treated any error of its stream as the body's
+  end, so a body cut short (a client that went away, a close short of
+  its Content-Length, a streamed body over the host's 16 MiB cap) reached
+  a handler as a shorter, complete-looking body. Now only the stream's
+  `closed` is its end, and only once the trailers say it ended well;
+  anything else makes `bytes()`, `text()` and `json()` throw `the request
+  body is incomplete: ...`, on QuickJS and StarlingMonkey alike. The
+  Rust and Python SDKs already told the two apart, and Go's
+  `ReadBody()` does (its `Body()` gives what arrived); the C (and Zig,
+  which uses it), D and MoonBit SDKs still read a broken body as a
+  shorter one.
 - **A failed listing of `nodes/` no longer stops the reads of known
   nodes.** In 0.4.2 a node whose scheduled listing failed tried the
   listing again every heartbeat instead of reading the nodes it knows, so

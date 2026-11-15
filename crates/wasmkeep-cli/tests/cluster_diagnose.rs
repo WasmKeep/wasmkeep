@@ -114,7 +114,12 @@ fn the_test_store_is_safe_and_left_as_found() {
         );
     }
     assert!(stdout.contains("is empty again"), "{shown}");
-    assert!(stdout.trim_end().ends_with("safe for WasmKeep"), "{shown}");
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with("required behaviour observed by these checks (not a proof of safety)"),
+        "{shown}"
+    );
     assert_eq!(
         listed(&store, &prefix),
         [format!("{prefix}/nodes/a")],

@@ -49,7 +49,8 @@ pub(crate) struct DiagnoseArgs {
 pub(crate) enum Status {
     /// The bucket does what WasmKeep needs.
     Pass,
-    /// It does, with a measured value worth knowing (a listing that lags).
+    /// It does, with a measured value worth knowing (a deleted key that
+    /// stays listed for a while).
     Warn,
     /// It broke a guarantee WasmKeep relies on: not safe.
     Fail,
@@ -144,7 +145,9 @@ pub(crate) struct Report {
 /// The verdict and its exit code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    Safe,
+    /// Every check saw the behaviour WasmKeep requires: what these checks
+    /// observed this time, not a proof that the bucket always behaves so.
+    Observed,
     Unsafe(Vec<&'static str>),
     Incomplete(Vec<&'static str>),
 }
@@ -152,7 +155,7 @@ pub(crate) enum Verdict {
 impl Verdict {
     pub(crate) fn code(&self) -> i32 {
         match self {
-            Self::Safe => 0,
+            Self::Observed => 0,
             Self::Unsafe(_) => 1,
             Self::Incomplete(_) => 2,
         }
@@ -160,7 +163,9 @@ impl Verdict {
 
     fn text(&self) -> String {
         match self {
-            Self::Safe => "safe for WasmKeep".into(),
+            Self::Observed => {
+                "required behaviour observed by these checks (not a proof of safety)".into()
+            }
             Self::Unsafe(names) => format!("not safe: {} failed", names.join(", ")),
             Self::Incomplete(names) => format!(
                 "could not finish: {} did not complete (no verdict)",
@@ -176,7 +181,7 @@ impl Report {
         self.left == Some(0) && self.cleanup_error.is_none()
     }
 
-    /// The exit code: the verdict's, but 2 for a safe verdict whose
+    /// The exit code: the verdict's, but 2 for an observed verdict whose
     /// cleanup failed (objects are left to delete by hand).
     pub(crate) fn exit_code(&self) -> i32 {
         match self.verdict().code() {
@@ -201,7 +206,7 @@ impl Report {
         if !errors.is_empty() {
             return Verdict::Incomplete(errors);
         }
-        Verdict::Safe
+        Verdict::Observed
     }
 
     fn cleanup_text(&self, scratch_url: &str) -> String {
@@ -256,7 +261,7 @@ impl Report {
                 "error": self.cleanup_error,
             },
             "verdict": match verdict {
-                Verdict::Safe => "safe",
+                Verdict::Observed => "safe",
                 Verdict::Unsafe(_) => "unsafe",
                 Verdict::Incomplete(_) => "incomplete",
             },
@@ -1112,56 +1117,95 @@ async fn read_after_overwrite<T: Target>(t: &Tracked<'_, T>) -> Check {
     )
 }
 
-/// A listing shows a new key, then stops showing it once deleted, within
-/// the wait; the lag is reported.
+/// How many fresh keys `list-new-key` writes, one at a time.
+const LIST_ROUNDS: usize = 5;
+
+/// The first listing that starts after a write was acknowledged shows it
+/// (a restore plans from one listing), for each of a few fresh keys; then
+/// a listing stops showing them once deleted, within the wait (the lag is
+/// reported).
 async fn list_lag<T: Target>(t: &Tracked<'_, T>, options: &Options) -> (Check, Check) {
     const SEEN: &str = "list-new-key";
     const GONE: &str = "list-deleted-key";
-    let key = "list/k";
     let not_run = |why: &str| check(GONE, Status::Error, format!("not run: {why}"));
-    if let Err(e) = t.put(key, b"x".to_vec()).await {
-        return (error(SEEN, "writing", &e), not_run("the write failed"));
-    }
-    let lag = |want: bool| async move {
-        let start = Instant::now();
-        loop {
-            let listed = t.list("list/").await?;
-            let present = listed.iter().any(|(k, _, _)| k == key);
-            if present == want {
-                return Ok::<_, BucketError>(Some(start.elapsed()));
-            }
-            if start.elapsed() >= options.list_wait {
-                return Ok(None);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let keys: Vec<String> = (0..LIST_ROUNDS).map(|i| format!("list/k{i}")).collect();
+    let mut slowest = Duration::ZERO;
+    for key in &keys {
+        if let Err(e) = t.put(key, b"x".to_vec()).await {
+            return (error(SEEN, "writing", &e), not_run("a write failed"));
         }
+        let asked = Instant::now();
+        let listed = match first_listing(t, "list/", options, |l| {
+            l.iter().any(|(k, _, _)| k == key)
+        })
+        .await
+        {
+            Ok(l) => l,
+            Err(e) => return (error(SEEN, "listing", &e), not_run("a listing failed")),
+        };
+        match listed {
+            Listed::Now(_) => slowest = slowest.max(asked.elapsed()),
+            Listed::Omitted(later) => {
+                return (
+                    check(SEEN, Status::Fail, omission("a new key", later, options)),
+                    not_run("a new key was not listed"),
+                );
+            }
+        }
+    }
+    let seen = check(
+        SEEN,
+        Status::Pass,
+        format!(
+            "{LIST_ROUNDS} of {LIST_ROUNDS} new keys in the first listing after their write \
+             (slowest listing {} ms)",
+            slowest.as_millis()
+        ),
+    );
+    for key in &keys {
+        if let Err(e) = t.delete(key).await {
+            return (seen, error(GONE, "deleting", &e));
+        }
+    }
+    let start = Instant::now();
+    let gone = loop {
+        let listed = match t.list("list/").await {
+            Ok(l) => l,
+            Err(e) => break Err(e),
+        };
+        if !listed.iter().any(|(k, _, _)| keys.contains(k)) {
+            break Ok(Some(start.elapsed()));
+        }
+        if start.elapsed() >= options.list_wait {
+            break Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let judge = |name: &'static str, what: &str, r: Result<Option<Duration>, BucketError>| match r {
+    let gone = match gone {
         Ok(Some(d)) if d <= Duration::from_secs(1) => check(
-            name,
+            GONE,
             Status::Pass,
-            format!("{what} after {} ms", d.as_millis()),
+            format!("gone from the listing after {} ms", d.as_millis()),
         ),
         Ok(Some(d)) => check(
-            name,
+            GONE,
             Status::Warn,
             format!(
-                "{what} only after {} ms (nodes discover peers and alarms through listings)",
+                "gone from the listing only after {} ms (a restore that lists a \
+                 deleted object fails and is tried again)",
                 d.as_millis()
             ),
         ),
         Ok(None) => check(
-            name,
+            GONE,
             Status::Fail,
-            format!("not {what} within {} s", options.list_wait.as_secs_f64()),
+            format!(
+                "not gone from the listing within {} s",
+                options.list_wait.as_secs_f64()
+            ),
         ),
-        Err(e) => error(name, "listing", &e),
+        Err(e) => error(GONE, "listing", &e),
     };
-    let seen = judge(SEEN, "listed", lag(true).await);
-    if let Err(e) = t.delete(key).await {
-        return (seen, error(GONE, "deleting", &e));
-    }
-    let gone = judge(GONE, "gone from the listing", lag(false).await);
     (seen, gone)
 }
 
@@ -1217,36 +1261,56 @@ fn pattern(len: usize) -> Vec<u8> {
 /// A listing of `prefix`, `(key, last-modified ms, size)` each.
 type Listing = Vec<(String, u64, u64)>;
 
-/// Lists `prefix` until `ready` holds or the listing wait runs out: the
-/// last listing, and how long until it was ready (`None`: never).
-async fn list_until<T: Target>(
+/// What the first listing after acknowledged writes showed.
+enum Listed {
+    /// Everything the writes put there: the listing.
+    Now(Listing),
+    /// Not all of it. How long until a later listing did (`None`: not
+    /// within the listing wait, or a later listing failed).
+    Omitted(Option<Duration>),
+}
+
+/// Lists `prefix` once, after the writes `ready` looks for were
+/// acknowledged. A restore plans from one listing (ADR 0007), so this
+/// first listing must show them: if it does not, lists again until it
+/// does or the listing wait runs out, only to say how late they came.
+/// `Err` only when the first listing fails.
+async fn first_listing<T: Target>(
     t: &Tracked<'_, T>,
     prefix: &str,
     options: &Options,
     ready: impl Fn(&Listing) -> bool,
-) -> Result<(Listing, Option<Duration>), BucketError> {
+) -> Result<Listed, BucketError> {
+    let listed = t.list(prefix).await?;
+    if ready(&listed) {
+        return Ok(Listed::Now(listed));
+    }
     let start = Instant::now();
     loop {
-        let listed = t.list(prefix).await?;
-        if ready(&listed) {
-            return Ok((listed, Some(start.elapsed())));
-        }
         if start.elapsed() >= options.list_wait {
-            return Ok((listed, None));
+            return Ok(Listed::Omitted(None));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+        match t.list(prefix).await {
+            Ok(l) if ready(&l) => return Ok(Listed::Omitted(Some(start.elapsed()))),
+            Ok(_) => {}
+            Err(_) => return Ok(Listed::Omitted(None)),
+        }
     }
 }
 
-/// A listing that took more than a second to show a write: a warning, as
-/// in `list-new-key`.
-fn lag_note(lag: Duration) -> Option<String> {
-    (lag > Duration::from_secs(1)).then(|| {
-        format!(
-            "; the listing showed the writes only after {} ms",
-            lag.as_millis()
-        )
-    })
+/// A failure's text for writes a first listing omitted.
+fn omission(what: &str, later: Option<Duration>, options: &Options) -> String {
+    let when = match later {
+        Some(d) => format!("listed {} ms later", d.as_millis()),
+        None => format!("not listed within {} s", options.list_wait.as_secs_f64()),
+    };
+    format!(
+        "{what} was missing from a listing started after its write was acknowledged \
+         ({when}); a node restoring an actor plans from one listing, so it could \
+         restore an older head and fork the actor's history: listings must be \
+         strongly consistent after a write"
+    )
 }
 
 /// A large object (a database snapshot is one PUT) comes back whole, and
@@ -1277,20 +1341,19 @@ async fn large_object<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Check
         }
         None => return check(NAME, Status::Fail, "a large object read back as absent"),
     }
-    let (listed, lag) = try_or!(
+    let listed = match try_or!(
         NAME,
         "listing",
-        list_until(t, "large/", options, |l| l.iter().any(|(k, _, _)| k == key)).await
-    );
-    let Some(lag) = lag else {
-        return check(
-            NAME,
-            Status::Fail,
-            format!(
-                "the large object was not listed within {} s",
-                options.list_wait.as_secs_f64()
-            ),
-        );
+        first_listing(t, "large/", options, |l| l.iter().any(|(k, _, _)| k == key)).await
+    ) {
+        Listed::Now(l) => l,
+        Listed::Omitted(later) => {
+            return check(
+                NAME,
+                Status::Fail,
+                omission("the large object", later, options),
+            );
+        }
     };
     let size = listed.iter().find(|(k, _, _)| k == key).map(|(_, _, s)| *s);
     if size != Some(len as u64) {
@@ -1305,10 +1368,7 @@ async fn large_object<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Check
         up.as_secs_f64(),
         down.as_secs_f64()
     );
-    match lag_note(lag) {
-        Some(note) => check(NAME, Status::Warn, value + &note),
-        None => check(NAME, Status::Pass, value),
-    }
+    check(NAME, Status::Pass, value)
 }
 
 /// Last-modified times as the migration and `cluster fence` use them: a
@@ -1323,23 +1383,21 @@ async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Chec
     };
     try_or!(NAME, "writing", t.put("mod/a", b"1".to_vec()).await);
     try_or!(NAME, "writing", t.put("mod/b", b"1".to_vec()).await);
-    let (first, lag1) = try_or!(
+    let first = match try_or!(
         NAME,
         "listing",
-        list_until(t, "mod/", options, |l| {
+        first_listing(t, "mod/", options, |l| {
             time(l, "mod/a").is_some() && time(l, "mod/b").is_some()
         })
         .await
-    );
+    ) {
+        Listed::Now(l) => l,
+        Listed::Omitted(later) => {
+            return check(NAME, Status::Fail, omission("a write", later, options));
+        }
+    };
     let (Some(a1), Some(b1)) = (time(&first, "mod/a"), time(&first, "mod/b")) else {
-        return check(
-            NAME,
-            Status::Fail,
-            format!(
-                "a listing missed one of two writes for {} s",
-                options.list_wait.as_secs_f64()
-            ),
-        );
+        unreachable!("the first listing shows both writes");
     };
     if a1 == 0 || b1 == 0 {
         return check(
@@ -1367,23 +1425,25 @@ async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Chec
     tokio::time::sleep(options.modified_gap).await;
     try_or!(NAME, "writing", t.put("mod/c", b"1".to_vec()).await);
     try_or!(NAME, "overwriting", t.put("mod/a", b"2".to_vec()).await);
-    let (second, lag2) = try_or!(
+    let second = match try_or!(
         NAME,
         "listing",
-        list_until(t, "mod/", options, |l| {
+        first_listing(t, "mod/", options, |l| {
             time(l, "mod/c").is_some() && time(l, "mod/a").is_some_and(|a| a != a1)
         })
         .await
-    );
+    ) {
+        Listed::Now(l) => l,
+        Listed::Omitted(later) => {
+            return check(
+                NAME,
+                Status::Fail,
+                omission("a write or an overwrite", later, options),
+            );
+        }
+    };
     let (Some(a2), Some(c)) = (time(&second, "mod/a"), time(&second, "mod/c")) else {
-        return check(
-            NAME,
-            Status::Fail,
-            format!(
-                "a listing missed one of two writes for {} s",
-                options.list_wait.as_secs_f64()
-            ),
-        );
+        unreachable!("the first listing shows both writes");
     };
     let gap = options.modified_gap.as_millis();
     if c <= b1 {
@@ -1415,8 +1475,6 @@ async fn last_modified<T: Target>(t: &Tracked<'_, T>, options: &Options) -> Chec
             format!("a head and a listing disagree by {diff} ms"),
         );
     }
-    let lag = lag1.max(lag2).unwrap_or_default();
-    notes.extend(lag_note(lag));
     let whole = [a1, b1, a2, c, head].iter().all(|m| m % 1_000 == 0);
     let value = format!(
         "{} precision, writes a second apart in order; head and listing agree within {diff} ms{}",
@@ -1522,26 +1580,34 @@ async fn paging<T: Target>(t: &Tracked<'_, T>, n: usize, options: &Options) -> C
             try_or!(NAME, "writing", result);
         }
     }
-    let start = Instant::now();
-    loop {
-        let listed = try_or!(NAME, "listing", t.list("page/").await);
-        let distinct: BTreeSet<&str> = listed.iter().map(|(k, _, _)| k.as_str()).collect();
-        if distinct.len() == n {
-            return check(NAME, Status::Pass, format!("{n} of {n} keys listed"));
-        }
-        if start.elapsed() >= options.list_wait {
-            return check(
-                NAME,
-                Status::Fail,
-                format!(
-                    "{} of {n} keys listed after {} s",
-                    distinct.len(),
-                    options.list_wait.as_secs_f64()
-                ),
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    let distinct = |l: &Listing| {
+        l.iter()
+            .map(|(k, _, _)| k.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+    };
+    let first = try_or!(NAME, "listing", t.list("page/").await);
+    let shown = distinct(&first);
+    if shown == n {
+        return check(NAME, Status::Pass, format!("{n} of {n} keys listed"));
     }
+    // Only to tell late keys from a listing that stops at a page.
+    let later = match first_listing(t, "page/", options, |l| distinct(l) == n).await {
+        Ok(Listed::Omitted(later)) => later,
+        Ok(Listed::Now(_)) => Some(Duration::ZERO),
+        Err(_) => None,
+    };
+    check(
+        NAME,
+        Status::Fail,
+        match later {
+            Some(_) => omission(&format!("one of {n} keys ({shown} listed)"), later, options),
+            None => format!(
+                "{shown} of {n} keys listed, still {} s later",
+                options.list_wait.as_secs_f64()
+            ),
+        },
+    )
 }
 
 /// This run's folder name: unique to this process.
@@ -1686,6 +1752,12 @@ mod tests {
         list_lag: Option<Duration>,
         /// Listings give `mod/b` a time this much earlier than it is.
         shift_b_ms: u64,
+        /// Every listing takes this long, and shows every write.
+        slow_list: Option<Duration>,
+        /// Listings of this prefix fail.
+        list_fails: Option<&'static str>,
+        /// Listings of this prefix never answer.
+        list_hangs: Option<&'static str>,
         /// A plain write of this key lands this long after it was sent,
         /// and its answer never comes.
         late_put: Option<(&'static str, Duration)>,
@@ -1798,6 +1870,15 @@ mod tests {
 
     impl Store for Fake {
         async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, BucketError> {
+            if self.f.list_fails == Some(prefix) {
+                return Err(BucketError::Unavailable("503".into()));
+            }
+            if self.f.list_hangs == Some(prefix) {
+                return std::future::pending().await;
+            }
+            if let Some(slow) = self.f.slow_list {
+                tokio::time::sleep(slow).await;
+            }
             let mut listed = Store::list(&self.inner, prefix).await?;
             if let Some(lag) = self.f.list_lag {
                 let written = self.written.borrow();
@@ -1876,7 +1957,7 @@ mod tests {
     async fn the_in_memory_store_is_safe_and_left_empty() {
         let (store, bucket) = memory("wk/diagnose/run-1");
         let report = run(&bucket, &quick()).await.unwrap();
-        assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
+        assert_eq!(report.verdict(), Verdict::Observed, "{report:#?}");
         assert!(
             report.checks.iter().all(|c| c.status == Status::Pass),
             "{report:#?}"
@@ -1891,7 +1972,10 @@ mod tests {
         assert_eq!(report.left, Some(0));
         assert_eq!(everything_under(&store).await, Vec::<String>::new());
         let text = report.to_text("s3://b/wk", "s3://b/wk/diagnose/run-1/");
-        assert!(text.ends_with("safe for WasmKeep\n"), "{text}");
+        assert!(
+            text.ends_with("required behaviour observed by these checks (not a proof of safety)\n"),
+            "{text}"
+        );
         assert_eq!(report.exit_code(), 0);
         let json = report.to_json("s3://b/wk", "s3://b/wk/diagnose/run-1/");
         assert_eq!(json["verdict"], "safe");
@@ -1993,7 +2077,7 @@ mod tests {
         };
         let (store, bucket) = fake(f);
         let report = run(&bucket, &quick()).await.unwrap();
-        assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
+        assert_eq!(report.verdict(), Verdict::Observed, "{report:#?}");
         for name in [
             "create-if-absent",
             "concurrent-creates",
@@ -2027,17 +2111,69 @@ mod tests {
         assert_eq!(report.exit_code(), 2);
     }
 
-    /// A listing that shows writes late warns in every check that lists,
-    /// as `list-new-key` does; none fails.
+    /// A store whose listings hide a just-written object for a moment
+    /// (150 ms: less than the second the checks once tolerated), while its
+    /// reads and conditional writes are right, is not compatible: a restore
+    /// plans from one listing, so a new owner could restore an older head.
+    /// Every check that lists fails, and the run is unsafe.
     #[tokio::test]
-    async fn a_lagging_listing_warns() {
-        let f = Faults {
-            list_lag: Some(Duration::from_millis(1_200)),
+    async fn a_listing_that_hides_a_new_write_fails() {
+        let (store, bucket) = fake(Faults {
+            list_lag: Some(Duration::from_millis(150)),
             ..Faults::default()
-        };
-        let (store, bucket) = fake(f);
+        });
+        let report = run(&bucket, &quick()).await.unwrap();
+        for name in [
+            "list-new-key",
+            "large-object",
+            "last-modified",
+            "list-paging",
+        ] {
+            assert_eq!(
+                status_of(&report, name),
+                Status::Fail,
+                "{name}: {report:#?}"
+            );
+            let value = &of(&report, name).value;
+            assert!(
+                value.contains("missing from a listing started after its write was acknowledged")
+                    && value.contains("fork"),
+                "{name}: {value}"
+            );
+        }
+        for name in [
+            "start-check",
+            "create-if-absent",
+            "concurrent-creates",
+            "replace-if-match",
+            "concurrent-replaces",
+            "read-after-write",
+            "read-after-overwrite",
+            "delete-absent",
+        ] {
+            assert_eq!(
+                status_of(&report, name),
+                Status::Pass,
+                "{name}: {report:#?}"
+            );
+        }
+        assert!(
+            matches!(&report.verdict(), Verdict::Unsafe(names) if names.contains(&"list-new-key")),
+            "{report:#?}"
+        );
+        assert_eq!(report.exit_code(), 1);
+        assert_eq!(everything_under(&store).await, Vec::<String>::new());
+    }
+
+    /// A slow listing that shows the write passes: what counts is that it
+    /// started after the write's acknowledgement, not how long it took.
+    #[tokio::test]
+    async fn a_slow_listing_that_shows_the_write_passes() {
+        let (_, bucket) = fake(Faults {
+            slow_list: Some(Duration::from_millis(1_200)),
+            ..Faults::default()
+        });
         let options = Options {
-            list_wait: Duration::from_secs(5),
             paging_keys: None,
             ..quick()
         };
@@ -2045,12 +2181,56 @@ mod tests {
         for name in ["list-new-key", "large-object", "last-modified"] {
             assert_eq!(
                 status_of(&report, name),
-                Status::Warn,
+                Status::Pass,
                 "{name}: {report:#?}"
             );
         }
-        assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
-        assert_eq!(everything_under(&store).await, Vec::<String>::new());
+        assert_eq!(report.verdict(), Verdict::Observed, "{report:#?}");
+    }
+
+    /// A listing that fails, or does not answer in time, is no verdict,
+    /// never unsafe: only a listing that answers without the write fails.
+    #[tokio::test]
+    async fn a_listing_that_fails_or_hangs_gives_no_verdict() {
+        let (_, bucket) = fake(Faults {
+            list_fails: Some("list/"),
+            ..Faults::default()
+        });
+        let report = run(&bucket, &quick()).await.unwrap();
+        assert_eq!(
+            status_of(&report, "list-new-key"),
+            Status::Error,
+            "{report:#?}"
+        );
+        assert!(
+            matches!(&report.verdict(), Verdict::Incomplete(names) if names.contains(&"list-new-key")),
+            "{report:#?}"
+        );
+        assert_eq!(report.exit_code(), 2);
+
+        let (_, bucket) = fake(Faults {
+            list_hangs: Some("list/"),
+            ..Faults::default()
+        });
+        let options = Options {
+            check_timeout: Duration::from_millis(500),
+            paging_keys: None,
+            ..quick()
+        };
+        let report = run(&bucket, &options).await.unwrap();
+        assert_eq!(
+            status_of(&report, "list-new-key"),
+            Status::Error,
+            "{report:#?}"
+        );
+        assert!(
+            of(&report, "list-new-key").value.contains("no answer"),
+            "{report:#?}"
+        );
+        assert!(
+            matches!(report.verdict(), Verdict::Incomplete(_)),
+            "{report:#?}"
+        );
     }
 
     /// Two writes back to back may list out of order by less than the
@@ -2205,7 +2385,7 @@ mod tests {
             .unwrap();
         let scratch = ObjectStoreBucket::new(Arc::clone(&store), "wk/diagnose/run-1");
         let report = run(&scratch, &quick()).await.unwrap();
-        assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
+        assert_eq!(report.verdict(), Verdict::Observed, "{report:#?}");
         assert_eq!(everything_under(&store).await, ["wk/nodes/a"]);
     }
 
@@ -2232,7 +2412,7 @@ mod tests {
         };
         let (a, b) = tokio::join!(run(&one, &options), run(&two, &options));
         for report in [a.unwrap(), b.unwrap()] {
-            assert_eq!(report.verdict(), Verdict::Safe, "{report:#?}");
+            assert_eq!(report.verdict(), Verdict::Observed, "{report:#?}");
             assert_eq!(report.left, Some(0), "{report:#?}");
         }
         assert_eq!(everything_under(&store).await, ["wk/shared/theirs"]);
@@ -2247,7 +2427,7 @@ mod tests {
         };
         let report = run(&bucket, &options).await.unwrap();
         assert_eq!(status_of(&report, "list-paging"), Status::Skipped);
-        assert_eq!(report.verdict(), Verdict::Safe);
+        assert_eq!(report.verdict(), Verdict::Observed);
     }
 
     #[test]
@@ -2284,7 +2464,10 @@ mod tests {
             text.contains("cleanup FAILED: 3 object(s) left under s3://b/p/diagnose/run-1/"),
             "{text}"
         );
-        assert!(text.ends_with("safe for WasmKeep\n"), "{text}");
+        assert!(
+            text.ends_with("required behaviour observed by these checks (not a proof of safety)\n"),
+            "{text}"
+        );
         assert_eq!(report.exit_code(), 2);
         let json = report.to_json("s3://b/p", "s");
         assert_eq!(json["cleanup"]["ok"], false);
