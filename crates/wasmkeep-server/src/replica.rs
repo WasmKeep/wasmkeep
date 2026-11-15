@@ -22,6 +22,15 @@ use wasmkeep_storage::wal::Changes;
 
 use crate::cluster::{Cluster, LeaseView};
 
+mod batched;
+#[allow(
+    unused_imports,
+    reason = "wired to actors with batched writes in S9 (ADR 0034, plan)"
+)]
+pub(crate) use batched::{
+    Applied, BudgetPermit, NODE_UPLOAD_BYTES, Ticket, UploadBudget, UploadFailure,
+};
+
 /// Upload a snapshot after this many segments, so restores stay short.
 const SNAPSHOT_EVERY: u64 = 64;
 
@@ -594,9 +603,14 @@ pub(crate) struct Replica {
     /// class with strict writes an upload runs inside [`Self::ship`], which
     /// holds the replica until it ends, so no snapshot or reset ever sees
     /// one, except after a `ship` cancelled half-way, which leaves `failed`
-    /// set as well. Batched writes (ADR 0034, section 2) will keep a segment
-    /// in flight here while the actor runs on.
+    /// set as well. A batched segment (ADR 0034, section 2) is in flight
+    /// from [`Self::prepare`] until its outcome is applied
+    /// ([`Self::apply`]), while the actor runs on.
     in_flight: Option<SegmentId>,
+    /// Batched writes' uploader: the captured position, the outcome cell
+    /// and the waiters (ADR 0034, sections 2 and 5). Idle in a strict
+    /// class.
+    batched: batched::Uploads,
     /// An upload attempt's base bound ([`UPLOAD_IDLE`]; shorter in tests).
     upload_idle: std::time::Duration,
 }
@@ -740,6 +754,7 @@ impl Replica {
             max_db_bytes,
             failed: None,
             in_flight: None,
+            batched: batched::Uploads::default(),
             upload_idle: UPLOAD_IDLE,
         };
         replica.resume_snapshot_wait();
@@ -1151,6 +1166,13 @@ impl Replica {
                 "replication stopped: {reason}"
             )));
         }
+        // Only a batched segment can be in flight here (a strict `ship`
+        // cut half-way left `failed` set, refused above): an inline upload
+        // beside it would be a second segment in flight (ADR 0034,
+        // section 2), and a mode switch waits for a `Flushed` barrier.
+        if let Some(segment) = self.in_flight {
+            return Err(self.refuse(format!("a segment while {segment:?} is in flight")));
+        }
         if changes.pre_apply != self.checksum {
             // Something committed locally was never shipped: building on
             // the bucket's head now would fork the history.
@@ -1394,6 +1416,40 @@ impl Replica {
         bytes: Vec<u8>,
         what: &'static str,
     ) -> Result<(), ReplicaError> {
+        self.target().put_bounded(key, bytes, what).await
+    }
+
+    /// What an upload needs of this replica, owned: a batched segment's
+    /// upload runs on a task of its own, after the event that captured it
+    /// (ADR 0034, section 2).
+    fn target(&self) -> UploadTarget {
+        UploadTarget {
+            store: Arc::clone(&self.store),
+            prefix: self.prefix.clone(),
+            lease: self.lease.clone(),
+            upload_idle: self.upload_idle,
+        }
+    }
+}
+
+/// What [`Replica::put_bounded`] uploads with: the bucket, the actor's
+/// history prefix, the hold's validity and the attempt's base bound.
+#[derive(Debug, Clone)]
+struct UploadTarget {
+    store: Arc<dyn ObjectStore>,
+    prefix: String,
+    lease: LeaseView,
+    upload_idle: std::time::Duration,
+}
+
+impl UploadTarget {
+    /// See [`Replica::put_bounded`].
+    async fn put_bounded(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        what: &'static str,
+    ) -> Result<(), ReplicaError> {
         use tokio::time::{Instant, timeout_at};
         let location = StorePath::from(format!("{}{key}", self.prefix));
         // Shared, not copied, by each attempt.
@@ -1526,7 +1582,7 @@ fn definite(e: &object_store::Error) -> bool {
     )
 }
 
-impl Replica {
+impl UploadTarget {
     /// What sits at `location` after a create was refused, read before
     /// `deadline`.
     async fn read_back(
@@ -1579,6 +1635,13 @@ impl Replica {
         } else {
             Err(ReplicaError::Late)
         }
+    }
+}
+
+impl Replica {
+    /// See [`UploadTarget::acknowledged`].
+    fn acknowledged(&self) -> Result<(), ReplicaError> {
+        self.target().acknowledged()
     }
 }
 
@@ -1949,6 +2012,8 @@ async fn list_sized(
 mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
+    mod batched;
+
     use std::collections::BTreeMap;
 
     use object_store::memory::InMemory;
@@ -2002,6 +2067,7 @@ mod tests {
             max_db_bytes: 1 << 30,
             failed: None,
             in_flight: None,
+            batched: super::batched::Uploads::default(),
             upload_idle: UPLOAD_IDLE,
         }
     }
@@ -2147,6 +2213,18 @@ mod tests {
         call_at_put: std::sync::atomic::AtomicU32,
         puts: std::sync::atomic::AtomicU32,
         on_put: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// The next segment uploads wait for a permit of `gate` (added by
+        /// [`PutFaults::open_gate`]), then are applied: a PUT held in
+        /// flight as long as a test wants, landing when it says.
+        gate_next: std::sync::atomic::AtomicU32,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl PutFaults {
+        /// Lets one gated segment upload go on and land.
+        fn open_gate(&self) {
+            self.gate.add_permits(1);
+        }
     }
 
     impl std::fmt::Debug for PutFaults {
@@ -2180,6 +2258,9 @@ mod tests {
                     && let Some(f) = self.on_put.lock().unwrap().as_ref()
                 {
                     f();
+                }
+                if take(&self.gate_next) {
+                    self.gate.acquire().await.unwrap().forget();
                 }
             }
             if location.as_ref().contains("/wal/") || location.as_ref().contains("/snapshot/") {
@@ -2310,6 +2391,8 @@ mod tests {
             call_at_put: std::sync::atomic::AtomicU32::new(0),
             puts: std::sync::atomic::AtomicU32::new(0),
             on_put: std::sync::Mutex::new(None),
+            gate_next: std::sync::atomic::AtomicU32::new(0),
+            gate: tokio::sync::Semaphore::new(0),
         });
         let mut r = replica(dir).await;
         r.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
@@ -2871,6 +2954,8 @@ mod tests {
             call_at_put: 0.into(),
             puts: 0.into(),
             on_put: std::sync::Mutex::new(None),
+            gate_next: 0.into(),
+            gate: tokio::sync::Semaphore::new(0),
         });
         let location = StorePath::from("a/wal/object");
         let body = vec![7u8; 3 << 20];
