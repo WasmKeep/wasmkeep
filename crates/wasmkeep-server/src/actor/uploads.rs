@@ -502,6 +502,68 @@ impl ActorState {
         .await;
         if let Err(e) = done {
             self.abandon(&e);
+            return;
+        }
+        // A periodic snapshot is asked for only here, in the mailbox gap
+        // after an event, and taken only at the acknowledged head (ADR
+        // 0034, section 7): a flush to the barrier first, with one upload
+        // budget; past it the snapshot waits for a later gap. Events queue
+        // behind it meanwhile, as behind a strict periodic snapshot.
+        if slot.lock().await.batched_snapshot_due() {
+            self.snapshot_in_gap(slot).await;
+        }
+    }
+
+    /// The periodic snapshot of a batched hold, at a `Flushed` barrier.
+    async fn snapshot_in_gap(&mut self, slot: SharedReplica) {
+        let deadline = self.upload_deadline().await;
+        match self.flush_to_barrier(Some(deadline)).await {
+            Some(Barrier::Flushed) => {}
+            Some(Barrier::GaveUp(_)) => {
+                self.abandon("replication stopped before a periodic snapshot");
+                return;
+            }
+            None => return,
+        }
+        let taken = self.db_at().run(ActorDb::snapshot).await;
+        let all = match taken {
+            Ok(Some(Ok(all))) => all,
+            Ok(Some(Err(wasmkeep_storage::wal::CaptureError::Pending(_)))) => {
+                self.abandon("changes appeared during a snapshot");
+                return;
+            }
+            other => {
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?other, "periodic snapshot failed");
+                return;
+            }
+        };
+        let mut replica = slot.lock().await;
+        match replica
+            .ship_snapshot(&all, crate::replica::SnapshotKind::Periodic)
+            .await
+        {
+            Ok(true) => {
+                if let Some(cluster) = &self.cluster {
+                    spawn_collection(
+                        self.address.clone(),
+                        Arc::clone(&self.collecting),
+                        CollectRequest {
+                            collector: replica.collector(),
+                            snapshot: replica.head(),
+                            retention: cluster.history_retention,
+                            erase: false,
+                        },
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(crate::replica::ReplicaError::Refused(e)) => {
+                drop(replica);
+                self.abandon(&format!("periodic snapshot refused: {e}"));
+            }
+            Err(e) => {
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "periodic snapshot failed");
+            }
         }
     }
 

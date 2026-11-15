@@ -1436,3 +1436,37 @@ async fn a_failed_entry_put_fails_the_segment_before_its_upload() {
     drop(hold);
     drop(db);
 }
+
+/// A periodic snapshot of a batched hold is due by segments, as a strict
+/// one's, or by the acknowledged segments' bytes, whichever comes first,
+/// so that a restore stays bounded when segments are full (ADR 0034,
+/// section 7). Here the bytes bound is small: one large segment makes it
+/// due; a snapshot taken starts both counts again.
+#[tokio::test]
+async fn a_batched_snapshot_is_due_by_acknowledged_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    r.set_snapshot_bytes(16 << 10);
+    db.exec("INSERT INTO t VALUES ('small')", &[]).unwrap();
+    db.mark_boundary().unwrap().unwrap();
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    assert!(!r.batched_snapshot_due(), "one small segment");
+    db.exec("INSERT INTO t VALUES (randomblob(40000))", &[])
+        .unwrap();
+    db.mark_boundary().unwrap().unwrap();
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    assert!(r.batched_snapshot_due(), "past the bytes bound");
+    let all = db.snapshot().unwrap();
+    assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
+    assert!(!r.batched_snapshot_due(), "counted again from the snapshot");
+    drop(hold);
+    drop(db);
+}

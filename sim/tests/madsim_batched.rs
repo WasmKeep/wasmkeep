@@ -128,3 +128,10 @@ fn stalled_age_and_stale_completion_are_found_by_search() {
 fn slow_healthy_handover_requires_both_windows() {
     batched::caught_in_scenario(Switch::ReleaseWithoutBarrier, Violation::CleanLoss, 30);
 }
+
+/// ADR 0034, section 7: a periodic snapshot in a gap flushes to the
+/// barrier first; one taken over uncaptured commits is caught.
+#[test]
+fn snapshot_over_uncaptured_commits_is_caught() {
+    caught(Switch::SnapshotUncaptured, Violation::NotOwnerPrefix);
+}

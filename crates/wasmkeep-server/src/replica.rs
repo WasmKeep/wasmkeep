@@ -1331,6 +1331,7 @@ impl Replica {
     /// A snapshot holds the database at the head: the count starts again.
     fn snapshot_taken(&mut self) {
         self.since_snapshot = 0;
+        self.batched.bytes_since_snapshot = 0;
         self.snapshot_failures = 0;
         self.snapshot_retry_at = 0;
         self.snapshot_waits.forget(&self.address);

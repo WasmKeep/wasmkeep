@@ -870,3 +870,72 @@ async fn a_stale_entry_after_a_trapped_event_is_cleared_only_at_a_barrier() {
     .await;
     assert_eq!(fired(p.a.addr).await, "0", "the moved alarm did not fire");
 }
+
+/// Snapshots and collected segments of the actor, in the bucket now.
+async fn history(p: &Pair) -> (usize, usize) {
+    let store: Arc<dyn ObjectStore> = p.flaky.clone();
+    let keys = bucket_keys(&store).await;
+    (
+        keys.iter().filter(|k| k.contains("/snapshot/")).count(),
+        keys.iter().filter(|k| k.contains("/wal/")).count(),
+    )
+}
+
+/// A batched hold takes periodic snapshots again, in a mailbox gap at its
+/// acknowledged head, and what they make unnecessary is collected: a busy
+/// actor's history stays bounded, and the next owner restores every
+/// write (ADR 0034, section 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_batched_actor_takes_periodic_snapshots() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        // Collect at once what a snapshot makes unnecessary (ADR 0012).
+        if let Some(cluster) = c.cluster.as_mut() {
+            cluster.history_retention = Duration::ZERO;
+        }
+    })
+    .await;
+    warmed(&p).await;
+    for n in 2..=80 {
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, n.to_string().as_str()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    // Without a periodic snapshot all 80 segments would stay.
+    let (snapshots, segments) = history(&p).await;
+    assert!(snapshots >= 1);
+    assert!(
+        segments < 64,
+        "{segments} segments kept: no periodic snapshot"
+    );
+    let r = b_answers(&p, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "80", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
+/// A delete at a batched hold's barrier retires the entry its state named:
+/// the reset is acknowledged, nothing is in flight, so no state can name
+/// it again (ADR 0034, section 9; ADR 0028).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_retires_the_alarm_entry_it_ends() {
+    let p = batched_pair(Duration::from_secs(30), |_| {}).await;
+    warmed(&p).await;
+    let due = now_ms() + 600_000;
+    let r = send(p.a.addr, "POST", &format!("/actor/t/x/alarm?at={due}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let shared: Arc<dyn ObjectStore> = Arc::clone(&p.flaky.inner);
+    eventually("the entry is listed", async || {
+        due_at(&bucket_keys(&shared).await, due) == 1
+    })
+    .await;
+    let r = send(p.a.addr, "POST", "/actor/t/x/delete", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "ok"), "{}", r.body);
+    eventually("the deleted actor's entry is retired", async || {
+        due_at(&bucket_keys(&shared).await, due) == 0
+    })
+    .await;
+}
