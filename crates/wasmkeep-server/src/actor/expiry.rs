@@ -57,7 +57,7 @@ impl ActorState {
         };
         // Held or running here: in use, whatever the listing said. Never
         // taken as a hold for the expiry: only its own acquisition counts.
-        if self.lease.is_some() || self.live.is_some() {
+        if self.held.is_some() || self.live.is_some() {
             return Expired::Kept("active");
         }
         if cluster.is_parked(&self.address) || self.sockets.reserved_by(&self.address) > 0 {
@@ -79,7 +79,7 @@ impl ActorState {
                 return Expired::Refused("this node is draining or moving the actor".into());
             }
         }
-        if self.replica.is_none() {
+        if self.replica().is_none() {
             return Expired::Refused("no replication for the actor".into());
         }
         let (marker, stale, alarm) = match self.delete_marks().await {

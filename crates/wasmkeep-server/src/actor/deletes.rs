@@ -93,7 +93,7 @@ impl ActorState {
         }
         // Held: only a holder's reset counts, and only an acknowledged one
         // makes the request done.
-        if self.cluster.is_some() && self.replica.is_none() {
+        if self.cluster.is_some() && self.replica().is_none() {
             return Deleted::Refused("no replication for the actor".into());
         }
         let (marker, stale, _) = match self.delete_marks().await {

@@ -97,9 +97,9 @@ impl ActorState {
             }
             return HandOver::Busy;
         }
-        if !self.lease.as_ref().is_some_and(LeaseHold::is_valid) {
-            // A lapsed hold: drop it (released on drop), nothing to hand.
-            self.lease = None;
+        if !self.held.as_ref().is_some_and(Held::is_valid) {
+            // A lapsed hold: dropped (released), nothing to hand.
+            self.drop_hold(Dropped::Lapse);
             return HandOver::NotHeld;
         }
         let alarm = self.committed_alarm().await;
@@ -108,11 +108,11 @@ impl ActorState {
         // giving the lease up.
         self.live = None;
         self.db = None;
-        self.replica = None;
-        let Some(hold) = self.lease.take() else {
+        let Some(hold) = self.held.take() else {
             return HandOver::NotHeld;
         };
-        match hold.release().await {
+        let barrier = hold.barrier();
+        match hold.release(barrier).returned().await {
             LeaseReturn::Released | LeaseReturn::Superseded => HandOver::Done { alarm },
             LeaseReturn::Pending => HandOver::Expiring { alarm },
         }
