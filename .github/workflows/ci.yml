@@ -18,13 +18,15 @@ defaults:
   run:
     shell: bash
 
-# A newer commit on the same branch or pull request replaces the run in
-# progress, on main too: only the latest commit's result matters. A release
-# needs a passing run on its commit (release.yml); if that run was replaced,
-# run CI again on the commit from the Actions page.
+# A newer commit on the same pull request replaces the run in progress:
+# only its latest commit's result matters. A push to main is never
+# replaced, nor left waiting where a later push could replace it: each such
+# run has a group of its own (its run id), so runs on main overlap and
+# every commit of main keeps a finished run. A release needs a passing run
+# on its commit (release.yml).
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,8 +41,9 @@ jobs:
   # needs a passing run on its commit. Their names stay required checks: a
   # skipped job reports as passed.
   #
-  # Documentation, benchmark result files and the two release workflows
-  # (which run on a tag or a published release) are read by no code job: a pull
+  # Documentation, benchmark result files, the two release workflows
+  # (which run on a tag or a published release) and the CodeQL workflow
+  # with its configuration (which run on main) are read by no code job: a pull
   # request that changes nothing else runs this job, "benchmark publication
   # paths" and "docs site" only. scripts/ci-changes.sh holds the list.
   #

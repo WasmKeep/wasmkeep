@@ -15,6 +15,8 @@ BASE = {
     '.github/workflows/ci.yml': 'name: CI\n',
     '.github/workflows/release.yml': 'name: release\n',
     '.github/workflows/publish.yml': 'name: publish\n',
+    '.github/workflows/codeql.yml': 'name: CodeQL\n',
+    '.github/codeql/codeql-config.yml': 'paths-ignore: []\n',
     'deploy/compose/README.md': 'compose\n',
     'deploy/systemd/units/README.md': 'units\n',
     'sdks/go/README.md': 'go\n',
@@ -116,6 +118,18 @@ class Changes(unittest.TestCase):
 
     def test_a_release_workflow_and_the_ci_workflow(self):
         self.assertTrue(self.code(self.writes('.github/workflows/publish.yml', '.github/workflows/ci.yml')))
+
+    def test_the_codeql_workflow_and_its_configuration_alone(self):
+        self.assertFalse(self.code(self.writes(
+            '.github/workflows/codeql.yml', '.github/codeql/codeql-config.yml',
+            '.github/codeql/another.yml')))
+
+    def test_the_codeql_workflow_and_the_ci_workflow(self):
+        self.assertTrue(self.code(self.writes('.github/workflows/codeql.yml', '.github/workflows/ci.yml')))
+
+    def test_the_codeql_configuration_and_a_rust_file(self):
+        self.assertTrue(self.code(self.writes(
+            '.github/codeql/codeql-config.yml', 'crates/wasmkeep-server/src/lib.rs')))
 
     def test_another_workflow_is_code(self):
         self.assertTrue(self.code(self.writes('.github/workflows/nightly.yml')))

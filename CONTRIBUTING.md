@@ -50,13 +50,15 @@ Actions) is split so that a pull request waits a minute or two, not ten:
 - **On a pull request**: format, clippy, MSRV, the simulations, the
   examples, dependency and licence checks, the docs site and the
   publication backstop described below. A pull request that changes only
-  documentation, benchmark result files or the two release workflows (the
-  list is in `scripts/ci-changes.sh`) runs the docs site and the
+  documentation, benchmark result files, the two release workflows or the
+  CodeQL workflow and its configuration (the list is in
+  `scripts/ci-changes.sh`) runs the docs site and the
   publication checks alone.
 - **On `main` after the merge, and nightly**: everything, which adds the
   test suites on Linux x86_64, arm64 and macOS, every language, and the S3
-  suites. When several changes land together, only the last commit's run
-  is kept. A failure there is fixed forward.
+  suites. Every commit of `main` keeps its own run, even when several
+  changes land together; a newer push to a pull request replaces the
+  run in progress. A failure there is fixed forward.
 - **Nightly only**: the tutorials, run as written. `./scripts/test-tutorials.sh`
   runs each page in `docs/tutorials/` that has a test in
   `scripts/tutorials/` (the blocks marked `<!-- test: ID -->`, as a reader
