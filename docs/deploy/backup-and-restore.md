@@ -19,7 +19,10 @@ wasmkeep backup verify --from s3://archive/prod
 ```
 
 `backup.env` contains destination `AWS_*` settings as `NAME=value`, one per
-line. Source credentials need only LIST and GET; no lease, owner request,
+line. Bucket overrides (`AWS_BUCKET`, `AWS_BUCKET_NAME`, `bucket`, and
+`bucket_name`) are rejected in both source and destination settings. The CLI
+bucket is applied after configuration; overlapping prefixes in the same
+effective endpoint and bucket are refused. Source credentials need only LIST and GET; no lease, owner request,
 source write or running-node connection is made. The destination needs
 LIST, GET and PUT. Use a separate bucket and account. Keep credentials,
 archives and the local plaintext cache private. `--all` discovers deployed
@@ -39,15 +42,32 @@ immediately, but **older backups still contain the deleted data**. An app
 recreated between runs starts a new history set; a tombstone or recreation
 during a run refuses completion.
 
+Each actor records the recoverable transaction ranges actually archived.
+A GET miss in retained history can split a range, even when the head is intact.
+Create reports these gaps and exits nonzero with `--require-continuous true`,
+the default for `--history all`. Use `--require-continuous false` to explicitly
+accept a partial historical range; full verify replays every position within
+each recorded range and reports those ranges. Runs closer than the retention
+window alone do not guarantee continuous history: a read can cross expiry.
+Objects already erased before listing cannot be promised by this archive.
+
 The archive uses immutable `data/<sha256>` objects and checksummed actor
-manifest chunks (1,000 actors each). `runs/<id>/complete` is published after
-the chunks and deploy/secrets records; `latest` is only a convenience pointer.
+manifest chunks bounded by serialized bytes below the 64 MiB loader cap;
+large actor records span multiple ordered fragments. `runs/<id>/complete` is published after
+the chunks and deploy/secrets records; `latest` records the run ID and the
+completion record SHA-256. Verification checks that reference.
 Never start nodes against this layout. `backup list` distinguishes incomplete
 runs from complete runs and reports failed actors. A partial run exits nonzero,
 and verification refuses it. A missing object, invalid chunk, corrupted LTX
 or mismatched head/checksum also causes verification to fail. `--run ID`
 selects an older run; `--sample N` checks a random subset and explicitly
 records partial verification. Use full verification before a restore drill.
+
+Threat model: verify detects corruption and inconsistent edits. Protected
+chunk and app records bind expected actor membership and copied/failed status.
+There is no key and no signature: an attacker who can rewrite the whole archive,
+including all digests and the latest reference, can forge a consistent archive.
+These hashes do not authenticate the archive or provide an externally trusted root.
 
 Deploys (current plus five predecessors) and sealed secrets are copied after
 actor history, with current pointers checked again. Owners, leases, node

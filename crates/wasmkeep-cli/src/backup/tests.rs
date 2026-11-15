@@ -73,6 +73,7 @@ impl Fixture {
             app: Some(("acme".into(), "shop".into())),
             all: false,
             history: History::All,
+            require_continuous: None,
             cache: Some(self._dir.path().join("cache")),
             to_env: None,
         }
@@ -81,7 +82,7 @@ impl Fixture {
         create(&self.args(), &self.source, "", &self.dest, "")
             .await
             .unwrap();
-        String::from_utf8(read(&self.dest, "latest", 1024).await.unwrap()).unwrap()
+        latest(&self.dest, "").await.unwrap().unwrap()
     }
     async fn increment(&mut self) {
         self.db.exec("UPDATE counts SET n=2", &[]).unwrap();
@@ -128,13 +129,14 @@ async fn incremental_archive_replays_and_verification_refuses_missing_data() {
     verify(&f.dest, "", &first, None).await.unwrap();
     verify(&f.dest, "", &second, None).await.unwrap();
     let run = load(&f.dest, "", &second).await.unwrap();
-    assert_eq!(run.actors[0]["txid"], 2);
+    assert_eq!(disk_actor(&run.actors[0]).unwrap()["txid"], 2);
     assert_eq!(
-        run.actors[0]["replayed_objects"], 1,
+        disk_actor(&run.actors[0]).unwrap()["replayed_objects"],
+        1,
         "cache should apply only the new segment"
     );
-    assert_eq!(run.actors[0]["alarm"], 123456);
-    let actor = &run.actors[0];
+    assert_eq!(disk_actor(&run.actors[0]).unwrap()["alarm"], 123456);
+    let actor = &disk_actor(&run.actors[0]).unwrap();
     let name = actor["plan"][0].as_str().unwrap();
     let hash = actor["objects"][name]["sha256"].as_str().unwrap();
     f.dest
@@ -199,7 +201,10 @@ async fn recreated_source_keys_do_not_overwrite_an_earlier_run() {
     let second = f.create().await;
     let a = load(&f.dest, "", &first).await.unwrap();
     let b = load(&f.dest, "", &second).await.unwrap();
-    assert_ne!(a.actors[0]["objects"], b.actors[0]["objects"]);
+    assert_ne!(
+        disk_actor(&a.actors[0]).unwrap()["objects"],
+        disk_actor(&b.actors[0]).unwrap()["objects"]
+    );
     verify(&f.dest, "", &first, None).await.unwrap();
     verify(&f.dest, "", &second, None).await.unwrap();
 }
@@ -291,7 +296,11 @@ impl ObjectStore for ReadOnly {
     ) -> object_store::Result<object_store::GetResult> {
         assert!(path.as_ref().starts_with("state/") || path.as_ref().starts_with("apps/"));
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let collect = self.collect.lock().unwrap().take();
+        let collect = if path.as_ref().starts_with("state/") {
+            self.collect.lock().unwrap().take()
+        } else {
+            None
+        };
         if let Some((old, new, bytes)) = collect {
             self.inner
                 .put_opts(&new, bytes.into(), PutOptions::default())
@@ -383,7 +392,12 @@ async fn corrupt_raw_cache_falls_back_and_deleted_boundary_replays_empty() {
     let second = f.create().await;
     verify(&f.dest, "", &second, None).await.unwrap();
     let run = load(&f.dest, "", &second).await.unwrap();
-    assert!(run.actors[0]["replayed_objects"].as_u64().unwrap() > 1);
+    assert!(
+        disk_actor(&run.actors[0]).unwrap()["replayed_objects"]
+            .as_u64()
+            .unwrap()
+            > 1
+    );
     f.db.exec("DROP TABLE counts", &[]).unwrap();
     f.db.clear_alarm().unwrap();
     let reset = Segment {
@@ -419,13 +433,13 @@ async fn corrupt_raw_cache_falls_back_and_deleted_boundary_replays_empty() {
     let deleted = f.create().await;
     let run = load(&f.dest, "", &deleted).await.unwrap();
     assert!(
-        run.actors[0]["plan"]
+        disk_actor(&run.actors[0]).unwrap()["plan"]
             .as_array()
             .unwrap()
             .contains(&json!(segment_key(&reset)))
     );
     assert!(
-        replay(&f.dest, "", &run.actors[0])
+        replay(&f.dest, "", &disk_actor(&run.actors[0]).unwrap())
             .await
             .unwrap()
             .verification
@@ -501,7 +515,7 @@ async fn corrupt_ltx_records_partial_and_never_verifies() {
     bytes[last] ^= 1;
     put(&f.source, &path, bytes, true).await.unwrap();
     assert!(create(&f.args(), &f.source, "", &f.dest, "").await.is_err());
-    let id = String::from_utf8(read(&f.dest, "latest", 1024).await.unwrap()).unwrap();
+    let id = latest(&f.dest, "").await.unwrap().unwrap();
     let run = load(&f.dest, "", &id).await.unwrap();
     assert_eq!(array(&run.complete, "failed").unwrap().len(), 1);
     assert!(verify(&f.dest, "", &id, None).await.is_err());
@@ -550,4 +564,326 @@ async fn snapshot_must_match_its_boundary_even_when_both_ltx_files_are_valid() {
             "{error}"
         );
     }
+}
+
+#[tokio::test]
+async fn destination_rejects_every_bucket_alias() {
+    let f = Fixture::new().await;
+    for name in ["AWS_BUCKET", "AWS_BUCKET_NAME", "bucket", "bucket_name"] {
+        let file = f._dir.path().join("destination.env");
+        std::fs::write(&file, format!("{name}=source\nAWS_REGION=us-east-1\n")).unwrap();
+        let mut args = f.args();
+        args.to_env = Some(file);
+        assert!(destination(&args).is_err(), "accepted {name}");
+    }
+}
+
+#[tokio::test]
+async fn editing_complete_cannot_hide_failed_membership() {
+    let f = Fixture::new().await;
+    put(
+        &f.source,
+        &format!(
+            "state/acme/shop/actors/counter/bob/{}",
+            snapshot_key(SegmentId {
+                generation: 1,
+                txid: 1
+            })
+        ),
+        b"broken".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(create(&f.args(), &f.source, "", &f.dest, "").await.is_err());
+    let id = latest(&f.dest, "").await.unwrap().unwrap();
+    let run = load(&f.dest, "", &id).await.unwrap();
+    let mut complete = run.complete;
+    complete["failed"] = json!([]);
+    json_put(&f.dest, &format!("runs/{id}/complete"), &complete, true)
+        .await
+        .unwrap();
+    assert!(
+        verify(&f.dest, "", &id, None).await.is_err(),
+        "failure hidden by complete-only edit"
+    );
+}
+
+#[tokio::test]
+async fn history_all_reports_listed_get_miss() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    let old = Key::from(format!(
+        "{prefix}{}",
+        snapshot_key(SegmentId {
+            generation: 1,
+            txid: 1
+        })
+    ));
+    let new = Key::from(format!(
+        "{prefix}{}",
+        snapshot_key(SegmentId {
+            generation: 1,
+            txid: 2
+        })
+    ));
+    let bytes = f.db.snapshot().unwrap().to_ltx(1, 2, 500).unwrap();
+    put(&f.source, new.as_ref(), bytes.clone(), false)
+        .await
+        .unwrap();
+    let source: Store = Arc::new(ReadOnly {
+        inner: f.source.clone(),
+        gets: Default::default(),
+        collect: std::sync::Mutex::new(Some((old, new, bytes))),
+    });
+    let copier = Copier {
+        source: &source,
+        dest: &f.dest,
+        dp: "",
+        cache: None,
+        all: true,
+    };
+    let actor = copier
+        .actor(
+            prefix,
+            history::list_objects(&source, prefix).await.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!array(&actor, "gaps").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn chunks_stay_below_loader_cap() {
+    let dest: Store = Arc::new(object_store::memory::InMemory::new());
+    let mut chunks = Vec::new();
+    let mut actors = vec![
+        json!({"prefix":"large", "objects": {"one": "x".repeat(34 << 20), "two": "y".repeat(34 << 20)}}),
+    ];
+    flush_chunk(&dest, "runs/test", &mut chunks, &mut actors)
+        .await
+        .unwrap();
+    for chunk in chunks {
+        checked_json(
+            &dest,
+            text(&chunk, "key").unwrap(),
+            text(&chunk, "sha256").unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[test]
+fn effective_store_identity_refuses_prefix_overlap() {
+    assert!(
+        disjoint(
+            ("https://s3.example", "live", "prod//actors"),
+            ("https://s3.example", "live", "prod/actors")
+        )
+        .is_err()
+    );
+    assert_eq!(
+        endpoint_identity("https://S3.EXAMPLE:443/").unwrap(),
+        endpoint_identity("https://s3.example").unwrap()
+    );
+    assert_eq!(
+        endpoint_identity("https://s3.amazonaws.com").unwrap(),
+        endpoint_identity("https://s3.us-east-1.amazonaws.com/").unwrap()
+    );
+    for alias in ["AWS_BUCKET", "AWS_BUCKET_NAME", "bucket", "bucket_name"] {
+        assert!(
+            setting(alias)
+                .unwrap_err()
+                .to_string()
+                .contains("bucket override")
+        );
+    }
+    for prefix in ["", "prod", "prod/archive"] {
+        assert!(
+            disjoint(
+                ("https://s3.example", "live", "prod"),
+                ("https://s3.example", "live", prefix)
+            )
+            .is_err()
+        );
+    }
+    disjoint(
+        ("https://s3.example", "live", "prod"),
+        ("https://s3.example", "live", "other"),
+    )
+    .unwrap();
+    disjoint(
+        ("https://one.example", "live", "prod"),
+        ("https://two.example", "live", "prod"),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn latest_digest_and_protected_app_membership_are_checked() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let run = load(&f.dest, "", &id).await.unwrap();
+    let mut complete = run.complete.clone();
+    complete["source"] = json!("s3://another");
+    json_put(&f.dest, &format!("runs/{id}/complete"), &complete, true)
+        .await
+        .unwrap();
+    assert!(
+        latest(&f.dest, "")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("digest mismatch")
+    );
+    // Even if the convenience root is refreshed, chunk membership cannot be
+    // removed by editing just the completion record.
+    complete = run.complete;
+    complete["actors"] = json!(0);
+    complete["chunks"] = json!([]);
+    let hash = json_put(&f.dest, &format!("runs/{id}/complete"), &complete, true)
+        .await
+        .unwrap();
+    json_put(&f.dest, "latest", &json!({"run":id,"sha256":hash}), true)
+        .await
+        .unwrap();
+    assert!(
+        verify(&f.dest, "", &id, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("membership")
+    );
+}
+
+#[tokio::test]
+async fn historical_get_gap_splits_ranges_and_requires_opt_out() {
+    for continuous in [true, false] {
+        let mut f = Fixture::new().await;
+        f.increment().await;
+        let prefix = "state/acme/shop/actors/counter/alice/";
+        for txid in 3..=4 {
+            f.db.exec(&format!("UPDATE counts SET n={txid}"), &[])
+                .unwrap();
+            let bytes =
+                f.db.take_changes()
+                    .unwrap()
+                    .unwrap()
+                    .to_ltx(txid, txid, txid as i64 * 100)
+                    .unwrap();
+            let segment = Segment {
+                id: SegmentId {
+                    generation: 1,
+                    txid,
+                },
+                parent_generation: 1,
+            };
+            put(
+                &f.source,
+                &format!("{prefix}{}", segment_key(&segment)),
+                bytes,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let snapshot = Key::from(format!(
+            "{prefix}{}",
+            snapshot_key(SegmentId {
+                generation: 1,
+                txid: 4
+            })
+        ));
+        let bytes = f.db.snapshot().unwrap().to_ltx(1, 4, 500).unwrap();
+        put(&f.source, snapshot.as_ref(), bytes.clone(), false)
+            .await
+            .unwrap();
+        let missing = Key::from(format!(
+            "{prefix}{}",
+            segment_key(&Segment {
+                id: SegmentId {
+                    generation: 1,
+                    txid: 2
+                },
+                parent_generation: 1
+            })
+        ));
+        let source: Store = Arc::new(ReadOnly {
+            inner: f.source.clone(),
+            gets: Default::default(),
+            collect: std::sync::Mutex::new(Some((missing, snapshot, bytes))),
+        });
+        let mut args = f.args();
+        args.require_continuous = Some(continuous);
+        let result = create(&args, &source, "", &f.dest, "").await;
+        assert_eq!(result.is_err(), continuous);
+        let id = latest(&f.dest, "").await.unwrap().unwrap();
+        let run = load(&f.dest, "", &id).await.unwrap();
+        let actor = disk_actor(&run.actors[0]).unwrap();
+        assert_eq!(
+            actor["ranges"],
+            json!([{"generation":1,"start":1,"end":1},{"generation":1,"start":4,"end":4}])
+        );
+        assert_eq!(array(&actor, "gaps").unwrap().len(), 1);
+        assert_eq!(verify(&f.dest, "", &id, None).await.is_err(), continuous);
+    }
+}
+
+#[tokio::test]
+async fn newer_snapshot_cannot_hide_a_broken_historical_chain() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    let bytes = f.db.snapshot().unwrap().to_ltx(1, 2, 300).unwrap();
+    put(
+        &f.source,
+        &format!(
+            "{prefix}{}",
+            snapshot_key(SegmentId {
+                generation: 1,
+                txid: 2
+            })
+        ),
+        bytes,
+        false,
+    )
+    .await
+    .unwrap();
+    let mut other = Fixture::new().await;
+    other.db.exec("INSERT INTO counts VALUES(99)", &[]).unwrap();
+    other.db.take_changes().unwrap();
+    let bytes = other.db.snapshot().unwrap().to_ltx(1, 1, 100).unwrap();
+    put(
+        &f.source,
+        &format!(
+            "{prefix}{}",
+            snapshot_key(SegmentId {
+                generation: 1,
+                txid: 1
+            })
+        ),
+        bytes,
+        true,
+    )
+    .await
+    .unwrap();
+    let copier = Copier {
+        source: &f.source,
+        dest: &f.dest,
+        dp: "",
+        cache: None,
+        all: true,
+    };
+    let error = copier
+        .actor(
+            prefix,
+            history::list_objects(&f.source, prefix).await.unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("checksum"), "{error:#}");
 }

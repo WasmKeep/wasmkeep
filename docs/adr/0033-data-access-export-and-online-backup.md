@@ -423,10 +423,10 @@ backup guide already asks.
 | --- | --- |
 | `data/<sha-256>` | Copies of source objects, keyed by the SHA-256 of their bytes, so a key names one content for good whatever happened at the source (an app recreated, two source prefixes backed up into one destination). Each is created once and never rewritten. |
 | `runs/<run id>/started` | Written first, with the source bucket and prefix (no credential) and the app's `recreated` marker as read at the start. |
-| `runs/<run id>/actors/<chunk>` | The run's manifest, 1,000 actors per chunk (below): for each object, its source key and its digest. |
+| `runs/<run id>/actors/<chunk>` | The run's manifest, bounded by serialized bytes below 64 MiB, with ordered fragments for oversized actors: for each object, its source key and its digest. |
 | `runs/<run id>/app/<tenant>/<app>` | The deploy version and the secrets version the run copied for that app, with their keys. |
 | `runs/<run id>/complete` | Written last: the run's summary and the SHA-256 of every chunk. A run is **restorable** only if this object exists and its chunks match it. |
-| `latest` | The id of the newest complete run (a hint; `backup list` lists `runs/`). |
+| `latest` | The id and completion record SHA-256 of the newest complete run (a checked hint; `backup list` lists `runs/`). |
 | `prunes/<id>` | Written by `prune` before it deletes anything (below). |
 
 A run id is the start time (UTC, to the second) and 8 random hex
@@ -449,7 +449,16 @@ plan (section 1), in this order:
    that also holds its older objects;
 3. the plan's segments, ascending;
 4. with `--history all`, every other history object of the listing that
-   is still there (a 404 there is skipped, not retried).
+   is still there. A GET miss records a gap and may split the recoverable
+   ranges; it is never silently treated as continuous history.
+
+With `--history all`, `--require-continuous` defaults to true: a gap in
+history observed at listing makes create report the gap and exit nonzero.
+An explicit false permits the ranges that actually survived. Verification
+replays every position inside each recorded range, including historical
+snapshot boundaries and segment chains. Runs spaced closer than retention
+alone do not ensure continuity: reads can cross expiry, and deletes erase
+without a retention window. No claim covers objects erased before listing.
 
 Each object is read from the source, checked (its size against the
 listing, its LTX trailer checksum), applied to the actor's replay, and
@@ -994,7 +1003,8 @@ collection, plus write rate times `W` for a busy actor), `s` the
 segments replayed (at most 64 while periodic snapshots succeed: the
 snapshot follows the 64th segment), `A` an
 app's actors and `K` its history objects. A listing is one LIST per
-1,000 keys. These are derived from the code, not measured. The
+1,000 keys. C is the number of serialized manifest chunks (at least one per actor,
+more for oversized records). These are derived from the code, not measured. The
 measured floor they add to is three idle nodes of 0.4.1 making 8.6
 million LISTs and 13 million GETs a month
 ([at rest](../benchmarks.md#bucket-requests-at-rest)). 0.4.2 lists the
@@ -1008,8 +1018,8 @@ bounds: against 0.4.2's floor these tools weigh more.
 | `actor export` / first `actor sql` | ⌈n/1000⌉ | 1 + s, +1 for the record hint | 0 | 0 |
 | `actor sql` with a warm cache | ⌈n/1000⌉ | new segments only | 0 | 0 |
 | A retry after collection (section 1) | +⌈n/1000⌉ | up to +64 | 0 | 0 |
-| `backup create`, first run, `head` | ⌈K/1000⌉ + 1 (`prunes/`) | Σ (2 + s) over actors, + deploy and secrets objects | the same, in the destination, + ⌈A/1000⌉ + 4 | 0 |
-| `backup create`, later run, `head` | ⌈K/1000⌉ + 1 | per moved actor: new objects of its plan (+ one HEAD per carried object if a prune ran meanwhile) | the same, + ⌈A/1000⌉ + 4 | 0 |
+| `backup create`, first run, `head` | ⌈K/1000⌉ + 1 (`prunes/`) | Σ (2 + s) over actors, + deploy and secrets objects | the same, in the destination, + C + 4 | 0 |
+| `backup create`, later run, `head` | ⌈K/1000⌉ + 1 | per moved actor: new objects of its plan (+ one HEAD per carried object if a prune ran meanwhile) | the same, + C + 4 | 0 |
 | `backup create`, `all` | ⌈K/1000⌉ | one per object written since the last run | the same | 0 |
 | `backup verify` | 0 (manifest) | Σ (2 + s) in the destination, or for the sample | 1 | 0 |
 | `backup restore` | 2 (nodes, empty check); in place, + a backup run's and ⌈old keys/1000⌉ per listing until empty | Σ (2 + s) from the destination; in place, + one record read per old actor | Σ (2 + s) + one marker per actor + one or two per alarm + deploy + `restoring` and `restored` | 1 (`restoring`); in place, + every old key |
@@ -1031,7 +1041,7 @@ What follows from it:
   PUT at the source, adds a GET at the source and a PUT at the
   destination, with the manifest growing by one entry per write kept. `head` costs at most one snapshot and 64 segments per
   actor per run.
-- **Pruning** reads every kept manifest (⌈A/1000⌉ GETs per kept run)
+- **Pruning** reads every kept manifest (C chunk GETs per kept run)
   and lists `data/`, ⌈objects/1000⌉ LISTs.
 - **The change feed listing a whole app every minute** is
   ⌈K/1000⌉ × 43,200 LISTs a month: 8.6 million for an app of 200,000
@@ -1150,8 +1160,7 @@ What follows from it:
 against collection is the kind of interleaving CLAUDE.md asks a
 simulation for. It runs the replication simulation's owners (node
 leases, held and late uploads, kills, skewed clocks), collecting by
-`collectable` with deletes that land late, with retention windows of 0,
-short and long, and deleting actors (reset, then erase). Beside them, a
+`collectable` with deletes that land late, and deleting actors (reset, then erase). Beside them, a
 backup reader lists by pages with delays between pages and between a
 listing and its GETs, copies, retries by section 1, and runs
 incrementally. Invariants checked at the end of each seed:
@@ -1161,8 +1170,9 @@ incrementally. Invariants checked at the end of each seed:
   checksum;
 - that head holds every write acknowledged before the actor's listing;
 - a deleted actor's copy replays to the empty database;
-- with `--history all` and runs closer than the window, every
-  acknowledged position replays from the destination.
+- per-run manifests remain preserved and every recorded recoverable range
+  replays from destination bodies; a listing/GET collection miss is reported
+  as a retry or history gap, never proof of continuous coverage.
 
 Unsafe variants some seed must catch: copying the plan without the
 segment at `P` (with incremental runs and deletes); marking an actor
@@ -1171,8 +1181,9 @@ a missing link; reading `wal/` and `snapshot/` from different listings
 and trusting the plan; keying the destination by source key (with an
 app deleted and recreated between runs, so generations restart); a
 prune that ignores a running create. The test also fails if
-no seed makes a reader retry (it cannot pass vacuously), and with
-retention 0 it counts starved actors rather than failing.
+no seed makes a reader retry (it cannot pass vacuously), and records collection misses rather than manufacturing retries from random
+booleans. The model bodies are abstract positions/reset markers; CLI tests
+exercise real LTX and SQLite checksums.
 
 **The restore job** joins two existing simulations. In
 `madsim_replication`, an owner writes a replacement: every acknowledged

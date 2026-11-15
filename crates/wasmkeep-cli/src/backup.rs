@@ -34,6 +34,9 @@ pub(crate) struct Create {
     all: bool,
     #[arg(long, value_enum, default_value = "head")]
     history: History,
+    /// Fail if listed retained history could not be archived (default for all).
+    #[arg(long, action = clap::ArgAction::Set)]
+    require_continuous: Option<bool>,
     /// Local verified content cache; contains plaintext actor data.
     #[arg(long)]
     cache: Option<PathBuf>,
@@ -136,43 +139,114 @@ async fn json_put(
     replace: bool,
 ) -> anyhow::Result<String> {
     let bytes = serde_json::to_vec(value)?;
+    ensure!(
+        (bytes.len() as u64) < META_MAX,
+        "metadata exceeds loader cap: {path}"
+    );
     let hash = digest(&bytes);
     put(store, path, bytes, replace).await?;
     Ok(hash)
 }
-fn destination(args: &Create) -> anyhow::Result<(Store, String)> {
-    let Some(file) = &args.to_env else {
-        return crate::open_bucket_unchecked(&args.to);
+fn setting(name: &str) -> anyhow::Result<object_store::aws::AmazonS3ConfigKey> {
+    let config = name
+        .trim()
+        .to_ascii_lowercase()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unsupported S3 setting {name}"))?;
+    ensure!(
+        config != object_store::aws::AmazonS3ConfigKey::Bucket,
+        "bucket override forbidden: {name}"
+    );
+    Ok(config)
+}
+fn configured(
+    url: &str,
+    file: Option<&std::path::Path>,
+) -> anyhow::Result<(Store, String, String)> {
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey as C};
+    let (bucket, prefix) = crate::parse_bucket(url)?;
+    ensure!(
+        Key::from(prefix).as_ref() == prefix,
+        "bucket prefix must be canonical"
+    );
+    let mut builder = AmazonS3Builder::new();
+    let settings: Vec<(String, String)> = if let Some(file) = file {
+        std::fs::read_to_string(file)?
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .map(|line| {
+                let (k, v) = line
+                    .split_once('=')
+                    .context("destination env needs NAME=value")?;
+                Ok((
+                    k.trim().to_owned(),
+                    v.trim().trim_matches(['\'', '"']).to_owned(),
+                ))
+            })
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        std::env::vars()
+            .filter(|(k, _)| k.to_ascii_lowercase().parse::<C>().is_ok())
+            .collect()
     };
-    let (bucket, prefix) = crate::parse_bucket(&args.to)?;
-    let mut builder = object_store::aws::AmazonS3Builder::new().with_bucket_name(bucket);
-    for line in std::fs::read_to_string(file)?
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.starts_with('#'))
-    {
-        let (name, value) = line
-            .split_once('=')
-            .context("destination env needs NAME=value")?;
-        let config = name
-            .trim()
-            .to_ascii_lowercase()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("unsupported destination setting {}", name.trim()))?;
-        builder = builder.with_config(config, value.trim().trim_matches(['\'', '"']));
+    for (name, value) in settings {
+        builder = builder.with_config(setting(&name)?, value);
     }
-    Ok((Arc::new(builder.build()?), prefix.to_owned()))
+    let endpoint = builder
+        .get_config_value(&C::S3Endpoint)
+        .or_else(|| builder.get_config_value(&C::Endpoint))
+        .unwrap_or_else(|| "https://s3.amazonaws.com".into());
+    let endpoint = endpoint_identity(&endpoint)?;
+    let store = builder.with_bucket_name(bucket).build()?;
+    Ok((Arc::new(store), prefix.to_owned(), endpoint))
+}
+fn endpoint_identity(endpoint: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(endpoint).context("invalid S3 endpoint")?;
+    let host = url.host_str().context("S3 endpoint has no host")?;
+    // AWS bucket names identify the same bucket across regional S3 endpoints.
+    if (host == "s3.amazonaws.com" || host.starts_with("s3.") || host.starts_with("s3-"))
+        && (host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn"))
+    {
+        return Ok(if host.ends_with(".cn") {
+            "aws-cn"
+        } else {
+            "aws"
+        }
+        .into());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+#[cfg(test)]
+fn destination(args: &Create) -> anyhow::Result<(Store, String)> {
+    let (store, prefix, _) = configured(&args.to, args.to_env.as_deref())?;
+    Ok((store, prefix))
+}
+fn disjoint(source: (&str, &str, &str), dest: (&str, &str, &str)) -> anyhow::Result<()> {
+    let source_prefix = Key::from(source.2);
+    let dest_prefix = Key::from(dest.2);
+    let overlap = |a: &str, b: &str| {
+        a.is_empty() || a == b || b.starts_with(&format!("{}/", a.trim_end_matches('/')))
+    };
+    ensure!(
+        source.0 != dest.0
+            || source.1 != dest.1
+            || !(overlap(source_prefix.as_ref(), dest_prefix.as_ref())
+                || overlap(dest_prefix.as_ref(), source_prefix.as_ref())),
+        "source and destination overlap"
+    );
+    Ok(())
 }
 pub(crate) fn run(command: &Command) -> anyhow::Result<()> {
     crate::actor_read::run(async {
         match command {
             Command::Create(args) => {
-                let (source, sp) = crate::open_bucket_unchecked(&args.bucket)?;
-                let (dest, dp) = destination(args)?;
-                ensure!(
-                    crate::parse_bucket(&args.bucket)?.0 != crate::parse_bucket(&args.to)?.0,
-                    "source and destination must differ"
-                );
+                let (source, sp, se) = configured(&args.bucket, None)?;
+                let (dest, dp, de) = configured(&args.to, args.to_env.as_deref())?;
+                disjoint(
+                    (&se, crate::parse_bucket(&args.bucket)?.0, &sp),
+                    (&de, crate::parse_bucket(&args.to)?.0, &dp),
+                )?;
                 create(args, &source, &sp, &dest, &dp).await
             }
             Command::List(args) => {
@@ -197,16 +271,32 @@ pub(crate) fn run(command: &Command) -> anyhow::Result<()> {
                 let (store, prefix) = crate::open_bucket_unchecked(&args.from)?;
                 let id = match &args.run {
                     Some(id) => id.clone(),
-                    None => String::from_utf8(read(&store, &key(&prefix, "latest"), 1024).await?)?,
+                    None => latest(&store, &prefix).await?.context("no latest run")?,
                 };
                 verify(&store, &prefix, id.trim(), args.sample).await
             }
         }
     })
 }
+async fn latest(store: &Store, prefix: &str) -> anyhow::Result<Option<String>> {
+    let Some(bytes) = optional(store, &key(prefix, "latest")).await? else {
+        return Ok(None);
+    };
+    let reference: Value = serde_json::from_slice(&bytes)?;
+    let id = text(&reference, "run")?;
+    safe_id(id)?;
+    checked_json(
+        store,
+        &key(prefix, &format!("runs/{id}/complete")),
+        text(&reference, "sha256")?,
+    )
+    .await?;
+    Ok(Some(id.to_owned()))
+}
 struct Run {
     complete: Value,
-    actors: Vec<Value>,
+    actors: Vec<PathBuf>,
+    _spool: tempfile::TempDir,
     apps: Vec<Value>,
 }
 async fn checked_json(store: &Store, path: &str, hash: &str) -> anyhow::Result<Value> {
@@ -223,7 +313,10 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
         complete["format"] == 1 && complete["run"] == id,
         "unknown or inconsistent backup format"
     );
+    let spool = tempfile::tempdir()?;
     let mut actors = Vec::new();
+    let mut pending = String::new();
+    let mut part = 0;
     let mut apps = Vec::new();
     let mut seen = BTreeSet::new();
     for chunk in array(&complete, "chunks")? {
@@ -233,22 +326,48 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
             "invalid/duplicate chunk"
         );
         let value = checked_json(store, path, text(chunk, "sha256")?).await?;
-        actors.extend(
-            value
-                .as_array()
-                .context("actor chunk is not an array")?
-                .iter()
-                .cloned(),
-        );
+        for fragment in value.as_array().context("actor chunk is not an array")? {
+            ensure!(
+                number(fragment, "part")? == if pending.is_empty() { 0 } else { part },
+                "actor fragment order mismatch"
+            );
+            pending.push_str(text(fragment, "json")?);
+            part += 1;
+            if fragment["last"] == true {
+                let actor: Value = serde_json::from_str(&pending)?;
+                let path = spool.path().join(format!("{:08}.json", actors.len()));
+                std::fs::write(&path, &pending)?;
+                actors.push(path);
+                pending.clear();
+                part = 0;
+                ensure!(
+                    actor["status"] == "copied" || actor["status"] == "failed",
+                    "invalid actor status"
+                );
+            }
+        }
     }
+    ensure!(pending.is_empty(), "unfinished actor fragments");
     ensure!(
         actors.len() as u64 == number(&complete, "actors")?,
         "actor count mismatch"
     );
     let mut addresses = BTreeSet::new();
-    for actor in &actors {
-        ensure!(addresses.insert(text(actor, "prefix")?), "duplicate actor");
+    let mut failures = Vec::new();
+    for path in &actors {
+        let actor = disk_actor(path)?;
+        ensure!(
+            addresses.insert(text(&actor, "prefix")?.to_owned()),
+            "duplicate actor"
+        );
+        if actor["status"] == "failed" {
+            failures.push(actor["failure"].clone());
+        }
     }
+    ensure!(
+        json!(failures) == complete["failed"],
+        "failed membership mismatch"
+    );
     for app in array(&complete, "apps")? {
         let path = text(app, "key")?;
         ensure!(
@@ -261,9 +380,13 @@ async fn load(store: &Store, prefix: &str, id: &str) -> anyhow::Result<Run> {
     array(&complete, "failed")?;
     Ok(Run {
         complete,
+        _spool: spool,
         actors,
         apps,
     })
+}
+fn disk_actor(path: &std::path::Path) -> anyhow::Result<Value> {
+    Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
 }
 async fn blob(store: &Store, prefix: &str, object: &Value) -> anyhow::Result<Vec<u8>> {
     let hash = text(object, "sha256")?;
@@ -360,7 +483,137 @@ async fn replay(dest: &Store, dp: &str, actor: &Value) -> anyhow::Result<history
     );
     Ok(result)
 }
+fn recoverable_ranges(actor: &Value) -> anyhow::Result<Vec<Value>> {
+    let objects = actor["objects"].as_object().context("missing objects")?;
+    let listing = Listing::from_keys(objects.keys().map(String::as_str));
+    let positions: BTreeSet<_> = listing
+        .snapshots
+        .iter()
+        .copied()
+        .chain(listing.segments.iter().map(|s| s.id))
+        .collect();
+    let mut ranges: Vec<Value> = Vec::new();
+    for target in positions {
+        let subset = Listing {
+            snapshots: listing
+                .snapshots
+                .iter()
+                .copied()
+                .filter(|id| *id <= target)
+                .collect(),
+            segments: listing
+                .segments
+                .iter()
+                .copied()
+                .filter(|s| s.id <= target)
+                .collect(),
+        };
+        if plan_restore(&subset).is_ok_and(|p| p.head() == target) {
+            if let Some(last) = ranges.last_mut()
+                && last["generation"] == target.generation
+                && last["end"].as_u64().and_then(|n| n.checked_add(1)) == Some(target.txid)
+            {
+                last["end"] = json!(target.txid);
+            } else {
+                ranges.push(
+                    json!({"generation":target.generation,"start":target.txid,"end":target.txid}),
+                );
+            }
+        }
+    }
+    Ok(ranges)
+}
+async fn verify_ranges(store: &Store, prefix: &str, actor: &Value) -> anyhow::Result<()> {
+    let ranges = recoverable_ranges(actor)?;
+    ensure!(
+        actor["ranges"] == json!(ranges),
+        "recoverable range mismatch"
+    );
+    let objects = actor["objects"].as_object().context("missing objects")?;
+    let listing = Listing::from_keys(objects.keys().map(String::as_str));
+    // Replay each whole range from its first recoverable base, not from the
+    // newest snapshot (which would hide corrupt older segment chains).
+    for range in &ranges {
+        let start = wasmkeep_cluster::replication::SegmentId {
+            generation: number(range, "generation")?,
+            txid: number(range, "start")?,
+        };
+        let target = wasmkeep_cluster::replication::SegmentId {
+            generation: start.generation,
+            txid: number(range, "end")?,
+        };
+        let subset = Listing {
+            snapshots: listing
+                .snapshots
+                .iter()
+                .copied()
+                .filter(|id| *id <= start)
+                .collect(),
+            segments: listing
+                .segments
+                .iter()
+                .copied()
+                .filter(|s| s.id <= target)
+                .collect(),
+        };
+        replay_range(store, prefix, &subset, objects, target).await?;
+    }
+    // Each intermediate snapshot also has to agree with its boundary and
+    // reconstruct a valid database, even when the range replay didn't use it.
+    for snapshot in &listing.snapshots {
+        let subset = Listing {
+            snapshots: vec![*snapshot],
+            segments: listing
+                .segments
+                .iter()
+                .copied()
+                .filter(|s| s.id == *snapshot)
+                .collect(),
+        };
+        replay_range(store, prefix, &subset, objects, *snapshot).await?;
+    }
+    println!(
+        "{} recoverable ranges: {}",
+        text(actor, "prefix")?,
+        json!(ranges)
+    );
+    Ok(())
+}
+
+async fn replay_range(
+    store: &Store,
+    prefix: &str,
+    listing: &Listing,
+    objects: &serde_json::Map<String, Value>,
+    target: wasmkeep_cluster::replication::SegmentId,
+) -> anyhow::Result<()> {
+    let plan = plan_restore(listing)?;
+    let keys = history::copy_keys(listing, &plan)?;
+    check_boundary(store, prefix, &keys, objects).await?;
+    let tmp = tempfile::tempdir()?;
+    let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
+        tmp.path(),
+    )?);
+    for name in keys {
+        put(
+            &local,
+            &name,
+            blob(
+                store,
+                prefix,
+                objects.get(&name).context("range object missing")?,
+            )
+            .await?,
+            false,
+        )
+        .await?;
+    }
+    let restored = history::replay(&local, "", &tmp.path().join("range.db"), MAX).await?;
+    ensure!(restored.position == target, "range chain changed target");
+    Ok(())
+}
 async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> anyhow::Result<()> {
+    latest(store, prefix).await?;
     let run = load(store, prefix, id).await?;
     ensure!(
         array(&run.complete, "failed")?.is_empty(),
@@ -375,25 +628,23 @@ async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> a
             "{}/",
             key(source_prefix, &format!("state/{app_name}/actors"))
         );
-        let members: Vec<_> = run
-            .actors
-            .iter()
-            .filter(|actor| {
-                actor["prefix"]
-                    .as_str()
-                    .is_some_and(|p| p.starts_with(&actor_prefix))
-            })
-            .collect();
+        let mut members = BTreeMap::new();
+        for path in &run.actors {
+            let actor = disk_actor(path)?;
+            let address = text(&actor, "prefix")?;
+            if address.starts_with(&actor_prefix) {
+                ensure!(
+                    covered.insert(address.to_owned()),
+                    "actor belongs to duplicate app records"
+                );
+                members.insert(address.to_owned(), actor["status"].clone());
+            }
+        }
+        ensure!(json!(members) == app["members"], "app membership mismatch");
         ensure!(
             members.len() as u64 == number(app, "actors")?,
             "app actor count mismatch"
         );
-        for member in members {
-            ensure!(
-                covered.insert(text(member, "prefix")?),
-                "actor belongs to duplicate app records"
-            );
-        }
         verify_app(store, prefix, source_prefix, app).await?;
     }
     ensure!(
@@ -403,12 +654,14 @@ async fn verify(store: &Store, prefix: &str, id: &str, sample: Option<u64>) -> a
     // Random sample by fresh entropy, independent of manifest ordering.
     let nonce = tempfile::tempdir()?;
     let mut actors: Vec<_> = run.actors.iter().collect();
-    actors.sort_by_key(|a| digest(format!("{}{}", nonce.path().display(), a["prefix"]).as_bytes()));
+    actors.sort_by_key(|a| digest(format!("{}{}", nonce.path().display(), a.display()).as_bytes()));
     let count = sample.map_or(actors.len(), |n| {
         usize::try_from(n).unwrap_or(usize::MAX).min(actors.len())
     });
     for actor in actors.into_iter().take(count) {
-        replay(store, prefix, actor).await?;
+        let actor = disk_actor(actor)?;
+        replay(store, prefix, &actor).await?;
+        verify_ranges(store, prefix, &actor).await?;
         // `all` also promises retained history, not only the head's plan.
         for object in actor["objects"]
             .as_object()
@@ -489,6 +742,7 @@ impl Copier<'_> {
     ) -> anyhow::Result<Value> {
         let mut objects = initial;
         let mut reason = String::new();
+        let expected: BTreeSet<_> = objects.keys().cloned().collect();
         for attempt in 0..8 {
             if attempt > 0 {
                 objects = history::list_objects(self.source, prefix).await?;
@@ -506,7 +760,20 @@ impl Copier<'_> {
                 .await
                 .context("backup actor copy deadline exceeded")?
             {
-                Ok(actor) => return Ok(actor),
+                Ok(mut actor) => {
+                    let copied = actor["objects"].as_object().context("missing objects")?;
+                    let gaps: Vec<_> = if self.all {
+                        expected
+                            .iter()
+                            .filter(|k| !copied.contains_key(*k))
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    actor["gaps"] = json!(gaps);
+                    return Ok(actor);
+                }
                 Err(e)
                     if matches!(
                         e.downcast_ref::<history::Error>(),
@@ -740,7 +1007,12 @@ impl Copier<'_> {
             staged.as_file().sync_all()?;
             staged.persist(target).map_err(|e| e.error)?;
         }
-        let actor = json!({"prefix":prefix,"generation":result.position.generation,"txid":result.position.txid,"checksum":result.raw_checksum,"timestamp_ms":result.timestamp_ms,"replayed_objects":result.objects,"plan":keys,"objects":copied,"replacement":result.verification.replaced,"foreign_key_violations":result.verification.foreign_key_violations,"alarm":alarm,"alarm_indexed":alarm_indexed});
+        let mut actor = json!({"prefix":prefix,"generation":result.position.generation,"txid":result.position.txid,"checksum":result.raw_checksum,"timestamp_ms":result.timestamp_ms,"replayed_objects":result.objects,"plan":keys,"objects":copied,"replacement":result.verification.replaced,"foreign_key_violations":result.verification.foreign_key_violations,"alarm":alarm,"alarm_indexed":alarm_indexed});
+        actor["ranges"] = json!(recoverable_ranges(&actor)?);
+        actor["gaps"] = json!([]);
+        if self.all {
+            verify_ranges(self.dest, self.dp, &actor).await?;
+        }
         if let Some(cache) = self.cache {
             let mut sidecar = tempfile::NamedTempFile::new_in(cache)?;
             serde_json::to_writer(&mut sidecar, &actor)?;
@@ -792,26 +1064,32 @@ async fn app_metadata(
                         let manifest_bytes = read(source, &manifest_key, META_MAX).await?;
                         let manifest = Manifest::parse(std::str::from_utf8(&manifest_bytes)?)
                             .context("invalid deploy manifest")?;
-                        let mut required = vec![(manifest_key, manifest_bytes)];
+                        objects.insert(
+                            manifest_key.clone(),
+                            save_blob(dest, dp, &manifest_key, manifest_bytes, None, None).await?,
+                        );
                         for (class, hash) in &manifest.classes {
                             let path = key(&vp, &format!("{class}.wasm"));
                             let bytes = read(source, &path, MAX).await?;
                             ensure!(digest(&bytes) == *hash, "component digest mismatch");
-                            required.push((path, bytes));
+                            objects.insert(
+                                path.clone(),
+                                save_blob(dest, dp, &path, bytes, None, None).await?,
+                            );
                         }
                         if let Some(hash) = &manifest.front {
                             let path = key(&vp, "_front.wasm");
                             let bytes = read(source, &path, MAX).await?;
                             ensure!(digest(&bytes) == *hash, "front digest mismatch");
-                            required.push((path, bytes));
+                            objects.insert(
+                                path.clone(),
+                                save_blob(dest, dp, &path, bytes, None, None).await?,
+                            );
                         }
                         for (class, hash) in &manifest.config {
                             let path = key(&vp, &format!("{class}.config"));
                             let bytes = read(source, &path, META_MAX).await?;
                             ensure!(digest(&bytes) == *hash, "config digest mismatch");
-                            required.push((path, bytes));
-                        }
-                        for (path, bytes) in required {
                             objects.insert(
                                 path.clone(),
                                 save_blob(dest, dp, &path, bytes, None, None).await?,
@@ -857,9 +1135,28 @@ async fn flush_chunk(
     if actors.is_empty() {
         return Ok(());
     }
-    let path = key(base, &format!("actors/{:08}", chunks.len()));
-    let hash = json_put(dest, &path, &json!(actors), false).await?;
-    chunks.push(json!({"key":path,"sha256":hash}));
+    for actor in actors.iter() {
+        let encoded = serde_json::to_string(actor)?;
+        let mut rest = encoded.as_str();
+        let mut part = 0;
+        while !rest.is_empty() {
+            let mut end = rest.len().min((META_MAX / 8) as usize);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (fragment, tail) = rest.split_at(end);
+            let record = json!([{"part":part,"last":tail.is_empty(),"json":fragment}]);
+            ensure!(
+                (serde_json::to_vec(&record)?.len() as u64) < META_MAX,
+                "manifest chunk exceeds cap"
+            );
+            let path = key(base, &format!("actors/{:08}", chunks.len()));
+            let hash = json_put(dest, &path, &record, false).await?;
+            chunks.push(json!({"key":path,"sha256":hash}));
+            rest = tail;
+            part += 1;
+        }
+    }
     actors.clear();
     Ok(())
 }
@@ -965,7 +1262,14 @@ async fn create(
     .await?;
     let prunes = history::list_objects(dest, &format!("{}/", key(dp, "prunes"))).await?;
     let previous = match optional(dest, &key(dp, "latest")).await? {
-        Some(bytes) => Some(load(dest, dp, std::str::from_utf8(&bytes)?.trim()).await?),
+        Some(_) => Some(
+            load(
+                dest,
+                dp,
+                &latest(dest, dp).await?.context("missing latest")?,
+            )
+            .await?,
+        ),
         None => None,
     };
     let compatible = previous.as_ref().is_some_and(|r| {
@@ -976,7 +1280,7 @@ async fn create(
             .as_ref()
             .into_iter()
             .flat_map(|r| &r.actors)
-            .map(|a| Ok((text(a, "prefix")?.to_owned(), a)))
+            .map(|a| Ok((text(&disk_actor(a)?, "prefix")?.to_owned(), a)))
             .collect::<anyhow::Result<_>>()?
     } else {
         BTreeMap::new()
@@ -995,33 +1299,56 @@ async fn create(
     let mut app_records = Vec::new();
     for (t, a) in apps {
         let app_start = actor_count;
+        let mut members = BTreeMap::new();
         let prefix = format!("{}/", key(sp, &format!("state/{t}/{a}/actors")));
         let mut copying = actor_groups(source, &prefix)
             .map_ok(|(actor_prefix, group)| {
                 let copier = &copier;
                 let old = &old;
                 async move {
-                    let result = copier
-                        .actor(&actor_prefix, group, old.get(&actor_prefix).copied())
-                        .await;
+                    let previous = old
+                        .get(&actor_prefix)
+                        .map(|path| disk_actor(path))
+                        .transpose()?
+                        .filter(|actor| actor["status"] == "copied");
+                    let result = copier.actor(&actor_prefix, group, previous.as_ref()).await;
                     Ok::<_, anyhow::Error>((actor_prefix, result))
                 }
             })
             .try_buffer_unordered(16);
         while let Some((actor_prefix, result)) = copying.try_next().await? {
-            match result {
-                Ok(actor) => {
-                    actors.push(actor);
-                    actor_count += 1;
-                    if actors.len() == 1000 {
-                        flush_chunk(dest, &base, &mut chunks, &mut actors).await?;
+            let actor = match result {
+                Ok(mut actor) => {
+                    actor["status"] = json!("copied");
+                    if !array(&actor, "gaps")?.is_empty() {
+                        println!("{actor_prefix}: retained history gaps: {}", actor["gaps"]);
                     }
+                    if args
+                        .require_continuous
+                        .unwrap_or(args.history == History::All)
+                        && !array(&actor, "gaps")?.is_empty()
+                    {
+                        let failure = json!({"actor":actor_prefix,"error":"retained history gap", "gaps":actor["gaps"]});
+                        failures.push(failure.clone());
+                        actor["status"] = json!("failed");
+                        actor["failure"] = failure;
+                    }
+                    actor
                 }
-                Err(e) => failures.push(json!({"actor":actor_prefix,"error":e.to_string()})),
-            }
+                Err(e) => {
+                    let failure = json!({"actor":actor_prefix,"error":e.to_string()});
+                    failures.push(failure.clone());
+                    json!({"prefix":actor_prefix,"status":"failed","failure":failure})
+                }
+            };
+            members.insert(actor_prefix, actor["status"].clone());
+            actor_count += 1;
+            actors.push(actor);
+            flush_chunk(dest, &base, &mut chunks, &mut actors).await?;
         }
         let mut app = app_metadata(source, sp, dest, dp, &t, &a).await?;
         app["actors"] = json!(actor_count - app_start);
+        app["members"] = json!(members);
         ensure!(
             incarnation(source, &key(sp, &format!("apps/{t}/{a}"))).await?
                 == starts[&format!("{t}/{a}")],
@@ -1052,8 +1379,14 @@ async fn create(
         );
     }
     let complete = json!({"format":1,"run":id,"source":args.bucket,"incarnations":starts,"actors":actor_count,"chunks":chunks,"apps":app_records,"failed":failures,"history":if args.history==History::All{"all"}else{"head"}});
-    json_put(dest, &key(&base, "complete"), &complete, false).await?;
-    put(dest, &key(dp, "latest"), id.as_bytes().to_vec(), true).await?;
+    let hash = json_put(dest, &key(&base, "complete"), &complete, false).await?;
+    json_put(
+        dest,
+        &key(dp, "latest"),
+        &json!({"run":id,"sha256":hash}),
+        true,
+    )
+    .await?;
     println!(
         "{id}: {} actors, {} failed; no cross-actor consistency",
         actor_count,
@@ -1078,12 +1411,18 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
             path.starts_with(&format!("{base}/")) && !objects.contains_key(path),
             "invalid/duplicate app object"
         );
-        objects.insert(path.to_owned(), blob(store, dp, object).await?);
+        blob(store, dp, object).await?;
+        objects.insert(path.to_owned(), object);
     }
     let current = Current::parse(
-        objects
-            .get(&key(&base, "current"))
-            .context("deploy current missing")?,
+        &blob(
+            store,
+            dp,
+            objects
+                .get(&key(&base, "current"))
+                .context("deploy current missing")?,
+        )
+        .await?,
     )
     .context("invalid deploy current")?;
     let mut version = Some(current.version);
@@ -1093,17 +1432,27 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
         };
         let vp = key(&base, &v);
         let manifest = Manifest::parse(std::str::from_utf8(
-            objects
-                .get(&key(&vp, "manifest"))
-                .context("deploy manifest missing")?,
+            &blob(
+                store,
+                dp,
+                objects
+                    .get(&key(&vp, "manifest"))
+                    .context("deploy manifest missing")?,
+            )
+            .await?,
         )?)
         .context("invalid deploy manifest")?;
         for (class, hash) in &manifest.classes {
             ensure!(
                 digest(
-                    objects
-                        .get(&key(&vp, &format!("{class}.wasm")))
-                        .context("component missing")?
+                    &blob(
+                        store,
+                        dp,
+                        objects
+                            .get(&key(&vp, &format!("{class}.wasm")))
+                            .context("component missing")?
+                    )
+                    .await?
                 ) == *hash,
                 "component mismatch"
             );
@@ -1111,9 +1460,14 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
         if let Some(hash) = &manifest.front {
             ensure!(
                 digest(
-                    objects
-                        .get(&key(&vp, "_front.wasm"))
-                        .context("front missing")?
+                    &blob(
+                        store,
+                        dp,
+                        objects
+                            .get(&key(&vp, "_front.wasm"))
+                            .context("front missing")?
+                    )
+                    .await?
                 ) == *hash,
                 "front mismatch"
             );
@@ -1121,9 +1475,14 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
         for (class, hash) in &manifest.config {
             ensure!(
                 digest(
-                    objects
-                        .get(&key(&vp, &format!("{class}.config")))
-                        .context("configuration missing")?
+                    &blob(
+                        store,
+                        dp,
+                        objects
+                            .get(&key(&vp, &format!("{class}.config")))
+                            .context("configuration missing")?
+                    )
+                    .await?
                 ) == *hash,
                 "configuration mismatch"
             );
@@ -1131,7 +1490,8 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
         version = manifest.previous;
     }
     if let Some(bytes) = objects.get(&key(&base, "secrets/current")) {
-        let version = std::str::from_utf8(bytes)?.trim();
+        let bytes = blob(store, dp, bytes).await?;
+        let version = std::str::from_utf8(&bytes)?.trim();
         ensure!(
             objects.contains_key(&key(&base, &format!("secrets/{version}"))),
             "sealed secrets missing"

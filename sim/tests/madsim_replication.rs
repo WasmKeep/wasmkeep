@@ -847,6 +847,27 @@ fn simulate(seed: u64, rules: Rules, duration: Duration) -> Outcome {
 }
 
 fn simulate_with_exports(seed: u64, rules: Rules, duration: Duration, export: bool) -> Outcome {
+    simulate_observed(seed, rules, duration, export, None)
+}
+
+type Observer = Box<dyn FnMut(&Store, &[SegmentId])>;
+#[allow(dead_code)]
+pub(crate) fn backup_simulation(seed: u64, observer: Observer) {
+    simulate_observed(
+        seed,
+        SAFE_DELETING_COLLECTING,
+        Duration::from_secs(90),
+        false,
+        Some(observer),
+    );
+}
+fn simulate_observed(
+    seed: u64,
+    rules: Rules,
+    duration: Duration,
+    export: bool,
+    mut observer: Option<Observer>,
+) -> Outcome {
     bucket::clear_delays();
     EARLY.with(|e| e.set(0));
     LATE.with(|l| l.set(0));
@@ -996,6 +1017,9 @@ fn simulate_with_exports(seed: u64, rules: Rules, duration: Duration, export: bo
         for step in 1..=steps {
             sleep(Duration::from_millis(50)).await;
             let at = step * 50;
+            if let Some(observer) = &mut observer {
+                observer(&export_store, &acked.lock().unwrap());
+            }
             // ADR 0033: an observer with no node lease or hold lists, then
             // fetches later while writers, kills and collection keep running.
             // The model checks positions; real LTX verification is covered
