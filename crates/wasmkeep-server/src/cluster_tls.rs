@@ -196,7 +196,8 @@ impl ClusterTls {
     }
 
     /// Whether the claim on `uri`'s address is refused only because its
-    /// heartbeat, as last listed, expired: a newer listing may renew it.
+    /// heartbeat, as last read (a listing of `nodes/` or one read of that
+    /// node's object), expired: a newer read may renew it.
     fn lapsed(&self, uri: &Uri) -> bool {
         address_key(uri).is_some_and(|key| {
             self.by_address
@@ -222,7 +223,7 @@ impl ClusterTls {
                 "{key}: claimed by two live nodes at once; trusting neither"
             )),
             Some(c) if now_ms() > c.expires_at_ms => Err(format!(
-                "{key}: the heartbeat naming it expired (the bucket was not listed since)"
+                "{key}: the heartbeat naming it expired (not renewed by a read of the bucket since)"
             )),
             Some(c) if c.pins.is_empty() => {
                 Err(format!("{key}: the node published no certificate pin"))

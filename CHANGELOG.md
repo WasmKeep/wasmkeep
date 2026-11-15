@@ -170,8 +170,10 @@ writes allow
   the sweep, at most a minute apart, and at once when a node joins or
   leaves. Fencing, failover timings for known nodes and pin revocation are
   unchanged ([ADR 0009, 0011, 0014, 0017 and 0020](docs/adr/0020-one-lease-per-node.md),
-  amendments of 2026-11-14). New metric: `wasmkeep_node_hellos_total`.
-  These listings change no format in the bucket. Upgrade the CLI with
+  amendments of 2026-11-14). A listing of `nodes/` that fails does not
+  stop the reads of the nodes a node knows, so a store that refuses LIST
+  does not make it distrust its peers. New metric:
+  `wasmkeep_node_hellos_total`. These listings change no format in the bucket. Upgrade the CLI with
   the nodes: `cluster drain`, `undrain` and
   `actor move` of 0.4.1 do not write `control/changed`, so nodes of 0.4.2
   read their requests within a minute instead of 3 s. While both versions
