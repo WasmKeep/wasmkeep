@@ -649,6 +649,130 @@ fn values_and_results_are_capped() {
 }
 
 #[test]
+fn result_cap_counts_empty_text_rows() {
+    assert_empty_rows_hit_result_cap("''");
+}
+
+#[test]
+fn result_cap_counts_empty_blob_rows() {
+    assert_empty_rows_hit_result_cap("x''");
+}
+
+fn assert_empty_rows_hit_result_cap(value: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::new(dir.path());
+    config.max_result_bytes = 1024;
+    let mut db = rooted(config).open("c", "a").unwrap();
+    let err = db
+        .query(
+            &format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL \
+                 SELECT x + 1 FROM c WHERE x < 100) SELECT {value} AS v FROM c"
+            ),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert_eq!(
+        err.message,
+        "result larger than 1024 bytes; select less or page through it"
+    );
+    // Quota rejection leaves the connection usable for ordinary small results.
+    assert_eq!(
+        db.query("SELECT 1 AS n, 'ok' AS t, x'01' AS b, NULL AS z", &[])
+            .unwrap()
+            .values,
+        vec![vec![
+            V::Integer(1),
+            V::Text("ok".into()),
+            V::Blob(vec![1]),
+            V::Null,
+        ]]
+    );
+}
+
+#[test]
+fn result_cap_counts_empty_cells_in_a_wide_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::new(dir.path());
+    config.max_result_bytes = 4096;
+    let mut db = rooted(config).open("c", "a").unwrap();
+    // The column names fit; their cells must also be charged.
+    let cells = ["'' AS v"; 64].join(", ");
+    assert!(
+        db.query(&format!("SELECT {cells} WHERE 0"), &[])
+            .unwrap()
+            .values
+            .is_empty()
+    );
+    let err = db.query(&format!("SELECT {cells}"), &[]).unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(err.message.starts_with("result larger than 4096 bytes"));
+}
+
+#[test]
+fn result_cap_counts_column_names_even_without_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::new(dir.path());
+    config.max_result_bytes = 1024;
+    let mut db = rooted(config).open("c", "a").unwrap();
+    let alias = "a".repeat(2048);
+    for condition in ["", " WHERE 0"] {
+        let err = db
+            .query(&format!("SELECT '' AS \"{alias}\"{condition}"), &[])
+            .unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+        assert_eq!(
+            err.message,
+            "result larger than 1024 bytes; select less or page through it"
+        );
+    }
+}
+
+#[test]
+fn result_cap_charges_column_names_only_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::new(dir.path());
+    config.max_result_bytes = 4096;
+    let mut db = rooted(config).open("c", "a").unwrap();
+    let alias = "a".repeat(1024);
+    let rows = db
+        .query(
+            &format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL \
+                 SELECT x + 1 FROM c WHERE x < 10) SELECT '' AS \"{alias}\" FROM c"
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.columns, [alias]);
+    assert_eq!(rows.values, vec![vec![V::Text(String::new())]; 10]);
+}
+
+#[test]
+fn result_cap_counts_lossy_text_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::new(dir.path());
+    config.max_result_bytes = 2048;
+    let mut db = rooted(config).open("c", "a").unwrap();
+    let sql = "SELECT CAST(?1 AS TEXT) AS v";
+    // Preserve SQLite text conversion, including mixed valid/invalid UTF-8.
+    let bytes = b"ok\xc3\xa9\xff\xf0\x90\x80";
+    assert_eq!(
+        db.query(sql, &[V::Blob(bytes.to_vec())]).unwrap().values,
+        vec![vec![V::Text(String::from_utf8_lossy(bytes).into_owned())]]
+    );
+    assert_eq!(
+        db.query(sql, &[V::Blob(vec![b'a'; 1000])]).unwrap().values,
+        vec![vec![V::Text("a".repeat(1000))]]
+    );
+    // Raw bytes fit, but each invalid byte becomes a three-byte replacement.
+    let err = db.query(sql, &[V::Blob(vec![0xff; 1000])]).unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(err.message.starts_with("result larger than 2048 bytes"));
+}
+
+#[test]
 fn writes_stop_when_one_event_fills_the_wal() {
     // Replication keeps committed pages in the WAL until the host captures
     // them between events; one event rewriting the same rows must not grow it
