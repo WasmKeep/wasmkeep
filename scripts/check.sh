@@ -171,6 +171,8 @@ elif $preflight; then
 fi
 # Every simulation but madsim_lease, the retired per-actor lease's: the
 # server no longer runs that protocol, so it runs under --deep only.
+# Includes ADR 0034's split batched model; new madsim_*.rs suites join this
+# 200-seed gate and the deep sweep automatically.
 gate_sims=()
 for test in sim/tests/madsim_*.rs; do
   [ -e "$test" ] || continue

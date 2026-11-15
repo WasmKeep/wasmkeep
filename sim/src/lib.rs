@@ -9,6 +9,10 @@
 //! `madsim_socket_home` (ADR 0024) run on [`node`], a node on node leases
 //! with its lease on a task of its own and its holds acting by the
 //! server's own rule (`wasmkeep_cluster::holds`);
+//! `madsim_batched` (ADR 0034) splits local commit, capture, entry PUT,
+//! segment PUT, acknowledgement and completion in a shared protocol model.
+//! It uses the production restore/GC planners and alarm rules, with abstract
+//! hold validity; its alarm mutations also run in `madsim_alarm_index`.
 //! `madsim_lease` still models the retired per-actor lease itself
 //! ([`driver`]), kept after the server moved to node leases (ADR 0020).
 //!
