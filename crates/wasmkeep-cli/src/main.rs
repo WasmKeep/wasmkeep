@@ -1424,6 +1424,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             deployed_rules = Some((current.marked, deployed.access));
             config.config = deployed.config;
             config.requires = deployed.requires;
+            config.batched = deployed.batched;
             config.expire_after_idle = deployed
                 .expire
                 .iter()
@@ -2072,6 +2073,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 }
                 args.expire_after_idle.clone()
             },
+            writes: Vec::new(),
             every_rule: false,
         };
         rt.block_on(app_ref.deploy_changes(&runtime, changes))

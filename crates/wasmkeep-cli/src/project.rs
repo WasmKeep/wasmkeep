@@ -51,6 +51,8 @@ pub(crate) struct Class {
     pub(crate) access: String,
     /// `expire-after-idle` (ADR 0028), in seconds; `None`: never.
     pub(crate) expire_after_idle: Option<u64>,
+    /// `writes` (ADR 0034): `strict` when the file says nothing.
+    pub(crate) writes: wasmkeep_server::apps::Writes,
 }
 
 /// `[dev]`: for `wasmkeep dev` only.
@@ -75,6 +77,7 @@ const CLASS: &[&str] = &[
     "requires",
     "watch",
     "expire-after-idle",
+    "writes",
 ];
 const DEV: &[&str] = &["port", "data-dir", "env"];
 
@@ -464,12 +467,23 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
                     }
                 },
             };
+            let writes = match string(&src, ct, "writes", &what)? {
+                None => wasmkeep_server::apps::Writes::default(),
+                Some(mode) => match wasmkeep_server::apps::Writes::parse(&mode) {
+                    Ok(writes) => writes,
+                    Err(e) => {
+                        let span = get(ct, "writes").map(|(_, v)| v.span()).unwrap_or(0..0);
+                        return src.err(span, format!("{what} writes: {e}"));
+                    }
+                },
+            };
             classes.insert(
                 name_str.to_owned(),
                 Class {
                     item,
                     access,
                     expire_after_idle,
+                    writes,
                 },
             );
         }
@@ -764,6 +778,7 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
                 config: config.remove(&name),
                 requires: class.item.requires.clone(),
                 expire: class.expire_after_idle,
+                writes: class.writes,
             };
             Some((name, class.access.clone(), part))
         })
@@ -774,6 +789,7 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
             config: config.remove(crate::FRONT_SCOPE),
             requires: item.requires.clone(),
             expire: None,
+            writes: wasmkeep_server::apps::Writes::Strict,
         }),
         _ => None,
     };
@@ -854,6 +870,34 @@ port = 9090
 data-dir = "state"
 env = ".env.dev"
 "#;
+
+    #[test]
+    fn writes_is_a_class_key() {
+        // ADR 0034: `strict` (the default) or `batched`; classes only. The
+        // deploy refuses `batched` for now; the file reads it.
+        use wasmkeep_server::apps::Writes;
+        let base =
+            "[app]\ntenant = \"acme\"\nname = \"shop\"\n[classes.carts]\ncomponent = \"c.wasm\"\n";
+        assert_eq!(parse_ok(base).classes["carts"].writes, Writes::Strict);
+        for (line, want) in [
+            ("writes = \"strict\"\n", Writes::Strict),
+            ("writes = \"batched\"\n", Writes::Batched),
+        ] {
+            let p = parse_ok(&format!("{base}{line}"));
+            assert_eq!(p.classes["carts"].writes, want, "{line}");
+        }
+        for (bad, why) in [
+            ("writes = \"gated\"\n", "strict, batched"),
+            ("writes = true\n", "writes"),
+        ] {
+            let err = parse_err(&format!("{base}{bad}"));
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        let err = parse_err(
+            "[app]\ntenant = \"acme\"\nname = \"shop\"\n[front]\ncomponent = \"f.wasm\"\nwrites = \"strict\"\n",
+        );
+        assert!(err.contains("writes"), "{err}");
+    }
 
     #[test]
     fn expire_after_idle_is_a_class_key() {

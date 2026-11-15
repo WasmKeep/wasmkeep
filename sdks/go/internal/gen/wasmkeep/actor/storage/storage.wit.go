@@ -117,3 +117,24 @@ func DeleteSelfDurable() (result cm.Result[SQLError, struct{}, SQLError]) {
 	wasmimport_DeleteSelfDurable(&result)
 	return
 }
+
+// Flush represents the imported function "flush".
+//
+// Returns once every write this actor committed before the call is
+// durable: in the bucket, uploaded while this node held the actor, when
+// the node has one; fsynced locally when it does not. Refused with
+// `not-allowed` inside an open transaction. `internal` means what was
+// committed since the last durable point is not known to be durable:
+// fail the request. A message starting `not durable: still uploading`
+// means the wait ran out while the upload went on: the writes stay
+// committed here, later events see them, and they usually become
+// durable soon after. Any other `internal` means replication stopped:
+// the actor's state is then whatever the bucket holds.
+//
+//	flush: func() -> result<_, sql-error>
+//
+//go:nosplit
+func Flush() (result cm.Result[SQLError, struct{}, SQLError]) {
+	wasmimport_Flush(&result)
+	return
+}

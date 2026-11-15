@@ -500,7 +500,9 @@ impl ActorState {
             Ok(hold) => {
                 self.owner_hint = None;
                 let (view, generation) = (hold.view(), hold.generation().unwrap_or(0));
-                self.held = Some(Held::new(hold));
+                // The hold takes the class's mode now, and keeps it until
+                // a `Flushed` barrier (ADR 0034, section 1).
+                self.held = Some(Held::new(hold, self.class.writes));
                 let path = self
                     .storage
                     .db_path(self.address.class(), self.address.name());
@@ -688,6 +690,18 @@ impl ActorState {
                 self.db = live.store.data_mut().db.take();
             }
             self.class = current;
+        }
+        // A deploy that changed the class's mode reaches a resident hold
+        // at a `Flushed` barrier, never at each use (ADR 0034, section 1).
+        // A strict hold is always flushed; a batched one seen under a
+        // strict version flushes first (slice S9).
+        if let Some(held) = self.held.as_mut()
+            && held.writes() != self.class.writes
+        {
+            let barrier = held.barrier();
+            if held.switch_writes(self.class.writes, barrier) {
+                tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), writes = self.class.writes.as_str(), "the hold now runs the class's new mode of writes");
+            }
         }
         Ok(())
     }

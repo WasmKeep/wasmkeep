@@ -90,6 +90,43 @@ pub enum DeployError {
         /// Their ids, comma separated.
         nodes: String,
     },
+    /// Live nodes of the app do not announce the capability word `flush`
+    /// (ADR 0034, section 15): they cannot link a component that imports
+    /// `storage.flush`, nor read a version with a batched class (manifest
+    /// format 5). There is no `--force`.
+    #[error(
+        "live nodes of {app} do not have storage.flush ({nodes}), which {what}: upgrade \
+         every node of the app first, then deploy (this check has no --force: such a node \
+         would stay not ready on the version)"
+    )]
+    NodesWithoutFlush {
+        /// `tenant/app`.
+        app: String,
+        /// Their ids, comma separated.
+        nodes: String,
+        /// What needs it: the classes importing it, or the format.
+        what: String,
+    },
+    /// Live nodes of the app do not announce the capability word `ends`
+    /// (ADR 0028) while a component imports `storage.delete-self-durable`
+    /// (ADR 0034, section 1, exception 2): they cannot link it.
+    #[error(
+        "live nodes of {app} do not have storage.delete-self-durable ({nodes}), which {what}: \
+         upgrade every node of the app first, then deploy (this check has no --force: such a \
+         node would stay not ready on the version)"
+    )]
+    NodesWithoutDeleteDurable {
+        /// `tenant/app`.
+        app: String,
+        /// Their ids, comma separated.
+        nodes: String,
+        /// The classes importing it.
+        what: String,
+    },
+    /// A class is `writes = "batched"`, which this release does not run
+    /// yet (ADR 0034): nothing was written.
+    #[error("class {0:?}: {BATCHED_NOT_YET}")]
+    BatchedNotYet(String),
     /// The app was deleted (`wasmkeep app delete`, ADR 0028): its
     /// tombstone is in the bucket.
     #[error(
@@ -120,6 +157,47 @@ pub enum DeployError {
         name: String,
     },
 }
+
+/// How a class's plain writes reach the bucket (ADR 0034, section 1): part
+/// of the class's version, like its access rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Writes {
+    /// Every event's writes are uploaded before the next event starts:
+    /// the behaviour of every release before, and the default.
+    #[default]
+    Strict,
+    /// Opt in: plain writes are uploaded behind the events, one segment in
+    /// flight per actor. Not yet available: a deploy refuses it.
+    Batched,
+}
+
+impl Writes {
+    /// As the project file writes it: `strict` or `batched`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Batched => "batched",
+        }
+    }
+
+    /// `strict` or `batched`.
+    ///
+    /// # Errors
+    /// Anything else, with what is accepted.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "strict" => Ok(Self::Strict),
+            "batched" => Ok(Self::Batched),
+            _ => Err(format!("{s:?} is not a mode of writes (strict, batched)")),
+        }
+    }
+}
+
+/// What a deploy that names a batched class answers, while batched writes
+/// are not built (ADR 0034, slices S7 to S12).
+pub const BATCHED_NOT_YET: &str = "writes = \"batched\" is not yet available in this release \
+     (ADR 0034): deploy the class without `writes`, or with writes = \"strict\"";
 
 fn bucket(e: impl std::fmt::Display) -> DeployError {
     DeployError::Bucket(e.to_string())
@@ -220,8 +298,26 @@ impl AppRef {
         .await
     }
 
-    /// Refuses `manifest` while a live node could not read it.
+    /// Refuses `manifest` while a live node could not read it: format 5
+    /// needs `flush` (ADR 0034), and every format inherits the checks of
+    /// those below it (4 needs `ends`, 3 needs `front`).
     async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        if manifest.format_number() >= 5 {
+            let nodes = nodes_without_flush(
+                Arc::clone(&self.store),
+                &self.prefix,
+                &self.tenant,
+                &self.app,
+            )
+            .await?;
+            if !nodes.is_empty() {
+                return Err(DeployError::NodesWithoutFlush {
+                    app: format!("{}/{}", self.tenant, self.app),
+                    nodes: nodes.join(", "),
+                    what: "a version with a batched class (manifest format 5) needs".into(),
+                });
+            }
+        }
         if manifest.format_number() >= 4 {
             let nodes = nodes_without_ends(
                 Arc::clone(&self.store),
@@ -249,6 +345,105 @@ impl AppRef {
                 nodes: nodes.join(", "),
             })
         }
+    }
+
+    /// Refuses a version whose components import a `storage` function a
+    /// live node of the app lacks (ADR 0034, section 15): `flush` needs the
+    /// word `flush`, `delete-self-durable` the word `ends` (for strict
+    /// classes too: section 1, exception 2). Such a node could not link the
+    /// component and would stay not ready on the version. `given` are the
+    /// components a deploy was given, already read; `kept`, `(version,
+    /// class)`, those it keeps or a rollback brings back, read from the
+    /// bucket only when a live node lacks a word.
+    async fn check_imports(
+        &self,
+        runtime: Option<&Runtime>,
+        given: &[(String, StorageImports)],
+        kept: &[(String, String)],
+    ) -> Result<(), DeployError> {
+        let needs_any = given.iter().any(|(_, i)| i.flush || i.delete_self_durable);
+        if !needs_any && kept.is_empty() {
+            return Ok(());
+        }
+        let nodes = live_nodes(
+            Arc::clone(&self.store),
+            &self.prefix,
+            &self.tenant,
+            &self.app,
+        )
+        .await?;
+        if nodes.iter().all(|n| n.can_flush && n.can_end) {
+            return Ok(());
+        }
+        let mut imports = given.to_vec();
+        if !kept.is_empty() {
+            let own;
+            let runtime = match runtime {
+                Some(r) => r,
+                None => {
+                    own = Runtime::new(&wasmkeep_runtime::RuntimeConfig::default())
+                        .map_err(|e| DeployError::Bucket(format!("checking imports: {e:#}")))?;
+                    &own
+                }
+            };
+            for (version, class) in kept {
+                let key = format!("{version}/{class}.wasm");
+                let (bytes, _) = self
+                    .get(&key)
+                    .await?
+                    .ok_or_else(|| DeployError::Corrupt(format!("{key} (missing)")))?;
+                let component = runtime
+                    .compile(&bytes)
+                    .map_err(|e| DeployError::Invalid(class.clone(), format!("{e:#}")))?;
+                imports.push((class.clone(), StorageImports::of(runtime, &component)));
+            }
+        }
+        let classes = |pick: fn(&StorageImports) -> bool| -> Vec<&str> {
+            imports
+                .iter()
+                .filter(|(_, i)| pick(i))
+                .map(|(c, _)| c.as_str())
+                .collect()
+        };
+        let (flush, ends) = (classes(|i| i.flush), classes(|i| i.delete_self_durable));
+        let app = format!("{}/{}", self.tenant, self.app);
+        let lacking = |has: fn(&wasmkeep_cluster::membership::NodeInfo) -> bool| {
+            nodes
+                .iter()
+                .filter(|n| !has(n))
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let what = |classes: &[&str]| {
+            let plural = if classes.len() == 1 { "" } else { "es" };
+            format!(
+                "class{plural} {} import{}",
+                classes.join(", "),
+                if classes.len() == 1 { "s" } else { "" }
+            )
+        };
+        if !flush.is_empty() {
+            let without = lacking(|n| n.can_flush);
+            if !without.is_empty() {
+                return Err(DeployError::NodesWithoutFlush {
+                    app,
+                    nodes: without,
+                    what: what(&flush),
+                });
+            }
+        }
+        if !ends.is_empty() {
+            let without = lacking(|n| n.can_end);
+            if !without.is_empty() {
+                return Err(DeployError::NodesWithoutDeleteDurable {
+                    app,
+                    nodes: without,
+                    what: what(&ends),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn path(&self, key: &str) -> StorePath {
@@ -602,6 +797,7 @@ impl AppRef {
             config,
             requires,
             expire: manifest.expire.clone(),
+            batched: manifest.batched.clone(),
             front,
         })
     }
@@ -715,6 +911,12 @@ impl AppRef {
         self.check_not_deleted().await?;
         self.check_layout().await?;
         let every_rule = changes.every_rule;
+        // What the components given import of `storage` beyond 0.4.1's
+        // (ADR 0034, section 15): checked against the live nodes below.
+        let mut imports = Vec::new();
+        // The classes kept from the current version: read only if a live
+        // node lacks a word.
+        let mut kept = Vec::new();
         if let Some(classes) = &changes.classes {
             let mut compiled = Vec::new();
             for (name, bytes) in classes {
@@ -725,6 +927,9 @@ impl AppRef {
             }
             ActorService::validate(runtime, &compiled)
                 .map_err(|(name, e)| DeployError::Invalid(name, e))?;
+            for (name, component) in &compiled {
+                imports.push((name.clone(), StorageImports::of(runtime, component)));
+            }
         }
         // The front is checked before anything is written too (ADR 0023).
         if let FrontChange::Set(bytes) = &changes.front {
@@ -811,6 +1016,7 @@ impl AppRef {
                 Some((current, manifest, _)) => {
                     for class in manifest.classes.keys() {
                         copies.push((current.version.clone(), format!("{class}.wasm")));
+                        kept.push((current.version.clone(), class.clone()));
                     }
                     manifest.classes.clone()
                 }
@@ -944,6 +1150,39 @@ impl AppRef {
                 }
             }
         }
+        // How plain writes reach the bucket (ADR 0034): kept for the
+        // classes still there unless the whole set is given, with the
+        // changes applied. `strict` is the absence of a mode.
+        let mut batched: std::collections::BTreeSet<String> = match (keep_requires, &base) {
+            (true, Some((_, m, _))) => m
+                .batched
+                .iter()
+                .filter(|c| table.contains_key(*c))
+                .cloned()
+                .collect(),
+            _ => std::collections::BTreeSet::new(),
+        };
+        for (class, writes) in changes.writes {
+            if !table.contains_key(&class) {
+                return Err(DeployError::Invalid(
+                    class,
+                    "a mode of writes for a class this version does not have".into(),
+                ));
+            }
+            match writes {
+                Writes::Strict => {
+                    batched.remove(&class);
+                }
+                Writes::Batched => {
+                    batched.insert(class);
+                }
+            }
+        }
+        // Not built yet (ADR 0034, slices S7 to S12): refused before
+        // anything is written.
+        if let Some(class) = batched.first() {
+            return Err(DeployError::BatchedNotYet(class.clone()));
+        }
         let mut manifest = Manifest {
             previous: None,
             classes: table,
@@ -952,6 +1191,7 @@ impl AppRef {
             config: BTreeMap::new(),
             requires,
             expire,
+            batched,
         };
         for (class, _) in set.access.restricted() {
             if !manifest.classes.contains_key(&class) {
@@ -1012,8 +1252,10 @@ impl AppRef {
             manifest.previous = Some(current.version.clone());
         }
         // A node that cannot read format 3 would stay not ready on it: no
-        // such node may be live (ADR 0023). Checked before any write.
+        // such node may be live (ADR 0023). Checked before any write, as
+        // is a component no live node could link (ADR 0034, section 15).
         self.check_readers(&manifest).await?;
+        self.check_imports(Some(runtime), &imports, &kept).await?;
         if !plan(&diff) {
             return Err(DeployError::Stopped);
         }
@@ -1107,8 +1349,14 @@ impl AppRef {
             return Err(DeployError::Reopens(diff.reopened.join(", ")));
         }
         // Back to a version with a front: its readers are checked as a
-        // deploy writing it checks them.
+        // deploy writing it checks them, and its components' imports too.
         self.check_readers(&back).await?;
+        let kept: Vec<(String, String)> = back
+            .classes
+            .keys()
+            .map(|c| (previous.clone(), c.clone()))
+            .collect();
+        self.check_imports(None, &[], &kept).await?;
         // Rooted, so marked (ADR 0022).
         let marked = true;
         let seq = current.seq + 1;
@@ -1243,6 +1491,7 @@ impl AppRef {
             config,
             requires,
             expire,
+            batched,
             front,
         } = self.version(&current.version).await?;
         // Everything compiled first, then swapped in at once with the
@@ -1274,6 +1523,7 @@ impl AppRef {
                 &service.effective_rules(current.marked, &access),
                 &config,
                 &requires,
+                &batched,
                 front.as_ref(),
             )
             .map_err(|(name, e)| {
@@ -1375,6 +1625,9 @@ pub struct Changes {
     /// `(class, limit)`: sets how long the class's actors may stay idle
     /// before they are deleted, in seconds (ADR 0028); `None` removes it.
     pub expire: Vec<(String, Option<u64>)>,
+    /// `(class, mode)`: sets how the class's plain writes reach the bucket
+    /// (ADR 0034). Classes not named keep theirs.
+    pub writes: Vec<(String, Writes)>,
     /// The front (ADR 0023): kept by default.
     pub front: FrontChange,
     /// The front's configuration (`--front-config`): `None` keeps it,
@@ -1400,6 +1653,9 @@ pub struct Part {
     /// A class's idle limit in seconds (ADR 0028); `None`: never. Ignored
     /// for the front.
     pub expire: Option<u64>,
+    /// How a class's plain writes reach the bucket (ADR 0034). Ignored for
+    /// the front.
+    pub writes: Writes,
 }
 
 impl std::fmt::Debug for Part {
@@ -1411,6 +1667,8 @@ impl std::fmt::Debug for Part {
                 &self.config.as_ref().map(|v| v.keys().collect::<Vec<_>>()),
             )
             .field("requires", &self.requires)
+            .field("expire", &self.expire)
+            .field("writes", &self.writes)
             .finish()
     }
 }
@@ -1432,6 +1690,7 @@ impl Changes {
             changes.config.push((name.clone(), part.config));
             changes.requires.push((name.clone(), part.requires));
             changes.expire.push((name.clone(), part.expire));
+            changes.writes.push((name.clone(), part.writes));
             if let Some(table) = changes.classes.as_mut() {
                 table.push((name, part.wasm));
             }
@@ -1578,6 +1837,7 @@ impl Diff {
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
+            batched: std::collections::BTreeSet::new(),
         };
         let empty = Settings::default();
         let (bm, bs) = before.unwrap_or((&empty_manifest, &empty));
@@ -1770,6 +2030,9 @@ pub struct Version {
     /// Each class's idle limit in seconds (ADR 0028; classes not listed
     /// never expire).
     pub expire: BTreeMap<String, u64>,
+    /// The classes whose writes are batched (ADR 0034; every other class
+    /// is strict).
+    pub batched: std::collections::BTreeSet<String>,
     /// The version's front (ADR 0023), if it has one. Its values are not
     /// in `config` and `requires`, which hold classes only.
     pub front: Option<VersionFront>,
@@ -1870,6 +2133,11 @@ pub struct Manifest {
     /// deleted, in seconds (`expire <class> <secs>`, ADR 0028): written in
     /// format 4 only, so a version without one keeps its bytes and id.
     pub expire: BTreeMap<String, u64>,
+    /// Classes whose writes are batched (`writes <class> batched`, ADR
+    /// 0034, section 15): written in format 5 only. `strict`, the default,
+    /// is written as absence, said or not, so a version of strict classes
+    /// keeps its format, bytes and id.
+    pub batched: std::collections::BTreeSet<String>,
 }
 
 impl Manifest {
@@ -1902,6 +2170,9 @@ impl Manifest {
         for (class, secs) in &self.expire {
             out.push_str(&format!("expire {class} {secs}\n"));
         }
+        for class in &self.batched {
+            out.push_str(&format!("writes {class} batched\n"));
+        }
         out
     }
 
@@ -1916,12 +2187,15 @@ impl Manifest {
         hex(&Sha256::digest(text.as_bytes()))[..16].to_owned()
     }
 
-    /// 3 with a front, or an explicit `open` rule (ADR 0023); else 1 when
-    /// there are neither rules nor configuration (the form from before ADR
-    /// 0013, kept as the minimal one), else 2.
+    /// 5 with a batched class (ADR 0034); 4 with an idle limit (ADR
+    /// 0028); 3 with a front, or an explicit `open` rule (ADR 0023); else 1
+    /// when there are neither rules nor configuration (the form from before
+    /// ADR 0013, kept as the minimal one), else 2.
     #[must_use]
     pub fn format_number(&self) -> u8 {
-        if !self.expire.is_empty() {
+        if !self.batched.is_empty() {
+            5
+        } else if !self.expire.is_empty() {
             4
         } else if self.front.is_some() || self.access.values().any(|s| s == "open") {
             3
@@ -1948,6 +2222,7 @@ impl Manifest {
             "wasmkeep-manifest 2" => 2,
             "wasmkeep-manifest 3" => 3,
             "wasmkeep-manifest 4" => 4,
+            "wasmkeep-manifest 5" => 5,
             _ => return None,
         };
         let mut manifest = Self {
@@ -1958,6 +2233,7 @@ impl Manifest {
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
+            batched: std::collections::BTreeSet::new(),
         };
         for line in lines {
             // `access` keeps the rest of the line: names may hold spaces.
@@ -2009,6 +2285,13 @@ impl Manifest {
                     }
                     manifest.expire.insert(n.to_owned(), secs);
                 }
+                // A batched class (ADR 0034), once per class. `strict` is
+                // never written: it is the absence of the line.
+                (Some("writes"), Some(n), Some("batched"), None)
+                    if format >= 5 && !manifest.batched.contains(n) =>
+                {
+                    manifest.batched.insert(n.to_owned());
+                }
                 (Some("requires"), Some(n), Some(name), None)
                     if format >= 2 && crate::env::valid_name(name) =>
                 {
@@ -2027,6 +2310,7 @@ impl Manifest {
         let scoped = |c: &String| known(c) || (manifest.front.is_some() && c == FRONT);
         if !manifest.access.keys().all(known)
             || !manifest.expire.keys().all(known)
+            || !manifest.batched.iter().all(known)
             || !manifest.config.keys().all(scoped)
             || !manifest.requires.keys().all(scoped)
         {
@@ -2082,6 +2366,26 @@ pub async fn nodes_without_ends(
         .await?
         .into_iter()
         .filter(|n| !n.can_end)
+        .map(|n| n.id)
+        .collect())
+}
+
+/// Live nodes of `tenant/app` whose heartbeat does not announce `flush`
+/// (ADR 0034, section 15), under the bucket key `prefix`: they cannot link
+/// a component that imports `storage.flush`, nor read manifest format 5.
+///
+/// # Errors
+/// The bucket did not answer.
+pub async fn nodes_without_flush(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> Result<Vec<String>, DeployError> {
+    Ok(live_nodes(store, prefix, tenant, app)
+        .await?
+        .into_iter()
+        .filter(|n| !n.can_flush)
         .map(|n| n.id)
         .collect())
 }
@@ -2149,6 +2453,46 @@ async fn without_front(
         .collect())
 }
 
+/// The `storage` functions a component imports that a node of 0.4.1 or
+/// 0.4.2 may lack (ADR 0034, section 15). TypeScript and Python components
+/// import the whole interface, called or not; Rust, Go, C and Zig ones
+/// only what they call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageImports {
+    /// `storage.flush`: a node announcing `flush`.
+    pub flush: bool,
+    /// `storage.delete-self-durable`: a node announcing `ends`.
+    pub delete_self_durable: bool,
+}
+
+impl StorageImports {
+    /// Read from the component's type, as the front's link check reads its
+    /// exports: the functions of its `wasmkeep:actor/storage` import, at
+    /// any version of the package.
+    #[must_use]
+    pub fn of(runtime: &Runtime, component: &wasmtime::component::Component) -> Self {
+        use wasmtime::component::types::ComponentItem;
+        let engine = runtime.engine();
+        let mut found = Self::default();
+        for (name, item) in component.component_type().imports(engine) {
+            let ComponentItem::ComponentInstance(instance) = item.ty else {
+                continue;
+            };
+            if !name.starts_with("wasmkeep:actor/storage@") {
+                continue;
+            }
+            for (function, _) in instance.exports(engine) {
+                match function {
+                    "flush" => found.flush = true,
+                    "delete-self-durable" => found.delete_self_durable = true,
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+}
+
 /// An error with its causes, for a message.
 fn error_chain(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
@@ -2183,6 +2527,7 @@ mod tests {
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
+            batched: std::collections::BTreeSet::new(),
         }
     }
 
@@ -2359,6 +2704,7 @@ mod tests {
             )]),
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
+            batched: std::collections::BTreeSet::new(),
             front: None,
         };
         let shown = format!("{v:?}");
@@ -2393,7 +2739,8 @@ mod tests {
     fn manifests_with_unknown_or_inconsistent_lines_are_refused() {
         let base = "wasmkeep-manifest 2\nclass chat 11\n";
         for bad in [
-            "wasmkeep-manifest 5\nclass chat 11\n".to_owned(),
+            // A format after this version's (5, ADR 0034).
+            "wasmkeep-manifest 6\nclass chat 11\n".to_owned(),
             format!("{base}secret chat 11\n"),
             // Idle limits (ADR 0028): format 4 only, a known class, once,
             // between an hour and the longest.
@@ -2416,6 +2763,126 @@ mod tests {
         ] {
             assert_eq!(Manifest::parse(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_batched_class_makes_format_5_and_reads_back() {
+        // ADR 0034, section 15: without a batched class, the version keeps
+        // its format, bytes and id (strict is written as absence).
+        let mut m = two_classes();
+        let before = (m.format(), m.version_id());
+        m.batched.insert("chat".into());
+        assert_eq!(m.format_number(), 5);
+        let text = m.format();
+        assert!(text.starts_with("wasmkeep-manifest 5\n"), "{text}");
+        assert!(text.ends_with("writes chat batched\n"), "{text}");
+        assert_ne!(m.version_id(), before.1);
+        assert_eq!(Manifest::parse(&text), Some(m.clone()));
+        // With everything formats 2 to 4 carry: all of it reads back.
+        m.front = Some("ff".into());
+        m.access.insert("counter".into(), "open".into());
+        m.config.insert("chat".into(), "cc".into());
+        m.requires.insert(
+            "chat".into(),
+            std::collections::BTreeSet::from(["KEY".into()]),
+        );
+        m.expire.insert("chat".into(), 7 * 86_400);
+        m.batched.insert("counter".into());
+        let text = m.format();
+        assert!(text.starts_with("wasmkeep-manifest 5\n"), "{text}");
+        assert_eq!(Manifest::parse(&text), Some(m.clone()));
+        let mut m = two_classes();
+        m.batched.insert("chat".into());
+        m.batched.clear();
+        assert_eq!((m.format(), m.version_id()), before);
+    }
+
+    #[test]
+    fn writes_lines_are_refused_where_they_do_not_belong() {
+        let ok = "wasmkeep-manifest 5\nclass chat 11\nwrites chat batched\n";
+        assert!(Manifest::parse(ok).is_some());
+        for bad in [
+            // Strict is never written: absence says it.
+            "wasmkeep-manifest 5\nclass chat 11\nwrites chat strict\n",
+            "wasmkeep-manifest 5\nclass chat 11\nwrites chat gated\n",
+            "wasmkeep-manifest 5\nclass chat 11\nwrites chat\n",
+            "wasmkeep-manifest 5\nclass chat 11\nwrites chat batched extra\n",
+            // A known class, once.
+            "wasmkeep-manifest 5\nclass chat 11\nwrites nope batched\n",
+            "wasmkeep-manifest 5\nclass chat 11\nwrites chat batched\nwrites chat batched\n",
+            "wasmkeep-manifest 5\nclass chat 11\nwrites _front batched\n",
+            // Not before format 5: a reader of format 4 stays as it was.
+            "wasmkeep-manifest 4\nclass chat 11\nwrites chat batched\n",
+            "wasmkeep-manifest 1\nclass chat 11\nwrites chat batched\n",
+            // A format this version does not know.
+            "wasmkeep-manifest 6\nclass chat 11\n",
+        ] {
+            assert_eq!(Manifest::parse(bad), None, "{bad}");
+        }
+        // Format 5 keeps the rules of the formats below it.
+        for bad in [
+            "wasmkeep-manifest 5\nclass chat 11\nexpire chat 1\nwrites chat batched\n",
+            "wasmkeep-manifest 5\nclass chat 11\naccess nope open\nwrites chat batched\n",
+        ] {
+            assert_eq!(Manifest::parse(bad), None, "{bad}");
+        }
+    }
+
+    /// A live heartbeat of a node serving `default/shop` with these words.
+    async fn heartbeat(store: &Arc<dyn ObjectStore>, id: &str, words: &str) {
+        let body = format!(
+            "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n0.4.2\n{}\ndefault/shop\n\n\nserving\nsecrets\n{words}\n",
+            crate::alarm::now_ms_i64()
+        );
+        store
+            .put(
+                &format!("nodes/{id}").as_str().into(),
+                body.into_bytes().into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Format 5 needs `flush` and inherits the reader checks of formats 4
+    /// (`ends`) and 3 (`front`), even without an idle limit or a front.
+    #[tokio::test]
+    async fn format_5_needs_flush_and_every_word_below_it() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let mut m = two_classes();
+        m.batched.insert("chat".into());
+        app.check_readers(&m).await.unwrap();
+        heartbeat(&store, "n", "take front handoff ends flush").await;
+        app.check_readers(&m).await.unwrap();
+        heartbeat(&store, "n", "take front handoff ends").await;
+        let e = app.check_readers(&m).await.unwrap_err();
+        assert!(
+            matches!(&e, DeployError::NodesWithoutFlush { nodes, .. } if nodes == "n"),
+            "{e}"
+        );
+        assert!(e.to_string().contains("manifest format 5"), "{e}");
+        heartbeat(&store, "n", "take front handoff flush").await;
+        let e = app.check_readers(&m).await.unwrap_err();
+        assert!(matches!(e, DeployError::NodesWithoutEnds { .. }), "{e}");
+        heartbeat(&store, "n", "take handoff ends flush").await;
+        let e = app.check_readers(&m).await.unwrap_err();
+        assert!(matches!(e, DeployError::NodesWithoutFront { .. }), "{e}");
+        // Strict classes only: format 1, read by every node as before.
+        heartbeat(&store, "n", "take").await;
+        app.check_readers(&two_classes()).await.unwrap();
+    }
+
+    #[test]
+    fn modes_of_writes_parse_and_print() {
+        for w in [Writes::Strict, Writes::Batched] {
+            assert_eq!(Writes::parse(w.as_str()), Ok(w));
+        }
+        assert_eq!(Writes::default(), Writes::Strict);
+        assert!(
+            Writes::parse("gated")
+                .unwrap_err()
+                .contains("strict, batched")
+        );
     }
 
     #[test]
@@ -2500,6 +2967,7 @@ mod tests {
             config: BTreeMap::new(),
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
+            batched: std::collections::BTreeSet::new(),
         };
         assert_eq!(alone.format(), "wasmkeep-manifest 3\nfront main 44\n");
         assert_eq!(Manifest::parse(&alone.format()), Some(alone));

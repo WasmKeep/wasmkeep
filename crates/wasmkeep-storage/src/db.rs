@@ -867,6 +867,41 @@ impl ActorDb {
         Ok(u64::try_from(changed).unwrap_or(u64::MAX))
     }
 
+    /// `storage.flush` on a single node (ADR 0034, section 4): fsyncs every
+    /// commit made so far, those of plain `exec` included, without running
+    /// a statement. Refused with `not-allowed` inside an open transaction,
+    /// changing nothing: nothing in it can be made durable.
+    pub fn sync_committed(&mut self) -> Result<(), SqlError> {
+        self.flushable()?;
+        #[cfg(feature = "fault-injection")]
+        crate::faults::note_local_sync();
+        self.sync_wal()
+    }
+
+    /// Whether `storage.flush` may run now (ADR 0034, section 4): not inside
+    /// an open transaction, nor after SQLite rolled the event's transaction
+    /// back under the guest (which still believes it open, and whose every
+    /// later statement is refused).
+    ///
+    /// # Errors
+    /// `not-allowed`, saying which.
+    pub fn flushable(&self) -> Result<(), SqlError> {
+        if self.transaction_aborted {
+            return Err(SqlError::new(
+                crate::SqlErrorKind::NotAllowed,
+                "this event's transaction was rolled back when one of its statements failed \
+                 (stopped at its deadline or CPU budget, say); nothing more runs in this event",
+            ));
+        }
+        if self.in_transaction() {
+            return Err(SqlError::new(
+                crate::SqlErrorKind::NotAllowed,
+                "flush inside a transaction: commit or roll back first",
+            ));
+        }
+        Ok(())
+    }
+
     /// Fsyncs the WAL file, so every commit written to it is on disk.
     fn sync_wal(&self) -> Result<(), SqlError> {
         let mut wal = self.path.clone().into_os_string();

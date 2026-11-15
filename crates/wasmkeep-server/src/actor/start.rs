@@ -33,6 +33,7 @@ impl ActorService {
             );
             let rules = Arc::clone(&rules);
             let requires = Arc::new(config.requires.get(&name).cloned().unwrap_or_default());
+            let writes = writes_of(&config.batched, &name);
             map.insert(
                 name,
                 Arc::new(ActorClass {
@@ -40,6 +41,7 @@ impl ActorService {
                     rules,
                     env,
                     requires,
+                    writes,
                     ..class
                 }),
             );

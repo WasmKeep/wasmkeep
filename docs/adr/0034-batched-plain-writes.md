@@ -1266,7 +1266,12 @@ which it now does.
   check, format 5 parsing and `writes` (section 15), the per-hold mode
   field (section 1); a batched class refused at deploy behind a build
   flag. Tests: a strict manifest's bytes unchanged; deploys refused on
-  mixed capabilities.
+  mixed capabilities. Built with an explicit refusal rather than a
+  flag, `writes` in the project file only (the `--writes` flag and the
+  plan's diff line come with S9), and the import check run on every
+  component of the version a deploy or a rollback makes current. Nodes
+  from S4 on announce `flush` and run a batched class as strict until
+  S9, which keeps every promise of a batched class.
 - **S5. `storage.flush` for strict classes and a single node**: the WIT
   and the Rust and TypeScript SDKs (as for `delete-self-durable`).
   `exec-durable` untouched.

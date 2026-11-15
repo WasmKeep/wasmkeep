@@ -142,6 +142,9 @@ pub struct ActorConfig {
     /// (ADR 0028, section 4): the deployed version's limits (in a cluster
     /// only; classes not listed never expire).
     pub expire_after_idle: std::collections::BTreeMap<String, Duration>,
+    /// The classes whose writes are batched (ADR 0034, section 1): the
+    /// deployed version's; every other class is strict.
+    pub batched: std::collections::BTreeSet<String>,
     /// Who may reach each class from outside (ADR 0010): the deployed
     /// version's rules, or `--access` for classes not from a deploy.
     pub access: crate::access::AccessRules,
@@ -198,6 +201,7 @@ impl ActorConfig {
             secrets: crate::secrets::SecretSet::default(),
             requires: std::collections::BTreeMap::new(),
             expire_after_idle: std::collections::BTreeMap::new(),
+            batched: std::collections::BTreeSet::new(),
             access: crate::access::AccessRules::default(),
             flag_access: None,
             deploy_seq: 0,

@@ -244,6 +244,14 @@ Each actor owns one SQLite database. Nothing else can read or write it.
   `exec-durable("COMMIT")` makes the whole transaction durable. Any other
   statement there is refused with `not-allowed` before it runs, since
   nothing in a transaction is durable before its commit.
+- **`flush`** runs no statement: it returns once every write the actor
+  committed before the call is durable, plain `exec` included. Use it
+  after several plain writes, before saying "done": one bucket round trip
+  for all of them (none when nothing is pending), or one fsync on a single
+  node. It is refused with `not-allowed` inside a transaction, and an
+  `internal` means those writes are not known to be durable: fail the
+  request. A component that imports it needs a node of the release that
+  has it ([languages](languages.md#versions)).
 - A database is capped at 1 GB by default; past that, writes fail with
   `quota-exceeded` and reads still work.
 - Values (text and blobs) are capped at 16 MiB. Each `query` also has a

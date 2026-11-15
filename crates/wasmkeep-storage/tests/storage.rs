@@ -246,6 +246,14 @@ fn an_interrupted_write_aborts_the_events_transaction() {
         let err = db.exec_durable(sql, &[]).unwrap_err();
         assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{sql}: {err:?}");
     }
+    // And `storage.flush` (ADR 0034): the guest believes its transaction
+    // open, so nothing is made durable under it.
+    for _ in 0..2 {
+        let err = db.sync_committed().unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{err:?}");
+        assert!(err.message.contains("rolled back"), "{err:?}");
+        assert!(db.flushable().is_err());
+    }
     // The guest's own ROLLBACK (an error handler's) is what happened: Ok.
     assert_eq!(db.exec("ROLLBACK", &[]).unwrap(), 0);
     let err = db.query("SELECT count(*) FROM t", &[]).unwrap_err();
@@ -326,6 +334,39 @@ fn a_durable_commit_fsyncs_the_wal() {
         !db.in_transaction(),
         "committed, only not confirmed on disk"
     );
+}
+
+/// `storage.flush` on a single node (ADR 0034, section 4): plain commits
+/// fsynced without a statement; refused, changing nothing, inside a
+/// transaction; a failed fsync says so.
+#[cfg(unix)]
+#[test]
+fn a_flush_fsyncs_plain_commits_and_not_inside_a_transaction() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = storage(&dir).open("c", "a").unwrap();
+        db.exec("CREATE TABLE t (x)", &[]).unwrap();
+        db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+        db.sync_committed().unwrap();
+        db.exec("BEGIN", &[]).unwrap();
+        db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+        let e = db.sync_committed().unwrap_err();
+        assert_eq!(e.kind, SqlErrorKind::NotAllowed, "{e:?}");
+        assert!(db.in_transaction(), "the transaction is still open");
+        db.exec("ROLLBACK", &[]).unwrap();
+        let mut wal = db.path().as_os_str().to_owned();
+        wal.push("-wal");
+        let perms = |mode| std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(mode));
+        perms(0o000).unwrap();
+        let r = db.sync_committed();
+        perms(0o644).unwrap();
+        let e = r.unwrap_err();
+        assert_eq!(e.kind, SqlErrorKind::Internal, "{e:?}");
+        assert!(e.message.contains("not fsynced"), "{e:?}");
+    }
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    assert_eq!(db.query("SELECT x FROM t", &[]).unwrap().values.len(), 1);
 }
 
 #[test]

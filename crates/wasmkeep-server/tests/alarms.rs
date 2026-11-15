@@ -394,3 +394,29 @@ async fn a_durable_write_without_a_bucket_is_synced_locally() {
     );
     assert_eq!(wasmkeep_storage::faults::local_syncs(), before + 2);
 }
+
+/// Without a bucket, `storage.flush` (ADR 0034, section 4) fsyncs what
+/// plain `exec` committed, once per call, and is refused inside a
+/// transaction without a sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_without_a_bucket_syncs_plain_writes_locally() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    assert_eq!(call_at(addr, "POST", "/actor/t/x/plain").await.0, 200);
+    let before = wasmkeep_storage::faults::local_syncs();
+    assert_eq!(
+        call_at(addr, "POST", "/actor/t/x/flush?n=2").await.1,
+        "ok:3"
+    );
+    assert_eq!(
+        wasmkeep_storage::faults::local_syncs(),
+        before + 1,
+        "one flush, one local sync"
+    );
+    let (_, body) = call_at(addr, "POST", "/actor/t/x/flush?n=1&tx").await;
+    assert!(body.starts_with("err:SqlErrorKind::NotAllowed:"), "{body}");
+    assert_eq!(wasmkeep_storage::faults::local_syncs(), before + 1);
+    // Nothing written since: still a sync, and still ok.
+    assert_eq!(call_at(addr, "POST", "/actor/t/x/flush").await.1, "ok:4");
+    assert_eq!(wasmkeep_storage::faults::local_syncs(), before + 2);
+}

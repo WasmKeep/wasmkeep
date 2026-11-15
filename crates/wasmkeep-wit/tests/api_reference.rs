@@ -125,6 +125,10 @@ const SDK_NAMES: &[(&str, [&str; 5])] = &[
         ],
     ),
     (
+        "storage.flush",
+        ["storage::flush", "storage.flush", "", "", ""],
+    ),
+    (
         "alarms.set-alarm",
         [
             "alarms::set_alarm",

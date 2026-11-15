@@ -425,6 +425,7 @@ fn a_move_target_that_cannot_take_it_gets_a_warning() {
         can_front: true,
         can_handoff: true,
         can_end: true,
+        can_flush: true,
         instance: None,
         lease: None,
         load: None,

@@ -27,3 +27,7 @@ func wasmimport_DeleteSelf()
 //go:wasmimport wasmkeep:actor/storage@0.2.0 delete-self-durable
 //go:noescape
 func wasmimport_DeleteSelfDurable(result *cm.Result[SQLError, struct{}, SQLError])
+
+//go:wasmimport wasmkeep:actor/storage@0.2.0 flush
+//go:noescape
+func wasmimport_Flush(result *cm.Result[SQLError, struct{}, SQLError])
