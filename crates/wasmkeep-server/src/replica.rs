@@ -8,6 +8,8 @@
 //! still valid. On acquiring an actor, the node restores the chain the
 //! highest generation wrote, unless its local file already is that head.
 
+pub mod history;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

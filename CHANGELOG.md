@@ -11,6 +11,18 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.2, in no release yet.
 
+- **Actor export and read-only SQL** ([guide](docs/actor-data-access.md),
+  ADR 0033): `actor export TENANT/APP CLASS/NAME -o FILE` and `actor sql`
+  replay verified bucket history without contacting nodes or acquiring a
+  hold. Current-head, capture-time and transaction selection follow the
+  current ancestry; output reports the unacknowledged-tip caveat. Exports
+  are portable SQLite files; SQL has an authorizer, bounded results and
+  table/CSV/TSV/JSON/JSONL output. Both accept `--tmpdir` with advisory disk
+  checks and clean scratch copies on Ctrl-C/SIGTERM; `--require-owner-match`
+  refuses unknown/mismatched owner hints (exit 3). Publication falls back to
+  private no-clobber copying when links are unavailable. Time selection skips
+  undated snapshot-only bases, and short object bodies are retried.
+
 - **SQL result limits now account for retained memory.** The 16 MiB
   budget includes row and cell overhead, vector spare capacity, allocation
   allowances and column names once, as well as text/blob payloads. Queries

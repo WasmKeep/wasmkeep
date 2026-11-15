@@ -61,6 +61,8 @@ mod draining;
 mod durable_writes;
 #[path = "expiry.rs"]
 mod expiry;
+#[path = "export.rs"]
+mod export;
 #[path = "failover.rs"]
 mod failover;
 #[path = "failover_wait.rs"]

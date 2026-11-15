@@ -3424,6 +3424,8 @@ name = "wasmkeep-cli"
 version = "0.4.2"
 dependencies = [
  "anyhow",
+ "base64",
+ "chrono",
  "clap",
  "futures-util",
  "object_store",
@@ -3438,6 +3440,7 @@ dependencies = [
  "wasmkeep-cluster",
  "wasmkeep-runtime",
  "wasmkeep-server",
+ "wasmkeep-storage",
  "wasmtime",
 ]
 

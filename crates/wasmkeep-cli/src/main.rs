@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod actor_read;
 mod app_delete;
 mod dev;
 mod dev_project;
@@ -106,6 +107,10 @@ struct AppDeleteArgs {
 
 #[derive(Debug, Subcommand)]
 enum ActorCommand {
+    /// Export a verified, portable SQLite database from bucket history. No node or hold.
+    Export(actor_read::ExportArgs),
+    /// Run one read-only SQL statement on a temporary, verified actor export.
+    Sql(actor_read::SqlArgs),
     /// Move an actor to NODE (ADR 0017): its owner hands it over, or NODE
     /// takes it if nobody holds it, within a few seconds. NODE must serve
     /// the same app and not be draining. The actor is not pinned there: once
@@ -1146,6 +1151,8 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Actor(ActorCommand::Export(args)) => actor_read::finish(actor_read::export(&args)),
+        Command::Actor(ActorCommand::Sql(args)) => actor_read::finish(actor_read::sql(&args)),
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
         Command::Actor(ActorCommand::Delete(args)) => actor_delete(&args),
         Command::App(AppCommand::Delete(args)) => app_delete::run(&args),
