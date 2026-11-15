@@ -3,6 +3,7 @@
 - Status: accepted (2026-11-14), built in 0.4.0; revised after an
   adversarial review (the resolver's generation, parking in one step,
   drains on every pass, the safeguard re-read)
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a batched actor's hold is parked only once flushed.
 - Date: 2026-11-14
 - Release: [0.4.0](../../ROADMAP.md#m4-operating-a-cluster)
 - Amends: [ADR 0020](0020-one-lease-per-node.md) (section 3, "Release":

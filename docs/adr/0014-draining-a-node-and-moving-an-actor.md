@@ -28,6 +28,7 @@
   every heartbeat period and list the intents only when it changed, or
   every 20 periods (60 s) anyway; writers of an intent rewrite it. See
   "Amendment of 2026-11-14" at the end.
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hand-over of a batched actor flushes before it releases, within 20 s, else answers `Busy`.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster)
 

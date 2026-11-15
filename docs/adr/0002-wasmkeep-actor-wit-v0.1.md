@@ -6,6 +6,7 @@
   [0016](0016-secrets-in-the-bucket.md)); guest stdout and stderr reach
   the node's log since 2026-11-06, not in M1 as planned (until
   then the host discarded them).
+- Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): one function added, `storage.flush`, under `wasmkeep:actor@0.2.0`.
 - Date: 2026-11-02
 - Milestone: [M1](../../ROADMAP.md#m1-actors-on-one-node)
 - Source: [`crates/wasmkeep-wit/wit/actor.wit`](../../crates/wasmkeep-wit/wit/actor.wit)
