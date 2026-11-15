@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use wasmkeep_cluster::alarm_index::{self, Entry, SweepClaim, SweepFound};
 use wasmkeep_runtime::{
-    ActorAddress, BoxError, CpuMeter, MailboxConfig, MailboxError, Mailboxes, Residency, Runtime,
+    ActorAddress, BoxError, BoxFuture, CpuMeter, DropCause, MailboxConfig, MailboxError, Mailboxes,
+    Residency, Runtime, StepOutcome,
 };
 use wasmkeep_storage::{ActorDb, Storage, StorageConfig};
 use wasmkeep_wit::wasmkeep::actor::actors::{
@@ -72,7 +73,7 @@ use self::{
     state::*,
 };
 
-use self::held::{Dropped, Held};
+use self::held::{Barrier, Dropped, Held};
 
 pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};
@@ -86,6 +87,12 @@ const ADMISSION_WAIT: Duration = Duration::from_millis(250);
 
 /// Meta key holding the component version `on-init` last succeeded for.
 const INIT_VERSION_KEY: &str = "init_version";
+
+/// After a stop's deadline, how long its steps before a drop that gave up
+/// there get to return (to count what they dropped and hand their holds to
+/// the pending releases) before the node lease is released (ADR 0034,
+/// section 10).
+const STOP_STEP_EXTRA: Duration = Duration::from_millis(500);
 
 /// What `publish_alarm` left the actor's alarm index entry as.
 struct Published {
@@ -476,16 +483,35 @@ impl ActorService {
     /// of their own. A release that does not make it is safe: the node
     /// lease's `released` write frees its record, or else a peer's fence.
     pub async fn shutdown(&self, limit: Duration) {
-        self.stop_actors(limit, 1012, "node shutting down").await;
+        self.stop_actors(limit, true, 1012, "node shutting down")
+            .await;
     }
 
     /// [`Self::shutdown`], its sockets closed with `code` and `reason`.
-    async fn stop_actors(&self, limit: Duration, code: u16, reason: &str) {
+    /// `flush`: each actor's step before its drop flushes, by the stop's
+    /// deadline (a clean stop), rather than dropping (an app deleted);
+    /// ADR 0034, sections 6 and 10.
+    async fn stop_actors(&self, limit: Duration, flush: bool, code: u16, reason: &str) {
         let started = tokio::time::Instant::now();
+        let deadline = started + limit;
         let resident = self.inner.mailboxes.resident();
         self.inner.sockets.close_all(code, reason);
-        self.inner.mailboxes.close();
-        if !self.inner.mailboxes.drained(limit).await {
+        self.inner.mailboxes.close_by(Some(deadline), flush);
+        if !self
+            .inner
+            .mailboxes
+            .drained(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+        {
+            // Steps that gave up at the deadline count what they dropped
+            // and hand their holds to the pending releases: a moment for
+            // that, before the releases and the node lease. Only when a
+            // step is still running (never for a strict class, whose step
+            // ends at once).
+            let extra = tokio::time::Instant::now() + STOP_STEP_EXTRA;
+            while self.inner.mailboxes.steps_running() > 0 && tokio::time::Instant::now() < extra {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             tracing::warn!(
                 still_running = self.inner.mailboxes.resident(),
                 "shutdown: some actors did not finish in time"
@@ -588,7 +614,7 @@ impl ActorService {
             c.app_tombstoned();
         }
         self.begin_shutdown();
-        self.stop_actors(crate::http::SHUTDOWN_GRACE, 1001, "app deleted")
+        self.stop_actors(crate::http::SHUTDOWN_GRACE, false, 1001, "app deleted")
             .await;
         // No new database is opened past the closed mailboxes.
         let dir = self.inner.local_app_dir.clone();

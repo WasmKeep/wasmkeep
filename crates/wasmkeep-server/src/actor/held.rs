@@ -25,10 +25,6 @@ pub(super) enum Barrier {
     /// local database.
     Flushed,
     /// The hold could not acknowledge what it holds, for this reason.
-    #[allow(
-        dead_code,
-        reason = "only a batched hold gives up (ADR 0034, section 6); a strict one is always flushed"
-    )]
     GaveUp(Dropped),
 }
 
@@ -37,7 +33,6 @@ pub(super) enum Barrier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Dropped {
     /// A clean stop's deadline passed.
-    #[allow(dead_code, reason = "the clean stop's step (ADR 0034, section 10)")]
     Stop,
     /// An upload, a capture or the database worker failed.
     Failure,
@@ -117,6 +112,16 @@ impl Held {
     )]
     pub(super) fn barrier(&self) -> Barrier {
         Barrier::Flushed
+    }
+
+    /// Waits for the hold to reach a barrier, until `deadline` (none: no
+    /// limit): `None` if the deadline passes first. A strict hold has
+    /// nothing pending, so it is at its barrier at once, whatever the
+    /// deadline. Cancel-safe: the mailbox drops this future when an event
+    /// arrives first.
+    pub(super) async fn flush(&self, deadline: Option<tokio::time::Instant>) -> Option<Barrier> {
+        let _ = deadline;
+        Some(self.barrier())
     }
 
     /// Ends the hold and releases the lease: [`Releasing`] dropped releases
@@ -274,6 +279,23 @@ mod tests {
         hold.park(Barrier::Flushed, &x);
         assert!(a.is_parked(&x));
         a.release_all_parked("stop").await;
+        assert_eq!(dropped_total(), 0);
+    }
+
+    /// The step before a drop finds a strict hold at its barrier at once,
+    /// even with a deadline already past (ADR 0034, section 10).
+    #[tokio::test]
+    async fn a_strict_hold_flushes_at_once_whatever_the_deadline() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let a = node(&store).await;
+        let x = ActorAddress::new("t", "c", "x").unwrap();
+        let hold = held(&a, &x).await;
+        let past = tokio::time::Instant::now();
+        for deadline in [None, Some(past)] {
+            assert_eq!(hold.flush(deadline).await, Some(Barrier::Flushed));
+        }
+        drop(hold.release(Barrier::Flushed));
+        released(&a, &x).await;
         assert_eq!(dropped_total(), 0);
     }
 
