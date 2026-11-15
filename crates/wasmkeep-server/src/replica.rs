@@ -1155,7 +1155,9 @@ impl Replica {
 
     /// Stops replication; the actor must be given up.
     pub(crate) fn fail(&mut self, reason: impl Into<String>) {
-        self.failed.get_or_insert_with(|| reason.into());
+        let reason = self.failed.get_or_insert_with(|| reason.into());
+        // Only batched waiters listen (ADR 0034, section 4).
+        self.batched.stopped(reason);
     }
 
     /// Uploads one transaction. `Ok` means durable. Refuses changes that do
@@ -1166,6 +1168,7 @@ impl Replica {
                 "replication stopped: {reason}"
             )));
         }
+        self.settle_abandoned();
         // Only a batched segment can be in flight here (a strict `ship`
         // cut half-way left `failed` set, refused above): an inline upload
         // beside it would be a second segment in flight (ADR 0034,
@@ -1228,6 +1231,7 @@ impl Replica {
                 "replication stopped: {reason}"
             )));
         }
+        self.settle_abandoned();
         if let Some(segment) = self.in_flight {
             return Err(self.refuse(format!("a reset while segment {segment:?} is in flight")));
         }
@@ -1260,6 +1264,7 @@ impl Replica {
         all: &Changes,
         kind: SnapshotKind,
     ) -> Result<(), ReplicaError> {
+        self.settle_abandoned();
         if let Some(segment) = self.in_flight {
             return Err(self.refuse(format!("a snapshot while segment {segment:?} is in flight")));
         }

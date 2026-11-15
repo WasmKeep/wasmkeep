@@ -219,6 +219,8 @@ async fn segments_are_acknowledged_in_order_and_chain() {
 ///
 /// Model: capture and its hand-off are one scheduled step there; a capture
 /// whose changes were dropped would break the chain (`Violation::MissingLink`).
+/// The step being synchronous is what makes this hold; the test checks it
+/// holds the way `with_db` runs it.
 #[tokio::test]
 async fn a_cut_never_interrupts_the_hand_off() {
     let dir = tempfile::tempdir().unwrap();
@@ -308,7 +310,7 @@ async fn a_put_landing_after_a_cut_is_late() {
 /// segment stay uncaptured (dropped with the hold). Applied, it stops
 /// replication for good.
 ///
-/// Model: `Switch::CaptureAfterFailure` (`Violation::NotOwnerPrefix`):
+/// Model: `Switch::CaptureAfterFailure` (`Violation::MissingLink`):
 /// a failed hold captures nothing more and is dropped.
 #[tokio::test]
 async fn an_upload_failure_drops_what_is_pending() {
@@ -362,8 +364,9 @@ async fn an_upload_failure_drops_what_is_pending() {
 /// head, sidecar and failure flag stay as they were; a waiter of the old
 /// hold fails when the hold ends.
 ///
-/// Model: `Switch::CompletionOtherHold` (`Violation::DurableLost` and
-/// `Violation::NotOwnerPrefix`).
+/// Model: `Switch::CompletionOtherHold` (`Violation::HeadBackwards`).
+/// Here it holds by construction (each replica has its own cell); the test
+/// pins that down, and that the old PUT is judged on the old hold.
 #[tokio::test]
 async fn a_completion_after_a_reacquire_does_not_apply() {
     let dir = tempfile::tempdir().unwrap();
@@ -382,8 +385,7 @@ async fn a_completion_after_a_reacquire_does_not_apply() {
     let waiter = old.wait_acknowledged(b.sequence);
     let mut old_flag = old.failure_flag();
     start(&mut old, &mut db, &budget).await;
-    // Abandoned: the hold's cell emptied (the lease view lapses), its
-    // replica dropped.
+    // Abandoned: the old hold's lease view lapses, its replica dropped.
     validity.invalidate();
     drop(old);
     assert!(
@@ -549,8 +551,9 @@ async fn the_sidecar_is_never_ahead_of_the_acknowledged_head() {
 /// guards), and so is a strict upload beside it; once the segment is
 /// applied, a snapshot at the acknowledged head is taken.
 ///
-/// Model: `Switch::SnapshotInFlight` and `Switch::ResetInFlight`
-/// (`Violation::MissingLink`), `Switch::ModeWithoutBarrier`.
+/// Model: `Switch::SnapshotInFlight` (`Violation::NotOwnerPrefix`),
+/// `Switch::ResetInFlight` (`Violation::DeletedReturned`) and, for the
+/// strict upload, `Switch::ModeWithoutBarrier` (`Violation::StrictAhead`).
 #[tokio::test]
 async fn snapshots_and_resets_wait_for_the_acknowledged_head() {
     for what in ["snapshot", "reset", "strict"] {
@@ -664,6 +667,244 @@ async fn a_crash_at_each_point_leaves_local_is_at_right() {
         judge(&r, "sidecar written", checkpointed).await;
         db.finish_batched_capture().unwrap();
         judge(&r, "flushed", true).await;
+        drop(hold);
+        drop(db);
+    }
+}
+
+/// A ticket dropped before its capture (the event cut before the database
+/// worker took the step) consumes nothing: the segment leaves flight, the
+/// guards no longer see it, and the next capture takes the commits.
+///
+/// Model: no switch; the WAL keeps what was not captured.
+#[tokio::test]
+async fn a_ticket_dropped_before_its_capture_takes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let head = r.head();
+    let b = write(&mut db, "row");
+    let plan = db.next_bounded_capture().unwrap();
+    let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
+    drop(r.prepare(plan, permit).unwrap());
+    assert_eq!(budget.available(), budget.total());
+    assert_eq!(r.apply().await.unwrap(), Applied::Abandoned);
+    assert!(r.uploader_idle());
+    assert_eq!(r.head(), head);
+    assert!(db.has_pending_boundaries(), "nothing consumed");
+    // Dropped again, then a prepare without an apply in between.
+    let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
+    drop(r.prepare(plan, permit).unwrap());
+    let id = start(&mut r, &mut db, &budget).await;
+    assert_eq!(id.txid, head.txid + 1);
+    assert_eq!(land(&mut r).await.unwrap(), Applied::Acknowledged(id));
+    assert!(r.acknowledged_covers(b.sequence));
+    assert_eq!(restored(&r, dir.path()).await, r.acknowledged_position().1);
+    drop(hold);
+    drop(db);
+}
+
+/// The hand-off's tripwires: a capture that does not chain from the
+/// captured position (something captured outside the uploader) is refused
+/// before any upload, and so is a plan no longer the WAL's next prefix;
+/// either fails the replica and raises the failure flag.
+///
+/// Model: `Switch::TwoInFlight` and `Switch::ResetCaptured` break the same
+/// chain there (`Violation::MissingLink`); here the checksum catches it.
+#[tokio::test]
+async fn a_capture_that_does_not_chain_is_refused() {
+    for stale in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let Actor {
+            mut r,
+            store: _store,
+            mut db,
+            hold,
+        } = actor(dir.path(), 1 << 30).await;
+        let budget = UploadBudget::node();
+        write(&mut db, "a");
+        let early = db.next_bounded_capture().unwrap();
+        // Captured outside the uploader: the WAL moved past the head.
+        db.take_bounded_changes(early).unwrap();
+        let plan = if stale {
+            early
+        } else {
+            write(&mut db, "b");
+            db.next_bounded_capture().unwrap()
+        };
+        let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
+        let flag = r.failure_flag();
+        let handed = r.prepare(plan, permit).unwrap().hand_off(&mut db);
+        let why = match handed {
+            Err(ReplicaError::Local(m)) => m,
+            other => panic!("stale {stale}: {other:?}"),
+        };
+        assert!(
+            why.contains(if stale { "capture:" } else { "does not chain" }),
+            "{why}"
+        );
+        assert!(flag.borrow().is_some(), "stale {stale}");
+        assert!(r.apply().await.is_err());
+        assert!(r.failed().is_some());
+        assert_eq!(bucket_head(&r).await.txid, 1, "nothing uploaded");
+        assert_eq!(budget.available(), budget.total());
+        drop(hold);
+        drop(db);
+    }
+}
+
+/// A PUT that lands with its reply lost is sent again, meets its own
+/// object and is acknowledged once, by the uploader as by `ship`. ADR 0034,
+/// Verification: "hung then landed".
+#[tokio::test]
+async fn a_segment_that_landed_unanswered_is_acknowledged_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    store.land_then_hang_next.store(1, SeqCst);
+    let b = write(&mut db, "row");
+    let id = start(&mut r, &mut db, &budget).await;
+    assert_eq!(land(&mut r).await.unwrap(), Applied::Acknowledged(id));
+    assert_eq!(store.puts.load(SeqCst), 2, "sent again once");
+    assert_eq!(r.apply().await.unwrap(), Applied::Nothing, "applied once");
+    assert!(r.acknowledged_covers(b.sequence));
+    assert_eq!(sidecar_of(&r), names_head(&r));
+    drop(hold);
+    drop(db);
+}
+
+/// An apply cancelled while it writes the sidecar leaves the uploader not
+/// idle and its waiters waiting; the next apply finishes the write (one at
+/// a time) and wakes them. The sidecar is never ahead meanwhile.
+///
+/// Model: `Switch::SidecarBeforeAck` (`Violation::SidecarAhead`).
+#[tokio::test]
+async fn an_apply_cut_while_writing_the_sidecar_is_finished_by_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    let before = sidecar_of(&r);
+    let b = write(&mut db, "row");
+    let waiter = r.wait_acknowledged(b.sequence);
+    let id = start(&mut r, &mut db, &budget).await;
+    tokio::time::timeout(PATIENCE, r.landed()).await.unwrap();
+    // Polled once, then cut: usually at the sidecar write.
+    if tokio::time::timeout(Duration::ZERO, r.apply())
+        .await
+        .is_err()
+    {
+        assert_eq!(r.head(), id, "the head moved before the write");
+        assert!(!r.uploader_idle(), "the sidecar is still due");
+        assert!(!r.acknowledged_covers(b.sequence));
+        let side = sidecar_of(&r);
+        assert!(side == before || side == names_head(&r), "{side:?}");
+    }
+    assert_eq!(r.apply().await.unwrap(), Applied::Nothing);
+    assert!(r.uploader_idle());
+    assert!(r.acknowledged_covers(b.sequence));
+    assert_eq!(sidecar_of(&r), names_head(&r));
+    waiter.await.unwrap();
+    drop(hold);
+    drop(db);
+}
+
+/// A waiter fails when replication stops for any reason, not only a failed
+/// upload: here a refused snapshot, with nothing in flight.
+#[tokio::test]
+async fn a_waiter_fails_when_a_guard_stops_replication() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let b = write(&mut db, "row");
+    let waiter = r.wait_acknowledged(b.sequence);
+    let moved = super::changes(DbChecksum::from_value(1));
+    assert!(matches!(
+        r.ship_snapshot(&moved, SnapshotKind::Periodic).await,
+        Err(ReplicaError::Refused(_))
+    ));
+    assert!(
+        tokio::time::timeout(PATIENCE, waiter)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    drop(hold);
+    drop(db);
+}
+
+/// Boundary sequences start over when the capture restarts: a replica
+/// told so counts in a new epoch (a waiter of the old one resolves only on
+/// what the old one acknowledged); one not told refuses the first plan
+/// whose sequence it already acknowledged, rather than letting a waiter
+/// take an old acknowledgement for a new boundary.
+///
+/// Model: `Switch::FlushCaptured`'s rule, that a flush resolves only on
+/// its own acknowledgement (`Violation::DurableLost`).
+#[tokio::test]
+async fn a_capture_restarted_counts_boundaries_again() {
+    for told in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let Actor {
+            mut r,
+            store: _store,
+            mut db,
+            hold,
+        } = actor(dir.path(), 1 << 30).await;
+        let budget = UploadBudget::node();
+        let a = write(&mut db, "a");
+        let old = r.wait_acknowledged(a.sequence);
+        let never = r.wait_acknowledged(a.sequence + 1);
+        start(&mut r, &mut db, &budget).await;
+        land(&mut r).await.unwrap();
+        // A `Flushed` barrier, then the capture starts again.
+        db.finish_batched_capture().unwrap();
+        drop(hold);
+        db.start_capture().unwrap();
+        let hold = CaptureHold::default();
+        db.enable_batched_capture(&hold).unwrap();
+        let b = write(&mut db, "b");
+        assert!(b.sequence <= a.sequence, "sequences started over");
+        let plan = db.next_bounded_capture().unwrap();
+        let permit = budget.reserve(plan.boundary.estimated_bytes).await.unwrap();
+        if !told {
+            assert!(matches!(
+                r.prepare(plan, permit),
+                Err(ReplicaError::Refused(m)) if m.contains("already acknowledged")
+            ));
+            drop(hold);
+            drop(db);
+            continue;
+        }
+        r.capture_restarted().unwrap();
+        old.await.unwrap();
+        assert!(never.await.is_err(), "never acknowledged in its epoch");
+        assert!(!r.acknowledged_covers(b.sequence));
+        let mut waiter = Box::pin(r.wait_acknowledged(b.sequence));
+        let id = r.prepare(plan, permit).unwrap().hand_off(&mut db).unwrap();
+        tokio::time::timeout(PATIENCE, r.landed()).await.unwrap();
+        assert!(pending(&mut waiter).await);
+        assert_eq!(r.apply().await.unwrap(), Applied::Acknowledged(id));
+        waiter.await.unwrap();
+        assert_eq!(restored(&r, dir.path()).await, r.acknowledged_position().1);
         drop(hold);
         drop(db);
     }
