@@ -237,7 +237,9 @@ impl http::Guest for Room {
                         Ok((seq, false)) => {
                             http::respond(out, 202, "text/plain", format!("{seq}\n").as_bytes());
                         }
-                        Err(e) => http::respond(out, 500, "text/plain", format!("{e}\n").as_bytes()),
+                        Err(e) => {
+                            http::respond(out, 500, "text/plain", format!("{e}\n").as_bytes())
+                        }
                     },
                     _ => http::respond(out, 400, "text/plain", b"send one line of UTF-8 text\n"),
                 }

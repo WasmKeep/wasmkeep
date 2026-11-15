@@ -938,11 +938,17 @@ fn merge(args: &MergeArgs) {
     let mut deliveries = 0u64;
     let mut last_receipt = 0u64;
     let mut incomplete = 0u64;
+    // Messages whose last socket had them more than a second after they
+    // were sent: the room fell behind, even if it caught up in the drain.
+    let mut late = 0u64;
     for (seq, s) in &seqs {
         deliveries += s.receivers;
         last_receipt = last_receipt.max(s.last);
         if s.send > 0 {
             last_lat.push(s.last.saturating_sub(s.send));
+            if s.last.saturating_sub(s.send) > 1_000_000_000 {
+                late += 1;
+            }
             first_lat.push(s.first.saturating_sub(s.send));
         }
         // Fewer receipts than the sockets that should have had it.
@@ -961,6 +967,7 @@ fn merge(args: &MergeArgs) {
         "sent",
         "skipped",
         "acked",
+        "late_start",
     ] {
         row(k, meta.get(k).copied().unwrap_or(0), "count");
     }
@@ -992,12 +999,16 @@ fn merge(args: &MergeArgs) {
     row("duplicates", duplicates, "count");
     row("reordered", reordered, "count");
     row("incomplete_messages", incomplete, "count");
-    let unacked = meta
-        .get("sent")
-        .copied()
-        .unwrap_or(0)
-        .saturating_sub(meta.get("acked").copied().unwrap_or(0));
+    // With HTTP senders, a message is acknowledged by its answer (200, or
+    // 202 in a batch room); otherwise by its echo on the sender's socket.
+    let acked = if http.is_empty() {
+        meta.get("acked").copied().unwrap_or(0)
+    } else {
+        http.get("200").copied().unwrap_or(0) + http.get("202").copied().unwrap_or(0)
+    };
+    let unacked = meta.get("sent").copied().unwrap_or(0).saturating_sub(acked);
     row("unacked", unacked, "count");
+    row("late_messages", late, "count");
     row("latency_last_p50", percentile(&last_lat, 0.5), "ns");
     row("latency_last_p99", percentile(&last_lat, 0.99), "ns");
     row(
@@ -1019,7 +1030,11 @@ fn merge(args: &MergeArgs) {
     // Acknowledged (echoed to its sender) but not in the room's table: the
     // room's numbers have no holes, so the highest echo must be stored.
     let stored_max = room.get("stored_max_seq").copied();
-    let lost_acked = stored_max.map(|m| max_seq.saturating_sub(m));
+    // And holes in what it stored: numbers below its highest, missing.
+    let holes = room
+        .get("stored")
+        .map(|stored| stored_max.unwrap_or(0).saturating_sub(*stored));
+    let lost_acked = stored_max.map(|m| max_seq.saturating_sub(m) + holes.unwrap_or(0));
     if let Some(n) = lost_acked {
         row("lost_acked", n, "count");
     }
@@ -1100,6 +1115,7 @@ fn merge(args: &MergeArgs) {
         kinds.push("loss");
     }
     let stalled = unacked > 0
+        || late > 0
         || incomplete > 0
         || broken > 0
         || closed.keys().any(|k| *k == 1011)

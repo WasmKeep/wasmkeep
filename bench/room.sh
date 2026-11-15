@@ -26,7 +26,9 @@
 #   ROOM_SOURCE_IPS  comma-separated source addresses for this machine's
 #                sockets (each gives about 28,000 to one server address)
 #   ROOM_HTTP_SENDERS=1  senders POST instead of using their socket
-#   ROOM_URL     the node, ws://HOST:PORT (client); ROOM_LISTEN for node
+#   ROOM_URL     the node, ws://HOST:PORT (client); ROOM_LISTEN for node,
+#                and ROOM_ADVERTISE, its address as others reach it
+#                (http://HOST:PORT), when ROOM_LISTEN is 0.0.0.0
 #   ROOM_DIR     where the per-process files go (a temporary directory)
 #   ROOM_START_DELAY seconds from a client's start to its cells' first send,
 #                so every client is connected (client; 60)
@@ -109,7 +111,8 @@ start_node() {
   local listen=$1 metrics=$2 prefix=$3 dir=$4 n=$5
   mkdir -p "$dir"
   local cluster=()
-  [ -z "$prefix" ] || cluster=(--bucket "$prefix" --node-id room --cluster-plaintext accept --advertise "http://$listen")
+  [ -z "$prefix" ] || cluster=(--bucket "$prefix" --node-id room --cluster-plaintext accept \
+    --advertise "${ROOM_ADVERTISE:-http://$listen}")
   target/release/wasmkeep serve \
     --actor "room=bench/room/target/wasm32-wasip2/release/room.wasm" \
     --data-dir "$dir/data" --cache-dir "$dir/cache" \
@@ -119,7 +122,7 @@ start_node() {
   # A new node first checks that no other process runs its node id (about
   # 15 s), then serves.
   for _ in $(seq 1 600); do
-    curl -sf -o /dev/null "http://$listen/actor/room/ready" && return
+    curl -sf -o /dev/null "http://${listen/0.0.0.0/127.0.0.1}/actor/room/ready" && return
     kill -0 "$node_pid" 2>/dev/null || { tail -20 "$dir/node.log" >&2; exit 1; }
     sleep 0.1
   done
@@ -227,7 +230,7 @@ node)
   start_node "$ROOM_LISTEN" "$metrics" "$WASMKEEP_ROOM_BUCKET/room-${ROOM_RUN:-$commit}" "$work/node" "$largest"
   echo "node up on $ROOM_LISTEN (pid $node_pid); sampling to $work/sample.txt; stop with Ctrl-C" >&2
   target/release/roomload sample --pid "$node_pid" --metrics "http://$metrics/metrics" \
-    --interval-ms 500 --out "$work/sample.txt"
+    --interval-ms 500 --duration 604800 --out "$work/sample.txt"
   ;;
 client)
   : "${ROOM_URL:?the node, for example ROOM_URL=ws://NODE:8080}"

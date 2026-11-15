@@ -1093,9 +1093,10 @@ message, the last socket to receive it over every process, and prints:
 | `latency_last_p50`, `_p99`, `_max` | From the send to the last socket's receipt, over the messages delivered |
 | `latency_first_p50` | To the first socket's receipt |
 | `delivered_per_s` | Receipts per second, over all sockets, from the first send to the last receipt |
-| `sent`, `acked`, `unacked` | Messages sent; seen back by their sender (stored and broadcast); never seen back before the end |
+| `sent`, `acked`, `unacked` | Messages sent; acknowledged (seen back by their sender, stored and broadcast, or with HTTP senders answered 200 or 202); not acknowledged before the end |
+| `late_messages`, `late_start` | Messages the last socket had more than a second after they were sent (the room fell behind, even if it caught up in the drain); processes that were still connecting at the start time |
 | `lost_deliveries`, `duplicates`, `reordered`, `incomplete_messages` | Per socket, numbers it should have had and did not; received twice; out of order; messages some open socket missed |
-| `lost_acked` | Acknowledged numbers past the highest the room stored |
+| `lost_acked` | Acknowledged numbers past the highest the room stored, plus holes in what it stored |
 | `room_backpressure` | The room's sends dropped because a client fell 256 messages (or 4 MiB) behind ([WebSockets](concepts.md#websockets)) |
 | `handshake_<status>`, `server_close_<code>`, `http_<status>` | Upgrades by answer (`101`, `503` past a limit), closes from the server (`1013`, `1011`), and `POST` answers with `ROOM_HTTP_SENDERS=1` (`429` when the actor's queue is full) |
 | `node_cpu_pct`, `node_rss_peak`, `node_fds_peak`, `node_websockets_open_peak`, `node_refused_*` | The node, from `/proc` and its metrics page |
@@ -1130,17 +1131,20 @@ senders, in
   message was missing from the room's table.
 - On a bucket, the room's `plain` and `durable` modes both stopped at a
   few hundred messages a second, whatever the room's size (10 sockets as
-  1,000) and with the node mostly idle: each event that writes waits for
-  the bucket before the next one runs, so the room's rate is one bucket
-  round trip per message. At 1,000 messages a second the rest queued in the
+  1,000) and with the node mostly idle (15% of a core with 10 sockets),
+  while the same room without a bucket took 1,000 a second: on a bucket,
+  as observed, a room that writes on every message runs about one
+  message per bucket round trip, plain writes included. At 1,000 messages a second the rest queued in the
   senders' sockets (`outcome_stall`: unacknowledged, latency growing for
   the whole run). `batch` took every rate, about 30 ms of latency at the
   median (half the 50 ms window) and under 100 ms at p99 in every cell but
 one (1,000 sockets at 100 a second, 178 ms).
-- Without a bucket, the limit moves to the broadcast itself: a room of
+- Without a bucket (and with the data on tmpfs, where an fsync is free, so
+  `durable` costs what `plain` does), the limit moves to the broadcast itself: a room of
   1,000 sockets kept up at 100 messages a second and fell behind at 1,000
-  (its sends to 1,000 sockets per message), where `batch`, one frame per
-  socket per batch, did not.
+  (its sends to 1,000 sockets per message: about 800,000 deliveries a
+  second, latency growing to seconds), where `batch`, one frame per socket
+  per batch, did not.
 - 10,000 sockets: 1,000 accepted, 9,000 answered `503` (`refused`), as the
   limits above say. The workstation did not need any system change for it.
 
@@ -1182,10 +1186,10 @@ a few minutes ahead, computed once and given to both load machines):
 
 ```bash
 # node machine
-WASMKEEP_ROOM_BUCKET=s3://BUCKET/PREFIX ROOM_LISTEN=0.0.0.0:8080 \
+WASMKEEP_ROOM_BUCKET=s3://BUCKET/PREFIX ROOM_LISTEN=0.0.0.0:8080 ROOM_ADVERTISE=http://NODE:8080 \
   ROOM_SIZES="10000 100000" ROOM_RUN=r1 ROOM_DIR=room-r1 ./bench/room.sh node
 # each load machine, ROOM_CLIENT=0 and ROOM_CLIENT=1
-ROOM_URL=ws://NODE:8080 ROOM_CLIENTS=2 ROOM_CLIENT=0 ROOM_PROCS=4 \
+ROOM_URL=ws://NODE:8080 ROOM_SECS=60 ROOM_CLIENTS=2 ROOM_CLIENT=0 ROOM_PROCS=4 \
   ROOM_SIZES="10000 100000" ROOM_RATES="1 10 100 1000" ROOM_RUN=r1 \
   ROOM_T0=T0 ROOM_DIR=room-r1 ./bench/room.sh client
 # then, on one machine, with every client's cell directories and the
@@ -1197,7 +1201,10 @@ ROOM_SIZES="10000 100000" ROOM_RATES="1 10 100 1000" ROOM_DIR=room-r1 \
 Each machine takes its share of the sockets, senders and rate
 (`ROOM_CLIENTS` times `ROOM_PROCS` processes), and the cells start on a
 schedule from `ROOM_T0` (`ROOM_CELL_SECS` apart), so every process of a cell
-sends at the same moment. The node serves every cell, in rooms named by
+sends at the same moment (`late_start` counts processes that were not
+connected in time: raise `ROOM_START_DELAY`). Use the same `ROOM_SECS` on
+every machine, long enough that the lowest rate gives each cell a few
+hundred messages. The node serves every cell, in rooms named by
 `ROOM_RUN`; `merge` counts only the node's samples from each cell's
 ramp-up to its last receipt.
 
