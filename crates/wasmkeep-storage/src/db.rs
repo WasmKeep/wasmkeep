@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::wal::{CaptureError, Changes, WalCapture};
+use crate::wal::{BoundaryChanges, BoundaryPlan, CaptureError, Changes, WalBoundary, WalCapture};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
@@ -323,6 +323,17 @@ fn db_files(root: &Path) -> Result<Vec<PathBuf>, StorageError> {
     Ok(files)
 }
 
+/// Lifetime token owned by the server's batched hold. Keep it alive until a
+/// `Flushed` or `GaveUp` barrier, including while a captured segment is in
+/// flight. Dropping it permits connection teardown, not reuse of lost changes.
+/// Storage cannot determine acknowledgement; the server owns that decision.
+/// In a containing struct, declare `ActorDb` BEFORE `CaptureHold`: Rust drops
+/// fields in declaration order, so the database checks the still-live hold.
+/// On give-up, explicitly drop the hold first; on success call
+/// `finish_batched_capture` after the acknowledgement barrier.
+#[derive(Debug, Default)]
+pub struct CaptureHold(Arc<()>);
+
 /// One actor's open database. Not `Sync`: owned by the actor's task.
 #[derive(Debug)]
 pub struct ActorDb {
@@ -360,21 +371,48 @@ pub struct ActorDb {
     cpu_deadline: Arc<AtomicU64>,
     /// Change capture for replication, once started.
     capture: Option<WalCapture>,
+    batch_hold: Option<std::sync::Weak<()>>,
+    segment_byte_cap: u64,
     /// Last, so it is released after the connection has closed.
     open_guard: Option<OpenGuard>,
+}
+
+impl Drop for ActorDb {
+    fn drop(&mut self) {
+        // Do not double-panic during unwinding. NO_CKPT_ON_CLOSE still keeps
+        // the WAL in place; a failed hold must be restored from its head.
+        if !std::thread::panicking() {
+            debug_assert!(
+                !self
+                    .batch_hold
+                    .as_ref()
+                    .is_some_and(|h| h.strong_count() != 0)
+                    || self
+                        .capture
+                        .as_ref()
+                        .is_none_or(|c| matches!(c.has_uncaptured_commits(), Ok(false))),
+                "ActorDb dropped with uncaptured commits while its hold lives"
+            );
+        }
+    }
 }
 
 /// Refuses a statement that may write while the WAL is full. Transaction
 /// control counts as read-only, so a guest can still commit or roll back.
 fn refuse_writes_if(
     wal_full: impl FnOnce() -> bool,
+    batched: bool,
     stmt: rusqlite::Statement<'_>,
 ) -> Result<rusqlite::Statement<'_>, SqlError> {
     if !stmt.readonly() && wal_full() {
         return Err(SqlError::new(
             crate::SqlErrorKind::QuotaExceeded,
-            "too many writes in one event: the write-ahead log is full until the \
-             event ends; split the work across events",
+            if batched {
+                "the write-ahead log is full; hold new events until batched capture drains and checkpoints"
+            } else {
+                "too many writes in one event: the write-ahead log is full until the \
+                 event ends; split the work across events"
+            },
         ));
     }
     Ok(stmt)
@@ -574,6 +612,8 @@ impl ActorDb {
             max_sql_cpu: config.max_sql_cpu_per_event,
             cpu_deadline,
             capture: None,
+            batch_hold: None,
+            segment_byte_cap: crate::wal::DEFAULT_SEGMENT_BYTES,
             open_guard: None,
         })
     }
@@ -582,6 +622,15 @@ impl ActorDb {
     /// checkpoints off, so committed pages stay in the WAL until captured,
     /// and checkpoints once so capture starts from a complete main file.
     pub fn start_capture(&mut self) -> Result<(), CaptureError> {
+        if self
+            .batch_hold
+            .as_ref()
+            .is_some_and(|h| h.strong_count() != 0)
+        {
+            return Err(CaptureError::Sql(
+                "batched capture restart requires a barrier".into(),
+            ));
+        }
         self.internal(|conn| conn.pragma_update(None, "wal_autocheckpoint", 0))
             .map_err(|e| CaptureError::Sql(e.to_string()))?;
         self.checkpoint()?;
@@ -590,6 +639,146 @@ impl ActorDb {
             .map_err(|e| CaptureError::Sql(e.to_string()))?;
         let page_size = u32::try_from(page_size).unwrap_or(4096);
         self.capture = Some(WalCapture::start(&self.path, page_size)?);
+        if self.batch_hold.take().is_some() {
+            self.conn
+                .set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    false,
+                )
+                .map_err(|e| CaptureError::Sql(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Opt an existing capture into boundary mode. Establish the initial
+    /// snapshot before this call. The server owns `hold` through its barrier;
+    /// capture, encoding and uploader hand-off must be one uncancellable step.
+    /// SQLite's last-connection checkpoint is disabled in this mode, including
+    /// release builds and unwinding, so a mistaken close cannot consume WAL.
+    pub fn enable_batched_capture(&mut self, hold: &CaptureHold) -> Result<(), CaptureError> {
+        if self.capture.is_none() || self.batch_hold.is_some() {
+            return Err(CaptureError::Sql(
+                "batched capture needs an existing strict capture".into(),
+            ));
+        }
+        self.conn
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .map_err(|e| CaptureError::Sql(e.to_string()))?;
+        self.batch_hold = Some(Arc::downgrade(&hold.0));
+        Ok(())
+    }
+
+    /// Configure the conservative encoded-byte cap (default 1 MiB). Even a
+    /// zero cap makes progress: each writing event is then oversize alone.
+    pub fn set_segment_byte_cap(&mut self, bytes: u64) {
+        self.segment_byte_cap = bytes;
+    }
+
+    /// Mark the last commit at a mailbox gap or flush point, without capture.
+    /// An open transaction is refused; the caller must finish/roll it back.
+    pub fn mark_boundary(&mut self) -> Result<Option<WalBoundary>, CaptureError> {
+        if self.in_transaction() {
+            return Err(CaptureError::Sql("boundary inside a transaction".into()));
+        }
+        self.batched_capture()?.mark_boundary()
+    }
+
+    /// Pending boundary estimates, rebased after every capture. The final
+    /// estimate supplies ADR 0034's event-start rule 2; the server also checks
+    /// age, node budget and `wal_wants_checkpoint`. Use boundary sequences
+    /// for alarm metadata: offsets restart after a checkpoint.
+    pub fn boundaries(&self) -> impl Iterator<Item = WalBoundary> + '_ {
+        self.capture.iter().flat_map(WalCapture::boundaries)
+    }
+
+    /// Exposed for the server's hold/barrier assertions.
+    pub fn has_pending_boundaries(&self) -> bool {
+        self.capture
+            .as_ref()
+            .is_some_and(WalCapture::has_pending_boundaries)
+    }
+
+    /// The next segment and byte reservation, without consuming it. Keep the
+    /// mailbox serialized between reserving the budget and capture.
+    pub fn next_bounded_capture(&self) -> Option<BoundaryPlan> {
+        self.capture.as_ref()?.next_capture(self.segment_byte_cap)
+    }
+
+    /// Whether WAL pressure requires holding new events until fully drained
+    /// and checkpointed. Rewrites can keep the page estimate small while the
+    /// physical WAL grows. The threshold is at most 4 MiB.
+    pub fn wal_wants_checkpoint(&self) -> bool {
+        self.capture
+            .as_ref()
+            .is_some_and(|c| c.wal_len() >= CHECKPOINT_AFTER_BYTES.min(self.max_wal_bytes))
+    }
+
+    /// Capture exactly the reserved prefix. Later marks and cap changes do
+    /// not enlarge it. A stale plan is refused without advancing capture.
+    /// Once consumed, changes are returned even if checkpointing is blocked.
+    pub fn take_bounded_changes(
+        &mut self,
+        plan: BoundaryPlan,
+    ) -> Result<BoundaryChanges, CaptureError> {
+        let changes = self.batched_capture()?.capture_plan(plan)?;
+        // Checkpointing is maintenance, never a reason to lose a consumed
+        // segment. A blocked checkpoint leaves pressure set for a later retry.
+        if self.wal_wants_checkpoint() && self.conn.is_autocommit() {
+            let _ = self.checkpoint_batched_capture();
+        }
+        Ok(changes)
+    }
+
+    /// Retry maintenance after draining, including when no boundary remains.
+    pub fn checkpoint_batched_capture(&mut self) -> Result<(), CaptureError> {
+        if self.batched_capture()?.has_uncaptured_commits()? {
+            return Err(CaptureError::BoundariesPending);
+        }
+        self.checkpoint()?;
+        if let Some(c) = self.capture.as_mut() {
+            c.wal_truncated();
+        }
+        Ok(())
+    }
+
+    /// Complete a successful batched barrier after the caller has awaited
+    /// acknowledgement. Refuses unmarked or marked commits, truncates the
+    /// WAL and restores normal close behavior so the local file is reusable.
+    pub fn finish_batched_capture(&mut self) -> Result<(), CaptureError> {
+        self.checkpoint_batched_capture()?;
+        self.conn
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                false,
+            )
+            .map_err(|e| CaptureError::Sql(e.to_string()))?;
+        self.batch_hold = None;
+        Ok(())
+    }
+
+    fn batched_capture(&mut self) -> Result<&mut WalCapture, CaptureError> {
+        if !self
+            .batch_hold
+            .as_ref()
+            .is_some_and(|h| h.strong_count() != 0)
+        {
+            return Err(CaptureError::Sql("no live batched capture hold".into()));
+        }
+        self.capture
+            .as_mut()
+            .ok_or(CaptureError::Sql("capture not started".into()))
+    }
+
+    fn check_batched_checkpoint(&self) -> Result<(), CaptureError> {
+        if self.batch_hold.is_some()
+            && let Some(capture) = &self.capture
+            && capture.has_uncaptured_commits()?
+        {
+            return Err(CaptureError::BoundariesPending);
+        }
         Ok(())
     }
 
@@ -597,6 +786,9 @@ impl ActorDb {
     /// nothing was (or capture is not started). Call between events, with no
     /// transaction open.
     pub fn take_changes(&mut self) -> Result<Option<Changes>, CaptureError> {
+        if self.batch_hold.is_some() {
+            return Err(CaptureError::BoundariesPending);
+        }
         let Some(capture) = self.capture.as_mut() else {
             return Ok(None);
         };
@@ -620,6 +812,7 @@ impl ActorDb {
     /// changes first; if there were any, returns them in
     /// [`CaptureError::Pending`] (ship them, then snapshot again).
     pub fn snapshot(&mut self) -> Result<Changes, CaptureError> {
+        self.check_batched_checkpoint()?;
         let Some(capture) = self.capture.as_mut() else {
             return Err(CaptureError::Sql("capture not started".into()));
         };
@@ -636,6 +829,11 @@ impl ActorDb {
         capture.snapshot()
     }
 
+    /// WAL position as of the last capture, if capturing.
+    pub fn captured_wal_bytes(&self) -> Option<u64> {
+        self.capture.as_ref().map(WalCapture::wal_bytes)
+    }
+
     /// The database checksum as of the last capture, if capturing.
     pub fn captured_checksum(&self) -> Option<crate::ltx::DbChecksum> {
         self.capture.as_ref().map(WalCapture::checksum)
@@ -643,6 +841,7 @@ impl ActorDb {
 
     /// Moves everything into the main file and empties the WAL.
     fn checkpoint(&mut self) -> Result<(), CaptureError> {
+        self.check_batched_checkpoint()?;
         let (busy, _, _): (i64, i64, i64) = self
             .internal(|conn| {
                 conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
@@ -675,9 +874,10 @@ impl ActorDb {
             return Ok(0);
         }
         let wal = self.wal_limit();
+        let batched = self.batch_hold.is_some();
         self.guest(|conn| {
             let stmt = conn.prepare(sql)?;
-            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), stmt)?;
+            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), batched, stmt)?;
             let changed = stmt.execute(bind(params))?;
             Ok(u64::try_from(changed).unwrap_or(u64::MAX))
         })
@@ -923,9 +1123,10 @@ impl ActorDb {
     pub fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Rows, SqlError> {
         let max = self.max_result_bytes;
         let wal = self.wal_limit();
+        let batched = self.batch_hold.is_some();
         self.guest(|conn| {
             let stmt = conn.prepare(sql)?;
-            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), stmt)?;
+            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), batched, stmt)?;
             let mut remaining = max;
             let mut charge = |bytes: usize| {
                 remaining = remaining.checked_sub(bytes).ok_or_else(|| {

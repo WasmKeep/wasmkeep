@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 
 use crate::ltx::{DbChecksum, lock_pgno, page_checksum};
 
+mod batched;
+pub use batched::{
+    BoundaryChanges, BoundaryPlan, DEFAULT_SEGMENT_BYTES, WalBoundary, estimated_segment_bytes,
+};
+
 const WAL_HEADER: usize = 32;
 const FRAME_HEADER: usize = 24;
 const MAGIC_LE: u32 = 0x377f_0682;
@@ -47,6 +52,9 @@ pub enum CaptureError {
     /// and must be shipped before a snapshot is taken.
     #[error("changes are pending")]
     Pending(Box<Changes>),
+    /// Batched commits must go through boundary capture before this operation.
+    #[error("batched WAL boundaries are pending; use the uploader")]
+    BoundariesPending,
     /// SQLite refused a statement the capture needs (a checkpoint).
     #[error("sqlite: {0}")]
     Sql(String),
@@ -124,6 +132,7 @@ pub struct WalCapture {
     header: Option<WalHeader>,
     /// Running checksum after the last frame consumed.
     running: (u32, u32),
+    scan: batched::BoundaryScan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +184,7 @@ impl WalCapture {
             offset: 0,
             header: None,
             running: (0, 0),
+            scan: batched::BoundaryScan::default(),
         })
     }
 
@@ -206,6 +216,13 @@ impl WalCapture {
     /// Call after `PRAGMA wal_checkpoint(TRUNCATE)` succeeded: the WAL is
     /// empty and the next write starts a new one.
     pub fn wal_truncated(&mut self) {
+        assert!(
+            !self.has_pending_boundaries(),
+            "checkpoint with pending boundaries"
+        );
+        let sequence = self.scan.sequence;
+        self.scan = batched::BoundaryScan::default();
+        self.scan.sequence = sequence;
         self.offset = 0;
         self.header = None;
         self.running = (0, 0);
@@ -213,6 +230,9 @@ impl WalCapture {
 
     /// Reads what was committed since the last call. `None` if nothing was.
     pub fn capture(&mut self) -> Result<Option<Changes>, CaptureError> {
+        if self.has_pending_boundaries() {
+            return Err(CaptureError::BoundariesPending);
+        }
         let io = |source| CaptureError::Io {
             path: self.wal_path.to_path_buf(),
             source,

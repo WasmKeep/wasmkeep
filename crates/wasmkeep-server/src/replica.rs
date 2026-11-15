@@ -18,7 +18,7 @@ use wasmkeep_cluster::replication::{
 };
 use wasmkeep_runtime::ActorAddress;
 use wasmkeep_storage::ltx::DbChecksum;
-use wasmkeep_storage::wal::{Changes, WalCapture};
+use wasmkeep_storage::wal::Changes;
 
 use crate::cluster::{Cluster, LeaseView};
 
@@ -618,17 +618,6 @@ fn sidecar(db_path: &Path) -> PathBuf {
     p.into()
 }
 
-fn read_sidecar(db_path: &Path) -> Option<(SegmentId, u64)> {
-    let text = std::fs::read_to_string(sidecar(db_path)).ok()?;
-    let mut parts = text.split_whitespace().map(|s| s.parse::<u64>().ok());
-    let (Some(Some(generation)), Some(Some(txid)), Some(Some(sum))) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    Some((SegmentId { generation, txid }, sum))
-}
-
 fn write_sidecar(db_path: &Path, head: SegmentId, sum: DbChecksum) -> Result<(), ReplicaError> {
     let tmp = {
         let mut p = sidecar(db_path).into_os_string();
@@ -776,16 +765,7 @@ impl Replica {
         let path = self.db_path.clone();
         let head = plan.head();
         tokio::task::spawn_blocking(move || {
-            let (at, sum) = read_sidecar(&path)?;
-            let mut wal = path.as_os_str().to_owned();
-            wal.push("-wal");
-            let wal_empty = std::fs::metadata(PathBuf::from(wal)).map_or(true, |m| m.len() == 0);
-            if at != head || !wal_empty {
-                return None;
-            }
-            let page_size = page_size_of(&path).unwrap_or(4096);
-            let found = WalCapture::start(&path, page_size).ok()?.checksum();
-            (found.value() == sum).then_some(found)
+            wasmkeep_storage::local_is_at(&path, head.generation, head.txid)
         })
         .await
         .ok()
@@ -1963,15 +1943,6 @@ async fn list_sized(
         "{prefix}: the listing stalled ({:?} without a key), {attempts} times",
         idle.unwrap_or_default()
     )))
-}
-
-/// Reads the page size from a database header (offset 16, 1 means 65536).
-fn page_size_of(path: &Path) -> Option<u32> {
-    use std::io::Read;
-    let mut h = [0u8; 18];
-    std::fs::File::open(path).ok()?.read_exact(&mut h).ok()?;
-    let raw = u16::from_be_bytes([h[16], h[17]]);
-    Some(if raw == 1 { 65_536 } else { u32::from(raw) })
 }
 
 #[cfg(test)]
