@@ -1,0 +1,25 @@
+[package]
+name = "wasmkeep-roomload"
+description = "Load generator for one big WebSocket room (bench/room.sh): sockets, senders, merge."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "roomload"
+path = "src/main.rs"
+
+[dependencies]
+# All already workspace dependencies; tokio gains the multi-threaded
+# runtime and buffered I/O, both already in the tree through wasmtime-wasi.
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

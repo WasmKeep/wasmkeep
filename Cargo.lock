@@ -3460,6 +3460,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmkeep-roomload"
+version = "0.4.1"
+dependencies = [
+ "clap",
+ "futures-util",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "wasmkeep-runtime"
 version = "0.4.2"
 dependencies = [
