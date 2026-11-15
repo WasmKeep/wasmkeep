@@ -60,13 +60,25 @@ Going back to 0.4.1 rolls the same way while no version with an idle
 limit is current and no component that needs 0.4.2 is deployed. From
 0.4.0, upgrade to 0.4.1 first.
 
-TODO-TRIAL: the mixed-version trial (0.4.1 and 0.4.2 nodes on the three VPS, kills of either version, roll forward) goes here.
+The rolling upgrade was tried on the same three nodes: one node put back
+on 0.4.1 beside two on this release, one counter written through each in
+turn (1, 2, 3, one owner); the 0.4.2 owner killed (`kill -9`), writable
+again through the 0.4.1 node after 17 s with the count kept (4); that
+0.4.1 owner killed, writable through a 0.4.2 node after 15 s (5); the
+0.4.1 node rolled forward, and 6, 7, 8 through the three nodes.
 
 Soaked on three nodes against a real bucket, a node killed every three
 minutes, for two hours on this release's code (commit `563cb94`; later
 commits change documentation, these notes and versions only):
 
-TODO-SOAK: kills, acknowledged durable writes (none lost or duplicated), failover p50/p99/max, alarms missed, stale reads, restart-to-ready, and the CSV path (bench/results/...-563cb94-soak-ovh-bhs-3vps-2h-0.4.2-rc.csv) go here.
+39 kills, 378,472 acknowledged durable writes, none lost or applied
+twice; writable again after a kill (1,264 takeovers) at 17.4 s at the
+median, 22.5 s at p99 and 29.0 s at worst; 312 alarms fired, none
+missed; no stale read after a takeover; a restarted node ready within
+0.2 s. Of 202,535 plain writes (acknowledged before the bucket holds
+them), one was lost to a kill and its number handed out again, as plain
+writes allow
+([`2026-11-14-563cb94-soak-ovh-bhs-3vps-2h-0.4.2-rc.csv`](bench/results/2026-11-14-563cb94-soak-ovh-bhs-3vps-2h-0.4.2-rc.csv)).
 
 ### What changed
 
