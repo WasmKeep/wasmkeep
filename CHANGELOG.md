@@ -11,6 +11,15 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.2, in no release yet.
 
+- **A failed listing of `nodes/` no longer stops the reads of known
+  nodes.** In 0.4.2 a node whose scheduled listing failed tried the
+  listing again every heartbeat instead of reading the nodes it knows, so
+  a bucket that refuses or throttles LIST while it answers reads would
+  freeze its view, and its trust in every peer would lapse one horizon
+  later. Now a heartbeat whose listing fails still reads the known nodes,
+  and the listing is tried again the next one
+  ([ADR 0020](docs/adr/0020-one-lease-per-node.md), amendment of 2026-11-14).
+
 ## 0.4.2
 
 **Actors that end, and a database kept by one actor.** An operator

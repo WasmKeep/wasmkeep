@@ -91,6 +91,9 @@ struct Gate {
     heartbeat: String,
     beats: AtomicBool,
     lists: AtomicBool,
+    /// Listings of `nodes/` refused while unset; reads of each node's
+    /// object still answered (a store that throttles LIST).
+    lists_nodes: AtomicBool,
 }
 
 impl Gate {
@@ -100,6 +103,7 @@ impl Gate {
             heartbeat: format!("nodes/{id}"),
             beats: AtomicBool::new(true),
             lists: AtomicBool::new(true),
+            lists_nodes: AtomicBool::new(true),
         })
     }
 
@@ -178,7 +182,9 @@ impl ObjectStore for Gate {
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
     {
         let heartbeats = prefix.is_some_and(|p| p.as_ref().starts_with("nodes"));
-        if heartbeats && !self.lists.load(Ordering::SeqCst) {
+        if heartbeats
+            && !(self.lists.load(Ordering::SeqCst) && self.lists_nodes.load(Ordering::SeqCst))
+        {
             return futures_util::stream::once(async { Err(Self::refused("listing")) }).boxed();
         }
         self.inner.list(prefix)
@@ -1066,4 +1072,55 @@ async fn an_upgrade_refused_at_the_handshake_is_sent_again_once_the_relay_is_liv
     )
     .await;
     eprintln!("503 after a wait of {waited:?}, {at:?} after b's heartbeat stopped");
+}
+
+/// ADR 0020, amendment of 2026-11-14: a node trusts a peer's pin on the
+/// strength of its latest read of the peer's heartbeat, a listing of
+/// `nodes/` or one read of that object, never on when it last listed.
+/// With every listing of `nodes/` failing and reads still answered (a
+/// store that throttles LIST), `a` keeps reaching `b` over TLS for many
+/// horizons and many due listings. Before the fix, a failed scheduled
+/// listing was tried again every period instead of the reads, so `a`
+/// read nothing and stopped trusting `b` one horizon later.
+#[tokio::test(flavor = "multi_thread")]
+async fn trust_is_renewed_by_reads_while_listings_fail() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node("a", da.path(), &store).await;
+    let b = node("b", db.path(), &store).await;
+    let r = send(b.addr, "GET", "/actor/t/on-b/fired").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("b")),
+        "{}",
+        r.body
+    );
+    let started = Instant::now();
+    while send(a.addr, "GET", "/actor/t/on-b/fired")
+        .await
+        .node
+        .as_deref()
+        != Some("b")
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a never reached b"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    a.gate.lists_nodes.store(false, Ordering::SeqCst);
+    // Ten horizons, and two listings due (one every ten periods), each
+    // failing.
+    let until = Instant::now() + 10 * HORIZON;
+    while Instant::now() < until {
+        let r = send(a.addr, "GET", "/actor/t/on-b/fired").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("b")),
+            "a stopped reaching b while only its listings failed: {}",
+            r.body
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(b);
 }

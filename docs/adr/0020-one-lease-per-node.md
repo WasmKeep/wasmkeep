@@ -725,7 +725,14 @@ GET of each gives the same body.
   of the same day). An asked-for listing is made at once, at most one
   early listing a period and none in a period that listed already; one
   asked for after that is made at the next period. A scheduled listing
-  that fails is tried again the next period.
+  that fails is tried again the next period, and the nodes this node
+  knows are read one by one in that period all the same (fix of
+  2026-11-15: a failed scheduled listing was retried every period in
+  place of those reads, so a store refusing LIST while answering GET
+  froze the view, and the trust in every pin lapsed one horizon later).
+  How fresh a peer's heartbeat is, and how long its pin is trusted,
+  comes from the latest read of its object, by a listing or not: never
+  from when this node last listed.
 - In the other periods, one GET of each node the last refresh found,
   live or not, this node's own included (`Membership::heartbeats_of`). An
   object that is gone (`cluster forget`) drops out; a read that fails

@@ -123,7 +123,13 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
         }
         let wanted = c.take_listing_wanted();
         let full = wasmkeep_cluster::membership::full_listing_due(since_full, wanted);
-        let ok = c.refresh_view(full).await;
+        let mut ok = c.refresh_view(full).await;
+        // A listing that failed (a store that throttles or refuses LIST
+        // while it answers GET) must not leave the nodes this node knows
+        // unread: their heartbeats, and the trust in their pins, are
+        // renewed by one read each, as in the periods between listings.
+        // The listing is tried again next period.
+        let read_known = full && !ok && c.refresh_view(false).await;
         since_full = match (full, ok) {
             (true, true) => Some(1),
             // A listing asked for and not made: asked again.
@@ -135,6 +141,7 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
             }
             (false, _) => since_full.map(|n| n.saturating_add(1)),
         };
+        ok |= read_known;
         if c.identity_taken() {
             return;
         }
