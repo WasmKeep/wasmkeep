@@ -34,7 +34,9 @@
 # A durable write needs a bucket: WASMKEEP_ROOM_BUCKET=s3://BUCKET[/PREFIX]
 # and AWS_* for it, or, locally, moto through uvx as scripts/s3-suites.sh
 # starts it. Every mode runs on the same one-node cluster on that bucket, so
-# the modes differ only in how the room writes.
+# the modes differ only in how the room writes. ROOM_BUCKET=none runs the
+# node without one (local mode): `exec-durable` is then an fsync, and
+# nothing is replicated after each event.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -76,6 +78,10 @@ trap cleanup EXIT
 
 # Sets prefix (not in a subshell: it exports AWS_* and keeps moto's pid).
 bucket() {
+  if [ "${ROOM_BUCKET:-}" = none ]; then
+    prefix=
+    return
+  fi
   if [ -n "${WASMKEEP_ROOM_BUCKET:-}" ]; then
     prefix=$WASMKEEP_ROOM_BUCKET
     return
@@ -102,13 +108,13 @@ free_port() { python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.
 start_node() {
   local listen=$1 metrics=$2 prefix=$3 dir=$4 n=$5
   mkdir -p "$dir"
+  local cluster=()
+  [ -z "$prefix" ] || cluster=(--bucket "$prefix" --node-id room --cluster-plaintext accept --advertise "http://$listen")
   target/release/wasmkeep serve \
     --actor "room=bench/room/target/wasm32-wasip2/release/room.wasm" \
     --data-dir "$dir/data" --cache-dir "$dir/cache" \
     --listen "$listen" --metrics-listen "$metrics" \
-    --max-connections $(( n + 1000 )) \
-    --bucket "$prefix" --node-id room --cluster-plaintext accept \
-    --advertise "http://$listen" >"$dir/node.log" 2>&1 &
+    --max-connections $(( n + 1000 )) "${cluster[@]}" >"$dir/node.log" 2>&1 &
   node_pid=$!
   # A new node first checks that no other process runs its node id (about
   # 15 s), then serves.
@@ -191,7 +197,8 @@ local)
         mkdir -p "$dir"
         listen=127.0.0.1:$(free_port)
         metrics=127.0.0.1:$(free_port)
-        start_node "$listen" "$metrics" "$prefix/$(room_name "$mode" "$n" "$rate")" "$dir/node" "$n"
+        cell_prefix=; [ -z "$prefix" ] || cell_prefix="$prefix/$(room_name "$mode" "$n" "$rate")"
+        start_node "$listen" "$metrics" "$cell_prefix" "$dir/node" "$n"
         target/release/roomload sample --pid "$node_pid" --metrics "http://$metrics/metrics" \
           --interval-ms 250 --out "$dir/sample.txt" &
         sampler_pid=$!
