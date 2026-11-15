@@ -541,7 +541,7 @@ app is done:
 | `R moves/`, `R deletes/`, `R restores/`, `control/` | Operator intents of that moment. A restore must not drain, move or delete again. |
 | `probe/`, `diagnose/`, `cluster/migration` and the migration marks | Scratch and one-time state. |
 
-Files of ADR 0030 (proposed), if it lands, live under `R blobs/` and
+Files of [ADR 0030](0030-files-and-static-assets.md) (proposed, not built) live under `R blobs/` and
 can be overwritten under conditions. A run would copy them after the
 history, by listing, with no consistency between a row and the file it
 names. That is left to that record (Not decided here).
@@ -919,7 +919,7 @@ data back: from the live bucket only if the position is after the
 delete (section 1), otherwise from a backup. A restore asked for before
 a delete that ran first is superseded. A move moves the restored actor.
 
-**Files of ADR 0030 (proposed).** A restored database names the files
+**Files of [ADR 0030](0030-files-and-static-assets.md) (proposed).** A restored database names the files
 of its own time. A restore to a point before a delete brings back an
 incarnation whose files were swept. That record already says such a
 restore takes the files from the same backup. Restoring files is not in
@@ -1109,7 +1109,7 @@ What follows from it:
    wrote, and how its schema is checked, is a product question.
 4. **Two credentials in one command** (`--to-env FILE`), or a profile
    file shared with the other commands.
-5. **Files of ADR 0030**, if it lands: copy order, and whether a run
+5. **Files of [ADR 0030](0030-files-and-static-assets.md)**, once built: copy order, and whether a run
    records which incarnations its databases name.
 6. **`wasmkeep bucket verify`** for the live bucket (the roadmap's
    "verify a bucket"): section 1's replay over every actor, writing
