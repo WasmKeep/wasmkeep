@@ -1212,7 +1212,9 @@ vacuously.
   for a `Flushed` barrier, at most one upload budget of delay, nothing
   given up.
 - A caller of `actors.call` into a batched actor held by the
-  event-start rule waits for the end of the event, not only its answer.
+  event-start rule gets its answer when the callee sets it, as an HTTP
+  client does; the callee's next event starts only after the wait
+  (section 3, as corrected in S12).
 - A strict class behaves as 0.4.2 (the existing replication tests, run on
   a strict class, and the golden trace).
 - `flush` inside a transaction, on a single node, with nothing pending,
@@ -1351,9 +1353,15 @@ it is to flush first when it is. The model checks that a snapshot over
 uncaptured commits is caught (`SnapshotUncaptured`).
 
 **As built in S12 (2026-11-16).** The clean stop flushes every resident
-batched actor in its step before the drop and gives up at its deadline,
-counted `stop` (tests: a clean stop with a healthy and with a slow
-bucket). The section 16 metrics are on the metrics page. `deploy
+batched actor in its step before the drop. Its deadline bounds the rest:
+a batched hold's event still running then is cut (`Cut::Stop`), queued
+events after it are cut at once, the waits at their ends and of the step
+stop there, and the step gives up, counting `stop` what was not
+acknowledged, commits after the last boundary included. The node lease
+is released after a short extra wait (0.5 s) for those steps; an actor
+whose database work does not return within it is let go by that release
+uncounted, its writes lost as on a node's death (tests: a clean stop with
+a healthy and with a slow bucket, and one cutting a running event). The section 16 metrics are on the metrics page. `deploy
 --writes CLASS=MODE` sets a class's mode, and the plan prints a
 `writes CLASS: strict -> batched` line; `serve --writes` sets it for
 classes given with `--actor` (hidden while the flag is needed). The docs

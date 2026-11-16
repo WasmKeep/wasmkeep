@@ -564,6 +564,16 @@ impl LeaseHold {
 
     /// Resolves once this node may no longer act as the owner: its lease
     /// ran out, was lost or made invalid, or the hold ended.
+    /// The node's clean stop reaching its deadline (ADR 0034, section 10).
+    pub(crate) fn stop_reached(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.cluster.stop_reached()
+    }
+
+    /// The node's clean stop deadline, if one began.
+    pub(crate) fn stop_deadline(&self) -> Option<tokio::time::Instant> {
+        self.cluster.stop_deadline()
+    }
+
     pub(crate) fn expiry(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let view = self.view();
         let cluster = Arc::clone(&self.cluster);

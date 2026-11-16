@@ -39,6 +39,20 @@ thp=$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled
 
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
+# Interrupted: stop the harness and the nodes it started (its whole process
+# group); remote nodes it killed are started again by the harness on its
+# way out, and here once more in case it was killed first.
+interrupted() {
+  trap '' INT TERM
+  kill -TERM -- -$$ 2>/dev/null || true
+  if [ -n "${WASMKEEP_SOAK_NODES:-}" ] && [ -n "${WASMKEEP_SOAK_START:-}" ]; then
+    for id in a b c; do
+      sh -c "$(printf '%s' "$WASMKEEP_SOAK_START" | sed "s|{id}|$id|g")" || true
+    done
+  fi
+  exit 130
+}
+trap interrupted INT TERM
 status=0
 cargo nextest run -p wasmkeep-cli "${features[@]}" --test soak --no-capture 2>&1 | tee "$log" || status=$?
 

@@ -967,10 +967,10 @@ async fn a_clean_stop_flushes_and_loses_nothing() {
     );
 }
 
-/// A clean stop under a slow bucket gives up at its deadline: what it
-/// drops is counted (`stop`), the hold released, and the stop ends soon
-/// after its limit; the next owner has what was acknowledged (ADR 0034,
-/// section 10).
+/// A clean stop under a slow bucket gives up at its deadline: exactly the
+/// events not acknowledged (the segment in flight and the one behind it)
+/// are counted, as `stop`, the hold released, and the stop ends soon
+/// after its limit (ADR 0034, section 10).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clean_stop_behind_a_slow_bucket_gives_up_at_its_deadline() {
     let p = batched_pair(Duration::from_secs(30), |c| {
@@ -979,25 +979,48 @@ async fn a_clean_stop_behind_a_slow_bucket_gives_up_at_its_deadline() {
     .await;
     warmed(&p).await;
     p.flaky.delay_wal_ms.store(6_000, Ordering::SeqCst);
-    for _ in 0..3 {
+    for _ in 0..2 {
         let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
         assert_eq!(r.status, 200, "{}", r.body);
     }
     let started = std::time::Instant::now();
     p.a.service.shutdown(Duration::from_secs(1)).await;
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(5), "the stop took {took:?}");
-    assert!(
-        wasmkeep_server::metrics::plain_events_dropped_total() >= 2,
-        "the given-up events are counted"
-    );
-    let r = poll_get(p.b.addr, "/actor/t/x/plain").await;
+    assert!(took < Duration::from_secs(3), "the stop took {took:?}");
+    assert_eq!(wasmkeep_server::metrics::plain_events_dropped_by("stop"), 2);
+    assert_eq!(wasmkeep_server::metrics::plain_events_dropped_total(), 2);
+}
+
+/// A clean stop whose deadline comes while a batched actor runs an event
+/// cuts that event at the deadline, and counts what the actor had not
+/// acknowledged, as `stop`, before the node lets its actors go: an event
+/// in progress does not outlast the stop (ADR 0034, section 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_stop_cuts_a_running_batched_event_at_its_deadline() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(6_000, Ordering::SeqCst);
+    for _ in 0..2 {
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let addr = p.a.addr;
+    let running =
+        tokio::spawn(async move { send(addr, "POST", "/actor/t/x/sleep?ms=8000", "").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    p.a.service.shutdown(Duration::from_secs(1)).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "the stop took {took:?}");
     assert_eq!(
-        (r.status, r.node.as_deref()),
-        (200, Some("b")),
-        "{}",
-        r.body
+        wasmkeep_server::metrics::plain_events_dropped_by("stop"),
+        2,
+        "counted before the stop returned"
     );
+    running.abort();
 }
 
 /// An actor acquired again after a hibernation keeps counting toward a

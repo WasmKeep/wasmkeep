@@ -43,6 +43,12 @@ impl Histogram {
         self.sum_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    /// Observations so far.
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
     fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
         for (bound, bucket) in BUCKETS.iter().zip(&self.buckets) {
@@ -500,6 +506,15 @@ pub fn plain_events_dropped_total() -> u64 {
     METRICS.plain_events_dropped.total()
 }
 
+/// The events `wasmkeep_plain_events_dropped_total` counted for `reason`
+/// in this process.
+pub fn plain_events_dropped_by(reason: &str) -> u64 {
+    METRICS
+        .plain_events_dropped
+        .get(&[("reason", reason)])
+        .load(Ordering::Relaxed)
+}
+
 /// Counts `n` events dropped for `reason`
 /// ([`Metrics::plain_events_dropped`]).
 pub(crate) fn plain_events_dropped(reason: &str, n: u64) {
@@ -549,7 +564,7 @@ pub(crate) const BUCKET_OPERATIONS: [&str; 8] = [
 /// `status` of `wasmkeep_bucket_requests_total`.
 pub(crate) const BUCKET_STATUSES: [&str; 4] = ["ok", "not_found", "precondition", "error"];
 /// `reason` of `wasmkeep_event_cuts_total`.
-pub(crate) const CUT_REASONS: [&str; 3] = ["wall", "lease", "replica"];
+pub(crate) const CUT_REASONS: [&str; 4] = ["wall", "lease", "replica", "stop"];
 /// `kind` of `wasmkeep_forwards_total`.
 pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
 /// `record` of `wasmkeep_signatures_refused_full_total`.
