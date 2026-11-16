@@ -65,7 +65,8 @@ export function isProblemCode(code: string): boolean {
 
 /** Why `value` cannot be `details`, or `undefined` if it can. */
 export function detailsFault(value: unknown, depth = 1): string | undefined {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return undefined;
+  if (value === null || typeof value === "boolean") return undefined;
+  if (typeof value === "string") return LONE.test(value) ? "a string that is not valid Unicode" : undefined;
   if (typeof value === "number") return Number.isFinite(value) ? undefined : "a number that is not finite";
   if (depth > MAX_DETAILS_DEPTH) return `nested deeper than ${MAX_DETAILS_DEPTH}`;
   if (Array.isArray(value)) {
@@ -79,6 +80,7 @@ export function detailsFault(value: unknown, depth = 1): string | undefined {
     const keys = Object.keys(value);
     if (keys.length > MAX_DETAILS_MEMBERS) return `an object of more than ${MAX_DETAILS_MEMBERS} members`;
     for (const k of keys) {
+      if (LONE.test(k)) return "a key that is not valid Unicode";
       const f = detailsFault((value as Record<string, unknown>)[k], depth + 1);
       if (f) return f;
     }
@@ -94,6 +96,7 @@ export function detailsFault(value: unknown, depth = 1): string | undefined {
  * credentials. */
 export function problemResponse(status: number, problem: Problem): Exclude<ActorResponse, string | Uint8Array> {
   if (!Number.isInteger(status) || status < 400 || status > 599) throw new RangeError("status must be 400 to 599");
+  if (typeof problem.message === "string" && LONE.test(problem.message)) throw new RangeError("message is not valid Unicode");
   if (!isProblemCode(problem.code)) throw new RangeError(`invalid error code ${JSON.stringify(problem.code)}`);
   if (typeof problem.message !== "string" || problem.message.length > MAX_MESSAGE_LENGTH) {
     throw new RangeError(`message must be a string of at most ${MAX_MESSAGE_LENGTH} characters`);
@@ -134,6 +137,10 @@ export function classifyFailure(answer: WireAnswer): FailureAnswer {
   } catch {
     return malformed("the body is not UTF-8");
   }
+  // The parse-time rules both SDKs share, checked on the text before it is
+  // parsed or walked, so hostile input cannot reach the recursion.
+  const fault = textFault(text);
+  if (fault) return malformed(fault);
   let json: unknown;
   try {
     json = JSON.parse(text);
@@ -142,10 +149,6 @@ export function classifyFailure(answer: WireAnswer): FailureAnswer {
   }
   if (typeof json !== "object" || json === null || Array.isArray(json)) return malformed("the body is not an object");
   const o = json as Record<string, unknown>;
-  // As the Rust reader: an object has at most 64 members, and a string is
-  // never a lone surrogate (which `JSON.parse` accepts as an escape).
-  if (Object.keys(o).length > MAX_DETAILS_MEMBERS) return malformed("too many members");
-  if (hasLoneSurrogate(o)) return malformed("a string is not valid Unicode");
   const v = o.v;
   if (typeof v !== "number" || !Number.isSafeInteger(v)) return malformed("v is missing or not an integer");
   if (v !== PROBLEM_VERSION) return { kind: "unsupported-version", status, version: v };
@@ -164,13 +167,54 @@ export function classifyFailure(answer: WireAnswer): FailureAnswer {
 
 const LONE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
-function hasLoneSurrogate(value: unknown): boolean {
-  if (typeof value === "string") return LONE.test(value);
-  if (Array.isArray(value)) return value.some(hasLoneSurrogate);
-  if (typeof value === "object" && value !== null) {
-    return Object.keys(value).some((k) => LONE.test(k) || hasLoneSurrogate((value as Record<string, unknown>)[k]));
+/** The deepest nesting of arrays and objects in a body, counting the
+ * envelope's own object (the Rust reader's JSON limit). */
+export const MAX_JSON_DEPTH = 16;
+
+/** Why `text` breaks a rule the Rust reader applies while parsing, or
+ * `undefined`: nesting deeper than {@link MAX_JSON_DEPTH}, an object with
+ * more than {@link MAX_DETAILS_MEMBERS} members, a repeated key (the last
+ * would win and could hide a bad value), or a lone surrogate in a string or
+ * key. A scan of the text with an explicit stack: no recursion, one pass.
+ * It does not check the syntax; `JSON.parse` does, afterwards. */
+function textFault(text: string): string | undefined {
+  const stack: Array<{ object: boolean; keys: Set<string>; expectKey: boolean }> = [];
+  const n = text.length;
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x7b /* { */ || c === 0x5b /* [ */) {
+      if (stack.length >= MAX_JSON_DEPTH) return "nested too deeply";
+      stack.push({ object: c === 0x7b, keys: new Set(), expectKey: c === 0x7b });
+    } else if (c === 0x7d || c === 0x5d) {
+      stack.pop();
+    } else if (c === 0x2c /* , */) {
+      const top = stack[stack.length - 1];
+      if (top?.object) top.expectKey = true;
+    } else if (c === 0x3a /* : */) {
+      const top = stack[stack.length - 1];
+      if (top) top.expectKey = false;
+    } else if (c === 0x22 /* " */) {
+      let j = i + 1;
+      while (j < n && text.charCodeAt(j) !== 0x22) j += text.charCodeAt(j) === 0x5c ? 2 : 1;
+      if (j >= n) return undefined; // unterminated: JSON.parse reports it
+      let value: string;
+      try {
+        value = JSON.parse(text.slice(i, j + 1)) as string;
+      } catch {
+        return undefined; // a bad escape: JSON.parse reports it
+      }
+      if (LONE.test(value)) return "a string is not valid Unicode";
+      const top = stack[stack.length - 1];
+      if (top?.object && top.expectKey) {
+        if (top.keys.has(value)) return "a key is repeated";
+        top.keys.add(value);
+        if (top.keys.size > MAX_DETAILS_MEMBERS) return "too many members";
+        top.expectKey = false;
+      }
+      i = j;
+    }
   }
-  return false;
+  return undefined;
 }
 
 function preview(body: Uint8Array): string | undefined {

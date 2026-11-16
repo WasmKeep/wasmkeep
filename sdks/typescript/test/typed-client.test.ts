@@ -202,3 +202,49 @@ test("batch: the limit is the host's, an empty batch calls nothing", () => {
   assert.equal(many, 1);
   assert.equal(MAX_BATCH, 16);
 });
+
+test("a hostile envelope in one batch entry does not cost the others their results", () => {
+  const h = { "content-type": "application/vnd.wasmkeep.error+json" };
+  const hostile = `{"v":1,"code":"x","message":"m","extra":${"[".repeat(8000)}0${"]".repeat(8000)}}`;
+  const { c } = client((address) =>
+    address === "evil/x" ? { status: 400, headers: h, body: enc.encode(hostile) } : json(200, { count: 1 }),
+  );
+  const r = c.batch([
+    ["a/1", addItem, { sku: "s", qty: 1 }],
+    ["evil/x", addItem, { sku: "s", qty: 1 }],
+    ["a/2", addItem, { sku: "s", qty: 1 }],
+  ] as const);
+  assert(r[0].ok && r[2].ok);
+  assert(!r[1].ok && r[1].failure.kind === "malformed-envelope");
+});
+
+test("an interpretation failure stays in its entry", () => {
+  const poison = defineOperation({
+    name: "poison",
+    path: "/",
+    output: { parse: () => { throw new RangeError("deep"); } },
+  });
+  const r = client(() => json(200, {})).c.batch([["a/1", ping], ["a/2", poison], ["a/3", ping]] as const);
+  assert(!r[1].ok && r[1].failure.kind === "invalid-response");
+  assert.equal(r.length, 3);
+});
+
+test("a third-party input codec that throws makes that entry invalid-request, nothing else", () => {
+  const zodLike = { parse(v: unknown): { n: number } { if (typeof (v as { n?: unknown })?.n !== "number") throw new Error("Expected number"); return v as { n: number }; } };
+  const op = defineOperation({ name: "z", method: "POST", path: "/", input: zodLike, output: codec.unknown() });
+  const sentTo: string[] = [];
+  const { c } = client((a) => { sentTo.push(a); return json(200, 1); });
+  const single = c.call("a/0", op, { n: "x" } as never);
+  assert(!single.ok && single.failure.kind === "invalid-request" && single.failure.reason.includes("Expected number"));
+  const r = c.batch([["a/1", op, { n: 1 }], ["a/2", op, { n: "x" } as never], ["a/3", op, { n: 3 }]] as const);
+  assert(r[0].ok && r[2].ok);
+  assert(!r[1].ok && r[1].failure.kind === "invalid-request");
+  assert.deepEqual(sentTo, ["a/1", "a/3"]);
+  // A path or body function that throws is the same.
+  const badPath = defineOperation({ name: "p", path: () => { throw new Error("no path"); } });
+  const bp = c.call("a/4", badPath);
+  assert(!bp.ok && bp.failure.kind === "invalid-request");
+  const badBody = defineOperation({ name: "b", method: "POST", path: "/", body: () => { throw new Error("no body"); } });
+  const bb = c.call("a/5", badBody);
+  assert(!bb.ok && bb.failure.kind === "invalid-request");
+});

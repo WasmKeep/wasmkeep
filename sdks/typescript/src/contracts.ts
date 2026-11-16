@@ -103,24 +103,30 @@ export function defineOperation<I = void, O = void, E extends ErrorMap = {}>(
     errors: (spec.errors ?? {}) as E,
     maxResponseBytes: spec.maxResponseBytes ?? 1024 * 1024,
     request(raw: I): WireRequest {
-      const value = input.parse(raw);
-      let path: string;
+      // Whatever a codec, the path function or the body function throws (a
+      // third-party validator throws its own errors) is the input being
+      // invalid: the caller gets a CodecError, nothing is sent.
       try {
-        path = typeof spec.path === "function" ? spec.path(value) : spec.path;
+        return build(raw);
       } catch (e) {
         if (e instanceof CodecError) throw e;
-        throw new CodecError("", `path: ${e instanceof Error ? e.message : String(e)}`);
+        throw new CodecError("", e instanceof Error ? e.message : String(e));
       }
-      checkPath(path);
-      const headers: Record<string, string> = { accept: "application/json" };
-      const payload = spec.body ? spec.body(value) : NO_BODY.has(method) ? undefined : value;
-      if (payload === undefined) return { method, path, headers };
-      const text = JSON.stringify(payload);
-      if (text === undefined) return { method, path, headers };
-      headers["content-type"] = "application/json";
-      return { method, path, headers, body: encoder.encode(text) };
     },
   };
+
+  function build(raw: I): WireRequest {
+    const value = input.parse(raw);
+    const path = typeof spec.path === "function" ? spec.path(value) : spec.path;
+    checkPath(path);
+    const headers: Record<string, string> = { accept: "application/json" };
+    const payload = spec.body ? spec.body(value) : NO_BODY.has(method) ? undefined : value;
+    if (payload === undefined) return { method, path, headers };
+    const text = JSON.stringify(payload);
+    if (text === undefined) return { method, path, headers };
+    headers["content-type"] = "application/json";
+    return { method, path, headers, body: encoder.encode(text) };
+  }
 }
 
 /** Groups operations for a client (`client.bind(address, contract)`). */
@@ -132,14 +138,18 @@ function checkPath(path: string): void {
   if (!path.startsWith("/")) throw new CodecError("", "path must start with /");
   // eslint-disable-next-line no-control-regex
   if (/[\u0000- \u007f#\\]/.test(path)) throw new CodecError("", "path has a space, control character, # or backslash");
+  // A dot segment, written or percent-encoded, is resolved away by URL
+  // normalization: it would name another path than the one built.
+  for (const seg of path.split("?")[0].split("/")) {
+    if (/^(?:\.|%2e)(?:\.|%2e)?$/i.test(seg)) throw new CodecError("", "path has a . or .. segment");
+  }
 }
 
-function segment(value: unknown): string {
+function scalar(value: unknown): string {
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean" && typeof value !== "bigint") {
     throw new CodecError("", `a path value must be a string, number, boolean or bigint, not ${typeof value}`);
   }
   const s = String(value);
-  if (s === "." || s === "..") return s.replace(/\./g, "%2E");
   try {
     return encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
   } catch {
@@ -147,8 +157,14 @@ function segment(value: unknown): string {
   }
 }
 
+function segment(value: unknown): string {
+  const s = scalar(value);
+  if (s === "." || s === "..") throw new CodecError("", "a path value cannot be . or ..");
+  return s;
+}
+
 /** A tagged template that percent-encodes every interpolated value as one
- * path segment (`/` in a value becomes `%2F`; `.` and `..` cannot climb):
+ * path segment (`/` in a value becomes `%2F`; a value of `.` or `..` is refused):
  * ``urlPath`/carts/${id}/items` ``. */
 export function urlPath(strings: TemplateStringsArray, ...values: unknown[]): string {
   let out = strings[0];
@@ -172,7 +188,7 @@ export function withQuery(
       if (typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") {
         throw new CodecError("", `query value of ${k} is not a string, number or boolean`);
       }
-      parts.push(`${segment(k)}=${segment(item)}`);
+      parts.push(`${scalar(k)}=${scalar(item)}`);
     }
   }
   return parts.length === 0 ? path : `${path}${path.includes("?") ? "&" : "?"}${parts.join("&")}`;

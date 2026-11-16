@@ -248,7 +248,7 @@ pub fn classify(status: u16, headers: &[(String, String)], body: &[u8]) -> Failu
     let Ok(text) = std::str::from_utf8(body) else {
         return malformed("the body is not UTF-8");
     };
-    let Some(parsed) = json::parse(text) else {
+    let Some(parsed) = json::parse_unique(text) else {
         return malformed("the body is not JSON");
     };
     if !matches!(parsed, Json::Object(_)) {
@@ -400,6 +400,20 @@ mod tests {
                 vec![("content-type".to_string(), CONTENT_TYPE.to_string())]
             );
             assert_eq!(text(&all, "content_type"), CONTENT_TYPE);
+        }
+    }
+
+    #[test]
+    fn refuses_the_shared_vectors_the_writer_must_not_write() {
+        let all = vectors();
+        for v in items(&all, "refuse") {
+            let p = Problem::new(text(v, "code"), text(v, "message")).expect("valid");
+            assert_eq!(
+                p.with_details(text(v, "details_json")),
+                Err(ProblemError::Details),
+                "{}",
+                text(v, "name")
+            );
         }
     }
 

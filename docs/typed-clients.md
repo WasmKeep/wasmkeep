@@ -70,8 +70,10 @@ that shape.
 
 Build paths with the `urlPath` tag and queries with `withQuery`. Each value
 is percent-encoded as one segment, so a `/` inside a value cannot add a
-segment, and `.` or `..` cannot climb. A value that is not text (a lone
-surrogate) or not a scalar is refused before anything is sent.
+segment. A value that is `.` or `..`, is not text (a lone surrogate) or is
+not a scalar is refused before anything is sent, and so is any path with a
+`.` or `..` segment, written or percent-encoded, because URL normalization
+would resolve it to another path.
 
 ```ts
 path: (i) => withQuery("/", { limit: i.limit, tag: i.tags })
@@ -121,7 +123,7 @@ const [added, current] = client.batch([
 ] as const);
 ```
 
-- Every entry is its own result, so one failure does not hide the others.
+- Every entry is its own result, so one failure does not hide the others, whether it is a transport error, a hostile answer or a validator that throws.
   Nothing collapses them into a thrown error.
 - At most 16 entries (`MAX_BATCH`). A longer batch sends nothing and every
   entry is a `transport` failure, as the host does.
@@ -176,6 +178,10 @@ is `application/vnd.wasmkeep.error+json`. The body is UTF-8 JSON of at most
 - `message`: public text, at most 512 characters.
 - `details`: optional JSON, nested at most 8 deep, objects of at most 64
   members, numbers finite.
+- The whole body is read strictly, in both SDKs: nesting at most 16 deep, objects
+  of at most 64 members, no repeated key (the last would win and could hide a
+  bad value) and no lone surrogate in a string or key. A body that breaks a
+  rule is malformed, whatever its version.
 - Fields a reader does not know are ignored. A version it does not know is
   reported as unsupported, not guessed at.
 
@@ -198,7 +204,7 @@ let p = Problem::new("cart.out_of_stock", "Out of stock")?.with_details(r#"{"lef
 let response = problem::response(409, &p)?;
 ```
 
-Writing one refuses a code, message or details outside these limits (a
+Writing one refuses a code, message or details outside these limits, or text that is not valid Unicode (a
 `RangeError` in TypeScript, a `ProblemError` in Rust), so a mistake shows when
 the handler is written. Treat message and details as public: leave out stack traces,
 queries, storage locations and credentials. An unhandled

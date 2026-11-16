@@ -84,8 +84,10 @@ test("requests: JSON body for writes, none for reads, accept header always", () 
 
 test("path values are encoded as one safe segment", () => {
   assert.equal(urlPath`/a/${"x/y"}/b`, "/a/x%2Fy/b");
-  assert.equal(urlPath`/a/${".."}`, "/a/%2E%2E");
-  assert.equal(urlPath`/a/${"."}`, "/a/%2E");
+  assert.equal(urlPath`/a/${"%2e%2e"}`, "/a/%252e%252e");
+  for (const dot of [".", ".."]) {
+    assert.throws(() => urlPath`/a/${dot}/b`, (e: unknown) => e instanceof CodecError, dot);
+  }
   assert.equal(urlPath`/a/${"é ?#%"}`, "/a/%C3%A9%20%3F%23%25");
   assert.equal(urlPath`/a/${"(*)'!"}`, "/a/%28%2A%29%27%21");
   assert.equal(urlPath`/n/${5}/${true}`, "/n/5/true");
@@ -109,4 +111,12 @@ test("a path that is not a path is refused", () => {
   }
   assert.throws(() => defineOperation({ name: "", path: "/" }), TypeError as never);
   assert.throws(() => defineOperation({ name: "x", path: "/", method: "G ET" }), TypeError as never);
+});
+
+test("a path with a dot segment is refused, encoded or not", () => {
+  const mk = (p: string) => defineOperation({ name: "x", path: p });
+  for (const p of ["/a/../b", "/a/./b", "/a/%2e%2E/b", "/a/%2E/b", "/..", "/a/.."]) {
+    assert.throws(() => mk(p).request(undefined), (e: unknown) => e instanceof CodecError, p);
+  }
+  assert.equal(mk("/a/.b/..c/d.e?x=../y").request(undefined).path, "/a/.b/..c/d.e?x=../y");
 });

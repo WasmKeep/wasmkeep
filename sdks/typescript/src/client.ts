@@ -158,6 +158,21 @@ function invalid(e: unknown): { kind: "invalid-request"; reason: string } {
 }
 
 function interpret<O, E extends ErrorMap>(operation: Operation<any, O, E>, answer: WireAnswer): Result<O, E> {
+  // Reading an answer must not throw whatever it holds: in a batch one bad
+  // answer would hide the others' results.
+  try {
+    return interpretAnswer(operation, answer);
+  } catch (e) {
+    const reason = `the answer could not be read (${e instanceof Error ? e.name : "error"})`;
+    return fail(
+      answer.status >= 200 && answer.status < 300
+        ? { kind: "invalid-response", status: answer.status, reason }
+        : { kind: "malformed-envelope", status: answer.status, reason },
+    );
+  }
+}
+
+function interpretAnswer<O, E extends ErrorMap>(operation: Operation<any, O, E>, answer: WireAnswer): Result<O, E> {
   const { status } = answer;
   if (status >= 200 && status < 300) {
     if (answer.body.length > operation.maxResponseBytes) {

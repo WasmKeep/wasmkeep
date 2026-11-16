@@ -74,3 +74,23 @@ test("call error kinds: known ones narrow, unknown ones pass through", () => {
   assert.equal(isCallErrorKind("nope"), false);
   assert(odd instanceof Error && odd.name === "CallError");
 });
+
+test("shared vectors: what the writer refuses", () => {
+  for (const v of vectors.refuse) {
+    const details = JSON.parse(v.details_json) as JsonValue;
+    assert.throws(() => problem(400, v.code, v.message, details), RangeError as never, v.name);
+  }
+  assert.throws(() => problem(400, "x", "a\ud800b"), RangeError as never);
+  assert.throws(() => problem(400, "x", "m", { ["a\udc00"]: 1 }), RangeError as never);
+  assert.equal(problem(400, "x", "\ud83d\ude00").status, 400); // a pair is fine
+});
+
+test("hostile nesting is classified, never thrown", () => {
+  const h = { "content-type": vectors.content_type };
+  for (const n of [17, 100, 8000, 50000]) {
+    const body = enc.encode(`{"v":1,"code":"x","message":"m","extra":${"[".repeat(n)}0${"]".repeat(n)}}`);
+    assert.doesNotThrow(() => classifyFailure({ status: 400, headers: h, body }));
+  }
+  const body = enc.encode(`{"v":1,"code":"x","message":"m","extra":${"[".repeat(8000)}0${"]".repeat(8000)}}`);
+  assert.equal(classifyFailure({ status: 400, headers: h, body }).kind, "malformed");
+});

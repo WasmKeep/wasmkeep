@@ -115,9 +115,21 @@ impl Json {
 
 /// Parses a whole JSON text (whitespace around it allowed).
 pub(crate) fn parse(text: &str) -> Option<Json> {
+    parse_with(text, false)
+}
+
+/// Like [`parse`], but a repeated key in any object is an error rather than
+/// "the last wins", so a value cannot be hidden by overwriting it. What
+/// the error envelope's readers use, in both SDKs.
+pub(crate) fn parse_unique(text: &str) -> Option<Json> {
+    parse_with(text, true)
+}
+
+fn parse_with(text: &str, unique: bool) -> Option<Json> {
     let mut p = Parser {
         s: text.as_bytes(),
         at: 0,
+        unique,
     };
     let v = p.value(0)?;
     p.ws();
@@ -127,6 +139,7 @@ pub(crate) fn parse(text: &str) -> Option<Json> {
 struct Parser<'a> {
     s: &'a [u8],
     at: usize,
+    unique: bool,
 }
 
 impl Parser<'_> {
@@ -203,6 +216,9 @@ impl Parser<'_> {
                     // As `JSON.parse`: the last of a repeated key wins.
                     // The protocol's objects are small: a cap keeps this
                     // linear search from going quadratic.
+                    if self.unique && members.iter().any(|(k, _)| *k == key) {
+                        return None;
+                    }
                     members.retain(|(k, _)| *k != key);
                     if members.len() >= MAX_MEMBERS {
                         return None;
