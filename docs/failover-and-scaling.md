@@ -91,7 +91,10 @@ dead node may have run there. Retry what is safe to repeat, and make the
 rest idempotent. What the actor had committed with `exec-durable` and
 acknowledged is in the bucket and survives. A plain `exec` whose upload
 had not finished when the node died can be lost
-([replication](cluster.md#replication)).
+([replication](cluster.md#replication)): the one event uploading in a
+class with strict writes, about the last one or two bucket round trips of
+writes in a class with batched writes (up to `--max-unsent-age` and an
+event after a stalled bucket).
 
 After the fence, the first request for the actor makes the node it
 reaches take it: that node rebuilds the database from the bucket, then

@@ -1231,7 +1231,10 @@ fn serve_writes_names_served_classes_only() {
         ("t".to_owned(), Writes::Strict),
     ];
     let batched = serve_batched(&given, &served, false).unwrap();
-    assert_eq!(batched.into_iter().collect::<Vec<_>>(), vec!["rooms".to_owned()]);
+    assert_eq!(
+        batched.into_iter().collect::<Vec<_>>(),
+        vec!["rooms".to_owned()]
+    );
     assert!(serve_batched(&[("other".to_owned(), Writes::Batched)], &served, false).is_err());
     assert!(serve_batched(&given, &served, true).is_err(), "with --app");
     assert!(serve_batched(&[], &served, true).unwrap().is_empty());

@@ -281,7 +281,15 @@ Each actor's database follows it from node to node (ADR 0007):
   write since the last snapshot. Uploads not acknowledged are counted by
   `wasmkeep_snapshot_upload_failures_total` ([monitoring](monitoring.md)).
 - `storage.exec` commits locally; its upload follows when the event ends.
-  If the node dies in between, that write can be lost. `storage.exec-durable`
+  If the node dies in between, that write can be lost. In a class with
+  batched writes ([ADR 0034](adr/0034-batched-plain-writes.md), nodes
+  built with `batched-writes`) the upload follows behind the actor's next
+  events, one segment in flight at a time, and a node's death loses the
+  segment in flight and what was committed behind it: about the last one
+  or two round trips of writes. A drain, a move, a hibernation, parking
+  and a clean stop flush first and lose nothing with a healthy bucket; a
+  clean stop whose bucket is too slow gives up at its deadline and counts
+  what it drops (`wasmkeep_plain_events_dropped_total`). `storage.exec-durable`
   returns only once the write is in the bucket, uploaded while the node still
   held the actor's lease: an acknowledged durable write survives any node
   failure. The bucket is its only durable copy: the node does not fsync

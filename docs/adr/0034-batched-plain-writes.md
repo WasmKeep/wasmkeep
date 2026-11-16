@@ -1349,3 +1349,16 @@ its call) flush first since S9. ADR 0033's restore of one actor is not
 built yet; `ship_reset`'s guard refuses it with a segment in flight, and
 it is to flush first when it is. The model checks that a snapshot over
 uncaptured commits is caught (`SnapshotUncaptured`).
+
+**As built in S12 (2026-11-16).** The clean stop flushes every resident
+batched actor in its step before the drop and gives up at its deadline,
+counted `stop` (tests: a clean stop with a healthy and with a slow
+bucket). The section 16 metrics are on the metrics page. `deploy
+--writes CLASS=MODE` sets a class's mode, and the plan prints a
+`writes CLASS: strict -> batched` line; `serve --writes` sets it for
+classes given with `--actor` (hidden while the flag is needed). The docs
+listed below describe batched classes as needing nodes built with
+`batched-writes`. The flag stays: removing it waits for the soak with
+both modes (`SOAK_WRITES=batched bench/soak.sh` builds the binary with
+the feature and starts the nodes with `--writes t=batched`; the default
+runs strict), and for the docs to state the loss bound from its data.
