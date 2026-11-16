@@ -333,3 +333,32 @@ async fn a_node_cut_off_through_the_delete_never_writes_again() {
         Vec::<String>::new()
     );
 }
+
+/// ADR 0035, sections 5 and 6: an app's ownership-format setting lives
+/// outside its two prefixes, so neither a delete nor `--recreate` removes
+/// or rewrites it: a recreated app keeps the format its name had.
+#[tokio::test]
+async fn delete_and_recreate_keep_the_app_format_setting() {
+    use object_store::ObjectStoreExt as _;
+    use wasmkeep_cluster::app_format;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store).await.unwrap();
+    let setting = object_store::path::Path::from(app_format::key("", TENANT, APP));
+    store
+        .put(&setting, app_format::ENABLED_BODY.to_vec().into())
+        .await
+        .unwrap();
+    let app = app_ref(&store);
+    assert!(
+        !app.app_keys()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k.contains("formats/")),
+        "not one of the app's keys"
+    );
+    delete(&store).await.unwrap();
+    assert!(app.recreate(Duration::from_millis(500)).await.unwrap());
+    let body = store.get(&setting).await.unwrap().bytes().await.unwrap();
+    assert_eq!(&body[..], app_format::ENABLED_BODY);
+}

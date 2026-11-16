@@ -1,0 +1,85 @@
+//! An app's durable ownership-format setting ([ADR 0035], section 5):
+//! `formats/<tenant>/<app>/recorded-head` under the bucket prefix, outside
+//! both `state/` and `apps/`, so state replacement, app deletion,
+//! `--recreate`, deploy restoration and component rollback never touch it.
+//!
+//! Absent: the app writes ownership records in version 1. The exact body
+//! [`ENABLED_BODY`]: it has enabled the recorded-head format
+//! (`wasmkeep-owner 2`), one way. Anything else refuses service.
+//!
+//! This version reads the setting and fails closed on it; it does not yet
+//! enforce the format, so it serves an enabled app nowhere and offers no
+//! way to enable one.
+//!
+//! [ADR 0035]: ../../../docs/adr/0035-a-recorded-head-on-hand-over.md
+
+/// The setting's body once enabled, exactly.
+pub const ENABLED_BODY: &[u8] = b"wasmkeep-recorded-head 1\n";
+
+/// The setting's key under the bucket prefix (`prefix` ends in `/` or is
+/// empty).
+pub fn key(prefix: &str, tenant: &str, app: &str) -> String {
+    format!("{prefix}formats/{tenant}/{app}/recorded-head")
+}
+
+/// An app's ownership format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppFormat {
+    /// No setting: version 1 records.
+    Version1,
+    /// Enabled: version 2 records, with the recorded head.
+    RecordedHead,
+}
+
+/// The setting holds something this version cannot read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the app's ownership-format setting is unreadable ({len} bytes); refusing service")]
+pub struct Unknown {
+    /// Its length.
+    pub len: usize,
+}
+
+/// The format a read of the setting gives (`None`: absent).
+pub fn decode(body: Option<&[u8]>) -> Result<AppFormat, Unknown> {
+    match body {
+        None => Ok(AppFormat::Version1),
+        Some(ENABLED_BODY) => Ok(AppFormat::RecordedHead),
+        Some(other) => Err(Unknown { len: other.len() }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_setting_is_absent_exact_or_refused() {
+        assert_eq!(decode(None), Ok(AppFormat::Version1));
+        assert_eq!(decode(Some(ENABLED_BODY)), Ok(AppFormat::RecordedHead));
+        for bad in [
+            &b""[..],
+            b"wasmkeep-recorded-head 1",
+            b"wasmkeep-recorded-head 1\n\n",
+            b"wasmkeep-recorded-head 2\n",
+            b"wasmkeep-recorded-head 1\r\n",
+            b" wasmkeep-recorded-head 1\n",
+        ] {
+            assert_eq!(
+                decode(Some(bad)),
+                Err(Unknown { len: bad.len() }),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_is_outside_state_and_apps() {
+        let k = key("p/", "acme", "shop");
+        assert_eq!(k, "p/formats/acme/shop/recorded-head");
+        let root = crate::state_root::StateRoot::new("p/", "acme", "shop");
+        for family in crate::state_root::Family::ALL {
+            assert!(!k.starts_with(&root.key(family, "")), "{family:?}");
+        }
+        assert!(!k.starts_with("p/apps/") && !k.starts_with("p/state/"));
+    }
+}

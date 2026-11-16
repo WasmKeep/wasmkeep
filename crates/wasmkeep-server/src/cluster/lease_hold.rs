@@ -18,6 +18,7 @@
 use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use wasmkeep_cluster::app_format::{self, AppFormat};
 use wasmkeep_cluster::hold_cell::{self, Late};
 pub(super) use wasmkeep_cluster::holds::PendingEntry;
 use wasmkeep_cluster::holds::{Parked, Retried, Validity};
@@ -118,6 +119,9 @@ pub(crate) struct Pending {
     /// Locked after `holds`, never before, and never with `entries` or
     /// `parked` held.
     local: Mutex<LocalHeads>,
+    /// The app's ownership format as last read, and the lease epoch it
+    /// was read in (ADR 0035, section 5): read again in each new epoch.
+    format: Mutex<Option<(u64, AppFormat)>>,
 }
 
 /// Records the parked set's size moving from `before` to `after` in the
@@ -553,6 +557,7 @@ impl LeaseHold {
         if let Some(why) = cluster.app_refusal() {
             return Err(OwnershipError::Refused(why.into()));
         }
+        cluster.format_gate(epoch).await?;
         // ADR 0035, section 2: after the authoritative read, before the
         // write, this process's local evidence goes into the attempt.
         let mut prepared = false;
@@ -874,6 +879,67 @@ impl LeaseHold {
 }
 
 impl Cluster {
+    /// The app's ownership-format setting (ADR 0035, section 5), read
+    /// once per lease epoch (so again after a lapse), before any
+    /// acquisition. Absent: version 1, as before. Enabled: this version
+    /// reads the recorded-head format but does not enforce it yet, so it
+    /// serves the app nowhere rather than write version 1 records there.
+    /// Unreadable: refused. Unanswered: retry.
+    async fn format_gate(&self, epoch: u64) -> Result<(), OwnershipError> {
+        let cached = *self
+            .pending
+            .format
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let format = match cached {
+            Some((e, format)) if e == epoch => format,
+            _ => {
+                let key = StorePath::from(app_format::key(
+                    self.root.prefix(),
+                    self.root.tenant(),
+                    self.root.app(),
+                ));
+                let read = tokio::time::timeout(self.lease_attempt, async {
+                    match self.store.get(&key).await {
+                        Ok(got) => got.bytes().await.map(Some),
+                        Err(object_store::Error::NotFound { .. }) => Ok(None),
+                        Err(e) => Err(e),
+                    }
+                })
+                .await;
+                let body = match read {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(e)) => {
+                        return Err(OwnershipError::Unavailable(format!(
+                            "reading the app's ownership-format setting: {e}"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(OwnershipError::Unavailable(
+                            "reading the app's ownership-format setting: no answer".into(),
+                        ));
+                    }
+                };
+                let format = app_format::decode(body.as_deref())
+                    .map_err(|e| OwnershipError::Broken(e.to_string()))?;
+                *self
+                    .pending
+                    .format
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some((epoch, format));
+                format
+            }
+        };
+        match format {
+            AppFormat::Version1 => Ok(()),
+            AppFormat::RecordedHead => Err(OwnershipError::Refused(
+                "the app has enabled the recorded-head ownership format (ADR 0035), which this \
+                 server version reads but does not enforce: serve it with a version that does"
+                    .into(),
+            )),
+        }
+    }
+
     /// The ownership record of an actor (ADR 0020). The name is encoded
     /// like the database file name, so any actor name is a safe key.
     pub(crate) fn owner_key(&self, address: &ActorAddress) -> String {

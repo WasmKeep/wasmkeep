@@ -3624,3 +3624,47 @@ async fn a_re_acquire_inherits_the_head_its_predecessor_froze() {
     // releases write the recorded head).
     assert_eq!(a.pending.local_head(&key), None);
 }
+
+/// ADR 0035, section 5: the app's format setting fails closed. Absent,
+/// acquisitions proceed (version 1). Enabled, this version, which cannot
+/// enforce the recorded-head format yet, serves the app nowhere; anything
+/// else is refused as unreadable. Neither writes an ownership record.
+#[tokio::test]
+async fn the_app_format_setting_fails_closed() {
+    use wasmkeep_cluster::app_format;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let setting = StorePath::from(app_format::key("", "t", "default"));
+    for (body, want) in [
+        (app_format::ENABLED_BODY.to_vec(), "refused"),
+        (b"wasmkeep-recorded-head 9\n".to_vec(), "broken"),
+    ] {
+        store.put(&setting, body.into()).await.unwrap();
+        // A new epoch: the setting is read again.
+        a.validity.bump_epoch();
+        let got = LeaseHold::acquire(&a, &x).await;
+        match (&got, want) {
+            (Err(OwnershipError::Refused(why)), "refused") => {
+                assert!(why.contains("recorded-head"), "{why}");
+            }
+            (Err(OwnershipError::Broken(why)), "broken") => {
+                assert!(why.contains("setting"), "{why}");
+            }
+            _ => panic!("{want}: {:?}", got.as_ref().map(|_| ())),
+        }
+        let record = StorePath::from(a.owner_key(&x));
+        assert!(
+            matches!(
+                store.head(&record).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "no ownership record written"
+        );
+    }
+    store.delete(&setting).await.unwrap();
+    a.validity.bump_epoch();
+    LeaseHold::acquire(&a, &x).await.unwrap();
+}

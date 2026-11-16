@@ -5,6 +5,7 @@
 mod actor_read;
 mod actor_restore;
 mod app_delete;
+mod app_format_cmd;
 use wasmkeep_cli::backup;
 use wasmkeep_cli::{open_bucket_unchecked, parse_app, parse_bucket};
 mod dev;
@@ -86,6 +87,22 @@ enum AppCommand {
     /// to finish a delete that stopped. Cannot be undone. Keys held
     /// outside the bucket (the secrets key) are yours to destroy.
     Delete(AppDeleteArgs),
+    /// Show the app's ownership-format setting (ADR 0035): version 1
+    /// records, the recorded-head format enabled, or an unreadable
+    /// setting. Read only.
+    Format(AppFormatArgs),
+}
+
+#[derive(Debug, Args)]
+struct AppFormatArgs {
+    /// The app, TENANT/APP.
+    #[arg(long, value_parser = parse_app)]
+    app: (String, String),
+
+    /// Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from
+    /// the AWS_* environment variables).
+    #[arg(long)]
+    bucket: String,
 }
 
 #[derive(Debug, Args)]
@@ -1233,6 +1250,7 @@ fn main() -> anyhow::Result<()> {
         Command::Actor(ActorCommand::Delete(args)) => actor_delete(&args),
         Command::Actor(ActorCommand::Restore(args)) => actor_restore::run(&args),
         Command::App(AppCommand::Delete(args)) => app_delete::run(&args),
+        Command::App(AppCommand::Format(args)) => app_format_cmd::run(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
         Command::Dev(args) => dev(args),
         Command::New(args) => new_cmd::run(&args),
