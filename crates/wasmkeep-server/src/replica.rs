@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use wasmkeep_cluster::recorded_head::Position;
 use wasmkeep_cluster::replication::{
     EMPTY, Listing, Plan, Segment, SegmentId, collectable, plan_restore, segment_key, snapshot_key,
 };
@@ -742,7 +743,18 @@ impl Replica {
         max_db_bytes: u64,
     ) -> Result<Self, ReplicaError> {
         let restored =
-            Self::restore_within(cluster, address, lease, generation, db_path, max_db_bytes).await;
+            Self::restore_within(cluster, address, lease, generation, db_path, max_db_bytes)
+                .await
+                .and_then(|replica| {
+                    // The verified head goes into the hold cell, under its
+                    // lock and validity check, before activation (ADR 0035,
+                    // section 2): a hold that lapsed meanwhile is late.
+                    replica
+                        .lease
+                        .verify(replica.verified_head())
+                        .map_err(|_| ReplicaError::Late)?;
+                    Ok(replica)
+                });
         if restored.is_err() {
             crate::metrics::inc(&crate::metrics::METRICS.restore_failures);
         }
@@ -1118,7 +1130,9 @@ impl Replica {
                 let bound = periodic_snapshot_bound(self.upload_idle, bytes.len());
                 self.put_once(&key, bytes, bound).await
             } else {
-                self.put_bounded(&key, bytes, "snapshot").await
+                // After a delete: it confirms the reset position, which
+                // the reset segment's acknowledgement recorded.
+                self.put_bounded(&key, bytes, "snapshot", None).await
             };
             return match sent {
                 Ok(()) => {
@@ -1137,7 +1151,8 @@ impl Replica {
             };
         }
         self.fail(INTERRUPTED);
-        if let Err(e) = self.put_bounded(&key, bytes, "snapshot").await {
+        let advance = Some(position_of(position, all.post_apply));
+        if let Err(e) = self.put_bounded(&key, bytes, "snapshot", advance).await {
             if !matches!(e, ReplicaError::Exists) {
                 crate::metrics::inc(&crate::metrics::METRICS.snapshot_upload_failures);
             }
@@ -1171,6 +1186,12 @@ impl Replica {
     /// The position the bucket and the local database agree on.
     pub(crate) fn head(&self) -> SegmentId {
         self.head
+    }
+
+    /// The head with its database checksum, as the hold cell records it
+    /// (ADR 0035): the explicit pre-history position for an empty history.
+    pub(crate) fn verified_head(&self) -> Position {
+        position_of(self.head, self.checksum)
     }
 
     /// What a garbage-collection pass of this hold needs, detached so it
@@ -1250,7 +1271,12 @@ impl Replica {
         self.fail(INTERRUPTED);
         self.in_flight = Some(segment.id);
         let sent = self
-            .put_bounded(&segment_key(&segment), bytes, "segment")
+            .put_bounded(
+                &segment_key(&segment),
+                bytes,
+                "segment",
+                Some(position_of(segment.id, changes.post_apply)),
+            )
             .await;
         self.in_flight = None;
         if let Err(e) = sent {
@@ -1450,7 +1476,8 @@ impl Replica {
             .store
             .put_opts(&location, PutPayload::from(bytes), opts);
         let reason = match timeout_at(until, sent).await {
-            Ok(Ok(_)) => return self.acknowledged(),
+            // A snapshot at the head: a check, never an advance.
+            Ok(Ok(_)) => return self.acknowledged(None),
             Ok(Err(object_store::Error::AlreadyExists { .. })) => {
                 match timeout_at(until, self.store.head(&location)).await {
                     Ok(Ok(_)) => return Err(ReplicaError::Exists),
@@ -1489,13 +1516,18 @@ impl Replica {
     /// there"). A refusal with nothing there yet (a bucket answering 409
     /// to a create racing an earlier attempt still in flight) is sent
     /// again.
+    ///
+    /// `advance`: the position this upload makes durable, which its
+    /// acknowledgement moves the hold's head to; `None` for an upload at
+    /// the head (ADR 0035, section 2).
     async fn put_bounded(
         &self,
         key: &str,
         bytes: Vec<u8>,
         what: &'static str,
+        advance: Option<Position>,
     ) -> Result<(), ReplicaError> {
-        self.target().put_bounded(key, bytes, what).await
+        self.target().put_bounded(key, bytes, what, advance).await
     }
 
     /// Resolve a delete's ordering from the immutable reset, never a node clock.
@@ -1580,8 +1612,9 @@ impl UploadTarget {
         key: &str,
         bytes: Vec<u8>,
         what: &'static str,
+        advance: Option<Position>,
     ) -> Result<(), ReplicaError> {
-        self.put_bounded_by(key, bytes, what, None).await
+        self.put_bounded_by(key, bytes, what, advance, None).await
     }
 
     /// The upload's budget for `len` bytes: its base idle bounds plus a
@@ -1601,6 +1634,7 @@ impl UploadTarget {
         key: &str,
         bytes: Vec<u8>,
         what: &'static str,
+        advance: Option<Position>,
         cap: Option<tokio::time::Instant>,
     ) -> Result<(), ReplicaError> {
         use tokio::time::{Instant, timeout_at};
@@ -1636,12 +1670,12 @@ impl UploadTarget {
                 .store
                 .put_opts(&location, PutPayload::from(bytes.clone()), opts);
             match timeout_at(until, sent).await {
-                Ok(Ok(_)) => return self.acknowledged(),
+                Ok(Ok(_)) => return self.acknowledged(advance),
                 Ok(Err(object_store::Error::AlreadyExists { .. })) => {
                     match self.read_back(&location, &bytes, deadline).await {
                         ReadBack::Ours => {
                             tracing::info!(object = %location, what, "an upload had landed unanswered; acknowledged");
-                            return self.acknowledged();
+                            return self.acknowledged(advance);
                         }
                         ReadBack::Other => return Err(ReplicaError::Exists),
                         ReadBack::Refused(e) => return Err(e),
@@ -1719,6 +1753,20 @@ impl UploadTarget {
     }
 }
 
+/// A history position and the database checksum after it, as the hold
+/// cell records an acknowledged head (ADR 0035, section 2).
+pub(crate) fn position_of(head: SegmentId, checksum: DbChecksum) -> Position {
+    if head == EMPTY {
+        Position::Empty
+    } else {
+        Position::Known {
+            generation: head.generation,
+            txid: head.txid,
+            checksum: checksum.value(),
+        }
+    }
+}
+
 /// A failure no resend changes: the bucket refused the request itself (on
 /// an upload, `NotFound` is the bucket missing, and a precondition cannot
 /// fail a create). An attempt in flight, or a pause, still runs out
@@ -1782,20 +1830,21 @@ impl UploadTarget {
     }
 
     /// The acknowledgement rule: an upload counts only if it completed
-    /// while the hold could still act.
-    fn acknowledged(&self) -> Result<(), ReplicaError> {
-        if self.lease.is_valid() {
-            Ok(())
-        } else {
-            Err(ReplicaError::Late)
-        }
+    /// while the hold could still act. Checked and, with `advance`, the
+    /// hold's acknowledged head moved, in one critical section of the hold
+    /// cell (ADR 0035, section 2), so an ending hold freezes it or this is
+    /// late.
+    fn acknowledged(&self, advance: Option<Position>) -> Result<(), ReplicaError> {
+        self.lease
+            .acknowledge(advance)
+            .map_err(|_| ReplicaError::Late)
     }
 }
 
 impl Replica {
     /// See [`UploadTarget::acknowledged`].
-    fn acknowledged(&self) -> Result<(), ReplicaError> {
-        self.target().acknowledged()
+    fn acknowledged(&self, advance: Option<Position>) -> Result<(), ReplicaError> {
+        self.target().acknowledged(advance)
     }
 }
 
@@ -2706,6 +2755,38 @@ mod tests {
         );
         assert_eq!(r.head, head, "the head did not move");
         assert!(r.failed().is_some());
+    }
+
+    /// ADR 0035, section 2: the hold cell is the home of the acknowledged
+    /// head. A segment's acknowledgement advances it, with the database
+    /// checksum after it; a periodic snapshot's only checks validity; once
+    /// the lease lapsed, nothing advances it, and the hold ended carries
+    /// the last acknowledged head.
+    #[tokio::test]
+    async fn acknowledgements_advance_the_hold_cell_head() {
+        use wasmkeep_cluster::recorded_head::Position;
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        let (view, validity) = LeaseView::lapsable(1);
+        r.lease = view.clone();
+        let head = |v: &LeaseView| v.acknowledged_head();
+        assert_eq!(head(&view), Some(Position::Empty), "verified at the start");
+        r.ship(&changes(DbChecksum::from_value(7))).await.unwrap();
+        let after = Position::Known {
+            generation: 1,
+            txid: 2,
+            checksum: DbChecksum::from_value(9).value(),
+        };
+        assert_eq!(head(&view), Some(after));
+        // A snapshot at the head is a check, never an advance.
+        let all = at_head(&r);
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
+        assert_eq!(head(&view), Some(after));
+        validity.invalidate();
+        let mut next = changes(DbChecksum::from_value(9));
+        next.post_apply = DbChecksum::from_value(11);
+        assert!(r.ship(&next).await.is_err());
+        assert_eq!(head(&view), Some(after), "nothing advances after a lapse");
     }
 
     /// After the lease lapsed, nothing is acknowledged and nothing more is

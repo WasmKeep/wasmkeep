@@ -854,6 +854,10 @@ pub struct Hold {
     /// failover: that node's process was fenced, released, or replaced),
     /// if another node.
     pub previous: Option<String>,
+    /// Its acknowledged head (ADR 0035, section 2), kept in the hold cell
+    /// and frozen when the hold ends: what its release, park or pending
+    /// release carries. Unverified at acquisition.
+    pub head: crate::hold_cell::HoldHead,
 }
 
 /// Why an acquisition did not give a hold.
@@ -1053,6 +1057,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             generation,
             version,
             previous,
+            head: Default::default(),
         })
     }
 
@@ -1111,6 +1116,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             generation,
             version,
             previous: None,
+            head: Default::default(),
         })
     }
 
@@ -1324,6 +1330,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                         generation,
                         version,
                         previous: None,
+                        head: Default::default(),
                     };
                     self.release(&hold).await
                 }
@@ -2179,6 +2186,7 @@ mod tests {
             generation: 6,
             version,
             previous: None,
+            head: Default::default(),
         };
         let _ = hold;
         assert_eq!(

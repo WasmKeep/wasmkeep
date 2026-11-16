@@ -18,9 +18,11 @@
 use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use wasmkeep_cluster::hold_cell::{self, Late};
 pub(super) use wasmkeep_cluster::holds::PendingEntry;
 use wasmkeep_cluster::holds::{Parked, Retried, Validity};
 use wasmkeep_cluster::node_lease::{AcquireError, Hold, Released};
+use wasmkeep_cluster::recorded_head::Position;
 
 use super::*;
 
@@ -195,7 +197,7 @@ impl Pending {
         valid: impl Fn() -> bool,
     ) -> Option<Hold> {
         let mut holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
-        let hold = cell.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let hold = hold_cell::end(cell);
         if holds.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
             holds.remove(key);
         }
@@ -268,11 +270,39 @@ impl Pending {
             .insert(key.to_owned(), Arc::clone(cell));
     }
 
-    fn unregister(&self, key: &str, cell: &Cell) {
+    /// Freezes `cell` and removes it from the live set in one step under
+    /// the live set's lock (the order [`Self::end_all`] and [`Self::park`]
+    /// use): the hold, its head frozen, if it was still there.
+    fn take_out(&self, key: &str, cell: &Cell) -> Option<Hold> {
         let mut holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        let hold = hold_cell::end(cell);
         if holds.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
             holds.remove(key);
         }
+        hold
+    }
+
+    /// The heads of `key`'s pending releases and parked hold, as frozen
+    /// when each ended (tests of ADR 0035, section 2).
+    #[cfg(test)]
+    pub(crate) fn frozen_heads(&self, key: &str) -> Vec<Option<Position>> {
+        let mut heads: Vec<Option<Position>> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|e| match e {
+                PendingEntry::Release(hold) if hold.key == key => Some(hold.head.acknowledged),
+                _ => None,
+            })
+            .collect();
+        heads.extend(
+            self.parked()
+                .iter()
+                .filter(|(hold, _)| hold.key == key)
+                .map(|(hold, _)| hold.head.acknowledged),
+        );
+        heads
     }
 
     /// Whether this node holds the actor whose record is `key`.
@@ -287,17 +317,17 @@ impl Pending {
     /// Ends every hold at once: each becomes a pending release if
     /// `release`, and is dropped otherwise (a lost lease: the fence or the
     /// other process frees the records; a clean stop: `released` does).
+    ///
+    /// Each cell is frozen (its hold, acknowledged head included, taken out
+    /// under the cell's lock, ADR 0035 section 2) and its release queued
+    /// while the live set's lock is still held: a hold is never out of the
+    /// live set before it is frozen and in the pending set. Lock order: the
+    /// live set, then a cell, then the pending set; an acknowledgement
+    /// takes only its cell.
     pub(super) fn end_all(&self, release: bool) {
-        let cells: Vec<Cell> = self
-            .holds
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .drain()
-            .map(|(_, c)| c)
-            .collect();
-        for cell in cells {
-            let hold = cell.lock().unwrap_or_else(|p| p.into_inner()).take();
-            if let Some(hold) = hold
+        let mut holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, cell) in holds.drain() {
+            if let Some(hold) = hold_cell::end(&cell)
                 && release
             {
                 self.push(PendingEntry::Release(hold));
@@ -305,7 +335,6 @@ impl Pending {
         }
         // Parked records too (ADR 0024, section 3), under the live set's
         // lock as parking takes it: a park cannot land after this.
-        let holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
         let parked = {
             let mut parked = self.parked();
             let before = parked.len();
@@ -641,10 +670,10 @@ impl LeaseHold {
 
     /// Takes the hold out: this node stops acting as owner before any
     /// release is sent.
+    /// The hold comes out with its acknowledged head frozen (ADR 0035,
+    /// section 2), under the live set's lock, then the cell's.
     fn take(&self) -> Option<Hold> {
-        let hold = self.cell.lock().unwrap_or_else(|p| p.into_inner()).take();
-        self.cluster.pending.unregister(&self.key, &self.cell);
-        hold
+        self.cluster.pending.take_out(&self.key, &self.cell)
     }
 }
 
@@ -1198,6 +1227,10 @@ impl LeaseView {
                 generation,
                 version: wasmkeep_cluster::lease::Version(String::new()),
                 previous: None,
+                // Verified at the explicit pre-history position.
+                head: wasmkeep_cluster::hold_cell::HoldHead {
+                    acknowledged: Some(wasmkeep_cluster::recorded_head::Position::Empty),
+                },
             }))),
             epoch: 0,
             validity: Arc::new(validity),
@@ -1211,6 +1244,34 @@ impl LeaseView {
         let view = Self::always_valid(generation);
         let validity = Arc::clone(&view.validity);
         (view, validity)
+    }
+
+    /// The acknowledgement critical section (ADR 0035, section 2): under
+    /// the hold cell's lock, the hold must still be here and valid in its
+    /// epoch; then `advance`, if given, becomes its acknowledged head.
+    /// `None` only checks (a periodic snapshot, the snapshot after a
+    /// reset). Refused: [`ReplicaError::Late`](crate::replica::ReplicaError).
+    pub(crate) fn acknowledge(&self, advance: Option<Position>) -> Result<(), Late> {
+        let (validity, epoch) = (&self.validity, self.epoch);
+        hold_cell::acknowledge(&self.cell, || validity.valid_in(epoch), advance)
+    }
+
+    /// After a successful restore: the verified head, set under the cell's
+    /// lock and validity check before activation.
+    pub(crate) fn verify(&self, position: Position) -> Result<(), Late> {
+        let (validity, epoch) = (&self.validity, self.epoch);
+        hold_cell::verify(&self.cell, || validity.valid_in(epoch), position)
+    }
+
+    /// The hold's acknowledged head while it lives (`None`: ended, or not
+    /// verified yet). Tests.
+    #[cfg(test)]
+    pub(crate) fn acknowledged_head(&self) -> Option<Position> {
+        self.cell
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|h| h.head.acknowledged)
     }
 
     /// Whether this node may still act as the owner: the hold exists here

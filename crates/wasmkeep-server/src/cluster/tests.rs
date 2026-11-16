@@ -3423,3 +3423,127 @@ async fn many_releases_in_one_lapse_are_each_counted_and_logged_once() {
         "a sixth would be logged again before the lease is valid"
     );
 }
+
+/// ADR 0035, section 2, on a real hold: the hold cell's acknowledged head
+/// is verified by `Replica::restore`, advanced by a first snapshot, a
+/// strict segment and a reset (with the database checksum after each),
+/// never by a periodic snapshot, and frozen into the pending release a
+/// lapse leaves and the parked hold a hibernation leaves. A restore from
+/// that history into an empty directory verifies the same head and
+/// checksum; a lapse before the verification makes the restore late.
+#[tokio::test]
+async fn a_real_hold_carries_its_acknowledged_head_into_every_ending() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::recorded_head::Position;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let first_dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(first_dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let view = hold.view();
+    assert_eq!(view.acknowledged_head(), Some(Position::Empty));
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    let all = db.snapshot().unwrap();
+    assert!(
+        replica
+            .ship_snapshot(&all, SnapshotKind::First)
+            .await
+            .unwrap()
+    );
+    assert_eq!(view.acknowledged_head(), Some(replica.verified_head()));
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    let changes = db.take_changes().unwrap().unwrap();
+    replica.ship(&changes).await.unwrap();
+    let segment = replica.verified_head();
+    assert!(
+        matches!(segment, Position::Known { txid: 2, .. }),
+        "{segment:?}"
+    );
+    assert_eq!(view.acknowledged_head(), Some(segment));
+    // A periodic snapshot at the head checks; it never advances.
+    let at_head = db.snapshot().unwrap();
+    replica
+        .ship_snapshot(&at_head, SnapshotKind::Periodic)
+        .await
+        .unwrap();
+    assert_eq!(view.acknowledged_head(), Some(segment));
+    // A reset (after `delete-self`) is a new position.
+    db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+    let _ = db.take_changes().unwrap();
+    replica.ship_reset(db.snapshot().unwrap()).await.unwrap();
+    let reset = replica.verified_head();
+    assert_ne!(reset, segment);
+    assert_eq!(view.acknowledged_head(), Some(reset));
+    drop(db);
+
+    // A lapse ends the hold into a pending release that carries it.
+    a.pending.end_all(true);
+    assert_eq!(a.pending.frozen_heads(&key), vec![Some(reset)]);
+    assert_eq!(view.acknowledged_head(), None, "ended");
+    drop((hold, replica));
+    assert!(a.releases_done(Duration::from_secs(5)).await);
+
+    // Restored from that history into an empty directory: the same head
+    // and checksum, verified into the new hold's cell.
+    let second_dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(second_dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let restored = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.verified_head(), reset);
+    assert_eq!(hold.view().acknowledged_head(), Some(reset));
+    // A hibernation with sockets open parks it, head and all.
+    drop(restored);
+    hold.park(&x);
+    assert_eq!(a.pending.frozen_heads(&key), vec![Some(reset)]);
+    a.release_all_parked("stop").await;
+
+    // A lapse between the restore and its verification: late (answered
+    // 503 by `ActorState::ensure_owner_with`).
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let view = hold.view();
+    let generation = hold.generation().unwrap();
+    a.validity.invalidate();
+    let third_dir = tempfile::tempdir().unwrap();
+    let late = Replica::restore(
+        &a,
+        &x,
+        view,
+        generation,
+        storage_in(third_dir.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(matches!(late, Err(ReplicaError::Late)), "{:?}", late.err());
+}

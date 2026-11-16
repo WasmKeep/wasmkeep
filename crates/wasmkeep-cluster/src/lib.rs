@@ -40,6 +40,7 @@ pub mod bucket_check;
 pub mod control;
 pub mod expiry;
 pub mod failover;
+pub mod hold_cell;
 pub mod holds;
 pub mod lease;
 pub mod membership;

@@ -1206,7 +1206,13 @@ impl Ticket {
                 }
             }
             let sent = target
-                .put_bounded_by(&key, bytes, "segment", Some(until))
+                .put_bounded_by(
+                    &key,
+                    bytes,
+                    "segment",
+                    Some(super::position_of(id, post_apply)),
+                    Some(until),
+                )
                 .await;
             // The PUT future has ended: its bytes leave the node's budget
             // now, whoever applies the outcome, and whenever.

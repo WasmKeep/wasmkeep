@@ -389,6 +389,7 @@ mod tests {
             generation,
             version: crate::lease::Version(format!("v{generation}")),
             previous: None,
+            head: Default::default(),
         }
     }
 

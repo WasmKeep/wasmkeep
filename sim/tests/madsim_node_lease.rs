@@ -307,6 +307,7 @@ async fn acquire_broken<B: Bucket, C: Clock>(
             generation,
             version,
             previous: None,
+            head: Default::default(),
         })
         .map_err(|_| AcquireError::Unresolved {
             generation,
