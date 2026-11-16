@@ -21,9 +21,6 @@ const SEND_QUEUE: usize = 256;
 pub(crate) const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 /// Largest message (and frame) a client may send.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-/// Open sockets per actor, and per node.
-pub(crate) const MAX_SOCKETS_PER_ACTOR: usize = 1_000;
-pub(crate) const MAX_SOCKETS_PER_NODE: usize = 50_000;
 /// A silent client is pinged after this long, and closed if still silent
 /// after [`PONG_WAIT`] more (half-open connections otherwise never end).
 /// Under a load balancer's usual idle timeout (60 s for nginx and AWS
@@ -117,9 +114,11 @@ impl Registry {
 }
 
 /// All open connections on this node.
-#[derive(Default)]
 pub(crate) struct Sockets {
     next_id: AtomicU64,
+    pub(crate) limits: crate::SocketLimits,
+    pub(crate) budget: Arc<crate::SocketBudget>,
+    app_budget: Arc<crate::SocketBudget>,
     registry: Mutex<Registry>,
     /// Told the actor whose last slot was freed ([`Self::on_vacated`]).
     vacated: std::sync::OnceLock<mpsc::UnboundedSender<ActorAddress>>,
@@ -134,7 +133,36 @@ pub(crate) struct Opened {
     pub(crate) closing: Arc<tokio::sync::Notify>,
 }
 
+impl Default for Sockets {
+    fn default() -> Self {
+        Self::new(
+            crate::SocketLimits::default(),
+            crate::SocketBudget::new(50_000, 50_000),
+        )
+    }
+}
+
 impl Sockets {
+    pub(crate) fn new(limits: crate::SocketLimits, budget: Arc<crate::SocketBudget>) -> Self {
+        Self {
+            next_id: AtomicU64::new(0),
+            limits,
+            budget,
+            app_budget: crate::SocketBudget::new(limits.per_app, limits.per_app),
+            registry: Mutex::default(),
+            vacated: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn reserve(&self) -> Option<crate::socket_limits::SessionPermit> {
+        let process = self.budget.reserve()?;
+        let app = self.app_budget.reserve()?;
+        Some(crate::socket_limits::SessionPermit {
+            _process: process,
+            _app: app,
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.registry.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -142,18 +170,14 @@ impl Sockets {
     /// Whether `owner` may open another socket now (checked again by
     /// [`Self::open`]): answered before the upgrade is accepted.
     pub(crate) fn can_open(&self, owner: &ActorAddress) -> Result<(), OpenError> {
-        Self::room(&self.lock(), owner)
+        self.room(&self.lock(), owner)
     }
 
-    fn room(registry: &Registry, owner: &ActorAddress) -> Result<(), OpenError> {
-        if registry.conns.len() >= MAX_SOCKETS_PER_NODE {
+    fn room(&self, registry: &Registry, owner: &ActorAddress) -> Result<(), OpenError> {
+        if registry.conns.len() >= self.budget.effective() {
             return Err(OpenError::NodeFull);
         }
-        if registry
-            .by_owner
-            .get(owner)
-            .is_some_and(|ids| ids.len() >= MAX_SOCKETS_PER_ACTOR)
-        {
+        if registry.by_owner.get(owner).map_or(0, BTreeSet::len) >= self.limits.per_actor {
             return Err(OpenError::ActorFull);
         }
         Ok(())
@@ -169,7 +193,7 @@ impl Sockets {
     /// [`Self::open`], for a socket `opener` opened.
     pub(crate) fn open_as(&self, owner: ActorAddress, opener: Opener) -> Result<Opened, OpenError> {
         let mut registry = self.lock();
-        Self::room(&registry, &owner)?;
+        self.room(&registry, &owner)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, outgoing) = mpsc::channel(SEND_QUEUE);
         let queued = Arc::new(AtomicUsize::new(0));
@@ -447,6 +471,45 @@ mod tests {
     }
 
     #[test]
+    fn configured_actor_zero_and_app_and_process_limits() {
+        let shared = crate::SocketBudget::new(2, 2);
+        let first = Sockets::new(
+            crate::SocketLimits {
+                per_actor: 0,
+                per_app: 1,
+            },
+            Arc::clone(&shared),
+        );
+        let second = Sockets::new(
+            crate::SocketLimits {
+                per_actor: 1,
+                per_app: 2,
+            },
+            Arc::clone(&shared),
+        );
+        assert!(matches!(first.open(actor("a")), Err(OpenError::ActorFull)));
+        let a = first.reserve().unwrap();
+        assert!(first.reserve().is_none(), "app cap below process cap");
+        assert_eq!(
+            shared.in_use(),
+            1,
+            "failed app reservation returns process permit"
+        );
+        let b = second.reserve().unwrap();
+        assert!(second.reserve().is_none(), "shared process cap");
+        drop(a);
+        assert!(second.reserve().is_some());
+        drop(b);
+        assert_eq!(shared.in_use(), 0);
+        let opened = second.open(actor("a")).unwrap();
+        assert!(matches!(second.open(actor("a")), Err(OpenError::ActorFull)));
+        second.begin_close(opened.id);
+        assert!(second.open(actor("a")).is_err());
+        second.remove(opened.id);
+        assert!(second.open(actor("a")).is_ok());
+    }
+
+    #[test]
     fn each_socket_keeps_who_opened_it_until_removed() {
         let sockets = Sockets::default();
         let a = actor("a");
@@ -523,9 +586,16 @@ mod tests {
 
     #[test]
     fn sockets_per_actor_are_capped() {
-        let sockets = Sockets::default();
+        const CAP: usize = 2;
+        let sockets = Sockets::new(
+            crate::SocketLimits {
+                per_actor: CAP,
+                ..Default::default()
+            },
+            crate::SocketBudget::new(3, 3),
+        );
         let a = actor("a");
-        for _ in 0..MAX_SOCKETS_PER_ACTOR {
+        for _ in 0..CAP {
             sockets.open(a.clone()).unwrap();
         }
         assert!(matches!(sockets.open(a.clone()), Err(OpenError::ActorFull)));
@@ -533,20 +603,27 @@ mod tests {
             sockets.open(actor("b")).is_ok(),
             "other actors are not affected"
         );
-        assert_eq!(sockets.len(), MAX_SOCKETS_PER_ACTOR + 1);
+        assert_eq!(sockets.len(), CAP + 1);
     }
 
     #[test]
     fn closing_sockets_keep_their_capacity_until_the_close_event_finishes() {
-        let sockets = Sockets::default();
+        const CAP: usize = 2;
+        let sockets = Sockets::new(
+            crate::SocketLimits {
+                per_actor: CAP,
+                ..Default::default()
+            },
+            crate::SocketBudget::new(3, 3),
+        );
         let a = actor("a");
         let first = sockets.open(a.clone()).unwrap();
         sockets.accept(first.id);
-        for _ in 1..MAX_SOCKETS_PER_ACTOR {
+        for _ in 1..CAP {
             sockets.open(a.clone()).unwrap();
         }
         sockets.close(&a, first.id, 1000, "done".into());
-        assert_eq!(sockets.len(), MAX_SOCKETS_PER_ACTOR);
+        assert_eq!(sockets.len(), CAP);
         assert!(matches!(sockets.can_open(&a), Err(OpenError::ActorFull)));
         assert!(sockets.of(&a, Some(first.id)).is_empty());
         sockets.accept(first.id);

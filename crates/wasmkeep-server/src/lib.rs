@@ -29,7 +29,9 @@ mod rate_limit;
 mod replica;
 pub mod secret_store;
 pub mod secrets;
+mod socket_limits;
 mod websocket;
+pub use socket_limits::{SocketBudget, SocketLimits};
 
 pub use access::{Access, AccessRules};
 #[cfg(feature = "batched-writes")]

@@ -43,12 +43,26 @@ Point load balancers at `/_wasmkeep/ready`, and use `/_wasmkeep/health` for
 
 Every resident actor holds three open files (its database, write-ahead log
 and shared-memory index), every connection one. At start, `wasmkeep serve`
-raises its soft open-files limit to the hard limit, then caps connections
-and resident actors to what fits, logging a warning when that lowers them.
+raises its soft open-files limit to the hard limit, then caps connections,
+resident actors and socket sessions to an admission estimate, logging requested
+and effective values when that lowers them. Each socket session is charged
+two descriptors, covering both sides of a relay; 256 descriptors are reserved
+for listeners and other host activity. Bucket and outbound HTTP pools are not
+all bounded by these caps, so monitor actual FD usage as well.
 With a cluster listener (`--cluster-listen`), its connections (up to
 1,024) are counted first.
 Give the process a generous limit (`LimitNOFILE=65536` in the systemd unit,
 or `ulimit -n`) to serve many actors at once.
+
+Socket gauges distinguish owned sockets (`wasmkeep_websockets_open`) from
+process sessions (`wasmkeep_socket_sessions`, including relays and opening
+upgrades). `wasmkeep_socket_limit_requested` and
+`wasmkeep_socket_limit_effective` show process ceilings;
+`wasmkeep_socket_actor_limit_requested` and
+`wasmkeep_socket_actor_limit_effective` show actor ceilings. A difference
+means the requested capacity cannot all be admitted. Capacity refusals count
+in `wasmkeep_admission_refused_total{reason="capacity"}` and return 503 with
+`Retry-After`. See [CLI options and tuning](reference/socket-limits.md).
 
 The resident cap includes actors still closing their databases and blocking
 database work left by a cancelled event. An address without a mailbox

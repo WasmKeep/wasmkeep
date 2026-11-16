@@ -312,6 +312,7 @@ fn wasmkeep_cluster(label: &'static str, wasm: &Path, bucket: &str, relayed: boo
                     .arg(data.join("cache"))
                     .args(["--listen", &addr.to_string(), "--max-instances", "2000"])
                     .args(["--max-connections", &CLUSTER_MAX_CONNECTIONS.to_string()])
+                    .args(["--max-sockets-per-node", "0"])
                     .arg("--bucket")
                     .arg(&bucket)
                     .args([

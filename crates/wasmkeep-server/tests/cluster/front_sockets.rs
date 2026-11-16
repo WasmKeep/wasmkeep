@@ -449,3 +449,19 @@ async fn a_hand_off_is_not_relayed_to_a_node_that_does_not_announce_it() {
     );
     assert_eq!(room_holder(&store, "after").await.as_deref(), Some("a"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_caps_count_a_local_front_handoff_once() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let node = room_node("a", dir.path(), &store, Duration::from_secs(30)).await;
+    let mut ws = hand_off(node.addr, "one", "/ws").await;
+    assert_eq!(echo(&mut ws, "one session").await, "one session");
+    assert_eq!(node.service.socket_sessions(), 1);
+    assert_eq!(node.service.websockets(), 1);
+    drop(ws);
+    eventually("local handoff releases its session", async || {
+        node.service.socket_sessions() == 0
+    })
+    .await;
+}

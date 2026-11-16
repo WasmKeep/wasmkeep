@@ -28,8 +28,10 @@ impl Drop for Node {
     }
 }
 
-fn counter_wasm() -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter");
+fn guest_wasm(example: &str, artifact: &str) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(example);
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(cargo)
         .current_dir(&root)
@@ -43,7 +45,7 @@ fn counter_wasm() -> PathBuf {
         .status()
         .unwrap();
     assert!(status.success(), "building examples/counter failed");
-    root.join("target/wasm32-wasip2/release/counter.wasm")
+    root.join(format!("target/wasm32-wasip2/release/{artifact}.wasm"))
 }
 
 #[derive(Debug)]
@@ -170,7 +172,11 @@ impl Drop for DescriptorSampler {
 
 #[test]
 fn a_low_open_files_limit_caps_residents_instead_of_failing() {
-    let wasm = counter_wasm();
+    let wasm = guest_wasm("counter", "counter");
+    let chat = guest_wasm("chat-room", "chat_room");
+    let metrics_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    drop(metrics_listener);
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("node.log");
     // Hard limit 1,024: the node cannot raise it, so it must fit inside.
@@ -185,6 +191,9 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
                 "--actor",
             ])
             .arg(format!("counter={}", wasm.display()))
+            .arg("--actor")
+            .arg(format!("chat={}", chat.display()))
+            .args(["--metrics-listen", &metrics_addr.to_string()])
             .arg("--data-dir")
             .arg(dir.path().join("data"))
             .arg("--cache-dir")
@@ -205,6 +214,29 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
         assert!(started.elapsed() < Duration::from_secs(60), "never started");
         std::thread::sleep(Duration::from_millis(100));
     }
+    // Keep upgraded transports open while SQLite residency churns. Raw
+    // clients suffice here; protocol behavior is covered by the socket suite.
+    let sockets: Vec<_> = (0..8).map(|_| {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(b"GET /actor/chat/room HTTP/1.1\r\nHost: test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            header.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&header).starts_with("HTTP/1.1 101"));
+        stream
+    }).collect();
+    let page = request(metrics_addr, "GET", "/metrics").unwrap();
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("wasmkeep_socket_sessions 8\n"));
+    assert!(
+        page.body
+            .contains("wasmkeep_socket_limit_requested 50000\n")
+    );
+    assert!(page.body.contains("wasmkeep_socket_limit_effective 144\n"));
     let descriptors = DescriptorSampler::start(node.0.id());
     const ACTORS: usize = 2000;
     const CLIENTS: usize = 8;
@@ -245,9 +277,19 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
     }
     // The clients use only eight concurrent connections, covered by the
     // reserved headroom; assert the actor budget, not the OS hard ceiling.
-    let (_, resident_limit) = wasmkeep_server::fds::budget(1024, 10_000, 900);
-    let descriptor_budget =
-        wasmkeep_server::fds::PER_ACTOR * resident_limit as u64 + wasmkeep_server::fds::RESERVED;
+    let resident_limit = wasmkeep_server::fds::budget(
+        1024,
+        wasmkeep_server::fds::Budget {
+            public_connections: 10_000,
+            resident_actors: 900,
+            socket_sessions: 50_000,
+            ..Default::default()
+        },
+    )
+    .resident_actors;
+    let descriptor_budget = wasmkeep_server::fds::PER_ACTOR * resident_limit as u64
+        + wasmkeep_server::fds::RESERVED
+        + 2 * sockets.len() as u64;
     if let Some(peak) = descriptors.finish() {
         assert!(
             peak as u64 <= descriptor_budget,
@@ -259,10 +301,19 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
             "verified 2,256 counter states; descriptor sampling unavailable on this platform"
         );
     }
+    assert_eq!(
+        request(addr, "GET", "/_wasmkeep/health").unwrap().status,
+        200
+    );
+    assert_eq!(
+        request(metrics_addr, "GET", "/metrics").unwrap().status,
+        200
+    );
+    drop(sockets);
     // And the node said why it capped them.
     let said = std::fs::read_to_string(&log).unwrap();
     assert!(
-        said.contains("open-files limit is low"),
+        said.contains("descriptor admission estimate reduced requested limits"),
         "missing descriptor-cap warning"
     );
     let lower = said.to_ascii_lowercase();

@@ -485,3 +485,12 @@ each step (connect, first byte, between bytes) waits at most 60 s (30 s
 unless the guest asks otherwise). A handler waits for each request it
 sends; to have several open at once, it sends them as one batch with its
 SDK's helper ([per language](languages.md#several-outbound-requests-at-once)).
+
+## Socket capacity
+
+Socket admission has configurable actor and process ceilings. A process
+counts local and relayed sessions, including upgrades still opening and
+sockets still closing. The actor ceiling applies on the actor's owner;
+a local front hand-off consumes one process session. Descriptor budgeting
+can lower the requested ceilings. See [socket admission options](reference/socket-limits.md)
+for defaults, refusal behavior and tuning.

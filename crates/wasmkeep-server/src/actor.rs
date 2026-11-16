@@ -117,6 +117,10 @@ struct Published {
 /// Settings for the actor service.
 #[derive(Debug, Clone)]
 pub struct ActorConfig {
+    /// Owner and application socket limits.
+    pub socket_limits: crate::SocketLimits,
+    /// Share this allowance across every service in the same process.
+    pub socket_budget: Arc<crate::SocketBudget>,
     /// Tenant all actors belong to (one tenant per process for now; see
     /// ROADMAP.md).
     pub tenant: String,
@@ -206,6 +210,8 @@ impl ActorConfig {
     /// Defaults with the given data directory.
     pub fn new(data_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
+            socket_limits: crate::SocketLimits::default(),
+            socket_budget: crate::SocketBudget::new(50_000, 50_000),
             tenant: "default".into(),
             app: crate::cluster::IMPLICIT_APP_NAME.into(),
             storage: StorageConfig::new(data_dir),
@@ -728,9 +734,25 @@ impl ActorService {
         self.inner.mailboxes.resident()
     }
 
+    /// Process socket sessions, including relays and upgrades in progress.
+    pub fn socket_sessions(&self) -> usize {
+        self.inner.sockets.budget.in_use()
+    }
+
     /// What the metrics page reads at scrape time.
     pub fn gauges(&self) -> crate::metrics::Gauges {
         crate::metrics::Gauges {
+            socket_sessions: self.socket_sessions(),
+            socket_requested: self.inner.sockets.budget.requested(),
+            socket_effective: self.inner.sockets.budget.effective(),
+            socket_actor_requested: self.inner.sockets.limits.per_actor,
+            socket_actor_effective: self
+                .inner
+                .sockets
+                .limits
+                .per_actor
+                .min(self.inner.sockets.limits.per_app)
+                .min(self.inner.sockets.budget.effective()),
             resident: self.resident(),
             websockets: self.websockets(),
             classes: self.class_names().len(),

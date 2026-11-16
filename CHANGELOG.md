@@ -11,6 +11,15 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.2, in no release yet.
 
+- **Configurable socket admission (0.5.0):** `serve` accepts
+  `--max-sockets-per-actor` (1,000 requested) and `--max-sockets-per-node`
+  (50,000 requested); zero disables admission. The node ceiling now includes
+  relays, tightening the previous owner-only accounting. Socket sessions join
+  the descriptor admission estimate and hold reservations through transport
+  cleanup. Over-capacity upgrades receive 503 with `Retry-After`. Startup
+  logs and metrics report requested/effective socket ceilings. See
+  [socket admission options](docs/reference/socket-limits.md).
+
 - **Actor export and read-only SQL** ([guide](docs/actor-data-access.md),
   ADR 0033): `actor export TENANT/APP CLASS/NAME -o FILE` and `actor sql`
   replay verified bucket history without contacting nodes or acquiring a

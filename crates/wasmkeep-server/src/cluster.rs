@@ -1066,6 +1066,7 @@ impl Cluster {
         owner: &str,
         req: Request<B>,
         opener: crate::websocket::Opener,
+        permit: crate::socket_limits::SessionPermit,
     ) -> Response<HyperOutgoingBody> {
         if never_forward(&req) {
             return unavailable("actor ownership is changing; retry\n");
@@ -1180,6 +1181,7 @@ impl Cluster {
         }
         let revoked = still.map(|s| crate::cluster_tls::until_untrusted(move || s()));
         tokio::spawn(async move {
+            let _permit = permit;
             let (client, owner_side) =
                 match tokio::join!(hyper::upgrade::on(req), hyper::upgrade::on(response)) {
                     (Ok(c), Ok(o)) => (c, o),

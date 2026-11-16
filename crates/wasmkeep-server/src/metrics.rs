@@ -701,6 +701,12 @@ pub(crate) fn inc(c: &AtomicU64) {
 /// Gauges read from the service at scrape time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gauges {
+    /// Process sessions, including relays and upgrades still opening.
+    pub socket_sessions: usize,
+    pub socket_requested: usize,
+    pub socket_effective: usize,
+    pub socket_actor_requested: usize,
+    pub socket_actor_effective: usize,
     /// Actors resident in memory.
     pub resident: usize,
     /// Open WebSockets.
@@ -769,6 +775,35 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "Actors resident in memory.",
         gauges.resident,
     );
+    for (name, help, value) in [
+        (
+            "wasmkeep_socket_sessions",
+            "Process socket sessions including relays and opening upgrades.",
+            gauges.socket_sessions,
+        ),
+        (
+            "wasmkeep_socket_limit_requested",
+            "Requested process socket sessions.",
+            gauges.socket_requested,
+        ),
+        (
+            "wasmkeep_socket_limit_effective",
+            "Effective process socket sessions after descriptor budgeting.",
+            gauges.socket_effective,
+        ),
+        (
+            "wasmkeep_socket_actor_limit_requested",
+            "Requested sockets per actor.",
+            gauges.socket_actor_requested,
+        ),
+        (
+            "wasmkeep_socket_actor_limit_effective",
+            "Sockets per actor bounded by app and process ceilings.",
+            gauges.socket_actor_effective,
+        ),
+    ] {
+        gauge(&mut out, name, help, value);
+    }
     gauge(
         &mut out,
         "wasmkeep_websockets_open",

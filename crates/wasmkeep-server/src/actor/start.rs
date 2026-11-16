@@ -120,7 +120,22 @@ impl ActorService {
         let factory_storage = storage.clone();
         let factory_alarms = alarms.clone();
         let factory_service = Arc::clone(&fire_to);
-        let sockets = Arc::new(Sockets::default());
+        let sockets = Arc::new(Sockets::new(
+            config.socket_limits,
+            Arc::clone(&config.socket_budget),
+        ));
+        tracing::info!(
+            requested_per_node = sockets.budget.requested(),
+            effective_per_node = sockets.budget.effective(),
+            requested_per_actor = sockets.limits.per_actor,
+            effective_per_actor = sockets
+                .limits
+                .per_actor
+                .min(sockets.limits.per_app)
+                .min(sockets.budget.effective()),
+            per_app = sockets.limits.per_app,
+            "socket admission limits"
+        );
         let factory_sockets = Arc::clone(&sockets);
         let secrets_blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let factory_blocked = Arc::clone(&secrets_blocked);

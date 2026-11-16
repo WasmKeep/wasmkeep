@@ -30,7 +30,11 @@ limits below are enforced by the code (each has a test), not aspirations.
   handler read none of it: it is never asked for, see
   [concepts](concepts.md)).
 - WebSockets: 1 MiB per client message, 256 messages or 4 MiB queued per
-  client, 1,000 sockets per actor and 50,000 per node, idle clients pinged
+  client, requested defaults of 1,000 sockets per actor and 50,000 sessions
+  per node (including relays), configurable with
+  [socket admission options](reference/socket-limits.md) and reduced by the
+  descriptor budget; zero disables admission. Over capacity: HTTP 503 with
+  `Retry-After`. Opening and closing sessions retain capacity; idle clients are pinged
   then closed.
   A socket is invisible to the actor's other events until
   `on-websocket-open` accepts it. Close reasons never carry host errors.
