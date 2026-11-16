@@ -284,8 +284,8 @@ impl ActorService {
         tracing::info!(classes_changed = changed, front_changed, "secrets applied");
     }
 
-    /// Actor ownership may be discovered only inside its mailbox. Preserve
-    /// ingress metadata until then, before routing strips reserved headers.
+    /// Preserve ingress metadata through read-only routing. Admission must
+    /// finish before a local mailbox is created, woken or reserved.
     pub(crate) fn prepare_ingress<B>(
         &self,
         req: &mut hyper::Request<B>,
@@ -396,6 +396,7 @@ impl ActorService {
         }
         let mut authenticated = false;
         let mut client_peer = None;
+        let mut charged = false;
         if let Some(cluster) = &self.inner.cluster {
             if let Some(signed) = cluster.is_internal(
                 req.method(),
@@ -416,7 +417,10 @@ impl ActorService {
                 authenticated = true;
             }
             if !authenticated {
-                client_peer = cluster.admission_received(req);
+                if let Some((ip, already_charged)) = cluster.admission_received(req) {
+                    client_peer = Some(ip);
+                    charged = already_charged;
+                }
                 // Do not collapse forwarded clients into the forwarder's IP.
                 if client_peer.is_none()
                     && (req.headers().contains_key(crate::cluster::ADMITTED)
@@ -429,7 +433,7 @@ impl ActorService {
                 }
             }
         }
-        if !limits.is_empty() && !authenticated {
+        if !limits.is_empty() && !authenticated && !charged {
             let result = self.inner.rate_limiter.admit(
                 &limits,
                 req.method().as_str(),
@@ -462,6 +466,14 @@ impl ActorService {
                 );
                 return Some(response);
             }
+        }
+        if !authenticated
+            && (charged
+                || limits
+                    .values()
+                    .any(|p| p.matches(req.method().as_str(), req.uri().path())))
+        {
+            req.extensions_mut().insert(crate::cluster::IngressCharged);
         }
         req.extensions_mut().insert(crate::front::IngressFront(
             read_lock(&self.inner.front).clone(),
@@ -654,5 +666,14 @@ pub(super) fn finish_ingress<B>(
 ) -> Option<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>> {
     let DeferredIngress(service, mut original) =
         req.extensions_mut().remove::<DeferredIngress>()?;
-    service.admit_ingress(&mut original)
+    let response = service.admit_ingress(&mut original);
+    if response.is_none()
+        && original
+            .extensions()
+            .get::<crate::cluster::IngressCharged>()
+            .is_some()
+    {
+        req.extensions_mut().insert(crate::cluster::IngressCharged);
+    }
+    response
 }

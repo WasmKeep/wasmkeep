@@ -6,7 +6,6 @@ use std::sync::{
     Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicUsize, Ordering},
 };
-#[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
 
@@ -34,6 +33,7 @@ type Key = (String, [u8; 32]);
 struct Table {
     buckets: HashMap<Key, Bucket>,
     lru: BTreeSet<(u64, Key)>,
+    refilled: BTreeSet<(Instant, Key)>,
     clock: u64,
     cap: usize,
     requested: usize,
@@ -41,23 +41,33 @@ struct Table {
 }
 impl Table {
     fn evict(&mut self, now: Instant, protected: &[Key]) {
-        let candidate = self.lru.iter().filter(|(_, k)| !protected.contains(k));
-        let chosen = candidate
-            .clone()
-            .find(|(_, k)| {
-                let b = &self.buckets[k];
-                b.credit.saturating_add(
-                    now.saturating_duration_since(b.at)
-                        .as_nanos()
-                        .saturating_mul(u128::from(b.policy.rate)),
-                ) >= u128::from(b.policy.burst) * b.unit()
-            })
-            .or_else(|| candidate.into_iter().next())
-            .cloned();
-        if let Some((used, key)) = chosen {
-            self.lru.remove(&(used, key.clone()));
-            self.buckets.remove(&key);
+        // At most MAX_POLICIES protected entries can precede the candidate.
+        // Deadline order finds a full bucket without scanning depleted LRU entries.
+        let full = self
+            .refilled
+            .iter()
+            .take_while(|(at, _)| *at <= now)
+            .find(|(_, k)| !protected.contains(k))
+            .map(|(_, k)| k.clone());
+        let chosen = full.or_else(|| {
+            self.lru
+                .iter()
+                .find(|(_, k)| !protected.contains(k))
+                .map(|(_, k)| k.clone())
+        });
+        if let Some(key) = chosen
+            && let Some(b) = self.buckets.remove(&key)
+        {
+            self.lru.remove(&(b.used, key.clone()));
+            self.refilled.remove(&(b.full_at(), key));
             KEYS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    fn update(&mut self, key: &Key, policy: &Policy, now: Instant) {
+        if let Some(b) = self.buckets.get_mut(key) {
+            self.refilled.remove(&(b.full_at(), key.clone()));
+            b.update(policy, now);
+            self.refilled.insert((b.full_at(), key.clone()));
         }
     }
     fn touch(&mut self, key: &Key) {
@@ -96,6 +106,10 @@ impl Default for Limiter {
     }
 }
 impl Bucket {
+    fn full_at(&self) -> Instant {
+        let remaining = (u128::from(self.policy.burst) * self.unit()).saturating_sub(self.credit);
+        self.at + Duration::from_nanos(remaining.div_ceil(u128::from(self.policy.rate)) as u64)
+    }
     fn unit(&self) -> u128 {
         u128::from(self.policy.seconds) * 1_000_000_000
     }
@@ -125,6 +139,7 @@ impl Drop for Limiter {
             KEYS.fetch_sub(t.buckets.len(), Ordering::Relaxed);
             t.buckets.clear();
             t.lru.clear();
+            t.refilled.clear();
         }
         rebalance(&mut tables);
     }
@@ -169,6 +184,11 @@ impl Limiter {
             }
         });
         KEYS.fetch_sub(before - buckets.buckets.len(), Ordering::Relaxed);
+        buckets.refilled = buckets
+            .buckets
+            .iter()
+            .map(|(k, b)| (b.full_at(), k.clone()))
+            .collect();
         buckets.lru = buckets
             .buckets
             .iter()
@@ -184,7 +204,6 @@ impl Limiter {
         peer: Option<std::net::IpAddr>,
         now: Instant,
     ) -> Result<(), Rejection> {
-        self.activate(!policies.is_empty());
         let mut matched = Vec::with_capacity(policies.len());
         for (name, policy) in policies {
             if !policy.matches(method, path) {
@@ -234,12 +253,12 @@ impl Limiter {
         }
         let mut retry = 0;
         for (key, policy) in &matched {
-            if let Some(b) = buckets.buckets.get_mut(key) {
-                b.update(policy, now);
-                if b.credit < b.unit() {
-                    let nanos = (b.unit() - b.credit).div_ceil(u128::from(policy.rate));
-                    retry = retry.max(nanos.div_ceil(1_000_000_000) as u64);
-                }
+            buckets.update(key, policy, now);
+            if let Some(b) = buckets.buckets.get(key)
+                && b.credit < b.unit()
+            {
+                let nanos = (b.unit() - b.credit).div_ceil(u128::from(policy.rate));
+                retry = retry.max(nanos.div_ceil(1_000_000_000) as u64);
             }
         }
         if retry > 0 {
@@ -256,6 +275,10 @@ impl Limiter {
         }
         KEYS.fetch_add(missing, Ordering::Relaxed);
         for (key, policy) in matched {
+            if let Some(b) = buckets.buckets.get(&key) {
+                let at = b.full_at();
+                buckets.refilled.remove(&(at, key.clone()));
+            }
             let b = buckets
                 .buckets
                 .entry(key.clone())
@@ -266,6 +289,8 @@ impl Limiter {
                     used: 0,
                 });
             b.credit -= b.unit();
+            let full_at = b.full_at();
+            buckets.refilled.insert((full_at, key.clone()));
             buckets.touch(&key);
         }
         Ok(())
@@ -275,6 +300,11 @@ impl Limiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn active_limiter(cap: usize) -> Limiter {
+        let l = Limiter::with_cap(cap);
+        l.reconcile(&rules("1/h", 1), Instant::now());
+        l
+    }
     fn rules(rate: &str, burst: u32) -> Policies {
         [(
             "login".into(),
@@ -293,9 +323,47 @@ mod tests {
         )
     }
     #[test]
+    fn fix3_refill_index_tracks_debits_rejections_edits_and_eviction() {
+        let l = active_limiter(2);
+        let n = Instant::now();
+        let p = rules("1/h", 2);
+        for (offset, ip) in [(0, 1), (0, 2), (1, 1), (2, 1), (3600, 3)] {
+            let _ = admit(&l, &p, n + Duration::from_secs(offset), ip);
+            let table = l.buckets.lock().unwrap();
+            assert_eq!(table.refilled.len(), table.buckets.len());
+            for (key, b) in &table.buckets {
+                assert!(table.refilled.contains(&(b.full_at(), key.clone())));
+            }
+        }
+        l.reconcile(&rules("2/s", 4), n + Duration::from_secs(3600));
+        let table = l.buckets.lock().unwrap();
+        for (key, b) in &table.buckets {
+            assert!(table.refilled.contains(&(b.full_at(), key.clone())));
+        }
+        drop(table);
+        l.reconcile(&Policies::new(), n + Duration::from_secs(3601));
+        assert!(l.buckets.lock().unwrap().refilled.is_empty());
+    }
+    #[test]
+    fn fix3_admission_does_not_lock_registry() {
+        let l = Arc::new(active_limiter(APP_KEYS));
+        let p = rules("1/h", 1);
+        let n = Instant::now();
+        l.reconcile(&p, n);
+        let registry = TABLES.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(admit(&l, &p, n, 1)).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_millis(200));
+        drop(registry);
+        worker.join().unwrap();
+        assert_eq!(result, Ok(Ok(())));
+    }
+    #[test]
     fn fix2_unconfigured_apps_do_not_enable_identity_cycling() {
         let _idle: Vec<_> = (0..999).map(|_| Limiter::default()).collect();
-        let l = Limiter::default();
+        let l = active_limiter(APP_KEYS);
         let p = rules("1/h", 1);
         let n = Instant::now();
         for round in 0..3 {
@@ -322,7 +390,7 @@ mod tests {
     }
     #[test]
     fn fix2_pressure_prefers_refilled_over_depleted() {
-        let l = Limiter::with_cap(2);
+        let l = active_limiter(2);
         let n = Instant::now();
         let p = rules("1/h", 1);
         assert_eq!(admit(&l, &p, n, 1), Ok(()));
@@ -335,7 +403,7 @@ mod tests {
     }
     #[test]
     fn review_ipv6_subnet_shares_quota() {
-        let l = Limiter::default();
+        let l = active_limiter(APP_KEYS);
         let p = rules("1/h", 1);
         let n = Instant::now();
         for (ip, expected) in [
@@ -357,7 +425,7 @@ mod tests {
     }
     #[test]
     fn review_pressure_evicts_lru_without_refilling_survivors() {
-        let l = Limiter::with_cap(2);
+        let l = active_limiter(2);
         let p = rules("1/h", 1);
         let n = Instant::now();
         assert_eq!(admit(&l, &p, n, 1), Ok(()));
@@ -370,7 +438,7 @@ mod tests {
     }
     #[test]
     fn review_capacity_does_not_refill_unrelated_buckets() {
-        let l = Limiter::with_cap(2);
+        let l = active_limiter(2);
         let p = rules("1/h", 1);
         let n = Instant::now();
         assert_eq!(admit(&l, &p, n, 1), Ok(()));
@@ -382,7 +450,7 @@ mod tests {
     }
     #[test]
     fn review_apps_have_reserved_capacity() {
-        let apps: Vec<_> = (0..17).map(|_| Limiter::default()).collect();
+        let apps: Vec<_> = (0..17).map(|_| active_limiter(APP_KEYS)).collect();
         let p = rules("1/h", 1);
         let n = Instant::now();
         for l in &apps[..16] {
@@ -402,7 +470,7 @@ mod tests {
     }
     #[test]
     fn fractional_refill_and_rounded_retry() {
-        let l = Limiter::default();
+        let l = active_limiter(APP_KEYS);
         let p = rules("3/m", 1);
         let n = Instant::now();
         assert_eq!(admit(&l, &p, n, 1), Ok(()));
@@ -418,7 +486,7 @@ mod tests {
     }
     #[test]
     fn overlapping_rules_do_not_partially_debit() {
-        let l = Limiter::default();
+        let l = active_limiter(APP_KEYS);
         let n = Instant::now();
         let mut p = rules("1/s", 2);
         p.insert(
@@ -433,7 +501,7 @@ mod tests {
     }
     #[test]
     fn capacity_evicts_least_recently_used_keys() {
-        let l = Limiter::with_cap(2);
+        let l = active_limiter(2);
         let p = rules("1/s", 1);
         let n = Instant::now();
         assert_eq!(admit(&l, &p, n, 1), Ok(()));
@@ -444,7 +512,7 @@ mod tests {
     }
     #[test]
     fn edits_do_not_grant_a_new_burst() {
-        let l = Limiter::default();
+        let l = active_limiter(APP_KEYS);
         let n = Instant::now();
         assert_eq!(admit(&l, &rules("1/s", 1), n, 1), Ok(()));
         assert_eq!(admit(&l, &rules("2/s", 10), n, 1), Err(Rejection::Quota(1)));
@@ -455,7 +523,7 @@ mod tests {
     }
     #[test]
     fn high_cardinality_headers_stay_bounded_and_private() {
-        let l = Limiter::with_cap(16);
+        let l = active_limiter(16);
         let p: Policies = [(
             "api".into(),
             Policy::parse("/*", "header", Some("x-client-id"), "1/h", 1).unwrap(),
@@ -478,7 +546,7 @@ mod tests {
 
     #[test]
     fn maximum_rates_refill_without_overflow_or_clock_regression() {
-        let l = Limiter::default();
+        let l = active_limiter(APP_KEYS);
         let n = Instant::now();
         let p = rules("1000000/h", 1);
         assert_eq!(admit(&l, &p, n, 1), Ok(()));
@@ -502,7 +570,7 @@ mod tests {
 
     #[test]
     fn concurrent_admission_and_long_idle() {
-        let l = std::sync::Arc::new(Limiter::default());
+        let l = std::sync::Arc::new(active_limiter(APP_KEYS));
         let n = Instant::now();
         let threads: Vec<_> = (0..32)
             .map(|_| {

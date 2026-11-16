@@ -262,15 +262,25 @@ public actor routes and WebSocket handshakes. Forged `x-wasmkeep-*` headers
 do not exempt public requests. Cluster-port traffic is authenticated by
 mutual TLS. Quotas are local to a node and reset when its process restarts.
 
-Actor ownership resolution may precede admission; guest execution and body reads
-still follow it. A forwarding node does not charge public requests or WebSocket handshakes. When
-its cluster secret is already loaded, it replaces client-supplied proofs with a
-domain-separated signed client identity: the normalized TCP IP key (IPv6 by its 64-bit prefix,
-IPv4-mapped addresses equivalent to IPv4), bound to the destination owner, method,
-path and query, app, timestamp, and end-to-end header values. The owner verifies
-this proof and charges its own policies using that IP or the policy's header key.
-Replays are charged again; there is no ingress replay store or receipt throughput
-ceiling. The proof grants no actor privileges and does not authenticate the body.
+Read-only owner hints may precede admission. If routing selects a remote owner,
+that owner charges the request using a signed client identity. Otherwise the
+receiving node admits before creating or waking an actor, acquiring ownership,
+or reserving a mailbox slot, for both HTTP requests and WebSocket handshakes.
+A later ownership race may still cause forwarding: a charged request carries
+an authenticated charged bit in that identity and is not charged again by the
+owner. Admission may spend quota even if acquisition or execution subsequently
+fails; races may over-charge, but cannot bypass admission before local actor work.
+
+When its cluster secret is already loaded, a forwarder replaces client-supplied
+proofs with a domain-separated signed client identity: the normalized TCP IP key
+(IPv6 by its 64-bit prefix, IPv4-mapped addresses equivalent to IPv4), bound to
+the destination owner, method, path and query, app, timestamp, end-to-end header
+values and charged bit. An uncharged identity makes the owner apply its own
+policies using that IP or the policy's header key. Only successful admission
+matching at least one local rule sets the charged bit. Replayed uncharged proofs
+consume owner quota again; charged proofs retain their exemption within the
+signature window. There is no ingress replay store or receipt throughput ceiling.
+The proof grants no actor privileges and does not authenticate the body.
 Missing, invalid or expired proofs on forwarded requests return 503 when the
 owner has policies. Without policies, unsigned forwards retain their previous
 behavior. Signing never fetches a cold secret. Clock skew outside the signature
@@ -288,9 +298,14 @@ rotate identities. Header values are hashed and absent from logs and metric labe
 
 Matching is case-sensitive, excludes the query, decodes unreserved percent
 escapes, canonicalizes remaining escape hex to uppercase, and collapses repeated
-slashes and dot segments (`.` and `..`, including percent-encoded forms). Exact rules ignore trailing slashes. A `GET` rule also covers `HEAD`;
-a `HEAD` rule covers only `HEAD`. Actor names use the router's full percent
-and UTF-8 decoding, then canonical percent encoding to preserve segment boundaries.
+slashes outside actor routing identity. Both the raw dot-segment form and the
+resolved form of requests and rules are matched; a match in either charges once.
+Dot segments include percent-encoded `.` and `..`. Under `/actor/`, class and name
+are split exactly as the actor router splits them: dots never remove or alter
+those segments, and resolution of the remaining path cannot climb above the
+actor name. Actor names use the router's full percent and UTF-8 decoding, then
+canonical percent encoding to preserve segment boundaries. Exact rules ignore
+trailing slashes. A `GET` rule also covers `HEAD`; a `HEAD` rule covers only `HEAD`.
 Other reserved escapes stay encoded: the paths in `https://example.test/a%2Fb`
 and `https://example.test/a/b` differ. Prefix rules retain their final slash;
 a prefix covers that slash and descendants, not the path without the slash. This normalization is only for policy matching; it does not rewrite
@@ -300,8 +315,11 @@ Only app services with policies share the 65,536-bucket process budget, capped
 at 4,096 buckets per service. Publishing or removing policies and dropping a
 service rebalance shares. Under pressure, fully refilled buckets are evicted
 first; only then are depleted buckets evicted in least-recently-used order.
-Current request buckets are protected. Refill eligibility is computed without
-changing unrelated buckets' credits or clocks. Rejected quota attempts count as
+Current request buckets are protected. A separate ordered refill-deadline index
+selects eligible full buckets in O(log n) eviction work (with at most 32 protected
+keys); depleted fallback uses the LRU index. Unrelated credits and clocks are
+unchanged. Registry activation runs only during policy reconciliation, including
+initial publication; request admission never locks the process-wide registry. Rejected quota attempts count as
 uses. Evicted identities get a fresh burst if they return, so cycling more keys
 than the actual policy-service share can still weaken enforcement; these are
 bounded admission controls, not durable quotas.

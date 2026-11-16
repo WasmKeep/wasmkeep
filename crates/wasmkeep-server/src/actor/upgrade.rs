@@ -212,6 +212,9 @@ impl ActorService {
                 }
                 return response;
             }
+            if let Some(response) = super::deploys::finish_ingress(&mut req) {
+                return response;
+            }
             // Check admission before sending 101, including open classes. A
             // later eviction race is reported as WebSocket try-again (1013).
             let probe = self
@@ -321,9 +324,6 @@ impl ActorService {
                 }
             }
             break;
-        }
-        if let Some(response) = super::deploys::finish_ingress(&mut req) {
-            return response;
         }
         if let Err(e) = self.inner.sockets.can_open(&address) {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = ?e, "websocket refused");

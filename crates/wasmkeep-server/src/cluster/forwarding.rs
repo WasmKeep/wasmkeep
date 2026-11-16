@@ -200,7 +200,10 @@ pub(crate) fn never_forward<B>(req: &Request<B>) -> bool {
         || req.extensions().get::<ArrivedOnClusterPort>().is_some()
 }
 
-// Domain-separated client identity proof; replay is charged again by the owner.
+// Domain-separated client identity proof; uncharged replay consumes owner quota.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IngressCharged;
+
 pub(crate) const ADMITTED: &str = "x-wasmkeep-admitted";
 
 fn identity_headers(headers: &hyper::HeaderMap) -> String {
@@ -247,7 +250,8 @@ impl Cluster {
         };
         let secret = format!("wasmkeep-ingress-identity-v2:{secret}");
         let ts = now_ms();
-        let nonce = format!("{:032x}", u128::from(ip));
+        let charged = u8::from(req.extensions().get::<IngressCharged>().is_some());
+        let nonce = format!("{charged}{:032x}", u128::from(ip));
         let body = identity_headers(req.headers());
         let mac = signature(
             &secret,
@@ -267,7 +271,10 @@ impl Cluster {
         Ok(())
     }
 
-    pub(crate) fn admission_received<B>(&self, req: &Request<B>) -> Option<std::net::IpAddr> {
+    pub(crate) fn admission_received<B>(
+        &self,
+        req: &Request<B>,
+    ) -> Option<(std::net::IpAddr, bool)> {
         if self.refuse_plaintext && req.extensions().get::<ArrivedOnClusterPort>().is_none() {
             return None;
         }
@@ -291,14 +298,19 @@ impl Cluster {
             return None;
         }
         let encoded = given.split(' ').nth(2)?;
-        if encoded.len() != 32 {
-            return None;
-        }
+        let (encoded, charged) = match encoded.len() {
+            32 => (encoded, false), // Previous uncharged identity format.
+            33 if encoded.starts_with('0') || encoded.starts_with('1') => {
+                (&encoded[1..], encoded.starts_with('1'))
+            }
+            _ => return None,
+        };
         let ip = std::net::Ipv6Addr::from(u128::from_str_radix(encoded, 16).ok()?);
-        Some(
+        Some((
             ip.to_ipv4_mapped()
                 .map_or(std::net::IpAddr::V6(ip), std::net::IpAddr::V4),
-        )
+            charged,
+        ))
     }
 }
 
@@ -311,6 +323,36 @@ mod admission_tests {
         h.insert(ADMITTED, "forged".parse().unwrap());
         strip_hop_by_hop(&mut h, Framing::Keep);
         assert!(!h.contains_key(ADMITTED));
+    }
+    #[tokio::test]
+    async fn fix3_charged_identity_is_signed_and_tamper_evident() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        req.extensions_mut().insert(IngressCharged);
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster.admission_received(&req),
+            Some(("192.0.2.1".parse().unwrap(), true))
+        );
+        assert!(
+            cluster
+                .is_internal(req.method(), "/actor/c/a", req.headers(), false)
+                .is_none()
+        );
+        let proof = req.headers()[ADMITTED].to_str().unwrap();
+        let mut fields: Vec<_> = proof.split(' ').map(str::to_owned).collect();
+        fields[2].replace_range(..1, "0");
+        req.headers_mut()
+            .insert(ADMITTED, fields.join(" ").parse().unwrap());
+        assert!(cluster.admission_received(&req).is_none());
     }
     #[tokio::test]
     async fn fix2_cold_secret_forward_does_not_fetch_or_sign() {
@@ -348,7 +390,7 @@ mod admission_tests {
             .unwrap();
         assert_eq!(
             cluster.admission_received(&req),
-            Some("2001:db8:1:2::".parse().unwrap())
+            Some(("2001:db8:1:2::".parse().unwrap(), false))
         );
         let policies = [(
             "test".into(),
@@ -357,6 +399,7 @@ mod admission_tests {
         .into();
         let limiter = crate::rate_limit::Limiter::default();
         let now = std::time::Instant::now();
+        limiter.reconcile(&policies, now);
         for expected in [Ok(()), Err(crate::rate_limit::Rejection::Quota(3600))] {
             assert_eq!(
                 limiter.admit(
@@ -364,7 +407,7 @@ mod admission_tests {
                     "GET",
                     "/actor/c/a",
                     req.headers(),
-                    cluster.admission_received(&req),
+                    cluster.admission_received(&req).map(|(ip, _)| ip),
                     now
                 ),
                 expected

@@ -335,7 +335,7 @@ impl ActorService {
     pub(super) async fn dispatch<B>(
         &self,
         address: ActorAddress,
-        req: Request<B>,
+        mut req: Request<B>,
         chain: Chain,
         outside: bool,
     ) -> Result<Response<HyperOutgoingBody>, Box<Handback<B>>>
@@ -349,6 +349,9 @@ impl ActorService {
                 req,
                 elsewhere: false,
             }));
+        }
+        if let Some(response) = super::deploys::finish_ingress(&mut req) {
+            return Ok(response);
         }
         let (response_tx, response_rx) = oneshot::channel();
         let event = self.inner.mailboxes.submit_wait(

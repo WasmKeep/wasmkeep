@@ -1112,6 +1112,9 @@ impl Cluster {
             if let Some(peer) = req.extensions().get::<crate::http::PeerAddress>().copied() {
                 out.extensions_mut().insert(peer);
             }
+            if req.extensions().get::<IngressCharged>().is_some() {
+                out.extensions_mut().insert(IngressCharged);
+            }
             if self.sign_admission(owner, &path, &mut out).await.is_err() {
                 return unavailable("cannot authenticate ingress admission; retry\n");
             }

@@ -566,3 +566,173 @@ async fn review_decoded_policy_survives_component_outage() {
     assert_eq!(send(addr, "GET", "/missing", "").await.status, 503);
     drop(stop);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fix3_rejection_never_creates_an_owner_record() {
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store: Arc<dyn ObjectStore> = Arc::new(CountOwnerWrites(
+        Arc::new(InMemory::new()),
+        writes.clone(),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    deploy(&store, policy("/*", "header")).await;
+    let data = tempfile::tempdir().unwrap();
+    let node = super::front_deploys::front_app_node("fix3", data.path(), &store, None).await;
+    for attempt in 0..100 {
+        let r = send(
+            node.addr,
+            "GET",
+            "/actor/t/warm/durable",
+            &format!("x-client-id: warm-{attempt}\r\n"),
+        )
+        .await;
+        if r.status == 200 {
+            break;
+        }
+        assert!(attempt < 99, "warmup failed: {}", r.status);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        send(node.addr, "GET", "/self", "x-client-id: client\r\n")
+            .await
+            .status,
+        200
+    );
+    let before = writes.load(Ordering::Relaxed);
+    let resident = node.service.resident();
+    assert_eq!(
+        send(
+            node.addr,
+            "GET",
+            "/actor/t/rejected/durable",
+            "x-client-id: client\r\n"
+        )
+        .await
+        .status,
+        429
+    );
+    let socket = send(node.addr, "GET", "/actor/t/rejected-socket", "x-client-id: client\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n").await;
+    assert_eq!(socket.status, 429);
+    assert_eq!(
+        node.service.resident(),
+        resident,
+        "rejection allocated a mailbox"
+    );
+    assert_eq!(
+        writes.load(Ordering::Relaxed),
+        before,
+        "rejected request wrote ownership"
+    );
+}
+#[derive(Debug)]
+struct CountOwnerWrites(
+    Arc<dyn ObjectStore>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<AtomicBool>,
+);
+impl std::fmt::Display for CountOwnerWrites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "manifest-outage")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for CountOwnerWrites {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        b: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if p.as_ref().contains("/owners/") {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
+        self.0.put_opts(p, b, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if p.as_ref().ends_with("/owners/t/race") && self.2.swap(false, Ordering::AcqRel) {
+            return Err(object_store::Error::NotFound {
+                path: p.to_string(),
+                source: "owner became visible after routing".into(),
+            });
+        }
+        self.0.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.0.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.0.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &object_store::path::Path,
+        b: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(a, b, o).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fix3_charged_before_owner_race_is_not_charged_twice() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store, policy("/*", "header")).await;
+    let miss = Arc::new(AtomicBool::new(false));
+    let racing: Arc<dyn ObjectStore> = Arc::new(CountOwnerWrites(
+        store.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        miss.clone(),
+    ));
+    let da = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let a = super::front_deploys::front_app_node("race-a", da.path(), &store, None).await;
+    let b = super::front_deploys::front_app_node("race-b", db.path(), &racing, None).await;
+    for (node, path) in [(&a, "/actor/t/race/durable"), (&b, "/actor/t/warm/durable")] {
+        for attempt in 0..100 {
+            let r = send(
+                node.addr,
+                "GET",
+                path,
+                &format!("x-client-id: warm-{attempt}\r\n"),
+            )
+            .await;
+            if r.status == 200 {
+                break;
+            }
+            assert!(attempt < 99, "warmup failed: {}", r.status);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let header = "x-client-id: racing-client\r\n";
+    assert_eq!(send(a.addr, "GET", "/self", header).await.status, 200);
+    miss.store(true, Ordering::Release);
+    let r = send(b.addr, "GET", "/actor/t/race/durable", header).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(!miss.load(Ordering::Acquire));
+    assert_eq!(send(b.addr, "GET", "/self", header).await.status, 429);
+}

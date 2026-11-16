@@ -235,6 +235,14 @@ impl ActorService {
                 app_deleted: tokio::sync::watch::Sender::new(false),
             }),
         };
+        service.inner.rate_limiter.reconcile(
+            &service
+                .inner
+                .limits
+                .read()
+                .unwrap_or_else(|p| p.into_inner()),
+            std::time::Instant::now(),
+        );
         let _ = fire_to.set(Arc::downgrade(&service.inner));
         tokio::spawn(sample_disk(Arc::downgrade(&service.inner), data_dir));
         // In a cluster, deliver alarms whose owner never fired them.

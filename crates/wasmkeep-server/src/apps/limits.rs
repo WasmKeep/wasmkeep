@@ -117,16 +117,20 @@ impl Policy {
         })
     }
     pub(crate) fn matches(&self, method: &str, path: &str) -> bool {
-        let path = match_path(path);
-        let rule = match_path(&self.path);
+        let paths = [match_path(path, false), match_path(path, true)];
+        let rules = [match_path(&self.path, false), match_path(&self.path, true)];
         self.method
             .as_deref()
             .is_none_or(|m| m == method || (m == "GET" && method == "HEAD"))
-            && if self.prefix {
-                path.starts_with(&rule)
-            } else {
-                path.trim_end_matches('/') == rule.trim_end_matches('/')
-            }
+            && paths.iter().any(|path| {
+                rules.iter().any(|rule| {
+                    if self.prefix {
+                        path.starts_with(rule)
+                    } else {
+                        path.trim_end_matches('/') == rule.trim_end_matches('/')
+                    }
+                })
+            })
     }
     pub(crate) fn line(&self, name: &str) -> String {
         format!(
@@ -176,7 +180,27 @@ impl Policy {
     }
 }
 /// Matching only: routing and the guest-visible URI are not rewritten.
-fn match_path(path: &str) -> String {
+fn match_path(path: &str, resolve: bool) -> String {
+    // Split exactly as ActorTarget does. Class and name are routing identity,
+    // never dot segments; only the unresolved rest can be normalized.
+    if let Some(tail) = path.strip_prefix("/actor/")
+        && let Some((class, tail)) = tail.split_once('/')
+    {
+        let (name, rest) = tail.split_once('/').map_or((tail, ""), |(n, r)| (n, r));
+        let name = crate::http::percent_decode(name)
+            .map(|n| crate::cluster::percent_encode(&n))
+            .unwrap_or_else(|| name.to_owned());
+        let suffix = if tail.contains('/') {
+            normalize_path(&format!("/{rest}"), resolve)
+        } else {
+            String::new()
+        };
+        return format!("/actor/{class}/{name}{suffix}");
+    }
+    normalize_path(path, resolve)
+}
+
+fn normalize_path(path: &str, resolve: bool) -> String {
     let mut out = String::with_capacity(path.len());
     let mut trailing_dot = false;
     for segment in path.split('/').filter(|s| !s.is_empty()) {
@@ -200,25 +224,17 @@ fn match_path(path: &str) -> String {
                 i += 1;
             }
         }
-        trailing_dot = normalized == "." || normalized == "..";
-        if normalized == "." {
+        trailing_dot = resolve && (normalized == "." || normalized == "..");
+        if resolve && normalized == "." {
             continue;
         }
-        if normalized == ".." {
+        if resolve && normalized == ".." {
             if let Some(index) = out.rfind('/') {
                 out.truncate(index);
             }
             continue;
         }
         out.push('/');
-        // Actor routing decodes the entire name, including reserved bytes
-        // and UTF-8. Re-encode to preserve the name/path segment boundary.
-        if out.starts_with("/actor/")
-            && out.bytes().filter(|b| *b == b'/').count() == 3
-            && let Some(name) = crate::http::percent_decode(segment)
-        {
-            normalized = crate::cluster::percent_encode(&name);
-        }
         out.push_str(&normalized);
     }
     if path.ends_with('/') || trailing_dot || out.is_empty() {
@@ -241,6 +257,21 @@ pub fn validate(policies: &Policies) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn fix3_actor_boundary_and_raw_front_paths() {
+        let p = Policy::parse("POST /actor/chat/*", "ip", None, "1/h", 1).unwrap();
+        for path in [
+            "/actor/chat/abc/../../x",
+            "/actor/chat/abc/%2e%2e/%2e%2e/x",
+            "/actor/chat/../x",
+        ] {
+            assert!(p.matches("POST", path), "{path}");
+        }
+        let p = Policy::parse("/admin/*", "ip", None, "1/h", 1).unwrap();
+        assert!(p.matches("GET", "/admin/../public"));
+        let p = Policy::parse("/public", "ip", None, "1/h", 1).unwrap();
+        assert!(p.matches("GET", "/admin/../public"));
+    }
+    #[test]
     fn fix2_dot_segments_match_in_both_directions() {
         for alias in ["/a/../login", "/./login", "/a/%2e%2E/login", "/%2e/login"] {
             let p = Policy::parse("/login", "ip", None, "1/h", 1).unwrap();
@@ -249,7 +280,7 @@ mod tests {
             assert!(p.matches("GET", "/login"), "{alias}");
         }
         let p = Policy::parse("/admin/*", "ip", None, "1/h", 1).unwrap();
-        assert!(!p.matches("GET", "/admin/../public"));
+        assert!(p.matches("GET", "/admin/../public"));
         for path in ["/admin/.", "/admin/x/..", "/admin/%2e", "/admin/x/%2e."] {
             assert!(p.matches("GET", path), "{path}");
         }

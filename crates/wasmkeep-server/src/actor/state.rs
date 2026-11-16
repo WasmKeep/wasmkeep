@@ -311,7 +311,7 @@ impl ActorState {
     /// the request back with the owner's id.
     pub(super) async fn owned_request<B>(
         &mut self,
-        mut req: Request<B>,
+        req: Request<B>,
         response_tx: oneshot::Sender<Outcome<B>>,
         chain: Chain,
         outside: bool,
@@ -323,12 +323,6 @@ impl ActorState {
             return;
         }
         let admission = self.admit(outside).await;
-        if !matches!(admission, Ok(Admitted::Yes))
-            && let Some(response) = super::deploys::finish_ingress(&mut req)
-        {
-            let _ = response_tx.send(Outcome::Served(response));
-            return;
-        }
         match admission {
             Ok(Admitted::Yes) => {}
             Ok(Admitted::Missing) => {
@@ -354,16 +348,6 @@ impl ActorState {
             }
         }
         let ownership = self.ensure_owner().await;
-        // Only a handback is forwarded. Local refusals retain ingress quota
-        // ordering, without charging a request sent to another owner.
-        if !matches!(
-            ownership,
-            Err(OwnershipError::NotOwner { .. } | OwnershipError::Elsewhere { .. })
-        ) && let Some(response) = super::deploys::finish_ingress(&mut req)
-        {
-            let _ = response_tx.send(Outcome::Served(response));
-            return;
-        }
         match ownership {
             // Asked again after the wait for ownership (a takeover's restore
             // can be long): whoever sent it may have gone meanwhile.
