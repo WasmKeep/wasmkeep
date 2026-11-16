@@ -44,7 +44,7 @@ cp -R "$example/src" "$example/tsconfig.json" .
 printf '{ "name": "pack-test", "private": true, "type": "module" }\n' > package.json
 npm install --loglevel=error --no-audit --no-fund "$tarball" "typescript@$typescript"
 # What the NOTICE names, and what a consumer imports, is in the package.
-for f in LICENSE NOTICE README.md wit/deps types/actor.d.ts src/front.ts; do
+for f in LICENSE NOTICE README.md wit/deps types/actor.d.ts src/front.ts src/pure.ts; do
   [ -e "node_modules/@wasmkeep/sdk/$f" ] || { echo "pack-test: $f is not in the package" >&2; exit 1; }
 done
 

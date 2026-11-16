@@ -48,6 +48,11 @@ export {
 } from "./request";
 /** Synchronous outbound HTTP (`http.fetch(url, {...})`); see ./http.ts. */
 export * as http from "./http";
+/** Typed operation contracts, codecs, the structured error envelope and
+ * the typed client (`actorClient()`); see ./pure.ts and docs/typed-clients.md. */
+export * from "./pure";
+export { actorClient, actorTransport } from "./transport";
+
 
 /** A front: its request handler. */
 export interface FrontDefinition {

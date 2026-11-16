@@ -73,6 +73,11 @@ goes from an empty directory to an actor whose state survives a restart.
   or a client), and the `front` module (below).
 - `http`: the request handler, helpers to answer, and outbound requests
   (`http::fetch`, and `http::fetch_all` for several at once).
+- `problem`: the structured error envelope an actor may answer a failure with
+  (`Problem`, `problem::response`, `problem::classify`), the same bytes the
+  TypeScript SDK's typed clients write and read
+  (`docs/typed-clients.md` in the repository).
+  It works in a front too.
 - `kv`, `queue`, `workflow`: a key-value store, queues and durable workflows,
   each built from actors
   ([KV and queues](https://github.com/WasmKeep/wasmkeep/blob/v0.4.2/docs/kv-and-queues.md),

@@ -25,6 +25,7 @@
 - [Key-value and queues](kv-and-queues.md)
 - [Workflows](workflows.md)
 - [A database kept by one actor](database.md)
+- [Typed actor clients and structured errors](typed-clients.md)
 
 # Deploying
 

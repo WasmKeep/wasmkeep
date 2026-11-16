@@ -17,6 +17,40 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const stub = join(root, "test", "host-stub.ts");
 const callsStub = join(root, "test", "calls-stub.ts");
 const envStub = join(root, "test", "env-stub.ts");
+// The pure entry (`@wasmkeep/sdk/contracts`) must load no host module: bundle
+// it with no stubs, so any `wasmkeep:` or `wasi:` import fails to resolve,
+// and check the package maps it.
+{
+  const { readFile } = await import("node:fs/promises");
+  const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+  if (pkg.exports?.["./contracts"] !== "./src/pure.ts") {
+    console.error('package.json must export "./contracts" as ./src/pure.ts');
+    process.exit(1);
+  }
+  const r = await build({
+    entryPoints: [join(root, "src", "pure.ts")],
+    bundle: true,
+    write: false,
+    metafile: true,
+    format: "esm",
+    platform: "neutral",
+    logLevel: "silent",
+  }).catch((e) => {
+    console.error(`src/pure.ts imports a host module:\n${e.message}`);
+    process.exit(1);
+  });
+  const hostFiles = Object.keys(r.metafile.inputs).filter((f) => /(^|\/)(actors|call|index|front|db|kv|queue|workflow|http|handler|transport)\.ts$/.test(f));
+  if (hostFiles.length > 0) {
+    console.error(`src/pure.ts pulls in host-facing modules: ${hostFiles.join(", ")}`);
+    process.exit(1);
+  }
+}
+// The compile-time fixtures (test/typed-fixtures.ts) only count if `tsc`
+// runs: `npm test` runs it first.
+{
+  const tsc = spawnSync(process.execPath, [join(root, "node_modules", "typescript", "bin", "tsc"), "--noEmit", "-p", root], { stdio: "inherit" });
+  if (tsc.status !== 0) process.exit(tsc.status ?? 1);
+}
 const tests = (await readdir(join(root, "test"))).filter((f) => f.endsWith(".test.ts"));
 const out = await mkdtemp(join(tmpdir(), "wasmkeep-sdk-test-"));
 try {

@@ -10,6 +10,10 @@
 //! one), nesting is capped at [`MAX_DEPTH`] and an object's members at
 //! [`MAX_MEMBERS`].
 
+// Without the `actor` feature only the error envelope (`problem`) uses this
+// module, and not all of it.
+#![cfg_attr(not(feature = "actor"), allow(dead_code))]
+
 use std::fmt::Write as _;
 
 /// How deep arrays and objects may nest. The db protocol needs four.
@@ -47,6 +51,38 @@ impl Json {
         }
     }
 
+    /// Appends this value as JSON text, as `JSON.stringify` writes it.
+    pub(crate) fn write(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Number(n) => out.push_str(&number_to_string(*n)),
+            Json::String(s) => write_str(out, s),
+            Json::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write(out);
+                }
+                out.push(']');
+            }
+            Json::Object(members) => {
+                out.push('{');
+                for (i, (k, v)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_str(out, k);
+                    out.push(':');
+                    v.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
     pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Json::String(s) => Some(s),
@@ -79,9 +115,21 @@ impl Json {
 
 /// Parses a whole JSON text (whitespace around it allowed).
 pub(crate) fn parse(text: &str) -> Option<Json> {
+    parse_with(text, false)
+}
+
+/// Like [`parse`], but a repeated key in any object is an error rather than
+/// "the last wins", so a value cannot be hidden by overwriting it. What
+/// the error envelope's readers use, in both SDKs.
+pub(crate) fn parse_unique(text: &str) -> Option<Json> {
+    parse_with(text, true)
+}
+
+fn parse_with(text: &str, unique: bool) -> Option<Json> {
     let mut p = Parser {
         s: text.as_bytes(),
         at: 0,
+        unique,
     };
     let v = p.value(0)?;
     p.ws();
@@ -91,6 +139,7 @@ pub(crate) fn parse(text: &str) -> Option<Json> {
 struct Parser<'a> {
     s: &'a [u8],
     at: usize,
+    unique: bool,
 }
 
 impl Parser<'_> {
@@ -167,6 +216,9 @@ impl Parser<'_> {
                     // As `JSON.parse`: the last of a repeated key wins.
                     // The protocol's objects are small: a cap keeps this
                     // linear search from going quadratic.
+                    if self.unique && members.iter().any(|(k, _)| *k == key) {
+                        return None;
+                    }
                     members.retain(|(k, _)| *k != key);
                     if members.len() >= MAX_MEMBERS {
                         return None;
