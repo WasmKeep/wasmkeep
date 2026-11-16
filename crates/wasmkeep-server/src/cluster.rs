@@ -1192,7 +1192,7 @@ impl Cluster {
                 hyper_util::rt::TokioIo::new(owner_side),
                 revoked,
             );
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut owner_side).await;
+            relay_until_eof(&mut client, &mut owner_side).await;
         });
         let mut switching = text_response(StatusCode::SWITCHING_PROTOCOLS, "");
         *switching.headers_mut() = headers;
@@ -2394,3 +2394,24 @@ mod tests;
 
 #[cfg(test)]
 mod state_keys_tests;
+
+/// A half-closed relay must not retain admission indefinitely when the other
+/// peer disappears. Allow a short grace for the reverse stream to finish.
+async fn relay_until_eof<A, B>(a: &mut A, b: &mut B)
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+    // Bound the grace from copy completion itself: even shutdown/flush can
+    // block on an unresponsive peer. Dropping both transports closes them.
+    let ab = tokio::io::copy(&mut ar, &mut bw);
+    let ba = tokio::io::copy(&mut br, &mut aw);
+    tokio::pin!(ab, ba);
+    let grace = std::time::Duration::from_millis(250);
+    tokio::select! {
+        _ = &mut ab => { let _ = tokio::time::timeout(grace, ba).await; }
+        _ = &mut ba => { let _ = tokio::time::timeout(grace, ab).await; }
+    }
+}

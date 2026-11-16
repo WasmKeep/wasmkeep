@@ -13,8 +13,9 @@ Since 0.4.2, in no release yet.
 
 - **Configurable socket admission (0.5.0):** `serve` accepts
   `--max-sockets-per-actor` (1,000 requested) and `--max-sockets-per-node`
-  (50,000 requested); zero disables admission. The node ceiling now includes
-  relays, tightening the previous owner-only accounting. Socket sessions join
+  (50,000 requested), plus `--max-sockets-per-app` (defaults to the node cap;
+  set lower for isolation). Zero refuses every WebSocket at that scope.
+  The node ceiling now includes relays, tightening the previous owner-only accounting. Socket sessions join
   the descriptor admission estimate and hold reservations through transport
   cleanup. Over-capacity upgrades receive 503 with `Retry-After`. Startup
   logs and metrics report requested/effective socket ceilings. See

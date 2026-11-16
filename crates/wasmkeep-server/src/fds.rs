@@ -71,20 +71,31 @@ pub struct Budget {
     pub socket_sessions: usize,
 }
 
-/// Allocate cluster connections first, public connections next (at most a
-/// quarter), then split the remainder between sockets and actors. Unused
-/// actor capacity goes to sockets; unused socket capacity goes to actors.
-/// All arithmetic is bounded by `limit`, including at integer extremes.
+/// Default socket demand receives only what remains after actor storage.
+/// Explicit socket demand shares the remaining capacity with actor storage.
 pub fn budget(limit: u64, requested: Budget) -> Budget {
+    budget_with_socket_priority(limit, requested, false)
+}
+
+/// Estimate admission capacity. At very low limits retain one requested
+/// public/cluster connection and resident actor for degraded operation; the
+/// caller must warn that the reserved descriptor headroom cannot be met.
+pub fn budget_with_socket_priority(
+    limit: u64,
+    requested: Budget,
+    explicit_sockets: bool,
+) -> Budget {
     let mut left = limit.saturating_sub(RESERVED);
-    let cluster = (requested.cluster_connections as u64).min(left / 8);
-    left -= cluster;
-    let public = (requested.public_connections as u64).min(left / 4);
-    left -= public;
-    let mut actors = (requested.resident_actors as u64).min(left / 2 / PER_ACTOR);
-    let sockets = (requested.socket_sessions as u64).min((left - actors * PER_ACTOR) / 2);
+    let cluster = (requested.cluster_connections as u64).min((left / 8).max(1));
+    left = left.saturating_sub(cluster);
+    let public = (requested.public_connections as u64).min((left / 4).max(1));
+    left = left.saturating_sub(public);
+    let actor_share = if explicit_sockets { left / 2 } else { left };
+    let mut actors = (requested.resident_actors as u64).min((actor_share / PER_ACTOR).max(1));
+    let sockets =
+        (requested.socket_sessions as u64).min(left.saturating_sub(actors * PER_ACTOR) / 2);
     actors += (requested.resident_actors as u64 - actors)
-        .min((left - actors * PER_ACTOR - sockets * 2) / PER_ACTOR);
+        .min(left.saturating_sub(actors * PER_ACTOR + sockets * 2) / PER_ACTOR);
     Budget {
         public_connections: public as usize,
         cluster_connections: cluster as usize,
@@ -98,7 +109,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exhausted_budget_never_invents_descriptors() {
+    fn default_sockets_preserve_actor_capacity_at_1024() {
+        for (cluster_connections, actors) in [(0, 192), (1024, 168)] {
+            let b = budget(
+                1024,
+                Budget {
+                    public_connections: 10_000,
+                    cluster_connections,
+                    resident_actors: 900,
+                    socket_sessions: 50_000,
+                },
+            );
+            assert_eq!(b.resident_actors, actors);
+            assert_eq!(b.socket_sessions, 0);
+        }
+    }
+
+    #[test]
+    fn exhausted_budget_keeps_minimum_services_without_sockets() {
         assert_eq!(budget(0, Budget::default()), Budget::default());
         let all = Budget {
             public_connections: 10,
@@ -106,7 +134,15 @@ mod tests {
             resident_actors: 10,
             socket_sessions: 10,
         };
-        assert_eq!(budget(RESERVED, all), Budget::default());
+        assert_eq!(
+            budget(RESERVED, all),
+            Budget {
+                public_connections: 1,
+                cluster_connections: 1,
+                resident_actors: 1,
+                socket_sessions: 0
+            }
+        );
     }
 
     #[test]
@@ -124,7 +160,7 @@ mod tests {
                     + b.cluster_connections as u128
                     + 3 * b.resident_actors as u128
                     + 2 * b.socket_sessions as u128;
-                assert!(used <= limit.saturating_sub(RESERVED) as u128);
+                assert!(used <= limit.saturating_sub(RESERVED).max(5) as u128);
                 assert!(
                     b.public_connections <= want
                         && b.cluster_connections <= want
@@ -144,7 +180,7 @@ mod tests {
             socket_sessions: 50_000,
         };
         assert_eq!(budget(1 << 20, requested), requested);
-        let b = budget(1024, requested);
+        let b = budget_with_socket_priority(1024, requested, true);
         assert_eq!(b.cluster_connections, 96);
         assert_eq!(b.public_connections, 168);
         assert_eq!(b.resident_actors, 84);

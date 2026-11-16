@@ -11,22 +11,31 @@ cannot bound a node's concurrent socket load.
 
 ## Decision
 
-Reserve a process session before routing an upgrade. Transfer the reservation
+Reserve a process session after failover holds and admission probes, before
+forwarding an upgrade or sending 101. Transfer the reservation
 to the upgraded task, retaining it through transport and close cleanup. Each
 relay consumes a session on the ingress process and on the owner. Local front
 hand-offs reserve once. Actor registration remains atomic on the owner;
 application reservations sit beneath a shared process allowance.
 
-Expose actor and node ceilings, preserving requested defaults of 1,000 and
-50,000. Zero disables admission. Capacity refusals use 503 and `Retry-After`.
+Expose actor, app and node ceilings, preserving requested actor/node defaults
+of 1,000 and 50,000. The app ceiling defaults to the node ceiling for
+single-app compatibility; per-app isolation requires an explicit app ceiling
+below the effective node ceiling (or `SocketLimits::per_app` for embedders).
+Zero refuses every WebSocket at that scope. Capacity refusals use 503 and
+`Retry-After`.
 Report requested and effective socket limits in startup logs and metrics.
 
 Allocate descriptor capacity for public connections, cluster connections,
 resident SQLite databases and socket sessions together. Charge two descriptors
 per session to cover relays. Keep 256 descriptors for listeners and other host
-activity. Allocate cluster and public shares first, then divide remaining
-capacity between actor storage and sockets, reusing unrequested shares.
-Reject startup when required services cannot fit instead of inventing capacity.
+activity. Allocate cluster and public shares first, then give actors their
+request and sockets the remainder. An explicit node socket request instead
+shares that capacity between actors and sockets, reusing unrequested shares.
+At low limits retain one requested public/cluster connection and resident
+actor for degraded operation, warning when reserved headroom cannot be met.
+Sockets receive no minimum floor. Relay EOF starts a 250 ms reverse-stream
+grace before transport teardown, bounding the ingress permit lifetime.
 
 ## Consequences
 

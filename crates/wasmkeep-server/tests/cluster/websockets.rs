@@ -1074,11 +1074,20 @@ async fn socket_caps_refuse_and_release_local_and_relay_sessions() {
     })
     .await;
     let (again, _) = connect_async(url(b.addr)).await.unwrap();
-    drop(again);
-    eventually("second relay releases", async || {
-        b.service.socket_sessions() == 0
+    drain(&store, "a").await;
+    // Keep the client open and idle: it never acknowledges the owner close.
+    eventually("owner finishes closing its transport", async || {
+        a.service.socket_sessions() == 0
     })
     .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while b.service.socket_sessions() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("owner EOF must promptly release the idle ingress permit");
+    drop(again);
 }
 
 #[tokio::test(flavor = "multi_thread")]

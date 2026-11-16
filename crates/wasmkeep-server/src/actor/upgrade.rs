@@ -180,11 +180,6 @@ impl ActorService {
             crate::metrics::refused(crate::metrics::Refusal::Access);
             return text_response(StatusCode::FORBIDDEN, "not reachable from outside\n");
         }
-        // Reserve once before either routing path can open a transport.
-        let Some(permit) = self.inner.sockets.reserve() else {
-            crate::metrics::refused(crate::metrics::Refusal::Capacity);
-            return crate::cluster::unavailable("socket capacity exhausted; retry\n");
-        };
         // An upgrade from outside can wait for a dead node's actor to be
         // taken over (`ActorService::hold`): nothing of it was sent on, and
         // nothing of a body is read or buffered while it is kept. Its
@@ -211,6 +206,10 @@ impl ActorService {
                     Held::Answer(response) => return response,
                     Held::Forward => {}
                 }
+                let Some(permit) = self.inner.sockets.reserve() else {
+                    crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                    return crate::cluster::unavailable("socket capacity exhausted; retry\n");
+                };
                 let response = cluster.forward_upgrade(&owner, req, opener, permit).await;
                 if response.status().is_server_error() {
                     self.inner.forget_owner(&address);
@@ -299,6 +298,12 @@ impl ActorService {
                             Held::Answer(response) => return response,
                             Held::Forward => {}
                         }
+                        let Some(permit) = self.inner.sockets.reserve() else {
+                            crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                            return crate::cluster::unavailable(
+                                "socket capacity exhausted; retry\n",
+                            );
+                        };
                         return cluster.forward_upgrade(&owner, req, opener, permit).await;
                     }
                     Ok(Err(Some((peer, true)))) => {
@@ -310,6 +315,12 @@ impl ActorService {
                         // of an older version) says nothing of the peer.
                         let sent = !crate::cluster::never_forward(&req)
                             && (opener == Opener::Outside || cluster.can_handoff(&peer));
+                        let Some(permit) = self.inner.sockets.reserve() else {
+                            crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                            return crate::cluster::unavailable(
+                                "socket capacity exhausted; retry\n",
+                            );
+                        };
                         let response = cluster.forward_upgrade(&peer, req, opener, permit).await;
                         if sent && response.status().is_server_error() {
                             cluster.suspect(&peer);
@@ -340,6 +351,10 @@ impl ActorService {
             );
             return r;
         }
+        let Some(permit) = self.inner.sockets.reserve() else {
+            crate::metrics::refused(crate::metrics::Refusal::Capacity);
+            return crate::cluster::unavailable("socket capacity exhausted; retry\n");
+        };
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
         let path = req
             .uri()

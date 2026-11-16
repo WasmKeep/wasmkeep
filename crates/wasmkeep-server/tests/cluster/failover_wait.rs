@@ -648,3 +648,28 @@ async fn a_fenced_nodes_actor_is_waited_for() {
     );
     assert_eq!(d.waits("request", "served").await, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_upgrade_does_not_reserve_a_socket_session() {
+    use tokio_tungstenite::connect_async;
+    let mut d = duo_with(KEPT, 100, "chat", chat_wasm(), false).await;
+    let (alice, _) = connect_async(format!("ws://{}/actor/chat/lobby", d.a()))
+        .await
+        .unwrap();
+    d.b_can_fence_a(false);
+    d.kill_a().await;
+    d.a_left_the_view("/actor/chat/lobby").await;
+    let addr = d.b.addr;
+    let upgrade =
+        tokio::spawn(async move { connect_async(format!("ws://{addr}/actor/chat/lobby")).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!upgrade.is_finished(), "upgrade must still be held");
+    assert_eq!(
+        d.b.service.socket_sessions(),
+        0,
+        "held upgrades have no transport"
+    );
+    upgrade.abort();
+    let _ = upgrade.await;
+    drop(alice);
+}

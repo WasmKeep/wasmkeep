@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-/// Owner-side limits. Zero disables admission; pending and closing sockets count.
+/// Owner-side limits. Zero refuses every WebSocket at that scope; pending and closing sockets count.
 #[derive(Debug, Clone, Copy)]
 pub struct SocketLimits {
     pub per_actor: usize,

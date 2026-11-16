@@ -3,7 +3,7 @@
 
 #[cfg(unix)]
 #[test]
-fn exhausted_descriptor_limit_refuses_startup() {
+fn low_descriptor_limit_warns_and_continues_startup() {
     let output = std::process::Command::new("sh")
         .args(["-c", "ulimit -n 256; exec \"$@\"", "socket-budget"])
         .arg(env!("CARGO_BIN_EXE_wasmkeep"))
@@ -18,11 +18,12 @@ fn exhausted_descriptor_limit_refuses_startup() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reading not-loaded.wasm"), "{stderr}");
     assert!(
-        stderr.contains("open-files limit 256 cannot fit"),
-        "{stderr}"
+        String::from_utf8_lossy(&output.stdout).contains("degraded"),
+        "stdout: {} stderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    assert!(stderr.contains("RLIMIT_NOFILE"), "{stderr}");
 }
 
 #[test]
@@ -35,4 +36,6 @@ fn socket_options_are_documented_in_help() {
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--max-sockets-per-actor"));
     assert!(help.contains("--max-sockets-per-node"));
+    assert!(help.contains("--max-sockets-per-app"));
+    assert!(help.contains("Zero refuses all WebSockets"));
 }

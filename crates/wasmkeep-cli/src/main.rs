@@ -651,12 +651,18 @@ struct ServeArgs {
     /// Client connections open at once; more wait until one closes.
     #[arg(long, default_value_t = wasmkeep_server::ServeLimits::default().max_connections)]
     max_connections: usize,
-    /// Socket sessions per actor owner; zero disables admission.
+    /// Socket sessions per actor owner; zero refuses all WebSockets at this scope.
     #[arg(long, default_value_t = 1_000)]
     max_sockets_per_actor: usize,
-    /// Process socket sessions, including relays; clamped to the FD budget.
-    #[arg(long, default_value_t = 50_000)]
-    max_sockets_per_node: usize,
+    /// Process socket sessions, including relays; default 50,000, clamped to
+    /// the FD budget. Zero refuses all WebSockets. Explicit values share
+    /// descriptor capacity with actors; the default uses the remainder.
+    #[arg(long)]
+    max_sockets_per_node: Option<usize>,
+    /// App socket sessions; defaults to the node cap. Set below the node
+    /// cap for per-app isolation. Zero refuses all WebSockets for the app.
+    #[arg(long)]
+    max_sockets_per_app: Option<usize>,
 
     /// Configuration and secrets for a class, as CLASS=FILE: `NAME=value`
     /// lines its actors read with `env.get` (see docs/concepts.md). Keep the
@@ -1376,6 +1382,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Every resident actor holds three open files: size the caps to the
     // descriptors this process may open (raising the soft limit first).
     let wanted_resident = wasmkeep_server::fds::resident_limit(pool, front_requests);
+    let requested_sockets = args.max_sockets_per_node.unwrap_or(50_000);
     let requested = wasmkeep_server::fds::Budget {
         public_connections: args.max_connections,
         cluster_connections: if args.cluster_listen.is_some() {
@@ -1384,21 +1391,22 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             0
         },
         resident_actors: if serves_actors { wanted_resident } else { 0 },
-        socket_sessions: if serves_actors {
-            args.max_sockets_per_node
-        } else {
-            0
-        },
+        socket_sessions: if serves_actors { requested_sockets } else { 0 },
     };
     let effective = match wasmkeep_server::fds::raise_open_files_limit(1 << 20) {
         Some(limit) => {
-            let effective = wasmkeep_server::fds::budget(limit, requested);
-            anyhow::ensure!(
-                effective.public_connections > 0
-                    && (!serves_actors || effective.resident_actors > 0)
-                    && (args.cluster_listen.is_none() || effective.cluster_connections > 0),
-                "open-files limit {limit} cannot fit listeners, connections and actor storage; raise RLIMIT_NOFILE (ulimit -n or LimitNOFILE)"
+            let effective = wasmkeep_server::fds::budget_with_socket_priority(
+                limit,
+                requested,
+                args.max_sockets_per_node.is_some(),
             );
+            if limit <= wasmkeep_server::fds::RESERVED + 8 {
+                tracing::warn!(
+                    open_files = limit,
+                    ?effective,
+                    "degraded startup: minimum service slots retained without reserved descriptor headroom; raise RLIMIT_NOFILE (ulimit -n or LimitNOFILE)"
+                );
+            }
             if effective != requested {
                 tracing::warn!(
                     open_files = limit,
@@ -1420,7 +1428,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let resident_cap = effective.resident_actors;
     let cluster_connections = effective.cluster_connections;
     let socket_budget =
-        wasmkeep_server::SocketBudget::new(args.max_sockets_per_node, effective.socket_sessions);
+        wasmkeep_server::SocketBudget::new(requested_sockets, effective.socket_sessions);
     let cache = ComponentCache::new(runtime.clone(), &args.cache_dir)?;
     let load = |path: &PathBuf| -> anyhow::Result<(wasmtime::component::Component, Vec<u8>)> {
         let wasm = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -1614,7 +1622,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         config.mailbox.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
         config.mailbox.max_resident = resident_cap;
         config.socket_limits.per_actor = args.max_sockets_per_actor;
-        config.socket_limits.per_app = args.max_sockets_per_node;
+        config.socket_limits.per_app = args.max_sockets_per_app.unwrap_or(requested_sockets);
         config.socket_budget = std::sync::Arc::clone(&socket_budget);
         config.max_front_requests = Some(front_requests);
         config.max_unsent_age = std::time::Duration::from_millis(args.max_unsent_age_ms);

@@ -193,7 +193,12 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
             .arg(format!("counter={}", wasm.display()))
             .arg("--actor")
             .arg(format!("chat={}", chat.display()))
-            .args(["--metrics-listen", &metrics_addr.to_string()])
+            .args([
+                "--metrics-listen",
+                &metrics_addr.to_string(),
+                "--max-sockets-per-node",
+                "50000",
+            ])
             .arg("--data-dir")
             .arg(dir.path().join("data"))
             .arg("--cache-dir")
@@ -277,7 +282,7 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
     }
     // The clients use only eight concurrent connections, covered by the
     // reserved headroom; assert the actor budget, not the OS hard ceiling.
-    let resident_limit = wasmkeep_server::fds::budget(
+    let resident_limit = wasmkeep_server::fds::budget_with_socket_priority(
         1024,
         wasmkeep_server::fds::Budget {
             public_connections: 10_000,
@@ -285,6 +290,7 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
             socket_sessions: 50_000,
             ..Default::default()
         },
+        true,
     )
     .resident_actors;
     let descriptor_budget = wasmkeep_server::fds::PER_ACTOR * resident_limit as u64
@@ -384,4 +390,35 @@ fn an_eight_instance_cli_node_can_run_an_actor_call() {
             .join("data/state/default/default/actors/t/b.db")
             .exists()
     );
+}
+
+#[test]
+fn a_256_open_files_limit_still_serves_an_actor() {
+    let wasm = guest_wasm("counter", "counter");
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("node.log");
+    let mut node = Node(
+        Command::new("bash")
+            .args([
+                "-c",
+                "ulimit -Sn 256 && ulimit -Hn 256 && exec \"$@\"",
+                "low-files",
+                env!("CARGO_BIN_EXE_wasmkeep"),
+                "serve",
+                "--actor",
+            ])
+            .arg(format!("counter={}", wasm.display()))
+            .args(["--listen", "127.0.0.1:0", "--data-dir"])
+            .arg(dir.path().join("data"))
+            .arg("--cache-dir")
+            .arg(dir.path().join("cache"))
+            .env("RUST_LOG", QUIET_BUT_LISTENING)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let addr = support::listening_on(&mut node.0, &log, Duration::from_secs(60));
+    assert_eq!(value(addr, "POST", 0), 1);
+    assert!(std::fs::read_to_string(log).unwrap().contains("degraded"));
 }

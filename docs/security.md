@@ -33,9 +33,11 @@ limits below are enforced by the code (each has a test), not aspirations.
   client, requested defaults of 1,000 sockets per actor and 50,000 sessions
   per node (including relays), configurable with
   [socket admission options](reference/socket-limits.md) and reduced by the
-  descriptor budget; zero disables admission. Over capacity: HTTP 503 with
-  `Retry-After`. Opening and closing sessions retain capacity; idle clients are pinged
-  then closed.
+  descriptor budget; zero refuses every WebSocket at that scope. Per-app
+  isolation requires `--max-sockets-per-app` (or `SocketLimits::per_app`)
+  below the effective node cap; its default alone does not isolate apps.
+  Over capacity: HTTP 503 with `Retry-After`. Opening and closing sessions
+  retain capacity; idle clients are pinged then closed.
   A socket is invisible to the actor's other events until
   `on-websocket-open` accepts it. Close reasons never carry host errors.
 - `x-wasmkeep-*` headers from clients are stripped or ignored: only the host
