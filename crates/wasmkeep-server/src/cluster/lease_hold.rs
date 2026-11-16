@@ -894,11 +894,7 @@ impl Cluster {
         let format = match cached {
             Some((e, format)) if e == epoch => format,
             _ => {
-                let key = StorePath::from(app_format::key(
-                    self.root.prefix(),
-                    self.root.tenant(),
-                    self.root.app(),
-                ));
+                let key = StorePath::from(app_format::key_of(&self.root));
                 let read = tokio::time::timeout(self.lease_attempt, async {
                     match self.store.get(&key).await {
                         Ok(got) => got.bytes().await.map(Some),

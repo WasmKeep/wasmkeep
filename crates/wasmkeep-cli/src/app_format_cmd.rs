@@ -14,13 +14,11 @@ use crate::AppFormatArgs;
 /// `wasmkeep app format`.
 pub(crate) fn run(args: &AppFormatArgs) -> anyhow::Result<()> {
     let (store, prefix) = crate::open_bucket(&args.bucket)?;
-    let prefix = if prefix.is_empty() {
-        prefix
-    } else {
-        format!("{prefix}/")
-    };
     let (tenant, app) = &args.app;
-    let key = app_format::key(&prefix, tenant, app);
+    // The servers' own key: the prefix as their state root normalises it.
+    let key = app_format::key_of(&wasmkeep_cluster::state_root::StateRoot::new(
+        &prefix, tenant, app,
+    ));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

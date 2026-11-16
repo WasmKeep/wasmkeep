@@ -22,6 +22,12 @@ pub fn key(prefix: &str, tenant: &str, app: &str) -> String {
     format!("{prefix}formats/{tenant}/{app}/recorded-head")
 }
 
+/// The setting's key for the app `root` names, under its bucket prefix:
+/// what servers and the CLI both read.
+pub fn key_of(root: &crate::state_root::StateRoot) -> String {
+    key(root.prefix(), root.tenant(), root.app())
+}
+
 /// An app's ownership format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppFormat {
@@ -70,6 +76,21 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// A prefix given with or without its slash (the CLI trims it, a
+    /// server's configuration may not) names the same key.
+    #[test]
+    fn a_prefix_names_one_key_however_it_is_written() {
+        use crate::state_root::StateRoot;
+        let want = "wk/formats/acme/shop/recorded-head";
+        for prefix in ["wk", "wk/"] {
+            assert_eq!(key_of(&StateRoot::new(prefix, "acme", "shop")), want);
+        }
+        assert_eq!(
+            key_of(&StateRoot::new("", "acme", "shop")),
+            "formats/acme/shop/recorded-head"
+        );
     }
 
     #[test]
