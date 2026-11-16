@@ -389,6 +389,14 @@ struct DeployArgs {
     )]
     expire_after_idle: Vec<(String, Option<u64>)>,
 
+    /// How a class's plain writes reach the bucket, as CLASS=MODE: `strict`
+    /// (each event's writes before the next event, the default) or
+    /// `batched` (several events to a segment, ADR 0034; needs nodes built
+    /// with `batched-writes`). Part of the version; classes not named keep
+    /// theirs. Repeatable.
+    #[arg(long = "writes", value_name = "CLASS=MODE", value_parser = parse_writes)]
+    writes: Vec<(String, wasmkeep_server::apps::Writes)>,
+
     /// Deploy to an app deleted with `wasmkeep app delete`: its tombstone
     /// is removed first, only if nothing else of it is left in the bucket.
     #[arg(long, conflicts_with = "rollback")]
@@ -1948,6 +1956,7 @@ fn version_flags(args: &DeployArgs) -> Vec<&'static str> {
         ("--front-config", args.front_config.is_some()),
         ("--front-requires", args.front_requires.is_some()),
         ("--expire-after-idle", !args.expire_after_idle.is_empty()),
+        ("--writes", !args.writes.is_empty()),
     ]
     .into_iter()
     .filter_map(|(flag, given)| given.then_some(flag))
@@ -2025,9 +2034,10 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 && !args.no_front
                 && args.front_config.is_none()
                 && args.front_requires.is_none()
-                && args.expire_after_idle.is_empty()),
+                && args.expire_after_idle.is_empty()
+                && args.writes.is_empty()),
             "nothing to deploy: give --actor, --access, --config, --requires, \
-             --expire-after-idle or a front flag (--front, --no-front, --front-config, \
+             --expire-after-idle, --writes or a front flag (--front, --no-front, --front-config, \
              --front-requires), or --rollback"
         );
         let runtime = Runtime::new(&RuntimeConfig::default())?;
@@ -2098,7 +2108,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 }
                 args.expire_after_idle.clone()
             },
-            writes: Vec::new(),
+            writes: {
+                let mut seen = std::collections::BTreeSet::new();
+                for (class, _) in &args.writes {
+                    anyhow::ensure!(seen.insert(class.clone()), "--writes names {class} twice");
+                }
+                args.writes.clone()
+            },
             every_rule: false,
         };
         rt.block_on(app_ref.deploy_changes(&runtime, changes))
@@ -2686,6 +2702,20 @@ fn parse_path(s: &str) -> Result<PathBuf, String> {
 
 /// `--expire-after-idle CLASS=DURATION` (ADR 0028): the limit in seconds,
 /// or `None` for `CLASS=` (removes it).
+/// `--writes CLASS=MODE` (ADR 0034, section 15).
+fn parse_writes(s: &str) -> Result<(String, wasmkeep_server::apps::Writes), String> {
+    let (class, mode) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected CLASS=MODE, got {s:?}"))?;
+    if class.is_empty() || class == FRONT_SCOPE {
+        return Err(format!("expected a class name in {s:?}"));
+    }
+    Ok((
+        class.to_owned(),
+        wasmkeep_server::apps::Writes::parse(mode)?,
+    ))
+}
+
 fn parse_expire(s: &str) -> Result<(String, Option<u64>), String> {
     let (class, limit) = s
         .split_once('=')

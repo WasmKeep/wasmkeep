@@ -1183,3 +1183,37 @@ fn access_rules_must_name_a_served_class() {
     let typo = vec![("monitr".to_owned(), "internal".to_owned())];
     assert!(super::access_rules(&typo, &["monitor"]).is_err());
 }
+
+/// `deploy --writes CLASS=MODE` (ADR 0034, section 15): `strict` or
+/// `batched`, for a class; anything else is refused when parsed.
+#[test]
+fn writes_flag_parses_a_class_and_a_mode() {
+    use super::{Cli, Command, parse_writes};
+    use wasmkeep_server::apps::Writes;
+    assert_eq!(
+        parse_writes("rooms=batched").unwrap(),
+        ("rooms".to_owned(), Writes::Batched)
+    );
+    assert_eq!(
+        parse_writes("rooms=strict").unwrap(),
+        ("rooms".to_owned(), Writes::Strict)
+    );
+    for bad in ["rooms", "rooms=gated", "=batched", "_front=batched"] {
+        assert!(parse_writes(bad).is_err(), "{bad}");
+    }
+    let args = <Cli as clap::Parser>::try_parse_from([
+        "wasmkeep",
+        "deploy",
+        "--bucket",
+        "file:///tmp/b",
+        "--writes",
+        "rooms=batched",
+        "--writes",
+        "chat=strict",
+    ])
+    .unwrap();
+    match args.command {
+        Command::Deploy(d) => assert_eq!(d.writes.len(), 2),
+        _ => panic!("not a deploy"),
+    }
+}
