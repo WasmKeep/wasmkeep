@@ -3547,3 +3547,80 @@ async fn a_real_hold_carries_its_acknowledged_head_into_every_ending() {
     .await;
     assert!(matches!(late, Err(ReplicaError::Late)), "{:?}", late.err());
 }
+
+/// ADR 0035, section 2, simulation case 2 on the real code: a same-process
+/// re-acquire while the old hold's release is queued (dropped, its task
+/// not run yet), pending (a lapse ended it), or the hold parked, with the
+/// record still naming the old hold, inherits the head it froze.
+#[tokio::test]
+async fn a_re_acquire_inherits_the_head_its_predecessor_froze() {
+    use crate::replica::{Replica, SnapshotKind};
+    use wasmkeep_cluster::recorded_head::Completeness;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(
+        StorageConfig::new(dir.path()),
+        crate::state_dir(&StateRoot::new("", "t", "default")),
+    );
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let generation = hold.generation().unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        generation,
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    let all = db.snapshot().unwrap();
+    replica
+        .ship_snapshot(&all, SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    drop((db, replica));
+
+    let inherited = |hold: &LeaseHold| hold.view().inherited();
+    // Queued: dropped, its release task not run yet.
+    drop(hold);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let carried = inherited(&hold).expect("the queued release's head is carried");
+    assert_eq!(carried.head, h);
+    assert_eq!(
+        carried.set_at, generation,
+        "stamped with the hold that froze it"
+    );
+    assert_eq!(carried.completeness, Completeness::Complete);
+    // Pending: a lapse ended it into a pending release; never verified,
+    // the new hold re-freezes what it inherited, stamp unchanged.
+    a.pending.end_all(true);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let again = inherited(&hold).expect("the pending release's head is carried");
+    assert_eq!(again, carried);
+    // Parked, then woken.
+    hold.park(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(inherited(&hold), Some(carried));
+    assert_eq!(a.pending.local_head(&key), None, "transferred to the hold");
+    drop(hold);
+    assert!(a.releases_done(Duration::from_secs(5)).await);
+    // Its release landed: the entry ends (the record would carry it once
+    // releases write the recorded head).
+    assert_eq!(a.pending.local_head(&key), None);
+}

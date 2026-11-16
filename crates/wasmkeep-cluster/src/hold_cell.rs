@@ -29,6 +29,11 @@ pub struct HoldHead {
     /// The verified, acknowledged position: `None` until the restore was
     /// verified, then the last position an acknowledged upload reached.
     pub acknowledged: Option<Position>,
+    /// The requirement this hold inherited at acquisition (ADR 0035,
+    /// section 2: from this process's local evidence, and later the
+    /// record's): what its restore must reach, and what it freezes again,
+    /// unchanged, if it ends unverified.
+    pub inherited: Option<crate::local_heads::Requirement>,
 }
 
 /// An upload completed when its hold could no longer acknowledge it: the

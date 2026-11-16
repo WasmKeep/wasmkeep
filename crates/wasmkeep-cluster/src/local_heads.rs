@@ -1,0 +1,423 @@
+//! A node's local evidence of each actor's acknowledged head ([ADR 0035],
+//! section 2): the head each ended, parked or pending hold froze, kept by
+//! actor key from the moment the hold ends until a successor here
+//! inherits it, its release lands, or a fresh read of the record proves a
+//! remote successor ([`LocalHeads::prepare`]).
+//!
+//! An acquisition reads it under the actor's lock, after the record's
+//! authoritative read and before its conditional write (the preparation
+//! hook of [`crate::node_lease::Owners::acquire_prepared`]), so a same-
+//! process re-acquire never starts from less than what this process
+//! acknowledged, even while its release is still queued, in flight or
+//! pending, or the hold is parked. The new hold carries the requirement
+//! ([`crate::hold_cell::HoldHead::inherited`]); once it is registered the
+//! entry is transferred to it ([`LocalHeads::transferred`]).
+//!
+//! Process-local: a crash loses it (ADR 0035, section 4). Until the record
+//! itself carries the head (`wasmkeep-owner 2` written on release), this
+//! is the only place the requirement lives.
+//!
+//! [ADR 0035]: ../../../docs/adr/0035-a-recorded-head-on-hand-over.md
+
+use std::collections::HashMap;
+
+use crate::node_lease::{Hold, OwnerRecord};
+use crate::recorded_head::{Completeness, Position};
+
+/// A required position: the head, the ownership generation in which it was
+/// established (`set-at`), and whether it covers every acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requirement {
+    /// The position.
+    pub head: Position,
+    /// When it was established (never moved by a mere change of owner).
+    pub set_at: u64,
+    /// Whether it covers every acknowledgement of its holder.
+    pub completeness: Completeness,
+}
+
+impl Requirement {
+    /// What an ended hold proves. A verified hold froze every
+    /// acknowledgement under its cell's lock: its acknowledged head,
+    /// complete, established in its own generation (the head itself may
+    /// be older). An unverified one proves only what it inherited,
+    /// unchanged, stamp included; nothing if it inherited nothing.
+    pub fn frozen(hold: &Hold) -> Option<Self> {
+        match hold.head.acknowledged {
+            Some(head) => Some(Self {
+                head,
+                set_at: hold.generation,
+                completeness: Completeness::Complete,
+            }),
+            None => hold.head.inherited,
+        }
+    }
+}
+
+/// One actor's local evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHead {
+    /// The ownership generation of the hold that froze it.
+    pub generation: u64,
+    /// What it requires.
+    pub requirement: Requirement,
+    /// Generations this process tried to acquire the actor at while the
+    /// entry lived: a released record at one of them may be this
+    /// process's own unresolved acquisition, which inherited nothing it
+    /// could publish, so it retires nothing.
+    attempts: Vec<u64>,
+    /// Acquisitions that read it and have not finished (registered,
+    /// failed, or their unresolved write resolved): while any lasts, a
+    /// landed release only marks it ([`LocalHeads::released`]).
+    reserved: u32,
+    /// The release of its hold landed while it was reserved.
+    released: bool,
+}
+
+/// How many attempted generations an entry remembers.
+const ATTEMPTS_KEPT: usize = 64;
+
+/// The local evidence, by ownership record key. No runtime: the server
+/// keeps it under a synchronous mutex taken after its live-hold set and
+/// never across an await.
+#[derive(Debug, Default)]
+pub struct LocalHeads {
+    by_key: HashMap<String, LocalHead>,
+}
+
+impl LocalHeads {
+    /// Registers what `hold` froze as it ended (before its cell empties or
+    /// its release is sent). An entry of a later generation is kept: it
+    /// already covers this one by inheritance.
+    pub fn register(&mut self, hold: &Hold) {
+        let Some(requirement) = Requirement::frozen(hold) else {
+            return;
+        };
+        match self.by_key.get(&hold.key) {
+            Some(e) if e.generation > hold.generation => {}
+            _ => {
+                self.by_key.insert(
+                    hold.key.clone(),
+                    LocalHead {
+                        generation: hold.generation,
+                        requirement,
+                        attempts: Vec::new(),
+                        reserved: 0,
+                        released: false,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The preparation of an acquisition of `key` at `attempted`, after
+    /// the authoritative read found `record` (`None`: absent) and before
+    /// the conditional write: retires the entry if the record proves a
+    /// remote successor, then returns the requirement the acquisition
+    /// carries.
+    ///
+    /// Proof of a remote successor: the record, freshly read and decoded,
+    /// names another holder (not this node's process `node`/`instance`) at
+    /// a strictly higher generation than the entry's, or names nobody at a
+    /// strictly higher generation that this process never tried. A record
+    /// at the same or a lower generation, an absent one and (by the
+    /// caller never calling this) an unreadable one or a failed read prove
+    /// nothing. A record naming this process at a higher generation is its
+    /// own unresolved acquisition: it inherited the entry, and keeps it.
+    pub fn prepare(
+        &mut self,
+        key: &str,
+        record: Option<&OwnerRecord>,
+        attempted: u64,
+        node: &str,
+        instance: &str,
+    ) -> Option<Requirement> {
+        if let (Some(entry), Some(record)) = (self.by_key.get(key), record)
+            && record.generation > entry.generation
+        {
+            let superseded = match &record.holder {
+                Some((n, i)) => !(n == node && i == instance),
+                None => !entry.attempts.contains(&record.generation),
+            };
+            if superseded {
+                self.by_key.remove(key);
+            }
+        }
+        let entry = self.by_key.get_mut(key)?;
+        entry.reserved = entry.reserved.saturating_add(1);
+        if !entry.attempts.contains(&attempted) {
+            if entry.attempts.len() >= ATTEMPTS_KEPT {
+                entry.attempts.remove(0);
+            }
+            entry.attempts.push(attempted);
+        }
+        Some(entry.requirement)
+    }
+
+    /// An acquisition that [prepared](Self::prepare) with `key`'s entry
+    /// failed, or its unresolved write was resolved, without a hold to
+    /// inherit the entry: its reservation ends.
+    pub fn finished(&mut self, key: &str) {
+        if let Some(e) = self.by_key.get_mut(key) {
+            e.reserved = e.reserved.saturating_sub(1);
+            if e.reserved == 0 && e.released {
+                self.by_key.remove(key);
+            }
+        }
+    }
+
+    /// A hold at `generation` inherited the entry and is registered: the
+    /// entry is its now, and it registers its own when it ends.
+    pub fn transferred(&mut self, key: &str, generation: u64) {
+        if self
+            .by_key
+            .get(key)
+            .is_some_and(|e| e.generation < generation)
+        {
+            self.by_key.remove(key);
+        }
+    }
+
+    /// The release of the hold at `generation` landed. Its entry ends
+    /// (unless a later one replaced it), once no acquisition that read it
+    /// is still unfinished: one may yet be registered or unresolved, and
+    /// inherit it.
+    pub fn released(&mut self, key: &str, generation: u64) {
+        match self.by_key.get_mut(key) {
+            Some(e) if e.generation == generation && e.reserved > 0 => e.released = true,
+            Some(e) if e.generation == generation => {
+                self.by_key.remove(key);
+            }
+            _ => {}
+        }
+    }
+
+    /// The entry of `key`, if any.
+    pub fn get(&self, key: &str) -> Option<&LocalHead> {
+        self.by_key.get(key)
+    }
+
+    /// How many actors have an entry.
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// Whether none has.
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hold_cell::HoldHead;
+    use crate::lease::Version;
+
+    fn at(generation: u64, txid: u64) -> Position {
+        Position::Known {
+            generation,
+            txid,
+            checksum: txid,
+        }
+    }
+
+    fn hold(
+        generation: u64,
+        acknowledged: Option<Position>,
+        inherited: Option<Requirement>,
+    ) -> Hold {
+        Hold {
+            key: "owners/x".into(),
+            generation,
+            version: Version("v".into()),
+            previous: None,
+            head: HoldHead {
+                acknowledged,
+                inherited,
+            },
+        }
+    }
+
+    fn record(holder: Option<(&str, &str)>, generation: u64) -> OwnerRecord {
+        OwnerRecord {
+            holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
+            generation,
+            recorded: None,
+        }
+    }
+
+    #[test]
+    fn a_verified_hold_freezes_a_complete_head_stamped_with_its_generation() {
+        let h = hold(5, Some(at(4, 9)), None);
+        assert_eq!(
+            Requirement::frozen(&h),
+            Some(Requirement {
+                head: at(4, 9),
+                set_at: 5,
+                completeness: Completeness::Complete,
+            })
+        );
+        // Unverified: what it inherited, stamp unchanged; or nothing.
+        let inherited = Requirement {
+            head: at(4, 9),
+            set_at: 5,
+            completeness: Completeness::Complete,
+        };
+        assert_eq!(
+            Requirement::frozen(&hold(7, None, Some(inherited))),
+            Some(inherited)
+        );
+        assert_eq!(Requirement::frozen(&hold(7, None, None)), None);
+    }
+
+    /// The heart of case 2: a re-acquire while the release of H is still
+    /// queued, in flight or pending, with the record still at H's
+    /// generation, carries H.
+    #[test]
+    fn a_re_acquire_carries_the_frozen_head() {
+        let mut heads = LocalHeads::default();
+        heads.register(&hold(5, Some(at(5, 12)), None));
+        let carried = heads.prepare(
+            "owners/x",
+            Some(&record(Some(("a", "i1")), 5)),
+            6,
+            "a",
+            "i1",
+        );
+        assert_eq!(carried.map(|r| r.head), Some(at(5, 12)));
+        // Released already, at the same generation: still carried.
+        let carried = heads.prepare("owners/x", Some(&record(None, 5)), 6, "a", "i1");
+        assert_eq!(carried.map(|r| r.head), Some(at(5, 12)));
+        // Absent record: no proof of anything.
+        assert!(heads.prepare("owners/x", None, 6, "a", "i1").is_some());
+        // Transferred to the hold of generation 6: the entry is its.
+        heads.transferred("owners/x", 6);
+        assert!(heads.is_empty());
+    }
+
+    /// Case 16: another holder at a higher generation, or a release there
+    /// this process never tried, retires the entry; a record naming this
+    /// process, or a release at a generation it tried (its own unresolved
+    /// acquisition), does not.
+    #[test]
+    fn only_a_remote_successor_retires_local_evidence() {
+        let fresh = || {
+            let mut heads = LocalHeads::default();
+            heads.register(&hold(5, Some(at(5, 12)), None));
+            heads
+        };
+        let mut heads = fresh();
+        assert!(
+            heads
+                .prepare(
+                    "owners/x",
+                    Some(&record(Some(("b", "i2")), 6)),
+                    7,
+                    "a",
+                    "i1"
+                )
+                .is_none()
+        );
+        let mut heads = fresh();
+        assert!(
+            heads
+                .prepare("owners/x", Some(&record(None, 6)), 7, "a", "i1")
+                .is_none()
+        );
+        // Another instance of this node is another process.
+        let mut heads = fresh();
+        assert!(
+            heads
+                .prepare(
+                    "owners/x",
+                    Some(&record(Some(("a", "i0")), 6)),
+                    7,
+                    "a",
+                    "i1"
+                )
+                .is_none()
+        );
+        // This process at a higher generation: kept.
+        let mut heads = fresh();
+        assert!(
+            heads
+                .prepare(
+                    "owners/x",
+                    Some(&record(Some(("a", "i1")), 6)),
+                    7,
+                    "a",
+                    "i1"
+                )
+                .is_some()
+        );
+        // Its own attempt at 6, released by the resolver: kept.
+        let mut heads = fresh();
+        assert!(
+            heads
+                .prepare("owners/x", Some(&record(None, 5)), 6, "a", "i1")
+                .is_some()
+        );
+        assert!(
+            heads
+                .prepare("owners/x", Some(&record(None, 6)), 7, "a", "i1")
+                .is_some()
+        );
+        // Same or lower generation, another holder: kept.
+        let mut heads = fresh();
+        assert!(
+            heads
+                .prepare(
+                    "owners/x",
+                    Some(&record(Some(("b", "i2")), 5)),
+                    6,
+                    "a",
+                    "i1"
+                )
+                .is_some()
+        );
+    }
+
+    /// A release that lands while an acquisition that read the entry is
+    /// unfinished (its write unanswered) keeps the entry until it ends.
+    #[test]
+    fn a_reserved_entry_outlives_its_release() {
+        let mut heads = LocalHeads::default();
+        heads.register(&hold(5, Some(at(5, 12)), None));
+        let mine = record(Some(("a", "i1")), 5);
+        assert!(
+            heads
+                .prepare("owners/x", Some(&mine), 6, "a", "i1")
+                .is_some()
+        );
+        heads.released("owners/x", 5);
+        assert_eq!(heads.len(), 1, "reserved");
+        assert!(
+            heads
+                .prepare("owners/x", Some(&record(None, 5)), 6, "a", "i1")
+                .is_some()
+        );
+        heads.finished("owners/x");
+        assert_eq!(heads.len(), 1, "one reservation left");
+        heads.finished("owners/x");
+        assert!(heads.is_empty());
+    }
+
+    #[test]
+    fn a_landed_release_ends_only_its_own_entry() {
+        let mut heads = LocalHeads::default();
+        heads.register(&hold(5, Some(at(5, 12)), None));
+        heads.released("owners/x", 4);
+        assert_eq!(heads.len(), 1);
+        heads.released("owners/x", 5);
+        assert!(heads.is_empty());
+        // An older hold ending late keeps the later entry.
+        heads.register(&hold(7, Some(at(7, 20)), None));
+        heads.register(&hold(5, Some(at(5, 12)), None));
+        assert_eq!(heads.get("owners/x").unwrap().generation, 7);
+        // An unverified hold with nothing inherited registers nothing.
+        let mut heads = LocalHeads::default();
+        heads.register(&hold(5, None, None));
+        assert!(heads.is_empty());
+    }
+}

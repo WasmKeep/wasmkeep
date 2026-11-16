@@ -43,6 +43,7 @@ pub mod failover;
 pub mod hold_cell;
 pub mod holds;
 pub mod lease;
+pub mod local_heads;
 pub mod membership;
 pub mod migrate;
 pub mod node_lease;

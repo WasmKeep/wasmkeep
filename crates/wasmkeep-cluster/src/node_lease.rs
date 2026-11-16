@@ -25,7 +25,9 @@
 //!
 //! [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 
+use crate::hold_cell::HoldHead;
 use crate::lease::{Bucket, BucketError, Clock, LeaseConfig, Version};
+use crate::local_heads::Requirement;
 use crate::recorded_head::{OWNER_HEADER_V2, RecordedHead};
 
 /// The node lease's format header.
@@ -891,6 +893,10 @@ pub enum AcquireError {
     },
     /// The record or a node lease is unreadable.
     Corrupt,
+    /// This process still has a live hold of the actor, ending or not
+    /// (ADR 0035, section 2): an acquisition waits for its frozen head.
+    /// Nothing written.
+    LocalHold,
     /// The record is in version 2 (ADR 0035) and this node does not write
     /// that format for the app: refused, nothing written. Never written
     /// over with version 1.
@@ -976,6 +982,16 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         self.clock.now_ms().saturating_add(self.unresolved_wait_ms)
     }
 
+    /// This node's id.
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// This process's instance token.
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
     /// This node's clock (ms).
     pub fn now_ms(&self) -> u64 {
         self.clock.now_ms()
@@ -1001,15 +1017,36 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         lease_valid: impl Fn() -> bool,
         first_generation: impl AsyncFnOnce() -> Result<u64, AcquireError>,
     ) -> Result<Hold, AcquireError> {
+        self.acquire_prepared(key, lease_valid, first_generation, |_, _| Ok(None))
+            .await
+    }
+
+    /// [`Self::acquire`] with a preparation hook (ADR 0035, section 2):
+    /// `prepare(record, generation)` runs after the authoritative read and
+    /// the eligibility checks (`record`: what the read decoded, `None` for
+    /// an absent record) and before the conditional write at
+    /// `generation`. It combines this process's local evidence
+    /// ([`crate::local_heads`]); the requirement it gives is the new
+    /// hold's [`crate::hold_cell::HoldHead::inherited`]. An error refuses
+    /// the acquisition with nothing written.
+    pub async fn acquire_prepared(
+        &self,
+        key: &str,
+        lease_valid: impl Fn() -> bool,
+        first_generation: impl AsyncFnOnce() -> Result<u64, AcquireError>,
+        prepare: impl FnOnce(Option<&OwnerRecord>, u64) -> Result<Option<Requirement>, AcquireError>,
+    ) -> Result<Hold, AcquireError> {
         let read = self
             .bucket
             .get(key)
             .await
             .map_err(|_| AcquireError::Unavailable)?;
         let mut previous = None;
+        let inherited;
         let (generation, before, written) = match read {
             None => {
                 let first = first_generation().await?;
+                inherited = prepare(None, first)?;
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
@@ -1045,6 +1082,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                     .generation
                     .checked_add(1)
                     .ok_or(AcquireError::Corrupt)?;
+                inherited = prepare(Some(&record), generation)?;
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
@@ -1064,7 +1102,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             generation,
             version,
             previous,
-            head: Default::default(),
+            head: HoldHead {
+                acknowledged: None,
+                inherited,
+            },
         })
     }
 
@@ -1085,6 +1126,19 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         unchanged: impl Fn(&Version) -> bool,
         lease_valid: impl Fn() -> bool,
     ) -> Result<Hold, AcquireError> {
+        self.acquire_unchanged_prepared(key, unchanged, lease_valid, |_, _| Ok(None))
+            .await
+    }
+
+    /// [`Self::acquire_unchanged`] with the preparation hook of
+    /// [`Self::acquire_prepared`].
+    pub async fn acquire_unchanged_prepared(
+        &self,
+        key: &str,
+        unchanged: impl Fn(&Version) -> bool,
+        lease_valid: impl Fn() -> bool,
+        prepare: impl FnOnce(Option<&OwnerRecord>, u64) -> Result<Option<Requirement>, AcquireError>,
+    ) -> Result<Hold, AcquireError> {
         let Some((body, version)) = self
             .bucket
             .get(key)
@@ -1104,6 +1158,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             .generation
             .checked_add(1)
             .ok_or(AcquireError::Corrupt)?;
+        let inherited = prepare(Some(&record), generation)?;
         if !lease_valid() {
             return Err(AcquireError::LeaseInvalid);
         }
@@ -1123,7 +1178,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             generation,
             version,
             previous: None,
-            head: Default::default(),
+            head: HoldHead {
+                acknowledged: None,
+                inherited,
+            },
         })
     }
 

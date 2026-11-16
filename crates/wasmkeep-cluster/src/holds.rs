@@ -264,6 +264,7 @@ impl<T> Parked<T> {
                 | AcquireError::LeaseInvalid
                 | AcquireError::Corrupt
                 | AcquireError::FormatMismatch
+                | AcquireError::LocalHold
                 | AcquireError::Changed,
             ) => None,
         }
