@@ -559,7 +559,9 @@ struct ServeArgs {
     /// Seconds an actor's old history stays in the bucket before garbage
     /// collection may delete it (ADR 0012); 0 deletes it as soon as the
     /// rule allows. A deleted actor's history goes at once whatever this
-    /// is.
+    /// is. Restoring after a delete reset was collected requires at least
+    /// 3003 seconds with default clock skew (50-minute request lifetime
+    /// plus clock and timestamp margins).
     #[arg(long, value_name = "SECS", default_value_t = 3600)]
     history_retention_secs: u64,
 

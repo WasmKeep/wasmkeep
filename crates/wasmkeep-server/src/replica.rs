@@ -1499,8 +1499,14 @@ impl Replica {
     }
 
     /// Resolve a delete's ordering from the immutable reset, never a node clock.
-    /// A collected reset leaves no ordering proof: refuse rather than resurrect.
-    pub(crate) async fn delete_time(&self, label: &str) -> Result<u64, ReplicaError> {
+    /// A collected reset predates every live request when retention covers
+    /// the request TTL plus the caller's clock/precision margin.
+    pub(crate) async fn delete_time(
+        &self,
+        label: &str,
+        retention: std::time::Duration,
+        minimum_retention: std::time::Duration,
+    ) -> Result<Option<u64>, ReplicaError> {
         use futures_util::StreamExt as _;
         let fields: Vec<_> = label.split_whitespace().collect();
         let invalid = || ReplicaError::Local("delete ordering evidence unavailable".into());
@@ -1528,10 +1534,20 @@ impl Replica {
                 .iter()
                 .any(|s| s.id == (SegmentId { generation, txid }))
             {
-                return u64::try_from(meta.last_modified.timestamp_millis()).map_err(|_| invalid());
+                return u64::try_from(meta.last_modified.timestamp_millis())
+                    .map(Some)
+                    .map_err(|_| invalid());
             }
         }
-        Err(invalid())
+        if retention >= minimum_retention {
+            Ok(None)
+        } else {
+            Err(ReplicaError::Local(format!(
+                "delete ordering evidence unavailable: history retention {} ms is shorter than the request TTL plus clock-skew margin ({} ms required)",
+                retention.as_millis(),
+                minimum_retention.as_millis(),
+            )))
+        }
     }
 
     /// What an upload needs of this replica, owned: a batched segment's
@@ -3121,7 +3137,16 @@ mod tests {
             .last_modified
             .timestamp_millis() as u64;
         let label = format!("delete {} 1 {}", r.head.txid, r.head.generation);
-        assert_eq!(r.delete_time(&label).await.unwrap(), bucket_time);
+        assert_eq!(
+            r.delete_time(
+                &label,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(3603)
+            )
+            .await
+            .unwrap(),
+            Some(bucket_time)
+        );
     }
 
     #[tokio::test]

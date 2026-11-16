@@ -951,3 +951,72 @@ async fn actor_restore_marker_read_error_does_not_break_strict_durable_delete() 
         );
     }
 }
+
+// Age only the old history's bucket timestamps: no hour-long wall-clock wait,
+// and collection itself must remove the reset and after-delete snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_restore_after_delete_reset_collected() {
+    for retention_secs in [3600, 3002] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky = Arc::new(Flaky::new(store.clone(), Arc::new(AtomicBool::new(false))));
+        let seen: Arc<dyn ObjectStore> = flaky.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let a = node_configured(
+            "collected",
+            dir.path(),
+            &seen,
+            Duration::from_millis(200),
+            &["t"],
+            test_actor_wasm(),
+            Duration::from_secs(30),
+            "",
+            |c| {
+                let cluster = c.cluster.as_mut().unwrap();
+                cluster.history_retention = Duration::from_secs(retention_secs);
+                // Default skew: bound = 3000 s + 2 * 1 s + 1 s = 3003 s.
+                cluster.lease = LeaseConfig::default_safe();
+            },
+        )
+        .await;
+        super::deletes::write(a.addr, "aged", 1).await;
+        let stage = actor_restore_stage(&store, "aged").await;
+        assert_eq!(
+            send(a.addr, "POST", "/actor/t/aged/delete-durable", "")
+                .await
+                .status,
+            200
+        );
+        eventually("delete snapshot", async || {
+            let (snapshots, segments) = history_of(&store, "aged").await;
+            snapshots.len() == 1 && segments.len() == 1 && snapshots == segments
+        })
+        .await;
+        let old = actor_keys(&store, "aged").await;
+        flaky
+            .aged_history
+            .lock()
+            .unwrap()
+            .extend(old.iter().cloned());
+        super::deletes::write(a.addr, "aged", 64).await;
+        eventually("ordinary collection removed delete evidence", async || {
+            let keys = actor_keys(&store, "aged").await;
+            old.iter().all(|key| !keys.contains(key))
+        })
+        .await;
+        assert!(
+            actor_restore_meta(&store, "aged", "replaced")
+                .await
+                .unwrap()
+                .starts_with("delete ")
+        );
+        let key = actor_restore_submit(&store, "aged", "7777777777777777", &stage).await;
+        if retention_secs == 3600 {
+            actor_restore_outcome(&store, &key, "done").await;
+            assert_eq!(read(a.addr, "aged").await, "1");
+        } else {
+            let error = actor_restore_outcome(&store, &key, "refused").await;
+            assert!(error.contains("history retention"), "{error}");
+            assert!(error.contains("3003000"), "{error}");
+        }
+    }
+}

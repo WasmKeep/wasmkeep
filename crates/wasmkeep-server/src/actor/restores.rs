@@ -117,10 +117,14 @@ impl ActorState {
             match slot
                 .lock()
                 .await
-                .delete_time(replaced.as_deref().unwrap_or_default())
+                .delete_time(
+                    replaced.as_deref().unwrap_or_default(),
+                    cluster.history_retention,
+                    cluster.restore_delete_retention_bound(),
+                )
                 .await
             {
-                Ok(at) => Some(format!("delete 0 {at}")),
+                Ok(at) => at.map(|at| format!("delete 0 {at}")),
                 Err(e) => return Restored::End("refused", e.to_string()),
             }
         } else {
@@ -458,22 +462,53 @@ impl ActorState {
     }
 }
 
-pub(super) fn restores_pass(
-    inner: &Arc<ServiceInner>,
-    cluster: &Arc<Cluster>,
-    active: &deletes::Active,
-) {
-    for intent in cluster.restores() {
+#[derive(Default)]
+pub(super) struct Active {
+    running: deletes::Active,
+    failures: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+}
+
+fn retry_delay(failures: u32, heartbeat: Duration) -> Duration {
+    let base = heartbeat.max(Duration::from_secs(3));
+    base.saturating_mul(1 << failures.min(5))
+        .min(Duration::from_secs(60).max(base))
+}
+
+pub(super) fn restores_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, active: &Active) {
+    let intents = cluster.restores();
+    active
+        .failures
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|key, _| intents.iter().any(|intent| intent.key() == *key));
+    for intent in intents {
         let key = intent.key();
         {
-            let mut running = active.lock().unwrap_or_else(|p| p.into_inner());
+            let mut running = active.running.lock().unwrap_or_else(|p| p.into_inner());
             if running.len() >= 16 || !running.insert(key.clone()) {
                 continue;
             }
         }
-        let (inner, cluster, active) = (inner.clone(), cluster.clone(), active.clone());
+        let failures = active.failures.clone();
+        let (inner, cluster, active) = (inner.clone(), cluster.clone(), active.running.clone());
         tokio::spawn(async move {
-            restore_one(&inner, &cluster, intent).await;
+            if restore_one(&inner, &cluster, intent).await {
+                let delay = {
+                    let mut failures = failures.lock().unwrap_or_else(|p| p.into_inner());
+                    let count = failures.entry(key.clone()).or_default();
+                    let delay = retry_delay(*count, cluster.heartbeat_period());
+                    *count = count.saturating_add(1);
+                    delay
+                };
+                // Admission is open again, but this request stays active so
+                // heartbeat passes cannot bypass its growing backoff.
+                tokio::time::sleep(delay).await;
+            } else {
+                failures
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key);
+            }
             active
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -481,22 +516,26 @@ pub(super) fn restores_pass(
         });
     }
 }
-async fn restore_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: RestoreIntent) {
+async fn restore_one(
+    inner: &Arc<ServiceInner>,
+    cluster: &Arc<Cluster>,
+    intent: RestoreIntent,
+) -> bool {
     let Ok(address) = ActorAddress::new(&intent.tenant, &intent.class, &intent.name) else {
-        return;
+        return false;
     };
     if intent.tenant != inner.tenant || !read(&inner.classes).contains_key(address.class()) {
-        return;
+        return false;
     }
     if !cluster.holds_here(&address)
         && !cluster.is_parked(&address)
         && !inner.sockets.has_open(&address)
         && (cluster.draining() || !matches!(cluster.other_owner(&address).await, Ok(None)))
     {
-        return;
+        return false;
     }
     if !cluster.actor_restore_allowed().await {
-        return;
+        return false;
     }
     struct Admission<'a>(&'a ServiceInner, ActorAddress);
     impl Drop for Admission<'_> {
@@ -531,7 +570,7 @@ async fn restore_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: 
         match result {
             Ok(Restored::End(suffix, body)) => {
                 cluster.end_restore_request(&intent, suffix, body).await;
-                return;
+                return false;
             }
             Ok(Restored::Busy) if attempt < 3 => {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -540,22 +579,34 @@ async fn restore_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: 
                 cluster
                     .end_restore_request(&intent, "refused", "sockets did not close".into())
                     .await;
-                return;
+                return false;
             }
             _ => {
-                drop(_admission);
-                // Keep the request in the active set during backoff, but reopen
-                // socket admission; a failing request cannot churn every heartbeat.
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                return;
+                return true;
             }
         }
     }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actor_restore_retry_backoff_grows_and_is_bounded() {
+        let heartbeat = Duration::from_secs(3);
+        let waits: Vec<_> = (0..8)
+            .map(|n| retry_delay(n, heartbeat).as_secs())
+            .collect();
+        assert_eq!(waits, [3, 6, 12, 24, 48, 60, 60, 60]);
+        assert_eq!(retry_delay(u32::MAX, heartbeat), Duration::from_secs(60));
+        assert_eq!(retry_delay(0, Duration::from_millis(100)), heartbeat);
+        assert_eq!(
+            retry_delay(0, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
     #[test]
     fn actor_restore_replay_and_delete_supersession() {
         assert_eq!(replay(Some("10 a"), None, 10, "a"), Some("done"));

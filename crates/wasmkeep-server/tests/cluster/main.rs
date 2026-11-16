@@ -819,6 +819,8 @@ async fn durable_write_survives_failover(name: &str) {
 /// A bucket that can be cut off, as seen from one node.
 #[derive(Debug)]
 struct Flaky {
+    /// History objects aged past retention in collection regressions.
+    aged_history: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     inner: Arc<dyn ObjectStore>,
     down: Arc<AtomicBool>,
     /// Heartbeats (`nodes/`) are written without the capability word
@@ -934,6 +936,7 @@ impl Flaky {
             delay_owner_lists_ms: Arc::default(),
             owner_lists_taken: Arc::default(),
             owner_lists_done: Arc::default(),
+            aged_history: Arc::default(),
             inner,
             down,
             fail_wal: Arc::default(),
@@ -1333,7 +1336,19 @@ impl ObjectStore for Flaky {
             .flatten()
             .boxed();
         }
-        self.inner.list(prefix)
+        let aged = self.aged_history.clone();
+        self.inner
+            .list(prefix)
+            .map(move |meta| {
+                meta.map(|mut meta| {
+                    if aged.lock().unwrap().contains(meta.location.as_ref()) {
+                        meta.last_modified =
+                            (std::time::SystemTime::now() - Duration::from_secs(7200)).into();
+                    }
+                    meta
+                })
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(

@@ -207,7 +207,7 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
     let awaiting: moving::Awaiting = Arc::default();
     // Deletes under way (ADR 0028), by request key.
     let deleting: deletes::Active = Arc::default();
-    let restoring: deletes::Active = Arc::default();
+    let restoring = restores::Active::default();
     loop {
         tokio::time::sleep(every).await;
         let Some(inner) = service.upgrade() else {

@@ -154,7 +154,10 @@ Sockets close with 1012 before replacement; upgrades receive 503 while the
 request is pending. Restored alarms get fresh index entries before the upload
 and can fire again. Effects outside the actor's database are not undone.
 The staged database must have the current database's page size and fit the
-node's database limit. Requests expire after an hour by the bucket's clock.
+node's database limit. Requests expire after 50 minutes by the bucket's clock. After a delete reset
+has been collected, restore requires history retention of at least 3003 seconds
+with the default clock skew; the default 3600 seconds clears this bound.
+Shorter retention refuses restoration when the reset is missing.
 Only the `.done` outcome acknowledges restoration; the request disappearing
 alone does not. During a rolling upgrade, older nodes do not process restore
 requests or preserve their markers through deletes: finish upgrading before

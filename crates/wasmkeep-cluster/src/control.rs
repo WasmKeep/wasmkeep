@@ -55,6 +55,10 @@ pub const MOVE_TTL_MS: u64 = 5 * 60 * 1000;
 /// and deleted by the next node that lists it (ADR 0028).
 pub const DELETE_TTL_MS: u64 = 60 * 60 * 1000;
 
+/// An actor restore request's lifetime by the bucket's clock (ADR 0033).
+/// Shorter than default history retention, including clock and precision margins.
+pub const RESTORE_TTL_MS: u64 = 50 * 60 * 1000;
+
 /// Keys and their last-modified time, and deletes: what intents need.
 #[allow(async_fn_in_trait)]
 pub trait Keys {
@@ -411,7 +415,8 @@ impl ControlWatch {
 
 /// Reads the intents: drain markers, and the moves and deletes of
 /// `moves_of`'s app (none without it) written within [`MOVE_TTL_MS`]
-/// (moves) or [`DELETE_TTL_MS`] (deletes) of `now_ms`. Older ones are
+/// (moves), [`DELETE_TTL_MS`] (deletes), or [`RESTORE_TTL_MS`] (restores)
+/// of `now_ms`. Older ones are
 /// deleted, best effort. Keys that do not parse are
 /// ignored. A failed listing is an error: callers keep what they read
 /// last (ADR 0014).
@@ -453,7 +458,7 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
     let live_requests: BTreeSet<&str> = listed
         .iter()
         .filter_map(|(key, modified)| {
-            (now_ms.saturating_sub(*modified) <= DELETE_TTL_MS
+            (now_ms.saturating_sub(*modified) <= RESTORE_TTL_MS
                 && key
                     .strip_prefix(STATE_PREFIX)
                     .and_then(|rest| parse_restore(rest, *modified))
@@ -468,7 +473,7 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
             }
         } else if let Some(rest) = key.strip_prefix(STATE_PREFIX) {
             if let Some(intent) = parse_restore(rest, *modified) {
-                if now_ms.saturating_sub(*modified) > DELETE_TTL_MS {
+                if now_ms.saturating_sub(*modified) > RESTORE_TTL_MS {
                     expired.push(key.clone());
                     expired.push(format!("{key}.ltx"));
                 } else {
@@ -477,7 +482,7 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
                 continue;
             }
             // A stage is written before its request: never expire it while
-            // that request is still live, even across the one-hour boundary.
+            // that request is still live, even across the restore lifetime boundary.
             if key
                 .strip_suffix(".ltx")
                 .is_some_and(|k| live_requests.contains(k))
@@ -492,7 +497,7 @@ pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
                 )
                 && parse_restore(base, *modified).is_some()
             {
-                if now_ms.saturating_sub(*modified) > DELETE_TTL_MS {
+                if now_ms.saturating_sub(*modified) > RESTORE_TTL_MS {
                     expired.push(key.clone());
                 }
                 continue;
@@ -795,9 +800,21 @@ mod restore_regression {
     use super::*;
 
     #[test]
+    fn restore_expires_before_delete_and_keeps_its_exact_boundary() {
+        let restore = "state/acme/shop/restores/cart/78/0123456789abcdef";
+        let listed = [(restore.to_owned(), 1000)];
+        let (live, expired) = parse(&listed, 1000 + RESTORE_TTL_MS);
+        assert_eq!(live.restores.len(), 1);
+        assert!(expired.is_empty());
+        let (live, expired) = parse(&listed, 1001 + RESTORE_TTL_MS);
+        assert!(live.restores.is_empty());
+        assert!(expired.contains(&restore.to_owned()));
+    }
+
+    #[test]
     fn expired_restore_removes_both_request_and_staged_snapshot() {
         let key = "state/acme/shop/restores/cart/78/0123456789abcdef";
-        let (_, expired) = parse(&[(key.into(), 1)], DELETE_TTL_MS + 2);
+        let (_, expired) = parse(&[(key.into(), 1)], RESTORE_TTL_MS + 2);
         assert!(
             expired.contains(&key.to_owned()),
             "restore request never expires"
@@ -817,7 +834,7 @@ mod staged_restore_lifetime {
         let key = "state/acme/shop/restores/cart/78/0123456789abcdef";
         let (_, expired) = parse(
             &[(key.into(), 1000), (format!("{key}.ltx"), 1)],
-            DELETE_TTL_MS + 2,
+            RESTORE_TTL_MS + 2,
         );
         assert!(
             !expired.contains(&format!("{key}.ltx")),

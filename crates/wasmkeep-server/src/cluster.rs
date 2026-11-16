@@ -1872,10 +1872,20 @@ impl Cluster {
         }
     }
 
+    /// Two clock comparisons (collector and request reader), plus one second
+    /// for buckets that expose last-modified at whole-second precision.
+    pub(crate) fn restore_delete_retention_bound(&self) -> Duration {
+        Duration::from_millis(
+            control::RESTORE_TTL_MS
+                .saturating_add(self.lease_config.max_skew_ms().saturating_mul(2))
+                .saturating_add(1000),
+        )
+    }
+
     pub(crate) fn restores(&self) -> Vec<wasmkeep_cluster::control::RestoreIntent> {
         let now = now_ms();
         let live = |d: &control::RestoreIntent| {
-            now.saturating_sub(d.written_at_ms) <= control::DELETE_TTL_MS
+            now.saturating_sub(d.written_at_ms) <= control::RESTORE_TTL_MS
         };
         let ended = {
             let mut ended = self

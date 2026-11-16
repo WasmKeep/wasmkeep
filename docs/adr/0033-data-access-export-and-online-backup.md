@@ -835,8 +835,8 @@ target; a parked actor with sockets is woken by its parking node (ADR
 amendment of 2026-11-14): when `control/changed` changes, at their first
 period, and in the 60 s fallback listing, which is what retries a
 refused request and expires an old one. One prefix more in that
-listing is one LIST per node per 60 s at rest. Requests expire after an
-hour by the bucket's clock, and the node that lists an expired one
+listing is one LIST per node per 60 s at rest. Requests expire after 50
+minutes (`RESTORE_TTL_MS`) by the bucket's clock, and the node that lists an expired one
 deletes it with its staged object. A node that ends a request (its
 outcome written) deletes the request and its staged object, rewrites
 `control/changed`, and keeps the request out of its own copy until it
@@ -865,9 +865,22 @@ other nodes stop acting on their copies within a period.
    used for this comparison is the reset object's bucket last-modified
    timestamp, located by its generation and txid. The label's node time is
    diagnostic only. Equal bucket timestamps supersede conservatively. If
-   the reset was collected or its ordering evidence cannot be read, the job
-   refuses instead of guessing. An operator who means to undo a delete
-   asks again after it.
+   listing fails or the label cannot identify the reset, the job refuses.
+   If a successful listing finds no reset, ordinary collection proves it
+   predates every live request when history retention is at least
+   `RESTORE_TTL_MS + 2 * max_skew_ms + 1000 ms`: restore requests live at most 50
+   minutes, and collection removes only objects past retention. The margin
+   covers the collector and request reader's clock comparisons plus one
+   second for bucket last-modified precision (3 s with the default 1 s
+   skew; the retention bound is then 3003 s). Such a collected delete does
+   not supersede the request, even though its label survives in the actor's
+   next life. With shorter retention, a missing reset refuses with an error
+   naming the configured retention and required TTL-plus-margin bound.
+   The unchanged default 3600 s retention clears that bound. Delete requests
+   keep their independent one-hour lifetime (`DELETE_TTL_MS`). This inference assumes
+   ordinary collection under that retention policy, not external object
+   deletion or a previously shorter retention. An operator who means to undo
+   a delete asks again after it.
 3. **Sockets, first.** While an executable restore job is queued or running
    on the node holding the actor, that node answers WebSocket upgrades for it with 503 and `Retry-After: 1`,
    relayed or not, so no new socket opens on the state being replaced.
@@ -945,16 +958,21 @@ written into a carried snapshot. A restore itself always writes its new,
 non-empty marker. The `replaced` delete label remains independent: it also
 supersedes a pending restore that has never run. A failed read of only the
 restore marker does not fail a strict delete: the fresh reset position still
-provides bucket-clock supersession evidence. Missing ordering evidence makes
-a subsequent restore refuse, so losing that marker cannot resurrect data.
+provides bucket-clock supersession evidence. Unreadable ordering evidence
+makes a subsequent restore refuse; a collected reset uses the retention bound
+in step 2, so losing that marker cannot resurrect data from a live old request.
 
 The replacement also records `restore_stale_alarms`, allowing a retry after
 an outcome-write failure to retire the old index entry under its fence. Before
 another replacement, prior cleanup debt is retired. Build and app-gate failures
 remove their fresh entries; an ambiguous upload keeps its entry until the next
 owner restores and fences the actual head, then removes entries at the staged
-alarm time not named by that head. Retries wait two seconds with socket admission
-reopened. Transaction-id exhaustion is checked before allocating scratch state.
+alarm time not named by that head. Failed requests retain a per-request retry
+count across heartbeat passes. Backoff starts at the larger of 3 s and the
+heartbeat period, doubles to a 60 s cap (or the heartbeat period if larger),
+and keeps the request active while reopening socket admission. Finished or
+expired requests discard the count; an owner restart starts it again.
+Transaction-id exhaustion is checked before allocating scratch state.
 An AfterRestore upload failure does not change periodic-snapshot backoff.
 
 **Ordering with other requests.** Deletes and restores of one actor

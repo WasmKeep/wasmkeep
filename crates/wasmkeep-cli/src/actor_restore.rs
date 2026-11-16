@@ -28,8 +28,10 @@ pub(crate) struct RestoreArgs {
     /// Refuse if the owner's flushed head changed (GEN:TXID).
     #[arg(long)]
     if_head: Option<String>,
-    #[arg(long, default_value_t = 60, conflicts_with = "no_wait", value_parser = clap::value_parser!(u64).range(0..=3000))]
+    /// Seconds to wait for an outcome (maximum 3000); requests expire after 50 minutes.
+    #[arg(long, default_value_t = 60, conflicts_with = "no_wait", value_parser = clap::value_parser!(u64).range(0..=control::RESTORE_TTL_MS / 1000))]
     wait: u64,
+    /// Return immediately; the request remains live for 50 minutes.
     #[arg(long)]
     no_wait: bool,
 }
@@ -199,7 +201,8 @@ async fn execute(
         }
         if std::time::Instant::now() >= until {
             println!(
-                "Restore requested ({id}); the cluster retries until one hour after the request's bucket timestamp."
+                "Restore requested ({id}); the cluster retries until {} minutes after the request's bucket timestamp.",
+                control::RESTORE_TTL_MS / 60_000
             );
             return Ok(());
         }
