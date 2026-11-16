@@ -138,6 +138,8 @@ pub(super) const MAX_SEEN: usize = 500_000;
 /// The same for take and alarm hand-off calls, which are rare: a drain or
 /// a move sends one per actor.
 pub(super) const MAX_SEEN_CONTROL: usize = 50_000;
+/// Charged ingress forwarded after an ownership race: rare, fail closed when full.
+pub(super) const MAX_SEEN_INGRESS: usize = 4_096;
 
 impl SeenSignatures {
     /// An empty record of up to [`MAX_SEEN`], `name` in the metric of
@@ -153,6 +155,11 @@ impl SeenSignatures {
             name,
             cap,
         }
+    }
+
+    pub(super) fn used(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {
+        let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        ts.saturating_add(SIGNATURE_WINDOW_MS) < seen.horizon.max(now) || seen.macs.contains(&mac)
     }
 
     /// Records `mac`, signed at `ts`; false if it was already used (or the

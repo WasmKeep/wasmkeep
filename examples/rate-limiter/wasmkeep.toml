@@ -1,0 +1,15 @@
+[app]
+tenant = "default"
+name = "rate-limiter"
+
+[classes.limit]
+component = "target/wasm32-wasip2/release/rate_limiter.wasm"
+build = "cargo build --release --target wasm32-wasip2"
+watch = ["src", "Cargo.toml"]
+access = "open"
+
+[limits.ingress]
+match = "/actor/limit/*"
+key = "ip"
+rate = "10/s"
+burst = 20

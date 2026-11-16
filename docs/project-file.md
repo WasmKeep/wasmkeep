@@ -78,6 +78,140 @@ least one class.
 | `build` | optional | a command for the system shell (`sh -c`, `cmd.exe` on Windows), run in the file's directory before `component` is read |
 | `watch` | optional | files or directories of sources; `wasmkeep dev` runs `build` again when one changes (name sources, not what the build writes) |
 
+<a id="ingress-limits"></a>
+
+### `[limits.<name>]`
+
+Optional host admission rules, applied by both `dev` and deployed nodes.
+There may be 32 rules, named like classes. All matching rules must allow a
+request; a refusal spends no tokens in any rule.
+
+```toml
+[limits.signin]
+match = "POST /signin"
+key = "ip"
+rate = "4/s"
+burst = 8
+
+[limits.api]
+match = "/api/*"
+key = "header"
+header = "x-client-id"
+rate = "90/m"
+burst = 15
+```
+
+| Key | Meaning |
+| --- | --- |
+| `match` | Absolute encoded path, optionally preceded by an uppercase standard HTTP method and one space. Only a final `/*` wildcard is allowed; `/api/*` includes `/api/` but not `/api`. Queries do not participate. Maximum 1024 bytes; no whitespace, fragments or regex. |
+| `key` | `ip` (TCP peer) or `header`. Each app and named rule has separate client buckets on each node. |
+| `header` | Required only for `header` keys. Lowercase HTTP field name, at most 128 bytes. Host-internal, forwarding and hop-by-hop fields are refused. |
+| `rate` | Positive decimal integer followed by `/s`, `/m` or `/h`, at most 1,000,000 tokens per period. |
+| `burst` | Integer from 1 to 1,000,000: initial and maximum tokens. |
+
+Matching is case-sensitive, excludes the query, decodes unreserved percent
+escapes, canonicalizes remaining escape hex to uppercase, and collapses repeated
+slashes outside actor routing identity. Both the raw dot-segment form and the
+resolved form of requests and rules are matched; a match in either charges once.
+Dot segments include percent-encoded `.` and `..`. Under `/actor/`, class and name
+are split exactly as the actor router splits them: dots never remove or alter
+those segments, and resolution of the remaining path cannot climb above the
+actor name. Actor names use the router's full percent and UTF-8 decoding, then
+canonical percent encoding to preserve segment boundaries. Exact rules ignore
+trailing slashes. A `GET` rule also covers `HEAD`; a `HEAD` rule covers only `HEAD`.
+Other reserved escapes stay encoded: the paths in `https://example.test/a%2Fb`
+and `https://example.test/a/b` differ. Prefix rules retain their final slash;
+a prefix covers that slash and descendants, not the path without the slash. This normalization is only for policy matching; it does not rewrite
+the URI delivered to routing or guest code.
+
+A missing method matches any method. A header
+key must occur once and contain 1–256 non-whitespace printable ASCII
+bytes; missing, duplicate or invalid values return 400. Unknown fields
+and duplicate definitions fail with a source position.
+
+Budgets are **per node**, reset on process restart, and use monotonic
+elapsed time. A 429 response includes an integer `Retry-After` in seconds;
+clients should wait at least that long. Direct `/actor/` requests and
+WebSocket handshakes are covered; frames are not charged. Authenticated actor-to-actor calls are exempt. Forwarded public requests
+are admitted on the owner unless already charged before an ownership race.
+
+IP keys use the TCP peer only, with IPv6 aggregated to 64-bit subnet prefixes and IPv4-mapped
+IPv6 using the IPv4 key. Forwarding headers are never used as IP
+identity. There is no trusted-proxy IP configuration in this release: a
+proxy shares one peer quota. A header key supplied by an edge must be
+removed from incoming requests and overwritten at that edge, with direct
+access to the node restricted. Client-supplied identifiers are not auth.
+
+Full project deploys replace the policy set (omission removes it). Legacy
+partial flag deploys preserve policies. Plan output lists added, changed
+and removed rules. Unchanged rules retain their budgets; edits to a named
+rule clamp retained available tokens to the new burst. Renaming or
+removing a rule discards its old budget. Nonempty policies require manifest
+format 6 and `rate_limits` on every live app reader; deploy and rollback
+refuse older readers. See [ADR 0036](adr/0036-per-node-ingress-rate-limits.md).
+
+Only app services with policies share the 65,536-bucket process budget, capped
+at 4,096 buckets per service. Publishing or removing policies and dropping a
+service rebalance shares. Under pressure, fully refilled buckets are evicted
+first; only then are depleted buckets evicted in least-recently-used order.
+Current request buckets are protected. A separate ordered refill-deadline index
+selects eligible full buckets in O(log n) eviction work (with at most 32 protected
+keys); depleted fallback uses the LRU index. Unrelated credits and clocks are
+unchanged. Registry activation runs only during policy reconciliation, including
+initial publication; request admission never locks the process-wide registry. Rejected quota attempts count as
+uses. Evicted identities get a fresh burst if they return, so cycling more keys
+than the actual policy-service share can still weaken enforcement; these are
+bounded admission controls, not durable quotas.
+If an admission needs more simultaneous rule buckets than its app share, it
+returns 429 with `Retry-After: 1` and the capacity outcome.
+
+
+Read-only owner hints may precede admission. If routing selects a remote owner,
+that owner charges the request using a signed client identity. Otherwise the
+receiving node admits before creating or waking an actor, acquiring ownership,
+or reserving a mailbox slot, for both HTTP requests and WebSocket handshakes.
+A later ownership race may still cause forwarding: a charged request carries
+an authenticated charged bit in that identity and is not charged again by the
+owner. Admission may spend quota even if acquisition or execution subsequently
+fails; races may over-charge, but cannot bypass admission before local actor work.
+
+When its cluster secret is already loaded, a forwarder replaces client-supplied
+proofs with a domain-separated signed client identity: the normalized TCP IP key
+(IPv6 by its 64-bit prefix, IPv4-mapped addresses equivalent to IPv4), bound to
+the destination owner, method, path and query, app, timestamp, end-to-end header
+values and charged bit. An uncharged identity makes the owner apply its own
+policies using that IP or the policy's header key. Only successful admission
+matching at least one local rule sets the charged bit. Replayed uncharged proofs
+consume owner quota again. Charged proofs are single-use, with a unique send nonce
+and a separate per-node replay store capped at 4,096 signatures, isolated from
+actor-call and control replay stores. Entries remain until their signature window
+expires; replays and new charged proofs when the store is full return 503, never
+an unchecked exemption. Uncharged proofs do not consume replay-store capacity.
+The proof grants no actor privileges and does not authenticate the body.
+Missing, invalid or expired proofs on forwarded requests return 503 when the
+owner has policies. Without policies, unsigned forwards retain their previous
+behavior. Signing never fetches a cold secret. Clock skew outside the signature
+window still invalidates a proof on a policy-enforcing owner.
+Forwarded public traffic is charged on both plaintext and mutual-TLS transports;
+authenticated internal actor calls remain exempt. Already-spent internal call
+signatures return 403 before body reads in plaintext mode; fresh signatures still
+undergo body and atomic replay checks before actor work.
+
+
+Offline or later-joining older binaries are not protected by the live-reader
+check: they may treat format 6 as corrupt and serve without limits. Before
+enabling policies, stop and upgrade every node, including offline nodes;
+prevent an older binary from rejoining. Fail-closed handling of undecodable
+manifests is a guarantee of rate-limit-aware binaries only.
+
+With neither current nor pending policies, ingress admission returns immediately:
+it does not change response ordering, capture a front snapshot, or increment rate
+counters. Bucket read errors do not invent pending policies; corrupt manifests do.
+The metrics endpoint still registers `wasmkeep_rate_limit_requests_total` and
+`wasmkeep_rate_limit_active_keys` even when no policy exists, plus the `ingress`
+record label in `wasmkeep_signatures_refused_full_total`. These metrics are the
+intentional exception to no-policy compatibility.
+
 ### `[dev]` (optional, `wasmkeep dev` only)
 
 | Key | Default | |

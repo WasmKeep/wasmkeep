@@ -107,6 +107,8 @@ pub struct NodeInfo {
     /// node announcing it runs a batched class's events as strict ones,
     /// which keeps every promise a batched class makes.
     pub can_flush: bool,
+    /// Reads manifest format 6 and enforces ingress admission.
+    pub can_rate_limits: bool,
     /// Honours whole-app restore fences (capability word `restore`).
     pub can_restore: bool,
     /// Supports live actor restores and delete supersession markers.
@@ -414,6 +416,7 @@ impl NodeInfo {
             can_handoff: words.can_handoff,
             can_end: words.can_end,
             can_flush: words.can_flush,
+            can_rate_limits: words.can_rate_limits,
             can_restore: words.can_restore,
             can_actor_restore: words.can_actor_restore,
             instance: lease.instance,
@@ -434,6 +437,7 @@ impl NodeInfo {
             (self.can_handoff, "handoff"),
             (self.can_end, "ends"),
             (self.can_flush, "flush"),
+            (self.can_rate_limits, "rate_limits"),
             (self.can_restore, "restore"),
             (self.can_actor_restore, "actor-restore"),
         ]
@@ -465,6 +469,7 @@ impl NodeInfo {
             can_handoff: words.contains(&"handoff"),
             can_end: words.contains(&"ends"),
             can_flush: words.contains(&"flush"),
+            can_rate_limits: words.contains(&"rate_limits"),
             can_restore: words.contains(&"restore"),
             can_actor_restore: words.contains(&"actor-restore"),
             instance: words.iter().find_map(|w| {
@@ -714,6 +719,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_handoff: true,
             can_end: true,
             can_flush: true,
+            can_rate_limits: true,
             can_restore: true,
             can_actor_restore: true,
             instance: self.instance.clone(),
@@ -946,6 +952,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_rate_limits: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -985,6 +992,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_rate_limits: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1060,6 +1068,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_rate_limits: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1436,6 +1445,7 @@ mod tests {
             can_handoff: false,
             can_end: false,
             can_flush: false,
+            can_rate_limits: false,
             can_restore: false,
             can_actor_restore: false,
             instance: lease.instance,
@@ -1553,7 +1563,7 @@ mod tests {
         let payload = String::from_utf8(a.lease_payload()).unwrap();
         assert_eq!(
             payload.lines().nth(8),
-            Some("take front handoff ends flush restore actor-restore"),
+            Some("take front handoff ends flush rate_limits restore actor-restore"),
             "{payload}"
         );
     }
@@ -1573,6 +1583,26 @@ mod tests {
                     .any(|w| w == "actor-restore")
             );
         }
+    }
+
+    #[test]
+    fn rate_limits_capability_round_trips_and_defaults_to_absent() {
+        let node = NodeInfo {
+            can_rate_limits: true,
+            ..loaded_node()
+        };
+        assert!(NodeInfo::decode(&node.encode()).unwrap().can_rate_limits);
+        assert!(
+            NodeInfo::decode(&format3(&node, NodeState::Live, "beef"))
+                .unwrap()
+                .can_rate_limits
+        );
+        assert!(
+            !NodeInfo::decode(&loaded_node().encode())
+                .unwrap()
+                .can_rate_limits
+        );
+        assert!(decode_before_load(&format3(&node, NodeState::Live, "beef")).is_some());
     }
 
     #[test]
@@ -1607,6 +1637,7 @@ mod tests {
             can_handoff: true,
             can_end: true,
             can_flush: true,
+            can_rate_limits: false,
             can_restore: true,
             can_actor_restore: false,
             ..loaded_node()
@@ -1630,6 +1661,7 @@ mod tests {
         // Without `flush`, the line is as a node of 0.4.2 writes it.
         let before = NodeInfo {
             can_flush: false,
+            can_rate_limits: false,
             can_restore: false,
             can_actor_restore: false,
             ..node

@@ -18,6 +18,8 @@
 //! actor's database records the highest `seq` that ran an event on it, and a
 //! node behind that refuses the actor instead of running older code.
 
+pub mod limits;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -310,6 +312,26 @@ impl AppRef {
     /// needs `flush` (ADR 0034), and every format inherits the checks of
     /// those below it (4 needs `ends`, 3 needs `front`).
     async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        if !manifest.limits.is_empty() {
+            let nodes = live_nodes(
+                Arc::clone(&self.store),
+                &self.prefix,
+                &self.tenant,
+                &self.app,
+            )
+            .await?;
+            let lacking: Vec<_> = nodes
+                .iter()
+                .filter(|n| !n.can_rate_limits)
+                .map(|n| n.id.as_str())
+                .collect();
+            if !lacking.is_empty() {
+                return Err(DeployError::Refused(format!(
+                    "manifest format 6 needs rate_limits on all live readers: {}",
+                    lacking.join(", ")
+                )));
+            }
+        }
         if manifest.format_number() >= 5 {
             let nodes = nodes_without_flush(
                 Arc::clone(&self.store),
@@ -800,6 +822,14 @@ impl AppRef {
     /// name objects and lines, never a configuration value.
     pub async fn version(&self, version: &str) -> Result<Version, DeployError> {
         let manifest = self.manifest(version).await?;
+        self.version_from_manifest(version, &manifest).await
+    }
+
+    async fn version_from_manifest(
+        &self,
+        version: &str,
+        manifest: &Manifest,
+    ) -> Result<Version, DeployError> {
         let mut classes = Vec::new();
         for (class, digest) in &manifest.classes {
             let key = format!("{version}/{class}.wasm");
@@ -812,7 +842,7 @@ impl AppRef {
             }
             classes.push((class.clone(), bytes));
         }
-        let (access, mut config) = self.settings(version, &manifest).await?;
+        let (access, mut config) = self.settings(version, manifest).await?;
         let mut requires = manifest.requires.clone();
         let front = match &manifest.front {
             Some(digest) => {
@@ -839,6 +869,7 @@ impl AppRef {
             requires,
             expire: manifest.expire.clone(),
             batched: manifest.batched.clone(),
+            limits: manifest.limits.clone(),
             front,
         })
     }
@@ -1233,7 +1264,13 @@ impl AppRef {
             requires,
             expire,
             batched,
+            limits: changes.limits.clone().unwrap_or_else(|| {
+                base.as_ref()
+                    .map(|(_, m, _)| m.limits.clone())
+                    .unwrap_or_default()
+            }),
         };
+        limits::validate(&manifest.limits).map_err(DeployError::Refused)?;
         for (class, _) in set.access.restricted() {
             if !manifest.classes.contains_key(&class) {
                 return Err(DeployError::Invalid(
@@ -1538,6 +1575,18 @@ impl AppRef {
         if current.seq <= service.deploy_seq() {
             return Ok(false);
         }
+        let manifest = match self.manifest(&current.version).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if matches!(error, DeployError::Corrupt(_)) {
+                    service.set_rate_limits_pending(true);
+                }
+                return Err(error);
+            }
+        };
+        // Remember decoded policies before fetching any components. A bucket
+        // outage alone is not evidence of a policy; a decoded policy is.
+        service.set_rate_limits_pending(!manifest.limits.is_empty());
         let Version {
             classes,
             access,
@@ -1545,8 +1594,11 @@ impl AppRef {
             requires,
             expire,
             batched,
+            limits,
             front,
-        } = self.version(&current.version).await?;
+        } = self
+            .version_from_manifest(&current.version, &manifest)
+            .await?;
         // Everything compiled first, then swapped in at once with the
         // sequence, the rules and the values: a node that cannot build a
         // version keeps the previous one whole, and no event sees part of
@@ -1578,6 +1630,7 @@ impl AppRef {
                 &requires,
                 &batched,
                 front.as_ref(),
+                &limits,
             )
             .map_err(|(name, e)| {
                 if name == FRONT {
@@ -1681,6 +1734,8 @@ pub struct Changes {
     /// `(class, mode)`: sets how the class's plain writes reach the bucket
     /// (ADR 0034). Classes not named keep theirs.
     pub writes: Vec<(String, Writes)>,
+    /// None preserves policies; Some replaces the complete policy set.
+    pub limits: Option<limits::Policies>,
     /// The front (ADR 0023): kept by default.
     pub front: FrontChange,
     /// The front's configuration (`--front-config`): `None` keeps it,
@@ -1736,6 +1791,7 @@ impl Changes {
         let mut changes = Self {
             classes: Some(Vec::new()),
             every_rule: true,
+            limits: Some(Default::default()),
             ..Self::default()
         };
         for (name, access, part) in classes {
@@ -1876,6 +1932,8 @@ pub struct Diff {
     /// changed, or an added class's when it is not strict (ADR 0034,
     /// section 15).
     pub writes: Vec<String>,
+    /// Policy additions, changes and removals, without client values.
+    pub limits: Vec<String>,
 }
 
 impl Diff {
@@ -1895,11 +1953,26 @@ impl Diff {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            limits: Default::default(),
         };
         let empty = Settings::default();
         let (bm, bs) = before.unwrap_or((&empty_manifest, &empty));
         let (am, as_) = after;
         let mut diff = Self::default();
+        for name in bm
+            .limits
+            .keys()
+            .chain(am.limits.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let change = match (bm.limits.get(name), am.limits.get(name)) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "removed",
+                (Some(a), Some(b)) if a != b => "changed",
+                _ => continue,
+            };
+            diff.limits.push(format!("{name}: {change}"));
+        }
         for (class, digest) in &am.classes {
             match bm.classes.get(class) {
                 None => diff.added.push(class.clone()),
@@ -2047,6 +2120,7 @@ impl Diff {
                 format!("access {c}: open, no longer written in the version (the same rule)")
             }
         }));
+        out.extend(self.limits.iter().map(|l| format!("limit {l}")));
         out.extend(self.config.iter().map(|l| format!("config {l}")));
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
         out.extend(self.expire.iter().cloned());
@@ -2108,6 +2182,8 @@ pub struct Version {
     /// The classes whose writes are batched (ADR 0034; every other class
     /// is strict).
     pub batched: std::collections::BTreeSet<String>,
+    /// Node-local ingress policies (ADR 0036).
+    pub limits: limits::Policies,
     /// The version's front (ADR 0023), if it has one. Its values are not
     /// in `config` and `requires`, which hold classes only.
     pub front: Option<VersionFront>,
@@ -2213,6 +2289,8 @@ pub struct Manifest {
     /// is written as absence, said or not, so a version of strict classes
     /// keeps its format, bytes and id.
     pub batched: std::collections::BTreeSet<String>,
+    /// Node-local ingress policies (ADR 0036).
+    pub limits: limits::Policies,
 }
 
 impl Manifest {
@@ -2248,6 +2326,9 @@ impl Manifest {
         for class in &self.batched {
             out.push_str(&format!("writes {class} batched\n"));
         }
+        for (name, policy) in &self.limits {
+            out.push_str(&policy.line(name));
+        }
         out
     }
 
@@ -2262,13 +2343,16 @@ impl Manifest {
         hex(&Sha256::digest(text.as_bytes()))[..16].to_owned()
     }
 
-    /// 5 with a batched class (ADR 0034); 4 with an idle limit (ADR
+    /// 6 with ingress policies (ADR 0036); 5 with a batched class (ADR
+    /// 0034); 4 with an idle limit (ADR
     /// 0028); 3 with a front, or an explicit `open` rule (ADR 0023); else 1
     /// when there are neither rules nor configuration (the form from before
     /// ADR 0013, kept as the minimal one), else 2.
     #[must_use]
     pub fn format_number(&self) -> u8 {
-        if !self.batched.is_empty() {
+        if !self.limits.is_empty() {
+            6
+        } else if !self.batched.is_empty() {
             5
         } else if !self.expire.is_empty() {
             4
@@ -2299,6 +2383,7 @@ impl Manifest {
             "wasmkeep-manifest 3" => 3,
             "wasmkeep-manifest 4" => 4,
             "wasmkeep-manifest 5" => 5,
+            "wasmkeep-manifest 6" => 6,
             _ => return None,
         };
         let mut manifest = Self {
@@ -2310,8 +2395,20 @@ impl Manifest {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            limits: Default::default(),
         };
         for line in lines {
+            if line.starts_with("limit ") {
+                if format < 6 {
+                    return None;
+                }
+                let (name, policy) = limits::Policy::from_line(line)?;
+                if manifest.limits.insert(name, policy).is_some() {
+                    return None;
+                }
+                limits::validate(&manifest.limits).ok()?;
+                continue;
+            }
             // `access` keeps the rest of the line: names may hold spaces.
             if format >= 2
                 && let Some(rest) = line.strip_prefix("access ")
@@ -2604,6 +2701,7 @@ mod tests {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            limits: Default::default(),
         }
     }
 
@@ -2781,6 +2879,7 @@ mod tests {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            limits: Default::default(),
             front: None,
         };
         let shown = format!("{v:?}");
@@ -2815,8 +2914,8 @@ mod tests {
     fn manifests_with_unknown_or_inconsistent_lines_are_refused() {
         let base = "wasmkeep-manifest 2\nclass chat 11\n";
         for bad in [
-            // A format after this version's (5, ADR 0034).
-            "wasmkeep-manifest 6\nclass chat 11\n".to_owned(),
+            // A format after this version's (6, ADR 0036).
+            "wasmkeep-manifest 7\nclass chat 11\n".to_owned(),
             format!("{base}secret chat 11\n"),
             // Idle limits (ADR 0028): format 4 only, a known class, once,
             // between an hour and the longest.
@@ -2891,7 +2990,7 @@ mod tests {
             "wasmkeep-manifest 4\nclass chat 11\nwrites chat batched\n",
             "wasmkeep-manifest 1\nclass chat 11\nwrites chat batched\n",
             // A format this version does not know.
-            "wasmkeep-manifest 6\nclass chat 11\n",
+            "wasmkeep-manifest 7\nclass chat 11\n",
         ] {
             assert_eq!(Manifest::parse(bad), None, "{bad}");
         }
@@ -2946,6 +3045,49 @@ mod tests {
         // Strict classes only: format 1, read by every node as before.
         heartbeat(&store, "n", "take").await;
         app.check_readers(&two_classes()).await.unwrap();
+    }
+
+    #[test]
+    fn rate_limits_manifest_identity_and_legacy_bytes() {
+        let mut m = two_classes();
+        let old = (m.format(), m.version_id());
+        m.limits.insert(
+            "login".into(),
+            limits::Policy::parse("POST /login", "ip", None, "5/s", 10).unwrap(),
+        );
+        assert_eq!(m.format_number(), 6);
+        assert_eq!(Manifest::parse(&m.format()), Some(m.clone()));
+        assert_ne!(m.version_id(), old.1);
+        for bad in [
+            m.format().replace("manifest 6", "manifest 5"),
+            format!("{}limit login POST /login ip 5/s 10\n", m.format()),
+            m.format().replace("5/s", "0/s"),
+        ] {
+            assert!(Manifest::parse(&bad).is_none(), "{bad}");
+        }
+        m.limits.clear();
+        assert_eq!((m.format(), m.version_id()), old);
+    }
+
+    #[tokio::test]
+    async fn rate_limits_require_capable_readers() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let mut m = two_classes();
+        m.limits.insert(
+            "login".into(),
+            limits::Policy::parse("/login", "ip", None, "1/s", 1).unwrap(),
+        );
+        heartbeat(&store, "old", "take front ends flush").await;
+        assert!(
+            app.check_readers(&m)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("rate_limits")
+        );
+        heartbeat(&store, "old", "take front ends flush rate_limits").await;
+        app.check_readers(&m).await.unwrap();
     }
 
     #[test]
@@ -3044,6 +3186,7 @@ mod tests {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            limits: Default::default(),
         };
         assert_eq!(alone.format(), "wasmkeep-manifest 3\nfront main 44\n");
         assert_eq!(Manifest::parse(&alone.format()), Some(alone));

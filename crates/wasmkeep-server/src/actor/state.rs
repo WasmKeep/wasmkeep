@@ -322,7 +322,8 @@ impl ActorState {
         if self.abandoned(&response_tx) {
             return;
         }
-        match self.admit(outside).await {
+        let admission = self.admit(outside).await;
+        match admission {
             Ok(Admitted::Yes) => {}
             Ok(Admitted::Missing) => {
                 let _ = response_tx.send(Outcome::Missing);
@@ -346,7 +347,8 @@ impl ActorState {
                 return;
             }
         }
-        match self.ensure_owner().await {
+        let ownership = self.ensure_owner().await;
+        match ownership {
             // Asked again after the wait for ownership (a takeover's restore
             // can be long): whoever sent it may have gone meanwhile.
             Ok(()) if self.abandoned(&response_tx) => {}

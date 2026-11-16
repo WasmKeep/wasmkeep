@@ -17,6 +17,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
+static INGRESS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub(crate) fn ingress_admission(reason: Option<crate::rate_limit::Rejection>) {
+    let index = match reason {
+        None => 0,
+        Some(crate::rate_limit::Rejection::Quota(_)) => 1,
+        Some(crate::rate_limit::Rejection::Capacity) => 2,
+        Some(crate::rate_limit::Rejection::InvalidKey) => 3,
+    };
+    INGRESS[index].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Upper bounds of histogram buckets, in seconds.
 const BUCKETS: [f64; 14] = [
     0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0, 30.0,
@@ -342,7 +353,7 @@ pub(crate) struct Metrics {
     /// `Replica::snapshot_due`.
     pub(crate) snapshot_upload_failures: AtomicU64,
     /// Node calls refused because the record of used signatures was full,
-    /// by record (`calls`; `control`, takes and alarm hand-offs).
+    /// by record (`calls`; `control`, takes and alarm hand-offs; `ingress`, charged proofs).
     pub(crate) signatures_refused_full: Family<AtomicU64>,
     /// WebSockets this node closed with 1012 because it no longer owned
     /// their actor, by how it found out (`event`, `sweep`, `lease_lapse`,
@@ -568,7 +579,7 @@ pub(crate) const CUT_REASONS: [&str; 4] = ["wall", "lease", "replica", "stop"];
 /// `kind` of `wasmkeep_forwards_total`.
 pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
 /// `record` of `wasmkeep_signatures_refused_full_total`.
-pub(crate) const SIGNATURE_RECORDS: [&str; 2] = ["calls", "control"];
+pub(crate) const SIGNATURE_RECORDS: [&str; 3] = ["calls", "control", "ingress"];
 /// `reason` of `wasmkeep_websocket_owner_closes_total`.
 pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
     ["event", "sweep", "lease_lapse", "drain", "move"];
@@ -1118,6 +1129,33 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
             );
         });
     };
+    head(
+        &mut out,
+        "wasmkeep_rate_limit_requests_total",
+        "counter",
+        "Ingress admission decisions, by outcome.",
+    );
+    for (label, count) in ["admitted", "quota", "capacity", "invalid_key"]
+        .iter()
+        .zip(&INGRESS)
+    {
+        let _ = writeln!(
+            out,
+            "wasmkeep_rate_limit_requests_total{{outcome=\"{label}\"}} {}",
+            count.load(Ordering::Relaxed)
+        );
+    }
+    head(
+        &mut out,
+        "wasmkeep_rate_limit_active_keys",
+        "gauge",
+        "Retained ingress client buckets on this process.",
+    );
+    let _ = writeln!(
+        out,
+        "wasmkeep_rate_limit_active_keys {}",
+        crate::rate_limit::active_keys()
+    );
     app_family(
         &mut out,
         "wasmkeep_front_requests_total",

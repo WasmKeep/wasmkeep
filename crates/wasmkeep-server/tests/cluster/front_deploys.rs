@@ -60,6 +60,7 @@ pub(super) async fn front_app_node(
     config.access = version.access;
     config.config = version.config;
     config.requires = version.requires;
+    config.limits = version.limits;
     config.front = version.front.map(|f| wasmkeep_server::DeployedFront {
         component: runtime.compile(&f.wasm).unwrap(),
         config: f.config,

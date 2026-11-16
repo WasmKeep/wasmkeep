@@ -68,6 +68,9 @@ PUBLIC_DOC_ROUTES = {"/metrics"}
 # Additional application routes and deployment examples, reviewed per file. Match
 # complete candidates rather than exempting a whole line, directory, or /var.
 REVIEWED_PATHS = {
+    # Public ingress-policy grammar and literal HTTP route examples (ADR 0036).
+    "docs/adr/0036-per-node-ingress-rate-limits.md": {"/api/*", "/api/", "/api", "/s", "/m", "/h"},
+    "docs/project-file.md": {"/signin", "/api/*", "/api/", "/api", "/s", "/m", "/h", "/a%2Fb", "/a/b"},
     "bench/compare/src/main.rs": {"/actor/counter/{name}", "/counter/{name}", "/work"},
     "bench/compare/src/cluster.rs": {
         "/actor/counter/{name}", "/counter/{name}",

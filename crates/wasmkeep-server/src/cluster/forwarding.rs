@@ -71,6 +71,7 @@ pub(super) enum Framing {
 /// [`Framing::Keep`], the [`FRAMING`] headers stay, even when `Connection`
 /// names them.
 pub(super) fn strip_hop_by_hop(headers: &mut hyper::HeaderMap, framing: Framing) {
+    headers.remove(ADMITTED);
     let named: Vec<hyper::header::HeaderName> = headers
         .get_all(hyper::header::CONNECTION)
         .iter()
@@ -197,4 +198,418 @@ impl Cluster {
 pub(crate) fn never_forward<B>(req: &Request<B>) -> bool {
     req.headers().contains_key(FORWARDED)
         || req.extensions().get::<ArrivedOnClusterPort>().is_some()
+}
+
+// Domain-separated client identity proof; uncharged replay consumes owner quota.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IngressCharged;
+
+pub(crate) const ADMITTED: &str = "x-wasmkeep-admitted";
+
+fn identity_headers(headers: &hyper::HeaderMap) -> String {
+    let mut values: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| {
+            !HOP_BY_HOP.contains(&name.as_str())
+                && name.as_str() != "host"
+                && name.as_str() != "expect"
+                && !name.as_str().starts_with(RESERVED_PREFIX)
+        })
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .collect();
+    values.sort();
+    let mut bytes = Vec::new();
+    for (name, value) in values {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+    }
+    body_sha256(&bytes)
+}
+impl Cluster {
+    pub(super) async fn sign_admission<B>(
+        &self,
+        owner: &str,
+        path: &str,
+        req: &mut Request<B>,
+    ) -> Result<(), String> {
+        // No-policy forwards must never fetch a secret or wait on storage.
+        let Some(secret) = self.secret.get() else {
+            return Ok(());
+        };
+        let Some(peer) = req.extensions().get::<crate::http::PeerAddress>() else {
+            return Ok(());
+        };
+        let ip = match peer.0.ip() {
+            std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+            std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => ip,
+            std::net::IpAddr::V6(ip) => {
+                std::net::Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))
+            }
+        };
+        let secret = format!("wasmkeep-ingress-identity-v2:{secret}");
+        let ts = now_ms();
+        let charged = u8::from(req.extensions().get::<IngressCharged>().is_some());
+        let mut nonce = format!("{charged}{:032x}", u128::from(ip));
+        if charged != 0 {
+            // Fit the verifier's 64-hex-digit bound while distinguishing even
+            // identical hand-offs signed in the same millisecond. Hash the
+            // process seed and send counter to retain 124 bits of uniqueness.
+            nonce.push_str(&body_sha256(self.nonce().as_bytes())[..31]);
+        }
+        let body = identity_headers(req.headers());
+        let mac = signature(
+            &secret,
+            ts,
+            &nonce,
+            owner,
+            req.method(),
+            path,
+            &body,
+            req.headers(),
+        );
+        req.headers_mut().insert(
+            ADMITTED,
+            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body} {mac}"))
+                .map_err(|e| e.to_string())?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn admission_received<B>(
+        &self,
+        req: &Request<B>,
+    ) -> Option<(std::net::IpAddr, bool)> {
+        if self.refuse_plaintext && req.extensions().get::<ArrivedOnClusterPort>().is_none() {
+            return None;
+        }
+        let mut values = req.headers().get_all(ADMITTED).iter();
+        let given = values.next()?.to_str().ok()?;
+        if values.next().is_some() {
+            return None;
+        }
+        let secret = format!("wasmkeep-ingress-identity-v2:{}", self.secret.get()?);
+        let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+        let signed = verify(
+            &secret,
+            given,
+            now_ms(),
+            &self.node_id,
+            req.method(),
+            path,
+            req.headers(),
+        )?;
+        if signed.body != identity_headers(req.headers()) {
+            return None;
+        }
+        let encoded = given.split(' ').nth(2)?;
+        let (encoded, charged) = match encoded.len() {
+            32 => (encoded, false), // Previous uncharged identity format.
+            33 if encoded.starts_with('0') || encoded.starts_with('1') => {
+                (&encoded[1..], encoded.starts_with('1'))
+            }
+            64 if encoded.starts_with('1') => (&encoded[1..33], true),
+            _ => return None,
+        };
+        let ip = std::net::Ipv6Addr::from(u128::from_str_radix(encoded, 16).ok()?);
+        // Spend only authenticated, well-formed charged proofs, atomically.
+        // None uses the forwarded-request 503 path; never fall back to an
+        // unchecked exemption when this separate bounded record is full.
+        if charged && !self.seen_ingress.first_use(signed.mac, signed.ts, now_ms()) {
+            return None;
+        }
+        Some((
+            ip.to_ipv4_mapped()
+                .map_or(std::net::IpAddr::V6(ip), std::net::IpAddr::V4),
+            charged,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn review_forward_headers_strip_client_receipt() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(ADMITTED, "forged".parse().unwrap());
+        strip_hop_by_hop(&mut h, Framing::Keep);
+        assert!(!h.contains_key(ADMITTED));
+    }
+    #[tokio::test]
+    async fn fix4_charged_proof_is_single_use_even_with_another_body() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::post("/actor/c/a?q=1").body("first").unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        req.extensions_mut().insert(IngressCharged);
+        cluster
+            .sign_admission("owner", "/actor/c/a?q=1", &mut req)
+            .await
+            .unwrap();
+        assert!(cluster.admission_received(&req).is_some());
+        *req.body_mut() = "other";
+        assert!(
+            cluster.admission_received(&req).is_none(),
+            "charged replay accepted with another body"
+        );
+        assert_eq!(cluster.seen.len(), 0);
+        assert_eq!(cluster.seen_control.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn fix4_charged_proof_capacity_fails_closed_without_blocking_uncharged() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        for i in 0..=4096 {
+            let path = format!("/actor/c/a?q={i}");
+            let mut req = Request::get(&path).body(()).unwrap();
+            req.extensions_mut()
+                .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+            req.extensions_mut().insert(IngressCharged);
+            cluster
+                .sign_admission("owner", &path, &mut req)
+                .await
+                .unwrap();
+            assert_eq!(
+                cluster.admission_received(&req).is_some(),
+                i < 4096,
+                "entry {i}"
+            );
+            if i == 4096 {
+                req.extensions_mut().remove::<IngressCharged>();
+                cluster
+                    .sign_admission("owner", &path, &mut req)
+                    .await
+                    .unwrap();
+                assert!(cluster.admission_received(&req).is_some());
+                assert!(cluster.admission_received(&req).is_some());
+            }
+        }
+        assert_eq!(cluster.seen.len(), 0);
+        assert_eq!(cluster.seen_control.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn fix4_distinct_charged_sends_and_atomic_replay() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        req.extensions_mut().insert(IngressCharged);
+        let mut nonces = std::collections::HashSet::new();
+        for _ in 0..32 {
+            cluster
+                .sign_admission("owner", "/actor/c/a", &mut req)
+                .await
+                .unwrap();
+            let nonce = req.headers()[ADMITTED]
+                .to_str()
+                .unwrap()
+                .split(' ')
+                .nth(2)
+                .unwrap();
+            assert_eq!(nonce.len(), 64);
+            assert!(
+                nonces.insert(nonce.to_owned()),
+                "distinct sends reused a nonce"
+            );
+            let winners = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| usize::from(cluster.admission_received(&req).is_some()))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .sum::<usize>()
+            });
+            assert_eq!(winners, 1);
+        }
+        assert_eq!(cluster.seen_ingress.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn fix3_charged_identity_is_signed_and_tamper_evident() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        req.extensions_mut().insert(IngressCharged);
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster.admission_received(&req),
+            Some(("192.0.2.1".parse().unwrap(), true))
+        );
+        assert!(
+            cluster
+                .is_internal(req.method(), "/actor/c/a", req.headers(), false)
+                .is_none()
+        );
+        let proof = req.headers()[ADMITTED].to_str().unwrap();
+        let mut fields: Vec<_> = proof.split(' ').map(str::to_owned).collect();
+        fields[2].replace_range(..1, "0");
+        req.headers_mut()
+            .insert(ADMITTED, fields.join(" ").parse().unwrap());
+        assert!(cluster.admission_received(&req).is_none());
+    }
+    #[tokio::test]
+    async fn fix2_cold_secret_forward_does_not_fetch_or_sign() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store.clone());
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert!(cluster.secret.get().is_none());
+        assert!(!req.headers().contains_key(ADMITTED));
+        assert!(store.get(&"cluster/secret".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fix2_proof_binds_identity_owner_method_query_and_headers() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a?q=1")
+            .header("x-client-id", "alice")
+            .body(())
+            .unwrap();
+        req.extensions_mut().insert(crate::http::PeerAddress(
+            "[2001:db8:1:2::abcd]:1234".parse().unwrap(),
+        ));
+        cluster
+            .sign_admission("owner", "/actor/c/a?q=1", &mut req)
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster.admission_received(&req),
+            Some(("2001:db8:1:2::".parse().unwrap(), false))
+        );
+        let policies = [(
+            "test".into(),
+            crate::apps::limits::Policy::parse("/*", "ip", None, "1/h", 1).unwrap(),
+        )]
+        .into();
+        let limiter = crate::rate_limit::Limiter::default();
+        let now = std::time::Instant::now();
+        limiter.reconcile(&policies, now);
+        for expected in [Ok(()), Err(crate::rate_limit::Rejection::Quota(3600))] {
+            assert_eq!(
+                limiter.admit(
+                    &policies,
+                    "GET",
+                    "/actor/c/a",
+                    req.headers(),
+                    cluster.admission_received(&req).map(|(ip, _)| ip),
+                    now
+                ),
+                expected
+            );
+        }
+        for change in 0..5 {
+            let mut changed = req.clone();
+            match change {
+                0 => *changed.method_mut() = hyper::Method::POST,
+                1 => *changed.uri_mut() = "/actor/c/a?q=2".parse().unwrap(),
+                2 => {
+                    changed
+                        .headers_mut()
+                        .insert("x-client-id", "bob".parse().unwrap());
+                }
+                3 => {
+                    cluster
+                        .sign_admission("other", "/actor/c/a?q=1", &mut changed)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    let proof = changed.headers()[ADMITTED].to_str().unwrap().replace(
+                        "20010db8000100020000000000000000",
+                        "20010db8000100030000000000000000",
+                    );
+                    changed
+                        .headers_mut()
+                        .insert(ADMITTED, proof.parse().unwrap());
+                }
+            }
+            assert!(
+                cluster.admission_received(&changed).is_none(),
+                "change {change}"
+            );
+        }
+        assert_eq!(cluster.seen.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn review_receipts_do_not_fill_call_replay_store() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert!(cluster.admission_received(&req).is_some());
+        assert_eq!(cluster.seen.len(), 0);
+    }
+    #[tokio::test]
+    async fn fix2_identity_proofs_are_reusable_and_never_actor_credentials() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut config = ClusterConfig::new("owner", "http://owner", store);
+        config.heartbeat = Duration::from_secs(3600);
+        config.lease = LeaseConfig::new(10_800_000, 5000, 2000, 1000).unwrap();
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert!(
+            cluster
+                .is_internal(req.method(), "/actor/c/a", req.headers(), false)
+                .is_none()
+        );
+        let mut changed = req.clone();
+        *changed.uri_mut() = "/actor/c/b".parse().unwrap();
+        assert!(cluster.admission_received(&changed).is_none());
+        assert!(cluster.admission_received(&req).is_some());
+        assert!(cluster.admission_received(&req).is_some());
+        let proof = req.headers()[ADMITTED].clone();
+        req.headers_mut().remove(ADMITTED);
+        req.headers_mut().insert(INTERNAL, proof);
+        assert!(
+            cluster
+                .is_internal(req.method(), "/actor/c/a", req.headers(), false)
+                .is_none()
+        );
+    }
 }

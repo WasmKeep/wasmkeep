@@ -340,6 +340,8 @@ pub(crate) struct Cluster {
     /// apart: a flood of other signed calls that fills `seen` cannot
     /// refuse the calls a drain and a move depend on.
     seen_control: SeenSignatures,
+    /// Rare charged ingress hand-offs, isolated from actor and control calls.
+    seen_ingress: SeenSignatures,
     /// When each reason for refusing a node signature was last logged
     /// (ms): one slot per reason, so junk on the public port cannot hide a
     /// real refusal.
@@ -671,6 +673,7 @@ impl Cluster {
             serves: serves.to_owned(),
             seen: SeenSignatures::named("calls"),
             seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL),
+            seen_ingress: SeenSignatures::with_cap("ingress", signing::MAX_SEEN_INGRESS),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(
@@ -1109,6 +1112,15 @@ impl Cluster {
             let Ok(mut out) = out else {
                 return unavailable("bad advertised address\n");
             };
+            if let Some(peer) = req.extensions().get::<crate::http::PeerAddress>().copied() {
+                out.extensions_mut().insert(peer);
+            }
+            if req.extensions().get::<IngressCharged>().is_some() {
+                out.extensions_mut().insert(IngressCharged);
+            }
+            if self.sign_admission(owner, &path, &mut out).await.is_err() {
+                return unavailable("cannot authenticate ingress admission; retry\n");
+            }
             if front && let Err(e) = self.sign_hand_off(owner, &path, &mut out).await {
                 tracing::warn!(owner, error = %e, "relaying a hand-off refused");
                 return unavailable("cannot relay this socket now; retry\n");
@@ -1330,6 +1342,12 @@ impl Cluster {
                 None
             }
         }
+    }
+
+    /// Read-only early replay check; body verification still spends the
+    /// signature later, so a bad-body copy cannot burn the legitimate call.
+    pub(crate) fn admission_replayed(&self, signed: &Signed, control: bool) -> bool {
+        self.record(control).used(signed.mac, signed.ts, now_ms())
     }
 
     /// Records a signature whose body matched; false if it was already used.
@@ -2250,6 +2268,9 @@ impl Cluster {
             Ok(app) => req.headers_mut().insert(APP, app),
             Err(_) => return unavailable("cannot forward this request\n"),
         };
+        if self.sign_admission(owner, &path, &mut req).await.is_err() {
+            return unavailable("cannot authenticate ingress admission; retry\n");
+        }
         crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "request")]));
         // Bound the wait for the owner's response headers (a hung node or a
         // half-open connection); the body then streams as the owner sends it.

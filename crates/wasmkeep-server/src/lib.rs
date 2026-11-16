@@ -25,6 +25,7 @@ mod http;
 mod local_layout;
 mod logging;
 pub mod metrics;
+mod rate_limit;
 mod replica;
 pub mod secret_store;
 pub mod secrets;

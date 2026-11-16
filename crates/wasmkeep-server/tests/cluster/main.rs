@@ -80,6 +80,7 @@ mod front_deploys;
 mod front_sockets;
 #[path = "golden_trace.rs"]
 mod golden_trace;
+mod ingress_limits;
 #[path = "listings.rs"]
 mod listings;
 #[path = "migrate.rs"]

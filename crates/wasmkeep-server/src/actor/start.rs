@@ -49,6 +49,7 @@ impl ActorService {
         let classes: Classes = Arc::new(std::sync::RwLock::new(map));
         // The deployed version's front, linked like its classes: one that
         // does not link stops the start.
+        crate::apps::limits::validate(&config.limits).map_err(Error::NotAFront)?;
         let front_env = Arc::new(config.front_env.clone());
         let front_slot: crate::front::FrontSlot = Arc::default();
         if let Some(deployed) = &config.front {
@@ -213,6 +214,9 @@ impl ActorService {
                 node_env: config.env,
                 front_env,
                 front: front_slot,
+                limits: std::sync::RwLock::new(config.limits),
+                rate_limiter: Default::default(),
+                rate_limits_pending: std::sync::atomic::AtomicBool::new(false),
                 start_rules: rules,
                 flag_access: config.flag_access,
                 deploy_behind: std::sync::atomic::AtomicBool::new(false),
@@ -231,6 +235,14 @@ impl ActorService {
                 app_deleted: tokio::sync::watch::Sender::new(false),
             }),
         };
+        service.inner.rate_limiter.reconcile(
+            &service
+                .inner
+                .limits
+                .read()
+                .unwrap_or_else(|p| p.into_inner()),
+            std::time::Instant::now(),
+        );
         let _ = fire_to.set(Arc::downgrade(&service.inner));
         tokio::spawn(sample_disk(Arc::downgrade(&service.inner), data_dir));
         // In a cluster, deliver alarms whose owner never fired them.

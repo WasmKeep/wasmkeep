@@ -335,3 +335,25 @@ in front, and WasmKeep has no rate limiting or filtering of its own beyond
 its protective limits.
 
 
+
+## Application admission policies
+
+Configure [ingress limits](../project-file.md#ingress-limits) in the app's
+project file. These run on the receiving node before front or actor work.
+A 429 response carries `Retry-After`; pass it through to clients. Each
+node has its own budget, so adding nodes changes the total allowance.
+WebSocket handshakes count once; existing frames do not.
+
+The TCP peer behind this load balancer is the load balancer. WasmKeep
+does not trust `Forwarded` or `X-Forwarded-For` for these policies and has
+no trusted-proxy IP option in this release. If an edge supplies a header
+key, configure it to discard client input and set the value itself, and
+keep the node's public listener reachable only through that edge. The
+header is an admission key, not authentication. Keep listener and network
+flood protection at the edge.
+
+Upgrade all live app readers to a binary advertising `rate_limits` before
+deploying a nonempty policy. Such deployments use manifest format 6;
+deploy and rollback refuse unsupported readers. Removing all policies in
+a full project deployment restores the older format appropriate to its
+other features. Legacy partial deployments preserve policies.
