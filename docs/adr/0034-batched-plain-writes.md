@@ -342,13 +342,14 @@ knob it never acts. With a slower one the actor runs `knob` worth of
 events per round trip and waits for the rest; a stalled bucket stops
 the actor's events after `knob`, as strict stops them at once.
 
-The wait at an event's end is inside the job, so whoever awaits the
-job's answer waits too: a caller of `actors.call` and the job of a
-socket message get their answer only once the job returns (`submit`
-awaits the job's reply, `mailbox.rs:188-195`; that the reply is sent
-only after `finish` is inferred from the job wrapping `finish`, and is
-checked by a test). The answer to the guest's caller is set before
-that wait; a waiting caller inherits only the delay.
+The wait at an event's end is inside the job, after the answer. An HTTP
+client and a caller of `actors.call` get the answer when the guest sets
+it (the response is forwarded as soon as it is set, `state.rs`'s
+`request`), so neither waits for the rule; the callee's next event, from
+whoever sends it, starts only after the wait. (As first written, this
+paragraph inferred that a caller of `actors.call` waits for the job's
+end; the S12 test `a_held_callee_answers_its_caller_and_holds_its_next_event`
+showed it does not, as it does not for a strict upload either.)
 
 **The loss bound.** When a node dies, or a batched actor's hold ends
 without a flush (section 6), what is lost is the segment in flight and
