@@ -271,3 +271,19 @@ async fn a_flush_to_the_barrier_ends_by_its_deadline_whatever_it_waits_on() {
     assert!(took.1 < Duration::from_secs(2), "{:?}", took.1);
     f.mailboxes.hibernate(&address);
 }
+
+#[tokio::test]
+async fn actor_restore_meta_does_not_make_an_idle_database_resident() {
+    let f = fixture().await;
+    let address = ActorAddress::new("t", "c", "metadata").unwrap();
+    f.mailboxes
+        .submit(&address, |s: &mut ActorState| {
+            Box::pin(async move {
+                assert!(s.db.is_none());
+                assert_eq!(s.restore_meta(OPERATOR_RESTORE_KEY).await.unwrap(), None);
+                assert!(s.db.is_none(), "metadata read retained an idle database");
+            })
+        })
+        .await
+        .unwrap();
+}

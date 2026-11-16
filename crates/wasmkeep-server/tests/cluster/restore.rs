@@ -489,6 +489,14 @@ async fn actor_restore_submit(
 async fn actor_restore_outcome(store: &Arc<dyn ObjectStore>, key: &str, suffix: &str) -> String {
     let outcome = Key::from(format!("{key}.{suffix}"));
     eventually("restore outcome", async || {
+        if suffix != "refused"
+            && let Ok(got) = store.get(&Key::from(format!("{key}.refused"))).await
+        {
+            panic!(
+                "unexpected restore refusal: {:?}",
+                got.bytes().await.unwrap()
+            );
+        }
         store.head(&outcome).await.is_ok()
     })
     .await;
@@ -616,11 +624,13 @@ async fn actor_restore_marker_survives_every_delete_and_replay_does_not_resurrec
 async fn actor_restore_closes_sockets_and_restores_alarm_with_fresh_index() {
     use futures_util::StreamExt as _;
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(store.clone(), Arc::new(AtomicBool::new(false))));
+    let seen: Arc<dyn ObjectStore> = flaky.clone();
     let dir = tempfile::tempdir().unwrap();
     let a = node_with(
         "restore-socket",
         dir.path(),
-        &store,
+        &seen,
         Duration::from_secs(30),
         "t",
         test_actor_wasm(),
@@ -658,6 +668,7 @@ async fn actor_restore_closes_sockets_and_restores_alarm_with_fresh_index() {
         .await
         .unwrap();
     let key = actor_restore_submit(&store, "socket", "3333333333333333", &stage).await;
+    *flaky.fail_puts_of.lock().unwrap() = Some(format!("{key}.done"));
     let close = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) = ws.next().await
@@ -679,6 +690,21 @@ async fn actor_restore_closes_sockets_and_restores_alarm_with_fresh_index() {
     }
     // Close acknowledgement permits the mailbox close callback to finish.
     let _ = ws.close(None).await;
+    drop(ws); // Finish the transport so the server can retire its reservation.
+    // Busy retries are five seconds apart. Include all three retries and
+    // scheduling time when this test runs with the full cluster suite.
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while actor_restore_meta(&store, "socket", "operator_restore")
+            .await
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("restore reset never acknowledged despite failed outcome");
+    assert!(store.head(&Key::from(format!("{key}.done"))).await.is_err());
+    *flaky.fail_puts_of.lock().unwrap() = None;
     actor_restore_outcome(&store, &key, "done").await;
     assert_ne!(
         actor_restore_meta(&store, "socket", "alarm_indexed").await,
@@ -826,4 +852,102 @@ async fn actor_restore_retries_on_a_new_owner_after_upload_failure_and_moves() {
         "2"
     );
     assert_eq!(read(b.addr, "retry").await, "2");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_restore_unexecutable_request_does_not_block_websocket() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "restore-gate",
+        dir.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    super::deletes::write(a.addr, "gate", 1).await;
+    let stage = actor_restore_stage(&store, "gate").await;
+    store.put(&Key::from("nodes/old"), b"wasmkeep-node 2\nold\nhttp://old\n0.4.2\n0\ndefault/default\n\n\nserving\n\ntake ends restore\n".to_vec().into()).await.unwrap();
+    let key = actor_restore_submit(&store, "gate", "7777777777777777", &stage).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(store.head(&Key::from(format!("{key}.done"))).await.is_err());
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/actor/t/gate", a.addr))
+        .await
+        .expect("an unexecutable request must not gate sockets");
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_restore_build_failure_cleans_fresh_alarm_entries() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "restore-cleanup",
+        dir.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    super::deletes::write(a.addr, "cleanup", 1).await;
+    assert_eq!(
+        send(a.addr, "POST", "/actor/t/cleanup/alarm?in=120000", "")
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        send(a.addr, "POST", "/actor/t/cleanup/flush", "")
+            .await
+            .status,
+        200
+    );
+    let stage = actor_restore_stage(&store, "cleanup").await;
+    for _ in 0..100 {
+        wasmkeep_storage::faults::fail_next("set_meta:operator_restore");
+    }
+    actor_restore_submit(&store, "cleanup", "8888888888888888", &stage).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        index_entries_for(&store, "cleanup").await.len(),
+        1,
+        "failed builds leaked fresh entries"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_restore_marker_read_error_does_not_break_strict_durable_delete() {
+    for mode in ["delete", "delete-durable"] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = tempfile::tempdir().unwrap();
+        let a = node_with(
+            "delete-meta-error",
+            dir.path(),
+            &store,
+            Duration::from_secs(30),
+            "t",
+            test_actor_wasm(),
+        )
+        .await;
+        super::deletes::write(a.addr, "meta-error", 1).await;
+        let stage = actor_restore_stage(&store, "meta-error").await;
+        let gate = Key::from("apps/default/default/restoring");
+        store.put(&gate, vec![1].into()).await.unwrap();
+        let key = actor_restore_submit(&store, "meta-error", "9999999999999999", &stage).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        wasmkeep_storage::faults::fail_next("meta:operator_restore");
+        let reply = send(a.addr, "POST", &format!("/actor/t/meta-error/{mode}"), "").await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!(read(a.addr, "meta-error").await, "0");
+        store.delete(&gate).await.unwrap();
+        actor_restore_outcome(&store, &key, "superseded").await;
+        assert_eq!(
+            read(a.addr, "meta-error").await,
+            "0",
+            "unreadable marker allowed replay"
+        );
+    }
 }

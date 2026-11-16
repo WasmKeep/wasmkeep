@@ -1,6 +1,9 @@
 //! Live single-actor replacement: a new owner-fenced write, never a history edit.
 use super::*;
-use wasmkeep_cluster::{actor_restore::Request as RestoreRequest, control::RestoreIntent};
+use wasmkeep_cluster::{
+    actor_restore::{Request as RestoreRequest, replay},
+    control::RestoreIntent,
+};
 use wasmkeep_storage::wal::{Changes, Restorer};
 
 impl ActorState {
@@ -16,26 +19,49 @@ impl ActorState {
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string());
         }
-        if self.db.is_none() {
-            let storage = self.storage.clone();
-            let a = self.address.clone();
-            let residency = self.residency.clone();
-            self.db = Some(
-                tokio::task::spawn_blocking(move || {
-                    storage
-                        .open(a.class(), a.name())
-                        .map(|db| residency.retain(db))
-                })
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?,
-            );
+        if let Some(db) = self.db.as_mut() {
+            return db.meta(key).map_err(|e| e.to_string());
         }
-        self.db
-            .as_mut()
-            .ok_or("database unavailable")?
-            .meta(key)
-            .map_err(|e| e.to_string())
+        let storage = self.storage.clone();
+        let address = self.address.clone();
+        tokio::task::spawn_blocking(move || {
+            storage
+                .open(address.class(), address.name())
+                .map_err(|e| e.to_string())?
+                .meta(key)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    async fn retire_restore_alarms(
+        &mut self,
+        cluster: &Cluster,
+        generation: u64,
+    ) -> Result<(), String> {
+        let debt = self
+            .restore_meta("restore_stale_alarms")
+            .await?
+            .unwrap_or_default();
+        for entry in debt.lines().filter_map(alarm_index::parse_meta) {
+            if !self.fence().await
+                || !self
+                    .replica()
+                    .ok_or("no replica")?
+                    .lock()
+                    .await
+                    .collector()
+                    .lease_valid()
+                || !alarm_index::may_delete(&entry, generation)
+            {
+                return Err("restore cleanup lost its fence".into());
+            }
+            cluster
+                .delete_alarm_entry(&self.address, &entry)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -44,28 +70,6 @@ enum Restored {
     End(&'static str, String),
     Retry,
     Busy,
-}
-
-/// Replay ordering: a repeated restore is fenced, a later restore or delete
-/// supersedes it. Equal bucket timestamps only identify the same request.
-fn replay(marker: Option<&str>, replaced: Option<&str>, at: u64, id: &str) -> Option<&'static str> {
-    if let Some((time, done)) = marker.and_then(|s| s.split_once(' '))
-        && let Ok(time) = time.parse::<u64>()
-    {
-        if time == at && done == id {
-            return Some("done");
-        }
-        if time > at {
-            return Some("superseded");
-        }
-    }
-    if let Some(rest) = replaced.and_then(|s| s.strip_prefix("delete "))
-        && let Some((_, time)) = rest.split_once(' ')
-        && time.parse::<u64>().is_ok_and(|time| time > at)
-    {
-        return Some("superseded");
-    }
-    None
 }
 
 impl ActorState {
@@ -104,20 +108,58 @@ impl ActorState {
             Ok(v) => v,
             Err(_) => return Restored::Retry,
         };
+        let replaced = if replay(marker.as_deref(), None, intent.written_at_ms, &intent.id)
+            .is_none()
+            && replaced
+                .as_deref()
+                .is_some_and(|v| v.starts_with("delete "))
+        {
+            match slot
+                .lock()
+                .await
+                .delete_time(replaced.as_deref().unwrap_or_default())
+                .await
+            {
+                Ok(at) => Some(format!("delete 0 {at}")),
+                Err(e) => return Restored::End("refused", e.to_string()),
+            }
+        } else {
+            replaced
+        };
         if let Some(outcome) = replay(
             marker.as_deref(),
             replaced.as_deref(),
             intent.written_at_ms,
             &intent.id,
         ) {
-            if !self.fence().await {
+            let marks = self.delete_marks().await;
+            if marks.is_err() || !self.fence().await {
                 return Restored::Retry;
             }
-            if let Ok((_, _, alarm)) = self.delete_marks().await {
+            if let Ok((_, _, alarm)) = marks {
                 self.alarms.clear(self.address.clone());
                 if let Some(at) = alarm {
                     self.alarms.set(self.address.clone(), at);
                 }
+            }
+            let head = slot.lock().await.head();
+            if !cluster
+                .restore_outcome(
+                    &intent,
+                    outcome,
+                    &format!("{}:{}", head.generation, head.txid),
+                )
+                .await
+            {
+                return Restored::Retry;
+            }
+            let generation = slot.lock().await.generation();
+            if self
+                .retire_restore_alarms(&cluster, generation)
+                .await
+                .is_err()
+            {
+                return Restored::Retry;
             }
             let head = slot.lock().await.head();
             return Restored::End(outcome, format!("{}:{}", head.generation, head.txid));
@@ -156,6 +198,14 @@ impl ActorState {
             Ok(v) => v,
             Err(_) => return Restored::Retry,
         };
+        if head.txid == u64::MAX {
+            return Restored::End("refused", "transaction id exhausted".into());
+        }
+        let mut stale_debt = String::new();
+        if let Some(stale) = &stale {
+            stale_debt.push_str(&alarm_index::to_meta(Some(stale)));
+            stale_debt.push('\n');
+        }
         // Scratch files are unique per attempt, including concurrent requests.
         let scratch = self.storage.scratch_dir().join(format!(
             "restore-{}",
@@ -231,29 +281,82 @@ impl ActorState {
             }
         };
         let generation = slot.lock().await.generation();
-        let entry = match alarm {
-            Some(at) => match cluster
-                .put_new_alarm_entry(&self.address, at, generation)
+        // The previous attempt may have uploaded without receiving an answer.
+        // Fence the restored head before retiring entries not named by that head.
+        if !self.fence().await
+            || self
+                .retire_restore_alarms(&cluster, generation)
                 .await
-            {
-                Ok(entry) => Some(entry),
+                .is_err()
+        {
+            drop(db);
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Restored::Retry;
+        }
+        let Some(txid) = slot.lock().await.head().txid.checked_add(1) else {
+            drop(db);
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Restored::End("refused", "transaction id exhausted".into());
+        };
+        let entry = if let Some(at) = alarm {
+            let candidates = match cluster.alarm_entries_at(&self.address, at).await {
+                Ok(v) => v,
                 Err(_) => {
                     drop(db);
                     let _ = std::fs::remove_dir_all(&scratch);
                     return Restored::Retry;
                 }
-            },
-            None => None,
+            };
+            for old in candidates {
+                if !slot.lock().await.collector().lease_valid() {
+                    drop(db);
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    return Restored::Retry;
+                }
+                if Some(&old) != stale.as_ref()
+                    && alarm_index::may_delete(&old, generation)
+                    && cluster
+                        .delete_alarm_entry(&self.address, &old)
+                        .await
+                        .is_err()
+                {
+                    drop(db);
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    return Restored::Retry;
+                }
+            }
+            match cluster.name_alarm_entry(at, generation) {
+                Ok(entry) => {
+                    if cluster
+                        .put_alarm_entry(&self.address, &entry)
+                        .await
+                        .is_err()
+                    {
+                        let _ = cluster.delete_alarm_entry(&self.address, &entry).await;
+                        drop(db);
+                        let _ = std::fs::remove_dir_all(&scratch);
+                        return Restored::Retry;
+                    }
+                    Some(entry)
+                }
+                Err(_) => {
+                    drop(db);
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    return Restored::Retry;
+                }
+            }
+        } else {
+            None
         };
         let mark = format!("{} {}", intent.written_at_ms, intent.id);
-        let Some(txid) = head.txid.checked_add(1) else {
-            return Restored::End("refused", "transaction id exhausted".into());
-        };
+        let fresh_entry = entry.clone();
+        let cleanup_debt = stale_debt.clone();
         let replacement = format!("restore {txid} {mark}");
         let built = tokio::task::spawn_blocking(move || -> Result<Changes, String> {
             for (key, value) in [
                 (OPERATOR_DELETE_KEY, delete.unwrap_or_default()),
                 (OPERATOR_RESTORE_KEY, mark),
+                ("restore_stale_alarms", stale_debt),
                 ("replaced", replacement),
                 (ALARM_INDEXED_KEY, alarm_index::to_meta(entry.as_ref())),
                 (ALARM_FAILURES_KEY, "0".into()),
@@ -267,11 +370,19 @@ impl ActorState {
         let _ = std::fs::remove_dir_all(&scratch);
         let all = match built {
             Ok(Ok(all)) => all,
-            _ => return Restored::Retry,
+            _ => {
+                if let Some(entry) = &fresh_entry {
+                    let _ = cluster.delete_alarm_entry(&self.address, entry).await;
+                }
+                return Restored::Retry;
+            }
         };
         // Recheck the app fence immediately before the write. Lease validity
         // also guards the upload acknowledgement and a concurrent owner change.
         if !cluster.actor_restore_allowed().await {
+            if let Some(entry) = &fresh_entry {
+                let _ = cluster.delete_alarm_entry(&self.address, entry).await;
+            }
             return Restored::Retry;
         }
         self.end_capture_at_barrier().await;
@@ -285,13 +396,19 @@ impl ActorState {
         let body = format!("{}:{}", head.generation, head.txid);
         // Publish done before retiring anything. A failed outcome leaves the
         // request for the next holder, which recognizes its durable marker.
-        let ended = cluster.restore_outcome(&intent, "done", &body).await;
+        let mut ended = cluster.restore_outcome(&intent, "done", &body).await;
         if ended {
-            if let Some(stale) = stale
-                && replica.collector().lease_valid()
-                && alarm_index::may_delete(&stale, generation)
-            {
-                let _ = cluster.delete_alarm_entry(&self.address, &stale).await;
+            for stale in cleanup_debt.lines().filter_map(alarm_index::parse_meta) {
+                if !replica.collector().lease_valid()
+                    || !alarm_index::may_delete(&stale, generation)
+                    || cluster
+                        .delete_alarm_entry(&self.address, &stale)
+                        .await
+                        .is_err()
+                {
+                    ended = false;
+                    break;
+                }
             }
             self.alarms.clear(self.address.clone());
             if let Some(at) = alarm {
@@ -378,6 +495,28 @@ async fn restore_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: 
     {
         return;
     }
+    if !cluster.actor_restore_allowed().await {
+        return;
+    }
+    struct Admission<'a>(&'a ServiceInner, ActorAddress);
+    impl Drop for Admission<'_> {
+        fn drop(&mut self) {
+            let mut active = self.0.restoring.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(count) = active.get_mut(&self.1) {
+                *count -= 1;
+                if *count == 0 {
+                    active.remove(&self.1);
+                }
+            }
+        }
+    }
+    *inner
+        .restoring
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(address.clone())
+        .or_default() += 1;
+    let _admission = Admission(inner, address.clone());
     inner.forget_owner(&address);
     for attempt in 0..=3 {
         let request = intent.clone();
@@ -403,7 +542,13 @@ async fn restore_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: 
                     .await;
                 return;
             }
-            _ => return,
+            _ => {
+                drop(_admission);
+                // Keep the request in the active set during backoff, but reopen
+                // socket admission; a failing request cannot churn every heartbeat.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return;
+            }
         }
     }
 }

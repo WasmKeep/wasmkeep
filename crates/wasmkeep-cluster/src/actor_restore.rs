@@ -78,6 +78,33 @@ impl Request {
     }
 }
 
+/// Replay ordering: a repeated restore is fenced, a later restore or delete
+/// supersedes it. Equal bucket timestamps only identify the same request.
+pub fn replay(
+    marker: Option<&str>,
+    replaced: Option<&str>,
+    at: u64,
+    id: &str,
+) -> Option<&'static str> {
+    if let Some((time, done)) = marker.and_then(|s| s.split_once(' '))
+        && let Ok(time) = time.parse::<u64>()
+    {
+        if time == at && done == id {
+            return Some("done");
+        }
+        if time > at {
+            return Some("superseded");
+        }
+    }
+    if let Some(rest) = replaced.and_then(|s| s.strip_prefix("delete "))
+        && let Some((_, time)) = rest.split_once(' ')
+        && time.parse::<u64>().is_ok_and(|time| time >= at)
+    {
+        return Some("superseded");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1112,7 +1112,9 @@ impl Replica {
                 // Counted as failed until it is known to have succeeded,
                 // so an upload cancelled half-way waits like one that
                 // failed.
-                self.snapshot_failed();
+                if kind == SnapshotKind::Periodic {
+                    self.snapshot_failed();
+                }
                 let bound = periodic_snapshot_bound(self.upload_idle, bytes.len());
                 self.put_once(&key, bytes, bound).await
             } else {
@@ -1494,6 +1496,42 @@ impl Replica {
         what: &'static str,
     ) -> Result<(), ReplicaError> {
         self.target().put_bounded(key, bytes, what).await
+    }
+
+    /// Resolve a delete's ordering from the immutable reset, never a node clock.
+    /// A collected reset leaves no ordering proof: refuse rather than resurrect.
+    pub(crate) async fn delete_time(&self, label: &str) -> Result<u64, ReplicaError> {
+        use futures_util::StreamExt as _;
+        let fields: Vec<_> = label.split_whitespace().collect();
+        let invalid = || ReplicaError::Local("delete ordering evidence unavailable".into());
+        let txid = fields
+            .get(1)
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(invalid)?;
+        let generation = fields
+            .get(3)
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(invalid)?;
+        let base = StorePath::from(self.prefix.trim_end_matches('/'));
+        let encoded = format!("{}/", base.as_ref());
+        let mut listing = self.store.list(Some(&base));
+        while let Some(meta) = tokio::time::timeout(self.upload_idle, listing.next())
+            .await
+            .map_err(|_| invalid())?
+        {
+            let meta = meta.map_err(|e| ReplicaError::Bucket(e.to_string()))?;
+            let Some(key) = meta.location.as_ref().strip_prefix(&encoded) else {
+                continue;
+            };
+            if Listing::from_keys([key])
+                .segments
+                .iter()
+                .any(|s| s.id == (SegmentId { generation, txid }))
+            {
+                return u64::try_from(meta.last_modified.timestamp_millis()).map_err(|_| invalid());
+            }
+        }
+        Err(invalid())
     }
 
     /// What an upload needs of this replica, owned: a batched segment's
@@ -3067,7 +3105,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_restore_snapshot_failure_backs_off_without_failing_replication() {
+    async fn actor_restore_delete_order_uses_bucket_time_despite_node_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, store) = faulty(dir.path(), 0, 0).await;
+        let segment = Segment {
+            id: r.head,
+            parent_generation: r.head.generation,
+        };
+        let path = StorePath::from(format!("{}{}", r.prefix, segment_key(&segment)));
+        store.put(&path, vec![1].into()).await.unwrap();
+        let bucket_time = store
+            .head(&path)
+            .await
+            .unwrap()
+            .last_modified
+            .timestamp_millis() as u64;
+        let label = format!("delete {} 1 {}", r.head.txid, r.head.generation);
+        assert_eq!(r.delete_time(&label).await.unwrap(), bucket_time);
+    }
+
+    #[tokio::test]
+    async fn actor_restore_snapshot_failure_preserves_periodic_schedule() {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, store) = faulty(dir.path(), 0, 0).await;
         store
@@ -3084,7 +3142,7 @@ mod tests {
             store.fail_next.load(std::sync::atomic::Ordering::SeqCst),
             u32::MAX - 1
         );
-        assert_eq!(r.snapshot_failures, 1);
+        assert_eq!(r.snapshot_failures, 0);
         assert!(r.failed().is_none());
         assert_eq!(r.head, head);
         store

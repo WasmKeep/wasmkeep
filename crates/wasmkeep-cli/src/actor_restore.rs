@@ -80,6 +80,13 @@ async fn execute(
     let address = wasmkeep_runtime::ActorAddress::new(&tenant, &class, &name)?;
     let keys =
         wasmkeep_cluster::object_store::ObjectStoreBucket::new(store.clone(), prefix.clone());
+    for node in wasmkeep_cluster::membership::all_heartbeats(&keys).await? {
+        ensure!(
+            node.app != format!("{tenant}/{app}") || node.can_actor_restore,
+            "node {} lacks actor-restore capability (including offline nodes); upgrade it before restoring",
+            node.id
+        );
+    }
     ensure!(
         !keys
             .list_keys(&wasmkeep_server::history_folder(&root, &class, &name))
@@ -243,6 +250,23 @@ mod tests {
             wait: 0,
             no_wait: true,
         };
+        let old = Path::from("nodes/old");
+        store.put(&old, b"wasmkeep-node 2\nold\nhttp://old\n0.4.2\n0\nt/a\n\n\nserving\n\ntake ends restore\n".to_vec().into()).await.unwrap();
+        let refused = execute(
+            &args,
+            store.clone(),
+            String::new(),
+            "t".into(),
+            "a".into(),
+            "c".into(),
+            "n".into(),
+            Point::Head,
+            None,
+        )
+        .await;
+        assert!(refused.is_err(), "old nodes must prevent staging a restore");
+        assert!(refused.unwrap_err().to_string().contains("actor-restore"));
+        store.delete(&old).await.unwrap();
         execute(
             &args,
             store.clone(),

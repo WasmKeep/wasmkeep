@@ -262,7 +262,7 @@ header tells them from an ordinary commit that rewrote every page (a
 small database), and a database past 1 GiB never holds every page
 anyway (the lock page is left out). So every delete routine and every
 restore writes a host meta key in the database it uploads, `replaced =
-delete <txid> <time>` or `replaced = restore <txid> <T> <id>`, naming
+delete <txid> <time> <generation>` or `replaced = restore <txid> <T> <id>`, naming
 the txid of the segment that carries it (the holder knows it: the head's
 txid plus one). The row stays in the database until the next delete or
 restore replaces it, so one read of the replayed database names the
@@ -857,15 +857,19 @@ other nodes stop acting on their copies within a period.
    request, the job **fences** (ADR 0028, section 3, step 3: what a
    restore read is the state only once this hold's upload is in) and
    reports done. If it is a later one, or if the newest delete in the
-   database (`replaced = delete <txid> <time>`, section 1) is later than
+   database (`replaced = delete <txid> <time> <generation>`, section 1) is later than
    this request's `T`, the job fences and writes `<id>.superseded`:
    a restore asked for before a delete that has since been reported
    never brings the data back, which keeps ADR 0028's promise that a
    "Deleted" is not followed by the data returning. The delete's time
-   is a node's clock and `T` the bucket's, so the comparison is good to
-   the skew bound. An operator who means to undo that delete asks again.
-3. **Sockets, first.** While a restore job is queued for an actor, the
-   node answers WebSocket upgrades for it with 503 and `Retry-After: 1`,
+   used for this comparison is the reset object's bucket last-modified
+   timestamp, located by its generation and txid. The label's node time is
+   diagnostic only. Equal bucket timestamps supersede conservatively. If
+   the reset was collected or its ordering evidence cannot be read, the job
+   refuses instead of guessing. An operator who means to undo a delete
+   asks again after it.
+3. **Sockets, first.** While an executable restore job is queued or running
+   on the node holding the actor, that node answers WebSocket upgrades for it with 503 and `Retry-After: 1`,
    relayed or not, so no new socket opens on the state being replaced.
    Sockets already open or closing are closed with **1012** ("service
    restart"), once: the actor goes on existing, rewound, and clients
@@ -929,17 +933,29 @@ other nodes stop acting on their copies within a period.
 **Every delete carries a non-empty `operator_restore` over**, as it carries
 `operator_delete` (`delete-self`, `delete-self-durable`, the operator
 delete and idle expiry): a restore request left behind must not bring
-back an actor deleted after it was carried out. A node from before this
-record does not carry it. During a rolling upgrade, a restore request
-whose key could not be deleted can then run again on an actor such a
-node deleted. The same caveat is ADR 0028's for deletes.
+back an actor deleted after it was carried out. The CLI and owner require every recorded node of the app, including
+offline nodes, to announce `actor-restore` before executing a request.
+Older nodes must be upgraded first; an unreadable membership listing refuses
+execution. This capability is separate from whole-app `restore` fences.
 
 Carrying this marker does not create an empty row: an absent or empty
 `operator_restore` means no completed restore request to recognize, and
 both take the same replay path in step 2. Only a non-empty marker is
 written into a carried snapshot. A restore itself always writes its new,
 non-empty marker. The `replaced` delete label remains independent: it also
-supersedes a pending restore that has never run.
+supersedes a pending restore that has never run. A failed read of only the
+restore marker does not fail a strict delete: the fresh reset position still
+provides bucket-clock supersession evidence. Missing ordering evidence makes
+a subsequent restore refuse, so losing that marker cannot resurrect data.
+
+The replacement also records `restore_stale_alarms`, allowing a retry after
+an outcome-write failure to retire the old index entry under its fence. Before
+another replacement, prior cleanup debt is retired. Build and app-gate failures
+remove their fresh entries; an ambiguous upload keeps its entry until the next
+owner restores and fences the actual head, then removes entries at the staged
+alarm time not named by that head. Retries wait two seconds with socket admission
+reopened. Transaction-id exhaustion is checked before allocating scratch state.
+An AfterRestore upload failure does not change periodic-snapshot backoff.
 
 **Ordering with other requests.** Deletes and restores of one actor
 run in the order their jobs reach the mailbox, and each is checked

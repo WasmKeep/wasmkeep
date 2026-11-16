@@ -231,6 +231,9 @@ const RESET: &[u8] = b"reset";
 /// database held (what it removes), and whether it was acknowledged.
 #[derive(Debug, Clone)]
 struct Reset {
+    /// Bucket request order and the carried restore marker, durable in state.
+    request_order: u64,
+    restore_marker: Option<u64>,
     id: SegmentId,
     removed: BTreeSet<SegmentId>,
     acked: bool,
@@ -323,6 +326,7 @@ fn record_backup_state(o: &Owner, id: SegmentId, reset: bool) {
     });
 }
 thread_local! {
+    static RESTORE_COVERAGE: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
     static BACKUP_HISTORY: std::cell::RefCell<BackupHistory> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     /// Uploads in this run that succeeded after their hold ended. The
     /// simulation runs on one thread, so a thread-local counts one run.
@@ -336,6 +340,14 @@ thread_local! {
     static WAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Deletes acknowledged as found carried out (after the fence).
     static READ_ACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count_restore(index: usize, n: u64) {
+    RESTORE_COVERAGE.with(|c| {
+        let mut counts = c.get();
+        counts[index] += n;
+        c.set(counts);
+    });
 }
 
 fn count_collected(n: usize) {
@@ -460,15 +472,67 @@ async fn snapshot_and_collect(
 /// write; then a snapshot of the empty database at it, and the erase of
 /// everything before it (ADR 0012's rule). `false` if the upload failed:
 /// the caller gives the actor up.
+#[allow(clippy::too_many_arguments)]
 async fn delete_actor(
-    node: &Node,
+    node: &Rc<Node>,
     bucket: &EpBucket,
     deletes: &EpBucket,
     rules: Rules,
     o: &mut Owner,
     acked: &Mutex<Vec<SegmentId>>,
     resets: &Mutex<Vec<Reset>>,
+    rng: &mut Rng,
 ) -> bool {
+    // A reset position in the replicated state represents its durable marker.
+    // Snapshots carry that position; later resets replace it. Request indices
+    // are immutable bucket order, so older requests cannot overwrite a marker.
+    let latest = resets
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| o.held_positions.contains(&r.id))
+        .max_by_key(|(_, r)| r.id.txid)
+        .map(|(i, r)| (i, r.clone()));
+    if rules.restores
+        && let Some((index, marker)) = &latest
+    {
+        let carried = marker.restore_marker.map(|id| format!("{id} {id}"));
+        let deleted = (marker.restore_marker != Some(marker.request_order))
+            .then(|| format!("delete {} {}", marker.id.txid, marker.request_order));
+        let request = if rng.chance(40) {
+            marker.restore_marker
+        } else {
+            resets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r.restore_marker)
+                .find(|id| *id < marker.request_order)
+        };
+        if let Some(request) = request {
+            let outcome = wasmkeep_cluster::actor_restore::replay(
+                carried.as_deref(),
+                deleted.as_deref(),
+                request,
+                &request.to_string(),
+            );
+            if let Some(outcome) = outcome {
+                let before = o.held_positions.clone();
+                let ok = ack_by_read(node, bucket, o, acked, resets, *index).await;
+                assert!(
+                    before.is_subset(&o.held_positions),
+                    "replayed or superseded request replaced state"
+                );
+                if ok {
+                    count_restore(if outcome == "done" { 2 } else { 3 }, 1);
+                }
+                return ok;
+            }
+        }
+    }
+    let restoring = rules.restores && !rng.chance(20);
+    let move_queued = restoring && rng.chance(35);
     let segment = Segment {
         id: SegmentId {
             generation: o.held.generation,
@@ -479,19 +543,27 @@ async fn delete_actor(
     let key = format!("{PREFIX}{}", segment_key(&segment));
     // The staged past state keeps the oldest event, replacing everything
     // written since. No history object is edited or erased for a restore.
-    let saved: BTreeSet<_> = if rules.restores {
+    let saved: BTreeSet<_> = if restoring {
         o.held_positions.iter().take(1).copied().collect()
     } else {
         BTreeSet::new()
     };
     let at = resets.lock().unwrap().len();
+    let request_order = at as u64 + 1;
+    let restore_marker = if restoring {
+        Some(request_order)
+    } else {
+        latest.as_ref().and_then(|(_, r)| r.restore_marker)
+    };
     resets.lock().unwrap().push(Reset {
+        request_order,
+        restore_marker,
         id: segment.id,
         removed: o.held_positions.difference(&saved).copied().collect(),
         acked: false,
     });
     record_backup_state(o, segment.id, true);
-    let body = if rules.restores {
+    let body = if restoring {
         format!(
             "restore {}",
             String::from_utf8(encode_positions(&saved)).unwrap()
@@ -537,8 +609,16 @@ async fn delete_actor(
     o.since_snapshot = 0;
     o.snapshot_failures = 0;
     o.snapshot_retry_at = 0;
-    if !may_ack || rules.deletes != Deletes::Safe || rules.restores {
+    // A move queued behind the reset releases only after its upload finishes.
+    // It can invalidate the detached AfterRestore snapshot's collection grant.
+    if move_queued && node.release(&o.held).await {
+        count_restore(4, 1);
+    }
+    if !may_ack || rules.deletes != Deletes::Safe {
         return true;
+    }
+    if restoring {
+        count_restore(0, 1);
     }
     let snapshot = format!("{PREFIX}{}", snapshot_key(segment.id));
     if bucket
@@ -554,6 +634,9 @@ async fn delete_actor(
     };
     let listing = read_listing(objects.iter().map(|(k, _)| k.as_str()));
     let gone = collectable(&listing, o.held.generation, segment.id);
+    if restoring {
+        count_restore(1, gone.len() as u64);
+    }
     count_collected(gone.len());
     for key in gone {
         if !node.may_act(&o.held) {
@@ -694,7 +777,8 @@ async fn run_node(
                     // delete of an actor nobody holds, or of a parked room.
                     if deleting
                         && rng.chance(25)
-                        && !delete_actor(node, bucket, deletes, rules, &mut o, acked, resets).await
+                        && !delete_actor(node, bucket, deletes, rules, &mut o, acked, resets, rng)
+                            .await
                     {
                         let _ = node.release(&o.held).await;
                         continue;
@@ -776,7 +860,7 @@ async fn run_node(
 
         // Now and then the owner deletes the actor instead of writing.
         if deleting && !released && rng.chance(6) {
-            if !delete_actor(node, bucket, deletes, rules, o, acked, resets).await {
+            if !delete_actor(node, bucket, deletes, rules, o, acked, resets, rng).await {
                 let held = o.held.clone();
                 let _ = node.release(&held).await;
                 owner = None;
@@ -866,6 +950,7 @@ impl GlobalTime {
 }
 
 struct Outcome {
+    restore_coverage: [u64; 5],
     acked: Vec<SegmentId>,
     /// Releases after a lapse the lease task had not seen, that landed.
     early: u64,
@@ -913,6 +998,7 @@ fn simulate_observed(
     export: bool,
     mut observer: Option<Observer>,
 ) -> Outcome {
+    RESTORE_COVERAGE.with(|c| c.set([0; 5]));
     BACKUP_HISTORY.with(|h| h.borrow_mut().clear());
     bucket::clear_delays();
     EARLY.with(|e| e.set(0));
@@ -1184,6 +1270,7 @@ fn simulate_observed(
     });
     let (exports, export_retries) = *export_counts_out.lock().unwrap();
     Outcome {
+        restore_coverage: RESTORE_COVERAGE.with(std::cell::Cell::get),
         acked: acked_out.lock().unwrap().clone(),
         early: EARLY.with(std::cell::Cell::get),
         resets: resets_out.lock().unwrap().clone(),
@@ -1626,4 +1713,47 @@ fn actor_restore_is_a_new_write_and_never_resurrects_replaced_events() {
         },
         "with historical replacements",
     );
+}
+
+fn restore_coverage() -> [u64; 5] {
+    let mut counts = [0; 5];
+    for seed in 0..seeds() {
+        let out = simulate(
+            seed,
+            Rules {
+                restores: true,
+                ..SAFE_DELETING_COLLECTING
+            },
+            Duration::from_secs(30),
+        );
+        check(&out).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        for (total, n) in counts.iter_mut().zip(out.restore_coverage) {
+            *total += n;
+        }
+    }
+    counts
+}
+
+#[test]
+fn actor_restore_after_restore_snapshot_and_collection_are_exercised() {
+    let c = restore_coverage();
+    assert!(
+        c[0] > seeds() / 2 && c[1] > seeds() / 2,
+        "no AfterRestore snapshot/collection: {c:?}"
+    );
+}
+
+#[test]
+fn actor_restore_marker_replay_and_supersession_are_exercised() {
+    let c = restore_coverage();
+    assert!(
+        c[2] > seeds() / 4 && c[3] > seeds() / 4,
+        "no marker replay/supersession: {c:?}"
+    );
+}
+
+#[test]
+fn actor_restore_racing_a_move_is_exercised() {
+    let c = restore_coverage();
+    assert!(c[4] > seeds() / 4, "no restore/move races: {c:?}");
 }

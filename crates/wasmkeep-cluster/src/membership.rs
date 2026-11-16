@@ -109,6 +109,8 @@ pub struct NodeInfo {
     pub can_flush: bool,
     /// Honours whole-app restore fences (capability word `restore`).
     pub can_restore: bool,
+    /// Supports live actor restores and delete supersession markers.
+    pub can_actor_restore: bool,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which
     /// each notices in its next listing. `None` from nodes that predate it.
@@ -413,6 +415,7 @@ impl NodeInfo {
             can_end: words.can_end,
             can_flush: words.can_flush,
             can_restore: words.can_restore,
+            can_actor_restore: words.can_actor_restore,
             instance: lease.instance,
             lease: Some(lease.state),
             load,
@@ -432,6 +435,7 @@ impl NodeInfo {
             (self.can_end, "ends"),
             (self.can_flush, "flush"),
             (self.can_restore, "restore"),
+            (self.can_actor_restore, "actor-restore"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -462,6 +466,7 @@ impl NodeInfo {
             can_end: words.contains(&"ends"),
             can_flush: words.contains(&"flush"),
             can_restore: words.contains(&"restore"),
+            can_actor_restore: words.contains(&"actor-restore"),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
                 let ok = !token.is_empty()
@@ -710,6 +715,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_end: true,
             can_flush: true,
             can_restore: true,
+            can_actor_restore: true,
             instance: self.instance.clone(),
             lease: None,
             load,
@@ -941,6 +947,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_restore: false,
+            can_actor_restore: false,
             instance: None,
             lease: None,
             load: None,
@@ -979,6 +986,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_restore: false,
+            can_actor_restore: false,
             instance: None,
             lease: None,
             load: None,
@@ -1053,6 +1061,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_restore: false,
+            can_actor_restore: false,
             instance: None,
             lease: None,
             load: None,
@@ -1428,6 +1437,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_restore: false,
+            can_actor_restore: false,
             instance: lease.instance,
             lease: Some(lease.state),
             load: None,
@@ -1543,9 +1553,26 @@ mod tests {
         let payload = String::from_utf8(a.lease_payload()).unwrap();
         assert_eq!(
             payload.lines().nth(8),
-            Some("take front handoff ends flush restore"),
+            Some("take front handoff ends flush restore actor-restore"),
             "{payload}"
         );
+    }
+
+    #[test]
+    fn actor_restore_capability_is_announced_and_round_trips() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let membership = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
+        let node = membership.info();
+        for bytes in [node.encode(), format3(&node, NodeState::Live, "beef")] {
+            let decoded = NodeInfo::decode(&bytes).unwrap();
+            assert!(
+                String::from_utf8(decoded.payload())
+                    .unwrap()
+                    .split_whitespace()
+                    .any(|w| w == "actor-restore")
+            );
+        }
     }
 
     #[test]
@@ -1565,6 +1592,7 @@ mod tests {
         let legacy = NodeInfo {
             version: "0.4.2+restore1".into(),
             can_restore: false,
+            can_actor_restore: false,
             ..node
         };
         assert!(!NodeInfo::decode(&legacy.encode()).unwrap().can_restore);
@@ -1580,6 +1608,7 @@ mod tests {
             can_end: true,
             can_flush: true,
             can_restore: true,
+            can_actor_restore: false,
             ..loaded_node()
         };
         let payload = String::from_utf8(node.payload()).unwrap();
@@ -1602,6 +1631,7 @@ mod tests {
         let before = NodeInfo {
             can_flush: false,
             can_restore: false,
+            can_actor_restore: false,
             ..node
         };
         let payload = String::from_utf8(before.payload()).unwrap();

@@ -1948,6 +1948,16 @@ impl Cluster {
 
     /// Fail closed on an app tombstone, whole-app restore, or unreadable gate.
     pub(crate) async fn actor_restore_allowed(&self) -> bool {
+        let nodes = tokio::time::timeout(
+            Duration::from_secs(10),
+            wasmkeep_cluster::membership::all_heartbeats(&self.control_keys),
+        )
+        .await;
+        if !matches!(nodes, Ok(Ok(nodes)) if nodes.iter().all(|node|
+            node.app != format!("{}/{}", self.root.tenant(), self.root.app()) || node.can_actor_restore))
+        {
+            return false;
+        }
         for marker in ["deleted", "restoring"] {
             let path = StorePath::from(format!(
                 "{}apps/{}/{}/{marker}",

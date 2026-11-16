@@ -917,11 +917,15 @@ impl ActorState {
         let Some(slot) = self.replica().cloned() else {
             return Ok(());
         };
-        let replacement = format!(
-            "delete {} {}",
-            slot.lock().await.head().txid.saturating_add(1),
-            crate::alarm::now_ms_i64()
-        );
+        let replacement = {
+            let replica = slot.lock().await;
+            format!(
+                "delete {} {} {}",
+                replica.head().txid.saturating_add(1),
+                crate::alarm::now_ms_i64(),
+                replica.generation()
+            )
+        };
         let storage = self.storage.clone();
         let a = self.address.clone();
         let residency = self.residency.clone();
@@ -1089,7 +1093,10 @@ impl ActorState {
             }
             self.end_capture_at_barrier().await;
         }
-        let operator_restore = self.restore_meta(OPERATOR_RESTORE_KEY).await?;
+        let operator_restore = self
+            .restore_meta(OPERATOR_RESTORE_KEY)
+            .await
+            .unwrap_or_default();
         if let Some(mut live) = self.live.take() {
             let _ = live.store.data_mut().drain_db().await;
         }

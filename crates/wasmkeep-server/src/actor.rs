@@ -240,6 +240,7 @@ pub struct ActorService {
 }
 
 struct ServiceInner {
+    restoring: std::sync::Mutex<std::collections::HashMap<ActorAddress, usize>>,
     tenant: String,
     wall: Duration,
     sockets: Arc<Sockets>,

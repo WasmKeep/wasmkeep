@@ -629,17 +629,14 @@ impl ActorHost {
             replica.fail("delete-self-durable: no database to delete");
             return Ok(Err(not_durable("no database to delete")));
         };
-        let restored = match restored {
-            Ok(v) => v,
-            Err(e) => {
-                replica.fail(e.message.clone());
-                return Ok(Err(not_durable(e.message)));
-            }
-        };
+        // A new delete carries its immutable reset position. Restore replay
+        // checks that object's bucket time even if this marker could not be read.
+        let restored = restored.unwrap_or_default();
         let replacement = format!(
-            "delete {} {}",
+            "delete {} {} {}",
             replica.head().txid.saturating_add(1),
-            crate::alarm::now_ms_i64()
+            crate::alarm::now_ms_i64(),
+            replica.generation()
         );
         let built = tokio::task::spawn_blocking(move || {
             empty_database_snapshot(
