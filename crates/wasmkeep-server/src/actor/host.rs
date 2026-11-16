@@ -411,14 +411,18 @@ impl ActorHost {
             Some(b) => (b.flush_until, Some(b.completion.clone())),
             None => (tokio::time::Instant::now(), None),
         };
-        uploads::flush_through(
+        let started = std::time::Instant::now();
+        let flushed = uploads::flush_through(
             &slot,
             &mut uploads::DbAt::Host(self),
             completion.as_ref(),
             until,
         )
-        .await
-        .map_err(|e| e.to_sql())
+        .await;
+        crate::metrics::METRICS
+            .flush_seconds
+            .observe(started.elapsed());
+        flushed.map_err(|e| e.to_sql())
     }
 
     /// The batched hold's replica, if the running event's hold is batched.

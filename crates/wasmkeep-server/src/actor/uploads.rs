@@ -26,6 +26,13 @@ use wasmkeep_storage::wal::WalBoundary;
 /// The node's budget of batched segments in flight (ADR 0034, section 2).
 static NODE_BUDGET: LazyLock<UploadBudget> = LazyLock::new(UploadBudget::node);
 
+/// The bytes of the node's budget of batched segments in flight in use
+/// now: `wasmkeep_upload_budget_bytes_in_use` (ADR 0034, section 16).
+pub(crate) fn upload_budget_in_use() -> usize {
+    let budget = LazyLock::force(&NODE_BUDGET);
+    usize::try_from(budget.total().saturating_sub(budget.available())).unwrap_or(usize::MAX)
+}
+
 /// Takes the whole node budget of batched uploads until the guard is
 /// dropped, as a node whose budget is full: for tests, in a binary built
 /// with `batched-writes`.
@@ -254,7 +261,20 @@ pub(super) async fn pump(
     // Waits for room in FIFO order, the actor held meanwhile (ADR 0034,
     // section 3, rule 3, applied at once rather than past the age bound),
     // the replica free for the completions and the deadline kept.
+    // How long the oldest commit this capture takes waited unsent.
+    if let Some(at) = replica.oldest_unsent() {
+        crate::metrics::METRICS
+            .unsent_age_seconds
+            .observe(at.elapsed());
+    }
     drop(replica);
+    if NODE_BUDGET.available() < NODE_BUDGET.charge(plan.boundary.estimated_bytes) {
+        crate::metrics::inc(
+            &crate::metrics::METRICS
+                .batched_waits
+                .get(&[("reason", "budget")]),
+        );
+    }
     let reserve = NODE_BUDGET.reserve(plan.boundary.estimated_bytes);
     let permit = match deadline {
         Some(at) => tokio::select! {
@@ -348,6 +368,12 @@ async fn hold_at_event_end(
         if !(oversize || old || full || pressure) {
             return Ok(());
         }
+        let reason = if old { "age" } else { "bytes" };
+        crate::metrics::inc(
+            &crate::metrics::METRICS
+                .batched_waits
+                .get(&[("reason", reason)]),
+        );
         if idle {
             pump(slot, db, Some(completion), None).await?;
             if slot.lock().await.uploader_idle() {

@@ -80,6 +80,7 @@ pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};
 #[cfg(feature = "batched-writes")]
 pub use self::uploads::hold_node_upload_budget;
+pub(crate) use self::uploads::upload_budget_in_use;
 
 /// `--max-unsent-age`'s default and bounds (ADR 0034, section 3).
 pub(crate) const DEFAULT_UNSENT_AGE: Duration = Duration::from_millis(500);
