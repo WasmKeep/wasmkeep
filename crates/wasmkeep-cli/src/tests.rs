@@ -1217,3 +1217,22 @@ fn writes_flag_parses_a_class_and_a_mode() {
         _ => panic!("not a deploy"),
     }
 }
+
+/// `serve --writes CLASS=MODE` (ADR 0034): the batched classes of the ones
+/// given with `--actor`, refused for a class not served or with `--app`
+/// (a deployed version names its own).
+#[test]
+fn serve_writes_names_served_classes_only() {
+    use super::serve_batched;
+    use wasmkeep_server::apps::Writes;
+    let served = ["t", "rooms"];
+    let given = vec![
+        ("rooms".to_owned(), Writes::Batched),
+        ("t".to_owned(), Writes::Strict),
+    ];
+    let batched = serve_batched(&given, &served, false).unwrap();
+    assert_eq!(batched.into_iter().collect::<Vec<_>>(), vec!["rooms".to_owned()]);
+    assert!(serve_batched(&[("other".to_owned(), Writes::Batched)], &served, false).is_err());
+    assert!(serve_batched(&given, &served, true).is_err(), "with --app");
+    assert!(serve_batched(&[], &served, true).unwrap().is_empty());
+}

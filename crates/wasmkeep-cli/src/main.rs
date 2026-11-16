@@ -667,6 +667,14 @@ struct ServeArgs {
     #[arg(long, value_name = "N")]
     max_front_requests: Option<usize>,
 
+    /// How a class given with --actor writes, as CLASS=MODE: `strict` (the
+    /// default) or `batched` (ADR 0034; a node built with `batched-writes`
+    /// runs it batched in a cluster, any other runs it strict). Not with
+    /// --app: a deployed version names its classes' modes. Repeatable.
+    /// Hidden while batched writes need that build.
+    #[arg(long = "writes", value_name = "CLASS=MODE", value_parser = parse_writes, hide = true)]
+    writes: Vec<(String, wasmkeep_server::apps::Writes)>,
+
     /// How long a committed write of a batched class may wait unsent behind
     /// the segment in flight, in milliseconds, before its actor stops
     /// starting events (ADR 0034, section 3): 100 to 5000. Hidden while
@@ -902,6 +910,35 @@ fn parse_access(s: &str) -> Result<(String, String), String> {
 
 /// The `--access` rules, refusing one for a class that is not served (a
 /// typo would otherwise leave the class open).
+/// `serve --writes`: the batched classes among those `served` (given with
+/// --actor). Refused for a class not served, and with --app (`app`),
+/// whose version names its classes' modes.
+pub(crate) fn serve_batched(
+    writes: &[(String, wasmkeep_server::apps::Writes)],
+    served: &[&str],
+    app: bool,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    anyhow::ensure!(
+        writes.is_empty() || !app,
+        "--writes cannot be used with --app: the deployed version names each class's mode \
+         (wasmkeep deploy --writes CLASS=MODE)"
+    );
+    let mut out = std::collections::BTreeSet::new();
+    for (class, mode) in writes {
+        anyhow::ensure!(
+            served.contains(&class.as_str()),
+            "--writes {class}=...: no class {class} is served (classes: {})",
+            served.join(", ")
+        );
+        if *mode == wasmkeep_server::apps::Writes::Batched {
+            out.insert(class.clone());
+        } else {
+            out.remove(class);
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn access_rules(
     rules: &[(String, String)],
     served: &[&str],
@@ -1527,8 +1564,12 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // starting; its values reach it if a deploy brings it back.
         config.env = load_env(&args.env, &served, deployed_rules.is_none())?;
         match deployed_rules {
-            None => config.access = access_rules(&args.access, &served)?,
+            None => {
+                config.access = access_rules(&args.access, &served)?;
+                config.batched = serve_batched(&args.writes, &served, false)?;
+            }
             Some((marked, deployed)) => {
+                serve_batched(&args.writes, &served, true)?;
                 let (tenant, name) = args
                     .app
                     .as_ref()

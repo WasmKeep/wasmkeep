@@ -274,11 +274,24 @@ fn start(
         // measured here.
         .args(["--cluster-plaintext", "accept"])
         .args(["--metrics-listen", &metrics.to_string()])
+        // `WASMKEEP_SOAK_WRITES=batched`: the class's plain writes batched
+        // (ADR 0034), in a binary built with `batched-writes`.
+        .args(soak_writes())
         .env("RUST_LOG", "wasmkeep_server=info")
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .spawn()
         .unwrap()
+}
+
+/// `serve --writes t=batched` when `WASMKEEP_SOAK_WRITES=batched`, nothing
+/// for `strict` (the default).
+fn soak_writes() -> Vec<String> {
+    match std::env::var("WASMKEEP_SOAK_WRITES").as_deref() {
+        Ok("batched") => vec!["--writes".into(), "t=batched".into()],
+        Ok("strict") | Err(_) => Vec::new(),
+        Ok(other) => panic!("WASMKEEP_SOAK_WRITES={other}: strict or batched"),
+    }
 }
 
 /// (status, x-wasmkeep-node, body); `None` if the node does not answer.
