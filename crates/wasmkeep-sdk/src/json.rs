@@ -10,6 +10,10 @@
 //! one), nesting is capped at [`MAX_DEPTH`] and an object's members at
 //! [`MAX_MEMBERS`].
 
+// Without the `actor` feature only the error envelope (`problem`) uses this
+// module, and not all of it.
+#![cfg_attr(not(feature = "actor"), allow(dead_code))]
+
 use std::fmt::Write as _;
 
 /// How deep arrays and objects may nest. The db protocol needs four.
@@ -44,6 +48,38 @@ impl Json {
         match self {
             Json::Object(members) => members.iter().all(|(k, _)| allowed.contains(&k.as_str())),
             _ => false,
+        }
+    }
+
+    /// Appends this value as JSON text, as `JSON.stringify` writes it.
+    pub(crate) fn write(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Number(n) => out.push_str(&number_to_string(*n)),
+            Json::String(s) => write_str(out, s),
+            Json::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write(out);
+                }
+                out.push(']');
+            }
+            Json::Object(members) => {
+                out.push('{');
+                for (i, (k, v)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_str(out, k);
+                    out.push(':');
+                    v.write(out);
+                }
+                out.push('}');
+            }
         }
     }
 

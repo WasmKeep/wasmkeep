@@ -72,6 +72,13 @@ call one actor at a time with `actors.call`, and keep building unchanged:
 the interface is an import of its own, which the host provides whether a
 component imports it or not.
 
+**Typed actor clients and structured errors**: TypeScript
+(`@wasmkeep/sdk/contracts`, `actorClient()`) describes an actor's operations
+once and checks every input and answer at run time; Rust and TypeScript share
+an opt-in error envelope for HTTP failures (`wasmkeep_sdk::problem`). Typed
+Rust clients are not generated yet. See
+[typed clients](typed-clients.md).
+
 The release's files are signed:
 [check a download](deploy/single-node.md#1-install-the-binary).
 

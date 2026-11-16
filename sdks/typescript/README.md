@@ -76,6 +76,7 @@ after `npm ci` in `sdks/typescript`).
 | `actors.self()` | this actor's address: `{ tenant, class, name }` |
 | `actors.call("class/name", { method, path, headers, body })` | call another actor, wherever it runs |
 | `actors.callMany([["class/name", request], ...])` | up to 16 calls at once: one entry per call, in input order, a response or the `CallError` it failed with (returned, not thrown) ([ADR 0025](https://github.com/WasmKeep/wasmkeep/blob/v0.4.2/docs/adr/0025-calling-several-actors-at-once.md)) |
+| `actorClient()`, `defineOperation`, `codec` | typed operation contracts and a typed client over `actors.call` and `actors.callMany`, with run-time checks and a structured error envelope (`problem(status, code, message)`) ([below](#typed-actor-clients)) |
 | `sockets.send(conn, data)`, `sockets.broadcast(data, except?)`, `sockets.close(conn)`, `sockets.connections()` | WebSockets held by the host, open across hibernation |
 | `json(value, status?)` | a JSON response |
 | `caller(req)` | who sent the request: `{ kind: "front" }`, `{ kind: "actor", address }` or `{ kind: "outside" }` (see [Writing a front](#writing-a-front)) |
@@ -96,6 +97,37 @@ and `req.text(limit)` return `undefined` for a body longer than `limit`
 bytes, having read at most `limit + 1` of it: check a size this way, as a
 chunked body has no `Content-Length` to check first
 (`const body = req.bytes(1000); if (body === undefined) return { status: 413 };`).
+
+## Typed actor clients
+
+Describe an operation once, in a file both sides import, and call it with
+types that are checked at run time:
+
+```ts
+import { codec, defineOperation, urlPath } from "@wasmkeep/sdk/contracts";
+import { actorClient } from "@wasmkeep/sdk";
+
+const addItem = defineOperation({
+  name: "cart.addItem",
+  method: "POST",
+  path: (i) => urlPath`/items/${i.sku}`,
+  input: codec.object({ sku: codec.string(), qty: codec.integer() }),
+  output: codec.object({ count: codec.integer() }),
+  errors: { "cart.out_of_stock": codec.object({ left: codec.integer() }) },
+});
+
+const r = actorClient().call("cart/alice", addItem, { sku: "A1", qty: 2 });
+if (r.ok) r.value.count;
+else if (r.failure.kind === "declared") r.failure.details.left;
+```
+
+`@wasmkeep/sdk/contracts` imports no host module, so a contract file loads in
+an actor, a front, a test or plain Node. A call returns a result and never
+throws for what the callee or the network did; `client.batch` sends several
+at once over `callMany` and keeps order and the limit of 16. Actors can answer
+failures with `problem(409, "code", "message", details)`, an opt-in envelope
+the Rust SDK reads and writes too. The raw `actors.call` stays. See `docs/typed-clients.md` in the
+repository (the typed clients guide).
 
 ## Several outbound requests at once
 

@@ -65,10 +65,10 @@ pub mod bindings {
 pub mod db;
 pub mod front;
 pub mod http;
-#[cfg(feature = "actor")]
 mod json;
 #[cfg(feature = "actor")]
 pub mod kv;
+pub mod problem;
 #[cfg(feature = "actor")]
 pub mod queue;
 #[cfg(feature = "actor")]

@@ -1,0 +1,263 @@
+{
+  "content_type": "application/vnd.wasmkeep.error+json",
+  "decode": [
+    {
+      "name": "minimal",
+      "status": 409,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"cart.conflict\",\"message\":\"Cart changed\"}",
+      "expect": {
+        "kind": "problem",
+        "code": "cart.conflict",
+        "message": "Cart changed"
+      }
+    },
+    {
+      "name": "details and escapes",
+      "status": 422,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"item.invalid\",\"message\":\"Quote \\\" and \\\\ and \\u00e9 \\ud83d\\ude00\",\"details\":{\"field\":\"qty\",\"min\":1,\"tags\":[\"a\",null,true],\"nested\":{\"x\":1.5}}}",
+      "expect": {
+        "kind": "problem",
+        "code": "item.invalid",
+        "message": "Quote \" and \\ and é 😀",
+        "details": {
+          "field": "qty",
+          "min": 1,
+          "tags": [
+            "a",
+            null,
+            true
+          ],
+          "nested": {
+            "x": 1.5
+          }
+        }
+      }
+    },
+    {
+      "name": "unknown fields are ignored",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\",\"extra\":{\"a\":1},\"retry\":true}",
+      "expect": {
+        "kind": "problem",
+        "code": "x",
+        "message": "m"
+      }
+    },
+    {
+      "name": "media type with parameters and case",
+      "status": 500,
+      "content_type": "Application/VND.WasmKeep.Error+JSON; charset=utf-8",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "problem",
+        "code": "x",
+        "message": "m"
+      }
+    },
+    {
+      "name": "null details are details",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\",\"details\":null}",
+      "expect": {
+        "kind": "problem",
+        "code": "x",
+        "message": "m",
+        "details": null
+      }
+    },
+    {
+      "name": "unknown version",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":2,\"code\":\"x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "unsupported-version",
+        "version": 2
+      }
+    },
+    {
+      "name": "missing version",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"code\":\"x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "version is a string",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":\"1\",\"code\":\"x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "not json",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "oops",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "not an object",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "[1]",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "code starts with a digit",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"1x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "code with a space",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"a b\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "message is a number",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":3}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "details nested too deep",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\",\"details\":[[[[[[[[[]]]]]]]]]}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "details nested to the limit",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\",\"details\":[[[[[[[[]]]]]]]]}",
+      "expect": {
+        "kind": "problem",
+        "code": "x",
+        "message": "m",
+        "details": [
+          [
+            [
+              [
+                [
+                  [
+                    [
+                      []
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "plain text failure",
+      "status": 500,
+      "content_type": "text/plain; charset=utf-8",
+      "body": "internal error\n",
+      "expect": {
+        "kind": "plain"
+      }
+    },
+    {
+      "name": "json failure without the envelope content type",
+      "status": 400,
+      "content_type": "application/json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "plain"
+      }
+    },
+    {
+      "name": "envelope type on a success status is not an error",
+      "status": 200,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "plain"
+      }
+    },
+    {
+      "name": "byte order mark",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "﻿{\"v\":1,\"code\":\"x\",\"message\":\"m\"}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "lone surrogate escape",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"a\\ud800b\"}",
+      "expect": {
+        "kind": "malformed"
+      }
+    },
+    {
+      "name": "too many members in details",
+      "status": 400,
+      "content_type": "application/vnd.wasmkeep.error+json",
+      "body": "{\"v\":1,\"code\":\"x\",\"message\":\"m\",\"details\":{\"k0\":1,\"k1\":1,\"k2\":1,\"k3\":1,\"k4\":1,\"k5\":1,\"k6\":1,\"k7\":1,\"k8\":1,\"k9\":1,\"k10\":1,\"k11\":1,\"k12\":1,\"k13\":1,\"k14\":1,\"k15\":1,\"k16\":1,\"k17\":1,\"k18\":1,\"k19\":1,\"k20\":1,\"k21\":1,\"k22\":1,\"k23\":1,\"k24\":1,\"k25\":1,\"k26\":1,\"k27\":1,\"k28\":1,\"k29\":1,\"k30\":1,\"k31\":1,\"k32\":1,\"k33\":1,\"k34\":1,\"k35\":1,\"k36\":1,\"k37\":1,\"k38\":1,\"k39\":1,\"k40\":1,\"k41\":1,\"k42\":1,\"k43\":1,\"k44\":1,\"k45\":1,\"k46\":1,\"k47\":1,\"k48\":1,\"k49\":1,\"k50\":1,\"k51\":1,\"k52\":1,\"k53\":1,\"k54\":1,\"k55\":1,\"k56\":1,\"k57\":1,\"k58\":1,\"k59\":1,\"k60\":1,\"k61\":1,\"k62\":1,\"k63\":1,\"k64\":1}}",
+      "expect": {
+        "kind": "malformed"
+      }
+    }
+  ],
+  "produce": [
+    {
+      "name": "minimal",
+      "status": 409,
+      "code": "cart.conflict",
+      "message": "Cart changed",
+      "body": "{\"v\":1,\"code\":\"cart.conflict\",\"message\":\"Cart changed\"}"
+    },
+    {
+      "name": "escapes and details",
+      "status": 422,
+      "code": "item.invalid",
+      "message": "Quote \" and \\ and \n tab\t é 😀",
+      "details": {
+        "field": "qty",
+        "min": 1,
+        "tags": [
+          "a",
+          null,
+          true
+        ],
+        "nested": {
+          "x": 1.5
+        }
+      },
+      "body": "{\"v\":1,\"code\":\"item.invalid\",\"message\":\"Quote \\\" and \\\\ and \\n tab\\t é 😀\",\"details\":{\"field\":\"qty\",\"min\":1,\"tags\":[\"a\",null,true],\"nested\":{\"x\":1.5}}}"
+    }
+  ]
+}

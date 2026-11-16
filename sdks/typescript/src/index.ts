@@ -195,6 +195,11 @@ export {
   type Caller,
 } from "./request";
 
+/** Typed operation contracts, codecs, the structured error envelope and
+ * the typed client (`actorClient()`); see ./pure.ts and docs/typed-clients.md. */
+export * from "./pure";
+export { actorClient, actorTransport } from "./transport";
+
 // ------------------------------------------------------------- websockets
 
 /** A WebSocket connection id. */
