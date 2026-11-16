@@ -182,8 +182,11 @@ the destination owner, method, path and query, app, timestamp, end-to-end header
 values and charged bit. An uncharged identity makes the owner apply its own
 policies using that IP or the policy's header key. Only successful admission
 matching at least one local rule sets the charged bit. Replayed uncharged proofs
-consume owner quota again; charged proofs retain their exemption within the
-signature window. There is no ingress replay store or receipt throughput ceiling.
+consume owner quota again. Charged proofs are single-use, with a unique send nonce
+and a separate per-node replay store capped at 4,096 signatures, isolated from
+actor-call and control replay stores. Entries remain until their signature window
+expires; replays and new charged proofs when the store is full return 503, never
+an unchecked exemption. Uncharged proofs do not consume replay-store capacity.
 The proof grants no actor privileges and does not authenticate the body.
 Missing, invalid or expired proofs on forwarded requests return 503 when the
 owner has policies. Without policies, unsigned forwards retain their previous

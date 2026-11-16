@@ -262,7 +262,11 @@ public actor routes and WebSocket handshakes. Forged `x-wasmkeep-*` headers
 do not exempt public requests. Cluster-port traffic is authenticated by
 mutual TLS. Quotas are local to a node and reset when its process restarts.
 
-Read-only owner hints may precede admission. If routing selects a remote owner,
+Read-only owner hints may precede admission. The `remote_owner` lookup in
+`actor/routing.rs` still performs one bucket GET per cold actor name before the
+limit check. Over-limit clients cycling random names can therefore cost bucket
+reads and owner-hint cache churn, without creating actor state.
+If routing selects a remote owner,
 that owner charges the request using a signed client identity. Otherwise the
 receiving node admits before creating or waking an actor, acquiring ownership,
 or reserving a mailbox slot, for both HTTP requests and WebSocket handshakes.
@@ -278,8 +282,11 @@ the destination owner, method, path and query, app, timestamp, end-to-end header
 values and charged bit. An uncharged identity makes the owner apply its own
 policies using that IP or the policy's header key. Only successful admission
 matching at least one local rule sets the charged bit. Replayed uncharged proofs
-consume owner quota again; charged proofs retain their exemption within the
-signature window. There is no ingress replay store or receipt throughput ceiling.
+consume owner quota again. Charged proofs are single-use, with a unique send nonce
+and a separate per-node replay store capped at 4,096 signatures, isolated from
+actor-call and control replay stores. Entries remain until their signature window
+expires; replays and new charged proofs when the store is full return 503, never
+an unchecked exemption. Uncharged proofs do not consume replay-store capacity.
 The proof grants no actor privileges and does not authenticate the body.
 Missing, invalid or expired proofs on forwarded requests return 503 when the
 owner has policies. Without policies, unsigned forwards retain their previous
@@ -340,7 +347,8 @@ With neither current nor pending policies, ingress admission returns immediately
 it does not change response ordering, capture a front snapshot, or increment rate
 counters. Bucket read errors do not invent pending policies; corrupt manifests do.
 The metrics endpoint still registers `wasmkeep_rate_limit_requests_total` and
-`wasmkeep_rate_limit_active_keys` even when no policy exists. These metrics are the
+`wasmkeep_rate_limit_active_keys` even when no policy exists, plus the `ingress`
+record label in `wasmkeep_signatures_refused_full_total`. These metrics are the
 intentional exception to no-policy compatibility.
 
 These limits control app admission. Use edge filtering and connection

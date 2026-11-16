@@ -340,6 +340,8 @@ pub(crate) struct Cluster {
     /// apart: a flood of other signed calls that fills `seen` cannot
     /// refuse the calls a drain and a move depend on.
     seen_control: SeenSignatures,
+    /// Rare charged ingress hand-offs, isolated from actor and control calls.
+    seen_ingress: SeenSignatures,
     /// When each reason for refusing a node signature was last logged
     /// (ms): one slot per reason, so junk on the public port cannot hide a
     /// real refusal.
@@ -671,6 +673,7 @@ impl Cluster {
             serves: serves.to_owned(),
             seen: SeenSignatures::named("calls"),
             seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL),
+            seen_ingress: SeenSignatures::with_cap("ingress", signing::MAX_SEEN_INGRESS),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(
