@@ -210,7 +210,8 @@ fn rates(id: &str, entries: &[Logged]) -> Rates {
             Op::List
                 if l.key.starts_with("control")
                     || l.key.contains("/moves")
-                    || l.key.contains("/deletes") =>
+                    || l.key.contains("/deletes")
+                    || l.key.contains("/restores") =>
             {
                 r.list_control += 1;
             }
@@ -279,15 +280,15 @@ async fn an_idle_node_lists_and_reads_what_its_cadences_say() {
             "{id} read {} heartbeats in {periods} periods",
             r.get_nodes
         );
-        // `control/changed` once a period; the intents (three prefixes:
-        // drains, the app's moves and deletes) every 20 periods.
+        // `control/changed` once a period; the intents (four prefixes:
+        // drains, the app's moves, deletes and restores) every 20 periods.
         assert!(
             (0.9..=1.1).contains(&per(r.get_marker)),
             "{id} read control/changed {} times in {periods} periods",
             r.get_marker
         );
         assert!(
-            (0.1..=0.2).contains(&per(r.list_control)),
+            (0.15..=0.25).contains(&per(r.list_control)),
             "{id} listed the intents {} times in {periods} periods",
             r.list_control
         );

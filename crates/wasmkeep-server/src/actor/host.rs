@@ -574,8 +574,14 @@ impl ActorHost {
         if self.delete_retry {
             return Ok(self.remove_files_durably().await);
         }
-        let (in_tx, carried) = self
-            .with_db(|db| (db.in_transaction(), db.meta(OPERATOR_DELETE_KEY)))
+        let (in_tx, carried, restored) = self
+            .with_db(|db| {
+                (
+                    db.in_transaction(),
+                    db.meta(OPERATOR_DELETE_KEY),
+                    db.meta(OPERATOR_RESTORE_KEY),
+                )
+            })
             .await?;
         if in_tx {
             return Ok(Err(SqlError {
@@ -623,8 +629,23 @@ impl ActorHost {
             replica.fail("delete-self-durable: no database to delete");
             return Ok(Err(not_durable("no database to delete")));
         };
+        // A new delete carries its immutable reset position. Restore replay
+        // checks that object's bucket time even if this marker could not be read.
+        let restored = restored.unwrap_or_default();
+        let replacement = format!(
+            "delete {} {} {}",
+            replica.head().txid.saturating_add(1),
+            crate::alarm::now_ms_i64(),
+            replica.generation()
+        );
         let built = tokio::task::spawn_blocking(move || {
-            empty_database_snapshot(&storage, &address, carried.as_deref())
+            empty_database_snapshot(
+                &storage,
+                &address,
+                carried.as_deref(),
+                restored.as_deref(),
+                &replacement,
+            )
         })
         .await;
         let all = match built {

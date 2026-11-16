@@ -734,6 +734,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_restore: false,
+            can_actor_restore: false,
             instance: None,
             lease: None,
             load: None,

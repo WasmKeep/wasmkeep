@@ -43,6 +43,8 @@ pub enum Family {
     /// they came after 0.4.0, so no layout before it has them and no
     /// migration copies them.
     Deletes,
+    /// Single-actor restore requests and staged snapshots (ADR 0033).
+    Restores,
 }
 
 impl Family {
@@ -64,6 +66,7 @@ impl Family {
             Self::Alarms => "alarms",
             Self::Moves => "moves",
             Self::Deletes => "deletes",
+            Self::Restores => "restores",
         }
     }
 
@@ -78,6 +81,7 @@ impl Family {
             Self::Moves => "control/move",
             // Never written: nothing before 0.4.0 deleted actors on request.
             Self::Deletes => "control/delete",
+            Self::Restores => "control/restore",
         }
     }
 }

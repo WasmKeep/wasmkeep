@@ -7,7 +7,9 @@
   backup restore (plan step 6) is implemented; the guide records its recovery
   journal, `restore` heartbeat capability, partial-undo force warning and
   phase-specific abort/undo recovery. Single-actor
-  live restore remains proposed. The [first-slice guide](../actor-data-access.md) records its
+  live restore (plan step 7) has an initial implementation: staged requests,
+  owner-fenced replacement, replay markers, alarm ordering and batched flush
+  barriers. See the [operator guide](../actor-data-access.md#restore-one-actor-while-its-cluster-runs). The [first-slice guide](../actor-data-access.md) records its
   positional app syntax, limits and deferred options. Revised after an
   adversarial review (a destination keyed by content, since generations restart after an
   app is recreated; prune excluded from a running backup; restore
@@ -260,7 +262,7 @@ header tells them from an ordinary commit that rewrote every page (a
 small database), and a database past 1 GiB never holds every page
 anyway (the lock page is left out). So every delete routine and every
 restore writes a host meta key in the database it uploads, `replaced =
-delete <txid> <time>` or `replaced = restore <txid> <T> <id>`, naming
+delete <txid> <time> <generation>` or `replaced = restore <txid> <T> <id>`, naming
 the txid of the segment that carries it (the holder knows it: the head's
 txid plus one). The row stays in the database until the next delete or
 restore replaces it, so one read of the replayed database names the
@@ -833,8 +835,8 @@ target; a parked actor with sockets is woken by its parking node (ADR
 amendment of 2026-11-14): when `control/changed` changes, at their first
 period, and in the 60 s fallback listing, which is what retries a
 refused request and expires an old one. One prefix more in that
-listing is one LIST per node per 60 s at rest. Requests expire after an
-hour by the bucket's clock, and the node that lists an expired one
+listing is one LIST per node per 60 s at rest. Requests expire after 50
+minutes (`RESTORE_TTL_MS`) by the bucket's clock, and the node that lists an expired one
 deletes it with its staged object. A node that ends a request (its
 outcome written) deletes the request and its staged object, rewrites
 `control/changed`, and keeps the request out of its own copy until it
@@ -855,15 +857,32 @@ other nodes stop acting on their copies within a period.
    request, the job **fences** (ADR 0028, section 3, step 3: what a
    restore read is the state only once this hold's upload is in) and
    reports done. If it is a later one, or if the newest delete in the
-   database (`replaced = delete <txid> <time>`, section 1) is later than
+   database (`replaced = delete <txid> <time> <generation>`, section 1) is later than
    this request's `T`, the job fences and writes `<id>.superseded`:
    a restore asked for before a delete that has since been reported
    never brings the data back, which keeps ADR 0028's promise that a
    "Deleted" is not followed by the data returning. The delete's time
-   is a node's clock and `T` the bucket's, so the comparison is good to
-   the skew bound. An operator who means to undo that delete asks again.
-3. **Sockets, first.** While a restore job is queued for an actor, the
-   node answers WebSocket upgrades for it with 503 and `Retry-After: 1`,
+   used for this comparison is the reset object's bucket last-modified
+   timestamp, located by its generation and txid. The label's node time is
+   diagnostic only. Equal bucket timestamps supersede conservatively. If
+   listing fails or the label cannot identify the reset, the job refuses.
+   If a successful listing finds no reset, ordinary collection proves it
+   predates every live request when history retention is at least
+   `RESTORE_TTL_MS + 2 * max_skew_ms + 1000 ms`: restore requests live at most 50
+   minutes, and collection removes only objects past retention. The margin
+   covers the collector and request reader's clock comparisons plus one
+   second for bucket last-modified precision (3 s with the default 1 s
+   skew; the retention bound is then 3003 s). Such a collected delete does
+   not supersede the request, even though its label survives in the actor's
+   next life. With shorter retention, a missing reset refuses with an error
+   naming the configured retention and required TTL-plus-margin bound.
+   The unchanged default 3600 s retention clears that bound. Delete requests
+   keep their independent one-hour lifetime (`DELETE_TTL_MS`). This inference assumes
+   ordinary collection under that retention policy, not external object
+   deletion or a previously shorter retention. An operator who means to undo
+   a delete asks again after it.
+3. **Sockets, first.** While an executable restore job is queued or running
+   on the node holding the actor, that node answers WebSocket upgrades for it with 503 and `Retry-After: 1`,
    relayed or not, so no new socket opens on the state being replaced.
    Sockets already open or closing are closed with **1012** ("service
    restart"), once: the actor goes on existing, rewound, and clients
@@ -924,13 +943,37 @@ other nodes stop acting on their copies within a period.
    collection, as a periodic snapshot's does. `on-init` does not run
    again unless the restored state never ran it.
 
-**Every delete carries `operator_restore` over**, as it carries
+**Every delete carries a non-empty `operator_restore` over**, as it carries
 `operator_delete` (`delete-self`, `delete-self-durable`, the operator
 delete and idle expiry): a restore request left behind must not bring
-back an actor deleted after it was carried out. A node from before this
-record does not carry it. During a rolling upgrade, a restore request
-whose key could not be deleted can then run again on an actor such a
-node deleted. The same caveat is ADR 0028's for deletes.
+back an actor deleted after it was carried out. The CLI and owner require every recorded node of the app, including
+offline nodes, to announce `actor-restore` before executing a request.
+Older nodes must be upgraded first; an unreadable membership listing refuses
+execution. This capability is separate from whole-app `restore` fences.
+
+Carrying this marker does not create an empty row: an absent or empty
+`operator_restore` means no completed restore request to recognize, and
+both take the same replay path in step 2. Only a non-empty marker is
+written into a carried snapshot. A restore itself always writes its new,
+non-empty marker. The `replaced` delete label remains independent: it also
+supersedes a pending restore that has never run. A failed read of only the
+restore marker does not fail a strict delete: the fresh reset position still
+provides bucket-clock supersession evidence. Unreadable ordering evidence
+makes a subsequent restore refuse; a collected reset uses the retention bound
+in step 2, so losing that marker cannot resurrect data from a live old request.
+
+The replacement also records `restore_stale_alarms`, allowing a retry after
+an outcome-write failure to retire the old index entry under its fence. Before
+another replacement, prior cleanup debt is retired. Build and app-gate failures
+remove their fresh entries; an ambiguous upload keeps its entry until the next
+owner restores and fences the actual head, then removes entries at the staged
+alarm time not named by that head. Failed requests retain a per-request retry
+count across heartbeat passes. Backoff starts at the larger of 3 s and the
+heartbeat period, doubles to a 60 s cap (or the heartbeat period if larger),
+and keeps the request active while reopening socket admission. Finished or
+expired requests discard the count; an owner restart starts it again.
+Transaction-id exhaustion is checked before allocating scratch state.
+An AfterRestore upload failure does not change periodic-snapshot backoff.
 
 **Ordering with other requests.** Deletes and restores of one actor
 run in the order their jobs reach the mailbox, and each is checked
@@ -1072,7 +1115,8 @@ What follows from it:
   the stopped-cluster method.
 - Server changes: on the write path, the restore job and its
   replacement segment, the `restores/` family, and the host meta keys
-  `operator_restore` and `replaced` written by every delete and restore;
+  `operator_restore` written by restores and carried by deletes only when
+  non-empty, and `replaced` written by every delete and restore;
   off it, the `restoring` and `restored` markers a node obeys.
   Per CLAUDE.md it needs its simulation cases, cluster tests and an
   adversarial review before it merges.

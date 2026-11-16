@@ -486,6 +486,7 @@ pub(crate) struct Cluster {
     /// Delete requests this node ended, kept out of [`Self::deletes`] until
     /// they expire, likewise.
     ended_deletes: Mutex<Vec<control::DeleteIntent>>,
+    ended_restores: Mutex<Vec<control::RestoreIntent>>,
 }
 
 /// One page of the alarm index, as the sweep reads it.
@@ -747,6 +748,7 @@ impl Cluster {
             view_changed: tokio::sync::Notify::new(),
             deleted_moves: Mutex::new(Vec::new()),
             ended_deletes: Mutex::new(Vec::new()),
+            ended_restores: Mutex::new(Vec::new()),
         });
         if refuse_plaintext {
             tracing::info!(
@@ -1868,6 +1870,146 @@ impl Cluster {
         if let Err(e) = control::announce(&self.control_keys, &self.change_token()).await {
             tracing::debug!(error = %e, "announcing an ended delete request failed");
         }
+    }
+
+    /// Two clock comparisons (collector and request reader), plus one second
+    /// for buckets that expose last-modified at whole-second precision.
+    pub(crate) fn restore_delete_retention_bound(&self) -> Duration {
+        Duration::from_millis(
+            control::RESTORE_TTL_MS
+                .saturating_add(self.lease_config.max_skew_ms().saturating_mul(2))
+                .saturating_add(1000),
+        )
+    }
+
+    pub(crate) fn restores(&self) -> Vec<wasmkeep_cluster::control::RestoreIntent> {
+        let now = now_ms();
+        let live = |d: &control::RestoreIntent| {
+            now.saturating_sub(d.written_at_ms) <= control::RESTORE_TTL_MS
+        };
+        let ended = {
+            let mut ended = self
+                .ended_restores
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ended.retain(live);
+            ended.clone()
+        };
+        self.control
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .restores
+            .iter()
+            .filter(|d| live(d) && !ended.contains(d))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) async fn restore_outcome(
+        &self,
+        intent: &control::RestoreIntent,
+        suffix: &str,
+        body: &str,
+    ) -> bool {
+        use control::Keys as _;
+        self.control_keys
+            .put_body(
+                &format!("{}.{suffix}", intent.key()),
+                body.as_bytes().to_vec(),
+            )
+            .await
+            .is_ok()
+    }
+
+    /// Finish only after the durable outcome is published. Suppress stale listings.
+    pub(crate) async fn end_restore_request(
+        &self,
+        intent: &control::RestoreIntent,
+        suffix: &str,
+        body: String,
+    ) -> bool {
+        use control::Keys as _;
+        let key = intent.key();
+        if self
+            .control_keys
+            .put_body(&format!("{key}.{suffix}"), body.into_bytes())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        // Delete the request before its data: a crash cannot leave an executable
+        // request with missing data unless its durable marker already exists.
+        if self.control_keys.delete(&key).await.is_ok() {
+            let _ = self.control_keys.delete(&format!("{key}.ltx")).await;
+        }
+        self.control
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .restores
+            .retain(|r| r != intent);
+        self.ended_restores
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(intent.clone());
+        let _ = control::announce(&self.control_keys, &self.change_token()).await;
+        true
+    }
+
+    /// Fail closed on an app tombstone, whole-app restore, or unreadable gate.
+    pub(crate) async fn actor_restore_allowed(&self) -> bool {
+        let nodes = tokio::time::timeout(
+            Duration::from_secs(10),
+            wasmkeep_cluster::membership::all_heartbeats(&self.control_keys),
+        )
+        .await;
+        if !matches!(nodes, Ok(Ok(nodes)) if nodes.iter().all(|node|
+            node.app != format!("{}/{}", self.root.tenant(), self.root.app()) || node.can_actor_restore))
+        {
+            return false;
+        }
+        for marker in ["deleted", "restoring"] {
+            let path = StorePath::from(format!(
+                "{}apps/{}/{}/{marker}",
+                self.root.prefix(),
+                self.root.tenant(),
+                self.root.app()
+            ));
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(10), self.store.head(&path)).await,
+                Ok(Err(object_store::Error::NotFound { .. }))
+            ) {
+                return false;
+            }
+        }
+        self.lease_valid_now() && self.app_refusal().is_none()
+    }
+
+    /// Bounded request/staged object read, including the streaming body.
+    pub(crate) async fn restore_object(&self, key: &str, cap: u64) -> Result<Vec<u8>, String> {
+        use futures_util::StreamExt as _;
+        let path = StorePath::from(format!("{}{key}", self.root.prefix()));
+        tokio::time::timeout(
+            Duration::from_secs(30) + Duration::from_secs(cap / (1024 * 1024)),
+            async {
+                let got = self.store.get(&path).await.map_err(|e| e.to_string())?;
+                if got.meta.size > cap {
+                    return Err("restore object exceeds limit".into());
+                }
+                let mut stream = got.into_stream();
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| e.to_string())?;
+                    if (bytes.len() as u64).saturating_add(chunk.len() as u64) > cap {
+                        return Err("restore object exceeds limit".into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(bytes)
+            },
+        )
+        .await
+        .map_err(|_| "restore read timed out".to_owned())?
     }
 
     /// Deletes a move request, best effort, forgets it here, and tells the

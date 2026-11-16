@@ -130,5 +130,35 @@ become `null`. Status and verification messages go to stderr, leaving SQL
 stdout suitable for piping.
 
 This implements the export/query slice of [ADR 0033](adr/0033-data-access-export-and-online-backup.md).
-History listing as a command, caching, application-only/raw exports, online
-backup and live actor restore remain future work.
+History listing, online backup, and live actor restore are also available.
+Caching and application-only/raw export options remain future work.
+
+## Restore one actor while its cluster runs
+
+`wasmkeep actor restore --app acme/shop cart/u-1842 --bucket s3://live/prod
+--txid 4123` stages verified historical state and asks the current owner to
+replace the actor in its mailbox. Use `--at -15m` instead of `--txid`, or
+`--from s3://archive/prod --run RUN` for a backup run. Backup credentials use
+the same AWS environment as the live bucket. `--if-head GEN:TXID` refuses a
+changed head; `--no-wait` returns the request id immediately, and `--wait`
+defaults to 60 seconds (maximum 3000).
+
+The replacement is a **new write**, at the owner's current generation and a
+new transaction id. It does not rewind or edit history. A batched owner flushes
+first. Earlier history stays subject to the ordinary retention window, so an
+undo needs a retained position or a backup. An app restore fence or tombstone
+blocks the job. A request predating a later delete cannot resurrect that data;
+an intentional undo of a delete needs a new request, usually from a backup.
+
+Sockets close with 1012 before replacement; upgrades receive 503 while the
+request is pending. Restored alarms get fresh index entries before the upload
+and can fire again. Effects outside the actor's database are not undone.
+The staged database must have the current database's page size and fit the
+node's database limit. Requests expire after 50 minutes by the bucket's clock. After a delete reset
+has been collected, restore requires history retention of at least 3003 seconds
+with the default clock skew; the default 3600 seconds clears this bound.
+Shorter retention refuses restoration when the reset is missing.
+Only the `.done` outcome acknowledges restoration; the request disappearing
+alone does not. During a rolling upgrade, older nodes do not process restore
+requests or preserve their markers through deletes: finish upgrading before
+using this command.

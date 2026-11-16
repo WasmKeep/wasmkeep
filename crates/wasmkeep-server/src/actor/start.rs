@@ -196,6 +196,7 @@ impl ActorService {
 
         let service = Self {
             inner: Arc::new(ServiceInner {
+                restoring: Default::default(),
                 tenant: config.tenant,
                 wall: config.wall_per_event,
                 sockets: Arc::clone(&sockets),

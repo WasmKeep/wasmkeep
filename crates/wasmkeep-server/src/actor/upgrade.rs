@@ -139,6 +139,26 @@ impl ActorService {
             Ok(a) => a,
             Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
+        if self
+            .inner
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.holds_here(&address))
+            && self
+                .inner
+                .restoring
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&address)
+        {
+            let mut response =
+                text_response(StatusCode::SERVICE_UNAVAILABLE, "actor restore pending\n");
+            response.headers_mut().insert(
+                hyper::header::RETRY_AFTER,
+                hyper::header::HeaderValue::from_static("1"),
+            );
+            return response;
+        }
         let header = |name: &str| {
             req.headers()
                 .get(name)
