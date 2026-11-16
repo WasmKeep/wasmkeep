@@ -2767,3 +2767,61 @@ async fn restore_abort_failed_copy_with_stray_history_and_lost_archive() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn actor_restore_from_backup_replays_selected_position_and_rejects_tampering() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let id = f.create().await;
+    let output = f._dir.path().join("actor-restore.db");
+    let (export, run) = export_actor_from_store(
+        &f.dest,
+        "",
+        Some(&id),
+        "acme",
+        "shop",
+        "counter",
+        "alice",
+        history::Point::Txid(1),
+        &output,
+    )
+    .await
+    .unwrap();
+    assert_eq!(run, id);
+    assert_eq!(export.position.txid, 1);
+    assert_eq!(&std::fs::read(&output).unwrap()[18..20], &[2, 2]);
+    let loaded = load(&f.dest, "", &id).await.unwrap();
+    let actor = disk_actor(&loaded.actors[0]).unwrap();
+    let object = actor["objects"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    let digest = text(object, "sha256").unwrap();
+    put(
+        &f.dest,
+        &format!("data/{digest}"),
+        b"corrupt".to_vec(),
+        true,
+    )
+    .await
+    .unwrap();
+    let refused = f._dir.path().join("refused.db");
+    assert!(
+        export_actor_from_store(
+            &f.dest,
+            "",
+            Some(&id),
+            "acme",
+            "shop",
+            "counter",
+            "alice",
+            history::Point::Head,
+            &refused
+        )
+        .await
+        .is_err()
+    );
+    assert!(!refused.exists());
+}

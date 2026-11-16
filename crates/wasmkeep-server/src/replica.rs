@@ -553,6 +553,8 @@ pub(crate) enum SnapshotKind {
     /// be erased: sent again as a segment is; a failure is not tried
     /// again, and leaves the periodic snapshot's schedule as it was.
     AfterDelete,
+    /// A replacement at the head; retains history using the ordinary window.
+    AfterRestore,
 }
 
 /// Why replication cannot continue. The actor must stop: the node gives up
@@ -1089,7 +1091,9 @@ impl Replica {
                 generation: self.generation,
                 txid: self.next_txid()?,
             },
-            SnapshotKind::Periodic | SnapshotKind::AfterDelete => self.head,
+            SnapshotKind::Periodic | SnapshotKind::AfterDelete | SnapshotKind::AfterRestore => {
+                self.head
+            }
         };
         if let Some(reason) = &self.failed {
             return Err(ReplicaError::Local(format!(
@@ -1104,7 +1108,7 @@ impl Replica {
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
         let key = snapshot_key(position);
         if kind != SnapshotKind::First {
-            let sent = if kind == SnapshotKind::Periodic {
+            let sent = if matches!(kind, SnapshotKind::Periodic | SnapshotKind::AfterRestore) {
                 // Counted as failed until it is known to have succeeded,
                 // so an upload cancelled half-way waits like one that
                 // failed.
@@ -3062,6 +3066,39 @@ mod tests {
         assert_eq!(r.since_snapshot, 0);
     }
 
+    #[tokio::test]
+    async fn actor_restore_snapshot_failure_backs_off_without_failing_replication() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        store
+            .fail_next
+            .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        let all = at_head(&r);
+        let head = r.head;
+        assert!(
+            r.ship_snapshot(&all, SnapshotKind::AfterRestore)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.fail_next.load(std::sync::atomic::Ordering::SeqCst),
+            u32::MAX - 1
+        );
+        assert_eq!(r.snapshot_failures, 1);
+        assert!(r.failed().is_none());
+        assert_eq!(r.head, head);
+        store
+            .fail_next
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            r.ship_snapshot(&all, SnapshotKind::AfterRestore)
+                .await
+                .unwrap()
+        );
+        assert_eq!(r.snapshot_failures, 0);
+        assert_eq!(r.head, head);
+    }
+
     /// A periodic snapshot's create refused as existing with nothing
     /// there is a failure, tried again later: "already there" is only
     /// said of an object the bucket shows.
@@ -3432,7 +3469,11 @@ mod tests {
     /// stops (the actor is given up).
     #[tokio::test]
     async fn a_snapshot_labelled_at_a_head_it_does_not_hold_is_refused() {
-        for kind in [SnapshotKind::Periodic, SnapshotKind::AfterDelete] {
+        for kind in [
+            SnapshotKind::Periodic,
+            SnapshotKind::AfterDelete,
+            SnapshotKind::AfterRestore,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let mut r = replica(dir.path()).await;
             r.since_snapshot = SNAPSHOT_EVERY;

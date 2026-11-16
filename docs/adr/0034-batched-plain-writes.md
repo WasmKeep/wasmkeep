@@ -1347,9 +1347,10 @@ upload budget, past which the snapshot waits for a later gap, and
 snapshots at the acknowledged head; collection follows as for a strict
 hold. Deletes (`delete-self` at the event's end, the operator delete's
 job and idle expiry, through `delete_recorded`; `delete-self-durable` in
-its call) flush first since S9. ADR 0033's restore of one actor is not
-built yet; `ship_reset`'s guard refuses it with a segment in flight, and
-it is to flush first when it is. The model checks that a snapshot over
+its call) flush first since S9. ADR 0033's restore of one actor now
+flushes to `Flushed` before inspecting its head or building the replacement;
+a failed flush abandons the hold and leaves the request for retry.
+`ship_reset` also refuses a segment in flight. The model checks that a snapshot over
 uncaptured commits is caught (`SnapshotUncaptured`).
 
 **As built in S12 (2026-11-16).** The clean stop flushes every resident

@@ -57,6 +57,7 @@ mod host;
 mod load;
 mod moving;
 mod requests;
+mod restores;
 mod routing;
 mod socket_owners;
 mod sockets;
@@ -427,6 +428,7 @@ const DEPLOY_SEQ_KEY: &str = "deploy_seq";
 /// over by later deletes, so a request listed again is never carried out
 /// twice.
 const OPERATOR_DELETE_KEY: &str = "operator_delete";
+const OPERATOR_RESTORE_KEY: &str = "operator_restore";
 
 /// `refresh_class`: the actor's class was removed by a deploy.
 const CLASS_GONE: &str = "class no longer served";

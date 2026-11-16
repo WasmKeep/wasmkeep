@@ -911,25 +911,42 @@ impl ActorState {
         &mut self,
         files_removed: bool,
         operator_delete: Option<String>,
+        operator_restore: Option<String>,
         erase_now: bool,
     ) -> Result<(), String> {
         let Some(slot) = self.replica().cloned() else {
             return Ok(());
         };
+        let replacement = format!(
+            "delete {} {}",
+            slot.lock().await.head().txid.saturating_add(1),
+            crate::alarm::now_ms_i64()
+        );
         let storage = self.storage.clone();
         let a = self.address.clone();
         let residency = self.residency.clone();
         let opened = tokio::task::spawn_blocking(move || {
             if !files_removed {
-                return empty_database_snapshot(&storage, &a, operator_delete.as_deref())
-                    .map(|all| (None, all));
+                return empty_database_snapshot(
+                    &storage,
+                    &a,
+                    operator_delete.as_deref(),
+                    operator_restore.as_deref(),
+                    &replacement,
+                )
+                .map(|all| (None, all));
             }
             let mut db = residency.retain(
                 storage
                     .open(a.class(), a.name())
                     .map_err(|e| format!("{e:#}"))?,
             );
-            mark_deleted(&mut db, operator_delete.as_deref())?;
+            mark_deleted(
+                &mut db,
+                operator_delete.as_deref(),
+                operator_restore.as_deref(),
+                &replacement,
+            )?;
             db.start_capture().map_err(|e| e.to_string())?;
             let all = db.snapshot().map_err(|e| e.to_string())?;
             Ok::<_, String>((Some(db), all))
@@ -1072,6 +1089,7 @@ impl ActorState {
             }
             self.end_capture_at_barrier().await;
         }
+        let operator_restore = self.restore_meta(OPERATOR_RESTORE_KEY).await?;
         if let Some(mut live) = self.live.take() {
             let _ = live.store.data_mut().drain_db().await;
         }
@@ -1089,7 +1107,7 @@ impl ActorState {
             }
         }
         let recorded = self
-            .replicate_delete(files_removed, operator_delete, erase_now)
+            .replicate_delete(files_removed, operator_delete, operator_restore, erase_now)
             .await;
         // Only once the delete is in the bucket.
         self.retire_alarm_entry(stale).await;

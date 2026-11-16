@@ -2042,3 +2042,79 @@ pub async fn execute_with_stores(
         _ => bail!("only create and restore accept opened stores"),
     }
 }
+
+/// Export one actor from a verified backup run for live actor restoration.
+/// Content hashes are checked before the normal history replay verifies LTX.
+#[allow(clippy::too_many_arguments)]
+pub async fn export_actor(
+    from: &str,
+    run_id: Option<&str>,
+    tenant: &str,
+    app: &str,
+    class: &str,
+    name: &str,
+    point: history::Point,
+    output: &std::path::Path,
+) -> anyhow::Result<(history::Export, String)> {
+    let (store, prefix) = crate::open_bucket_unchecked(from)?;
+    export_actor_from_store(
+        &store, &prefix, run_id, tenant, app, class, name, point, output,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_actor_from_store(
+    store: &Store,
+    prefix: &str,
+    run_id: Option<&str>,
+    tenant: &str,
+    app: &str,
+    class: &str,
+    name: &str,
+    point: history::Point,
+    output: &std::path::Path,
+) -> anyhow::Result<(history::Export, String)> {
+    let id = match run_id {
+        Some(id) => id.to_owned(),
+        None => latest(store, prefix)
+            .await?
+            .context("backup has no complete run")?,
+    };
+    let run = load(store, prefix, &id).await?;
+    let (_, source_prefix) = crate::parse_bucket(text(&run.complete, "source")?)?;
+    let suffix = format!(
+        "state/{tenant}/{app}/actors/{class}/{}/",
+        wasmkeep_storage::encode_segment(name)
+    );
+    let expected_prefix = key(source_prefix, &suffix);
+    let tmp = tempfile::tempdir()?;
+    let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
+        tmp.path(),
+    )?);
+    let root = wasmkeep_cluster::state_root::StateRoot::new("", tenant, app);
+    let address = wasmkeep_runtime::ActorAddress::new(tenant, class, name)?;
+    for path in &run.actors {
+        let actor = disk_actor(path)?;
+        if actor["status"] == "failed" || text(&actor, "prefix")? != expected_prefix {
+            continue;
+        }
+        let objects = actor["objects"].as_object().context("missing object map")?;
+        let mut total = 0;
+        for (tail, object) in objects {
+            let listing = Listing::from_keys([tail.as_str()]);
+            ensure!(
+                listing.segments.len() + listing.snapshots.len() == 1,
+                "invalid history key"
+            );
+            let bytes = blob(store, prefix, object).await?;
+            charge(&mut total, bytes.len() as u64, SPOOL_MAX, "actor restore")?;
+            put(&local, &format!("{suffix}{tail}"), bytes, false).await?;
+        }
+        return history::export_raw(&local, &root, &address, point, output, MAX)
+            .await
+            .map(|export| (export, id))
+            .map_err(Into::into);
+    }
+    bail!("actor is not in backup run {id}")
+}

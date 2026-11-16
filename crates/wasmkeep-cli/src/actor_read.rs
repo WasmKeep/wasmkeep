@@ -160,7 +160,7 @@ fn failure_code(error: &anyhow::Error) -> i32 {
     }
 }
 
-fn parse_at(text: &str) -> anyhow::Result<i64> {
+pub(crate) fn parse_at(text: &str) -> anyhow::Result<i64> {
     if let Some(relative) = text.strip_prefix('-') {
         let (split, _) = relative
             .char_indices()

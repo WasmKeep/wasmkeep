@@ -7,7 +7,9 @@
   backup restore (plan step 6) is implemented; the guide records its recovery
   journal, `restore` heartbeat capability, partial-undo force warning and
   phase-specific abort/undo recovery. Single-actor
-  live restore remains proposed. The [first-slice guide](../actor-data-access.md) records its
+  live restore (plan step 7) has an initial implementation: staged requests,
+  owner-fenced replacement, replay markers, alarm ordering and batched flush
+  barriers. See the [operator guide](../actor-data-access.md#restore-one-actor-while-its-cluster-runs). The [first-slice guide](../actor-data-access.md) records its
   positional app syntax, limits and deferred options. Revised after an
   adversarial review (a destination keyed by content, since generations restart after an
   app is recreated; prune excluded from a running backup; restore
@@ -924,13 +926,20 @@ other nodes stop acting on their copies within a period.
    collection, as a periodic snapshot's does. `on-init` does not run
    again unless the restored state never ran it.
 
-**Every delete carries `operator_restore` over**, as it carries
+**Every delete carries a non-empty `operator_restore` over**, as it carries
 `operator_delete` (`delete-self`, `delete-self-durable`, the operator
 delete and idle expiry): a restore request left behind must not bring
 back an actor deleted after it was carried out. A node from before this
 record does not carry it. During a rolling upgrade, a restore request
 whose key could not be deleted can then run again on an actor such a
 node deleted. The same caveat is ADR 0028's for deletes.
+
+Carrying this marker does not create an empty row: an absent or empty
+`operator_restore` means no completed restore request to recognize, and
+both take the same replay path in step 2. Only a non-empty marker is
+written into a carried snapshot. A restore itself always writes its new,
+non-empty marker. The `replaced` delete label remains independent: it also
+supersedes a pending restore that has never run.
 
 **Ordering with other requests.** Deletes and restores of one actor
 run in the order their jobs reach the mailbox, and each is checked
@@ -1072,7 +1081,8 @@ What follows from it:
   the stopped-cluster method.
 - Server changes: on the write path, the restore job and its
   replacement segment, the `restores/` family, and the host meta keys
-  `operator_restore` and `replaced` written by every delete and restore;
+  `operator_restore` written by restores and carried by deletes only when
+  non-empty, and `replaced` written by every delete and restore;
   off it, the `restoring` and `restored` markers a node obeys.
   Per CLAUDE.md it needs its simulation cases, cluster tests and an
   adversarial review before it merges.

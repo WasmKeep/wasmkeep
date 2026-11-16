@@ -130,6 +130,8 @@ struct Rules {
     act_until_answered: bool,
     /// Whether owners delete the actor (ADR 0028).
     deletes: Deletes,
+    /// Replace with a retained past state instead of deleting (ADR 0033).
+    restores: bool,
 }
 
 /// Deletes (ADR 0028): a reset, the snapshot at it, then the erase.
@@ -180,6 +182,7 @@ const SAFE: Rules = Rules {
     lease_cuts: false,
     act_until_answered: false,
     deletes: Deletes::Off,
+    restores: false,
 };
 
 const SAFE_RELEASING: Rules = Rules {
@@ -190,6 +193,7 @@ const SAFE_RELEASING: Rules = Rules {
     lease_cuts: false,
     act_until_answered: false,
     deletes: Deletes::Off,
+    restores: false,
 };
 
 /// Lease cuts, and no hibernation: besides fences and restarts, the actor
@@ -207,6 +211,7 @@ const SAFE_COLLECTING: Rules = Rules {
     lease_cuts: false,
     act_until_answered: false,
     deletes: Deletes::Off,
+    restores: false,
 };
 
 const SAFE_DELETING: Rules = Rules {
@@ -280,6 +285,11 @@ fn restored(plan: &Plan, objects: &[(String, String)]) -> Result<BTreeSet<Segmen
             .any(|(k, b)| *k == key && b.as_bytes() == RESET)
         {
             held.clear();
+        }
+        if let Some((_, body)) = objects.iter().find(|(k, _)| *k == key)
+            && let Some(saved) = body.strip_prefix("restore ")
+        {
+            held = decode_positions(saved);
         }
         held.insert(*segment);
     }
@@ -467,14 +477,30 @@ async fn delete_actor(
         parent_generation: o.head.generation,
     };
     let key = format!("{PREFIX}{}", segment_key(&segment));
+    // The staged past state keeps the oldest event, replacing everything
+    // written since. No history object is edited or erased for a restore.
+    let saved: BTreeSet<_> = if rules.restores {
+        o.held_positions.iter().take(1).copied().collect()
+    } else {
+        BTreeSet::new()
+    };
     let at = resets.lock().unwrap().len();
     resets.lock().unwrap().push(Reset {
         id: segment.id,
-        removed: o.held_positions.clone(),
+        removed: o.held_positions.difference(&saved).copied().collect(),
         acked: false,
     });
     record_backup_state(o, segment.id, true);
-    let uploaded = bucket.create(&key, RESET.to_vec()).await.is_ok();
+    let body = if rules.restores {
+        format!(
+            "restore {}",
+            String::from_utf8(encode_positions(&saved)).unwrap()
+        )
+        .into_bytes()
+    } else {
+        RESET.to_vec()
+    };
+    let uploaded = bucket.create(&key, body).await.is_ok();
     if rules.deletes == Deletes::EraseBeforeAck
         && let Ok(objects) = bucket.list(PREFIX).await
     {
@@ -506,11 +532,12 @@ async fn delete_actor(
         LATE.with(|l| l.set(l.get() + 1));
     }
     o.head = segment.id;
-    o.held_positions = BTreeSet::from([segment.id]);
+    o.held_positions = saved;
+    o.held_positions.insert(segment.id);
     o.since_snapshot = 0;
     o.snapshot_failures = 0;
     o.snapshot_retry_at = 0;
-    if !may_ack || rules.deletes != Deletes::Safe {
+    if !may_ack || rules.deletes != Deletes::Safe || rules.restores {
         return true;
     }
     let snapshot = format!("{PREFIX}{}", snapshot_key(segment.id));
@@ -1587,5 +1614,16 @@ fn lease_free_exports_during_writes_kills_and_collection_keep_acknowledged_posit
     eprintln!(
         "lease-free exports: {exports} verified, {retries} collection retries across {} seeds",
         seeds()
+    );
+}
+
+#[test]
+fn actor_restore_is_a_new_write_and_never_resurrects_replaced_events() {
+    deletes_hold(
+        Rules {
+            restores: true,
+            ..SAFE_DELETING_COLLECTING
+        },
+        "with historical replacements",
     );
 }

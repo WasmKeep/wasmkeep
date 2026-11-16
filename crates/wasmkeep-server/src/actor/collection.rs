@@ -127,6 +127,8 @@ pub(super) fn empty_database_snapshot(
     storage: &Storage,
     address: &ActorAddress,
     operator_delete: Option<&str>,
+    operator_restore: Option<&str>,
+    replacement: &str,
 ) -> Result<wasmkeep_storage::wal::Changes, String> {
     // Unique per call in this process (two actors may be deleted at the
     // same instant), and per process.
@@ -146,7 +148,7 @@ pub(super) fn empty_database_snapshot(
         let mut db = fresh
             .open(address.class(), address.name())
             .map_err(|e| format!("{e:#}"))?;
-        mark_deleted(&mut db, operator_delete)?;
+        mark_deleted(&mut db, operator_delete, operator_restore, replacement)?;
         db.start_capture().map_err(|e| e.to_string())?;
         db.snapshot().map_err(|e| e.to_string())
     })();
@@ -157,7 +159,18 @@ pub(super) fn empty_database_snapshot(
 /// Writes the operator delete marker (ADR 0028) into the empty database a
 /// delete leaves, before its snapshot is taken, so it travels with the
 /// reset.
-pub(super) fn mark_deleted(db: &mut ActorDb, operator_delete: Option<&str>) -> Result<(), String> {
+pub(super) fn mark_deleted(
+    db: &mut ActorDb,
+    operator_delete: Option<&str>,
+    operator_restore: Option<&str>,
+    replacement: &str,
+) -> Result<(), String> {
+    if let Some(marker) = operator_restore.filter(|marker| !marker.is_empty()) {
+        db.set_meta(OPERATOR_RESTORE_KEY, marker)
+            .map_err(|e| e.to_string())?;
+    }
+    db.set_meta("replaced", replacement)
+        .map_err(|e| e.to_string())?;
     match operator_delete {
         Some(at) => db
             .set_meta(OPERATOR_DELETE_KEY, at)

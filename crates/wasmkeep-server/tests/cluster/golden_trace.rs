@@ -19,8 +19,8 @@
 //! (`C1`...), alarm nonces (`N1`...), due times (`T1`...); the class
 //! version a database records (the component's digest, which follows
 //! the path the guest was built in) is masked. A page holding
-//! the actor's alarm index entry (which carries a nonce) is recorded as
-//! `volatile`. Requests that may start in either order are sorted within
+//! the actor's alarm index entry (which carries a nonce), or a delete's
+//! `replaced` label (which carries its time), is recorded as `volatile`. Requests that may start in either order are sorted within
 //! each run of them: the reads and listings of the history (a restore
 //! reads side by side; a collection pass lists in the background) and
 //! the deletes of alarm entries (an event retires one while the pass
@@ -504,7 +504,10 @@ fn ltx(bytes: &[u8], nonces: &[String], version: &str, labels: &mut Labels) -> S
         .pages
         .iter()
         .map(|(pgno, data)| {
+            // A delete's `replaced` label (ADR 0033) carries the time of
+            // the delete, like an alarm entry carries its nonce.
             let volatile = contains(data, b"alarm_indexed")
+                || contains(data, b"replaced")
                 || nonces.iter().any(|n| contains(data, n.as_bytes()));
             if volatile {
                 format!("{pgno}:volatile")

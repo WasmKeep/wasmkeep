@@ -2,14 +2,15 @@
 //! ([ADR 0014](../../../docs/adr/0014-draining-a-node-and-moving-an-actor.md)),
 //! delete an actor ([ADR 0028](../../../docs/adr/0028-actors-that-end.md)).
 //!
-//! An intent is an object *key*; bodies are empty and never read. Nodes
-//! list the intents' prefixes reading keys and their last-modified time
-//! (the bucket's clock) only.
+//! Nodes discover intents by keys and their last-modified time (the
+//! bucket's clock). Move/delete bodies are empty. A restore job reads its
+//! bounded request body separately, after acquiring the actor.
 //!
 //! ```text
 //! control/drain/<node-id>
 //! state/<tenant>/<app>/moves/<class>/<name hex>/<target node-id>
 //! state/<tenant>/<app>/deletes/<class>/<name hex>/<request id>
+//! state/<tenant>/<app>/restores/<class>/<name hex>/<request id>
 //! control/changed
 //! ```
 //!
@@ -131,6 +132,36 @@ impl DeleteIntent {
     }
 }
 
+/// An operator's request to restore an actor (ADR 0033).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreIntent {
+    /// The actor's tenant.
+    pub tenant: String,
+    /// The actor's app, within the tenant.
+    pub app: String,
+    /// The actor's class.
+    pub class: String,
+    /// The actor's name, as given.
+    pub name: String,
+    /// The request's own id ([`new_request_id`]).
+    pub id: String,
+    /// When the key was written, by the bucket's clock (ms): what the
+    /// actor records once the request is carried out.
+    pub written_at_ms: u64,
+}
+
+impl RestoreIntent {
+    /// Its key, relative to the bucket prefix.
+    pub fn key(&self) -> String {
+        restore_key(
+            &StateRoot::new("", self.tenant.as_str(), self.app.as_str()),
+            &self.class,
+            &self.name,
+            &self.id,
+        )
+    }
+}
+
 /// What became of a delete request: written by the node that carried it
 /// out, beside the request, before it deletes the request's key, and read
 /// (then deleted) by the command waiting for it. The key going away alone
@@ -203,6 +234,8 @@ pub struct Control {
     pub moves: Vec<MoveIntent>,
     /// Deletes not yet expired.
     pub deletes: Vec<DeleteIntent>,
+    /// Single-actor restores not yet expired.
+    pub restores: Vec<RestoreIntent>,
 }
 
 /// An intent that cannot be written: a bad node id, tenant or class.
@@ -270,6 +303,28 @@ fn check_actor(root: &StateRoot, class: &str, name: &str) -> Result<(), InvalidI
 fn delete_key(root: &StateRoot, class: &str, name: &str, id: &str) -> String {
     root.key(
         Family::Deletes,
+        &format!("{class}/{}/{id}", hex(name.as_bytes())),
+    )
+}
+
+/// Checked key for a restore request (exactly 16 lowercase hex digits).
+pub fn checked_restore_key(
+    root: &StateRoot,
+    class: &str,
+    name: &str,
+    id: &str,
+) -> Result<String, InvalidIntent> {
+    check_actor(root, class, name)?;
+    if id.len() != 16 || !request_id(id) {
+        return Err(InvalidIntent(
+            "restore id must be 16 lowercase hex digits".into(),
+        ));
+    }
+    Ok(restore_key(root, class, name, id))
+}
+fn restore_key(root: &StateRoot, class: &str, name: &str, id: &str) -> String {
+    root.key(
+        Family::Restores,
         &format!("{class}/{}/{id}", hex(name.as_bytes())),
     )
 }
@@ -376,6 +431,12 @@ pub async fn read<K: Keys>(
                 .await?,
         );
     }
+    if let Some(root) = moves_of {
+        listed.extend(
+            keys.list_keys(&format!("{}/", root.base(Family::Restores)))
+                .await?,
+        );
+    }
     let (control, expired) = parse(&listed, now_ms);
     for key in expired {
         // Best effort: a key left behind is still expired, and the next
@@ -389,12 +450,53 @@ pub async fn read<K: Keys>(
 pub fn parse(listed: &[(String, u64)], now_ms: u64) -> (Control, Vec<String>) {
     let mut control = Control::default();
     let mut expired = Vec::new();
+    let live_requests: BTreeSet<&str> = listed
+        .iter()
+        .filter_map(|(key, modified)| {
+            (now_ms.saturating_sub(*modified) <= DELETE_TTL_MS
+                && key
+                    .strip_prefix(STATE_PREFIX)
+                    .and_then(|rest| parse_restore(rest, *modified))
+                    .is_some())
+            .then_some(key.as_str())
+        })
+        .collect();
     for (key, modified) in listed {
         if let Some(node) = key.strip_prefix(DRAIN) {
             if validate_node_id(node).is_ok() {
                 control.draining.insert(node.to_owned());
             }
         } else if let Some(rest) = key.strip_prefix(STATE_PREFIX) {
+            if let Some(intent) = parse_restore(rest, *modified) {
+                if now_ms.saturating_sub(*modified) > DELETE_TTL_MS {
+                    expired.push(key.clone());
+                    expired.push(format!("{key}.ltx"));
+                } else {
+                    control.restores.push(intent);
+                }
+                continue;
+            }
+            // A stage is written before its request: never expire it while
+            // that request is still live, even across the one-hour boundary.
+            if key
+                .strip_suffix(".ltx")
+                .is_some_and(|k| live_requests.contains(k))
+            {
+                continue;
+            }
+            // Staged files and outcomes left by interrupted operators expire too.
+            if let Some((base, suffix)) = rest.rsplit_once('.')
+                && matches!(
+                    suffix,
+                    "ltx" | "done" | "conflict" | "refused" | "absent" | "superseded"
+                )
+                && parse_restore(base, *modified).is_some()
+            {
+                if now_ms.saturating_sub(*modified) > DELETE_TTL_MS {
+                    expired.push(key.clone());
+                }
+                continue;
+            }
             if let Some(intent) = parse_delete(rest, *modified) {
                 if now_ms.saturating_sub(*modified) > DELETE_TTL_MS {
                     expired.push(key.clone());
@@ -465,6 +567,31 @@ fn parse_delete(rest: &str, written_at_ms: u64) -> Option<DeleteIntent> {
     }
     let name = String::from_utf8(unhex(name)?).ok()?;
     (!name.is_empty()).then(|| DeleteIntent {
+        tenant: (*tenant).to_owned(),
+        app: (*app).to_owned(),
+        class: (*class).to_owned(),
+        name,
+        id: (*id).to_owned(),
+        written_at_ms,
+    })
+}
+
+fn parse_restore(rest: &str, written_at_ms: u64) -> Option<RestoreIntent> {
+    let parts: Vec<&str> = rest.split('/').collect();
+    let [tenant, app, family, class, name, id] = parts.as_slice() else {
+        return None;
+    };
+    if *family != Family::Restores.folder()
+        || !segment(tenant)
+        || !segment(app)
+        || !segment(class)
+        || id.len() != 16
+        || !request_id(id)
+    {
+        return None;
+    }
+    let name = String::from_utf8(unhex(name)?).ok()?;
+    (!name.is_empty()).then(|| RestoreIntent {
         tenant: (*tenant).to_owned(),
         app: (*app).to_owned(),
         class: (*class).to_owned(),
@@ -660,5 +787,41 @@ mod tests {
         assert!(checked_move_key(&StateRoot::new("", "acme", "blog"), "", "x", "c").is_err());
         assert!(checked_move_key(&StateRoot::new("", "acme", "blog"), "..", "x", "c").is_err());
         assert!(checked_move_key(&StateRoot::new("", "acme", "blog"), "room", "", "c").is_err());
+    }
+}
+
+#[cfg(test)]
+mod restore_regression {
+    use super::*;
+
+    #[test]
+    fn expired_restore_removes_both_request_and_staged_snapshot() {
+        let key = "state/acme/shop/restores/cart/78/0123456789abcdef";
+        let (_, expired) = parse(&[(key.into(), 1)], DELETE_TTL_MS + 2);
+        assert!(
+            expired.contains(&key.to_owned()),
+            "restore request never expires"
+        );
+        assert!(
+            expired.contains(&format!("{key}.ltx")),
+            "staged data leaked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod staged_restore_lifetime {
+    use super::*;
+    #[test]
+    fn an_older_stage_is_kept_while_its_request_is_live() {
+        let key = "state/acme/shop/restores/cart/78/0123456789abcdef";
+        let (_, expired) = parse(
+            &[(key.into(), 1000), (format!("{key}.ltx"), 1)],
+            DELETE_TTL_MS + 2,
+        );
+        assert!(
+            !expired.contains(&format!("{key}.ltx")),
+            "live restore lost its staged data"
+        );
     }
 }

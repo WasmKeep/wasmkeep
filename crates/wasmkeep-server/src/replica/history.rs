@@ -137,6 +137,44 @@ pub async fn export_with_options(
     output: &Path,
     options: Options<'_>,
 ) -> Result<Export, Error> {
+    export_mode(store, root, actor, point, output, options, false).await
+}
+
+/// Verified WAL-mode replay for an operator restore, before SQLite can convert
+/// its journal header. Uses the same bounded reads and retries as export.
+pub async fn export_raw(
+    store: &Arc<dyn ObjectStore>,
+    root: &StateRoot,
+    actor: &ActorAddress,
+    point: Point,
+    output: &Path,
+    max_bytes: u64,
+) -> Result<Export, Error> {
+    export_mode(
+        store,
+        root,
+        actor,
+        point,
+        output,
+        Options {
+            max_bytes,
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_mode(
+    store: &Arc<dyn ObjectStore>,
+    root: &StateRoot,
+    actor: &ActorAddress,
+    point: Point,
+    output: &Path,
+    options: Options<'_>,
+    raw: bool,
+) -> Result<Export, Error> {
     if output.try_exists()? {
         return Err(Error::Point(format!(
             "destination {} already exists; choose a new file",
@@ -162,7 +200,7 @@ pub async fn export_with_options(
     let staged = scratch.path().join("verified.db");
     let mut last = String::new();
     for attempt in 1..=8 {
-        match attempt_export(store, &prefix, point, &staged, options.max_bytes, false).await {
+        match attempt_export(store, &prefix, point, &staged, options.max_bytes, raw).await {
             Ok(mut result) => {
                 result.attempts = attempt;
                 // A hint only. Read-only credentials may deliberately omit owners/.

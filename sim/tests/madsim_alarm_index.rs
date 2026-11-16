@@ -98,6 +98,8 @@ struct Rules {
     /// seeds. With it, an owner hibernates half the time right after
     /// delivering a stale alarm (5% otherwise).
     cut_at_first_upload: bool,
+    restores: bool,
+    restore_entry_after_upload: bool,
 }
 
 const SAFE: Rules = Rules {
@@ -107,6 +109,8 @@ const SAFE: Rules = Rules {
     index_before_first_upload: true,
     refuse_clearing_when_empty: true,
     cut_at_first_upload: false,
+    restores: false,
+    restore_entry_after_upload: false,
 };
 
 /// The actor's durable state: its committed alarm and the entry it names.
@@ -176,6 +180,7 @@ fn listed(objects: &[(String, String)]) -> Vec<Entry> {
 struct Counts {
     /// Durable state writes holding an alarm.
     alarms: u64,
+    restores: u64,
     /// Tagged entries removed as stale (the legacy candidate not counted).
     clears: u64,
     /// Fences uploaded before clearing.
@@ -428,6 +433,45 @@ impl Node<'_> {
         true
     }
 
+    /// Restore an old due time, always with a fresh nonce, even when equal
+    /// to today's alarm. Retire the old entry only after acknowledgement.
+    async fn restore_actor(&mut self, o: &mut Owner) -> bool {
+        let at = TIMES[0];
+        let previous = o.state.indexed.clone();
+        let entry = self.fresh_entry(at, o.held.generation);
+        if !self.rules.restore_entry_after_upload
+            && self.bucket.create(&key(&entry), Vec::new()).await.is_err()
+        {
+            return false;
+        }
+        if !self
+            .write(
+                o,
+                State {
+                    alarm: Some(at),
+                    indexed: Some(entry.clone()),
+                },
+            )
+            .await
+        {
+            return false;
+        }
+        count(|c| c.restores += 1);
+        if self.rules.restore_entry_after_upload {
+            sleep(Duration::from_millis(100)).await;
+            if self.bucket.create(&key(&entry), Vec::new()).await.is_err() {
+                return false;
+            }
+        }
+        if let Some(previous) = previous
+            && self.valid(o)
+            && self.may_delete(&previous, o.held.generation)
+        {
+            let _ = self.deletes.delete(&key(&previous)).await;
+        }
+        true
+    }
+
     /// An alarm delivered for `hint` that the committed alarm no longer
     /// matches: removes the entries there the state does not name, as
     /// `clear_stale_hint` does.
@@ -509,16 +553,20 @@ impl Node<'_> {
                 continue;
             }
             let mut cleared = false;
-            let kept = match self.rng.below(10) {
-                0..=4 => {
-                    let at = TIMES[usize::try_from(self.rng.below(2)).unwrap()];
-                    self.set_alarm(&mut o, Some(at)).await
-                }
-                5..=6 => self.set_alarm(&mut o, None).await,
-                _ => {
-                    cleared = true;
-                    let hint = TIMES[usize::try_from(self.rng.below(2)).unwrap()];
-                    self.clear_stale(&mut o, hint).await
+            let kept = if self.rules.restores && self.rng.chance(25) {
+                self.restore_actor(&mut o).await
+            } else {
+                match self.rng.below(10) {
+                    0..=4 => {
+                        let at = TIMES[usize::try_from(self.rng.below(2)).unwrap()];
+                        self.set_alarm(&mut o, Some(at)).await
+                    }
+                    5..=6 => self.set_alarm(&mut o, None).await,
+                    _ => {
+                        cleared = true;
+                        let hint = TIMES[usize::try_from(self.rng.below(2)).unwrap()];
+                        self.clear_stale(&mut o, hint).await
+                    }
                 }
             };
             // Now and then the owner gives the actor up (hibernation). Under
@@ -1018,4 +1066,31 @@ fn batched_clearing_on_an_earlier_acknowledged_entry_is_caught() {
         batched::Violation::AlarmMissing,
         31,
     );
+}
+
+#[test]
+fn actor_restore_indexes_before_replacement_under_takeovers_and_late_deletes() {
+    let mut restores = 0;
+    for seed in 0..seeds() {
+        let (store, counts, violation) = simulate(
+            seed,
+            Rules {
+                restores: true,
+                ..SAFE
+            },
+            Duration::from_secs(30),
+        );
+        assert!(violation.is_none(), "seed {seed}: {violation:?}");
+        check(&store).unwrap();
+        restores += counts.restores;
+    }
+    assert!(restores > seeds(), "restore scenario was not exercised");
+}
+#[test]
+fn actor_restore_entry_after_upload_is_caught() {
+    caught(Rules {
+        restores: true,
+        restore_entry_after_upload: true,
+        ..SAFE
+    });
 }

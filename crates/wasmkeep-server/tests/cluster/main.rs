@@ -1267,7 +1267,10 @@ impl ObjectStore for Flaky {
                 );
                 async move {
                     let path = location?;
-                    if refuse.load(Ordering::SeqCst) && path.as_ref().contains("/deletes/") {
+                    if refuse.load(Ordering::SeqCst)
+                        && (path.as_ref().contains("/deletes/")
+                            || path.as_ref().contains("/restores/"))
+                    {
                         return Err(object_store::Error::Generic {
                             store: "flaky",
                             source: "delete refused".into(),

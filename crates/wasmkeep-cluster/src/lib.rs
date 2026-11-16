@@ -50,3 +50,5 @@ pub mod object_store;
 pub mod replication;
 pub mod restore_fence;
 pub mod state_root;
+
+pub mod actor_restore;

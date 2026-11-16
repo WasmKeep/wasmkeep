@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod actor_read;
+mod actor_restore;
 mod app_delete;
 use wasmkeep_cli::backup;
 use wasmkeep_cli::{open_bucket_unchecked, parse_app, parse_bucket};
@@ -131,6 +132,8 @@ enum ActorCommand {
     /// delete is recorded (60 s by default); the request stays for an
     /// hour otherwise. Cannot be undone.
     Delete(DeleteArgs),
+    /// Restore historical state as a new write by the current owner.
+    Restore(actor_restore::RestoreArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1217,6 +1220,7 @@ fn main() -> anyhow::Result<()> {
         Command::Actor(ActorCommand::Sql(args)) => actor_read::finish(actor_read::sql(&args)),
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
         Command::Actor(ActorCommand::Delete(args)) => actor_delete(&args),
+        Command::Actor(ActorCommand::Restore(args)) => actor_restore::run(&args),
         Command::App(AppCommand::Delete(args)) => app_delete::run(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
         Command::Dev(args) => dev(args),
