@@ -1109,6 +1109,14 @@ impl Cluster {
             let Ok(mut out) = out else {
                 return unavailable("bad advertised address\n");
             };
+            if req
+                .extensions()
+                .get::<crate::http::RateAdmitted>()
+                .is_some()
+                && self.sign_admission(owner, &path, &mut out).await.is_err()
+            {
+                return unavailable("cannot authenticate ingress admission; retry\n");
+            }
             if front && let Err(e) = self.sign_hand_off(owner, &path, &mut out).await {
                 tracing::warn!(owner, error = %e, "relaying a hand-off refused");
                 return unavailable("cannot relay this socket now; retry\n");
@@ -2250,6 +2258,14 @@ impl Cluster {
             Ok(app) => req.headers_mut().insert(APP, app),
             Err(_) => return unavailable("cannot forward this request\n"),
         };
+        if req
+            .extensions()
+            .get::<crate::http::RateAdmitted>()
+            .is_some()
+            && self.sign_admission(owner, &path, &mut req).await.is_err()
+        {
+            return unavailable("cannot authenticate ingress admission; retry\n");
+        }
         crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "request")]));
         // Bound the wait for the owner's response headers (a hung node or a
         // half-open connection); the body then streams as the owner sends it.

@@ -452,6 +452,10 @@ pub(crate) async fn validate(runtime: &Runtime, component: &Component) -> Result
 /// serving it.
 pub(crate) type FrontSlot = Arc<RwLock<Option<Arc<FrontVersion>>>>;
 
+/// Front selected together with ingress policies under the class publication lock.
+#[derive(Clone)]
+pub(crate) struct IngressFront(pub(crate) Option<Arc<FrontVersion>>);
+
 /// A deployed version's front, as a node loads it (ADR 0023): the
 /// compiled component, its deployed configuration and the names it
 /// requires. Its `Debug` shows names, never a value.
@@ -708,8 +712,14 @@ impl HttpComponent {
         actors: Option<&ActorService>,
     ) -> Response<HyperOutgoingBody> {
         let started = Instant::now();
-        // The version this request runs on, whatever is swapped in after.
-        let Some(version) = self.current() else {
+        // The version admitted with its policy, even if a deploy has since landed.
+        let pinned = req.extensions_mut().remove::<IngressFront>();
+        let selected = if actors.is_some_and(|a| Arc::ptr_eq(&self.version, &a.front_slot())) {
+            pinned.map_or_else(|| self.current(), |s| s.0)
+        } else {
+            self.current()
+        };
+        let Some(version) = selected else {
             return text_response(StatusCode::NOT_FOUND, "not found\n");
         };
         // A required value not set, or the app's secrets not open: not

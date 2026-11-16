@@ -130,6 +130,7 @@ pub(crate) fn run(project: Project, options: Options) -> anyhow::Result<()> {
     config.config = loaded.config.clone();
     config.requires = requires(&project);
     config.batched = batched(&project);
+    config.limits = project.limits.clone();
     config.front = loaded.front.clone();
     let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
     let front_requests = wasmkeep_server::fds::default_front_requests(pool).max(1);
@@ -328,6 +329,7 @@ async fn watch(
             &requires,
             &batched(&project),
             loaded.front.as_ref(),
+            &project.limits,
         ) {
             Ok(()) => tracing::info!("reloaded"),
             Err((name, e)) => {

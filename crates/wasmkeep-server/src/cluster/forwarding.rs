@@ -198,3 +198,108 @@ pub(crate) fn never_forward<B>(req: &Request<B>) -> bool {
     req.headers().contains_key(FORWARDED)
         || req.extensions().get::<ArrivedOnClusterPort>().is_some()
 }
+
+// A separate domain from actor calls: this receipt grants only rate admission,
+// never Caller::Actor/Front or access to an internal class. Its payload is the
+// empty digest, not a claim that a streamed request body has been authenticated.
+const ADMITTED: &str = "x-wasmkeep-admitted";
+impl Cluster {
+    pub(super) async fn sign_admission<B>(
+        &self,
+        owner: &str,
+        path: &str,
+        req: &mut Request<B>,
+    ) -> Result<(), String> {
+        let secret = format!("wasmkeep-ingress-v1:{}", self.secret().await?);
+        let ts = now_ms();
+        let nonce = self.nonce();
+        let body = body_sha256(b"");
+        let mac = signature(
+            &secret,
+            ts,
+            &nonce,
+            owner,
+            req.method(),
+            path,
+            &body,
+            req.headers(),
+        );
+        req.headers_mut().insert(
+            ADMITTED,
+            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body} {mac}"))
+                .map_err(|e| e.to_string())?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn admission_received<B>(&self, req: &Request<B>) -> bool {
+        // In refuse mode only mTLS grants hop identity; a receipt on the
+        // public port cannot change that. The router already exempts mTLS.
+        if self.refuse_plaintext {
+            return false;
+        }
+        let mut values = req.headers().get_all(ADMITTED).iter();
+        let Some(given) = values.next().and_then(|v| v.to_str().ok()) else {
+            return false;
+        };
+        if values.next().is_some() {
+            return false;
+        }
+        let Some(secret) = self.secret.get() else {
+            return false;
+        };
+        let secret = format!("wasmkeep-ingress-v1:{secret}");
+        let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+        let Some(signed) = verify(
+            &secret,
+            given,
+            now_ms(),
+            &self.node_id,
+            req.method(),
+            path,
+            req.headers(),
+        ) else {
+            return false;
+        };
+        // The existing replay store is process-bounded. A full store refuses
+        // exemption; the ordinary public admission policy then applies.
+        signed.body == body_sha256(b"") && self.first_use(&signed, false)
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn ingress_receipts_are_single_use_and_never_actor_credentials() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut config = ClusterConfig::new("owner", "http://owner", store);
+        config.heartbeat = Duration::from_secs(3600);
+        config.lease = LeaseConfig::new(10_800_000, 5000, 2000, 1000).unwrap();
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert!(
+            cluster
+                .is_internal(req.method(), "/actor/c/a", req.headers(), false)
+                .is_none()
+        );
+        let mut changed = req.clone();
+        *changed.uri_mut() = "/actor/c/b".parse().unwrap();
+        assert!(!cluster.admission_received(&changed));
+        assert!(cluster.admission_received(&req));
+        assert!(!cluster.admission_received(&req));
+        let proof = req.headers()[ADMITTED].clone();
+        req.headers_mut().remove(ADMITTED);
+        req.headers_mut().insert(INTERNAL, proof);
+        assert!(
+            cluster
+                .is_internal(req.method(), "/actor/c/a", req.headers(), false)
+                .is_none()
+        );
+    }
+}

@@ -426,6 +426,7 @@ fn a_move_target_that_cannot_take_it_gets_a_warning() {
         can_handoff: true,
         can_end: true,
         can_flush: true,
+        can_rate_limits: false,
         can_restore: true,
         can_actor_restore: false,
         instance: None,

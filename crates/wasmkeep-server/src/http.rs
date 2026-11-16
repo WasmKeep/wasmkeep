@@ -97,6 +97,12 @@ impl App {
                 _ => text_response(StatusCode::NOT_FOUND, "not found\n"),
             };
         }
+        if req.extensions().get::<ArrivedOnClusterPort>().is_none()
+            && let Some(actors) = &self.actors
+            && let Some(response) = actors.admit_ingress(&mut req)
+        {
+            return response;
+        }
         if declares_too_large(&req) {
             return text_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n");
         }
@@ -141,6 +147,14 @@ impl App {
 /// what the actor sees; forwarding to another node uses it.
 #[derive(Debug, Clone)]
 pub(crate) struct OriginalPath(pub(crate) String);
+
+/// Set only by the listener, never by an HTTP header.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PeerAddress(pub(crate) std::net::SocketAddr);
+
+/// A public request admitted locally; propagated only with host proof.
+#[derive(Clone, Copy)]
+pub(crate) struct RateAdmitted;
 
 /// `/actor/<class>/<name><rest>` split into its parts; `name` percent-decoded,
 /// `rest` (path and query) is what the actor sees, `/` at least.
@@ -710,6 +724,7 @@ async fn serve_connection<I>(
     let service = service_fn(move |mut req: Request<Incoming>| {
         let (app, cluster) = (app.clone(), cluster.clone());
         async move {
+            req.extensions_mut().insert(PeerAddress(peer));
             let Some(cluster) = cluster else {
                 return Ok::<_, std::convert::Infallible>(app.route(req).await);
             };

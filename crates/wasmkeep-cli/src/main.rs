@@ -1500,6 +1500,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             config.config = deployed.config;
             config.requires = deployed.requires;
             config.batched = deployed.batched;
+            config.limits = deployed.limits;
             config.expire_after_idle = deployed
                 .expire
                 .iter()
@@ -2129,6 +2130,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             }
         };
         let changes = wasmkeep_server::apps::Changes {
+            limits: None,
             front,
             front_config,
             front_requires: args.front_requires.clone(),

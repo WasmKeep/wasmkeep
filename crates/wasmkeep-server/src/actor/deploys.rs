@@ -112,6 +112,7 @@ impl ActorService {
             requires,
             &std::collections::BTreeSet::new(),
             None,
+            &std::collections::BTreeMap::new(),
         )
     }
 
@@ -137,7 +138,10 @@ impl ActorService {
         requires: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
         batched: &std::collections::BTreeSet<String>,
         front: Option<&crate::front::DeployedFront>,
+        limits: &crate::apps::limits::Policies,
     ) -> Result<(), (String, Error)> {
+        crate::apps::limits::validate(limits)
+            .map_err(|e| (FRONT_CLASS.to_owned(), Error::NotAFront(e)))?;
         // Linking is slow: done before taking the lock, the front's too.
         let front = match front {
             Some(deployed) => Some((
@@ -200,6 +204,10 @@ impl ActorService {
             );
         }
         *map = built;
+        self.inner
+            .rate_limiter
+            .reconcile(limits, std::time::Instant::now());
+        *self.inner.limits.write().unwrap_or_else(|p| p.into_inner()) = limits.clone();
         // The front's values from the same layers, under the same lock.
         let front = front.map(|(linked, deployed)| {
             Arc::new(front_values(
@@ -274,6 +282,108 @@ impl ActorService {
         }
         drop(front);
         tracing::info!(classes_changed = changed, front_changed, "secrets applied");
+    }
+
+    /// Capture the front and admit under the same publication lock as classes.
+    /// No lock is held while guest work or network I/O runs.
+    pub(crate) fn admit_ingress<B>(
+        &self,
+        req: &mut hyper::Request<B>,
+    ) -> Option<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>> {
+        use crate::http::text_response;
+        use hyper::StatusCode;
+        let _classes = read_lock(&self.inner.classes);
+        let limits = read_lock(&self.inner.limits);
+        let policy_behind = self
+            .inner
+            .deploy_behind
+            .load(std::sync::atomic::Ordering::Acquire)
+            && (!limits.is_empty()
+                || self
+                    .inner
+                    .rate_limits_pending
+                    .load(std::sync::atomic::Ordering::Acquire));
+        if self
+            .inner
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+            || policy_behind
+            || *self.inner.app_deleted.borrow()
+        {
+            return Some(crate::cluster::unavailable("app unavailable; retry\n"));
+        }
+        // A secrets-blocked node may still forward direct actor requests.
+        // The front's established response and outcome are unchanged.
+        if !req.uri().path().starts_with("/actor/") && self.secrets_blocked() {
+            crate::metrics::inc(
+                &crate::metrics::METRICS
+                    .front_requests
+                    .get(&[("outcome", "unconfigured")]),
+            );
+            return Some(crate::cluster::unavailable(
+                "this node cannot serve the app now; retry\n",
+            ));
+        }
+        let authenticated = !limits.is_empty()
+            && self.inner.cluster.as_ref().is_some_and(|cluster| {
+                cluster.admission_received(req)
+                    || cluster
+                        .is_internal(
+                            req.method(),
+                            req.uri().path_and_query().map_or("/", |p| p.as_str()),
+                            req.headers(),
+                            false,
+                        )
+                        .is_some()
+            });
+        if !limits.is_empty() && !authenticated {
+            let result = self.inner.rate_limiter.admit(
+                &limits,
+                req.method().as_str(),
+                req.uri().path(),
+                req.headers(),
+                req.extensions()
+                    .get::<crate::http::PeerAddress>()
+                    .map(|p| p.0.ip()),
+                std::time::Instant::now(),
+            );
+            crate::metrics::ingress_admission(result.as_ref().err().copied());
+            if let Err(rejection) = result {
+                let retry = match rejection {
+                    crate::rate_limit::Rejection::InvalidKey => {
+                        return Some(text_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid rate limit key\n",
+                        ));
+                    }
+                    crate::rate_limit::Rejection::Quota(seconds) => seconds,
+                    crate::rate_limit::Rejection::Capacity => 1,
+                };
+                let mut response =
+                    text_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded\n");
+                response.headers_mut().insert(
+                    hyper::header::RETRY_AFTER,
+                    hyper::header::HeaderValue::from(retry),
+                );
+                return Some(response);
+            }
+        }
+        if !limits.is_empty() && !authenticated {
+            req.extensions_mut().insert(crate::http::RateAdmitted);
+        }
+        req.extensions_mut().insert(crate::front::IngressFront(
+            read_lock(&self.inner.front).clone(),
+        ));
+        None
+    }
+
+    /// Whether a pending version needs ingress enforcement. Unknown manifests
+    /// are treated conservatively until decoded; ordinary legacy front failures
+    /// keep their previous behavior when no policy is involved.
+    pub(crate) fn set_rate_limits_pending(&self, required: bool) {
+        self.inner
+            .rate_limits_pending
+            .store(required, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether this node cannot open the app's current secrets (ADR

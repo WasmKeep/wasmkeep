@@ -349,3 +349,17 @@ INFO wasmkeep::guest: order 42 shipped app=acme/shop actor=orders/42 stream="std
   to keep only the drop warnings, or `wasmkeep::guest=off`.
 - Actors log what they choose to: whatever they print (a secret included)
   lands in the node's log, and wherever that is shipped.
+
+## Ingress admission
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `wasmkeep_rate_limit_requests_total{outcome}` | counter | Decisions for apps with configured limits: `admitted`, `quota` (429), `capacity` (429 without safe bucket space), or `invalid_key` (400). Internal forwarding is excluded. |
+| `wasmkeep_rate_limit_active_keys` | gauge | Retained client buckets in this process, bounded by 4,096 per app and 65,536 per process. |
+
+These fixed-label series never contain an IP or header value. Rising
+`capacity` means new identities cannot obtain buckets without resetting
+existing quotas. Rising `quota` means configured allowances were spent.
+Inspect the edge and the policy before raising limits. Budgets and
+counters reset on restart; quotas are per node, not a cluster-wide total.
+Clients receiving 429 should respect `Retry-After`.

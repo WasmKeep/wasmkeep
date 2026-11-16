@@ -158,6 +158,8 @@ pub struct ActorConfig {
     /// deployed version's; every other class is strict. Batched only in a
     /// binary built with `batched-writes` ([`crate::apps::BATCHED_BUILT`]).
     pub batched: std::collections::BTreeSet<String>,
+    /// Public ingress rate limits for this app.
+    pub limits: crate::apps::limits::Policies,
     /// `--max-unsent-age` (ADR 0034, section 3): how long a committed write
     /// of a batched actor may wait unsent behind the segment in flight
     /// before the actor stops starting events. 500 ms; kept within 100 ms
@@ -220,6 +222,7 @@ impl ActorConfig {
             requires: std::collections::BTreeMap::new(),
             expire_after_idle: std::collections::BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            limits: Default::default(),
             max_unsent_age: DEFAULT_UNSENT_AGE,
             access: crate::access::AccessRules::default(),
             flag_access: None,
@@ -267,6 +270,9 @@ struct ServiceInner {
     /// The deployed version's front, swapped with its classes under the
     /// classes' lock; `None` while it has none.
     front: crate::front::FrontSlot,
+    limits: std::sync::RwLock<crate::apps::limits::Policies>,
+    rate_limiter: crate::rate_limit::Limiter,
+    rate_limits_pending: std::sync::atomic::AtomicBool,
     /// The rules given at start, for classes `replace_class` adds.
     start_rules: Arc<crate::access::AccessRules>,
     /// `--access` during the migration of ADR 0013 (`ActorConfig::flag_access`).

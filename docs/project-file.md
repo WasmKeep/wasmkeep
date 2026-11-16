@@ -78,6 +78,63 @@ least one class.
 | `build` | optional | a command for the system shell (`sh -c`, `cmd.exe` on Windows), run in the file's directory before `component` is read |
 | `watch` | optional | files or directories of sources; `wasmkeep dev` runs `build` again when one changes (name sources, not what the build writes) |
 
+<a id="ingress-limits"></a>
+
+### `[limits.<name>]`
+
+Optional host admission rules, applied by both `dev` and deployed nodes.
+There may be 32 rules, named like classes. All matching rules must allow a
+request; a refusal spends no tokens in any rule.
+
+```toml
+[limits.signin]
+match = "POST /signin"
+key = "ip"
+rate = "4/s"
+burst = 8
+
+[limits.api]
+match = "/api/*"
+key = "header"
+header = "x-client-id"
+rate = "90/m"
+burst = 15
+```
+
+| Key | Meaning |
+| --- | --- |
+| `match` | Absolute encoded path, optionally preceded by an uppercase standard HTTP method and one space. Only a final `/*` wildcard is allowed; `/api/*` includes `/api/` but not `/api`. Queries do not participate. Maximum 1024 bytes; no whitespace, fragments or regex. |
+| `key` | `ip` (TCP peer) or `header`. Each app and named rule has separate client buckets on each node. |
+| `header` | Required only for `header` keys. Lowercase HTTP field name, at most 128 bytes. Host-internal, forwarding and hop-by-hop fields are refused. |
+| `rate` | Positive decimal integer followed by `/s`, `/m` or `/h`, at most 1,000,000 tokens per period. |
+| `burst` | Integer from 1 to 1,000,000: initial and maximum tokens. |
+
+Matching is case-sensitive and uses the encoded path as received: `/a%2Fb`
+is different from `/a/b`. A missing method matches any method. A header
+key must occur once and contain 1–256 non-whitespace printable ASCII
+bytes; missing, duplicate or invalid values return 400. Unknown fields
+and duplicate definitions fail with a source position.
+
+Budgets are **per node**, reset on process restart, and use monotonic
+elapsed time. A 429 response includes an integer `Retry-After` in seconds;
+clients should wait at least that long. Direct `/actor/` requests and
+WebSocket handshakes are covered; frames are not charged. Internal
+forwarding is authenticated and does not consume another allowance.
+
+IP keys use the TCP peer only. Forwarding headers are never used as IP
+identity. There is no trusted-proxy IP configuration in this release: a
+proxy shares one peer quota. A header key supplied by an edge must be
+removed from incoming requests and overwritten at that edge, with direct
+access to the node restricted. Client-supplied identifiers are not auth.
+
+Full project deploys replace the policy set (omission removes it). Legacy
+partial flag deploys preserve policies. Plan output lists added, changed
+and removed rules. Unchanged rules retain their budgets; edits to a named
+rule clamp retained available tokens to the new burst. Renaming or
+removing a rule discards its old budget. Nonempty policies require manifest
+format 6 and `rate_limits` on every live app reader; deploy and rollback
+refuse older readers. See [ADR 0036](adr/0036-per-node-ingress-rate-limits.md).
+
 ### `[dev]` (optional, `wasmkeep dev` only)
 
 | Key | Default | |

@@ -253,3 +253,31 @@ No independent third-party audit has been done yet.
 
 Report privately through the repository's security advisories, not in a
 public issue.
+
+## Ingress rate limits
+
+An app's [project-file limits](project-file.md#ingress-limits) run before body
+consumption, front instance allocation and actor dispatch, including
+public actor routes and WebSocket handshakes. Forged `x-wasmkeep-*` headers
+do not exempt public requests. Cluster-port traffic is authenticated by
+mutual TLS. Legacy public-request forwarding uses a separate signed,
+single-use admission receipt that grants no actor privileges. Internal
+actor calls still undergo signature, body and replay checks before work. Quotas are local to a node and reset
+when its process restarts.
+
+IP keys use only the TCP peer. Forwarded addresses are not trusted or
+parsed. Behind a proxy, use its shared IP quota or an edge-overwritten
+header and restrict direct access to the node. Header keys are not
+credentials; a client allowed to choose one can rotate identities.
+
+Each app retains at most 4,096 client buckets, and a process at most
+65,536. Only fully refilled buckets can be evicted for capacity. A full
+store refuses new keys with 429 and `Retry-After: 1`; it does not reset
+existing quotas. Header values are hashed and are absent from logs and
+metric labels. If its current or pending version has policies, a node that cannot apply
+the deployment refuses public intake with 503, including direct actor
+requests. Undecodable manifests also fail closed.
+
+These limits control app admission. Use edge filtering and connection
+limits for floods that can overwhelm the listener or the network before
+app admission runs.

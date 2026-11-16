@@ -28,6 +28,7 @@ pub(crate) struct Project {
     /// `[classes.<name>]`, by name.
     pub(crate) classes: BTreeMap<String, Class>,
     pub(crate) dev: Dev,
+    pub(crate) limits: wasmkeep_server::apps::limits::Policies,
 }
 
 /// What the front and a class have in common.
@@ -66,7 +67,7 @@ pub(crate) struct Dev {
     pub(crate) env_named: bool,
 }
 
-const TOP: &[&str] = &["app", "front", "classes", "dev"];
+const TOP: &[&str] = &["app", "front", "classes", "dev", "limits"];
 const APP: &[&str] = &["tenant", "name"];
 const FRONT: &[&str] = &["component", "build", "config", "requires", "watch"];
 const CLASS: &[&str] = &[
@@ -390,6 +391,7 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
             name: names.next().unwrap_or_default(),
             front: None,
             classes: BTreeMap::new(),
+            limits: Default::default(),
             dev: Dev {
                 env: dir.join(".env.local"),
                 ..Dev::default()
@@ -543,6 +545,50 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
         }
     }
 
+    let mut limits = wasmkeep_server::apps::limits::Policies::new();
+    if let Some(t) = table(&src, root, "limits")? {
+        for (name, value) in t {
+            let name = name.get_ref();
+            let what = format!("[limits.{name}]");
+            let ct = table(&src, t, name)?.ok_or_else(|| format!("{what}: expected table"))?;
+            known_keys(
+                &src,
+                ct,
+                &what,
+                &["match", "key", "header", "rate", "burst"],
+            )?;
+            let required = |key| {
+                string(&src, ct, key, &what)?
+                    .ok_or_else(|| format!("{}: {what} {key} is required", src.at(value.span())))
+            };
+            let matcher = required("match")?;
+            let key = required("key")?;
+            let rate = required("rate")?;
+            let header = string(&src, ct, "header", &what)?;
+            let burst = match get(ct, "burst").map(|(_, v)| v.get_ref()) {
+                Some(DeValue::Integer(n)) => n.to_string().parse::<u32>().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                format!(
+                    "{}: {what} burst must be a positive integer",
+                    src.at(value.span())
+                )
+            })?;
+            let policy = wasmkeep_server::apps::limits::Policy::parse(
+                &matcher,
+                &key,
+                header.as_deref(),
+                &rate,
+                burst,
+            )
+            .map_err(|e| format!("{}: {what}: {e}", src.at(value.span())))?;
+            limits.insert(name.to_string(), policy);
+            wasmkeep_server::apps::limits::validate(&limits)
+                .map_err(|e| format!("{}: {e}", src.at(value.span())))?;
+        }
+    }
+
     let mut names = names.into_iter();
     Ok(Project {
         path: path.to_path_buf(),
@@ -551,6 +597,7 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
         name: names.next().unwrap_or_default(),
         front,
         classes,
+        limits,
         dev,
     })
 }
@@ -793,7 +840,9 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
         }),
         _ => None,
     };
-    Changes::whole(front, classes)
+    let mut changes = Changes::whole(front, classes);
+    changes.limits = Some(project.limits.clone());
+    changes
 }
 
 /// What a deploy from the file changes, printed before it switches
@@ -870,6 +919,64 @@ port = 9090
 data-dir = "state"
 env = ".env.dev"
 "#;
+
+    #[test]
+    fn ingress_limits_project_grammar() {
+        let base = "[app]\ntenant = \"acme\"\nname = \"shop\"\n[front]\ncomponent = \"f.wasm\"\n";
+        let good =
+            "[limits.login]\nmatch = \"POST /login\"\nkey = \"ip\"\nrate = \"5/s\"\nburst = 10\n";
+        assert!(parse_with(&format!("{base}{good}"), Path::new("wasmkeep.toml"), false).is_ok());
+        for bad in [
+            good.replace("5/s", "0/s"),
+            good.replace("POST", "post"),
+            good.replace("burst = 10", "burst = 0"),
+            good.replace("key = \"ip\"", "key = \"header\""),
+            format!("{good}typo = true\n"),
+        ] {
+            let e =
+                parse_with(&format!("{base}{bad}"), Path::new("wasmkeep.toml"), false).unwrap_err();
+            assert!(e.starts_with("wasmkeep.toml:"), "{e}");
+        }
+    }
+
+    #[test]
+    fn ingress_limits_are_canonical_and_shared_by_dev_and_deploy() {
+        let base = "[app]\ntenant='acme'\nname='shop'\n[front]\ncomponent='f.wasm'\n";
+        let rule = |name: &str| {
+            format!(
+                "[limits.{name}]\nmatch='/api/*'\nkey='header'\nheader='x-client-id'\nrate='60/m'\nburst=2\n"
+            )
+        };
+        let p = parse_ok(&format!("{base}{}{}", rule("z"), rule("a")));
+        let reversed = parse_ok(&format!("{base}{}{}", rule("a"), rule("z")));
+        assert_eq!(p.limits, reversed.limits);
+        let changes = to_changes(
+            &p,
+            Parts {
+                front: Some(vec![]),
+                classes: vec![],
+                config: Default::default(),
+            },
+        );
+        assert_eq!(changes.limits.as_ref(), Some(&p.limits));
+        assert_eq!(
+            p.limits.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a", "z"]
+        );
+        for text in [
+            format!("{base}{}{}", rule("a"), rule("a")),
+            format!("{base}{}header='x-other'\n", rule("a")),
+            format!("{base}{}", rule("INVALID")),
+            format!(
+                "{base}{}",
+                (0..33)
+                    .map(|i| rule(&format!("rule-{i}")))
+                    .collect::<String>()
+            ),
+        ] {
+            assert!(parse_with(&text, Path::new("wasmkeep.toml"), false).is_err());
+        }
+    }
 
     #[test]
     fn writes_is_a_class_key() {
