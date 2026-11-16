@@ -43,6 +43,12 @@ impl Histogram {
         self.sum_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    /// Observations so far.
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
     fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
         for (bound, bucket) in BUCKETS.iter().zip(&self.buckets) {
@@ -63,6 +69,98 @@ impl Histogram {
         let _ = writeln!(out, "{name}_count{} {count}", braces(labels));
     }
 }
+
+/// A cumulative-bucket histogram of counts (events, bytes), with fixed
+/// upper bounds.
+#[derive(Debug)]
+pub(crate) struct Counts {
+    bounds: &'static [u64],
+    buckets: Vec<AtomicU64>,
+    count: AtomicU64,
+    sum: AtomicU64,
+}
+
+impl Counts {
+    fn new(bounds: &'static [u64]) -> Self {
+        Self {
+            bounds,
+            buckets: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
+            count: AtomicU64::new(0),
+            sum: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn observe(&self, v: u64) {
+        for (bound, bucket) in self.bounds.iter().zip(&self.buckets) {
+            if v <= *bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(v, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String, name: &str) {
+        for (bound, bucket) in self.bounds.iter().zip(&self.buckets) {
+            let n = bucket.load(Ordering::Relaxed);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {n}");
+        }
+        let count = self.count.load(Ordering::Relaxed);
+        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
+        let _ = writeln!(out, "{name}_sum {}", self.sum.load(Ordering::Relaxed));
+        let _ = writeln!(out, "{name}_count {count}");
+    }
+}
+
+/// Events per batched segment: the bounds of `wasmkeep_segment_events`.
+const SEGMENT_EVENT_BOUNDS: &[u64] = &[1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000];
+/// Encoded bytes per batched segment: the bounds of
+/// `wasmkeep_segment_bytes`, 4 KiB to 256 MiB.
+const SEGMENT_BYTE_BOUNDS: &[u64] = &[
+    4_096,
+    16_384,
+    65_536,
+    262_144,
+    1_048_576,
+    4_194_304,
+    16_777_216,
+    67_108_864,
+    268_435_456,
+];
+
+/// [`Counts`] of events per segment, on [`SEGMENT_EVENT_BOUNDS`].
+#[derive(Debug)]
+pub(crate) struct SegmentEvents(Counts);
+/// [`Counts`] of bytes per segment, on [`SEGMENT_BYTE_BOUNDS`].
+#[derive(Debug)]
+pub(crate) struct SegmentBytes(Counts);
+
+impl Default for SegmentEvents {
+    fn default() -> Self {
+        Self(Counts::new(SEGMENT_EVENT_BOUNDS))
+    }
+}
+impl Default for SegmentBytes {
+    fn default() -> Self {
+        Self(Counts::new(SEGMENT_BYTE_BOUNDS))
+    }
+}
+impl std::ops::Deref for SegmentEvents {
+    type Target = Counts;
+    fn deref(&self) -> &Counts {
+        &self.0
+    }
+}
+impl std::ops::Deref for SegmentBytes {
+    type Target = Counts;
+    fn deref(&self) -> &Counts {
+        &self.0
+    }
+}
+
+/// Why a batched actor's next event waited (ADR 0034, section 3): the
+/// `reason` of `wasmkeep_batched_waits_total`.
+pub(crate) const BATCHED_WAIT_REASONS: [&str; 3] = ["age", "bytes", "budget"];
 
 /// Values keyed by their label set (rendered `k="v",...`, sorted).
 #[derive(Debug)]
@@ -280,6 +378,17 @@ pub(crate) struct Metrics {
     /// ([`PLAIN_DROP_REASONS`], ADR 0034, section 10). A strict hold never
     /// counts here.
     pub(crate) plain_events_dropped: Family<AtomicU64>,
+    /// The oldest uncaptured commit's age at each batched capture (ADR
+    /// 0034, section 16).
+    pub(crate) unsent_age_seconds: Histogram,
+    /// Events per batched segment.
+    pub(crate) segment_events: SegmentEvents,
+    /// Encoded bytes per batched segment.
+    pub(crate) segment_bytes: SegmentBytes,
+    /// The event-start rule acting, by `reason` ([`BATCHED_WAIT_REASONS`]).
+    pub(crate) batched_waits: Family<AtomicU64>,
+    /// How long a batched `flush` (or `exec-durable`'s flush) took.
+    pub(crate) flush_seconds: Histogram,
     /// Front requests (ADR 0023), by outcome (`ok`, `busy`,
     /// `unconfigured`, `cpu_budget`, `wall`, `guest_error`); rendered with
     /// the node's tenant and app.
@@ -397,6 +506,15 @@ pub fn plain_events_dropped_total() -> u64 {
     METRICS.plain_events_dropped.total()
 }
 
+/// The events `wasmkeep_plain_events_dropped_total` counted for `reason`
+/// in this process.
+pub fn plain_events_dropped_by(reason: &str) -> u64 {
+    METRICS
+        .plain_events_dropped
+        .get(&[("reason", reason)])
+        .load(Ordering::Relaxed)
+}
+
 /// Counts `n` events dropped for `reason`
 /// ([`Metrics::plain_events_dropped`]).
 pub(crate) fn plain_events_dropped(reason: &str, n: u64) {
@@ -446,7 +564,7 @@ pub(crate) const BUCKET_OPERATIONS: [&str; 8] = [
 /// `status` of `wasmkeep_bucket_requests_total`.
 pub(crate) const BUCKET_STATUSES: [&str; 4] = ["ok", "not_found", "precondition", "error"];
 /// `reason` of `wasmkeep_event_cuts_total`.
-pub(crate) const CUT_REASONS: [&str; 3] = ["wall", "lease", "replica"];
+pub(crate) const CUT_REASONS: [&str; 4] = ["wall", "lease", "replica", "stop"];
 /// `kind` of `wasmkeep_forwards_total`.
 pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
 /// `record` of `wasmkeep_signatures_refused_full_total`.
@@ -554,6 +672,7 @@ impl Metrics {
         );
         one(&m.parked_releases, "reason", &PARKED_RELEASE_REASONS);
         one(&m.plain_events_dropped, "reason", &PLAIN_DROP_REASONS);
+        one(&m.batched_waits, "reason", &BATCHED_WAIT_REASONS);
         one(&m.front_requests, "outcome", &FRONT_REQUEST_OUTCOMES);
         one(&m.front_calls, "outcome", &FRONT_CALL_OUTCOMES);
         m
@@ -945,6 +1064,48 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_plain_events_dropped_total",
         "Events whose writes were committed but not acknowledged when a batched hold ended without a flush, by reason.",
         &m.plain_events_dropped,
+    );
+    head(
+        &mut out,
+        "wasmkeep_unsent_age_seconds",
+        "histogram",
+        "The oldest uncaptured commit's age at each batched capture.",
+    );
+    m.unsent_age_seconds
+        .render(&mut out, "wasmkeep_unsent_age_seconds", "");
+    head(
+        &mut out,
+        "wasmkeep_segment_events",
+        "histogram",
+        "Events per batched segment.",
+    );
+    m.segment_events.render(&mut out, "wasmkeep_segment_events");
+    head(
+        &mut out,
+        "wasmkeep_segment_bytes",
+        "histogram",
+        "Encoded bytes per batched segment.",
+    );
+    m.segment_bytes.render(&mut out, "wasmkeep_segment_bytes");
+    family(
+        &mut out,
+        "wasmkeep_batched_waits_total",
+        "Times a batched actor's next event waited at the end of the one before, by reason (age, bytes, budget).",
+        &m.batched_waits,
+    );
+    head(
+        &mut out,
+        "wasmkeep_flush_seconds",
+        "histogram",
+        "How long a batched flush took.",
+    );
+    m.flush_seconds
+        .render(&mut out, "wasmkeep_flush_seconds", "");
+    gauge(
+        &mut out,
+        "wasmkeep_upload_budget_bytes_in_use",
+        "Bytes of the node's budget of batched segments in flight in use now.",
+        crate::actor::upload_budget_in_use(),
     );
     let app_family = |out: &mut String, name: &str, help: &str, f: &Family<AtomicU64>| {
         head(out, name, "counter", help);
@@ -1463,6 +1624,34 @@ mod tests {
             }
         }
         out
+    }
+
+    /// ADR 0034's section 16: the batched uploader's series are on the
+    /// page from the start, the waits' reasons seeded at 0, and what is
+    /// observed shows in them.
+    #[test]
+    fn the_batched_series_are_on_the_page() {
+        let m = Metrics::seeded();
+        m.unsent_age_seconds.observe(Duration::from_millis(30));
+        m.segment_events.observe(3);
+        m.segment_bytes.observe(5_000);
+        crate::metrics::inc(&m.batched_waits.get(&[("reason", "age")]));
+        m.flush_seconds.observe(Duration::from_millis(60));
+        let page = render_with(&m, Gauges::default(), &Identity::default());
+        for want in [
+            "wasmkeep_unsent_age_seconds_count 1",
+            "wasmkeep_segment_events_bucket{le=\"5\"} 1",
+            "wasmkeep_segment_events_count 1",
+            "wasmkeep_segment_bytes_bucket{le=\"16384\"} 1",
+            "wasmkeep_segment_bytes_sum 5000",
+            "wasmkeep_batched_waits_total{reason=\"age\"} 1",
+            "wasmkeep_batched_waits_total{reason=\"bytes\"} 0",
+            "wasmkeep_batched_waits_total{reason=\"budget\"} 0",
+            "wasmkeep_flush_seconds_count 1",
+            "# TYPE wasmkeep_upload_budget_bytes_in_use gauge",
+        ] {
+            assert!(page.contains(want), "{want}:\n{page}");
+        }
     }
 
     /// The label values seeded at 0 are the ones the code counts: a value

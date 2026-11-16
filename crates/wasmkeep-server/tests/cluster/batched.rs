@@ -939,3 +939,149 @@ async fn a_delete_retires_the_alarm_entry_it_ends() {
     })
     .await;
 }
+
+/// A clean stop with a healthy bucket flushes every batched actor before
+/// it releases: nothing is given up, and the next owner has every write
+/// (ADR 0034, section 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_stop_flushes_and_loses_nothing() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(400, Ordering::SeqCst);
+    for _ in 0..3 {
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    p.a.service.shutdown(Duration::from_secs(10)).await;
+    assert_eq!(wasmkeep_server::metrics::plain_events_dropped_total(), 0);
+    p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
+    let r = poll_get(p.b.addr, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "4", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
+/// A clean stop under a slow bucket gives up at its deadline: exactly the
+/// events not acknowledged (the segment in flight and the one behind it)
+/// are counted, as `stop`, the hold released, and the stop ends soon
+/// after its limit (ADR 0034, section 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_stop_behind_a_slow_bucket_gives_up_at_its_deadline() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(6_000, Ordering::SeqCst);
+    for _ in 0..2 {
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let started = std::time::Instant::now();
+    p.a.service.shutdown(Duration::from_secs(1)).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "the stop took {took:?}");
+    assert_eq!(wasmkeep_server::metrics::plain_events_dropped_by("stop"), 2);
+    assert_eq!(wasmkeep_server::metrics::plain_events_dropped_total(), 2);
+}
+
+/// A clean stop whose deadline comes while a batched actor runs an event
+/// cuts that event at the deadline, and counts what the actor had not
+/// acknowledged, as `stop`, before the node lets its actors go: an event
+/// in progress does not outlast the stop (ADR 0034, section 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_stop_cuts_a_running_batched_event_at_its_deadline() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_secs(5);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.delay_wal_ms.store(6_000, Ordering::SeqCst);
+    for _ in 0..2 {
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let addr = p.a.addr;
+    let running =
+        tokio::spawn(async move { send(addr, "POST", "/actor/t/x/sleep?ms=8000", "").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    p.a.service.shutdown(Duration::from_secs(1)).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "the stop took {took:?}");
+    assert_eq!(
+        wasmkeep_server::metrics::plain_events_dropped_by("stop"),
+        2,
+        "counted before the stop returned"
+    );
+    running.abort();
+}
+
+/// An actor acquired again after a hibernation keeps counting toward a
+/// snapshot by bytes: two events of 36 MiB, one before the hibernation and
+/// one after, make it due, though only a few segments were uploaded (ADR
+/// 0034, section 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_by_bytes_is_due_across_a_hibernation() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.mailbox.idle_timeout = Duration::from_millis(500);
+    })
+    .await;
+    warmed(&p).await;
+    let r = send(p.a.addr, "POST", "/actor/t/x/big?kb=36864&random", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "big"), "{}", r.body);
+    eventually("hibernated", async || p.a.service.resident() == 0).await;
+    let (before, _) = history(&p).await;
+    let r = send(p.a.addr, "POST", "/actor/t/x/big?kb=36864&random", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "big"), "{}", r.body);
+    eventually("a snapshot due by bytes", async || {
+        history(&p).await.0 > before
+    })
+    .await;
+}
+
+/// A caller of `actors.call` into a batched actor held by the event-start
+/// rule gets its answer when the callee sets it, as an HTTP client does:
+/// the wait is after the answer, in the callee's job. The callee's next
+/// event, a second call, starts only after that wait (ADR 0034, section 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_callee_answers_its_caller_and_holds_its_next_event() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_millis(100);
+    })
+    .await;
+    warmed(&p).await;
+    let r = send(p.a.addr, "POST", "/actor/t/y/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    p.flaky.delay_wal_ms.store(2_000, Ordering::SeqCst);
+    // y: a segment in flight, then a write behind it that ages.
+    for _ in 0..2 {
+        let r = send(p.a.addr, "POST", "/actor/t/y/plain", "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let call = "/actor/t/x/call?to=t/y&path=%2Fplain";
+    let started = std::time::Instant::now();
+    let r = send(p.a.addr, "POST", call, "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "200:4"), "{}", r.body);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "the answer waited for the callee's wait: {:?}",
+        started.elapsed()
+    );
+    let started = std::time::Instant::now();
+    let r = send(p.a.addr, "POST", call, "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "200:5"), "{}", r.body);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_000),
+        "the callee's next event started before its wait: {:?}",
+        started.elapsed()
+    );
+}

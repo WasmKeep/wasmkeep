@@ -389,6 +389,14 @@ struct DeployArgs {
     )]
     expire_after_idle: Vec<(String, Option<u64>)>,
 
+    /// How a class's plain writes reach the bucket, as CLASS=MODE: `strict`
+    /// (each event's writes before the next event, the default) or
+    /// `batched` (several events to a segment, ADR 0034; needs nodes built
+    /// with `batched-writes`). Part of the version; classes not named keep
+    /// theirs. Repeatable.
+    #[arg(long = "writes", value_name = "CLASS=MODE", value_parser = parse_writes)]
+    writes: Vec<(String, wasmkeep_server::apps::Writes)>,
+
     /// Deploy to an app deleted with `wasmkeep app delete`: its tombstone
     /// is removed first, only if nothing else of it is left in the bucket.
     #[arg(long, conflicts_with = "rollback")]
@@ -659,6 +667,14 @@ struct ServeArgs {
     #[arg(long, value_name = "N")]
     max_front_requests: Option<usize>,
 
+    /// How a class given with --actor writes, as CLASS=MODE: `strict` (the
+    /// default) or `batched` (ADR 0034; a node built with `batched-writes`
+    /// runs it batched in a cluster, any other runs it strict). Not with
+    /// --app: a deployed version names its classes' modes. Repeatable.
+    /// Hidden while batched writes need that build.
+    #[arg(long = "writes", value_name = "CLASS=MODE", value_parser = parse_writes, hide = true)]
+    writes: Vec<(String, wasmkeep_server::apps::Writes)>,
+
     /// How long a committed write of a batched class may wait unsent behind
     /// the segment in flight, in milliseconds, before its actor stops
     /// starting events (ADR 0034, section 3): 100 to 5000. Hidden while
@@ -894,6 +910,35 @@ fn parse_access(s: &str) -> Result<(String, String), String> {
 
 /// The `--access` rules, refusing one for a class that is not served (a
 /// typo would otherwise leave the class open).
+/// `serve --writes`: the batched classes among those `served` (given with
+/// --actor). Refused for a class not served, and with --app (`app`),
+/// whose version names its classes' modes.
+pub(crate) fn serve_batched(
+    writes: &[(String, wasmkeep_server::apps::Writes)],
+    served: &[&str],
+    app: bool,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    anyhow::ensure!(
+        writes.is_empty() || !app,
+        "--writes cannot be used with --app: the deployed version names each class's mode \
+         (wasmkeep deploy --writes CLASS=MODE)"
+    );
+    let mut out = std::collections::BTreeSet::new();
+    for (class, mode) in writes {
+        anyhow::ensure!(
+            served.contains(&class.as_str()),
+            "--writes {class}=...: no class {class} is served (classes: {})",
+            served.join(", ")
+        );
+        if *mode == wasmkeep_server::apps::Writes::Batched {
+            out.insert(class.clone());
+        } else {
+            out.remove(class);
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn access_rules(
     rules: &[(String, String)],
     served: &[&str],
@@ -1519,8 +1564,12 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // starting; its values reach it if a deploy brings it back.
         config.env = load_env(&args.env, &served, deployed_rules.is_none())?;
         match deployed_rules {
-            None => config.access = access_rules(&args.access, &served)?,
+            None => {
+                config.access = access_rules(&args.access, &served)?;
+                config.batched = serve_batched(&args.writes, &served, false)?;
+            }
             Some((marked, deployed)) => {
+                serve_batched(&args.writes, &served, true)?;
                 let (tenant, name) = args
                     .app
                     .as_ref()
@@ -1948,6 +1997,7 @@ fn version_flags(args: &DeployArgs) -> Vec<&'static str> {
         ("--front-config", args.front_config.is_some()),
         ("--front-requires", args.front_requires.is_some()),
         ("--expire-after-idle", !args.expire_after_idle.is_empty()),
+        ("--writes", !args.writes.is_empty()),
     ]
     .into_iter()
     .filter_map(|(flag, given)| given.then_some(flag))
@@ -2025,9 +2075,10 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 && !args.no_front
                 && args.front_config.is_none()
                 && args.front_requires.is_none()
-                && args.expire_after_idle.is_empty()),
+                && args.expire_after_idle.is_empty()
+                && args.writes.is_empty()),
             "nothing to deploy: give --actor, --access, --config, --requires, \
-             --expire-after-idle or a front flag (--front, --no-front, --front-config, \
+             --expire-after-idle, --writes or a front flag (--front, --no-front, --front-config, \
              --front-requires), or --rollback"
         );
         let runtime = Runtime::new(&RuntimeConfig::default())?;
@@ -2098,7 +2149,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 }
                 args.expire_after_idle.clone()
             },
-            writes: Vec::new(),
+            writes: {
+                let mut seen = std::collections::BTreeSet::new();
+                for (class, _) in &args.writes {
+                    anyhow::ensure!(seen.insert(class.clone()), "--writes names {class} twice");
+                }
+                args.writes.clone()
+            },
             every_rule: false,
         };
         rt.block_on(app_ref.deploy_changes(&runtime, changes))
@@ -2686,6 +2743,20 @@ fn parse_path(s: &str) -> Result<PathBuf, String> {
 
 /// `--expire-after-idle CLASS=DURATION` (ADR 0028): the limit in seconds,
 /// or `None` for `CLASS=` (removes it).
+/// `--writes CLASS=MODE` (ADR 0034, section 15).
+fn parse_writes(s: &str) -> Result<(String, wasmkeep_server::apps::Writes), String> {
+    let (class, mode) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected CLASS=MODE, got {s:?}"))?;
+    if class.is_empty() || class == FRONT_SCOPE {
+        return Err(format!("expected a class name in {s:?}"));
+    }
+    Ok((
+        class.to_owned(),
+        wasmkeep_server::apps::Writes::parse(mode)?,
+    ))
+}
+
 fn parse_expire(s: &str) -> Result<(String, Option<u64>), String> {
     let (class, limit) = s
         .split_once('=')

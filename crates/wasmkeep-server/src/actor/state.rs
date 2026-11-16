@@ -262,9 +262,7 @@ impl ActorState {
                     StepOutcome::GaveUp
                 }
                 None if stopping => {
-                    if let Some(hold) = self.held.take() {
-                        drop(hold.release(Barrier::GaveUp(Dropped::Stop)));
-                    }
+                    self.give_up_at_stop();
                     StepOutcome::GaveUp
                 }
                 None => StepOutcome::Keep,
@@ -275,7 +273,7 @@ impl ActorState {
     /// Whether the actor's database holds commits after its last boundary,
     /// read where it is now; `None` if it cannot tell (the connection is
     /// with database work cut short, or the read failed).
-    fn unmarked_commits(&self) -> Option<bool> {
+    pub(super) fn unmarked_commits(&self) -> Option<bool> {
         match (self.live.as_ref(), self.db.as_ref()) {
             (Some(live), _) => live
                 .store

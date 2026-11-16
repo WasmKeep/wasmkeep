@@ -80,6 +80,7 @@ pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};
 #[cfg(feature = "batched-writes")]
 pub use self::uploads::hold_node_upload_budget;
+pub(crate) use self::uploads::upload_budget_in_use;
 
 /// `--max-unsent-age`'s default and bounds (ADR 0034, section 3).
 pub(crate) const DEFAULT_UNSENT_AGE: Duration = Duration::from_millis(500);
@@ -516,6 +517,12 @@ impl ActorService {
         let started = tokio::time::Instant::now();
         let deadline = started + limit;
         let resident = self.inner.mailboxes.resident();
+        // Batched holds' events end at the deadline and their waits stop
+        // there, so the steps count what they drop before the releases
+        // below (ADR 0034, section 10).
+        if let Some(cluster) = &self.inner.cluster {
+            cluster.stop_by(deadline);
+        }
         self.inner.sockets.close_all(code, reason);
         self.inner.mailboxes.close_by(Some(deadline), flush);
         if !self
@@ -530,7 +537,9 @@ impl ActorService {
             // step is still running (never for a strict class, whose step
             // ends at once).
             let extra = tokio::time::Instant::now() + STOP_STEP_EXTRA;
-            while self.inner.mailboxes.steps_running() > 0 && tokio::time::Instant::now() < extra {
+            while (self.inner.mailboxes.steps_running() > 0 || self.inner.mailboxes.resident() > 0)
+                && tokio::time::Instant::now() < extra
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             tracing::warn!(

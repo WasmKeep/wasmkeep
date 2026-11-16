@@ -403,6 +403,9 @@ pub(crate) struct Cluster {
     /// Actors' waits after a periodic snapshot that failed: here, so they
     /// outlive an actor's time in memory.
     pub(crate) snapshot_waits: Arc<crate::replica::SnapshotWaits>,
+    /// A clean stop's deadline, once one began (ADR 0034, section 10):
+    /// batched holds' events are cut there, and their uploads stop waiting.
+    stop_by: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
     /// When a heartbeat last reached the bucket (ms since the epoch; 0:
     /// never), and how often one is sent: for readiness.
     heartbeat_ok_ms: std::sync::atomic::AtomicU64,
@@ -705,6 +708,7 @@ impl Cluster {
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,
             snapshot_waits: Arc::default(),
+            stop_by: tokio::sync::watch::Sender::new(None),
             heartbeat_ok_ms: std::sync::atomic::AtomicU64::new(0),
             heartbeat_every: config.heartbeat,
             heartbeat_landed: tokio::sync::Notify::new(),
@@ -794,6 +798,31 @@ impl Cluster {
             self.root.tenant(),
             "{address} is not of this node's tenant"
         );
+    }
+
+    /// A clean stop began, to end by `at` (ADR 0034, section 10).
+    pub(crate) fn stop_by(&self, at: tokio::time::Instant) {
+        self.stop_by.send_replace(Some(at));
+    }
+
+    /// The clean stop's deadline, if one began.
+    pub(crate) fn stop_deadline(&self) -> Option<tokio::time::Instant> {
+        *self.stop_by.borrow()
+    }
+
+    /// Resolves at a clean stop's deadline (never without one).
+    pub(crate) fn stop_reached(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut by = self.stop_by.subscribe();
+        async move {
+            let at = match by.wait_for(Option::is_some).await {
+                Ok(at) => *at,
+                Err(_) => None,
+            };
+            match at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        }
     }
 
     /// Lists an alarm of `address` due at `at` in the bucket's index, as

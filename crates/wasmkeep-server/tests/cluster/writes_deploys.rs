@@ -254,3 +254,45 @@ async fn a_component_a_live_node_cannot_link_is_refused() {
     );
     assert_eq!(app.current().await.unwrap().unwrap(), v3.current);
 }
+
+/// The plan's diff line for a class's mode of writes (ADR 0034, section
+/// 15): a kept class switched either way says so; an added batched class
+/// says its mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mode_change_is_a_line_of_the_plan() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = deploy_runtime();
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let deploy = async |writes: Vec<(String, Writes)>, wasm: Option<&[u8]>| {
+        app.deploy_changes(
+            &rt,
+            Changes {
+                classes: wasm.and_then(classes),
+                writes,
+                ..Changes::default()
+            },
+        )
+        .await
+    };
+    let first = deploy(vec![], Some(counter_wasm())).await.unwrap();
+    assert!(first.diff.writes.is_empty(), "{:?}", first.diff.writes);
+    let batched = deploy(vec![("c".into(), Writes::Batched)], None).await;
+    if !wasmkeep_server::apps::BATCHED_BUILT {
+        assert!(batched.is_err());
+        return;
+    }
+    let batched = batched.unwrap();
+    assert_eq!(batched.diff.writes, vec!["c: strict -> batched".to_owned()]);
+    assert!(
+        batched
+            .diff
+            .lines()
+            .contains(&"writes c: strict -> batched".to_owned()),
+        "{:?}",
+        batched.diff.lines()
+    );
+    let strict = deploy(vec![("c".into(), Writes::Strict)], None)
+        .await
+        .unwrap();
+    assert_eq!(strict.diff.writes, vec!["c: batched -> strict".to_owned()]);
+}

@@ -162,8 +162,12 @@ async fn a_capture_past_its_deadline_starts_nothing() {
                 restored(s).await;
                 let db = s.db.as_mut().unwrap();
                 db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
-                db.mark_boundary().unwrap().unwrap();
+                let b = db.mark_boundary().unwrap().unwrap();
                 let slot = s.batched_replica().unwrap();
+                slot.lock()
+                    .await
+                    .note_named_boundary(b, std::time::Instant::now(), None);
+                let samples = crate::metrics::METRICS.unsent_age_seconds.count();
                 let past = tokio::time::Instant::now();
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 let db = s.db.as_mut().unwrap();
@@ -175,6 +179,8 @@ async fn a_capture_past_its_deadline_starts_nothing() {
                 )
                 .await
                 .unwrap();
+                // No capture, no sample of the unsent age (section 16).
+                assert_eq!(crate::metrics::METRICS.unsent_age_seconds.count(), samples);
                 let idle = slot.lock().await.uploader_idle();
                 (
                     started,
@@ -231,4 +237,37 @@ async fn a_state_dropped_without_a_step_counts_its_unmarked_commits() {
         .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(after - before, 1, "the unmarked commit is counted");
     assert!(!cluster.is_parked(&address));
+}
+
+/// A flush to the barrier ends by its deadline even when what it waits on
+/// first does not answer (here the replica, held elsewhere): a clean
+/// stop's step never outlasts the stop (ADR 0034, section 10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_to_the_barrier_ends_by_its_deadline_whatever_it_waits_on() {
+    let f = fixture().await;
+    let address = ActorAddress::new("t", "c", "stuck").unwrap();
+    let took = f
+        .mailboxes
+        .submit(&address, |s: &mut ActorState| {
+            Box::pin(async move {
+                restored(s).await;
+                s.db.as_mut()
+                    .unwrap()
+                    .exec("INSERT INTO t VALUES (1)", &[])
+                    .unwrap();
+                let slot = s.batched_replica().unwrap();
+                let held = Arc::clone(&slot).lock_owned().await;
+                let started = tokio::time::Instant::now();
+                let barrier = s
+                    .flush_to_barrier(Some(started + Duration::from_millis(200)))
+                    .await;
+                drop(held);
+                (barrier, started.elapsed())
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(took.0, None);
+    assert!(took.1 < Duration::from_secs(2), "{:?}", took.1);
+    f.mailboxes.hibernate(&address);
 }

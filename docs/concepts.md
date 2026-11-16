@@ -252,6 +252,21 @@ Each actor owns one SQLite database. Nothing else can read or write it.
   `internal` means those writes are not known to be durable: fail the
   request. A component that imports it needs a node of the release that
   has it ([languages](languages.md#versions)).
+- **A class's mode of writes.** By default (`strict`) an event's plain
+  writes are uploaded before the actor's next event starts. A class
+  deployed with `writes = "batched"` (or `deploy --writes CLASS=batched`)
+  uploads them behind its events instead, several events to a segment,
+  so a busy actor runs at its own speed rather than its bucket's round
+  trip ([ADR 0034](adr/0034-batched-plain-writes.md)). It loses more when
+  its node dies: about the last one or two round trips of plain writes,
+  at most `--max-unsent-age` (500 ms) and an event after a stalled
+  bucket, and later events may have read and answered from them.
+  `exec-durable` and `flush` keep their guarantee and cost up to one more
+  round trip; their `internal` starting `not durable: still uploading`
+  means the wait ran out at the event's wall less one second while the
+  upload went on, the writes kept here. Batched writes run only on nodes
+  built with the `batched-writes` feature for now; a node without it runs
+  such a class strict.
 - A database is capped at 1 GB by default; past that, writes fail with
   `quota-exceeded` and reads still work.
 - Values (text and blobs) are capped at 16 MiB. Each `query` also has a

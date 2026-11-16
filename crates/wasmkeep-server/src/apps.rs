@@ -169,7 +169,7 @@ pub enum Writes {
     #[default]
     Strict,
     /// Opt in: plain writes are uploaded behind the events, one segment in
-    /// flight per actor. Not yet available: a deploy refuses it.
+    /// flight per actor. Only in a binary built with `batched-writes`.
     Batched,
 }
 
@@ -1872,6 +1872,10 @@ pub struct Diff {
     pub open_written: Vec<(String, bool)>,
     /// `"class: expire after idle never -> 7d"` and the like (ADR 0028).
     pub expire: Vec<String>,
+    /// `"class: strict -> batched"` and the like: a class's mode of writes
+    /// changed, or an added class's when it is not strict (ADR 0034,
+    /// section 15).
+    pub writes: Vec<String>,
 }
 
 impl Diff {
@@ -1987,6 +1991,23 @@ impl Diff {
                     |s| wasmkeep_cluster::expiry::format_idle(*s),
                 )
             };
+            let mode = |m: &Manifest| {
+                if m.batched.contains(class) {
+                    Writes::Batched
+                } else {
+                    Writes::Strict
+                }
+            };
+            let (wb, wa) = (mode(bm), mode(am));
+            if class != FRONT
+                && (wb != wa || (wa == Writes::Batched && !bm.classes.contains_key(class)))
+            {
+                diff.writes.push(if bm.classes.contains_key(class) {
+                    format!("{class}: {} -> {}", wb.as_str(), wa.as_str())
+                } else {
+                    format!("{class}: {}", wa.as_str())
+                });
+            }
             let (b, a) = (bm.expire.get(class), am.expire.get(class));
             if class != FRONT && a != b && (a.is_some() || bm.classes.contains_key(class)) {
                 diff.expire.push(format!(
@@ -2029,6 +2050,7 @@ impl Diff {
         out.extend(self.config.iter().map(|l| format!("config {l}")));
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
         out.extend(self.expire.iter().cloned());
+        out.extend(self.writes.iter().map(|l| format!("writes {l}")));
         out.extend(
             self.open_past_front.iter().map(|c| {
                 format!("class {c}: open, reachable at /actor/{c}/<name>, past the front")

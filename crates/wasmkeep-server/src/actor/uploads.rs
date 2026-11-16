@@ -26,6 +26,13 @@ use wasmkeep_storage::wal::WalBoundary;
 /// The node's budget of batched segments in flight (ADR 0034, section 2).
 static NODE_BUDGET: LazyLock<UploadBudget> = LazyLock::new(UploadBudget::node);
 
+/// The bytes of the node's budget of batched segments in flight in use
+/// now: `wasmkeep_upload_budget_bytes_in_use` (ADR 0034, section 16).
+pub(crate) fn upload_budget_in_use() -> usize {
+    let budget = LazyLock::force(&NODE_BUDGET);
+    usize::try_from(budget.total().saturating_sub(budget.available())).unwrap_or(usize::MAX)
+}
+
 /// Takes the whole node budget of batched uploads until the guard is
 /// dropped, as a node whose budget is full: for tests, in a binary built
 /// with `batched-writes`.
@@ -254,7 +261,17 @@ pub(super) async fn pump(
     // Waits for room in FIFO order, the actor held meanwhile (ADR 0034,
     // section 3, rule 3, applied at once rather than past the age bound),
     // the replica free for the completions and the deadline kept.
+    // When the oldest commit this capture would take was marked: its age
+    // is sampled once the capture is handed off, budget wait included.
+    let oldest = replica.oldest_unsent();
     drop(replica);
+    if NODE_BUDGET.available() < NODE_BUDGET.charge(plan.boundary.estimated_bytes) {
+        crate::metrics::inc(
+            &crate::metrics::METRICS
+                .batched_waits
+                .get(&[("reason", "budget")]),
+        );
+    }
     let reserve = NODE_BUDGET.reserve(plan.boundary.estimated_bytes);
     let permit = match deadline {
         Some(at) => tokio::select! {
@@ -311,7 +328,13 @@ pub(super) async fn pump(
         None => hand_off.await?,
     };
     match handed {
-        Some(Ok(_)) => {}
+        Some(Ok(_)) => {
+            if let Some(at) = oldest {
+                crate::metrics::METRICS
+                    .unsent_age_seconds
+                    .observe(at.elapsed());
+            }
+        }
         Some(Err(e)) => return Err(e.to_string()),
         // Unreachable: a closed database has no plan.
         None => return Err("no database to capture from".into()),
@@ -330,8 +353,12 @@ async fn hold_at_event_end(
     db: &mut DbAt<'_>,
     completion: &Completion,
     max_unsent: Duration,
+    stop: Option<tokio::time::Instant>,
 ) -> Result<(), String> {
     loop {
+        if stop.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            return Ok(());
+        }
         let (oversize, old, idle, landed) = {
             let r = slot.lock().await;
             (
@@ -348,8 +375,14 @@ async fn hold_at_event_end(
         if !(oversize || old || full || pressure) {
             return Ok(());
         }
+        let reason = if old { "age" } else { "bytes" };
+        crate::metrics::inc(
+            &crate::metrics::METRICS
+                .batched_waits
+                .get(&[("reason", reason)]),
+        );
         if idle {
-            pump(slot, db, Some(completion), None).await?;
+            pump(slot, db, Some(completion), stop).await?;
             if slot.lock().await.uploader_idle() {
                 // Nothing left to capture: relieve the WAL if it asks.
                 if pressure {
@@ -359,8 +392,14 @@ async fn hold_at_event_end(
             }
             continue;
         }
-        landed.await;
-        pump(slot, db, Some(completion), None).await?;
+        match stop {
+            Some(at) => tokio::select! {
+                () = landed => {}
+                () = tokio::time::sleep_until(at) => return Ok(()),
+            },
+            None => landed.await,
+        }
+        pump(slot, db, Some(completion), stop).await?;
     }
 }
 
@@ -479,7 +518,8 @@ impl ActorState {
                 return;
             };
             let completion = self.completion();
-            let pumped = pump(&slot, &mut self.db_at(), Some(&completion), None).await;
+            let stop = self.stop_deadline();
+            let pumped = pump(&slot, &mut self.db_at(), Some(&completion), stop).await;
             if let Err(e) = pumped {
                 self.abandon(&e);
             }
@@ -493,15 +533,21 @@ impl ActorState {
     pub(super) async fn replicate_batched(&mut self, slot: SharedReplica) {
         let completion = self.completion();
         let max_unsent = self.limits.max_unsent_age;
+        // A clean stop's deadline bounds every wait here: past it the
+        // step before the drop gives up, counting what is left (section 10).
+        let stop = self.stop_deadline();
         let mut db = self.db_at();
         let done = async {
             mark(&slot, &mut db).await?;
-            pump(&slot, &mut db, Some(&completion), None).await?;
-            hold_at_event_end(&slot, &mut db, &completion, max_unsent).await
+            pump(&slot, &mut db, Some(&completion), stop).await?;
+            hold_at_event_end(&slot, &mut db, &completion, max_unsent, stop).await
         }
         .await;
         if let Err(e) = done {
             self.abandon(&e);
+            return;
+        }
+        if stop.is_some() {
             return;
         }
         // A periodic snapshot is asked for only here, in the mailbox gap
@@ -577,17 +623,42 @@ impl ActorState {
         let Some(slot) = self.batched_replica() else {
             return Some(hold.barrier());
         };
-        // A job that skips `prepare` (a hand-over, a delete, an alarm) may
-        // find capture ended by a step before a drop that an event cut
-        // short: enabled again first, as before an event.
-        if let Err(e) = self.ensure_batched_capture().await {
-            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "batched capture could not start");
-            return Some(Barrier::GaveUp(Dropped::Failure));
+        // Every wait of the flush, the database work a cut event left
+        // running and the replica's lock included, ends by the deadline:
+        // each is cancel-safe, so what it did not finish stays pending and
+        // is counted where the hold ends.
+        let flushed = async {
+            // A job that skips `prepare` (a hand-over, a delete, an alarm)
+            // may find capture ended by a step before a drop that an event
+            // cut short: enabled again first, as before an event.
+            if let Err(e) = self.ensure_batched_capture().await {
+                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "batched capture could not start");
+                return Some(Barrier::GaveUp(Dropped::Failure));
+            }
+            // No completion jobs: the step before a drop applies them
+            // itself, and a job it posted would cut it short (the mailbox
+            // serves a job that arrives during the step first).
+            to_barrier(&slot, &mut self.db_at(), None, deadline).await
+        };
+        match deadline {
+            Some(at) => tokio::time::timeout_at(at, flushed).await.unwrap_or(None),
+            None => flushed.await,
         }
-        // No completion jobs: the step before a drop applies them itself,
-        // and a job it posted would cut it short (the mailbox serves a job
-        // that arrives during the step first).
-        to_barrier(&slot, &mut self.db_at(), None, deadline).await
+    }
+
+    /// A clean stop's deadline, if one began on this node.
+    pub(super) fn stop_deadline(&self) -> Option<tokio::time::Instant> {
+        self.held.as_ref()?.lease().stop_deadline()
+    }
+
+    /// A clean stop's deadline passed with the hold not flushed: it ends
+    /// given up, counted `stop` with the commits after its last boundary
+    /// (ADR 0034, section 10).
+    pub(super) fn give_up_at_stop(&mut self) {
+        let unmarked = self.unmarked_commits();
+        if let Some(hold) = self.held.take() {
+            hold.drop_now_with(Dropped::Stop, u64::from(unmarked != Some(false)));
+        }
     }
 
     /// One upload's budget from now: the deadline of a hibernation's flush

@@ -14,6 +14,9 @@ pub(super) enum Cut {
     Lease,
     /// An asynchronous batched upload failed during this event.
     Replica,
+    /// A clean stop reached its deadline during a batched hold's event
+    /// (ADR 0034, section 10).
+    Stop,
 }
 
 impl std::fmt::Display for Cut {
@@ -21,6 +24,7 @@ impl std::fmt::Display for Cut {
         match self {
             Self::Wall(d) => write!(f, "exceeded the {d:?} wall-clock limit"),
             Self::Replica => f.write_str("stopped: replication stopped"),
+            Self::Stop => f.write_str("stopped: the node's clean stop reached its deadline"),
             Self::Lease => f.write_str("stopped: this node's lease on the actor ran out"),
         }
     }
@@ -35,12 +39,35 @@ pub(super) async fn limit<F: std::future::Future>(
     f: F,
 ) -> Result<F::Output, Cut> {
     let expiry = held.map(|h| h.lease().expiry());
-    let flag = match held.filter(|h| h.writes() == crate::apps::Writes::Batched) {
+    let batched = held.filter(|h| h.writes() == crate::apps::Writes::Batched);
+    let flag = match batched {
         Some(h) => match h.replica() {
             Some(r) => Some(r.lock().await.failure_flag()),
             None => None,
         },
         None => None,
+    };
+    // A batched hold's event ends at a clean stop's deadline, so the stop
+    // counts what it drops before the node lets its actors go; a strict
+    // one runs on as before (ADR 0034, section 10).
+    let stop = batched.map(|h| h.lease().stop_reached());
+    let stopping = async move {
+        match stop {
+            Some(s) => s.await,
+            None => std::future::pending().await,
+        }
+    };
+    let cut = |reason: &str| {
+        crate::metrics::inc(&crate::metrics::METRICS.cuts.get(&[("reason", reason)]));
+    };
+    let f = async move {
+        tokio::select! {
+            r = f => Ok(r),
+            () = stopping => {
+                cut("stop");
+                Err(Cut::Stop)
+            }
+        }
     };
     let lease_gone = async move {
         match expiry {
@@ -48,7 +75,7 @@ pub(super) async fn limit<F: std::future::Future>(
             None => std::future::pending().await,
         }
     };
-    limit_with_failure(wall, lease_gone, flag, f).await
+    limit_with_failure(wall, lease_gone, flag, f).await?
 }
 
 async fn limit_with_failure<F: std::future::Future>(
@@ -411,14 +438,18 @@ impl ActorHost {
             Some(b) => (b.flush_until, Some(b.completion.clone())),
             None => (tokio::time::Instant::now(), None),
         };
-        uploads::flush_through(
+        let started = std::time::Instant::now();
+        let flushed = uploads::flush_through(
             &slot,
             &mut uploads::DbAt::Host(self),
             completion.as_ref(),
             until,
         )
-        .await
-        .map_err(|e| e.to_sql())
+        .await;
+        crate::metrics::METRICS
+            .flush_seconds
+            .observe(started.elapsed());
+        flushed.map_err(|e| e.to_sql())
     }
 
     /// The batched hold's replica, if the running event's hold is batched.

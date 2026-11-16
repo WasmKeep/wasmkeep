@@ -342,13 +342,14 @@ knob it never acts. With a slower one the actor runs `knob` worth of
 events per round trip and waits for the rest; a stalled bucket stops
 the actor's events after `knob`, as strict stops them at once.
 
-The wait at an event's end is inside the job, so whoever awaits the
-job's answer waits too: a caller of `actors.call` and the job of a
-socket message get their answer only once the job returns (`submit`
-awaits the job's reply, `mailbox.rs:188-195`; that the reply is sent
-only after `finish` is inferred from the job wrapping `finish`, and is
-checked by a test). The answer to the guest's caller is set before
-that wait; a waiting caller inherits only the delay.
+The wait at an event's end is inside the job, after the answer. An HTTP
+client and a caller of `actors.call` get the answer when the guest sets
+it (the response is forwarded as soon as it is set, `state.rs`'s
+`request`), so neither waits for the rule; the callee's next event, from
+whoever sends it, starts only after the wait. (As first written, this
+paragraph inferred that a caller of `actors.call` waits for the job's
+end; the S12 test `a_held_callee_answers_its_caller_and_holds_its_next_event`
+showed it does not, as it does not for a strict upload either.)
 
 **The loss bound.** When a node dies, or a batched actor's hold ends
 without a flush (section 6), what is lost is the segment in flight and
@@ -1211,7 +1212,9 @@ vacuously.
   for a `Flushed` barrier, at most one upload budget of delay, nothing
   given up.
 - A caller of `actors.call` into a batched actor held by the
-  event-start rule waits for the end of the event, not only its answer.
+  event-start rule gets its answer when the callee sets it, as an HTTP
+  client does; the callee's next event starts only after the wait
+  (section 3, as corrected in S12).
 - A strict class behaves as 0.4.2 (the existing replication tests, run on
   a strict class, and the golden trace).
 - `flush` inside a transaction, on a single node, with nothing pending,
@@ -1348,3 +1351,22 @@ its call) flush first since S9. ADR 0033's restore of one actor is not
 built yet; `ship_reset`'s guard refuses it with a segment in flight, and
 it is to flush first when it is. The model checks that a snapshot over
 uncaptured commits is caught (`SnapshotUncaptured`).
+
+**As built in S12 (2026-11-16).** The clean stop flushes every resident
+batched actor in its step before the drop. Its deadline bounds the rest:
+a batched hold's event still running then is cut (`Cut::Stop`), queued
+events after it are cut at once, the waits at their ends and of the step
+stop there, and the step gives up, counting `stop` what was not
+acknowledged, commits after the last boundary included. The node lease
+is released after a short extra wait (0.5 s) for those steps; an actor
+whose database work does not return within it is let go by that release
+uncounted, its writes lost as on a node's death (tests: a clean stop with
+a healthy and with a slow bucket, and one cutting a running event). The section 16 metrics are on the metrics page. `deploy
+--writes CLASS=MODE` sets a class's mode, and the plan prints a
+`writes CLASS: strict -> batched` line; `serve --writes` sets it for
+classes given with `--actor` (hidden while the flag is needed). The docs
+listed below describe batched classes as needing nodes built with
+`batched-writes`. The flag stays: removing it waits for the soak with
+both modes (`SOAK_WRITES=batched bench/soak.sh` builds the binary with
+the feature and starts the nodes with `--writes t=batched`; the default
+runs strict), and for the docs to state the loss bound from its data.

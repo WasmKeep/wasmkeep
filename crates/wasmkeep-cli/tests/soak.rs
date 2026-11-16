@@ -168,6 +168,9 @@ enum Nodes {
         metrics: Vec<Option<SocketAddr>>,
         kill: String,
         start: String,
+        /// Killed by this run and not started again yet: started on drop,
+        /// so an interrupted run leaves no node of the fleet down.
+        down: Vec<bool>,
     },
 }
 
@@ -181,7 +184,10 @@ impl Nodes {
                 metrics,
                 children,
             } => children[i] = Some(start(NODES[i], addr, metrics[i], dir, wasm, bucket)),
-            Nodes::Remote { start, .. } => run(start, NODES[i]),
+            Nodes::Remote { start, down, .. } => {
+                run(start, NODES[i]);
+                down[i] = false;
+            }
         }
     }
 
@@ -194,7 +200,10 @@ impl Nodes {
                     let _ = child.wait();
                 }
             }
-            Nodes::Remote { kill, .. } => run(kill, NODES[i]),
+            Nodes::Remote { kill, down, .. } => {
+                down[i] = true;
+                run(kill, NODES[i]);
+            }
         }
     }
 
@@ -208,10 +217,21 @@ impl Nodes {
 
 impl Drop for Nodes {
     fn drop(&mut self) {
-        if let Nodes::Local { children, .. } = self {
-            for child in children.iter_mut().flatten() {
-                let _ = child.kill();
-                let _ = child.wait();
+        match self {
+            Nodes::Local { children, .. } => {
+                for child in children.iter_mut().flatten() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            // Never leave a fleet node down, even on a failed run.
+            Nodes::Remote { start, down, .. } => {
+                for (i, d) in down.iter().enumerate() {
+                    if *d {
+                        let command = start.replace("{id}", NODES[i]);
+                        let _ = Command::new("sh").args(["-c", &command]).status();
+                    }
+                }
             }
         }
     }
@@ -274,11 +294,55 @@ fn start(
         // measured here.
         .args(["--cluster-plaintext", "accept"])
         .args(["--metrics-listen", &metrics.to_string()])
+        // `WASMKEEP_SOAK_WRITES=batched`: the class's plain writes batched
+        // (ADR 0034), in a binary built with `batched-writes`.
+        .args(soak_writes())
         .env("RUST_LOG", "wasmkeep_server=info")
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .spawn()
         .unwrap()
+}
+
+/// A batched run checks that its nodes run the class batched: plain writes
+/// through every node make batched segments (`wasmkeep_segment_events`)
+/// on their metrics pages. Refused otherwise: results labelled batched
+/// must be batched.
+fn check_batched(addrs: &[SocketAddr], nodes: &Nodes) {
+    let segments = || -> f64 {
+        (0..NODES.len())
+            .filter_map(|i| nodes.metrics(i))
+            .filter_map(|m| send(m, "GET", "/metrics"))
+            .filter_map(|(_, _, page)| {
+                page.lines()
+                    .find_map(|l| l.strip_prefix("wasmkeep_segment_events_count "))
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
+            .sum()
+    };
+    let before = segments();
+    for (i, addr) in addrs.iter().enumerate() {
+        let _ = send(*addr, "POST", &actor_path(i, "/plain"));
+    }
+    let started = Instant::now();
+    while segments() <= before {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "WASMKEEP_SOAK_WRITES=batched, but the nodes upload no batched segment: \
+             are they built with batched-writes and started with --writes t=batched?"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// `serve --writes t=batched` when `WASMKEEP_SOAK_WRITES=batched`, nothing
+/// for `strict` (the default).
+fn soak_writes() -> Vec<String> {
+    match std::env::var("WASMKEEP_SOAK_WRITES").as_deref() {
+        Ok("batched") => vec!["--writes".into(), "t=batched".into()],
+        Ok("strict") | Err(_) => Vec::new(),
+        Ok(other) => panic!("WASMKEEP_SOAK_WRITES={other}: strict or batched"),
+    }
 }
 
 /// (status, x-wasmkeep-node, body); `None` if the node does not answer.
@@ -442,10 +506,19 @@ fn three_nodes_against_a_real_bucket() {
             || vec![None; NODES.len()],
             |m| m.into_iter().map(Some).collect(),
         );
+        // A batched run on remote nodes is checked on them below: their
+        // metrics must show batched segments (their mode cannot be set
+        // from here).
+        assert!(
+            soak_writes().is_empty() || metrics.iter().all(Option::is_some),
+            "WASMKEEP_SOAK_WRITES=batched with WASMKEEP_SOAK_NODES needs WASMKEEP_SOAK_METRICS, \
+             to check that the nodes run the class batched"
+        );
         let nodes = Nodes::Remote {
             metrics,
             kill: var("WASMKEEP_SOAK_KILL"),
             start: var("WASMKEEP_SOAK_START"),
+            down: vec![false; NODES.len()],
         };
         (addrs, nodes)
     } else {
@@ -479,6 +552,9 @@ fn three_nodes_against_a_real_bucket() {
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+    if !soak_writes().is_empty() {
+        check_batched(&addrs, &nodes);
     }
     let live: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(vec![true; NODES.len()]));
     let shared = Arc::new(Mutex::new(Shared::default()));

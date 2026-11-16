@@ -1164,6 +1164,11 @@ impl Ticket {
             std::sync::atomic::Ordering::Relaxed,
         );
         let post_apply = changes.post_apply;
+        let m = &crate::metrics::METRICS;
+        m.segment_events
+            .observe(u64::try_from(got.boundaries).unwrap_or(u64::MAX));
+        m.segment_bytes
+            .observe(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let Some(permit) = self.permit.take() else {
             return Err(self.fail("a ticket without its budget permit".into()));
         };

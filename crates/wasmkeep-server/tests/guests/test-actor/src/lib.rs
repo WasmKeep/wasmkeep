@@ -428,6 +428,23 @@ impl http::Guest for TestActor {
             (Method::Get, "/plain") => get("plain").to_string(),
             // One event writing `kb` KiB at once: over a batched segment's
             // cap when large (ADR 0034, section 2).
+            // `random`: bytes that do not compress, so a segment's encoded
+            // size is about the write's.
+            (Method::Post, "/big") if query_param(&full, "random").is_some() => {
+                // In rows of 256 KiB, under the value limit, in one event.
+                let mut answer = "big".to_owned();
+                for i in 0..(num("kb") / 256).max(1) {
+                    if let Err(e) = storage::exec(
+                        "INSERT INTO config (key, value) VALUES (?, randomblob(262144))
+                         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                        &[Value::Text(format!("big{i}"))],
+                    ) {
+                        answer = format!("err:{:?}", e.kind);
+                        break;
+                    }
+                }
+                answer
+            }
             (Method::Post, "/big") => {
                 let blob = vec![0x41; usize::try_from(num("kb")).unwrap_or(0) * 1024];
                 match storage::exec(
