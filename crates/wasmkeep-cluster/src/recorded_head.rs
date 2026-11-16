@@ -299,6 +299,11 @@ mod tests {
         };
         assert_eq!(free.encode(), b"wasmkeep-owner 1\n- -\n9\n");
         assert_eq!(OwnerRecord::decode(&free.encode()), Some(free));
+        // Version 1 keeps its historical, lenient parsing.
+        assert_eq!(
+            OwnerRecord::decode(b"wasmkeep-owner 1\n \n4\n").map(|r| r.holder),
+            Some(Some((String::new(), String::new())))
+        );
     }
 
     #[test]
@@ -347,6 +352,16 @@ mod tests {
             "n i x\n42\nhead 41 187 09abcdef01234567\nset-at 42\ncomplete\nidle-since -\n",
             "n -\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
             "- i\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            // Holder tokens: empty, whitespace or control characters
+            // (review of slice 1).
+            " \n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            "n \n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            " i\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            "n\ti i\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            "n i\t\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            "n i\u{7}\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            "n\u{a0}x i\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
+            "n i\u{85}\n42\nunknown\nset-at 0\nlower-bound\nidle-since -\n",
             "",
         ];
         for tail in bad {

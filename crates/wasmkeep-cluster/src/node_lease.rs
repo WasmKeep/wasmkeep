@@ -789,7 +789,7 @@ impl OwnerRecord {
                 recorded: None,
             });
         }
-        if (id == "-") != (instance == "-") || instance.contains(' ') {
+        if (id == "-") != (instance == "-") || !holder_token(id) || !holder_token(instance) {
             return None;
         }
         let generation = crate::recorded_head::number(lines.next()?)?;
@@ -805,6 +805,13 @@ impl OwnerRecord {
         // Strict: no extra, missing or non-canonical bytes.
         (record.encode() == body).then_some(record)
     }
+}
+
+/// A version 2 holder token (node id or instance, or `-`): nonempty, with
+/// no whitespace or control character. Version 1 keeps its historical,
+/// lenient parsing.
+fn holder_token(t: &str) -> bool {
+    !t.is_empty() && !t.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// What an ownership key holds: a record of either version, or the

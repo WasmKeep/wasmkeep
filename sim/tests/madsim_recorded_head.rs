@@ -14,11 +14,13 @@
 //! acknowledgement that succeeded, no acknowledgement succeeds after the
 //! end, and an acknowledgement whose validity check came before a lapse
 //! is either in the frozen head or refused (never a successful reply with
-//! a head the release does not carry). Every seed must race the end
-//! against an upload in flight, so a pass is not vacuous.
+//! a head the release does not carry). At least nine seeds in ten must
+//! end with an upload in flight (all of them do at 200 seeds), so a pass
+//! is not vacuous.
 //!
 //! Broken variant: acknowledging outside the cell (check validity, await,
-//! then advance a copy the end does not see) must be caught.
+//! then advance a copy the end does not see) must be caught on at least
+//! one seed in ten (the race is narrow: about one in six at 200 seeds).
 //!
 //! Not covered here (see the ADR's remaining cases): the per-key registry
 //! of frozen heads an acquisition combines, the demotion transition, and
@@ -215,7 +217,7 @@ fn the_frozen_head_covers_every_acknowledgement() {
         raced += u64::from(o.raced);
     }
     eprintln!("{} seeds: {raced} ends met an upload in flight", seeds());
-    let floor = (seeds() / 4).max(1);
+    let floor = (seeds() * 9 / 10).max(1);
     assert!(
         raced >= floor,
         "{raced} ends met an upload in flight, want {floor}"
