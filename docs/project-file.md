@@ -109,8 +109,17 @@ burst = 15
 | `rate` | Positive decimal integer followed by `/s`, `/m` or `/h`, at most 1,000,000 tokens per period. |
 | `burst` | Integer from 1 to 1,000,000: initial and maximum tokens. |
 
-Matching is case-sensitive and uses the encoded path as received: `/a%2Fb`
-is different from `/a/b`. A missing method matches any method. A header
+Matching is case-sensitive, excludes the query, decodes unreserved percent
+escapes, canonicalizes remaining escape hex to uppercase, and collapses repeated
+slashes. Exact rules ignore trailing slashes. A `GET` rule also covers `HEAD`;
+a `HEAD` rule covers only `HEAD`. Actor names use the router's full percent
+and UTF-8 decoding, then canonical percent encoding to preserve segment boundaries.
+Other reserved escapes stay encoded: the paths in `https://example.test/a%2Fb`
+and `https://example.test/a/b` differ. Prefix rules retain their final slash;
+a prefix covers that slash and descendants, not the path without the slash. This normalization is only for policy matching; it does not rewrite
+the URI delivered to routing or guest code.
+
+A missing method matches any method. A header
 key must occur once and contain 1–256 non-whitespace printable ASCII
 bytes; missing, duplicate or invalid values return 400. Unknown fields
 and duplicate definitions fail with a source position.
@@ -121,7 +130,8 @@ clients should wait at least that long. Direct `/actor/` requests and
 WebSocket handshakes are covered; frames are not charged. Internal
 forwarding is authenticated and does not consume another allowance.
 
-IP keys use the TCP peer only. Forwarding headers are never used as IP
+IP keys use the TCP peer only, with IPv6 aggregated to 64-bit subnet prefixes and IPv4-mapped
+IPv6 using the IPv4 key. Forwarding headers are never used as IP
 identity. There is no trusted-proxy IP configuration in this release: a
 proxy shares one peer quota. A header key supplied by an edge must be
 removed from incoming requests and overwritten at that edge, with direct
@@ -134,6 +144,45 @@ rule clamp retained available tokens to the new burst. Renaming or
 removing a rule discards its old budget. Nonempty policies require manifest
 format 6 and `rate_limits` on every live app reader; deploy and rollback
 refuse older readers. See [ADR 0036](adr/0036-per-node-ingress-rate-limits.md).
+
+Each live app service receives an equal reserved share of the 65,536-bucket
+process budget, capped at 4,096 buckets per service (including services without
+policies in the share count). Creating or dropping a service rebalances shares;
+shrinking a share evicts its least recently used buckets. Under request pressure,
+an ordered LRU index evicts even partially depleted buckets from that app only,
+without scanning or refilling unrelated buckets. Rejected quota attempts count as
+uses. Evicted identities get a fresh burst if they return, so rotating keys can
+weaken enforcement; these are bounded admission controls, not durable quotas.
+If an admission needs more simultaneous rule buckets than its app share, it
+returns 429 with `Retry-After: 1` and the capacity outcome.
+
+Every forwarded public request or WebSocket handshake carries a domain-separated,
+single-use signed receipt, even when the forwarder has no policy. The owner trusts
+the forwarder's admission decision, including absence of a policy during deploy
+skew. Receipts have a separate 500,000-entry replay store, independent of actor-call
+and control signatures. A receipt never grants actor privileges. A failed signing
+attempt, invalid/expired/replayed receipt, full receipt store, or unsigned forward
+claim with an app header returns 503 on a policy-enforcing public ingress path,
+instead of charging the forwarder's IP. Client-supplied receipts are stripped
+before forwarding and replaced with the node's proof. Mutual-TLS cluster-port
+traffic bypasses public admission. Already-spent internal call signatures return
+403 before body reads in plaintext mode; fresh signatures still undergo body and
+atomic replay checks before actor work. Concurrent copies arriving before that
+spend are stopped by the later atomic check, not by the early read-only check.
+
+Offline or later-joining older binaries are not protected by the live-reader
+check: they may treat format 6 as corrupt and serve without limits. Before
+enabling policies, stop and upgrade every node, including offline nodes;
+prevent an older binary from rejoining. Fail-closed handling of undecodable
+manifests is a guarantee of rate-limit-aware binaries only.
+
+With neither current nor pending policies, ingress admission returns immediately:
+it does not change response ordering, capture a front snapshot, or increment rate
+counters. Bucket read errors do not invent pending policies; corrupt manifests do.
+The metrics endpoint still registers `wasmkeep_rate_limit_requests_total` and
+`wasmkeep_rate_limit_active_keys` even when no policy exists, plus the `ingress`
+record label in `wasmkeep_signatures_refused_full_total`. These metrics are the
+intentional exception to no-policy compatibility.
 
 ### `[dev]` (optional, `wasmkeep dev` only)
 

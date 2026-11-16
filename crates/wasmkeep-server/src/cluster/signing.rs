@@ -155,6 +155,11 @@ impl SeenSignatures {
         }
     }
 
+    pub(super) fn used(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {
+        let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        ts.saturating_add(SIGNATURE_WINDOW_MS) < seen.horizon.max(now) || seen.macs.contains(&mac)
+    }
+
     /// Records `mac`, signed at `ts`; false if it was already used (or the
     /// record is full).
     pub(super) fn first_use(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {

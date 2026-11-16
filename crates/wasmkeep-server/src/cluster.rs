@@ -336,6 +336,7 @@ pub(crate) struct Cluster {
     serves: String,
     /// Node signatures already accepted (replay protection).
     seen: SeenSignatures,
+    seen_admission: SeenSignatures,
     /// The same for take and alarm hand-off calls (ADR 0014, 0017), kept
     /// apart: a flood of other signed calls that fills `seen` cannot
     /// refuse the calls a drain and a move depend on.
@@ -670,6 +671,7 @@ impl Cluster {
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
             seen: SeenSignatures::named("calls"),
+            seen_admission: SeenSignatures::named("ingress"),
             seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
@@ -1109,12 +1111,7 @@ impl Cluster {
             let Ok(mut out) = out else {
                 return unavailable("bad advertised address\n");
             };
-            if req
-                .extensions()
-                .get::<crate::http::RateAdmitted>()
-                .is_some()
-                && self.sign_admission(owner, &path, &mut out).await.is_err()
-            {
+            if self.sign_admission(owner, &path, &mut out).await.is_err() {
                 return unavailable("cannot authenticate ingress admission; retry\n");
             }
             if front && let Err(e) = self.sign_hand_off(owner, &path, &mut out).await {
@@ -1338,6 +1335,12 @@ impl Cluster {
                 None
             }
         }
+    }
+
+    /// Read-only early replay check; body verification still spends the
+    /// signature later, so a bad-body copy cannot burn the legitimate call.
+    pub(crate) fn admission_replayed(&self, signed: &Signed, control: bool) -> bool {
+        self.record(control).used(signed.mac, signed.ts, now_ms())
     }
 
     /// Records a signature whose body matched; false if it was already used.
@@ -2258,12 +2261,7 @@ impl Cluster {
             Ok(app) => req.headers_mut().insert(APP, app),
             Err(_) => return unavailable("cannot forward this request\n"),
         };
-        if req
-            .extensions()
-            .get::<crate::http::RateAdmitted>()
-            .is_some()
-            && self.sign_admission(owner, &path, &mut req).await.is_err()
-        {
+        if self.sign_admission(owner, &path, &mut req).await.is_err() {
             return unavailable("cannot authenticate ingress admission; retry\n");
         }
         crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "request")]));

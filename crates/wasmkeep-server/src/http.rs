@@ -152,10 +152,6 @@ pub(crate) struct OriginalPath(pub(crate) String);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PeerAddress(pub(crate) std::net::SocketAddr);
 
-/// A public request admitted locally; propagated only with host proof.
-#[derive(Clone, Copy)]
-pub(crate) struct RateAdmitted;
-
 /// `/actor/<class>/<name><rest>` split into its parts; `name` percent-decoded,
 /// `rest` (path and query) is what the actor sees, `/` at least.
 #[derive(Debug, PartialEq, Eq)]

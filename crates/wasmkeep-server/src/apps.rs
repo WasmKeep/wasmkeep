@@ -822,6 +822,14 @@ impl AppRef {
     /// name objects and lines, never a configuration value.
     pub async fn version(&self, version: &str) -> Result<Version, DeployError> {
         let manifest = self.manifest(version).await?;
+        self.version_from_manifest(version, &manifest).await
+    }
+
+    async fn version_from_manifest(
+        &self,
+        version: &str,
+        manifest: &Manifest,
+    ) -> Result<Version, DeployError> {
         let mut classes = Vec::new();
         for (class, digest) in &manifest.classes {
             let key = format!("{version}/{class}.wasm");
@@ -834,7 +842,7 @@ impl AppRef {
             }
             classes.push((class.clone(), bytes));
         }
-        let (access, mut config) = self.settings(version, &manifest).await?;
+        let (access, mut config) = self.settings(version, manifest).await?;
         let mut requires = manifest.requires.clone();
         let front = match &manifest.front {
             Some(digest) => {
@@ -1567,8 +1575,18 @@ impl AppRef {
         if current.seq <= service.deploy_seq() {
             return Ok(false);
         }
-        // Until decoded, a version may contain policies this node cannot apply.
-        service.set_rate_limits_pending(true);
+        let manifest = match self.manifest(&current.version).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if matches!(error, DeployError::Corrupt(_)) {
+                    service.set_rate_limits_pending(true);
+                }
+                return Err(error);
+            }
+        };
+        // Remember decoded policies before fetching any components. A bucket
+        // outage alone is not evidence of a policy; a decoded policy is.
+        service.set_rate_limits_pending(!manifest.limits.is_empty());
         let Version {
             classes,
             access,
@@ -1578,8 +1596,9 @@ impl AppRef {
             batched,
             limits,
             front,
-        } = self.version(&current.version).await?;
-        service.set_rate_limits_pending(!limits.is_empty());
+        } = self
+            .version_from_manifest(&current.version, &manifest)
+            .await?;
         // Everything compiled first, then swapped in at once with the
         // sequence, the rules and the values: a node that cannot build a
         // version keeps the previous one whole, and no event sees part of

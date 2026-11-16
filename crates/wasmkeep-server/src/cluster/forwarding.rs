@@ -71,6 +71,7 @@ pub(super) enum Framing {
 /// [`Framing::Keep`], the [`FRAMING`] headers stay, even when `Connection`
 /// names them.
 pub(super) fn strip_hop_by_hop(headers: &mut hyper::HeaderMap, framing: Framing) {
+    headers.remove(ADMITTED);
     let named: Vec<hyper::header::HeaderName> = headers
         .get_all(hyper::header::CONNECTION)
         .iter()
@@ -202,7 +203,7 @@ pub(crate) fn never_forward<B>(req: &Request<B>) -> bool {
 // A separate domain from actor calls: this receipt grants only rate admission,
 // never Caller::Actor/Front or access to an internal class. Its payload is the
 // empty digest, not a claim that a streamed request body has been authenticated.
-const ADMITTED: &str = "x-wasmkeep-admitted";
+pub(crate) const ADMITTED: &str = "x-wasmkeep-admitted";
 impl Cluster {
     pub(super) async fn sign_admission<B>(
         &self,
@@ -261,15 +262,38 @@ impl Cluster {
         ) else {
             return false;
         };
-        // The existing replay store is process-bounded. A full store refuses
-        // exemption; the ordinary public admission policy then applies.
-        signed.body == body_sha256(b"") && self.first_use(&signed, false)
+        // Receipts cannot consume the actor-call or control replay budget.
+        signed.body == body_sha256(b"")
+            && self
+                .seen_admission
+                .first_use(signed.mac, signed.ts, now_ms())
     }
 }
 
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+    #[test]
+    fn review_forward_headers_strip_client_receipt() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(ADMITTED, "forged".parse().unwrap());
+        strip_hop_by_hop(&mut h, Framing::Keep);
+        assert!(!h.contains_key(ADMITTED));
+    }
+    #[tokio::test]
+    async fn review_receipts_do_not_fill_call_replay_store() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert!(cluster.admission_received(&req));
+        assert_eq!(cluster.seen.len(), 0);
+    }
     #[tokio::test]
     async fn ingress_receipts_are_single_use_and_never_actor_credentials() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());

@@ -117,11 +117,15 @@ impl Policy {
         })
     }
     pub(crate) fn matches(&self, method: &str, path: &str) -> bool {
-        self.method.as_deref().is_none_or(|m| m == method)
+        let path = match_path(path);
+        let rule = match_path(&self.path);
+        self.method
+            .as_deref()
+            .is_none_or(|m| m == method || (m == "GET" && method == "HEAD"))
             && if self.prefix {
-                path.starts_with(&self.path)
+                path.starts_with(&rule)
             } else {
-                path == self.path
+                path.trim_end_matches('/') == rule.trim_end_matches('/')
             }
     }
     pub(crate) fn line(&self, name: &str) -> String {
@@ -171,6 +175,47 @@ impl Policy {
         Some((p[1].into(), policy))
     }
 }
+/// Matching only: routing and the guest-visible URI are not rewritten.
+fn match_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        out.push('/');
+        let mut normalized = String::with_capacity(segment.len());
+        let bytes = segment.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && let Some(hex) = segment.get(i + 1..i + 3)
+                && let Ok(b) = u8::from_str_radix(hex, 16)
+            {
+                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    normalized.push(char::from(b));
+                } else {
+                    normalized.push_str(&format!("%{b:02X}"));
+                }
+                i += 3;
+            } else {
+                // URI paths and policy paths are ASCII.
+                normalized.push(char::from(bytes[i]));
+                i += 1;
+            }
+        }
+        // Actor routing decodes the entire name, including reserved bytes
+        // and UTF-8. Re-encode to preserve the name/path segment boundary.
+        if out.starts_with("/actor/")
+            && out.bytes().filter(|b| *b == b'/').count() == 3
+            && let Some(name) = crate::http::percent_decode(segment)
+        {
+            normalized = crate::cluster::percent_encode(&name);
+        }
+        out.push_str(&normalized);
+    }
+    if path.ends_with('/') || out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
 pub fn validate(policies: &Policies) -> Result<(), String> {
     if policies.len() > MAX_POLICIES {
         return Err("at most 32 limit policies per app".into());
@@ -184,6 +229,17 @@ pub fn validate(policies: &Policies) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_matching_closes_route_aliases() {
+        let p = Policy::parse("GET /login", "ip", None, "1/h", 1).unwrap();
+        for path in ["/login/", "//login", "/%6Cogin"] {
+            assert!(p.matches("HEAD", path), "{path}");
+        }
+        let p = Policy::parse("/actor/chat/abc", "ip", None, "1/h", 1).unwrap();
+        assert!(p.matches("GET", "/actor/chat/a%62c"));
+        let p = Policy::parse("/actor/chat/a%2Fb", "ip", None, "1/h", 1).unwrap();
+        assert!(p.matches("GET", "/actor/chat/a%2fb"));
+    }
     #[test]
     fn matching_is_encoded_and_method_sensitive() {
         let p = Policy::parse("POST /api/*", "ip", None, "1/m", 1).unwrap();

@@ -285,6 +285,12 @@ async fn ingress_limits_and_front_values_share_a_snapshot_during_deploy_and_roll
                         accepted += 1;
                     }
                     400 => {}
+                    // The bounded front runtime may be busy while old
+                    // snapshots finish during repeated publication. This is
+                    // retryable overload, not a policy/front mismatch.
+                    503 if response.body == "this node is busy; retry\n" => {
+                        tokio::task::yield_now().await;
+                    }
                     status => panic!("unexpected {status}: {}", response.body),
                 }
             }
@@ -338,4 +344,216 @@ async fn ingress_limits_fail_closed_when_a_new_manifest_cannot_be_read() {
         assert_eq!(r.status, 503);
         assert_eq!(r.retry_after.as_deref(), Some("1"));
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn review_forwarder_without_policy_does_not_spend_owner_quota() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store, policy("/actor/*", "ip")).await;
+    let da = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let a = super::front_deploys::front_app_node("review-a", da.path(), &store, None).await;
+    let b = super::front_deploys::front_app_node("review-b", db.path(), &store, None).await;
+    let path = "/actor/t/skew/durable";
+    assert_eq!(send_runnable(a.addr, "GET", path, "").await.status, 200);
+    // Simulate a forwarder still on a version without policies. Its follow
+    // loop sees no newer sequence and leaves this local snapshot alone.
+    b.service
+        .apply_deployed(
+            b.service.deploy_seq(),
+            &[(
+                "t".into(),
+                b.service.runtime().compile(test_actor_wasm()).unwrap(),
+                test_actor_wasm().to_vec(),
+            )],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            &Policies::new(),
+        )
+        .unwrap();
+    for _ in 0..2 {
+        let r = send_reachable(b.addr, "GET", path, "").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn review_used_internal_signature_is_refused_before_body_read() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store, policy("/actor/t/replay/durable", "ip")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = super::front_deploys::front_app_node("review-replay", dir.path(), &store, None).await;
+    assert_eq!(
+        send_runnable(a.addr, "GET", "/actor/t/replay/fired", "")
+            .await
+            .status,
+        200
+    );
+    let secret = store
+        .get(&"cluster/secret".into())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let secret = std::str::from_utf8(&secret).unwrap().trim();
+    let ts = now_ms();
+    let path = "/actor/t/replay/durable";
+    let hash = sha256_hex(b"");
+    let msg = format!(
+        "wasmkeep-call v4\n{ts}\nabc\nreview-replay\nPOST\n{path}\n{hash}\nx-wasmkeep-app:default/shop\n"
+    );
+    let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
+    let headers = format!(
+        "x-wasmkeep-internal: v4 {ts} abc {hash} {mac}\r\nx-wasmkeep-app: default/shop\r\n"
+    );
+    let first = send(a.addr, "POST", path, &headers).await;
+    // In the TLS suite, signatures on the public port do not grant bypass.
+    // First arrival still burns this signature, so a replay cannot bypass.
+    assert_eq!(first.status, 200, "{}", first.body);
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\nExpect: 100-continue\r\n{headers}Connection: close\r\n\r\n"
+    );
+    let replay = tokio::time::timeout(Duration::from_secs(2), exchange(a.addr, &request))
+        .await
+        .expect("replayed signature waited for a body");
+    assert!(
+        matches!(replay.status, 403 | 429),
+        "{} {}",
+        replay.status,
+        replay.body
+    );
+}
+
+#[derive(Debug)]
+struct ManifestOutage(Arc<dyn ObjectStore>, &'static str);
+impl std::fmt::Display for ManifestOutage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "manifest-outage")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for ManifestOutage {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        b: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.0.put_opts(p, b, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if p.as_ref().ends_with(self.1) {
+            return Err(object_store::Error::Generic {
+                store: "outage",
+                source: "temporary read failure".into(),
+            });
+        }
+        self.0.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.0.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.0.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &object_store::path::Path,
+        b: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(a, b, o).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn review_manifest_outage_does_not_invent_pending_policy() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = deploy(&store, Policies::new()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let node =
+        super::front_deploys::front_app_node("review-outage", dir.path(), &store, None).await;
+    // Its real follow loop sees the current sequence as applied; only our
+    // fault-injected reader attempts a newer version.
+    node.service.set_deploy_seq(0);
+    let faulty = AppRef::new(
+        Arc::new(ManifestOutage(store.clone(), "/manifest")),
+        "",
+        "default",
+        "shop",
+    );
+    assert!(matches!(
+        faulty.update(&node.service).await,
+        Err(wasmkeep_server::apps::DeployError::Bucket(_))
+    ));
+    node.service
+        .set_deploy_seq(app.current().await.unwrap().unwrap().seq);
+    node.service.set_deploy_behind(true);
+    let r = send(node.addr, "GET", "/self", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn review_decoded_policy_survives_component_outage() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store, policy("/*", "ip")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ActorConfig::new(dir.path());
+    config.app = "shop".into();
+    let service = ActorService::new(rate_runtime(), config, vec![]).unwrap();
+    let faulty = AppRef::new(
+        Arc::new(ManifestOutage(store, ".wasm")),
+        "",
+        "default",
+        "shop",
+    );
+    assert!(matches!(
+        faulty.update(&service).await,
+        Err(wasmkeep_server::apps::DeployError::Bucket(_))
+    ));
+    service.set_deploy_behind(true);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    tokio::spawn(wasmkeep_server::serve(
+        listener,
+        wasmkeep_server::App {
+            front: None,
+            actors: Some(service),
+        },
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    assert_eq!(send(addr, "GET", "/missing", "").await.status, 503);
+    drop(stop);
 }

@@ -1,9 +1,9 @@
 //! Bounded, node-local ingress admission (ADR 0036).
 use crate::apps::limits::{Policies, Policy};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{
-    Mutex,
+    Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicUsize, Ordering},
 };
 #[cfg(test)]
@@ -26,19 +26,53 @@ struct Bucket {
     policy: Policy,
     credit: u128,
     at: Instant,
+    used: u64,
 }
 
+type Key = (String, [u8; 32]);
+#[derive(Debug, Default)]
+struct Table {
+    buckets: HashMap<Key, Bucket>,
+    lru: BTreeSet<(u64, Key)>,
+    clock: u64,
+    cap: usize,
+    requested: usize,
+}
+impl Table {
+    fn evict(&mut self) {
+        if let Some((_, key)) = self.lru.pop_first() {
+            self.buckets.remove(&key);
+            KEYS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    fn touch(&mut self, key: &Key) {
+        if let Some(b) = self.buckets.get_mut(key) {
+            self.lru.remove(&(b.used, key.clone()));
+            self.clock += 1;
+            b.used = self.clock;
+            self.lru.insert((b.used, key.clone()));
+        }
+    }
+}
+static TABLES: LazyLock<Mutex<Vec<Weak<Mutex<Table>>>>> = LazyLock::new(Mutex::default);
+fn rebalance(tables: &mut Vec<Weak<Mutex<Table>>>) {
+    tables.retain(|t| t.strong_count() > 0);
+    let share = PROCESS_KEYS / tables.len().max(1);
+    for table in tables.iter().filter_map(Weak::upgrade) {
+        let mut t = table.lock().unwrap_or_else(|p| p.into_inner());
+        t.cap = t.requested.min(share);
+        while t.buckets.len() > t.cap {
+            t.evict();
+        }
+    }
+}
 #[derive(Debug)]
 pub(crate) struct Limiter {
-    buckets: Mutex<HashMap<(String, [u8; 32]), Bucket>>,
-    cap: usize,
+    buckets: Arc<Mutex<Table>>,
 }
 impl Default for Limiter {
     fn default() -> Self {
-        Self {
-            buckets: Mutex::default(),
-            cap: APP_KEYS,
-        }
+        Self::with_cap(APP_KEYS)
     }
 }
 impl Bucket {
@@ -64,23 +98,36 @@ impl Bucket {
 }
 impl Drop for Limiter {
     fn drop(&mut self) {
-        let n = self
-            .buckets
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .len();
-        KEYS.fetch_sub(n, Ordering::Relaxed);
+        let mut tables = TABLES.lock().unwrap_or_else(|p| p.into_inner());
+        tables.retain(|t| !t.ptr_eq(&Arc::downgrade(&self.buckets)));
+        {
+            let mut t = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+            KEYS.fetch_sub(t.buckets.len(), Ordering::Relaxed);
+            t.buckets.clear();
+            t.lru.clear();
+        }
+        rebalance(&mut tables);
     }
 }
 pub(crate) fn active_keys() -> usize {
     KEYS.load(Ordering::Relaxed)
 }
 impl Limiter {
+    fn with_cap(cap: usize) -> Self {
+        let buckets = Arc::new(Mutex::new(Table {
+            requested: cap,
+            ..Table::default()
+        }));
+        let mut tables = TABLES.lock().unwrap_or_else(|p| p.into_inner());
+        tables.push(Arc::downgrade(&buckets));
+        rebalance(&mut tables);
+        Self { buckets }
+    }
     /// Reconcile at publication, even if no requests arrive between edits.
     pub(crate) fn reconcile(&self, policies: &Policies, now: Instant) {
         let mut buckets = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
-        let before = buckets.len();
-        buckets.retain(|(name, _), b| {
+        let before = buckets.buckets.len();
+        buckets.buckets.retain(|(name, _), b| {
             if let Some(policy) = policies.get(name) {
                 b.update(policy, now);
                 true
@@ -88,7 +135,12 @@ impl Limiter {
                 false
             }
         });
-        KEYS.fetch_sub(before - buckets.len(), Ordering::Relaxed);
+        KEYS.fetch_sub(before - buckets.buckets.len(), Ordering::Relaxed);
+        buckets.lru = buckets
+            .buckets
+            .iter()
+            .map(|(k, b)| (b.used, k.clone()))
+            .collect();
     }
     pub(crate) fn admit(
         &self,
@@ -116,7 +168,17 @@ impl Limiter {
                 }
                 Sha256::digest(value).into()
             } else {
-                Sha256::digest(peer.ok_or(Rejection::InvalidKey)?.to_string().as_bytes()).into()
+                let peer = match peer.ok_or(Rejection::InvalidKey)? {
+                    std::net::IpAddr::V6(ip) => {
+                        if let Some(v4) = ip.to_ipv4_mapped() {
+                            v4.into()
+                        } else {
+                            std::net::Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64)).into()
+                        }
+                    }
+                    ip => ip,
+                };
+                Sha256::digest(peer.to_string().as_bytes()).into()
             };
             matched.push(((name.clone(), digest), policy));
         }
@@ -126,35 +188,19 @@ impl Limiter {
         let mut buckets = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
         let missing = matched
             .iter()
-            .filter(|(key, _)| !buckets.contains_key(key))
+            .filter(|(key, _)| !buckets.buckets.contains_key(key))
             .count();
-        if missing > 0
-            && (buckets.len() + missing > self.cap
-                || KEYS.load(Ordering::Relaxed) + missing > PROCESS_KEYS)
-        {
-            let before = buckets.len();
-            buckets.retain(|key, b| {
-                b.refill(now);
-                matched.iter().any(|(k, _)| k == key)
-                    || b.credit < u128::from(b.policy.burst) * b.unit()
-            });
-            KEYS.fetch_sub(before - buckets.len(), Ordering::Relaxed);
-        }
-        if buckets.len() + missing > self.cap {
+        if matched.len() > buckets.cap {
             return Err(Rejection::Capacity);
         }
-        // Reserve atomically across app instances; a failed admission retains no new keys.
-        if KEYS
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                n.checked_add(missing).filter(|v| *v <= PROCESS_KEYS)
-            })
-            .is_err()
-        {
-            return Err(Rejection::Capacity);
+        // Protect this request's existing buckets, and record rejected accesses
+        // as uses too. Pressure only pops the LRU index, never refills a table.
+        for (key, _) in &matched {
+            buckets.touch(key);
         }
         let mut retry = 0;
         for (key, policy) in &matched {
-            if let Some(b) = buckets.get_mut(key) {
+            if let Some(b) = buckets.buckets.get_mut(key) {
                 b.update(policy, now);
                 if b.credit < b.unit() {
                     let nanos = (b.unit() - b.credit).div_ceil(u128::from(policy.rate));
@@ -163,16 +209,24 @@ impl Limiter {
             }
         }
         if retry > 0 {
-            KEYS.fetch_sub(missing, Ordering::Relaxed);
             return Err(Rejection::Quota(retry));
         }
+        while buckets.buckets.len() + missing > buckets.cap {
+            buckets.evict();
+        }
+        KEYS.fetch_add(missing, Ordering::Relaxed);
         for (key, policy) in matched {
-            let b = buckets.entry(key).or_insert_with(|| Bucket {
-                policy: policy.clone(),
-                credit: u128::from(policy.burst) * u128::from(policy.seconds) * 1_000_000_000,
-                at: now,
-            });
+            let b = buckets
+                .buckets
+                .entry(key.clone())
+                .or_insert_with(|| Bucket {
+                    policy: policy.clone(),
+                    credit: u128::from(policy.burst) * u128::from(policy.seconds) * 1_000_000_000,
+                    at: now,
+                    used: 0,
+                });
             b.credit -= b.unit();
+            buckets.touch(&key);
         }
         Ok(())
     }
@@ -197,6 +251,73 @@ mod tests {
             Some(std::net::Ipv4Addr::new(127, 0, 0, ip).into()),
             n,
         )
+    }
+    #[test]
+    fn review_ipv6_subnet_shares_quota() {
+        let l = Limiter::default();
+        let p = rules("1/h", 1);
+        let n = Instant::now();
+        for (ip, expected) in [
+            ("2001:db8::1", Ok(())),
+            ("2001:db8::2", Err(Rejection::Quota(3600))),
+        ] {
+            assert_eq!(
+                l.admit(
+                    &p,
+                    "POST",
+                    "/api/login",
+                    &http::HeaderMap::new(),
+                    Some(ip.parse().unwrap()),
+                    n
+                ),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn review_pressure_evicts_lru_without_refilling_survivors() {
+        let l = Limiter::with_cap(2);
+        let p = rules("1/h", 1);
+        let n = Instant::now();
+        assert_eq!(admit(&l, &p, n, 1), Ok(()));
+        assert_eq!(admit(&l, &p, n, 2), Ok(()));
+        assert_eq!(admit(&l, &p, n + Duration::from_secs(1), 3), Ok(()));
+        let buckets = l.buckets.lock().unwrap();
+        // Pressure must not refill or visit unrelated surviving buckets.
+        let key: [u8; 32] = Sha256::digest(b"127.0.0.2").into();
+        assert_eq!(buckets.buckets.get(&("login".into(), key)).unwrap().at, n);
+    }
+    #[test]
+    fn review_capacity_does_not_refill_unrelated_buckets() {
+        let l = Limiter::with_cap(2);
+        let p = rules("1/h", 1);
+        let n = Instant::now();
+        assert_eq!(admit(&l, &p, n, 1), Ok(()));
+        assert_eq!(admit(&l, &p, n, 2), Ok(()));
+        let _ = admit(&l, &p, n + Duration::from_secs(1), 3);
+        let buckets = l.buckets.lock().unwrap();
+        let key: [u8; 32] = Sha256::digest(b"127.0.0.2").into();
+        assert_eq!(buckets.buckets.get(&("login".into(), key)).unwrap().at, n);
+    }
+    #[test]
+    fn review_apps_have_reserved_capacity() {
+        let apps: Vec<_> = (0..17).map(|_| Limiter::default()).collect();
+        let p = rules("1/h", 1);
+        let n = Instant::now();
+        for l in &apps[..16] {
+            for ip in 0..4096u32 {
+                let _ = l.admit(
+                    &p,
+                    "POST",
+                    "/api/login",
+                    &http::HeaderMap::new(),
+                    Some(std::net::Ipv4Addr::from(ip).into()),
+                    n,
+                );
+            }
+        }
+        assert_eq!(admit(&apps[16], &p, n, 1), Ok(()));
+        assert!(active_keys() <= PROCESS_KEYS);
     }
     #[test]
     fn fractional_refill_and_rounded_retry() {
@@ -230,17 +351,14 @@ mod tests {
         assert_eq!(admit(&l, &p, n, 1), Err(Rejection::Quota(1)));
     }
     #[test]
-    fn capacity_never_evicts_depleted_keys() {
-        let l = Limiter {
-            cap: 2,
-            buckets: Mutex::default(),
-        };
+    fn capacity_evicts_least_recently_used_keys() {
+        let l = Limiter::with_cap(2);
         let p = rules("1/s", 1);
         let n = Instant::now();
         assert_eq!(admit(&l, &p, n, 1), Ok(()));
         assert_eq!(admit(&l, &p, n, 2), Ok(()));
-        assert_eq!(admit(&l, &p, n, 3), Err(Rejection::Capacity));
-        assert_eq!(admit(&l, &p, n, 1), Err(Rejection::Quota(1)));
+        assert_eq!(admit(&l, &p, n, 3), Ok(()));
+        assert_eq!(admit(&l, &p, n, 2), Err(Rejection::Quota(1)));
         assert_eq!(admit(&l, &p, n + Duration::from_secs(1), 3), Ok(()));
     }
     #[test]
@@ -256,10 +374,7 @@ mod tests {
     }
     #[test]
     fn high_cardinality_headers_stay_bounded_and_private() {
-        let l = Limiter {
-            cap: 16,
-            buckets: Mutex::default(),
-        };
+        let l = Limiter::with_cap(16);
         let p: Policies = [(
             "api".into(),
             Policy::parse("/*", "header", Some("x-client-id"), "1/h", 1).unwrap(),
@@ -273,17 +388,10 @@ mod tests {
                 format!("private-client-{i}").parse().unwrap(),
             );
             let result = l.admit(&p, "GET", "/", &h, None, n);
-            assert_eq!(
-                result,
-                if i < 16 {
-                    Ok(())
-                } else {
-                    Err(Rejection::Capacity)
-                }
-            );
+            assert_eq!(result, Ok(()));
         }
         let buckets = l.buckets.lock().unwrap();
-        assert_eq!(buckets.len(), 16);
+        assert_eq!(buckets.buckets.len(), 16);
         assert!(!format!("{buckets:?}").contains("private-client"));
     }
 

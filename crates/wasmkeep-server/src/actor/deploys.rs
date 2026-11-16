@@ -294,6 +294,14 @@ impl ActorService {
         use hyper::StatusCode;
         let _classes = read_lock(&self.inner.classes);
         let limits = read_lock(&self.inner.limits);
+        if limits.is_empty()
+            && !self
+                .inner
+                .rate_limits_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
         let policy_behind = self
             .inner
             .deploy_behind
@@ -324,18 +332,38 @@ impl ActorService {
                 "this node cannot serve the app now; retry\n",
             ));
         }
-        let authenticated = !limits.is_empty()
-            && self.inner.cluster.as_ref().is_some_and(|cluster| {
-                cluster.admission_received(req)
-                    || cluster
-                        .is_internal(
-                            req.method(),
-                            req.uri().path_and_query().map_or("/", |p| p.as_str()),
-                            req.headers(),
-                            false,
-                        )
-                        .is_some()
-            });
+        let mut authenticated = false;
+        if let Some(cluster) = &self.inner.cluster {
+            if let Some(signed) = cluster.is_internal(
+                req.method(),
+                req.uri().path_and_query().map_or("/", |p| p.as_str()),
+                req.headers(),
+                false,
+            ) {
+                let control = req.headers().contains_key(crate::cluster::TAKE)
+                    || req.headers().contains_key(crate::cluster::ALARM_HANDOFF);
+                if cluster.admission_replayed(&signed, control) {
+                    return Some(text_response(
+                        StatusCode::FORBIDDEN,
+                        "signature already used\n",
+                    ));
+                }
+                authenticated = true;
+            }
+            if !authenticated {
+                authenticated = cluster.admission_received(req);
+                // Do not collapse forwarded clients into the forwarder's IP.
+                if !authenticated
+                    && (req.headers().contains_key(crate::cluster::ADMITTED)
+                        || (req.headers().contains_key(crate::cluster::FORWARDED)
+                            && req.headers().contains_key(crate::cluster::APP)))
+                {
+                    return Some(crate::cluster::unavailable(
+                        "cannot authenticate ingress admission; retry\n",
+                    ));
+                }
+            }
+        }
         if !limits.is_empty() && !authenticated {
             let result = self.inner.rate_limiter.admit(
                 &limits,
@@ -367,9 +395,6 @@ impl ActorService {
                 );
                 return Some(response);
             }
-        }
-        if !limits.is_empty() && !authenticated {
-            req.extensions_mut().insert(crate::http::RateAdmitted);
         }
         req.extensions_mut().insert(crate::front::IngressFront(
             read_lock(&self.inner.front).clone(),
@@ -522,5 +547,34 @@ impl ActorService {
             }
             (None, _) => deployed.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_review_tests {
+    use super::*;
+    #[tokio::test]
+    async fn review_no_policy_skips_admission_and_front_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ActorService::new(
+            Runtime::new(&Default::default()).unwrap(),
+            ActorConfig::new(dir.path()),
+            vec![],
+        )
+        .unwrap();
+        service.set_secrets_blocked(true);
+        service.set_deploy_behind(true);
+        let mut req = hyper::Request::get("/missing").body(()).unwrap();
+        assert!(service.admit_ingress(&mut req).is_none());
+        assert!(
+            req.extensions()
+                .get::<crate::front::IngressFront>()
+                .is_none()
+        );
+        service
+            .inner
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(service.admit_ingress(&mut req).is_none());
     }
 }
