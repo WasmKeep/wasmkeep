@@ -1016,6 +1016,7 @@ async fn socket_caps_refuse_and_release_local_and_relay_sessions() {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let make = |limit| {
         move |c: &mut ActorConfig| {
+            c.websocket_close_wait = Duration::from_millis(500);
             c.socket_limits.per_actor = 2;
             c.socket_budget = wasmkeep_server::SocketBudget::new(limit, limit);
         }

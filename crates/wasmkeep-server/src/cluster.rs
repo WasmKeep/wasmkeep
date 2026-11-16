@@ -1067,6 +1067,7 @@ impl Cluster {
         req: Request<B>,
         opener: crate::websocket::Opener,
         permit: crate::socket_limits::SessionPermit,
+        close_wait: Duration,
     ) -> Response<HyperOutgoingBody> {
         if never_forward(&req) {
             return unavailable("actor ownership is changing; retry\n");
@@ -1192,7 +1193,7 @@ impl Cluster {
                 hyper_util::rt::TokioIo::new(owner_side),
                 revoked,
             );
-            relay_until_eof(&mut client, &mut owner_side).await;
+            relay_until_eof(&mut client, &mut owner_side, close_wait).await;
         });
         let mut switching = text_response(StatusCode::SWITCHING_PROTOCOLS, "");
         *switching.headers_mut() = headers;
@@ -2395,23 +2396,41 @@ mod tests;
 #[cfg(test)]
 mod state_keys_tests;
 
-/// A half-closed relay must not retain admission indefinitely when the other
-/// peer disappears. Allow a short grace for the reverse stream to finish.
-async fn relay_until_eof<A, B>(a: &mut A, b: &mut B)
+/// Propagate each EOF while draining the reverse stream. The first completed
+/// copy starts one close-wait deadline covering both shutdowns and the drain.
+async fn relay_until_eof<A, B>(a: &mut A, b: &mut B, close_wait: Duration)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    use tokio::io::AsyncWriteExt;
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
-    // Bound the grace from copy completion itself: even shutdown/flush can
-    // block on an unresponsive peer. Dropping both transports closes them.
-    let ab = tokio::io::copy(&mut ar, &mut bw);
-    let ba = tokio::io::copy(&mut br, &mut aw);
-    tokio::pin!(ab, ba);
-    let grace = std::time::Duration::from_millis(250);
+    let (ab_done, ab_eof) = tokio::sync::oneshot::channel();
+    let (ba_done, ba_eof) = tokio::sync::oneshot::channel();
+    let ab = async {
+        let _ = tokio::io::copy(&mut ar, &mut bw).await;
+        let _ = ab_done.send(());
+        let _ = bw.shutdown().await;
+    };
+    let ba = async {
+        let _ = tokio::io::copy(&mut br, &mut aw).await;
+        let _ = ba_done.send(());
+        let _ = aw.shutdown().await;
+    };
+    let drain = async {
+        tokio::join!(ab, ba);
+    };
+    tokio::pin!(drain);
     tokio::select! {
-        _ = &mut ab => { let _ = tokio::time::timeout(grace, ba).await; }
-        _ = &mut ba => { let _ = tokio::time::timeout(grace, ab).await; }
+        _ = &mut drain => return,
+        _ = ab_eof => {},
+        _ = ba_eof => {},
     }
+    // Keep polling both directions, including shutdown/flush, under the
+    // same bound. Never cancel a copy early and lose its buffered bytes.
+    let _ = tokio::time::timeout(close_wait, drain).await;
 }
+
+#[cfg(test)]
+mod relay_tests;

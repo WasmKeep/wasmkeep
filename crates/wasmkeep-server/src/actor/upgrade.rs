@@ -210,7 +210,9 @@ impl ActorService {
                     crate::metrics::refused(crate::metrics::Refusal::Capacity);
                     return crate::cluster::unavailable("socket capacity exhausted; retry\n");
                 };
-                let response = cluster.forward_upgrade(&owner, req, opener, permit).await;
+                let response = cluster
+                    .forward_upgrade(&owner, req, opener, permit, self.inner.close_wait)
+                    .await;
                 if response.status().is_server_error() {
                     self.inner.forget_owner(&address);
                 }
@@ -304,7 +306,9 @@ impl ActorService {
                                 "socket capacity exhausted; retry\n",
                             );
                         };
-                        return cluster.forward_upgrade(&owner, req, opener, permit).await;
+                        return cluster
+                            .forward_upgrade(&owner, req, opener, permit, self.inner.close_wait)
+                            .await;
                     }
                     Ok(Err(Some((peer, true)))) => {
                         self.inner.mailboxes.hibernate(&address);
@@ -321,7 +325,9 @@ impl ActorService {
                                 "socket capacity exhausted; retry\n",
                             );
                         };
-                        let response = cluster.forward_upgrade(&peer, req, opener, permit).await;
+                        let response = cluster
+                            .forward_upgrade(&peer, req, opener, permit, self.inner.close_wait)
+                            .await;
                         if sent && response.status().is_server_error() {
                             cluster.suspect(&peer);
                         }

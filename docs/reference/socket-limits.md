@@ -24,8 +24,10 @@ At startup the soft `RLIMIT_NOFILE` is raised toward the hard limit, up to
 resident actor and two per socket session. Cluster connections receive at
 most an eighth of the unreserved capacity (and at most 1,024); public
 connections receive at most a quarter of the remainder. By default, actors
-receive their full request up to the remaining capacity,
-and sockets receive the remainder. An explicit `--max-sockets-per-node`
+retain capacity alongside a minimum socket share of the smaller of the
+requested sessions and a quarter of the remaining descriptors (two descriptors
+per session). Actors keep their full request when it fits alongside that share;
+sockets receive unused actor capacity. An explicit `--max-sockets-per-node`
 shares the remainder between actors and sockets, reallocating unused shares.
 Both HTTP and socket slots
 are held during upgrade handover, so that transition is counted conservatively.

@@ -1415,6 +1415,14 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     "descriptor admission estimate reduced requested limits; raise LimitNOFILE to admit more"
                 );
             }
+            if effective.socket_sessions < requested.socket_sessions {
+                tracing::warn!(
+                    requested_sockets = requested.socket_sessions,
+                    effective_sockets = effective.socket_sessions,
+                    open_files = limit,
+                    "socket session capacity reduced by descriptor budget; raise RLIMIT_NOFILE (ulimit -n or LimitNOFILE) to admit more WebSockets"
+                );
+            }
             effective
         }
         None => {

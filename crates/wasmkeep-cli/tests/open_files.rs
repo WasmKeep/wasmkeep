@@ -193,12 +193,7 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
             .arg(format!("counter={}", wasm.display()))
             .arg("--actor")
             .arg(format!("chat={}", chat.display()))
-            .args([
-                "--metrics-listen",
-                &metrics_addr.to_string(),
-                "--max-sockets-per-node",
-                "50000",
-            ])
+            .args(["--metrics-listen", &metrics_addr.to_string()])
             .arg("--data-dir")
             .arg(dir.path().join("data"))
             .arg("--cache-dir")
@@ -282,7 +277,7 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
     }
     // The clients use only eight concurrent connections, covered by the
     // reserved headroom; assert the actor budget, not the OS hard ceiling.
-    let resident_limit = wasmkeep_server::fds::budget_with_socket_priority(
+    let resident_limit = wasmkeep_server::fds::budget(
         1024,
         wasmkeep_server::fds::Budget {
             public_connections: 10_000,
@@ -290,7 +285,6 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
             socket_sessions: 50_000,
             ..Default::default()
         },
-        true,
     )
     .resident_actors;
     let descriptor_budget = wasmkeep_server::fds::PER_ACTOR * resident_limit as u64
@@ -322,6 +316,7 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
         said.contains("descriptor admission estimate reduced requested limits"),
         "missing descriptor-cap warning"
     );
+    assert!(said.contains("socket session capacity reduced by descriptor budget"));
     let lower = said.to_ascii_lowercase();
     assert!(
         !lower.contains("too many open files")
@@ -420,5 +415,7 @@ fn a_256_open_files_limit_still_serves_an_actor() {
     );
     let addr = support::listening_on(&mut node.0, &log, Duration::from_secs(60));
     assert_eq!(value(addr, "POST", 0), 1);
-    assert!(std::fs::read_to_string(log).unwrap().contains("degraded"));
+    let said = std::fs::read_to_string(log).unwrap();
+    assert!(said.contains("degraded"));
+    assert!(said.contains("socket session capacity reduced by descriptor budget"));
 }

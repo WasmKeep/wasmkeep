@@ -71,7 +71,7 @@ pub struct Budget {
     pub socket_sessions: usize,
 }
 
-/// Default socket demand receives only what remains after actor storage.
+/// Default socket demand keeps a minimum share alongside actor storage.
 /// Explicit socket demand shares the remaining capacity with actor storage.
 pub fn budget(limit: u64, requested: Budget) -> Budget {
     budget_with_socket_priority(limit, requested, false)
@@ -90,7 +90,12 @@ pub fn budget_with_socket_priority(
     left = left.saturating_sub(cluster);
     let public = (requested.public_connections as u64).min((left / 4).max(1));
     left = left.saturating_sub(public);
-    let actor_share = if explicit_sockets { left / 2 } else { left };
+    let actor_share = if explicit_sockets {
+        left / 2
+    } else {
+        let socket_floor = (requested.socket_sessions as u64).min(left / 4);
+        left - socket_floor * 2
+    };
     let mut actors = (requested.resident_actors as u64).min((actor_share / PER_ACTOR).max(1));
     let sockets =
         (requested.socket_sessions as u64).min(left.saturating_sub(actors * PER_ACTOR) / 2);
@@ -109,8 +114,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_sockets_preserve_actor_capacity_at_1024() {
-        for (cluster_connections, actors) in [(0, 192), (1024, 168)] {
+    fn default_sockets_keep_a_share_at_1024() {
+        for (cluster_connections, actors) in [(0, 96), (1024, 84)] {
             let b = budget(
                 1024,
                 Budget {
@@ -121,8 +126,26 @@ mod tests {
                 },
             );
             assert_eq!(b.resident_actors, actors);
-            assert_eq!(b.socket_sessions, 0);
+            assert_eq!(
+                b.socket_sessions,
+                if cluster_connections == 0 { 144 } else { 126 }
+            );
         }
+    }
+
+    #[test]
+    fn default_sockets_preserve_small_actor_requests() {
+        let b = budget(
+            1024,
+            Budget {
+                public_connections: 10_000,
+                resident_actors: 20,
+                socket_sessions: 50_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(b.resident_actors, 20);
+        assert_eq!(b.socket_sessions, 258);
     }
 
     #[test]

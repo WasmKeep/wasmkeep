@@ -29,13 +29,16 @@ Report requested and effective socket limits in startup logs and metrics.
 Allocate descriptor capacity for public connections, cluster connections,
 resident SQLite databases and socket sessions together. Charge two descriptors
 per session to cover relays. Keep 256 descriptors for listeners and other host
-activity. Allocate cluster and public shares first, then give actors their
-request and sockets the remainder. An explicit node socket request instead
+activity. Allocate cluster and public shares first, then reserve a minimum socket share of
+`min(requested sessions, remaining descriptors / 4)`. Give actors their request
+where it fits alongside that share, and sockets any unused actor capacity. An explicit node socket request instead
 shares that capacity between actors and sockets, reusing unrequested shares.
 At low limits retain one requested public/cluster connection and resident
 actor for degraded operation, warning when reserved headroom cannot be met.
-Sockets receive no minimum floor. Relay EOF starts a 250 ms reverse-stream
-grace before transport teardown, bounding the ingress permit lifetime.
+Sockets receive no minimum floor when reserved capacity is exhausted. Relay
+EOF propagates a write-half shutdown while the reverse stream keeps draining.
+The configured WebSocket close wait bounds the entire wind-down, including
+shutdown, before transport teardown releases the ingress permit.
 
 ## Consequences
 
