@@ -389,6 +389,7 @@ async fn each_class_goes_to_the_app_that_deploys_it_and_a_shared_one_needs_an_he
     let record = wasmkeep_cluster::node_lease::OwnerRecord {
         holder: None,
         generation: 4,
+        recorded: None,
     }
     .encode();
     for class in ["chat", "post", "both"] {

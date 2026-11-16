@@ -572,7 +572,7 @@ pub fn tombstone_unowned(moved_to: &str) -> Vec<u8> {
 }
 
 /// Whether `body` is a tombstone written where no record existed.
-fn is_unowned(body: &[u8]) -> bool {
+pub(crate) fn is_unowned(body: &[u8]) -> bool {
     tombstone_target(body).is_some()
         && std::str::from_utf8(body).is_ok_and(|t| t.lines().nth(2) == Some(UNOWNED))
 }

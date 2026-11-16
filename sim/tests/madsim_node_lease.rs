@@ -252,6 +252,7 @@ async fn acquire_broken<B: Bucket, C: Clock>(
         OwnerRecord {
             holder: Some((node.to_owned(), instance.to_owned())),
             generation,
+            recorded: None,
         }
         .encode()
     };
@@ -307,7 +308,10 @@ async fn acquire_broken<B: Bucket, C: Clock>(
             version,
             previous: None,
         })
-        .map_err(|_| AcquireError::Unresolved { generation, before })
+        .map_err(|_| AcquireError::Unresolved {
+            generation,
+            before: before.map(Box::new),
+        })
 }
 
 /// One process slot's lives: a process (its own instance) starts through

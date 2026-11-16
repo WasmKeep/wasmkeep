@@ -64,6 +64,7 @@ use wasmkeep_cluster::migrate::{
     REMOVED_PREFIX, Removal, RemoveOptions,
 };
 use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState, OwnerRecord, encode_marker};
+use wasmkeep_cluster::recorded_head::{Completeness, Position, RecordedHead};
 use wasmkeep_cluster::replication::{
     Listing, Segment, SegmentId, plan_restore, segment_key, snapshot_key,
 };
@@ -365,6 +366,10 @@ struct Actor {
     /// Whether it has an ownership record: an actor last held before
     /// records (ADR 0020 §6) has history and a marker only.
     owned: bool,
+    /// Its record's recorded head (ADR 0035): stored as `wasmkeep-owner 2`,
+    /// which the migration copies byte for byte and an old binary cannot
+    /// read. `None`: version 1.
+    recorded: Option<RecordedHead>,
 }
 
 impl Actor {
@@ -399,6 +404,7 @@ impl Actor {
         OwnerRecord {
             holder: None,
             generation: self.generation,
+            recorded: self.recorded,
         }
         .encode()
     }
@@ -423,14 +429,28 @@ fn actors() -> Vec<Actor> {
         generation,
         txid,
         owned: true,
+        recorded: None,
     };
+    // A released record in the recorded-head format (ADR 0035), beside
+    // version 1 records and tombstones: migration keeps its bytes.
+    let mut recorded = a("acme", "post", "p", "p", "blog", 1, 1);
+    recorded.recorded = Some(RecordedHead {
+        head: Position::Known {
+            generation: 1,
+            txid: 1,
+            checksum: 0x0123_4567_89ab_cdef,
+        },
+        set_at: 1,
+        completeness: Completeness::Complete,
+        idle_since_ms: None,
+    });
     let mut before_records = a("acme", "chat", "early", "early", "shop", 2, 2);
     before_records.owned = false;
     vec![
         a("default", "t", "a", "a", "default", 2, 3),
         a("default", "t", &"x".repeat(256), &lossy(), "default", 1, 2),
         a("acme", "chat", "room 1", "room%201", "shop", 3, 4),
-        a("acme", "post", "p", "p", "blog", 1, 1),
+        recorded,
         a("acme", "gone", "old", "old", "blog", 1, 1),
         before_records,
     ]
@@ -539,6 +559,11 @@ fn fixture() -> Map {
     m
 }
 
+thread_local! {
+    /// How often an old binary met a version 2 record and refused it.
+    static OLD_REFUSED_V2: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// An old binary takes `a` (if its bare record is not a tombstone): a
 /// record of the next generation, of the same size, and a segment of it;
 /// with no record, it creates one seeded from the marker (v0.2.0's
@@ -547,7 +572,17 @@ fn fixture() -> Map {
 fn old_takes(m: &mut Map, a: &Actor, now: u64) -> Option<Actor> {
     let key = a.bare(Family::Owners);
     let generation = match m.get(&key) {
-        Some(o) => OwnerRecord::decode(&o.body)?.generation,
+        // An old binary reads only `wasmkeep-owner 1`: a tombstone or a
+        // version 2 record is corrupt to it, and it takes neither.
+        Some(o) if o.body.starts_with(b"wasmkeep-owner 1\n") => {
+            OwnerRecord::decode(&o.body)?.generation
+        }
+        Some(o) => {
+            if OwnerRecord::decode(&o.body).is_some_and(|r| r.recorded.is_some()) {
+                OLD_REFUSED_V2.with(|n| n.set(n.get() + 1));
+            }
+            return None;
+        }
         None => a.generation,
     };
     let mut taken = a.clone();
@@ -906,6 +941,14 @@ fn an_old_binary_between_two_runs_reuses_no_generation() {
             }
             check_migrated(seed, &sim.snapshot(), &before, &now);
         });
+    }
+    // ADR 0035, case 12: some seed's old binary met the version 2 record
+    // and refused it (and the checks above kept its bytes everywhere).
+    if seeds() >= 50 {
+        assert!(
+            OLD_REFUSED_V2.with(std::cell::Cell::get) > 0,
+            "no old binary met the version 2 record"
+        );
     }
 }
 

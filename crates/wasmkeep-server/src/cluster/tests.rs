@@ -2109,6 +2109,7 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         OwnerRecord {
             holder: holder.map(|i| ("a".to_owned(), i.to_owned())),
             generation,
+            recorded: None,
         }
         .encode()
     };
@@ -2139,6 +2140,7 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         before: Some(OwnerRecord {
             holder: None,
             generation: 4,
+            recorded: None,
         }),
         until_ms: now_ms() + 30_000,
     });
@@ -2148,7 +2150,8 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         read(&key).await,
         OwnerRecord {
             holder: None,
-            generation: 5
+            generation: 5,
+            recorded: None,
         }
     );
     assert!(a.nothing_pending());
@@ -2162,6 +2165,7 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         before: Some(OwnerRecord {
             holder: None,
             generation: 5,
+            recorded: None,
         }),
         until_ms: now_ms() + 30_000,
     });
@@ -2172,7 +2176,8 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         read(&key).await,
         OwnerRecord {
             holder: Some(("a".to_owned(), instance.clone())),
-            generation: 6
+            generation: 6,
+            recorded: None,
         }
     );
     assert!(hold.is_valid());
@@ -2210,6 +2215,7 @@ async fn the_resolver_waits_for_a_write_that_lands_late() {
     let nobody = |generation| OwnerRecord {
         holder: None,
         generation,
+        recorded: None,
     };
     let key = a.owner_key(&ActorAddress::new("t", "c", "late").unwrap());
     put(&key, nobody(4)).await;
@@ -2231,6 +2237,7 @@ async fn the_resolver_waits_for_a_write_that_lands_late() {
         OwnerRecord {
             holder: Some(("a".to_owned(), instance.clone())),
             generation: 5,
+            recorded: None,
         },
     )
     .await;
@@ -3230,6 +3237,7 @@ async fn a_landed_unresolved_wake_supersedes_the_parked_hold() {
     let woken = OwnerRecord {
         holder: Some(("a".to_owned(), instance)),
         generation: parked_at + 1,
+        recorded: None,
     };
     store
         .put(&StorePath::from(key.as_str()), woken.encode().into())
@@ -3246,7 +3254,8 @@ async fn a_landed_unresolved_wake_supersedes_the_parked_hold() {
         owner_record(&store, &key).await,
         OwnerRecord {
             holder: None,
-            generation: parked_at + 1
+            generation: parked_at + 1,
+            recorded: None,
         }
     );
     assert!(!a.is_parked(&x), "the superseded parked hold was kept");
