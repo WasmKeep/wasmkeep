@@ -284,6 +284,68 @@ impl ActorService {
         tracing::info!(classes_changed = changed, front_changed, "secrets applied");
     }
 
+    /// Actor ownership may be discovered only inside its mailbox. Preserve
+    /// ingress metadata until then, before routing strips reserved headers.
+    pub(crate) fn prepare_ingress<B>(
+        &self,
+        req: &mut hyper::Request<B>,
+    ) -> Option<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>> {
+        {
+            let limits = read_lock(&self.inner.limits);
+            let pending = self
+                .inner
+                .rate_limits_pending
+                .load(std::sync::atomic::Ordering::Acquire);
+            if limits.is_empty() && !pending {
+                return None;
+            }
+            if self
+                .inner
+                .deploy_behind
+                .load(std::sync::atomic::Ordering::Acquire)
+                || self
+                    .inner
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Acquire)
+                || *self.inner.app_deleted.borrow()
+            {
+                return Some(crate::cluster::unavailable("app unavailable; retry\n"));
+            }
+        }
+        if let Some(cluster) = &self.inner.cluster
+            && cluster
+                .is_internal(
+                    req.method(),
+                    req.uri().path_and_query().map_or("/", |p| p.as_str()),
+                    req.headers(),
+                    req.extensions()
+                        .get::<crate::http::ArrivedOnClusterPort>()
+                        .is_some(),
+                )
+                .is_some()
+        {
+            return self.admit_ingress(req);
+        }
+        if !read_lock(&self.inner.limits).is_empty()
+            && !req.headers().contains_key(crate::cluster::APP)
+            && !req.headers().contains_key(crate::cluster::ADMITTED)
+        {
+            req.headers_mut().remove(crate::cluster::FORWARDED);
+        }
+        if self.inner.cluster.is_some() && req.uri().path().starts_with("/actor/") {
+            let mut original = hyper::Request::new(());
+            *original.method_mut() = req.method().clone();
+            *original.uri_mut() = req.uri().clone();
+            *original.headers_mut() = req.headers().clone();
+            *original.extensions_mut() = req.extensions().clone();
+            req.extensions_mut()
+                .insert(DeferredIngress(self.clone(), original));
+            None
+        } else {
+            self.admit_ingress(req)
+        }
+    }
+
     /// Capture the front and admit under the same publication lock as classes.
     /// No lock is held while guest work or network I/O runs.
     pub(crate) fn admit_ingress<B>(
@@ -333,12 +395,15 @@ impl ActorService {
             ));
         }
         let mut authenticated = false;
+        let mut client_peer = None;
         if let Some(cluster) = &self.inner.cluster {
             if let Some(signed) = cluster.is_internal(
                 req.method(),
                 req.uri().path_and_query().map_or("/", |p| p.as_str()),
                 req.headers(),
-                false,
+                req.extensions()
+                    .get::<crate::http::ArrivedOnClusterPort>()
+                    .is_some(),
             ) {
                 let control = req.headers().contains_key(crate::cluster::TAKE)
                     || req.headers().contains_key(crate::cluster::ALARM_HANDOFF);
@@ -351,9 +416,9 @@ impl ActorService {
                 authenticated = true;
             }
             if !authenticated {
-                authenticated = cluster.admission_received(req);
+                client_peer = cluster.admission_received(req);
                 // Do not collapse forwarded clients into the forwarder's IP.
-                if !authenticated
+                if client_peer.is_none()
                     && (req.headers().contains_key(crate::cluster::ADMITTED)
                         || (req.headers().contains_key(crate::cluster::FORWARDED)
                             && req.headers().contains_key(crate::cluster::APP)))
@@ -370,9 +435,11 @@ impl ActorService {
                 req.method().as_str(),
                 req.uri().path(),
                 req.headers(),
-                req.extensions()
-                    .get::<crate::http::PeerAddress>()
-                    .map(|p| p.0.ip()),
+                client_peer.or_else(|| {
+                    req.extensions()
+                        .get::<crate::http::PeerAddress>()
+                        .map(|p| p.0.ip())
+                }),
                 std::time::Instant::now(),
             );
             crate::metrics::ingress_admission(result.as_ref().err().copied());
@@ -577,4 +644,15 @@ mod rate_review_tests {
             .store(true, std::sync::atomic::Ordering::Release);
         assert!(service.admit_ingress(&mut req).is_none());
     }
+}
+
+#[derive(Clone)]
+struct DeferredIngress(ActorService, hyper::Request<()>);
+
+pub(super) fn finish_ingress<B>(
+    req: &mut hyper::Request<B>,
+) -> Option<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>> {
+    let DeferredIngress(service, mut original) =
+        req.extensions_mut().remove::<DeferredIngress>()?;
+    service.admit_ingress(&mut original)
 }

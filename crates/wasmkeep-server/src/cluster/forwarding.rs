@@ -200,10 +200,30 @@ pub(crate) fn never_forward<B>(req: &Request<B>) -> bool {
         || req.extensions().get::<ArrivedOnClusterPort>().is_some()
 }
 
-// A separate domain from actor calls: this receipt grants only rate admission,
-// never Caller::Actor/Front or access to an internal class. Its payload is the
-// empty digest, not a claim that a streamed request body has been authenticated.
+// Domain-separated client identity proof; replay is charged again by the owner.
 pub(crate) const ADMITTED: &str = "x-wasmkeep-admitted";
+
+fn identity_headers(headers: &hyper::HeaderMap) -> String {
+    let mut values: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| {
+            !HOP_BY_HOP.contains(&name.as_str())
+                && name.as_str() != "host"
+                && name.as_str() != "expect"
+                && !name.as_str().starts_with(RESERVED_PREFIX)
+        })
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .collect();
+    values.sort();
+    let mut bytes = Vec::new();
+    for (name, value) in values {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+    }
+    body_sha256(&bytes)
+}
 impl Cluster {
     pub(super) async fn sign_admission<B>(
         &self,
@@ -211,10 +231,24 @@ impl Cluster {
         path: &str,
         req: &mut Request<B>,
     ) -> Result<(), String> {
-        let secret = format!("wasmkeep-ingress-v1:{}", self.secret().await?);
+        // No-policy forwards must never fetch a secret or wait on storage.
+        let Some(secret) = self.secret.get() else {
+            return Ok(());
+        };
+        let Some(peer) = req.extensions().get::<crate::http::PeerAddress>() else {
+            return Ok(());
+        };
+        let ip = match peer.0.ip() {
+            std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+            std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => ip,
+            std::net::IpAddr::V6(ip) => {
+                std::net::Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))
+            }
+        };
+        let secret = format!("wasmkeep-ingress-identity-v2:{secret}");
         let ts = now_ms();
-        let nonce = self.nonce();
-        let body = body_sha256(b"");
+        let nonce = format!("{:032x}", u128::from(ip));
+        let body = identity_headers(req.headers());
         let mac = signature(
             &secret,
             ts,
@@ -233,25 +267,18 @@ impl Cluster {
         Ok(())
     }
 
-    pub(crate) fn admission_received<B>(&self, req: &Request<B>) -> bool {
-        // In refuse mode only mTLS grants hop identity; a receipt on the
-        // public port cannot change that. The router already exempts mTLS.
-        if self.refuse_plaintext {
-            return false;
+    pub(crate) fn admission_received<B>(&self, req: &Request<B>) -> Option<std::net::IpAddr> {
+        if self.refuse_plaintext && req.extensions().get::<ArrivedOnClusterPort>().is_none() {
+            return None;
         }
         let mut values = req.headers().get_all(ADMITTED).iter();
-        let Some(given) = values.next().and_then(|v| v.to_str().ok()) else {
-            return false;
-        };
+        let given = values.next()?.to_str().ok()?;
         if values.next().is_some() {
-            return false;
+            return None;
         }
-        let Some(secret) = self.secret.get() else {
-            return false;
-        };
-        let secret = format!("wasmkeep-ingress-v1:{secret}");
+        let secret = format!("wasmkeep-ingress-identity-v2:{}", self.secret.get()?);
         let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
-        let Some(signed) = verify(
+        let signed = verify(
             &secret,
             given,
             now_ms(),
@@ -259,14 +286,19 @@ impl Cluster {
             req.method(),
             path,
             req.headers(),
-        ) else {
-            return false;
-        };
-        // Receipts cannot consume the actor-call or control replay budget.
-        signed.body == body_sha256(b"")
-            && self
-                .seen_admission
-                .first_use(signed.mac, signed.ts, now_ms())
+        )?;
+        if signed.body != identity_headers(req.headers()) {
+            return None;
+        }
+        let encoded = given.split(' ').nth(2)?;
+        if encoded.len() != 32 {
+            return None;
+        }
+        let ip = std::net::Ipv6Addr::from(u128::from_str_radix(encoded, 16).ok()?);
+        Some(
+            ip.to_ipv4_mapped()
+                .map_or(std::net::IpAddr::V6(ip), std::net::IpAddr::V4),
+        )
     }
 }
 
@@ -281,21 +313,115 @@ mod admission_tests {
         assert!(!h.contains_key(ADMITTED));
     }
     #[tokio::test]
+    async fn fix2_cold_secret_forward_does_not_fetch_or_sign() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store.clone());
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        cluster
+            .sign_admission("owner", "/actor/c/a", &mut req)
+            .await
+            .unwrap();
+        assert!(cluster.secret.get().is_none());
+        assert!(!req.headers().contains_key(ADMITTED));
+        assert!(store.get(&"cluster/secret".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fix2_proof_binds_identity_owner_method_query_and_headers() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = ClusterConfig::new("owner", "http://owner", store);
+        let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        cluster.load_secret().await;
+        let mut req = Request::get("/actor/c/a?q=1")
+            .header("x-client-id", "alice")
+            .body(())
+            .unwrap();
+        req.extensions_mut().insert(crate::http::PeerAddress(
+            "[2001:db8:1:2::abcd]:1234".parse().unwrap(),
+        ));
+        cluster
+            .sign_admission("owner", "/actor/c/a?q=1", &mut req)
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster.admission_received(&req),
+            Some("2001:db8:1:2::".parse().unwrap())
+        );
+        let policies = [(
+            "test".into(),
+            crate::apps::limits::Policy::parse("/*", "ip", None, "1/h", 1).unwrap(),
+        )]
+        .into();
+        let limiter = crate::rate_limit::Limiter::default();
+        let now = std::time::Instant::now();
+        for expected in [Ok(()), Err(crate::rate_limit::Rejection::Quota(3600))] {
+            assert_eq!(
+                limiter.admit(
+                    &policies,
+                    "GET",
+                    "/actor/c/a",
+                    req.headers(),
+                    cluster.admission_received(&req),
+                    now
+                ),
+                expected
+            );
+        }
+        for change in 0..5 {
+            let mut changed = req.clone();
+            match change {
+                0 => *changed.method_mut() = hyper::Method::POST,
+                1 => *changed.uri_mut() = "/actor/c/a?q=2".parse().unwrap(),
+                2 => {
+                    changed
+                        .headers_mut()
+                        .insert("x-client-id", "bob".parse().unwrap());
+                }
+                3 => {
+                    cluster
+                        .sign_admission("other", "/actor/c/a?q=1", &mut changed)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    let proof = changed.headers()[ADMITTED].to_str().unwrap().replace(
+                        "20010db8000100020000000000000000",
+                        "20010db8000100030000000000000000",
+                    );
+                    changed
+                        .headers_mut()
+                        .insert(ADMITTED, proof.parse().unwrap());
+                }
+            }
+            assert!(
+                cluster.admission_received(&changed).is_none(),
+                "change {change}"
+            );
+        }
+        assert_eq!(cluster.seen.len(), 0);
+    }
+
+    #[tokio::test]
     async fn review_receipts_do_not_fill_call_replay_store() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let config = ClusterConfig::new("owner", "http://owner", store);
         let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
         cluster.load_secret().await;
         let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
         cluster
             .sign_admission("owner", "/actor/c/a", &mut req)
             .await
             .unwrap();
-        assert!(cluster.admission_received(&req));
+        assert!(cluster.admission_received(&req).is_some());
         assert_eq!(cluster.seen.len(), 0);
     }
     #[tokio::test]
-    async fn ingress_receipts_are_single_use_and_never_actor_credentials() {
+    async fn fix2_identity_proofs_are_reusable_and_never_actor_credentials() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let mut config = ClusterConfig::new("owner", "http://owner", store);
         config.heartbeat = Duration::from_secs(3600);
@@ -303,6 +429,8 @@ mod admission_tests {
         let cluster = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
         cluster.load_secret().await;
         let mut req = Request::get("/actor/c/a").body(()).unwrap();
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
         cluster
             .sign_admission("owner", "/actor/c/a", &mut req)
             .await
@@ -314,9 +442,9 @@ mod admission_tests {
         );
         let mut changed = req.clone();
         *changed.uri_mut() = "/actor/c/b".parse().unwrap();
-        assert!(!cluster.admission_received(&changed));
-        assert!(cluster.admission_received(&req));
-        assert!(!cluster.admission_received(&req));
+        assert!(cluster.admission_received(&changed).is_none());
+        assert!(cluster.admission_received(&req).is_some());
+        assert!(cluster.admission_received(&req).is_some());
         let proof = req.headers()[ADMITTED].clone();
         req.headers_mut().remove(ADMITTED);
         req.headers_mut().insert(INTERNAL, proof);

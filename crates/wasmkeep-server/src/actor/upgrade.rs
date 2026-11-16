@@ -322,6 +322,9 @@ impl ActorService {
             }
             break;
         }
+        if let Some(response) = super::deploys::finish_ingress(&mut req) {
+            return response;
+        }
         if let Err(e) = self.inner.sockets.can_open(&address) {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = ?e, "websocket refused");
             crate::metrics::refused(crate::metrics::Refusal::Capacity);

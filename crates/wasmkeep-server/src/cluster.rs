@@ -336,7 +336,6 @@ pub(crate) struct Cluster {
     serves: String,
     /// Node signatures already accepted (replay protection).
     seen: SeenSignatures,
-    seen_admission: SeenSignatures,
     /// The same for take and alarm hand-off calls (ADR 0014, 0017), kept
     /// apart: a flood of other signed calls that fills `seen` cannot
     /// refuse the calls a drain and a move depend on.
@@ -671,7 +670,6 @@ impl Cluster {
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
             seen: SeenSignatures::named("calls"),
-            seen_admission: SeenSignatures::named("ingress"),
             seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
@@ -1111,6 +1109,9 @@ impl Cluster {
             let Ok(mut out) = out else {
                 return unavailable("bad advertised address\n");
             };
+            if let Some(peer) = req.extensions().get::<crate::http::PeerAddress>().copied() {
+                out.extensions_mut().insert(peer);
+            }
             if self.sign_admission(owner, &path, &mut out).await.is_err() {
                 return unavailable("cannot authenticate ingress admission; retry\n");
             }

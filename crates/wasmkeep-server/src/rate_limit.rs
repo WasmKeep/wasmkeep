@@ -37,10 +37,25 @@ struct Table {
     clock: u64,
     cap: usize,
     requested: usize,
+    active: bool,
 }
 impl Table {
-    fn evict(&mut self) {
-        if let Some((_, key)) = self.lru.pop_first() {
+    fn evict(&mut self, now: Instant, protected: &[Key]) {
+        let candidate = self.lru.iter().filter(|(_, k)| !protected.contains(k));
+        let chosen = candidate
+            .clone()
+            .find(|(_, k)| {
+                let b = &self.buckets[k];
+                b.credit.saturating_add(
+                    now.saturating_duration_since(b.at)
+                        .as_nanos()
+                        .saturating_mul(u128::from(b.policy.rate)),
+                ) >= u128::from(b.policy.burst) * b.unit()
+            })
+            .or_else(|| candidate.into_iter().next())
+            .cloned();
+        if let Some((used, key)) = chosen {
+            self.lru.remove(&(used, key.clone()));
             self.buckets.remove(&key);
             KEYS.fetch_sub(1, Ordering::Relaxed);
         }
@@ -57,12 +72,17 @@ impl Table {
 static TABLES: LazyLock<Mutex<Vec<Weak<Mutex<Table>>>>> = LazyLock::new(Mutex::default);
 fn rebalance(tables: &mut Vec<Weak<Mutex<Table>>>) {
     tables.retain(|t| t.strong_count() > 0);
-    let share = PROCESS_KEYS / tables.len().max(1);
+    let count = tables
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|t| t.lock().unwrap_or_else(|p| p.into_inner()).active)
+        .count();
+    let share = PROCESS_KEYS / count.max(1);
     for table in tables.iter().filter_map(Weak::upgrade) {
         let mut t = table.lock().unwrap_or_else(|p| p.into_inner());
-        t.cap = t.requested.min(share);
+        t.cap = if t.active { t.requested.min(share) } else { 0 };
         while t.buckets.len() > t.cap {
-            t.evict();
+            t.evict(Instant::now(), &[]);
         }
     }
 }
@@ -123,8 +143,21 @@ impl Limiter {
         rebalance(&mut tables);
         Self { buckets }
     }
+    fn activate(&self, active: bool) {
+        let mut tables = TABLES.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = {
+            let mut table = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = table.active != active;
+            table.active = active;
+            changed
+        };
+        if changed {
+            rebalance(&mut tables);
+        }
+    }
     /// Reconcile at publication, even if no requests arrive between edits.
     pub(crate) fn reconcile(&self, policies: &Policies, now: Instant) {
+        self.activate(!policies.is_empty());
         let mut buckets = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
         let before = buckets.buckets.len();
         buckets.buckets.retain(|(name, _), b| {
@@ -151,6 +184,7 @@ impl Limiter {
         peer: Option<std::net::IpAddr>,
         now: Instant,
     ) -> Result<(), Rejection> {
+        self.activate(!policies.is_empty());
         let mut matched = Vec::with_capacity(policies.len());
         for (name, policy) in policies {
             if !policy.matches(method, path) {
@@ -212,7 +246,13 @@ impl Limiter {
             return Err(Rejection::Quota(retry));
         }
         while buckets.buckets.len() + missing > buckets.cap {
-            buckets.evict();
+            buckets.evict(
+                now,
+                &matched
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>(),
+            );
         }
         KEYS.fetch_add(missing, Ordering::Relaxed);
         for (key, policy) in matched {
@@ -251,6 +291,47 @@ mod tests {
             Some(std::net::Ipv4Addr::new(127, 0, 0, ip).into()),
             n,
         )
+    }
+    #[test]
+    fn fix2_unconfigured_apps_do_not_enable_identity_cycling() {
+        let _idle: Vec<_> = (0..999).map(|_| Limiter::default()).collect();
+        let l = Limiter::default();
+        let p = rules("1/h", 1);
+        let n = Instant::now();
+        for round in 0..3 {
+            for subnet in 0..66u128 {
+                let ip = std::net::Ipv6Addr::from((0x20010db800000000u128 + subnet) << 64);
+                let result = l.admit(
+                    &p,
+                    "POST",
+                    "/api/login",
+                    &http::HeaderMap::new(),
+                    Some(ip.into()),
+                    n,
+                );
+                assert_eq!(
+                    result,
+                    if round == 0 {
+                        Ok(())
+                    } else {
+                        Err(Rejection::Quota(3600))
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn fix2_pressure_prefers_refilled_over_depleted() {
+        let l = Limiter::with_cap(2);
+        let n = Instant::now();
+        let p = rules("1/h", 1);
+        assert_eq!(admit(&l, &p, n, 1), Ok(()));
+        assert_eq!(admit(&l, &rules("1/s", 1), n, 2), Ok(()));
+        assert_eq!(admit(&l, &p, n + Duration::from_secs(2), 3), Ok(()));
+        assert_eq!(
+            admit(&l, &p, n + Duration::from_secs(2), 1),
+            Err(Rejection::Quota(3598))
+        );
     }
     #[test]
     fn review_ipv6_subnet_shares_quota() {

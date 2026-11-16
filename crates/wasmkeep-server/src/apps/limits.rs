@@ -178,8 +178,8 @@ impl Policy {
 /// Matching only: routing and the guest-visible URI are not rewritten.
 fn match_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
+    let mut trailing_dot = false;
     for segment in path.split('/').filter(|s| !s.is_empty()) {
-        out.push('/');
         let mut normalized = String::with_capacity(segment.len());
         let bytes = segment.as_bytes();
         let mut i = 0;
@@ -200,6 +200,17 @@ fn match_path(path: &str) -> String {
                 i += 1;
             }
         }
+        trailing_dot = normalized == "." || normalized == "..";
+        if normalized == "." {
+            continue;
+        }
+        if normalized == ".." {
+            if let Some(index) = out.rfind('/') {
+                out.truncate(index);
+            }
+            continue;
+        }
+        out.push('/');
         // Actor routing decodes the entire name, including reserved bytes
         // and UTF-8. Re-encode to preserve the name/path segment boundary.
         if out.starts_with("/actor/")
@@ -210,7 +221,7 @@ fn match_path(path: &str) -> String {
         }
         out.push_str(&normalized);
     }
-    if path.ends_with('/') || out.is_empty() {
+    if path.ends_with('/') || trailing_dot || out.is_empty() {
         out.push('/');
     }
     out
@@ -229,6 +240,20 @@ pub fn validate(policies: &Policies) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fix2_dot_segments_match_in_both_directions() {
+        for alias in ["/a/../login", "/./login", "/a/%2e%2E/login", "/%2e/login"] {
+            let p = Policy::parse("/login", "ip", None, "1/h", 1).unwrap();
+            assert!(p.matches("GET", alias), "{alias}");
+            let p = Policy::parse(alias, "ip", None, "1/h", 1).unwrap();
+            assert!(p.matches("GET", "/login"), "{alias}");
+        }
+        let p = Policy::parse("/admin/*", "ip", None, "1/h", 1).unwrap();
+        assert!(!p.matches("GET", "/admin/../public"));
+        for path in ["/admin/.", "/admin/x/..", "/admin/%2e", "/admin/x/%2e."] {
+            assert!(p.matches("GET", path), "{path}");
+        }
+    }
     #[test]
     fn review_matching_closes_route_aliases() {
         let p = Policy::parse("GET /login", "ip", None, "1/h", 1).unwrap();

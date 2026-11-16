@@ -101,7 +101,7 @@ async fn ingress_limits_reject_before_front_body_or_direct_actor_work() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ingress_limits_header_keys_and_internal_forwarding() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    deploy(&store, policy("/actor/*", "header")).await;
+    deploy(&store, policy("/*", "header")).await;
     let da = tempfile::tempdir().unwrap();
     let db = tempfile::tempdir().unwrap();
     let a = super::front_deploys::front_app_node("limit-a", da.path(), &store, None).await;
@@ -129,8 +129,7 @@ async fn ingress_limits_header_keys_and_internal_forwarding() {
         .status,
         200
     );
-    // Same key on another node gets its independent allowance. Forwarding to
-    // the already depleted owner must not charge that owner a second time.
+    // Forwarding charges the same client on the owner.
     let r = send_reachable(
         b.addr,
         "GET",
@@ -138,7 +137,7 @@ async fn ingress_limits_header_keys_and_internal_forwarding() {
         "x-client-id: client\r\n",
     )
     .await;
-    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.status, 429, "{}", r.body);
     assert_eq!(
         send(
             b.addr,
@@ -161,6 +160,16 @@ async fn ingress_limits_header_keys_and_internal_forwarding() {
         .status,
         200
     );
+    // The forwarder's local quota is untouched by a successfully forwarded request.
+    let header = "x-client-id: forward-only\r\n";
+    assert_eq!(
+        send_reachable(b.addr, "GET", "/actor/t/x/durable", header)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(send(b.addr, "GET", "/self", header).await.status, 200);
+    assert_eq!(send(b.addr, "GET", "/self", header).await.status, 429);
 }
 
 async fn old_reader(store: &Arc<dyn ObjectStore>) {
@@ -347,7 +356,7 @@ async fn ingress_limits_fail_closed_when_a_new_manifest_cannot_be_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn review_forwarder_without_policy_does_not_spend_owner_quota() {
+async fn fix2_forwarder_without_policy_charges_owner_quota() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     deploy(&store, policy("/actor/*", "ip")).await;
     let da = tempfile::tempdir().unwrap();
@@ -376,7 +385,7 @@ async fn review_forwarder_without_policy_does_not_spend_owner_quota() {
         .unwrap();
     for _ in 0..2 {
         let r = send_reachable(b.addr, "GET", path, "").await;
-        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.status, 429, "{}", r.body);
     }
 }
 

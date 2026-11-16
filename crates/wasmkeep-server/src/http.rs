@@ -97,9 +97,10 @@ impl App {
                 _ => text_response(StatusCode::NOT_FOUND, "not found\n"),
             };
         }
-        if req.extensions().get::<ArrivedOnClusterPort>().is_none()
+        if (req.extensions().get::<ArrivedOnClusterPort>().is_none()
+            || req.headers().contains_key(crate::cluster::FORWARDED))
             && let Some(actors) = &self.actors
-            && let Some(response) = actors.admit_ingress(&mut req)
+            && let Some(response) = actors.prepare_ingress(&mut req)
         {
             return response;
         }

@@ -257,24 +257,28 @@ public issue.
 ## Ingress rate limits
 
 An app's [project-file limits](project-file.md#ingress-limits) run before body
-consumption, front instance allocation and actor dispatch, including
+consumption, front instance allocation and guest actor work, including
 public actor routes and WebSocket handshakes. Forged `x-wasmkeep-*` headers
 do not exempt public requests. Cluster-port traffic is authenticated by
 mutual TLS. Quotas are local to a node and reset when its process restarts.
 
-Every forwarded public request or WebSocket handshake carries a domain-separated,
-single-use signed receipt, even when the forwarder has no policy. The owner trusts
-the forwarder's admission decision, including absence of a policy during deploy
-skew. Receipts have a separate 500,000-entry replay store, independent of actor-call
-and control signatures. A receipt never grants actor privileges. A failed signing
-attempt, invalid/expired/replayed receipt, full receipt store, or unsigned forward
-claim with an app header returns 503 on a policy-enforcing public ingress path,
-instead of charging the forwarder's IP. Client-supplied receipts are stripped
-before forwarding and replaced with the node's proof. Mutual-TLS cluster-port
-traffic bypasses public admission. Already-spent internal call signatures return
-403 before body reads in plaintext mode; fresh signatures still undergo body and
-atomic replay checks before actor work. Concurrent copies arriving before that
-spend are stopped by the later atomic check, not by the early read-only check.
+Actor ownership resolution may precede admission; guest execution and body reads
+still follow it. A forwarding node does not charge public requests or WebSocket handshakes. When
+its cluster secret is already loaded, it replaces client-supplied proofs with a
+domain-separated signed client identity: the normalized TCP IP key (IPv6 by its 64-bit prefix,
+IPv4-mapped addresses equivalent to IPv4), bound to the destination owner, method,
+path and query, app, timestamp, and end-to-end header values. The owner verifies
+this proof and charges its own policies using that IP or the policy's header key.
+Replays are charged again; there is no ingress replay store or receipt throughput
+ceiling. The proof grants no actor privileges and does not authenticate the body.
+Missing, invalid or expired proofs on forwarded requests return 503 when the
+owner has policies. Without policies, unsigned forwards retain their previous
+behavior. Signing never fetches a cold secret. Clock skew outside the signature
+window still invalidates a proof on a policy-enforcing owner.
+Forwarded public traffic is charged on both plaintext and mutual-TLS transports;
+authenticated internal actor calls remain exempt. Already-spent internal call
+signatures return 403 before body reads in plaintext mode; fresh signatures still
+undergo body and atomic replay checks before actor work.
 
 IP keys use only the TCP peer, with IPv6 aggregated to 64-bit subnet prefixes; IPv4-mapped IPv6
 uses the IPv4 key. Forwarded addresses are not trusted or parsed. Behind a proxy,
@@ -284,7 +288,7 @@ rotate identities. Header values are hashed and absent from logs and metric labe
 
 Matching is case-sensitive, excludes the query, decodes unreserved percent
 escapes, canonicalizes remaining escape hex to uppercase, and collapses repeated
-slashes. Exact rules ignore trailing slashes. A `GET` rule also covers `HEAD`;
+slashes and dot segments (`.` and `..`, including percent-encoded forms). Exact rules ignore trailing slashes. A `GET` rule also covers `HEAD`;
 a `HEAD` rule covers only `HEAD`. Actor names use the router's full percent
 and UTF-8 decoding, then canonical percent encoding to preserve segment boundaries.
 Other reserved escapes stay encoded: the paths in `https://example.test/a%2Fb`
@@ -292,14 +296,15 @@ and `https://example.test/a/b` differ. Prefix rules retain their final slash;
 a prefix covers that slash and descendants, not the path without the slash. This normalization is only for policy matching; it does not rewrite
 the URI delivered to routing or guest code.
 
-Each live app service receives an equal reserved share of the 65,536-bucket
-process budget, capped at 4,096 buckets per service (including services without
-policies in the share count). Creating or dropping a service rebalances shares;
-shrinking a share evicts its least recently used buckets. Under request pressure,
-an ordered LRU index evicts even partially depleted buckets from that app only,
-without scanning or refilling unrelated buckets. Rejected quota attempts count as
-uses. Evicted identities get a fresh burst if they return, so rotating keys can
-weaken enforcement; these are bounded admission controls, not durable quotas.
+Only app services with policies share the 65,536-bucket process budget, capped
+at 4,096 buckets per service. Publishing or removing policies and dropping a
+service rebalance shares. Under pressure, fully refilled buckets are evicted
+first; only then are depleted buckets evicted in least-recently-used order.
+Current request buckets are protected. Refill eligibility is computed without
+changing unrelated buckets' credits or clocks. Rejected quota attempts count as
+uses. Evicted identities get a fresh burst if they return, so cycling more keys
+than the actual policy-service share can still weaken enforcement; these are
+bounded admission controls, not durable quotas.
 If an admission needs more simultaneous rule buckets than its app share, it
 returns 429 with `Retry-After: 1` and the capacity outcome.
 
@@ -317,8 +322,7 @@ With neither current nor pending policies, ingress admission returns immediately
 it does not change response ordering, capture a front snapshot, or increment rate
 counters. Bucket read errors do not invent pending policies; corrupt manifests do.
 The metrics endpoint still registers `wasmkeep_rate_limit_requests_total` and
-`wasmkeep_rate_limit_active_keys` even when no policy exists, plus the `ingress`
-record label in `wasmkeep_signatures_refused_full_total`. These metrics are the
+`wasmkeep_rate_limit_active_keys` even when no policy exists. These metrics are the
 intentional exception to no-policy compatibility.
 
 These limits control app admission. Use edge filtering and connection
