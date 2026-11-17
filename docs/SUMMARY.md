@@ -96,5 +96,6 @@ are designs, not available capabilities. -->
 - [0036 Per-node ingress rate limits (accepted, as built)](adr/0036-per-node-ingress-rate-limits.md)
 - [0037 Socket session admission (accepted, as built)](adr/0037-socket-session-admission.md)
 - [0038 Several apps per process (accepted, as built)](adr/0038-several-apps-per-process.md)
+- [0039 The change feed (proposed)](adr/0039-the-change-feed.md)
 
 - [Socket admission options](reference/socket-limits.md)
