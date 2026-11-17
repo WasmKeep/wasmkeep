@@ -197,10 +197,11 @@ pub async fn delete_app(
                 since_ms.saturating_add(u64::try_from(args.late.as_millis()).unwrap_or(u64::MAX));
             let now = now();
             if now >= quiet_at {
+                let late = late_listings(&store, &app, &shown, id, now).await;
                 return Ok(format!(
                     "Deleted {shown}: {removed} object(s) removed. The tombstone stays; \
                      `wasmkeep deploy --recreate` uses the name again. Destroy the app's \
-                     secrets key yourself if it had one."
+                     secrets key yourself if it had one.\n{late}"
                 ));
             }
             tokio::time::sleep(Duration::from_millis(quiet_at - now)).await;
@@ -234,6 +235,43 @@ pub async fn delete_app(
             }
             since_ms = since_ms.max(fence_app_nodes(&store, prefix, tenant, name, say).await?);
         }
+    }
+}
+
+/// When the listings that remove late uploads are due (ADR 0030, section 5,
+/// decision 1): one hour and 25 hours after the tombstone, by its
+/// last-modified time (the bucket's clock). An upload through a link issued
+/// before the delete may land that late. Each run of the command removes
+/// what is there; this says which listings are still to come.
+async fn late_listings(
+    store: &Arc<dyn ObjectStore>,
+    app: &super::AppRef,
+    shown: &str,
+    id: &str,
+    now_ms: u64,
+) -> String {
+    use object_store::ObjectStoreExt as _;
+    const HOUR: u64 = 60 * 60 * 1_000;
+    let Ok(meta) = store.head(&app.path(super::TOMBSTONE)).await else {
+        return String::new();
+    };
+    let at = u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0);
+    let resume = format!("wasmkeep app delete --app {shown} --bucket ... --resume {id}");
+    let left = |due: u64| (due.saturating_sub(now_ms)).div_ceil(60_000);
+    let (first, last) = (at + HOUR, at + 25 * HOUR);
+    if now_ms < first {
+        format!(
+            "Files: uploads through links issued before the delete may still land. Run              `{resume}` in {} min and again in {} min to remove them.",
+            left(first),
+            left(last)
+        )
+    } else if now_ms < last {
+        format!(
+            "Files: the first late listing ran; run `{resume}` once more in {} min.",
+            left(last)
+        )
+    } else {
+        "Files: both late listings ran; nothing is left to wait for.".to_owned()
     }
 }
 

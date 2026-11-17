@@ -45,6 +45,7 @@ use wasmkeep_wit::wasmkeep::actor::websockets::{
 };
 
 mod alarm_delivery;
+mod blob_sweeps;
 mod classes;
 mod collection;
 mod deletes;
@@ -213,6 +214,29 @@ pub struct ActorConfig {
     /// Join a cluster: actors run only on the node holding their lease, and
     /// requests reaching another node are forwarded. `None` runs alone.
     pub cluster: Option<ClusterConfig>,
+    /// The app's epoch (ADR 0030, section 2): the segment after `blobs/`
+    /// in every file key, from the app's `recreated` and `restored`
+    /// markers ([`crate::blobs::epoch`], as
+    /// [`crate::apps::AppRef::prepare_local`] returns it). By default the
+    /// epoch of an app with neither marker.
+    pub blob_epoch: String,
+    /// How this app runtime makes links (ADR 0030, section 4): the
+    /// process's start proof decides whether downloads are presigned, and
+    /// the node file or the flags give node links' base.
+    pub blob_links: crate::blobs::links::LinkSettings,
+    /// One file's largest size, streamed (`--max-blob-bytes`): by default
+    /// [`crate::blobs::DEFAULT_MAX_FILE`], at most
+    /// [`crate::blobs::MAX_FILE_CEILING`].
+    pub max_blob_bytes: u64,
+    /// The app's stored-bytes limit (`max-app-blob-bytes`, ADR 0030,
+    /// section 7): writes and upload links are refused with
+    /// `quota-exceeded` while the last hourly count is over it. `None`: no
+    /// limit.
+    pub max_app_blob_bytes: Option<u64>,
+    /// How often the app's files are counted on a node without a bucket
+    /// (an hour; on a bucket the cluster's `blob_epochs_every`). Tests
+    /// shorten it.
+    pub blob_count_every: Duration,
     /// How long a WebSocket client may stay silent before the server pings
     /// it: 25 s, under a load balancer's usual 60 s idle timeout. Tests
     /// shorten it.
@@ -259,6 +283,11 @@ impl ActorConfig {
             assets: None,
             local_assets: None,
             assets_cache: crate::assets::default_cache(),
+            blob_epoch: crate::blobs::epoch(None, None),
+            blob_links: crate::blobs::links::LinkSettings::default(),
+            max_blob_bytes: crate::blobs::DEFAULT_MAX_FILE,
+            max_app_blob_bytes: None,
+            blob_count_every: Duration::from_secs(60 * 60),
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,
         }
@@ -354,6 +383,8 @@ struct ServiceInner {
     /// Set once the app's tombstone was seen and this node stopped serving
     /// it (ADR 0028, section 5).
     app_deleted: tokio::sync::watch::Sender<bool>,
+    /// The app's files (ADR 0030), in the bucket or on this node's disk.
+    blobs: Arc<crate::blobs::Blobs>,
 }
 
 impl ServiceInner {
@@ -473,6 +504,9 @@ const DEPLOY_SEQ_KEY: &str = "deploy_seq";
 /// twice.
 const OPERATOR_DELETE_KEY: &str = "operator_delete";
 const OPERATOR_RESTORE_KEY: &str = "operator_restore";
+/// The actor's blob incarnation (ADR 0030, section 2): drawn by each
+/// delete and written in the empty database its reset carries.
+const BLOB_INCARNATION_KEY: &str = "blob_incarnation";
 
 /// `refresh_class`: the actor's class was removed by a deploy.
 const CLASS_GONE: &str = "class no longer served";
@@ -652,6 +686,21 @@ impl ActorService {
             .cluster
             .as_ref()
             .is_some_and(|c| c.app_unchecked())
+    }
+
+    /// Answers a node link (`/_wasmkeep/blobs/v1/<token>`, ADR 0030,
+    /// section 4) under this app runtime's key.
+    pub(crate) async fn blob_link(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+    ) -> Response<HyperOutgoingBody> {
+        let deleted = *self.inner.app_deleted.borrow();
+        crate::blobs::serve::serve(&self.inner.blobs, deleted, req).await
+    }
+
+    /// The app's files (ADR 0030), for the front's `blobs` calls.
+    pub(crate) fn blobs(&self) -> Option<Arc<crate::blobs::Blobs>> {
+        Some(Arc::clone(&self.inner.blobs))
     }
 
     /// The app's folder under the data directory.
@@ -948,7 +997,11 @@ struct ActorHost {
     /// The running event's, when its hold is batched (ADR 0034): where
     /// `flush` stops waiting, and whom its uploads tell when they land.
     batched: Option<BatchedEvent>,
+    /// The actor's files (ADR 0030): its namespace, and its hold for writes.
+    blob: crate::blobs::host::Caller,
 }
+
+crate::blobs::host::impl_blobs_host!(ActorHost);
 
 /// What a batched hold's event gives its `flush` (ADR 0034, section 4).
 struct BatchedEvent {

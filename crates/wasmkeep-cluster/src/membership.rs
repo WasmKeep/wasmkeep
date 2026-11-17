@@ -111,6 +111,9 @@ pub struct NodeInfo {
     pub can_rate_limits: bool,
     /// Reads format 7 and serves static assets. Announced only from A4.
     pub can_assets: bool,
+    /// It keeps actors' and the front's files, ends them with their actor
+    /// and carries an incarnation through a restore (ADR 0030, section 11).
+    pub can_blobs: bool,
     /// Honours whole-app restore fences (capability word `restore`).
     pub can_restore: bool,
     /// Supports live actor restores and delete supersession markers.
@@ -443,6 +446,7 @@ impl NodeInfo {
             can_flush: words.can_flush,
             can_rate_limits: words.can_rate_limits,
             can_assets: words.can_assets,
+            can_blobs: words.can_blobs,
             can_restore: words.can_restore,
             can_actor_restore: words.can_actor_restore,
             can_recorded_head: words.can_recorded_head,
@@ -473,6 +477,7 @@ impl NodeInfo {
             (self.can_recorded_head, "recorded-head"),
             (self.can_multi_app, "multi-app"),
             (self.can_assets, "assets"),
+            (self.can_blobs, "blobs"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -504,6 +509,7 @@ impl NodeInfo {
             can_flush: words.contains(&"flush"),
             can_rate_limits: words.contains(&"rate_limits"),
             can_assets: words.contains(&"assets"),
+            can_blobs: words.contains(&"blobs"),
             can_restore: words.contains(&"restore"),
             can_actor_restore: words.contains(&"actor-restore"),
             can_recorded_head: words.contains(&"recorded-head"),
@@ -770,6 +776,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_flush: true,
             can_rate_limits: true,
             can_assets: true,
+            can_blobs: true,
             can_restore: true,
             can_actor_restore: true,
             can_recorded_head: true,
@@ -1043,6 +1050,7 @@ mod tests {
             can_flush: false,
             can_rate_limits: false,
             can_assets: false,
+            can_blobs: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1087,6 +1095,7 @@ mod tests {
             can_flush: false,
             can_rate_limits: false,
             can_assets: false,
+            can_blobs: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1167,6 +1176,7 @@ mod tests {
             can_flush: false,
             can_rate_limits: false,
             can_assets: false,
+            can_blobs: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1548,6 +1558,7 @@ mod tests {
             can_flush: false,
             can_rate_limits: false,
             can_assets: false,
+            can_blobs: false,
             can_restore: false,
             can_actor_restore: false,
             instance: lease.instance,
@@ -1669,7 +1680,7 @@ mod tests {
         assert_eq!(
             payload.lines().nth(8),
             Some(
-                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets"
+                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets blobs"
             ),
             "{payload}"
         );
@@ -1772,6 +1783,7 @@ mod tests {
         let node = NodeInfo {
             can_rate_limits: true,
             can_assets: false,
+            can_blobs: false,
             ..loaded_node()
         };
         assert!(NodeInfo::decode(&node.encode()).unwrap().can_rate_limits);
@@ -1822,6 +1834,7 @@ mod tests {
             can_flush: true,
             can_rate_limits: false,
             can_assets: false,
+            can_blobs: false,
             can_restore: true,
             can_actor_restore: false,
             ..loaded_node()
@@ -1847,6 +1860,7 @@ mod tests {
             can_flush: false,
             can_rate_limits: false,
             can_assets: false,
+            can_blobs: false,
             can_restore: false,
             can_actor_restore: false,
             ..node

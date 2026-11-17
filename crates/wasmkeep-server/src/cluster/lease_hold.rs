@@ -740,6 +740,16 @@ impl LeaseHold {
         }
     }
 
+    /// Keeps `origin_ms` as the record's idle origin at this hold's
+    /// release (ADR 0030, decision 8): a hold that judged a sweep record
+    /// ran no code, and must not make an idle actor look active. Only a
+    /// record in the recorded-head format carries it.
+    pub(crate) fn keep_idle_since(&self, origin_ms: u64) {
+        if let Some(hold) = self.cell.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            hold.head.idle_since_ms = Some(origin_ms);
+        }
+    }
+
     /// The generation this node holds, while it holds it.
     pub(crate) fn generation(&self) -> Option<u64> {
         self.cell
@@ -1034,6 +1044,17 @@ impl Cluster {
         )))
     }
 
+    /// A sweep judgement released `address` carrying its idle origin: the
+    /// next expiry passes read it back (bounded; forgotten past 100,000).
+    pub(crate) fn note_judged(&self, address: &ActorAddress) {
+        let key = self.owner_key(address);
+        let mut judged = self.judged.lock().unwrap_or_else(|p| p.into_inner());
+        if judged.len() >= 100_000 {
+            judged.clear();
+        }
+        judged.insert(key);
+    }
+
     /// The idle origin an actor's version 2 record carries (`idle-since`,
     /// ADR 0035), for an idle expiry pass: read only for actors this node
     /// refused, whose refused cycles rewrote the record. `None`: none,
@@ -1043,7 +1064,12 @@ impl Cluster {
             return None;
         }
         let key = self.owner_key(address);
-        if !self.pending.was_refused(&key) {
+        let judged = self
+            .judged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&key);
+        if !self.pending.was_refused(&key) && !judged {
             return None;
         }
         let read = tokio::time::timeout(self.lease_attempt, async {

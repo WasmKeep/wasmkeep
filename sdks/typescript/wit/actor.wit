@@ -268,9 +268,144 @@ interface env {
     get: func(name: string) -> option<string>;
 }
 
-/// WasmKeep's own part of the actor world: what the host bindings and the
-/// guest SDK are generated from.
-world actor-core {
+/// Files kept in the app's part of the bucket, or on the node's disk
+/// without one, in the caller's own namespace: an actor's, or the front's
+/// (docs/adr/0030-files-and-static-assets.md). No call names a namespace:
+/// the host derives it from where the code runs.
+///
+/// A key is 1 to 512 bytes of `[A-Za-z0-9._~-]` and `/`, in segments of at
+/// most 255 bytes separated by single `/`, none empty, `.` or `..`, not
+/// starting or ending with `/`; anything else is `invalid-key`. Calls wait
+/// on the bucket or disk within the event's wall clock, are not part of the
+/// database's transaction, and survive its rollback. Streams and uploads
+/// still open when the event ends are closed and abandoned.
+interface blobs {
+    use wasi:io/streams@0.2.12.{input-stream, output-stream};
+
+    record blob-info {
+        key: string,
+        size: u64,
+        /// As given when written; `application/octet-stream` if none was.
+        content-type: string,
+        /// The bucket's ETag, opaque: compare, never parse.
+        etag: string,
+        /// Milliseconds since the epoch, by the bucket's clock.
+        modified-ms: u64,
+    }
+
+    variant condition {
+        /// Write whatever is there.
+        any,
+        /// Write only if no file has this key.
+        absent,
+        /// Write only if the file's ETag is this one.
+        etag(string),
+    }
+
+    record write-options {
+        /// `type/subtype` with optional parameters, at most 256 bytes.
+        content-type: option<string>,
+        condition: condition,
+    }
+
+    variant disposition {
+        /// Downloaded under this name, or the key's last segment.
+        attachment(option<string>),
+        /// Shown by the browser: only for images, audio, video and plain text.
+        inline,
+    }
+
+    record download-options {
+        /// Default 300, at most 3,600.
+        expires-in-secs: option<u32>,
+        disposition: disposition,
+    }
+
+    record upload-options {
+        /// The exact size the browser will send.
+        size: u64,
+        content-type: string,
+        /// Default 900, at most 3,600.
+        expires-in-secs: option<u32>,
+    }
+
+    /// What the browser must send: `method` to `url`, with exactly these
+    /// headers, and a body of exactly the size given.
+    record upload-link {
+        url: string,
+        method: string,
+        headers: list<tuple<string, string>>,
+        expires-at-ms: u64,
+    }
+
+    record listing {
+        entries: list<blob-info>,
+        /// Pass as `after` for the next page; none at the end.
+        next: option<string>,
+    }
+
+    variant blob-error {
+        invalid-key(string),
+        /// Past a size limit.
+        too-large,
+        /// The app is over its stored-bytes limit.
+        quota-exceeded,
+        /// The write's condition did not hold.
+        conflict,
+        /// Refused as asked (an inline link for an unsafe type, a write
+        /// without a valid hold, a closed upload).
+        not-allowed(string),
+        /// The bucket or disk failed or did not answer in time: not known
+        /// to have happened. Safe to retry.
+        unavailable(string),
+    }
+
+    head: func(key: string) -> result<option<blob-info>, blob-error>;
+
+    /// The whole file, up to 16 MiB (else `too-large`; use `open-read`).
+    get: func(key: string) -> result<option<tuple<blob-info, list<u8>>>, blob-error>;
+
+    /// Writes the whole file, up to 16 MiB. Returns once it is durable.
+    put: func(key: string, body: list<u8>, options: write-options) -> result<blob-info, blob-error>;
+
+    /// Streams a file, or the bytes `[start, start + length)` of it.
+    open-read: func(key: string, range: option<tuple<u64, u64>>)
+        -> result<option<tuple<blob-info, input-stream>>, blob-error>;
+
+    /// Starts a streamed write; nothing is visible until `finish`.
+    open-write: func(key: string, options: write-options) -> result<upload, blob-error>;
+
+    resource upload {
+        /// The stream to write the body to; only once.
+        body: func() -> result<output-stream, blob-error>;
+        /// Ends the body and makes the file durable, with its condition.
+        /// Dropping an upload without `finish` abandons it.
+        finish: static func(this: upload) -> result<blob-info, blob-error>;
+    }
+
+    /// Removes the file if it exists. Durable when it returns.
+    delete: func(key: string) -> result<_, blob-error>;
+
+    /// Files whose key starts with `prefix` as a string (`up` finds
+    /// `uploads/a`; `uploads/` finds what is under it), in key order,
+    /// after the key `after`, at most `limit` (1 to 1,000). `prefix` is
+    /// empty or over the key alphabet and may end with `/`; `after` is a
+    /// key.
+    %list: func(prefix: string, after: option<string>, limit: u32) -> result<listing, blob-error>;
+
+    /// A link a browser downloads the file from, without this code.
+    link-download: func(key: string, options: download-options) -> result<string, blob-error>;
+
+    /// A link a browser uploads one new file to, without this code.
+    link-upload: func(key: string, options: upload-options) -> result<upload-link, blob-error>;
+}
+
+/// WasmKeep's own part of the actor world, without files: everything of
+/// `actor-core` but `blobs`. A component built for it imports no `blobs`,
+/// so it links on a node of any release since `blobs` came
+/// (docs/adr/0030-files-and-static-assets.md); the TypeScript and Python
+/// builds target it unless the code uses files.
+world actor-base {
     import storage;
     import alarms;
     import actors;
@@ -309,22 +444,24 @@ world actor-core {
     export on-websocket-close: func(conn: u64, code: u16, reason: string);
 }
 
-/// The world actor components target: WasmKeep's interfaces plus the standard
-/// `wasi:http/proxy` world, whose `incoming-handler` receives requests and
-/// whose imports provide outbound HTTP, clocks, randomness and stdio.
-///
-/// This is also the capability list. Toolchains import more than they use
-/// (ComponentizeJS and componentize-py import `wasi:filesystem`, Python also
-/// `wasi:sockets`), so the host links those too, inert: no preopened
-/// directories, and sockets and name lookups refused.
-world actor {
-    include actor-core;
+/// WasmKeep's own part of the actor world: what the host bindings and the
+/// guest SDK are generated from.
+world actor-core {
+    include actor-base;
+    import blobs;
+}
+
+/// What actor and front components import beside WasmKeep's interfaces:
+/// the standard `wasi:http/proxy` world, whose `incoming-handler` receives
+/// requests and whose imports provide outbound HTTP, clocks, randomness and
+/// stdio, and the `wasi:cli` interfaces standard libraries import.
+world guest-wasi {
     include wasi:http/proxy@0.2.12;
 
     // Imported by the standard library of Rust (and most languages) on
-    // wasm32-wasip2. The host provides them empty: no arguments, no
-    // environment variables, no terminal. Configuration arrives through
-    // the `env` interface instead.
+    // wasm32-wasip2, and by ComponentizeJS. The host provides them empty:
+    // no arguments, no environment variables, no terminal. Configuration
+    // arrives through the `env` interface instead.
     import wasi:cli/environment@0.2.12;
     import wasi:cli/exit@0.2.12;
     import wasi:cli/terminal-input@0.2.12;
@@ -338,35 +475,54 @@ world actor {
     import wasi:random/insecure-seed@0.2.12;
 }
 
-/// What the host links for a front, besides WASI and `wasi:http`: an app's
-/// optional stateless component that receives every request outside
-/// `/actor/` and `/_wasmkeep/` (see docs/adr/0023-the-front.md). It calls
-/// the app's actors with `actors.call` (or several at once with
-/// `calls.call-many`), as an inside caller, and reads its
-/// own values with `env.get`. Its `self-address` is
-/// `{ tenant, class: "_front", name: "main" }`.
-world front-core {
+/// The world actor components target: WasmKeep's interfaces plus
+/// `guest-wasi`.
+///
+/// This is also the capability list. Toolchains import more than they use
+/// (ComponentizeJS and componentize-py import `wasi:filesystem`, Python also
+/// `wasi:sockets`), so the host links those too, inert: no preopened
+/// directories, and sockets and name lookups refused.
+world actor {
+    include actor-core;
+    include guest-wasi;
+}
+
+/// World `actor` without files (`actor-base` instead of `actor-core`).
+world actor-without-files {
+    include actor-base;
+    include guest-wasi;
+}
+
+/// A front's own imports without files: `front-core` but `blobs`.
+world front-base {
     import actors;
     import calls;
     import env;
 }
 
-/// The world front components target: `front-core` plus the standard
-/// `wasi:http/proxy` world. A front exports only the incoming handler; it
-/// has no storage, alarms or WebSockets. Every plain `wasi:http/proxy`
+/// What the host links for a front, besides WASI and `wasi:http`: an app's
+/// optional stateless component that receives every request outside
+/// `/actor/` and `/_wasmkeep/` (see docs/adr/0023-the-front.md). It calls
+/// the app's actors with `actors.call` (or several at once with
+/// `calls.call-many`), as an inside caller, and reads its
+/// own values with `env.get`, and keeps files of its own with `blobs`.
+/// Its `self-address` is `{ tenant, class: "_front", name: "main" }`.
+world front-core {
+    include front-base;
+    import blobs;
+}
+
+/// The world front components target: `front-core` plus `guest-wasi`. A
+/// front exports only the incoming handler; it has no database, alarms or
+/// WebSockets: files are all it keeps. Every plain `wasi:http/proxy`
 /// component is a valid front.
 world front {
     include front-core;
-    include wasi:http/proxy@0.2.12;
+    include guest-wasi;
+}
 
-    // The same as world `actor`'s, for the same reason: standard libraries
-    // and ComponentizeJS import them, and the host provides them empty.
-    import wasi:cli/environment@0.2.12;
-    import wasi:cli/exit@0.2.12;
-    import wasi:cli/terminal-input@0.2.12;
-    import wasi:cli/terminal-output@0.2.12;
-    import wasi:cli/terminal-stdin@0.2.12;
-    import wasi:cli/terminal-stdout@0.2.12;
-    import wasi:cli/terminal-stderr@0.2.12;
-    import wasi:random/insecure-seed@0.2.12;
+/// World `front` without files (`front-base` instead of `front-core`).
+world front-without-files {
+    include front-base;
+    include guest-wasi;
 }

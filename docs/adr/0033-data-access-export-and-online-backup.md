@@ -20,6 +20,7 @@
   rebuilt from the committed alarm; a restore of a whole app fenced
   from node starts)
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): in a batched class a position is a segment of several events, stamped with its capture time; `--at` and `--txid` choose between segments.
+- Amended by [ADR 0030](0030-files-and-static-assets.md) (2026-11-17, proposed; with its slices B5 and B6): a backup copies an app's files as listed and the assets of the versions it keeps, and `backup restore` brings them back; `actor restore` rewinds the database only and its replacement keeps the actor's current `blob_incarnation`. See that record's section 5.
 - Date: 2026-11-14
 - Milestone: [Now](../../ROADMAP.md#now), `0.5.0`: actor export,
   read-only SQL, verified online backup and single-actor point-in-time
@@ -566,11 +567,14 @@ app is done:
 | `R alarms/` | Copied at another moment than the history, it can miss an entry a copied database names (an alarm lost) or name one it does not. Rebuilt from the databases instead (section 5). |
 | `R moves/`, `R deletes/`, `R restores/`, `control/` | Operator intents of that moment. A restore must not drain, move or delete again. |
 | `probe/`, `diagnose/`, `cluster/migration` and the migration marks | Scratch and one-time state. |
+| `R blob-sweeps/`, `R blob-usage` (ADR 0030, amendment of 2026-11-17) | Sweeps of that moment and a count. A `swept` record written back beside a restored database of that incarnation would remove a live actor's files; the count is taken again. |
 
 Files of [ADR 0030](0030-files-and-static-assets.md) (proposed, not built) live under `R blobs/` and
-can be overwritten under conditions. A run would copy them after the
+can be overwritten under conditions. A run copies them after the
 history, by listing, with no consistency between a row and the file it
-names. That is left to that record (Not decided here).
+names; `R blob-sweeps/` and `R blob-usage` are in the table above. That
+record's section 5 ("Backup and restore of a whole app", amendment of
+2026-11-17) decides it.
 
 **Incremental runs.** Every run is a full run in what it promises, and
 incremental in what it moves:
@@ -1013,10 +1017,11 @@ delete (section 1), otherwise from a backup. A restore asked for before
 a delete that ran first is superseded. A move moves the restored actor.
 
 **Files of [ADR 0030](0030-files-and-static-assets.md) (proposed).** A restored database names the files
-of its own time. A restore to a point before a delete brings back an
-incarnation whose files were swept. That record already says such a
-restore takes the files from the same backup. Restoring files is not in
-this one.
+of its own time, and this command restores no file. The replacement
+keeps the actor's current `blob_incarnation`, carried over in step 6
+like `operator_delete`, never the staged database's: a restore to a
+point before a delete brings back rows whose files were swept, and they
+stay gone (that record, section 5, amendment of 2026-11-17).
 
 **The command's answers**: `.done` prints "Restored to txid N of
 generation G, now txid M" and removes the outcome; `.conflict` prints
@@ -1211,8 +1216,9 @@ What follows from it:
    wrote, and how its schema is checked, is a product question.
 4. **Two credentials in one command** (`--to-env FILE`), or a profile
    file shared with the other commands.
-5. **Files of [ADR 0030](0030-files-and-static-assets.md)**, once built: copy order, and whether a run
-   records which incarnations its databases name.
+5. **Files of [ADR 0030](0030-files-and-static-assets.md)**: decided there (section 5, amendment of
+   2026-11-17): copied after the history, as listed, and a run records
+   the incarnation each database names.
 6. **`wasmkeep bucket verify`** for the live bucket (the roadmap's
    "verify a bucket"): section 1's replay over every actor, writing
    nothing. It falls out of `backup create` without the destination.

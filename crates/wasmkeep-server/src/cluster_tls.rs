@@ -745,6 +745,7 @@ mod tests {
             can_flush: false,
             can_rate_limits: false,
             can_assets: false,
+            can_blobs: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,

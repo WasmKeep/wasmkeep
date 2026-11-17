@@ -4,6 +4,7 @@
 use anyhow::Context;
 mod actor_groups;
 pub mod backup;
+pub mod blob_links;
 pub mod feed;
 
 /// Parses `TENANT/APP`.

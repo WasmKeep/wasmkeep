@@ -85,6 +85,15 @@ impl App {
                     Some(actors) => actors.hello(req).await,
                     None => text_response(StatusCode::NOT_FOUND, "not found\n"),
                 },
+                // Node links (ADR 0030, section 4): the public port only.
+                p if p.starts_with(crate::blobs::links::NODE_LINK_PATH)
+                    && req.extensions().get::<ArrivedOnClusterPort>().is_none() =>
+                {
+                    match &self.actors {
+                        Some(actors) => actors.blob_link(req).await,
+                        None => text_response(StatusCode::NOT_FOUND, "not found\n"),
+                    }
+                }
                 READY_PATH if get => match self.actors.as_ref().and_then(ActorService::not_ready) {
                     None => text_response(StatusCode::OK, "ready\n"),
                     // Why stays on the private metrics page: this port faces

@@ -1,6 +1,8 @@
 //! The host bindings and the guest SDK agree: examples/counter, built with
 //! wasmkeep-sdk, instantiates against `actor-core` host bindings (with fake
 //! storage) plus WASI, and its `on-init` reaches the host with the right SQL.
+//! Components that use `blobs` link in both worlds, and those that do not
+//! import it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
@@ -8,13 +10,58 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
+use wasmkeep_wit::ActorCorePre;
 use wasmkeep_wit::wasmkeep::actor::actors::{CallError, Request, Response};
+use wasmkeep_wit::wasmkeep::actor::blobs::{self, BlobError, BlobInfo, Listing, Upload};
 use wasmkeep_wit::wasmkeep::actor::types::{Rows, SqlError, Value};
-use wasmkeep_wit::wasmkeep::actor::{actors, alarms, calls, storage, types, websockets};
-use wasmkeep_wit::{ActorCore, ActorCorePre};
-use wasmtime::component::{HasSelf, Linker, ResourceTable};
+use wasmkeep_wit::wasmkeep::actor::{actors, alarms, calls, env, storage, types, websockets};
+use wasmtime::component::{HasSelf, Linker, Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
+
+fn build(dir: &str, name: &str) -> Vec<u8> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(dir);
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(cargo)
+        .current_dir(&root)
+        .args([
+            "build",
+            "-j",
+            "4",
+            "--release",
+            "--locked",
+            "--target",
+            "wasm32-wasip2",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "building {dir} failed");
+    std::fs::read(root.join(format!("target/wasm32-wasip2/release/{name}.wasm"))).unwrap()
+}
+
+/// Links `actor-core` interface by interface: the world's `add_to_linker`
+/// would define `wasi:io` again, which `blobs` uses and WASI links.
+fn link_actor_core(linker: &mut Linker<State>) {
+    fn get(s: &mut State) -> &mut Fake {
+        &mut s.fake
+    }
+    types::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+    storage::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+    alarms::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+    actors::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+    calls::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+    websockets::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+    env::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+    blobs::add_to_linker::<State, HasSelf<Fake>>(linker, get).unwrap();
+}
+
+fn linker(runtime: &Runtime) -> Linker<State> {
+    let mut linker = Linker::<State>::new(runtime.engine());
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).unwrap();
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).unwrap();
+    link_actor_core(&mut linker);
+    linker
+}
 
 fn counter_wasm() -> Vec<u8> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter");
@@ -146,7 +193,103 @@ impl websockets::Host for Fake {
     }
 }
 
-impl wasmkeep_wit::wasmkeep::actor::env::Host for Fake {
+fn no_files() -> BlobError {
+    BlobError::Unavailable("fake".into())
+}
+
+impl blobs::HostUpload for Fake {
+    async fn body(
+        &mut self,
+        _upload: Resource<Upload>,
+    ) -> wasmtime::Result<Result<Resource<wasmtime_wasi::p2::DynOutputStream>, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn finish(
+        &mut self,
+        _upload: Resource<Upload>,
+    ) -> wasmtime::Result<Result<BlobInfo, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn drop(&mut self, _upload: Resource<Upload>) -> wasmtime::Result<()> {
+        Ok(())
+    }
+}
+
+impl blobs::Host for Fake {
+    async fn head(
+        &mut self,
+        _key: String,
+    ) -> wasmtime::Result<Result<Option<BlobInfo>, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn get(
+        &mut self,
+        _key: String,
+    ) -> wasmtime::Result<Result<Option<(BlobInfo, Vec<u8>)>, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn put(
+        &mut self,
+        _key: String,
+        _body: Vec<u8>,
+        _options: blobs::WriteOptions,
+    ) -> wasmtime::Result<Result<BlobInfo, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn open_read(
+        &mut self,
+        _key: String,
+        _range: Option<(u64, u64)>,
+    ) -> wasmtime::Result<
+        Result<Option<(BlobInfo, Resource<wasmtime_wasi::p2::DynInputStream>)>, BlobError>,
+    > {
+        Ok(Err(no_files()))
+    }
+
+    async fn open_write(
+        &mut self,
+        _key: String,
+        _options: blobs::WriteOptions,
+    ) -> wasmtime::Result<Result<Resource<Upload>, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn delete(&mut self, _key: String) -> wasmtime::Result<Result<(), BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn list(
+        &mut self,
+        _prefix: String,
+        _after: Option<String>,
+        _limit: u32,
+    ) -> wasmtime::Result<Result<Listing, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn link_download(
+        &mut self,
+        _key: String,
+        _options: blobs::DownloadOptions,
+    ) -> wasmtime::Result<Result<String, BlobError>> {
+        Ok(Err(no_files()))
+    }
+
+    async fn link_upload(
+        &mut self,
+        _key: String,
+        _options: blobs::UploadOptions,
+    ) -> wasmtime::Result<Result<blobs::UploadLink, BlobError>> {
+        Ok(Err(no_files()))
+    }
+}
+
+impl env::Host for Fake {
     async fn get(&mut self, _name: String) -> wasmtime::Result<Option<String>> {
         Ok(None)
     }
@@ -201,11 +344,16 @@ async fn counter_on_init_reaches_the_host() {
             .any(|i| i.starts_with("wasmkeep:actor/calls@")),
         "{imports:?}"
     );
+    // Nor `blobs` (ADR 0030): a component that does not use files imports
+    // none, and links on a node with or without them.
+    assert!(
+        !imports
+            .iter()
+            .any(|i| i.starts_with("wasmkeep:actor/blobs@")),
+        "{imports:?}"
+    );
 
-    let mut linker = Linker::<State>::new(runtime.engine());
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker).unwrap();
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).unwrap();
-    ActorCore::add_to_linker::<State, HasSelf<Fake>>(&mut linker, |s| &mut s.fake).unwrap();
+    let linker = linker(&runtime);
 
     let pre = ActorCorePre::new(runtime.instantiate_pre(&linker, &component).unwrap()).unwrap();
     let mut store = runtime.new_async_store(State {
@@ -262,10 +410,52 @@ fn hello_is_not_an_actor() {
     })
     .unwrap();
     let component = runtime.compile(&wasm).unwrap();
+    let linker = linker(&runtime);
+    let pre = runtime.instantiate_pre(&linker, &component).unwrap();
+    assert!(ActorCorePre::new(pre).is_err());
+}
+
+/// A component that uses files imports `blobs` and `wasi:io/streams`, and
+/// links: an actor against `actor-core`, a front against `front-core`.
+#[test]
+fn components_using_files_link_in_both_worlds() {
+    let runtime = Runtime::new(&RuntimeConfig {
+        max_instances: 2,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let blobs_import = |c: &wasmtime::component::Component| {
+        c.component_type()
+            .imports(runtime.engine())
+            .any(|(name, _)| name == "wasmkeep:actor/blobs@0.2.0")
+    };
+    let actor = runtime
+        .compile(&build(
+            "../wasmkeep-server/tests/guests/blob-actor",
+            "blob_actor",
+        ))
+        .unwrap();
+    assert!(blobs_import(&actor));
+    let pre = runtime.instantiate_pre(&linker(&runtime), &actor).unwrap();
+    ActorCorePre::new(pre).unwrap();
+
+    let front = runtime
+        .compile(&build(
+            "../wasmkeep-server/tests/guests/test-front",
+            "test_front",
+        ))
+        .unwrap();
+    assert!(blobs_import(&front));
     let mut linker = Linker::<State>::new(runtime.engine());
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).unwrap();
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).unwrap();
-    ActorCore::add_to_linker::<State, HasSelf<Fake>>(&mut linker, |s| &mut s.fake).unwrap();
-    let pre = runtime.instantiate_pre(&linker, &component).unwrap();
-    assert!(ActorCorePre::new(pre).is_err());
+    fn get(s: &mut State) -> &mut Fake {
+        &mut s.fake
+    }
+    actors::add_to_linker::<State, HasSelf<Fake>>(&mut linker, get).unwrap();
+    calls::add_to_linker::<State, HasSelf<Fake>>(&mut linker, get).unwrap();
+    env::add_to_linker::<State, HasSelf<Fake>>(&mut linker, get).unwrap();
+    blobs::add_to_linker::<State, HasSelf<Fake>>(&mut linker, get).unwrap();
+    let pre = runtime.instantiate_pre(&linker, &front).unwrap();
+    wasmtime_wasi_http::p2::bindings::ProxyPre::new(pre).unwrap();
 }

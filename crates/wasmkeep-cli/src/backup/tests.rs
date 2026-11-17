@@ -3621,3 +3621,522 @@ async fn backup_restore_unknown_resume_files_nothing() {
     );
     assert!(list_bounded(&target, "").await.unwrap().is_empty());
 }
+
+// Files and assets (ADR 0030, section 5, "Backup and restore of a whole
+// app"; slice B6).
+
+/// The source's epoch: neither marker written.
+fn fresh_epoch() -> String {
+    wasmkeep_server::blobs::epoch(None, None)
+}
+fn alice_ns(incarnation: &str) -> String {
+    format!("counter/{}/{incarnation}", digest(b"alice"))
+}
+async fn put_file(store: &Store, epoch: &str, ns: &str, name: &str, bytes: &[u8], ctype: &str) {
+    let mut attributes = object_store::Attributes::new();
+    attributes.insert(
+        object_store::Attribute::ContentType,
+        ctype.to_owned().into(),
+    );
+    store
+        .put_opts(
+            &Key::parse(format!("state/acme/shop/blobs/{epoch}/{ns}/{name}")).unwrap(),
+            bytes.to_vec().into(),
+            PutOptions {
+                attributes,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+async fn file_at(store: &Store, path: &str) -> Option<(Vec<u8>, Option<String>)> {
+    let got = match store
+        .get_opts(&Key::parse(path).unwrap(), Default::default())
+        .await
+    {
+        Ok(got) => got,
+        Err(object_store::Error::NotFound { .. }) => return None,
+        Err(e) => panic!("{e}"),
+    };
+    let ctype = got
+        .attributes
+        .get(&object_store::Attribute::ContentType)
+        .map(|v| v.as_ref().to_owned());
+    Some((got.bytes().await.unwrap().to_vec(), ctype))
+}
+/// A second version with one asset, made current.
+async fn deploy_assets(source: &Store) -> (String, String) {
+    let content = b"<h1>hello</h1>".to_vec();
+    let content_digest = digest(&content);
+    let index = format!(
+        "wasmkeep-assets 1\nnot-found front\nfile index.html text/html identity:{content_digest}:{}\n",
+        content.len()
+    );
+    let parsed = wasmkeep_server::assets::Index::parse(index.as_bytes()).unwrap();
+    assert_eq!(parsed.bytes(), index.as_bytes());
+    let index_digest = digest(index.as_bytes());
+    put(
+        source,
+        &format!("apps/acme/shop/_assets/index/{index_digest}"),
+        index.into_bytes(),
+        false,
+    )
+    .await
+    .unwrap();
+    put(
+        source,
+        &format!("apps/acme/shop/_assets/content/{content_digest}"),
+        content,
+        false,
+    )
+    .await
+    .unwrap();
+    // Markers a deploy leaves: never copied.
+    put(
+        source,
+        "apps/acme/shop/_assets/deploying/x",
+        b"m".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    put(
+        source,
+        "apps/acme/shop/v2/manifest",
+        format!("wasmkeep-manifest 7\nprevious v1\nassets {index_digest}\n").into_bytes(),
+        false,
+    )
+    .await
+    .unwrap();
+    put(source, "apps/acme/shop/current", b"v2 2 3\n".to_vec(), true)
+        .await
+        .unwrap();
+    (index_digest, content_digest)
+}
+async fn restored_epoch(target: &Store) -> String {
+    let recreated = optional(target, "apps/acme/shop/recreated").await.unwrap();
+    let restored = optional(target, "apps/acme/shop/restored").await.unwrap();
+    wasmkeep_server::blobs::epoch(recreated.as_deref(), restored.as_deref())
+}
+
+#[tokio::test]
+async fn files_and_assets_come_back_under_the_new_epoch() {
+    let f = Fixture::new().await;
+    let epoch = fresh_epoch();
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("0"),
+        "photos/a.jpg",
+        b"jpeg",
+        "image/jpeg",
+    )
+    .await;
+    put_file(
+        &f.source,
+        &epoch,
+        "_front/main/0",
+        "logo.png",
+        b"png",
+        "image/png",
+    )
+    .await;
+    // Another incarnation of alice (deleted after her copy), and an actor
+    // the run holds no database for: neither comes back.
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("00000000deadbeef"),
+        "old",
+        b"old",
+        "text/plain",
+    )
+    .await;
+    let bob = format!("counter/{}/0", digest(b"bob"));
+    put_file(&f.source, &epoch, &bob, "b", b"bob", "text/plain").await;
+    // Cluster state that is never copied.
+    put(
+        &f.source,
+        &format!("state/acme/shop/blob-sweeps/counter/{}/0", digest(b"alice")),
+        b"wasmkeep-blob-sweep 1\nswept\n".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    put(
+        &f.source,
+        "state/acme/shop/blob-usage",
+        b"1".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    let (index_digest, content_digest) = deploy_assets(&f.source).await;
+    let id = f.create().await;
+    verify(&f.dest, "", &id, None).await.unwrap();
+    let run = load(&f.dest, "", &id).await.unwrap();
+    assert_eq!(
+        disk_actor(&run.actors[0]).unwrap()["blob_namespace"],
+        json!(alice_ns("0"))
+    );
+    assert_eq!(run.apps[0]["blob_epoch"], json!(epoch));
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    restore::execute(
+        &restore_args(&id, false),
+        &f.dest,
+        "",
+        &target,
+        "",
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    let new = restored_epoch(&target).await;
+    assert_ne!(new, epoch);
+    let root = format!("state/acme/shop/blobs/{new}");
+    assert_eq!(
+        file_at(&target, &format!("{root}/{}/photos/a.jpg", alice_ns("0"))).await,
+        Some((b"jpeg".to_vec(), Some("image/jpeg".into())))
+    );
+    assert_eq!(
+        file_at(&target, &format!("{root}/_front/main/0/logo.png")).await,
+        Some((b"png".to_vec(), Some("image/png".into())))
+    );
+    let written: Vec<_> = list_bounded(&target, "state/acme/shop/")
+        .await
+        .unwrap()
+        .into_keys()
+        .collect();
+    assert!(
+        !written
+            .iter()
+            .any(|k| k.contains("deadbeef") || k.contains(&digest(b"bob"))),
+        "{written:?}"
+    );
+    assert!(
+        !written
+            .iter()
+            .any(|k| k.starts_with("blob-sweeps") || k == "blob-usage"),
+        "{written:?}"
+    );
+    assert!(
+        !written
+            .iter()
+            .any(|k| k.starts_with(&format!("blobs/{epoch}"))),
+        "{written:?}"
+    );
+    assert_eq!(
+        read(
+            &target,
+            &format!("apps/acme/shop/_assets/content/{content_digest}"),
+            MAX
+        )
+        .await
+        .unwrap(),
+        b"<h1>hello</h1>"
+    );
+    assert!(
+        optional(
+            &target,
+            &format!("apps/acme/shop/_assets/index/{index_digest}")
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        optional(&target, "apps/acme/shop/_assets/deploying/x")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Nor did the archive take any of it.
+    for object in array(&run.apps[0], "objects").unwrap() {
+        let k = text(object, "key").unwrap();
+        assert!(!k.contains("deploying") && !k.contains("blob-"), "{k}");
+    }
+}
+
+#[tokio::test]
+async fn a_second_run_reads_no_unchanged_file_and_verify_needs_every_file() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new().await;
+    let epoch = fresh_epoch();
+    put_file(&f.source, &epoch, &alice_ns("0"), "a", b"one", "text/plain").await;
+    let readonly = Arc::new(ReadOnly {
+        inner: f.source.clone(),
+        gets: Default::default(),
+        collect: Default::default(),
+        collect_after: usize::MAX,
+        fail_collect: false,
+    });
+    let source: Store = readonly.clone();
+    create(&f.args(), &source, "", &f.dest, "").await.unwrap();
+    let first = latest(&f.dest, "").await.unwrap().unwrap();
+    // Count only GETs under blobs/ in the second run.
+    let counting = Arc::new(CountBlobGets {
+        inner: f.source.clone(),
+        gets: Default::default(),
+    });
+    let source: Store = counting.clone();
+    create(&f.args(), &source, "", &f.dest, "").await.unwrap();
+    assert_eq!(
+        counting.gets.load(Ordering::SeqCst),
+        0,
+        "an unchanged file was read again"
+    );
+    let second = latest(&f.dest, "").await.unwrap().unwrap();
+    assert_ne!(first, second);
+    verify(&f.dest, "", &second, None).await.unwrap();
+    f.dest
+        .delete(&Key::from(format!("data/{}", digest(b"one"))))
+        .await
+        .unwrap();
+    assert!(
+        verify(&f.dest, "", &second, None).await.is_err(),
+        "verify passed without the file's object"
+    );
+}
+
+#[tokio::test]
+async fn a_large_file_goes_through_the_spool() {
+    let f = Fixture::new().await;
+    let epoch = fresh_epoch();
+    let big: Vec<u8> = (0..20u32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("0"),
+        "big.bin",
+        &big,
+        "application/octet-stream",
+    )
+    .await;
+    let id = f.create().await;
+    let stored = read(&f.dest, &format!("data/{}", digest(&big)), MAX)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), big.len());
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    restore::execute(
+        &restore_args(&id, false),
+        &f.dest,
+        "",
+        &target,
+        "",
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    let new = restored_epoch(&target).await;
+    let (bytes, _) = file_at(
+        &target,
+        &format!("state/acme/shop/blobs/{new}/{}/big.bin", alice_ns("0")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(digest(&bytes), digest(&big));
+}
+
+#[tokio::test]
+async fn prune_keeps_a_named_file_and_drops_an_unnamed_one() {
+    let f = Fixture::new().await;
+    let epoch = fresh_epoch();
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("0"),
+        "kept",
+        b"kept",
+        "text/plain",
+    )
+    .await;
+    let first = f.create().await;
+    f.source
+        .delete(
+            &Key::parse(format!(
+                "state/acme/shop/blobs/{epoch}/{}/kept",
+                alice_ns("0")
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("0"),
+        "new",
+        b"new",
+        "text/plain",
+    )
+    .await;
+    let second = f.create().await;
+    // Keep latest (the second run) only: `kept` is named by no kept run.
+    prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+    assert!(load(&f.dest, "", &first).await.is_err());
+    assert!(
+        optional(&f.dest, &format!("data/{}", digest(b"new")))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        optional(&f.dest, &format!("data/{}", digest(b"kept")))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    verify(&f.dest, "", &second, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_in_place_restore_moves_files_to_a_new_epoch() {
+    let f = Fixture::new().await;
+    let epoch = fresh_epoch();
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("0"),
+        "a",
+        b"before",
+        "text/plain",
+    )
+    .await;
+    let id = f.create().await;
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("0"),
+        "a",
+        b"after",
+        "text/plain",
+    )
+    .await;
+    restore::execute(
+        &restore_args(&id, true),
+        &f.dest,
+        "",
+        &f.source,
+        "",
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    let new = restored_epoch(&f.source).await;
+    assert_ne!(new, epoch);
+    assert_eq!(
+        file_at(
+            &f.source,
+            &format!("state/acme/shop/blobs/{new}/{}/a", alice_ns("0"))
+        )
+        .await
+        .map(|f| f.0),
+        Some(b"before".to_vec())
+    );
+    // An upload through a link issued before the restore names the old
+    // epoch: it lands there, and nothing reads it.
+    put_file(
+        &f.source,
+        &epoch,
+        &alice_ns("0"),
+        "late",
+        b"late",
+        "text/plain",
+    )
+    .await;
+    assert!(
+        file_at(
+            &f.source,
+            &format!("state/acme/shop/blobs/{new}/{}/late", alice_ns("0"))
+        )
+        .await
+        .is_none()
+    );
+    // The undo run copied the files the restore replaced.
+    let labels = list_bounded(&f.dest, "before-restore/").await.unwrap();
+    let undo = String::from_utf8(
+        read(
+            &f.dest,
+            labels.values().next().unwrap().location.as_ref(),
+            MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        optional(&f.dest, &format!("data/{}", digest(b"after")))
+            .await
+            .unwrap()
+            .is_some(),
+        "undo run {undo} lacks the replaced file"
+    );
+}
+
+/// Counts GETs of files (`blobs/`) and passes everything to `inner`.
+#[derive(Debug)]
+struct CountBlobGets {
+    inner: Store,
+    gets: std::sync::atomic::AtomicUsize,
+}
+impl std::fmt::Display for CountBlobGets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("counting source")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for CountBlobGets {
+    async fn put_opts(
+        &self,
+        p: &Key,
+        b: object_store::PutPayload,
+        o: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(p, b, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &Key,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &Key,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if p.as_ref().contains("/blobs/") {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.get_opts(p, o).await
+    }
+    fn list(
+        &self,
+        prefix: Option<&Key>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    fn delete_stream(
+        &self,
+        s: futures_util::stream::BoxStream<'static, object_store::Result<Key>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Key>> {
+        self.inner.delete_stream(s)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &Key,
+        b: &Key,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(a, b, o).await
+    }
+}

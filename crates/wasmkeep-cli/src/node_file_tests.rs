@@ -27,6 +27,7 @@ min-resident = 200
 max-resident = 800
 max-front-requests = 32
 front-cpu-budget-ms = 50
+max-app-blob-bytes = 1073741824
 allow-outbound = ["127.0.0.1/32"]
 allow-outbound-port = [587]
 outbound-ca = ["ca/internal.pem"]
@@ -105,6 +106,7 @@ fn the_adr_example_parses_every_field_with_paths_from_the_file() {
     assert_eq!((a.min_resident, a.max_resident), (Some(200), Some(800)));
     assert_eq!(a.max_front_requests, Some(32));
     assert_eq!(a.front_cpu_budget_ms, Some(50));
+    assert_eq!(a.max_app_blob_bytes, Some(1 << 30));
     assert_eq!(a.allow_outbound, ["127.0.0.1/32".parse().unwrap()]);
     assert_eq!(a.allow_outbound_port, [587]);
     assert_eq!(a.outbound_ca, [dir.join("ca/internal.pem")]);
@@ -214,10 +216,21 @@ fn invalid_values_are_refused_naming_the_field() {
         ("min-resident = 900\nmax-resident = 800", "min-resident"),
         ("front-cpu-budget-ms = 0", "front-cpu-budget-ms"),
         ("max-front-requests = 0", "max-front-requests"),
+        ("max-app-blob-bytes = 0", "max-app-blob-bytes"),
+        ("max-app-blob-bytes = \"1G\"", "max-app-blob-bytes"),
         ("allow-outbound = [\"not-a-range\"]", "allow-outbound"),
         ("allow-outbound-port = [0]", "allow-outbound-port"),
         ("allow-outbound-port = [70000]", "allow-outbound-port"),
         ("no-alarms = \"yes\"", "no-alarms"),
+        ("blob-link-base = \"shop.example.com\"", "blob-link-base"),
+        (
+            "blob-link-base = \"https://shop.example.com/files\"",
+            "blob-link-base",
+        ),
+        (
+            "blob-link-base = \"https://user@shop.example.com\"",
+            "blob-link-base",
+        ),
         ("[app.env]\n_front = [\"f.env\"]", "env"),
         ("[app.env]\ncart = \"f.env\"", "env"),
         ("[app.access]\ncart = \"everyone\"", "access"),
@@ -465,6 +478,8 @@ const EVERY_APP_FLAG: &[&str] = &[
     "32",
     "--front-cpu-budget-ms",
     "70",
+    "--max-app-blob-bytes",
+    "4096",
     "--no-alarms",
 ];
 
@@ -541,6 +556,7 @@ secrets-key = ["k/shop.key", "k/shop-next.key"]
 max-sockets = 20000
 max-front-requests = 32
 front-cpu-budget-ms = 70
+max-app-blob-bytes = 4096
 no-alarms = true
 allow-outbound = ["127.0.0.1/32"]
 allow-outbound-port = [587]
@@ -715,4 +731,24 @@ fn several_apps_without_a_socket_ceiling_are_warned_about() {
     assert!(some.warnings().is_empty());
     let one = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
     assert!(one.warnings().is_empty());
+}
+
+#[test]
+fn blob_link_base_is_an_apps_field() {
+    let file = parse(
+        &format!(
+            "{LISTEN}{}",
+            app(
+                "acme/shop",
+                "shop-1",
+                "blob-link-base = \"https://files.example.net/\""
+            )
+        ),
+        at(),
+    )
+    .unwrap();
+    assert_eq!(
+        file.apps[0].blob_link_base.as_deref(),
+        Some("https://files.example.net")
+    );
 }

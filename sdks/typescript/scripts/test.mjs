@@ -3,7 +3,8 @@
 // dependency) and runs it with node's test runner. The host's
 // `wasmkeep:actor/actors` import is replaced by test/host-stub.ts (and
 // `wasmkeep:actor/calls` by test/calls-stub.ts, over it, and
-// `wasmkeep:actor/env` by test/env-stub.ts, empty), so the
+// `wasmkeep:actor/env` by test/env-stub.ts, empty, and
+// `wasmkeep:actor/blobs` by test/blobs-stub.ts, files in memory), so the
 // clients run against fake actors; nothing else from the host is loaded.
 
 import { build } from "esbuild";
@@ -73,6 +74,7 @@ try {
           b.onResolve({ filter: /^wasmkeep:actor\/alarms@/ }, () => ({ path: join(root, "test", "room-alarms-stub.ts") }));
           b.onResolve({ filter: /^wasmkeep:actor\/websockets@/ }, () => ({ path: join(root, "test", "sockets-stub.ts") }));
           b.onResolve({ filter: /^wasmkeep:actor\/storage@/ }, () => ({ path: join(root, "test", "directory-storage-stub.ts") }));
+          b.onResolve({ filter: /^wasmkeep:actor\/blobs@/ }, () => ({ path: join(root, "test", "blobs-stub.ts") }));
           b.onResolve({ filter: /^(wasmkeep|wasi):/ }, (a) => ({
             errors: [{ text: `${a.path} is not available under node: test a module that does not import it` }],
           }));

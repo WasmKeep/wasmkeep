@@ -71,6 +71,10 @@ pub(crate) struct AppEntry {
     pub(crate) front_cpu_budget_ms: Option<u64>,
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) no_alarms: bool,
+    /// Where its node links point (ADR 0030, section 4).
+    pub(crate) blob_link_base: Option<String>,
+    /// Its stored-bytes limit (ADR 0030, section 7).
+    pub(crate) max_app_blob_bytes: Option<u64>,
 }
 
 /// Reads and checks the file at `path`.
@@ -116,6 +120,8 @@ const APP: &[&str] = &[
     "front-cpu-budget-ms",
     "data-dir",
     "no-alarms",
+    "blob-link-base",
+    "max-app-blob-bytes",
 ];
 
 /// The node socket ceiling when `[limits]` names none (as
@@ -419,6 +425,14 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
             .map(|n| u64::try_from(n).unwrap_or(u64::MAX));
         a.data_dir = string_at(&src, t, "data-dir", what)?.map(|(p, _)| dir.join(p));
         a.no_alarms = boolean(&src, t, "no-alarms", what)?;
+        a.max_app_blob_bytes = positive(&src, t, "max-app-blob-bytes", what)?
+            .map(|n| u64::try_from(n).unwrap_or(u64::MAX));
+        if let Some((base, span)) = string_at(&src, t, "blob-link-base", what)? {
+            match wasmkeep_server::blobs::links::check_base(&base) {
+                Ok(b) => a.blob_link_base = Some(b),
+                Err(e) => return src.err(span, format!("{what} blob-link-base: {e}")),
+            }
+        }
         file.apps.push(a);
     }
     if file.apps.is_empty() {
@@ -723,6 +737,8 @@ impl NodeFile {
                 front_cpu_budget_ms: Some(args.front_cpu_budget_ms),
                 data_dir: None,
                 no_alarms: args.no_alarms,
+                blob_link_base: args.blob_link_base.clone(),
+                max_app_blob_bytes: args.max_app_blob_bytes,
             }],
         })
     }
@@ -791,6 +807,8 @@ impl NodeFile {
         args.max_sockets_per_app = a.max_sockets;
         args.max_front_requests = a.max_front_requests;
         args.no_alarms = a.no_alarms;
+        args.blob_link_base.clone_from(&a.blob_link_base);
+        args.max_app_blob_bytes = a.max_app_blob_bytes;
         if let Some(ms) = a.front_cpu_budget_ms {
             args.front_cpu_budget_ms = ms;
         }

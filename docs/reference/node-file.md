@@ -101,6 +101,11 @@ and `metrics`, as `--listen`, `--advertise`, `--cluster-listen`,
 | `max-sockets` | `--max-sockets-per-app` |
 | `min-resident`, `max-resident` | (none): the app's floor and cap in the process's resident pool |
 | `data-dir` | `--data-dir`, for this app alone |
+| `blob-link-base` | `--blob-link-base`: where the app's node links to [files](../files.md) point, `https://HOST[:PORT]` (default `https://` and the first hostname, else `public-advertise`) |
+| `max-app-blob-bytes` | `--max-app-blob-bytes`: the app's stored-bytes limit for files, at least 1, none by default; enforced with an hour's lag ([files](../files.md#limits)) |
+
+`--max-blob-bytes`, `--blob-links` and `--blob-link-endpoint` stay on
+the command line: they are the process's, shared by every app.
 
 ## Several apps in one process
 

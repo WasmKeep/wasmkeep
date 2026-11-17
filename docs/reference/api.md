@@ -459,6 +459,234 @@ The value of `name`, or none if it is not set.
 | --- | --- | --- | --- | --- |
 | `env::get` | `env.get` | `env.get` | `wk_env` | `wk.env` |
 
+## Interface `blobs`
+
+Files kept in the app's part of the bucket, or on the node's disk
+without one, in the caller's own namespace: an actor's, or the front's
+(docs/adr/0030-files-and-static-assets.md). No call names a namespace:
+the host derives it from where the code runs.
+
+A key is 1 to 512 bytes of `[A-Za-z0-9._~-]` and `/`, in segments of at
+most 255 bytes separated by single `/`, none empty, `.` or `..`, not
+starting or ending with `/`; anything else is `invalid-key`. Calls wait
+on the bucket or disk within the event's wall clock, are not part of the
+database's transaction, and survive its rollback. Streams and uploads
+still open when the event ends are closed and abandoned.
+
+### `blob-info` (record)
+
+| Field | |
+| --- | --- |
+| `key: string` |  |
+| `size: u64` |  |
+| `content-type: string` | As given when written; `application/octet-stream` if none was. |
+| `etag: string` | The bucket's ETag, opaque: compare, never parse. |
+| `modified-ms: u64` | Milliseconds since the epoch, by the bucket's clock. |
+
+### `condition` (variant)
+
+| Case | |
+| --- | --- |
+| `any` | Write whatever is there. |
+| `absent` | Write only if no file has this key. |
+| `etag(string)` | Write only if the file's ETag is this one. |
+
+### `write-options` (record)
+
+| Field | |
+| --- | --- |
+| `content-type: option<string>` | `type/subtype` with optional parameters, at most 256 bytes. |
+| `condition: condition` |  |
+
+### `disposition` (variant)
+
+| Case | |
+| --- | --- |
+| `attachment(option<string>)` | Downloaded under this name, or the key's last segment. |
+| `inline` | Shown by the browser: only for images, audio, video and plain text. |
+
+### `download-options` (record)
+
+| Field | |
+| --- | --- |
+| `expires-in-secs: option<u32>` | Default 300, at most 3,600. |
+| `disposition: disposition` |  |
+
+### `upload-options` (record)
+
+| Field | |
+| --- | --- |
+| `size: u64` | The exact size the browser will send. |
+| `content-type: string` |  |
+| `expires-in-secs: option<u32>` | Default 900, at most 3,600. |
+
+### `upload-link` (record)
+
+What the browser must send: `method` to `url`, with exactly these
+headers, and a body of exactly the size given.
+
+| Field | |
+| --- | --- |
+| `url: string` |  |
+| `method: string` |  |
+| `headers: list<tuple<string, string>>` |  |
+| `expires-at-ms: u64` |  |
+
+### `listing` (record)
+
+| Field | |
+| --- | --- |
+| `entries: list<blob-info>` |  |
+| `next: option<string>` | Pass as `after` for the next page; none at the end. |
+
+### `blob-error` (variant)
+
+| Case | |
+| --- | --- |
+| `invalid-key(string)` |  |
+| `too-large` | Past a size limit. |
+| `quota-exceeded` | The app is over its stored-bytes limit. |
+| `conflict` | The write's condition did not hold. |
+| `not-allowed(string)` | Refused as asked (an inline link for an unsafe type, a write without a valid hold, a closed upload). |
+| `unavailable(string)` | The bucket or disk failed or did not answer in time: not known to have happened. Safe to retry. |
+
+### `upload` (resource)
+
+### `head`
+
+```wit
+head: func(key: string) -> result<option<blob-info>, blob-error>;
+```
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::head` | `blobs.head` | not yet | not yet | not yet |
+
+### `get`
+
+```wit
+get: func(key: string) -> result<option<tuple<blob-info, list<u8>>>, blob-error>;
+```
+
+The whole file, up to 16 MiB (else `too-large`; use `open-read`).
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::get` | `blobs.get` | not yet | not yet | not yet |
+
+### `put`
+
+```wit
+put: func(key: string, body: list<u8>, options: write-options) -> result<blob-info, blob-error>;
+```
+
+Writes the whole file, up to 16 MiB. Returns once it is durable.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::put` | `blobs.put` | not yet | not yet | not yet |
+
+### `open-read`
+
+```wit
+open-read: func(key: string, range: option<tuple<u64, u64>>) -> result<option<tuple<blob-info, input-stream>>, blob-error>;
+```
+
+Streams a file, or the bytes `[start, start + length)` of it.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::open_read` | not yet | not yet | not yet | not yet |
+
+### `open-write`
+
+```wit
+open-write: func(key: string, options: write-options) -> result<upload, blob-error>;
+```
+
+Starts a streamed write; nothing is visible until `finish`.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::open_write` | not yet | not yet | not yet | not yet |
+
+### `upload.body`
+
+```wit
+body: func(self: borrow<upload>) -> result<output-stream, blob-error>;
+```
+
+The stream to write the body to; only once.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::Writer (io::Write)` | not yet | not yet | not yet | not yet |
+
+### `upload.finish`
+
+```wit
+finish: static func(this: upload) -> result<blob-info, blob-error>;
+```
+
+Ends the body and makes the file durable, with its condition.
+Dropping an upload without `finish` abandons it.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::Writer::finish` | not yet | not yet | not yet | not yet |
+
+### `delete`
+
+```wit
+delete: func(key: string) -> result<_, blob-error>;
+```
+
+Removes the file if it exists. Durable when it returns.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::delete` | `blobs.delete` | not yet | not yet | not yet |
+
+### `list`
+
+```wit
+list: func(prefix: string, after: option<string>, limit: u32) -> result<listing, blob-error>;
+```
+
+Files whose key starts with `prefix` as a string (`up` finds
+`uploads/a`; `uploads/` finds what is under it), in key order,
+after the key `after`, at most `limit` (1 to 1,000). `prefix` is
+empty or over the key alphabet and may end with `/`; `after` is a
+key.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::list, blobs::list_all` | `blobs.list, blobs.listAll` | not yet | not yet | not yet |
+
+### `link-download`
+
+```wit
+link-download: func(key: string, options: download-options) -> result<string, blob-error>;
+```
+
+A link a browser downloads the file from, without this code.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::link_download` | `blobs.linkDownload` | not yet | not yet | not yet |
+
+### `link-upload`
+
+```wit
+link-upload: func(key: string, options: upload-options) -> result<upload-link, blob-error>;
+```
+
+A link a browser uploads one new file to, without this code.
+
+| Rust | TypeScript | Python | C | Zig |
+| --- | --- | --- | --- | --- |
+| `blobs::link_upload` | `blobs.linkUpload` | not yet | not yet | not yet |
+
 ## Interface `types`
 
 Types shared by several interfaces.
@@ -508,4 +736,4 @@ Why a statement failed.
 
 ## Also available
 
-The `actor` world includes the standard `wasi:http/proxy` world: outbound HTTP (`wasi:http/outgoing-handler`), clocks, randomness and stdio (what an actor writes to stdout and stderr goes to the node's log, line by line, within `--guest-log-rate`). The `wasi:cli` interfaces most standard libraries import are present but empty: no arguments, environment or terminal. `wasi:filesystem` and `wasi:sockets`, which many toolchains import whether or not the code uses them, are linked but reach nothing: no directory is opened to the guest, and every socket and name lookup is refused. A component importing an interface the host does not provide is refused at deploy time.
+The `actor` world includes the standard `wasi:http/proxy` world: outbound HTTP (`wasi:http/outgoing-handler`), clocks, randomness and stdio (what an actor writes to stdout and stderr goes to the node's log, line by line, within `--guest-log-rate`), and the `wasi:io` streams `blobs` reads and writes files through. The `wasi:cli` interfaces most standard libraries import are present but empty: no arguments, environment or terminal. `wasi:filesystem` and `wasi:sockets`, which many toolchains import whether or not the code uses them, are linked but reach nothing: no directory is opened to the guest, and every socket and name lookup is refused. A component importing an interface the host does not provide is refused at deploy time.

@@ -37,6 +37,7 @@ mod version_tests {
 
 pub mod alarm_index;
 pub mod app_format;
+pub mod blob_sweep;
 pub mod bucket_check;
 pub mod control;
 pub mod expiry;

@@ -22,6 +22,43 @@ use wit_parser::{
 /// listed here (and implemented in the SDKs). An empty name: that SDK does
 /// not have it yet.
 const SDK_NAMES: &[(&str, [&str; 5])] = &[
+    // Files (ADR 0030): Rust and TypeScript first, TypeScript without
+    // streams; "" is "not yet".
+    ("blobs.head", ["blobs::head", "blobs.head", "", "", ""]),
+    ("blobs.get", ["blobs::get", "blobs.get", "", "", ""]),
+    ("blobs.put", ["blobs::put", "blobs.put", "", "", ""]),
+    ("blobs.open-read", ["blobs::open_read", "", "", "", ""]),
+    ("blobs.open-write", ["blobs::open_write", "", "", "", ""]),
+    (
+        "blobs.upload.body",
+        ["blobs::Writer (io::Write)", "", "", "", ""],
+    ),
+    (
+        "blobs.upload.finish",
+        ["blobs::Writer::finish", "", "", "", ""],
+    ),
+    (
+        "blobs.delete",
+        ["blobs::delete", "blobs.delete", "", "", ""],
+    ),
+    (
+        "blobs.list",
+        [
+            "blobs::list, blobs::list_all",
+            "blobs.list, blobs.listAll",
+            "",
+            "",
+            "",
+        ],
+    ),
+    (
+        "blobs.link-download",
+        ["blobs::link_download", "blobs.linkDownload", "", "", ""],
+    ),
+    (
+        "blobs.link-upload",
+        ["blobs::link_upload", "blobs.linkUpload", "", "", ""],
+    ),
     // Exports: what an actor implements.
     (
         "on-init",
@@ -277,7 +314,23 @@ fn type_id(resolve: &Resolve, id: TypeId) -> String {
             }
         }
         TypeDefKind::Type(t) => ty(resolve, t),
+        TypeDefKind::Handle(wit_parser::Handle::Own(r)) => type_id(resolve, *r),
+        TypeDefKind::Handle(wit_parser::Handle::Borrow(r)) => {
+            format!("borrow<{}>", type_id(resolve, *r))
+        }
         other => panic!("type not supported by the reference generator: {other:?}"),
+    }
+}
+
+/// A function's name as the reference shows it: a resource's methods as
+/// `resource.method`.
+fn display_name(f: &Function) -> String {
+    match &f.kind {
+        wit_parser::FunctionKind::Method(_) | wit_parser::FunctionKind::Static(_) => {
+            let resource = f.name.split_once(']').map_or("", |(_, r)| r);
+            resource.to_owned()
+        }
+        _ => f.name.clone(),
     }
 }
 
@@ -292,7 +345,11 @@ fn signature(resolve: &Resolve, f: &Function) -> String {
         .result
         .as_ref()
         .map_or(String::new(), |r| format!(" -> {}", ty(resolve, r)));
-    format!("{}: func({params}){result};", f.name)
+    let fixed = match &f.kind {
+        wit_parser::FunctionKind::Static(_) => "static ",
+        _ => "",
+    };
+    format!("{}: {fixed}func({params}){result};", f.item_name())
 }
 
 fn docs(out: &mut String, d: &Docs) {
@@ -333,7 +390,7 @@ fn sdk_table(out: &mut String, key: &str) {
 }
 
 fn function(out: &mut String, resolve: &Resolve, f: &Function, key: &str) {
-    writeln!(out, "### `{}`\n", f.name).unwrap();
+    writeln!(out, "### `{}`\n", display_name(f)).unwrap();
     writeln!(out, "```wit\n{}\n```\n", signature(resolve, f)).unwrap();
     docs(out, &f.docs);
     sdk_table(out, key);
@@ -376,10 +433,15 @@ fn type_def(out: &mut String, resolve: &Resolve, name: &str, id: TypeId) {
         ),
         // `use`d from another interface: documented there.
         TypeDefKind::Type(_) => return,
+        // Its methods follow the interface's functions.
+        TypeDefKind::Resource => ("resource", Vec::new()),
         other => panic!("type not supported by the reference generator: {other:?}"),
     };
     writeln!(out, "### `{name}` ({kind})\n").unwrap();
     docs(out, &def.docs);
+    if rows.is_empty() {
+        return;
+    }
     let header = if kind == "record" { "Field" } else { "Case" };
     writeln!(out, "| {header} | |\n| --- | --- |").unwrap();
     for (item, doc) in rows {
@@ -395,7 +457,7 @@ fn interface(out: &mut String, resolve: &Resolve, name: &str, iface: &Interface)
         type_def(out, resolve, type_name, *id);
     }
     for f in iface.functions.values() {
-        function(out, resolve, f, &format!("{name}.{}", f.name));
+        function(out, resolve, f, &format!("{name}.{}", display_name(f)));
     }
 }
 
@@ -440,13 +502,20 @@ fn generate() -> String {
         function(&mut out, &resolve, f, &f.name);
     }
 
-    for item in world.imports.values() {
-        if let WorldItem::Interface { id, .. } = item {
-            let iface = &resolve.interfaces[*id];
-            let name = iface.name.as_deref().unwrap();
-            if name != "types" {
-                interface(&mut out, &resolve, name, iface);
-            }
+    // In the package's order, the one the WIT defines them in, whatever
+    // order the world's `include`s give its imports. `wasi:io`, which
+    // `blobs` uses, is WASI's: see "Also available".
+    let imported: Vec<_> = world
+        .imports
+        .values()
+        .filter_map(|item| match item {
+            WorldItem::Interface { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for (name, id) in &package.interfaces {
+        if name != "types" && imported.contains(id) {
+            interface(&mut out, &resolve, name, &resolve.interfaces[*id]);
         }
     }
     // The shared types, last: referenced from the interfaces above.
@@ -458,7 +527,8 @@ fn generate() -> String {
          The `actor` world includes the standard `wasi:http/proxy` world: \
          outbound HTTP (`wasi:http/outgoing-handler`), clocks, randomness and \
          stdio (what an actor writes to stdout and stderr goes to the node's \
-         log, line by line, within `--guest-log-rate`). The \
+         log, line by line, within `--guest-log-rate`), and the `wasi:io` \
+         streams `blobs` reads and writes files through. The \
          `wasi:cli` interfaces most standard libraries import are present but \
          empty: no arguments, environment or terminal. `wasi:filesystem` and \
          `wasi:sockets`, which many toolchains import whether or not the code \
@@ -484,8 +554,15 @@ fn function_keys() -> BTreeSet<String> {
     for item in world.imports.values() {
         if let WorldItem::Interface { id, .. } = item {
             let iface = &resolve.interfaces[*id];
+            if iface.package != Some(package_id) {
+                continue;
+            }
             for f in iface.functions.values() {
-                keys.insert(format!("{}.{}", iface.name.as_deref().unwrap(), f.name));
+                keys.insert(format!(
+                    "{}.{}",
+                    iface.name.as_deref().unwrap(),
+                    display_name(f)
+                ));
             }
         }
     }
@@ -519,4 +596,58 @@ fn api_reference_is_up_to_date() {
         "{} is out of date; run WASMKEEP_BLESS=1 cargo nextest run -p wasmkeep-wit --test api_reference",
         path.display()
     );
+}
+
+/// A world's imports and exports, by name.
+fn items(resolve: &Resolve, world: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let package = resolve
+        .packages
+        .iter()
+        .find(|(_, p)| p.name.namespace == "wasmkeep")
+        .map(|(_, p)| p)
+        .unwrap();
+    let w = &resolve.worlds[package.worlds[world]];
+    let name = |k: &WorldKey| match k {
+        WorldKey::Name(n) => n.clone(),
+        WorldKey::Interface(id) => resolve.id_of(*id).unwrap(),
+    };
+    (
+        w.imports.keys().map(name).collect(),
+        w.exports.keys().map(name).collect(),
+    )
+}
+
+/// The worlds without files are the worlds with them, but `blobs` (and, in
+/// the core worlds, the `wasi:io` interfaces only `blobs` brings): what
+/// TypeScript and Python builds target unless the code uses files.
+#[test]
+fn the_worlds_without_files_lack_only_blobs() {
+    let (resolve, _) = load();
+    let blobs = "wasmkeep:actor/blobs@0.2.0".to_owned();
+    let io = [
+        "wasi:io/error@0.2.12",
+        "wasi:io/poll@0.2.12",
+        "wasi:io/streams@0.2.12",
+    ];
+    for (with, without, extra) in [
+        ("actor", "actor-without-files", &[][..]),
+        ("front", "front-without-files", &[][..]),
+        ("actor-core", "actor-base", &io[..]),
+        ("front-core", "front-base", &io[..]),
+    ] {
+        let (imports, exports) = items(&resolve, with);
+        let (imports_without, exports_without) = items(&resolve, without);
+        let mut gone: BTreeSet<String> = extra.iter().map(|s| (*s).to_owned()).collect();
+        gone.insert(blobs.clone());
+        let missing: BTreeSet<String> = imports.difference(&imports_without).cloned().collect();
+        assert_eq!(missing, gone, "{with} - {without}");
+        assert!(
+            imports_without.is_subset(&imports),
+            "{without} imports more than {with}"
+        );
+        assert_eq!(
+            exports, exports_without,
+            "{with} and {without} export the same"
+        );
+    }
 }

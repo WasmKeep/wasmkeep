@@ -1267,3 +1267,55 @@ async fn actor_restore_after_delete_reset_collected() {
         }
     }
 }
+
+/// `actor restore` rewinds rows, never the blob incarnation (ADR 0030,
+/// section 5): a restore to a point before a delete keeps the incarnation
+/// the delete drew (none of the old files comes back), and a restore
+/// within one incarnation keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_restore_keeps_the_current_blob_incarnation() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_configured(
+        "restore-incarnation",
+        dir.path(),
+        &store,
+        Duration::from_millis(200),
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |_| {},
+    )
+    .await;
+    super::deletes::write(a.addr, "inc", 2).await;
+    // Staged before the delete: no incarnation of its own.
+    let before = actor_restore_stage(&store, "inc").await;
+    assert_eq!(
+        actor_restore_meta(&store, "inc", "blob_incarnation").await,
+        None
+    );
+    let r = send_runnable(a.addr, "POST", "/actor/t/inc/delete-durable", "").await;
+    assert_eq!(r.body.trim(), "deleted", "{}", r.body);
+    let drawn = actor_restore_meta(&store, "inc", "blob_incarnation")
+        .await
+        .expect("the delete drew an incarnation");
+    assert!(wasmkeep_cluster::blob_sweep::is_incarnation(&drawn) && drawn != "0");
+    super::deletes::write(a.addr, "inc", 1).await;
+    let key = actor_restore_submit(&store, "inc", "4444444444444444", &before).await;
+    actor_restore_outcome(&store, &key, "done").await;
+    // The rows of before the delete, in the incarnation the delete drew.
+    assert_eq!(super::deletes::read(a.addr, "inc").await, "2");
+    assert_eq!(
+        actor_restore_meta(&store, "inc", "blob_incarnation").await,
+        Some(drawn.clone())
+    );
+    // Within one incarnation: staged now, restored, the same.
+    let now = actor_restore_stage(&store, "inc").await;
+    let key = actor_restore_submit(&store, "inc", "5555555555555555", &now).await;
+    actor_restore_outcome(&store, &key, "done").await;
+    assert_eq!(
+        actor_restore_meta(&store, "inc", "blob_incarnation").await,
+        Some(drawn)
+    );
+}

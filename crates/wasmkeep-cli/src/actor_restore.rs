@@ -94,8 +94,9 @@ async fn execute(
     }
     for node in wasmkeep_cluster::membership::all_heartbeats(&keys).await? {
         ensure!(
-            node.app != format!("{tenant}/{app}") || node.can_actor_restore,
-            "node {} lacks actor-restore capability (including offline nodes); upgrade it before restoring",
+            node.app != format!("{tenant}/{app}") || (node.can_actor_restore && node.can_blobs),
+            "node {} lacks actor-restore or blobs capability (including offline nodes); upgrade it \
+             before restoring (a node without blobs would bring back an earlier blob incarnation)",
             node.id
         );
     }

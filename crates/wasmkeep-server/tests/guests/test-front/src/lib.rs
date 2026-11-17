@@ -43,6 +43,8 @@
 //!   header it may set (the others skipped) and the body, plus
 //!   `x-upstream-range: NAMES`, the names of the upstream's headers in
 //!   the `x-wasmkeep-` range, comma-separated; or 502 and the error
+//! - the files routes of `../blob-routes.rs` (`/b/`, `/head/`, `/list`,
+//!   `/stream/`, `/link/`, `/upload-link/`), over the front's own namespace
 //! - anything else: `front ok`
 
 use std::io::Write as _;
@@ -56,10 +58,35 @@ mod bindings {
     wit_bindgen::generate!({
         path: "../../../../wasmkeep-wit/wit",
         world: "front-core",
+        with: {
+            "wasi:io/error@0.2.12": wasip2::io::error,
+            "wasi:io/poll@0.2.12": wasip2::io::poll,
+            "wasi:io/streams@0.2.12": wasip2::io::streams,
+        },
     });
 }
 
-use bindings::wasmkeep::actor::{actors, calls, env};
+use bindings::wasmkeep::actor::{actors, blobs, calls, env};
+
+include!("../../blob-routes.rs");
+
+/// The whole request body, or none past 32 MiB.
+fn whole_body(request: &IncomingRequest) -> Vec<u8> {
+    let Ok(incoming) = request.consume() else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    if let Ok(stream) = incoming.stream() {
+        while let Ok(chunk) = stream.blocking_read(65_536) {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > 32 << 20 {
+                return Vec::new();
+            }
+        }
+    }
+    drop(IncomingBody::finish(incoming));
+    bytes
+}
 
 wasip2::http::proxy::export!(Front);
 
@@ -230,6 +257,32 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
     fn handle(request: IncomingRequest, out: ResponseOutparam) {
         let full = request.path_with_query().unwrap_or_default();
         let (path, query) = full.split_once('?').unwrap_or((full.as_str(), ""));
+        if ["/b/", "/head/", "/stream/", "/link/", "/upload-link/"]
+            .iter()
+            .any(|p| path.starts_with(p))
+            || path == "/list"
+        {
+            let headers = request.headers().entries();
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+            };
+            let (if_match, if_none_match) = (header("if-match"), header("if-none-match"));
+            let method = method_name(&request.method());
+            let body = whole_body(&request);
+            let (status, body) = blob_route(
+                &method,
+                &full,
+                if_match,
+                if_none_match.as_deref() == Some("*"),
+                body,
+            )
+            .unwrap_or((404, b"no route".to_vec()));
+            respond(out, status, &[], &String::from_utf8_lossy(&body));
+            return;
+        }
         match path {
             "/call" => {
                 if let Some(ms) = param(query, "delay").and_then(|v| v.parse().ok()) {

@@ -27,3 +27,14 @@ declare module "node:fs" {
  export function rmSync(path:string,options:{recursive:boolean;force:boolean}):void;
 }
 declare module "node:os" {export function tmpdir():string;}
+declare module "node:child_process" {
+  export function execFileSync(
+    file: string,
+    args: string[],
+    options: { stdio?: unknown; encoding?: "utf8" },
+  ): string;
+}
+declare module "node:path" {
+  export function join(...parts: string[]): string;
+}
+declare const process: { cwd(): string; execPath: string };

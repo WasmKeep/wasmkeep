@@ -129,6 +129,7 @@ pub(super) fn empty_database_snapshot(
     operator_delete: Option<&str>,
     operator_restore: Option<&str>,
     replacement: &str,
+    incarnation: &str,
 ) -> Result<wasmkeep_storage::wal::Changes, String> {
     // Unique per call in this process (two actors may be deleted at the
     // same instant), and per process.
@@ -148,7 +149,13 @@ pub(super) fn empty_database_snapshot(
         let mut db = fresh
             .open(address.class(), address.name())
             .map_err(|e| format!("{e:#}"))?;
-        mark_deleted(&mut db, operator_delete, operator_restore, replacement)?;
+        mark_deleted(
+            &mut db,
+            operator_delete,
+            operator_restore,
+            replacement,
+            incarnation,
+        )?;
         db.start_capture().map_err(|e| e.to_string())?;
         db.snapshot().map_err(|e| e.to_string())
     })();
@@ -156,15 +163,24 @@ pub(super) fn empty_database_snapshot(
     result
 }
 
-/// Writes the operator delete marker (ADR 0028) into the empty database a
-/// delete leaves, before its snapshot is taken, so it travels with the
-/// reset.
+/// Writes the operator delete marker (ADR 0028) and the new blob
+/// incarnation (ADR 0030, section 2) into the empty database a delete
+/// leaves, before its snapshot is taken, so they travel with the reset:
+/// the incarnation is durable exactly when the delete is.
 pub(super) fn mark_deleted(
     db: &mut ActorDb,
     operator_delete: Option<&str>,
     operator_restore: Option<&str>,
     replacement: &str,
+    incarnation: &str,
 ) -> Result<(), String> {
+    if !wasmkeep_cluster::blob_sweep::is_incarnation(incarnation)
+        || incarnation == wasmkeep_cluster::blob_sweep::FIRST
+    {
+        return Err(format!("{incarnation:?} is not a new blob incarnation"));
+    }
+    db.set_meta(BLOB_INCARNATION_KEY, incarnation)
+        .map_err(|e| e.to_string())?;
     if let Some(marker) = operator_restore.filter(|marker| !marker.is_empty()) {
         db.set_meta(OPERATOR_RESTORE_KEY, marker)
             .map_err(|e| e.to_string())?;

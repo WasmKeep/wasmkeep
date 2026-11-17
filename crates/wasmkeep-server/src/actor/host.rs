@@ -480,6 +480,11 @@ impl ActorHost {
             batched: None,
             egress: crate::egress::EgressHooks::default(),
             env: Arc::default(),
+            blob: crate::blobs::host::Caller::new(
+                None,
+                crate::blobs::Namespace::front(),
+                crate::blobs::host::Gate::Unheld,
+            ),
         }
     }
 
@@ -574,12 +579,13 @@ impl ActorHost {
         if self.delete_retry {
             return Ok(self.remove_files_durably().await);
         }
-        let (in_tx, carried, restored) = self
+        let (in_tx, carried, restored, incarnation) = self
             .with_db(|db| {
                 (
                     db.in_transaction(),
                     db.meta(OPERATOR_DELETE_KEY),
                     db.meta(OPERATOR_RESTORE_KEY),
+                    db.meta(BLOB_INCARNATION_KEY),
                 )
             })
             .await?;
@@ -599,6 +605,7 @@ impl ActorHost {
             self.db = None;
             self.delete_requested = true;
             self.delete_retry = true;
+            self.blob.deleted();
             return Ok(self.remove_files_durably().await);
         };
         // A batched hold resets only at its acknowledged head (ADR 0034,
@@ -629,6 +636,22 @@ impl ActorHost {
             replica.fail("delete-self-durable: no database to delete");
             return Ok(Err(not_durable("no database to delete")));
         };
+        // The incarnation this delete ends, and the next one (ADR 0030):
+        // never defaulted from a value that cannot be read.
+        let old_incarnation = match incarnation
+            .map_err(|e| e.message)
+            .and_then(|v| wasmkeep_cluster::blob_sweep::incarnation_of(v.as_deref()))
+        {
+            Ok(v) => v,
+            Err(e) => {
+                replica.fail(format!("delete-self-durable: {e}"));
+                return Ok(Err(not_durable(e)));
+            }
+        };
+        let new_incarnation = match crate::blobs::random_id() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(not_durable(format!("{e:?}")))),
+        };
         // A new delete carries its immutable reset position. Restore replay
         // checks that object's bucket time even if this marker could not be read.
         let restored = restored.unwrap_or_default();
@@ -638,6 +661,7 @@ impl ActorHost {
             crate::alarm::now_ms_i64(),
             replica.generation()
         );
+        let new_for_reset = new_incarnation.clone();
         let built = tokio::task::spawn_blocking(move || {
             empty_database_snapshot(
                 &storage,
@@ -645,6 +669,7 @@ impl ActorHost {
                 carried.as_deref(),
                 restored.as_deref(),
                 &replacement,
+                &new_for_reset,
             )
         })
         .await;
@@ -659,12 +684,47 @@ impl ActorHost {
                 return Ok(Err(not_durable(e)));
             }
         };
+        // The sweep record first (ADR 0030, section 5): in the bucket
+        // before any byte of the reset, or no delete.
+        let address = self.deleter.as_ref().map(|(_, a)| a.clone());
+        let recorded = match (&address, self.blob.handle()) {
+            (Some(a), Some(blobs)) if blobs.on_a_bucket() => blobs
+                .write_record(
+                    a.class(),
+                    a.name(),
+                    &old_incarnation,
+                    wasmkeep_cluster::blob_sweep::State::Pending,
+                )
+                .await
+                .map_err(|e| format!("writing the sweep record: {e}")),
+            // Files are off on this bucket: none to sweep.
+            (Some(_), Some(_)) => Ok(()),
+            // No service to write the record with: no delete.
+            _ => Err("no service to write the sweep record with".to_owned()),
+        };
+        if let Err(e) = recorded {
+            crate::metrics::delete_failed("self_durable");
+            return Ok(Err(not_durable(e)));
+        }
         // On failure the replica is marked failed: the event's end gives
         // the actor up, and its next event restores what the bucket has.
+        // The record stays `pending`, for the sweep pass to judge.
         if let Err(e) = replica.ship_reset(all.clone()).await {
             crate::metrics::delete_failed("self_durable");
             return Ok(Err(not_durable(e)));
         }
+        // Acknowledged under a valid hold: the old namespace is swept.
+        if self.blob.hold_valid()
+            && let (Some(a), Some(blobs)) = (address, self.blob.handle())
+        {
+            crate::blobs::sweep::sweep_after_delete(
+                blobs,
+                a.class().to_owned(),
+                a.name().to_owned(),
+                old_incarnation,
+            );
+        }
+        self.blob.deleted();
         crate::metrics::deleted("self_durable");
         self.delete_requested = true;
         self.deleted = Some(Some(all));
@@ -677,12 +737,20 @@ impl ActorHost {
         let Some((storage, address)) = self.deleter.clone() else {
             return Err(not_durable("no database to delete"));
         };
+        let target = address.clone();
         let removed = tokio::task::spawn_blocking(move || {
-            storage.delete_durably(address.class(), address.name())
+            storage.delete_durably(target.class(), target.name())
         })
         .await;
         let failed = match removed {
             Ok(Ok(())) => {
+                // The database named the incarnation; the next one draws
+                // another, and the old files go now.
+                if let Some(blobs) = self.blob.handle() {
+                    blobs
+                        .remove_local(address.class(), address.name(), None)
+                        .await;
+                }
                 crate::metrics::deleted("self_durable");
                 self.delete_retry = false;
                 self.deleted = Some(None);

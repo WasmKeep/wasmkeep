@@ -23,6 +23,10 @@ struct Def {
     deployed: bool,
     /// Its floor in the process's resident pool, when it has one.
     min_resident: Option<usize>,
+    /// Serve the blob test actor as class `blob` beside the counter.
+    blob: bool,
+    /// Its stored-bytes limit, counted every 100 ms.
+    quota: Option<u64>,
 }
 
 const fn def(
@@ -38,6 +42,8 @@ const fn def(
         hosts,
         deployed: false,
         min_resident: None,
+        blob: false,
+        quota: None,
     }
 }
 
@@ -115,6 +121,8 @@ async fn process_inner(
                 let mut config = ActorConfig::new(&data);
                 config.tenant = d.tenant.into();
                 config.app = d.app.into();
+                // As the CLI does: node links under the app's first hostname.
+                config.blob_links.base = d.hosts.first().map(|h| format!("https://{h}"));
                 config.mailbox.idle_timeout = Duration::from_secs(30);
                 if let Some(pool) = pool {
                     config.mailbox.max_resident = pool.limit();
@@ -130,6 +138,11 @@ async fn process_inner(
                 cluster.cluster_plaintext = wasmkeep_server::ClusterPlaintext::Refuse;
                 cluster.app = format!("{}/{}", d.tenant, d.app);
                 cluster.process = Some(process);
+                config.max_app_blob_bytes = d.quota;
+                if d.quota.is_some() {
+                    cluster.blob_sweep_every = Duration::from_millis(100);
+                    cluster.blob_epochs_every = Duration::from_millis(100);
+                }
                 let mut follow = None;
                 let classes = if d.deployed {
                     let app = AppRef::new(Arc::clone(&store), "", d.tenant, d.app);
@@ -156,7 +169,13 @@ async fn process_inner(
                         .collect()
                 } else {
                     let c = runtime.compile(counter_wasm()).unwrap();
-                    vec![("counter".to_owned(), c, counter_wasm().to_vec())]
+                    let mut classes = vec![("counter".to_owned(), c, counter_wasm().to_vec())];
+                    if d.blob {
+                        let wasm = super::blobs::blob_actor();
+                        let c = guests::compile(&runtime, wasm);
+                        classes.push(("blob".to_owned(), c, wasm.to_vec()));
+                    }
+                    classes
                 };
                 config.cluster = Some(cluster);
                 let service =
@@ -1169,4 +1188,198 @@ async fn assets_are_isolated_by_hostname_and_cache_directory() {
             .status,
         404
     );
+}
+
+/// Files of two apps in one process (ADR 0030, section 8): the same class,
+/// name and key read their own bytes, each under its own app's root.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_apps_with_the_same_class_name_and_key_keep_their_own_files() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let defs = [
+        Def {
+            blob: true,
+            ..def("shop-1", "acme", "shop", &["shop.test"])
+        },
+        Def {
+            blob: true,
+            ..def("blog-1", "acme", "blog", &["blog.test"])
+        },
+    ];
+    let p = process(&store, d.path(), &defs).await;
+    settle().await;
+    for host in ["shop.test", "blog.test"] {
+        let body = host.as_bytes();
+        let r = exchange(
+            p.public,
+            &format!(
+                "PUT /actor/blob/alice/b/k HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{host}",
+                body.len()
+            ),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{host}: {}", r.body);
+    }
+    for host in ["shop.test", "blog.test"] {
+        let r = to_reachable(p.public, host, "GET", "/actor/blob/alice/b/k").await;
+        assert_eq!((r.status, r.body.as_str()), (200, host));
+        let r = to_reachable(p.public, host, "GET", "/actor/blob/alice/list").await;
+        assert_eq!(r.body, "k 9 application/octet-stream\nnext=-", "{host}");
+    }
+    let keys = bucket_keys(&store).await;
+    let files: Vec<&String> = keys.iter().filter(|k| k.contains("/blobs/")).collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    for app in ["shop", "blog"] {
+        assert!(
+            files
+                .iter()
+                .any(|k| k.starts_with(&format!("state/acme/{app}/blobs/"))),
+            "{files:?}"
+        );
+    }
+}
+
+/// A node link is checked by the app runtime its hostname picks, under
+/// that app's key: another app's hostname refuses it, in this process or
+/// another; its own app's takes it in either (ADR 0030, section 8).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_link_works_only_under_its_own_apps_hostnames() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let blob = |node, app, host| Def {
+        blob: true,
+        ..def(node, "acme", app, host)
+    };
+    let p1 = process(
+        &store,
+        d1.path(),
+        &[
+            blob("shop-1", "shop", &["shop.test"]),
+            blob("blog-1", "blog", &["blog.test"]),
+        ],
+    )
+    .await;
+    let p2 = process(
+        &store,
+        d2.path(),
+        &[
+            blob("shop-2", "shop", &["shop.test"]),
+            blob("blog-2", "blog", &["blog.test"]),
+        ],
+    )
+    .await;
+    settle().await;
+    for host in ["shop.test", "blog.test"] {
+        let r = exchange(
+            p1.public,
+            &format!("PUT /actor/blob/alice/b/k HTTP/1.1\r\nHost: {host}\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{}", &host[..4]),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let r = to_reachable(p1.public, "shop.test", "GET", "/actor/blob/alice/link/k").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let path = r
+        .body
+        .trim()
+        .strip_prefix("https://shop.test")
+        .unwrap()
+        .to_owned();
+    for (p, host, want) in [
+        (&p1, "shop.test", 200),
+        (&p2, "shop.test", 200),
+        (&p1, "blog.test", 403),
+        (&p2, "blog.test", 403),
+    ] {
+        let r = to(p.public, host, "GET", &path, "").await;
+        assert_eq!(r.status, want, "{host}: {}", r.body);
+        if want == 200 {
+            assert_eq!(r.body, "shop");
+        }
+    }
+}
+
+/// One app over its limit is refused; the other, in the same process, is
+/// not; each app's file series carry its own labels (ADR 0030, section 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn one_app_over_its_file_limit_does_not_refuse_the_other() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let defs = [
+        Def {
+            blob: true,
+            quota: Some(5),
+            ..def("shop-1", "acme", "shop", &["shop.test"])
+        },
+        Def {
+            blob: true,
+            quota: Some(1_000),
+            ..def("blog-1", "acme", "blog", &["blog.test"])
+        },
+    ];
+    let p = process(&store, d.path(), &defs).await;
+    settle().await;
+    let put = |host: &'static str, key: &'static str| {
+        let public = p.public;
+        async move {
+            exchange(
+                public,
+                &format!(
+                    "PUT /actor/blob/alice/b/{key} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789"
+                ),
+            )
+            .await
+        }
+    };
+    for host in ["shop.test", "blog.test"] {
+        let r = put(host, "k").await;
+        assert_eq!(r.status, 200, "{host}: {}", r.body);
+    }
+    let started = std::time::Instant::now();
+    while put("shop.test", "more").await.status != 507 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shop never refused"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let r = put("blog.test", "more").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let started = std::time::Instant::now();
+    loop {
+        let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+        let stored = |app: &str| {
+            page.lines().any(|l| {
+                l.starts_with(&format!(
+                    "wasmkeep_blob_stored_bytes{{tenant=\"acme\",app=\"{app}\"}} "
+                ))
+            })
+        };
+        if stored("shop") && stored("blog") {
+            assert!(
+                page.lines().any(|l| l.starts_with(
+                    "wasmkeep_blob_ops_total{tenant=\"acme\",app=\"shop\",op=\"put\",outcome=\"quota\"}"
+                )),
+                "{page}"
+            );
+            assert!(
+                !page.lines().any(|l| l.starts_with(
+                    "wasmkeep_blob_ops_total{tenant=\"acme\",app=\"blog\",op=\"put\",outcome=\"quota\"}"
+                )),
+                "{page}"
+            );
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "{page}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

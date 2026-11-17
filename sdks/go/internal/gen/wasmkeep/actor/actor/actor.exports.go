@@ -3,7 +3,7 @@
 package actor
 
 import (
-	actorcore "github.com/wasmkeep/wasmkeep/sdks/go/internal/gen/wasmkeep/actor/actor-core"
+	actorbase "github.com/wasmkeep/wasmkeep/sdks/go/internal/gen/wasmkeep/actor/actor-base"
 	"go.bytecodealliance.org/cm"
 )
 
@@ -49,7 +49,7 @@ var Exports struct {
 	// A message arrived on one of this actor's connections.
 	//
 	//	on-websocket-message: func(conn: u64, msg: message)
-	OnWebsocketMessage func(conn uint64, msg actorcore.Message)
+	OnWebsocketMessage func(conn uint64, msg actorbase.Message)
 
 	// OnWebsocketClose represents the caller-defined, exported function "on-websocket-close".
 	//

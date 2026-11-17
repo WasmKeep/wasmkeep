@@ -62,6 +62,12 @@ pub mod bindings {
         path: "wit",
         world: "front-core",
         additional_derives: [PartialEq, Clone],
+        // `blobs` streams are the standard library's WASI ones.
+        with: {
+            "wasi:io/error@0.2.12": wasip2::io::error,
+            "wasi:io/poll@0.2.12": wasip2::io::poll,
+            "wasi:io/streams@0.2.12": wasip2::io::streams,
+        },
     });
 }
 

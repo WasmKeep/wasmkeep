@@ -22,7 +22,8 @@ wasmkeep-runtime.workspace = true
 wasmkeep-storage.workspace = true
 wasmkeep-wit.workspace = true
 wasmkeep-cluster.workspace = true
-object_store.workspace = true
+# cloud-base: the `signer` trait presigned links take (ADR 0030); already enabled in the tree by the CLI's aws.
+object_store = { workspace = true, features = ["cloud-base"] }
 sha2.workspace = true
 ring.workspace = true
 tokio-tungstenite.workspace = true
@@ -40,6 +41,8 @@ bytes.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 thiserror.workspace = true
+# The index of an actor's files on a node without a bucket (ADR 0030, section 2); already in the tree through wasmkeep-storage.
+rusqlite.workspace = true
 # Implementing object_store's async trait (the request-counting bucket); already in the tree through object_store.
 async-trait = "=0.1.92"
 

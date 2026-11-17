@@ -649,7 +649,7 @@ struct ServeArgs {
         "cluster_advertise", "metrics_listen", "max_sockets_per_node", "max_sockets_per_app",
         "data_dir", "secrets_keys", "no_secrets", "env", "front_env", "access",
         "allow_outbound", "allow_outbound_port", "outbound_ca", "max_front_requests",
-        "front_cpu_budget_ms", "no_alarms",
+        "front_cpu_budget_ms", "no_alarms", "blob_link_base", "max_app_blob_bytes",
     ])]
     node_file: Option<PathBuf>,
 
@@ -810,6 +810,41 @@ struct ServeArgs {
     #[arg(long, value_name = "N")]
     max_front_requests: Option<usize>,
 
+    /// One file's largest size, in bytes, for a streamed write of an
+    /// actor's or the front's files (ADR 0030): at most 5 GiB, one
+    /// presigned PUT's ceiling on S3. The process's, shared by every app.
+    #[arg(long, value_name = "BYTES", default_value_t = wasmkeep_server::blobs::DEFAULT_MAX_FILE,
+          value_parser = clap::value_parser!(u64).range(1..=wasmkeep_server::blobs::MAX_FILE_CEILING))]
+    max_blob_bytes: u64,
+
+    /// The app's stored-bytes limit (ADR 0030, section 7): once the
+    /// hourly count of its files is over it, writes and upload links are
+    /// refused with `quota-exceeded` until a count is under it again. It
+    /// lags by up to an hour of writes plus the upload links outstanding.
+    /// By default none. In a node file, the `[[app]]` field
+    /// `max-app-blob-bytes`.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    max_app_blob_bytes: Option<u64>,
+
+    /// Links to actors' and the front's files (ADR 0030): `auto` presigns
+    /// downloads on a bucket whose start proof passed and uses node links
+    /// otherwise; `presigned` refuses to start when the proof fails;
+    /// `node`: node links only. Uploads are always node links.
+    #[arg(long, value_enum, default_value_t = wasmkeep_cli::blob_links::Mode::Auto)]
+    blob_links: wasmkeep_cli::blob_links::Mode,
+
+    /// The bucket's endpoint as browsers reach it, for presigned links
+    /// (default: the one this node uses, `AWS_ENDPOINT` or the provider's).
+    /// Must not be a host under the app's own site.
+    #[arg(long, value_name = "URL")]
+    blob_link_endpoint: Option<String>,
+
+    /// Where node links point, `https://HOST[:PORT]` (no path): by default
+    /// `https://` and the app's first hostname, else --advertise. Never
+    /// taken from a request.
+    #[arg(long, value_name = "URL", value_parser = wasmkeep_server::blobs::links::check_base)]
+    blob_link_base: Option<String>,
+
     /// Never fire an actor's alarms on this node: no delivery, no sweep of
     /// the cluster's alarm index. Requests are still served, and alarms
     /// stay recorded and pending, so a node started without this flag fires
@@ -887,6 +922,18 @@ fn huge_pages(mode: HugePages) {
 enum ClusterPlaintext {
     Accept,
     Refuse,
+}
+
+/// Where an app's node links point (ADR 0030, section 4, decision 7): its
+/// `blob-link-base`, else `https://` and its first hostname, else
+/// `--advertise`, else, alone, this node's listening address when it is
+/// one; never a request's `Host`.
+pub(crate) fn link_base(args: &ServeArgs, hostnames: &[String]) -> Option<String> {
+    args.blob_link_base
+        .clone()
+        .or_else(|| hostnames.first().map(|h| format!("https://{h}")))
+        .or_else(|| args.advertise.clone())
+        .or_else(|| (!args.listen.ip().is_unspecified()).then(|| format!("http://{}", args.listen)))
 }
 
 /// Checks `--cluster-advertise` is an `https://` address with a host (the
@@ -1685,6 +1732,9 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             classes.push((class.clone(), component, wasm));
         }
         let mut config = ActorConfig::new(&args.data_dir);
+        config.max_blob_bytes = args.max_blob_bytes;
+        config.max_app_blob_bytes = args.max_app_blob_bytes;
+        config.blob_links.base = link_base(&args, &[]);
         // With --app: whether rules were ever deployed (ADR 0013), and the
         // version's own.
         let mut deployed_rules = None;
@@ -1702,8 +1752,18 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             // go; after a `--recreate`, files from before the delete go
             // too (ADR 0028).
             let local = wasmkeep_server::local_app_dir(&args.data_dir, tenant, name);
-            rt.block_on(app_ref.prepare_local(&local))
+            let blob_epoch = rt
+                .block_on(app_ref.prepare_local(&local))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            config.blob_epoch = blob_epoch;
+            // Once per process (ADR 0030, section 4).
+            config.blob_links.presigner = rt.block_on(wasmkeep_cli::blob_links::presigner(
+                args.blob_links,
+                bucket,
+                args.blob_link_endpoint.as_deref(),
+                &app_store,
+                &prefix,
+            ))?;
             // Before the first deploy: wait for one, as a running node
             // waits for the next (nothing below can start without it).
             let Some((current, deployed)) = rt.block_on(async {

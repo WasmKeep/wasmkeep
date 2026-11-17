@@ -339,6 +339,17 @@ impl Cluster {
     /// asked to drain, are not suspected, and announce `ends`. Another node
     /// takes over once this one stops heartbeating.
     pub(crate) fn collects_expiry(&self) -> bool {
+        self.collects(|_| true)
+    }
+
+    /// Whether this node runs the sweep of deleted actors' files (ADR
+    /// 0030, section 5): the lowest-id live node of the app that announces
+    /// `ends` and `blobs`, as idle expiry chooses with `ends`.
+    pub(crate) fn collects_blob_sweeps(&self) -> bool {
+        self.collects(|peer| peer.can_blobs)
+    }
+
+    fn collects(&self, also: impl Fn(&Peer) -> bool) -> bool {
         if self.draining() || !self.lease_valid_now() {
             return false;
         }
@@ -360,6 +371,7 @@ impl Cluster {
                 && peer.app == self.serves
                 && peer.drain == Some(DrainState::Serving)
                 && peer.can_end
+                && also(peer)
                 && !draining.contains(*id)
                 && !suspects.contains(*id)
         });
@@ -394,6 +406,32 @@ impl Cluster {
                 })
             })
             .collect())
+    }
+
+    /// One actor's ownership record as a listing would show it (version,
+    /// last-modified time, carried idle origin), or `None` without one.
+    pub(crate) async fn owner_record_listed(
+        &self,
+        address: &ActorAddress,
+    ) -> Result<Option<wasmkeep_cluster::expiry::Listed>, String> {
+        use object_store::ObjectStoreExt as _;
+        let key = self.owner_key(address);
+        let r = match self.store.get(&StorePath::from(key)).await {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        let meta = r.meta.clone();
+        let body = r.bytes().await.map_err(|e| e.to_string())?;
+        let record = wasmkeep_cluster::node_lease::OwnerRecord::decode(&body);
+        Ok(Some(wasmkeep_cluster::expiry::Listed {
+            name: String::new(),
+            modified_ms: u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0),
+            version: meta.e_tag.unwrap_or_default(),
+            idle_since_ms: record
+                .and_then(|r| r.recorded)
+                .and_then(|r| r.idle_since_ms),
+        }))
     }
 
     /// The actors with an entry in this root's alarm index (ADR 0028): one

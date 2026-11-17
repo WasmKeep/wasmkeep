@@ -191,6 +191,11 @@ pub struct ClusterConfig {
     /// How often the collecting node runs an idle-expiry pass (ADR 0028,
     /// section 4): ten minutes; tests shorten it.
     pub expiry_every: Duration,
+    /// How often the sweep node lists `blob-sweeps/` (ADR 0030, section 5),
+    /// the ages it acts at, and how often it removes other epochs' files.
+    pub blob_sweep_every: Duration,
+    pub blob_sweep_ages: wasmkeep_cluster::blob_sweep::Ages,
+    pub blob_epochs_every: Duration,
     /// The node follows its app's deploys (`serve --app`): it acquires no
     /// actor until it has checked for the app's tombstone with its lease
     /// valid, at start and after every lapse (ADR 0028, section 5).
@@ -258,6 +263,9 @@ impl ClusterConfig {
             failover_wait: None,
             failover_wait_max: crate::http::ServeLimits::default().max_connections / 4,
             expiry_every: Duration::from_millis(wasmkeep_cluster::expiry::PASS_EVERY_MS),
+            blob_sweep_every: Duration::from_millis(wasmkeep_cluster::blob_sweep::PASS_EVERY_MS),
+            blob_sweep_ages: wasmkeep_cluster::blob_sweep::Ages::default(),
+            blob_epochs_every: Duration::from_secs(60 * 60),
             follows_app: false,
             process: None,
         }
@@ -367,6 +375,9 @@ pub(crate) struct Cluster {
     pub(crate) owners: Owners<ObjectStoreBucket, SystemClock>,
     /// Pending releases, unresolved acquires, live holds, locks per actor.
     pub(crate) pending: Pending,
+    /// Ownership records a sweep judgement released with their idle origin
+    /// carried (ADR 0030, decision 8): an expiry pass reads it back.
+    pub(crate) judged: std::sync::Mutex<std::collections::HashSet<String>>,
     membership: Membership<ObjectStoreBucket, SystemClock>,
     /// Live nodes by id, with their addresses; refreshed with every
     /// listing of the heartbeats.
@@ -476,6 +487,9 @@ pub(crate) struct Cluster {
     pub(crate) failover: FailoverWait,
     /// How often the collecting node runs an idle-expiry pass (ADR 0028).
     pub(crate) expiry_every: Duration,
+    pub(crate) blob_sweep_every: Duration,
+    pub(crate) blob_sweep_ages: wasmkeep_cluster::blob_sweep::Ages,
+    pub(crate) blob_epochs_every: Duration,
     /// The app's tombstone (ADR 0028, section 5): [`APP_OPEN`],
     /// [`APP_UNCHECKED`] or [`APP_DELETED`].
     app_gate: std::sync::atomic::AtomicU8,
@@ -545,6 +559,8 @@ pub(crate) struct Peer {
     /// It expires idle actors and honours an app's tombstone (heartbeat
     /// line 11, ADR 0028).
     pub(crate) can_end: bool,
+    /// It ends actors' files with them (heartbeat line 11, ADR 0030).
+    pub(crate) can_blobs: bool,
     /// The process its heartbeat names: routing trusts a record only if
     /// it names this one (ADR 0020).
     pub(crate) instance: Option<String>,
@@ -565,6 +581,7 @@ impl Peer {
             can_take: node.can_take,
             can_handoff: node.can_handoff,
             can_end: node.can_end,
+            can_blobs: node.can_blobs,
             instance: node.instance.clone(),
         })
     }
@@ -700,6 +717,7 @@ impl Cluster {
                 config.lease,
             ),
             pending: Pending::default(),
+            judged: std::sync::Mutex::default(),
             membership,
             peers: RwLock::new(HashMap::new()),
             heartbeat_horizon_ms: heartbeat_horizon_ms(config.heartbeat, &config.lease),
@@ -752,6 +770,9 @@ impl Cluster {
             fences_due,
             failover: FailoverWait::new(config),
             expiry_every: config.expiry_every,
+            blob_sweep_every: config.blob_sweep_every,
+            blob_sweep_ages: config.blob_sweep_ages,
+            blob_epochs_every: config.blob_epochs_every,
             app_gate: std::sync::atomic::AtomicU8::new(if config.follows_app {
                 APP_UNCHECKED
             } else {
@@ -1361,6 +1382,12 @@ impl Cluster {
             })
             .await
             .map(String::as_str)
+    }
+
+    /// The cluster secret if this node already loaded it ([`Self::load_secret`]):
+    /// never fetched here.
+    pub(crate) fn loaded_secret(&self) -> Option<&str> {
+        self.secret.get().map(String::as_str)
     }
 
     /// Loads the secret now (at startup), so that checking an incoming
@@ -2186,7 +2213,8 @@ impl Cluster {
         )
         .await;
         if !matches!(nodes, Ok(Ok(nodes)) if nodes.iter().all(|node|
-            node.app != format!("{}/{}", self.root.tenant(), self.root.app()) || node.can_actor_restore))
+            node.app != format!("{}/{}", self.root.tenant(), self.root.app())
+                || (node.can_actor_restore && node.can_blobs)))
         {
             return false;
         }

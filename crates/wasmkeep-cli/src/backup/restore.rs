@@ -166,7 +166,7 @@ fn actor_name<'a>(prefix: &'a str, root: &str) -> anyhow::Result<&'a str> {
 
 // History/owner keys were already escaped once by object_store. Preserve
 // their exact bytes on write; decode that layer only to recover an address.
-fn object_segment(encoded: &str) -> anyhow::Result<String> {
+pub(super) fn object_segment(encoded: &str) -> anyhow::Result<String> {
     let bytes = encoded.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -499,6 +499,10 @@ pub(super) async fn execute(
         let parts: Vec<_> = tail.split('/').collect();
         ensure!(
             tail == "current"
+                || (parts.len() == 3
+                    && parts[0] == "_assets"
+                    && (parts[1] == "index" || parts[1] == "content")
+                    && wasmkeep_server::assets::valid_digest(parts[2]))
                 || (parts.len() == 2
                     && (parts[0] == "secrets"
                         || parts[1] == "manifest"
@@ -572,8 +576,11 @@ pub(super) async fn execute(
             save_journal(target, &fence, &journal).await?;
         }
         if existing.is_none() {
+            // The epoch before this operation's `restored`: the undo run
+            // copies the files there.
             journal = json!({"run":id,"binding":binding,"phase":"prepare",
-                "nonce":wasmkeep_cluster::control::new_request_id(),"started_ms":now_ms()?});
+                "nonce":wasmkeep_cluster::control::new_request_id(),"started_ms":now_ms()?,
+                "files_epoch":files::epoch_of(target, &base).await?});
             json_put(target, &fence, &journal, false).await?;
         }
         println!("Operation ID: {}", text(&journal, "nonce")?);
@@ -712,6 +719,16 @@ pub(super) async fn execute(
                 same_or_create(target, &key(&state, &format!("alarms/{tail}")), Vec::new()).await?;
             }
         }
+        // Then the files of the incarnation each restored database names,
+        // and the front's, under the epoch `restored` just gave the app.
+        let mut namespaces = BTreeSet::new();
+        for path in &run.actors {
+            let actor = disk_actor(path)?;
+            if actor["status"] == "failed" || !text(&actor, "prefix")?.starts_with(&source_root) { continue; }
+            if let Some(ns) = actor["blob_namespace"].as_str() { namespaces.insert(ns.to_owned()); }
+        }
+        let files = files::restore_app(archive, ap, app, namespaces, target, &base, &state).await?;
+        if files > 0 { println!("Restored {files} files of {name}; each written after its actor's row, so a file may be newer than the rows that name it."); }
         nodes(args, target, tp).await?;
         if choice == DeployChoice::Backup {
             let source_app = format!("{}/", key(sp, &format!("apps/{name}")));

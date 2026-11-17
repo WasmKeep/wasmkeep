@@ -428,6 +428,7 @@ fn a_move_target_that_cannot_take_it_gets_a_warning() {
         can_flush: true,
         can_rate_limits: false,
         can_assets: false,
+        can_blobs: false,
         can_restore: true,
         can_actor_restore: false,
         instance: None,
@@ -1553,4 +1554,35 @@ fn assets_collect_command() {
     runtime.block_on(store.put(&key, vec![].into())).unwrap();
     crate::assets_collect_in(args, store.clone(), "").unwrap();
     assert!(runtime.block_on(store.head(&key)).is_err());
+}
+
+/// Node links point where configuration says, in this order, never at a
+/// request's `Host` (ADR 0030, decision 7).
+#[test]
+fn node_links_point_at_the_configured_base() {
+    let args = parse_serve(&["--blob-link-base", "https://files.example.net/"]).unwrap();
+    assert_eq!(
+        super::link_base(&args, &["shop.example.com".into()]).as_deref(),
+        Some("https://files.example.net")
+    );
+    let args = parse_serve(&[]).unwrap();
+    assert_eq!(
+        super::link_base(&args, &["shop.example.com".into()]).as_deref(),
+        Some("https://shop.example.com")
+    );
+    assert_eq!(
+        super::link_base(&args, &[]).as_deref(),
+        Some("http://10.0.0.11:8080")
+    );
+    for bad in ["files.example.net", "https://x/path", "https://u@x"] {
+        assert!(parse_serve(&["--blob-link-base", bad]).is_err(), "{bad}");
+    }
+    let args = parse_serve(&[
+        "--blob-links",
+        "node",
+        "--blob-link-endpoint",
+        "https://s3.example.com",
+    ])
+    .unwrap();
+    assert_eq!(args.blob_links, wasmkeep_cli::blob_links::Mode::Node);
 }

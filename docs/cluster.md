@@ -1256,6 +1256,10 @@ versions ([backup and restore](deploy/backup-and-restore.md)).
 A class may say how long its actors may stay idle before they are
 deleted ([ADR 0028](adr/0028-actors-that-end.md), section 4):
 
+Idle means no event: a [file](files.md) downloaded through a link every
+day runs no code and does not keep its actor alive. The actor's files
+are deleted with it.
+
 ```toml
 [classes.carts]
 component = "carts.wasm"

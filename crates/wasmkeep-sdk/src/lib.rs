@@ -52,15 +52,20 @@ pub mod bindings {
         export_macro_name: "export_core",
         default_bindings_module: "::wasmkeep_sdk::bindings",
         additional_derives: [PartialEq, Clone],
-        // One `actors`, `calls` and `env` for actors and fronts alike.
+        // One `actors`, `calls`, `env` and `blobs` for actors and fronts alike.
         with: {
             "wasmkeep:actor/actors@0.2.0": crate::front::actors,
             "wasmkeep:actor/calls@0.2.0": crate::front::calls,
             "wasmkeep:actor/env@0.2.0": crate::front::env,
+            "wasmkeep:actor/blobs@0.2.0": crate::front::bindings::wasmkeep::actor::blobs,
+            "wasi:io/error@0.2.12": wasip2::io::error,
+            "wasi:io/poll@0.2.12": wasip2::io::poll,
+            "wasi:io/streams@0.2.12": wasip2::io::streams,
         },
     });
 }
 
+pub mod blobs;
 pub mod broadcast;
 #[cfg(feature = "client")]
 pub mod client;

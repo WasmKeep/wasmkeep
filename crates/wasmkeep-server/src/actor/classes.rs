@@ -63,8 +63,32 @@ pub(super) fn actor_linker(runtime: &Runtime) -> Result<Linker<ActorHost>, Error
     let mut linker = Linker::<ActorHost>::new(runtime.engine());
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(Error::linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(Error::linker)?;
-    ActorCore::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, |h| h)
-        .map_err(Error::linker)?;
+    // Interface by interface: the world's own `add_to_linker` would define
+    // `wasi:io` again, which `blobs` uses and WASI already linked above.
+    {
+        use wasmkeep_wit::wasmkeep::actor::{
+            actors, alarms, blobs, calls, env, storage, types, websockets,
+        };
+        fn get(h: &mut ActorHost) -> &mut ActorHost {
+            h
+        }
+        types::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+        storage::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+        alarms::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+        actors::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+        calls::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+        websockets::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+        env::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+        blobs::add_to_linker::<ActorHost, HasSelf<ActorHost>>(&mut linker, get)
+            .map_err(Error::linker)?;
+    }
     Ok(linker)
 }
 
