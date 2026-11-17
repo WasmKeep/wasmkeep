@@ -92,6 +92,8 @@ mod listings;
 mod migrate;
 #[path = "node_leases.rs"]
 mod node_leases;
+#[path = "placement.rs"]
+mod placement;
 #[path = "project_file.rs"]
 mod project_file;
 #[path = "recorded_head.rs"]
@@ -499,6 +501,10 @@ async fn start_node(
     // Off unless a test asks (`failover_wait.rs`): every other test sees
     // the answer a node gives at once.
     cluster.failover_wait = Some(Duration::ZERO);
+    // Placement at wake-up (ADR 0041) is on by default; off here unless a
+    // test asks (`placement.rs`, the golden trace): every other test says
+    // in advance which node wakes each actor.
+    cluster.placement = false;
     config.cluster = Some(cluster);
     adjust(&mut config);
     let cluster_port = cluster_listener(&mut config).await;

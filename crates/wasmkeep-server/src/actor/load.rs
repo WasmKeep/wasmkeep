@@ -104,10 +104,20 @@ pub(super) fn load_source(
                 ..Load::default()
             };
         };
+        let load = rooms(&inner);
+        if let (Some(app), Some(actor_room), Some(socket_room)) =
+            (app.as_deref(), load.actor_room, load.socket_room)
+        {
+            crate::metrics::placement_fill(
+                app,
+                wasmkeep_cluster::placement::fill(load.actors, actor_room),
+                wasmkeep_cluster::placement::fill(load.sockets, socket_room),
+            );
+        }
         Load {
             events_per_min,
             front_per_min,
-            ..rooms(&inner)
+            ..load
         }
     })
 }

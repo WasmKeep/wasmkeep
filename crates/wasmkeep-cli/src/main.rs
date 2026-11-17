@@ -853,6 +853,13 @@ struct ServeArgs {
     #[arg(long)]
     no_alarms: bool,
 
+    /// Never send a wake-up of an actor nobody holds to a lighter node,
+    /// nor receive one (ADR 0041): this process's node ids keep every
+    /// actor they wake and do not announce `place`. Placement is on by
+    /// default; `[process] placement = false` in a node file says the same.
+    #[arg(long)]
+    no_placement: bool,
+
     /// How a class given with --actor writes, as CLASS=MODE: `strict` (the
     /// default) or `batched` (ADR 0034: plain writes are uploaded
     /// behind the events). Not with --app: a deployed version names its classes' modes.
@@ -1906,6 +1913,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             // (ADR 0028).
             cluster.follows_app = args.app.is_some();
             cluster.reads_secrets = !args.no_secrets;
+            cluster.placement = !args.no_placement;
             if let Some((tenant, name)) = &args.app {
                 cluster.app = format!("{tenant}/{name}");
             }

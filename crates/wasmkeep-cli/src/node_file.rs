@@ -27,6 +27,9 @@ pub(crate) struct Process {
     pub(crate) id: Option<String>,
     /// Every app's data directory unless its entry names its own.
     pub(crate) data_dir: Option<PathBuf>,
+    /// `placement` (ADR 0041, section 9): `Some(false)` turns placement at
+    /// wake-up off for every app of the process; `None`: on.
+    pub(crate) placement: Option<bool>,
 }
 
 /// `[listen]`: the three listeners, and the addresses peers use.
@@ -92,7 +95,7 @@ pub(crate) fn parse(text: &str, path: &Path) -> Result<NodeFile, String> {
 
 /// The top-level tables, and the keys of each.
 const TOP: &[&str] = &["process", "listen", "limits", "app"];
-const PROCESS: &[&str] = &["id", "data-dir"];
+const PROCESS: &[&str] = &["id", "data-dir", "placement"];
 const LISTEN: &[&str] = &[
     "public",
     "public-advertise",
@@ -163,6 +166,9 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
         }
         file.process.data_dir =
             string_at(&src, t, "data-dir", "[process]")?.map(|(p, _)| dir.join(p));
+        if crate::project::get(t, "placement").is_some() {
+            file.process.placement = Some(boolean(&src, t, "placement", "[process]")?);
+        }
     }
 
     let listen_at = get(root, "listen").map_or(0..0, |(k, _)| k.span());
@@ -705,6 +711,7 @@ impl NodeFile {
             process: Process {
                 id: None,
                 data_dir: Some(args.data_dir.clone()),
+                placement: args.no_placement.then_some(false),
             },
             listen: Listen {
                 public: Some(args.listen),
@@ -784,6 +791,10 @@ impl NodeFile {
     fn apply_app(&self, a: &AppEntry, args: &mut crate::ServeArgs) -> anyhow::Result<()> {
         args.app = Some((a.tenant.clone(), a.name.clone()));
         args.node_id.clone_from(&a.node_id);
+        // The process's switch, for each of its apps (ADR 0041).
+        if self.process.placement == Some(false) {
+            args.no_placement = true;
+        }
         args.advertise.clone_from(&self.listen.public_advertise);
         if let Some(public) = self.listen.public {
             args.listen = public;

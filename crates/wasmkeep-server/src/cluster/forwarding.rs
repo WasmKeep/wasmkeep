@@ -284,10 +284,11 @@ impl Cluster {
         Ok(())
     }
 
-    pub(crate) fn admission_received<B>(
-        &self,
-        req: &Request<B>,
-    ) -> Option<(std::net::IpAddr, bool)> {
+    /// A forward's proof ([`ADMITTED`]) that checks: its signature over
+    /// the request (the placed mark included), the client's identity
+    /// headers, and its sender. Spends nothing: the caller spends a
+    /// charged proof. Its [`Signed::sender`] is the checked sender.
+    pub(crate) fn admission_checked<B>(&self, req: &Request<B>) -> Option<(Signed, String)> {
         if self.refuse_plaintext && req.extensions().get::<ArrivedOnClusterPort>().is_none() {
             return None;
         }
@@ -297,7 +298,12 @@ impl Cluster {
             return None;
         }
         let secret = format!("wasmkeep-ingress-identity-v2:{}", self.secret.get()?);
-        let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+        // As signed: the path the request arrived with, before routing
+        // cut `/actor/<class>/<name>` off it.
+        let path = req.extensions().get::<OriginalPath>().map_or_else(
+            || req.uri().path_and_query().map_or("/", |p| p.as_str()),
+            |p| p.0.as_str(),
+        );
         let signed = verify(
             &secret,
             given,
@@ -311,7 +317,7 @@ impl Cluster {
             return None;
         }
         let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
-        if let Err(why) = self.sender_checked(
+        match self.sender_checked(
             req.headers(),
             self.secret.get()?,
             "admitted",
@@ -319,9 +325,20 @@ impl Cluster {
             path,
             on_cluster_port,
         ) {
-            self.note_refused(why);
-            return None;
+            Ok(sender) => Some((Signed { sender, ..signed }, given.to_owned())),
+            Err(why) => {
+                self.note_refused(why);
+                None
+            }
         }
+    }
+
+    pub(crate) fn admission_received<B>(
+        &self,
+        req: &Request<B>,
+    ) -> Option<(std::net::IpAddr, bool)> {
+        let (signed, given) = self.admission_checked(req)?;
+        let given = given.as_str();
         let encoded = given.split(' ').nth(2)?;
         let (encoded, charged) = match encoded.len() {
             32 => (encoded, false), // Previous uncharged identity format.

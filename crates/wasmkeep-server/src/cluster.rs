@@ -37,6 +37,7 @@ mod hello;
 mod identity;
 mod lease_hold;
 mod node_lease_task;
+mod placing;
 mod process;
 mod signing;
 mod view;
@@ -50,6 +51,7 @@ pub(crate) use identity::*;
 pub(crate) use lease_hold::*;
 pub(crate) use node_lease_task::lease_attempt;
 use node_lease_task::{lease_every, node_lease_loop};
+pub(crate) use placing::*;
 pub use process::NodeProcess;
 pub(crate) use signing::*;
 pub use view::older_nodes_advice;
@@ -106,7 +108,7 @@ pub(crate) const MULTI_APP_MISSING: &str =
 /// the request (a call, or a WebSocket's open): the signature, the
 /// sender's proof (ADR 0038), the caller and chain it vouches for, and a
 /// hand-off's upgrade mark.
-pub(crate) const HOP_PROOFS: [&str; 5] = [INTERNAL, SENDER, CALLER, CHAIN, UPGRADE_MARK];
+pub(crate) const HOP_PROOFS: [&str; 6] = [INTERNAL, SENDER, CALLER, CHAIN, UPGRADE_MARK, PLACED];
 /// The app name of nodes given classes on the command line (`serve
 /// --actor`, `dev`): with their tenant, `default`, the implicit app
 /// `default/default` (ADR 0022).
@@ -203,6 +205,12 @@ pub struct ClusterConfig {
     /// The process this app runs in (ADR 0038): what it shares with the
     /// process's other apps. `None`: a process of its own.
     pub process: Option<Arc<NodeProcess>>,
+    /// Placement at wake-up (ADR 0041): this node may send a wake-up of
+    /// an actor nobody holds to a clearly lighter node of its app, and
+    /// receives such wake-ups, announcing `place`. On by default; `serve
+    /// --no-placement` and `[process] placement = false` turn it off for
+    /// every app of the process.
+    pub placement: bool,
 }
 
 /// Plain HTTP between nodes, for a node with a cluster listener (ADR 0011).
@@ -268,6 +276,7 @@ impl ClusterConfig {
             blob_epochs_every: Duration::from_secs(60 * 60),
             follows_app: false,
             process: None,
+            placement: true,
         }
     }
 }
@@ -459,6 +468,10 @@ pub(crate) struct Cluster {
     suspects: Mutex<HashMap<String, u64>>,
     /// See [`Cluster::secrets_blocked`].
     secrets_blocked: std::sync::atomic::AtomicBool,
+    /// Placement at wake-up is on ([`ClusterConfig::placement`]).
+    place: bool,
+    /// Placement's own state (ADR 0041): credits, backoff, no return.
+    placing: placing::Placing,
     /// The lease timing (ttl, grace, safety, skew).
     lease_config: LeaseConfig,
     /// How often the node lease is written ([`lease_every`]).
@@ -585,13 +598,11 @@ pub(crate) struct Seen {
 
 /// How many heartbeat periods a peer's load stays fresh, and how long no
 /// return lasts (ADR 0041, sections 3 and 5): a constant in 0.6.0.
-#[allow(dead_code)] // Read by placement's wiring (ADR 0041, P4).
 pub(crate) const FRESH_PERIODS: u32 = 3;
 
 impl Seen {
     /// The load, if this heartbeat was first seen less than
     /// [`FRESH_PERIODS`] periods ago: stale means keep it.
-    #[allow(dead_code)] // Read by placement's wiring (ADR 0041, P4).
     pub(crate) fn fresh(&self, period: Duration) -> Option<&wasmkeep_cluster::membership::Load> {
         (self.at.elapsed() < period.saturating_mul(FRESH_PERIODS)).then_some(&self.load)
     }
@@ -729,7 +740,8 @@ impl Cluster {
         )
         .map_err(invalid_id)?
         .with_app(serves)
-        .with_reads_secrets(config.reads_secrets);
+        .with_reads_secrets(config.reads_secrets)
+        .with_place(config.placement);
         // Random per process: in every heartbeat (a second process writing
         // this id shows another one), and the seed of call nonces.
         let instance = random_hex(8).unwrap_or_else(|_| {
@@ -774,6 +786,8 @@ impl Cluster {
             membership,
             peers: RwLock::new(HashMap::new()),
             heartbeat_horizon_ms: heartbeat_horizon_ms(config.heartbeat, &config.lease),
+            place: config.placement,
+            placing: placing::Placing::default(),
             conflict_logged_ms: std::sync::atomic::AtomicU64::new(0),
             refuse_plaintext,
             plain_peers_logged_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1494,7 +1508,7 @@ impl Cluster {
             Some(signed) => {
                 match self.sender_checked(headers, secret, "internal", given, path, on_cluster_port)
                 {
-                    Ok(_) => Some(signed),
+                    Ok(sender) => Some(Signed { sender, ..signed }),
                     Err(why) => {
                         self.note_refused(why);
                         None
@@ -2517,27 +2531,35 @@ impl Cluster {
         }))
     }
 
-    /// Forwards a request for an actor to the node that owns it.
-    pub(crate) async fn forward(
+    /// What every forward does before it is sent (to `owner`): never a
+    /// second hop, the owner's address and the original path, the
+    /// connection headers dropped, the forwarded mark, the app and the
+    /// proof (ADR 0038), counted, and the target checked. The base it goes
+    /// to, or the answer that sends nothing.
+    pub(crate) async fn prepare_forward<B>(
         &self,
         owner: &str,
-        mut req: Request<Incoming>,
-    ) -> Response<HyperOutgoingBody> {
-        if never_forward(&req) {
+        req: &mut Request<B>,
+    ) -> Result<String, Box<Response<HyperOutgoingBody>>> {
+        if never_forward(req) {
             // Two nodes disagree about who owns the actor (a lease is
             // changing hands). Do not bounce; let the client retry.
-            return unavailable("actor ownership is changing; retry\n");
+            return Err(Box::new(unavailable(
+                "actor ownership is changing; retry\n",
+            )));
         }
         let Some(base) = self.address_of(owner) else {
-            return unavailable("the actor's node is not reachable; retry\n");
+            return Err(Box::new(unavailable(
+                "the actor's node is not reachable; retry\n",
+            )));
         };
         // Routing cut `/actor/<class>/<name>` off the path; send the original.
         let path = match req.extensions().get::<OriginalPath>() {
             Some(original) => original.0.clone(),
-            None => return unavailable("cannot forward this request\n"),
+            None => return Err(Box::new(unavailable("cannot forward this request\n"))),
         };
         let Ok(uri) = format!("{}{path}", base.trim_end_matches('/')).parse::<hyper::Uri>() else {
-            return unavailable("bad advertised address\n");
+            return Err(Box::new(unavailable("bad advertised address\n")));
         };
         *req.uri_mut() = uri;
         // The client's connection headers are for its hop to this node: a
@@ -2560,18 +2582,64 @@ impl Cluster {
         // This node's app, never the client's (ADR 0022).
         match self.app_header() {
             Ok(app) => req.headers_mut().insert(APP, app),
-            Err(_) => return unavailable("cannot forward this request\n"),
+            Err(_) => return Err(Box::new(unavailable("cannot forward this request\n"))),
         };
-        if self.sign_admission(owner, &path, &mut req).await.is_err() {
-            return unavailable("cannot authenticate ingress admission; retry\n");
+        if self.sign_admission(owner, &path, req).await.is_err() {
+            return Err(Box::new(unavailable(
+                "cannot authenticate ingress admission; retry\n",
+            )));
         }
         crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "request")]));
         // Bound the wait for the owner's response headers (a hung node or a
         // half-open connection); the body then streams as the owner sends it.
         if let Err(e) = self.check_tls_target(&base) {
             tracing::warn!(owner, error = %e, "forwarding refused");
-            return unavailable("the actor's node is not reachable; retry\n");
+            return Err(Box::new(unavailable(
+                "the actor's node is not reachable; retry\n",
+            )));
         }
+        Ok(base)
+    }
+
+    /// [`Self::forward`] for a request whose body was read into memory (a
+    /// placed request that ran here after all, ADR 0041, section 6, whose
+    /// actor another node took meanwhile). Answered as a forward is.
+    pub(crate) async fn forward_buffered(
+        &self,
+        owner: &str,
+        mut req: Request<http_body_util::Full<bytes::Bytes>>,
+    ) -> Response<HyperOutgoingBody> {
+        let base = match self.prepare_forward(owner, &mut req).await {
+            Ok(base) => base,
+            Err(response) => return *response,
+        };
+        let client = self.clients().call.clone();
+        match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
+            Ok(Ok(response)) => self
+                .trusted_response(&base, owner, response)
+                .unwrap_or_else(|| unavailable("the actor's node is no longer trusted; retry\n")),
+            Ok(Err(e)) => {
+                self.failover.connect_failed(owner, &e);
+                tracing::warn!(owner, error = %e, "forwarding failed");
+                unavailable("the actor's node did not answer; retry\n")
+            }
+            Err(_) => text_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "the actor's node did not answer in time\n",
+            ),
+        }
+    }
+
+    /// Forwards a request for an actor to the node that owns it.
+    pub(crate) async fn forward(
+        &self,
+        owner: &str,
+        mut req: Request<Incoming>,
+    ) -> Response<HyperOutgoingBody> {
+        let base = match self.prepare_forward(owner, &mut req).await {
+            Ok(base) => base,
+            Err(response) => return *response,
+        };
         let client = self.clients().request.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
             Ok(Ok(response)) => self
@@ -2683,6 +2751,8 @@ fn random_hex(n: usize) -> std::io::Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+#[cfg(test)]
+mod placing_tests;
 #[cfg(test)]
 mod sender_tests;
 #[cfg(test)]

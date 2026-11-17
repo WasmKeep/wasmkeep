@@ -3126,6 +3126,7 @@ async fn a_full_signature_record_still_accepts_control_calls() {
             mac,
             ts: now,
             body: String::new(),
+            sender: None,
         }
     };
     for n in 0..u32::try_from(MAX_SEEN).unwrap() {

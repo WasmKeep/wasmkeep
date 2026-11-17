@@ -634,7 +634,11 @@ async fn settled(log: &Log, node: &Node) {
 }
 
 /// Runs the scenario and returns its trace.
-async fn scenario() -> String {
+/// `placement`: both nodes with placement at wake-up on (ADR 0041). b
+/// then has one resident slot, like a: a full node's wake-up of another
+/// actor is evaluated, and kept, since 80% of a's fill is less than one
+/// resident on b (rule 4's share of 0), so the actor's life is the same.
+async fn scenario(placement: bool) -> String {
     let keys = Keys::new();
     let log = Arc::new(Log::default());
     let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -661,8 +665,9 @@ async fn scenario() -> String {
     let adjust = |resident: usize| {
         move |config: &mut ActorConfig| {
             config.mailbox.max_resident = resident;
-            config.cluster.as_mut().unwrap().lease =
-                LeaseConfig::new(6_000, 500, 1_000, 100).unwrap();
+            let cluster = config.cluster.as_mut().unwrap();
+            cluster.lease = LeaseConfig::new(6_000, 500, 1_000, 100).unwrap();
+            cluster.placement = placement;
         }
     };
     let idle = Duration::from_secs(600);
@@ -688,7 +693,7 @@ async fn scenario() -> String {
         test_actor_wasm(),
         wall,
         "",
-        adjust(usize::MAX),
+        adjust(if placement { 1 } else { usize::MAX }),
     )
     .await;
     settle().await;
@@ -845,6 +850,22 @@ async fn scenario() -> String {
     render(&ops, &keys, &sha256_hex(test_actor_wasm()))
 }
 
+/// The same life with placement at wake-up on (ADR 0041): the same
+/// operations, in the same order.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bucket_operations_are_the_same_with_placement_on() {
+    if over_tls() {
+        return;
+    }
+    let got = scenario(true).await;
+    let want = std::fs::read_to_string(FIXTURE).unwrap_or_default();
+    assert!(
+        want == got,
+        "placement changed the actor's bucket operations (- expected, + now):\n{}",
+        diff(&want, &got)
+    );
+}
+
 /// See the module documentation.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bucket_operations_of_one_actors_life_are_those_of_0_4_2() {
@@ -852,7 +873,7 @@ async fn the_bucket_operations_of_one_actors_life_are_those_of_0_4_2() {
     if over_tls() {
         return;
     }
-    let got = scenario().await;
+    let got = scenario(false).await;
     if std::env::var_os("WASMKEEP_RECORD_TRACE").is_some_and(|v| v == "1") {
         std::fs::write(FIXTURE, &got).unwrap();
         eprintln!("recorded {FIXTURE}");

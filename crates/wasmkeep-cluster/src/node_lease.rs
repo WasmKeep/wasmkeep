@@ -735,6 +735,17 @@ pub async fn mark_old_lease<B: Bucket, C: Clock>(
     written.map(|_| seed).map_err(|_| AcquireError::Unavailable)
 }
 
+/// Where routing sends a request for an actor ([`Owners::route`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Another node, live in the view, holds it: forward there.
+    Owner(String),
+    /// No record, or a released one: nobody holds it.
+    Nobody,
+    /// The record names a node, but not one to forward to: try here.
+    Named,
+}
+
 /// An ownership record, in version 1 or 2 ([ADR 0035]).
 ///
 /// [ADR 0035]: ../../../docs/adr/0035-a-recorded-head-on-hand-over.md
@@ -1355,19 +1366,38 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         key: &str,
         live: impl Fn(&str, &str) -> bool,
     ) -> Result<Option<String>, AcquireError> {
+        Ok(match self.route(key, live).await? {
+            Route::Owner(node) => Some(node),
+            Route::Nobody | Route::Named => None,
+        })
+    }
+
+    /// [`Self::other_owner`]'s single read, in three answers (ADR 0041,
+    /// section 1): another live node holds it, nobody does (no record, or
+    /// a released one), or the record names a node this read does not
+    /// send to (this node, any instance, or a holder not live in the
+    /// view). Only [`Route::Nobody`] may lead to a placement.
+    pub async fn route(
+        &self,
+        key: &str,
+        live: impl Fn(&str, &str) -> bool,
+    ) -> Result<Route, AcquireError> {
         let Some((body, _)) = self
             .bucket
             .get(key)
             .await
             .map_err(|_| AcquireError::Unavailable)?
         else {
-            return Ok(None);
+            return Ok(Route::Nobody);
         };
         let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
-        Ok(record
-            .holder
-            .filter(|(node, instance)| node != &self.node && live(node, instance))
-            .map(|(node, _)| node))
+        Ok(match record.holder {
+            None => Route::Nobody,
+            Some((node, instance)) if node != self.node && live(&node, &instance) => {
+                Route::Owner(node)
+            }
+            Some(_) => Route::Named,
+        })
     }
 
     /// Releases a hold: the record names nobody, generation kept, `If-Match`
@@ -2288,6 +2318,38 @@ mod tests {
         assert_eq!(run(a.other_owner("owners/x", anyone)), Ok(None));
         // Released: nobody, here.
         assert_eq!(run(a.release(&hold)), Released::Released);
+        assert_eq!(run(b.other_owner("owners/x", anyone)), Ok(None));
+    }
+
+    /// ADR 0041, section 1: the same single read answers who holds the
+    /// actor in three ways; only "nobody" (no record, or a released one)
+    /// may lead to a placement. A record naming any node, live or not,
+    /// this one included, is "named".
+    #[test]
+    fn routing_tells_nobody_from_a_named_holder() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let mut lease = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        run(lease.start(None)).unwrap();
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let b = Owners::new(&mem, At(&t), "b", "i2", "nodes/", cfg());
+        let anyone = |_: &str, _: &str| true;
+        assert_eq!(run(b.route("owners/x", anyone)), Ok(Route::Nobody));
+        let hold = run(a.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(
+            run(b.route("owners/x", |n, i| n == "a" && i == "i1")),
+            Ok(Route::Owner("a".into()))
+        );
+        // Not live in the view: named, so never placed (a takeover).
+        assert_eq!(run(b.route("owners/x", |_, i| i == "i9")), Ok(Route::Named));
+        // This node's own hold: named.
+        assert_eq!(run(a.route("owners/x", anyone)), Ok(Route::Named));
+        assert_eq!(run(a.release(&hold)), Released::Released);
+        // Released: nobody.
+        assert_eq!(run(b.route("owners/x", anyone)), Ok(Route::Nobody));
+        // `other_owner` is the same read, two ways.
         assert_eq!(run(b.other_owner("owners/x", anyone)), Ok(None));
     }
 

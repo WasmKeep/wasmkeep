@@ -474,8 +474,12 @@ impl ActorService {
                         || (req.headers().contains_key(crate::cluster::FORWARDED)
                             && req.headers().contains_key(crate::cluster::APP)))
                 {
-                    return Some(crate::cluster::unavailable(
-                        "cannot authenticate ingress admission; retry\n",
+                    // A placed forward refused so: it never ran here.
+                    return Some(crate::cluster::refuse_if_placed(
+                        req.headers(),
+                        crate::cluster::unavailable(
+                            "cannot authenticate ingress admission; retry\n",
+                        ),
                     ));
                 }
             }

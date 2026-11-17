@@ -779,15 +779,17 @@ async fn the_heartbeat_carries_the_nodes_load() {
         "{busy:?}"
     );
     // Front requests are published beside events, unknown (`-`) for the
-    // first minute too; a reader of the version before skips the key.
+    // first minute too, then the app's rooms (ADR 0041); a reader of the
+    // version before skips the keys.
     let raw = {
         use object_store::ObjectStoreExt as _;
         let body = store.get(&"nodes/a".into()).await.unwrap().bytes().await;
         String::from_utf8(body.unwrap().to_vec()).unwrap()
     };
     assert!(
-        raw.lines()
-            .any(|l| l.starts_with("load ") && l.ends_with(" events_per_min=- front_per_min=-")),
+        raw.lines().any(|l| l.starts_with("load ")
+            && l.contains(" events_per_min=- front_per_min=- actor_room=")
+            && l.contains(" socket_room=")),
         "{raw}"
     );
     assert_eq!(

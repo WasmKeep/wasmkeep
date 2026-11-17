@@ -13,6 +13,32 @@ pub(super) enum Held {
     Answer(Response<HyperOutgoingBody>),
 }
 
+/// On an answer given before the event reached the actor's guest, which
+/// a placed event's receiver turns into a refusal (ADR 0041, section 6):
+/// no slot, or the node refused to run it. Never sent.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NotRun;
+
+fn not_run(mut response: Response<HyperOutgoingBody>) -> Response<HyperOutgoingBody> {
+    response.extensions_mut().insert(NotRun);
+    response
+}
+
+/// Whether an outside request may be placed (ADR 0041, section 1): it
+/// did not come from another node, and its body is absent or declared at
+/// [`crate::cluster::MAX_PLACED_BODY`] or less, so it can be read into
+/// memory and run here after a refusal. A chunked body streams: never.
+fn placeable_request<B: hyper::body::Body>(req: &Request<B>) -> bool {
+    !crate::cluster::never_forward(req)
+        && !req.headers().contains_key(hyper::header::TRANSFER_ENCODING)
+        && (req.body().is_end_stream()
+            || req
+                .body()
+                .size_hint()
+                .exact()
+                .is_some_and(|n| n <= crate::cluster::MAX_PLACED_BODY))
+}
+
 /// Removes every name of the host's `x-wasmkeep-` range from a request
 /// from outside but the forwarded mark ([`crate::cluster::FORWARDED`]).
 fn strip_outside_headers(headers: &mut hyper::HeaderMap) {
@@ -78,8 +104,18 @@ impl ActorService {
             .as_ref()
             .and_then(|cluster| cluster.wrong_app(&req, internal))
         {
-            return refused;
+            return crate::cluster::refuse_if_placed(req.headers(), refused);
         }
+        // A placed wake-up (ADR 0041, section 8): its mark is believed only
+        // under a signature that checked (a call's, or the forward's
+        // proof, which signs the app read here, before it is removed).
+        // Unchecked, it only says what the forwarded mark says: never
+        // forwarded again, never placed.
+        let placed = self
+            .inner
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.placed_mark(&req, signed_body.as_ref()));
         req.headers_mut().remove(crate::cluster::APP);
         if !read(&self.inner.classes).contains_key(class) {
             return text_response(StatusCode::NOT_FOUND, "no such actor class\n");
@@ -159,9 +195,40 @@ impl ActorService {
                 });
             let mut ticket = None;
             let mut req = req;
+            if let (Some(mark), Some(cluster)) = (&placed, &self.inner.cluster) {
+                return self
+                    .run_placed(cluster, address, req, chain, outside, mark)
+                    .await;
+            }
+            // An outside request for an actor nobody holds may be placed on
+            // a lighter node (ADR 0041), from the same single read routing
+            // makes anyway.
+            let mut routed = None;
+            if let Some(cluster) = &self.inner.cluster
+                && cluster.placement_on()
+                && placeable_request(&req)
+            {
+                let route = self.inner.cold_route(&address).await;
+                if route == Cold::Nobody {
+                    match self
+                        .place_request(cluster, &address, req, &chain, outside)
+                        .await
+                    {
+                        Ok(response) => return response,
+                        Err(back) => req = *back,
+                    }
+                }
+                routed = Some(route);
+            }
             loop {
                 let handback = match self
-                    .dispatch(address.clone(), req, Arc::clone(&chain), outside)
+                    .dispatch_routed(
+                        address.clone(),
+                        req,
+                        Arc::clone(&chain),
+                        outside,
+                        routed.take(),
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -237,9 +304,12 @@ impl ActorService {
         };
         let body = body.to_bytes();
         if crate::cluster::body_sha256(&body) != signed.body {
-            return text_response(
-                StatusCode::FORBIDDEN,
-                "the body does not match the node's signature\n",
+            return crate::cluster::refuse_if_placed(
+                &parts.headers,
+                text_response(
+                    StatusCode::FORBIDDEN,
+                    "the body does not match the node's signature\n",
+                ),
             );
         }
         // Spent only now: a copy sent ahead with another body was refused
@@ -250,7 +320,10 @@ impl ActorService {
             .as_ref()
             .is_none_or(|cluster| !cluster.first_use(&signed, handoff || take));
         if replayed {
-            return text_response(StatusCode::FORBIDDEN, "signature already used\n");
+            return crate::cluster::refuse_if_placed(
+                &parts.headers,
+                text_response(StatusCode::FORBIDDEN, "signature already used\n"),
+            );
         }
         if handoff {
             return self.accept_alarm(&address, &body);
@@ -263,11 +336,181 @@ impl ActorService {
             |never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} },
         );
         let req = Request::from_parts(parts, body);
+        if let (Some(mark), Some(cluster)) = (&placed, &self.inner.cluster) {
+            return self
+                .run_placed(cluster, address, req, chain, outside, mark)
+                .await;
+        }
         match self.dispatch(address, req, chain, outside).await {
             Ok(response) => response,
             // A call is never forwarded twice (the calling node sent it to
             // the owner it saw); the calling actor gets the 503.
             Err(_) => crate::cluster::unavailable("actor ownership is changing; retry\n"),
+        }
+    }
+
+    /// An outside request for `address`, which nobody holds (ADR 0041):
+    /// placed on a lighter node if the rule says so, and that node's
+    /// answer returned, or run here after a refusal. `Err` hands the
+    /// request back, untouched, to run here as usual.
+    async fn place_request(
+        &self,
+        cluster: &crate::cluster::Cluster,
+        address: &ActorAddress,
+        req: Request<Incoming>,
+        chain: &Chain,
+        outside: bool,
+    ) -> Result<Response<HyperOutgoingBody>, Box<Request<Incoming>>> {
+        use crate::cluster::{Choice, Hop};
+        let app = &self.inner.app_labels;
+        // The forward's proof needs the client's address (ADR 0038).
+        let signable = req.extensions().get::<crate::http::PeerAddress>().is_some();
+        let (node, fill) =
+            match cluster.choose_placement(address, super::load::rooms(&self.inner), signable) {
+                Choice::NotPlaceable => return Err(Box::new(req)),
+                Choice::Keep(reason) => {
+                    crate::metrics::placement_kept(app, reason);
+                    return Err(Box::new(req));
+                }
+                Choice::Place { node, fill } => (node, fill),
+            };
+        // Read into memory, so that a refusal can run it here (section 6).
+        let (parts, body) = req.into_parts();
+        let max = usize::try_from(crate::cluster::MAX_PLACED_BODY).unwrap_or(usize::MAX);
+        let read = http_body_util::BodyExt::collect(http_body_util::Limited::new(body, max));
+        let Ok(Ok(body)) = tokio::time::timeout(SIGNED_BODY_TIMEOUT, read).await else {
+            return Ok(text_response(
+                StatusCode::BAD_REQUEST,
+                "request body unreadable or too large\n",
+            ));
+        };
+        let body = body.to_bytes();
+        let hop = Request::from_parts(parts.clone(), http_body_util::Full::new(body.clone()));
+        let sent = cluster.forward_placed(&node, hop, fill).await;
+        crate::metrics::placement_sent(app, "request", sent.outcome());
+        Ok(match sent {
+            Hop::Answered(response) => {
+                // It ran there: the next requests skip the record read. An
+                // access answer names no node and sets no hint.
+                if response
+                    .headers()
+                    .get(SERVED_BY)
+                    .is_some_and(|v| v.as_bytes() == node.as_bytes())
+                {
+                    self.inner.remember_owner(address, &node);
+                }
+                response
+            }
+            Hop::Refused | Hop::Unsent => {
+                cluster.placement_backoff(&node);
+                self.run_buffered(cluster, address, parts, body, chain, outside)
+                    .await
+            }
+            Hop::Failed(why) => {
+                cluster.placement_backoff(&node);
+                tracing::warn!(node, error = %why, "a placed request's hop failed");
+                // It may have run there: never run again here.
+                crate::cluster::unavailable("the actor's node did not answer; retry\n")
+            }
+        })
+    }
+
+    /// A placed request that did not run on its chosen node, run here by
+    /// the ordinary path (ADR 0041, section 6): the record read again,
+    /// then acquired, or forwarded once to an owner that appeared.
+    async fn run_buffered(
+        &self,
+        cluster: &crate::cluster::Cluster,
+        address: &ActorAddress,
+        parts: hyper::http::request::Parts,
+        body: bytes::Bytes,
+        chain: &Chain,
+        outside: bool,
+    ) -> Response<HyperOutgoingBody> {
+        let full = http_body_util::BodyExt::map_err(
+            http_body_util::Full::new(body.clone()),
+            |never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} },
+        );
+        let req = Request::from_parts(parts, full);
+        match self
+            .dispatch(address.clone(), req, Arc::clone(chain), outside)
+            .await
+        {
+            Ok(response) => response,
+            Err(handback) => {
+                let Handback {
+                    node,
+                    req,
+                    elsewhere,
+                } = *handback;
+                let (parts, _) = req.into_parts();
+                let req = Request::from_parts(parts, http_body_util::Full::new(body));
+                let response = cluster.forward_buffered(&node, req).await;
+                if response.status().is_server_error() {
+                    if elsewhere {
+                        cluster.suspect(&node);
+                    } else {
+                        self.inner.forget_owner(address);
+                    }
+                }
+                response
+            }
+        }
+    }
+
+    /// A placed event that arrived (ADR 0041, sections 5 and 6): run here
+    /// if this node takes it, never forwarded or placed again; otherwise
+    /// refused with the mark, and its sender runs it.
+    async fn run_placed<B>(
+        &self,
+        cluster: &crate::cluster::Cluster,
+        address: ActorAddress,
+        req: Request<B>,
+        chain: Chain,
+        outside: bool,
+        mark: &crate::cluster::Mark,
+    ) -> Response<HyperOutgoingBody>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<wasmtime_wasi_http::Error>,
+    {
+        use wasmkeep_cluster::placement::Arrival;
+        let app = &self.inner.app_labels;
+        let refuse = |outcome: &str, text: &str| {
+            crate::metrics::placement_received(app, outcome);
+            crate::cluster::placed_refusal(text)
+        };
+        if cluster.draining() || cluster.secrets_blocked() || cluster.move_names(&address) {
+            return refuse("refused", "this node does not take this actor now; retry\n");
+        }
+        let reservation = match cluster.arrive(mark, || super::load::rooms(&self.inner)) {
+            Ok(reservation) => reservation,
+            Err(Arrival::NoReturn) => {
+                return refuse("returned", "this node placed an actor there just now\n");
+            }
+            Err(Arrival::Capacity) => {
+                return refuse("fuller", "this node is not the lighter one\n");
+            }
+            Err(Arrival::InvalidMark | Arrival::Accept) => {
+                return refuse("refused", "the placed mark is not valid\n");
+            }
+        };
+        match self.dispatch(address, req, chain, outside).await {
+            // Another holder, or this node draining: it did not run.
+            Err(_) => refuse("refused", "another node holds the actor; retry\n"),
+            Ok(response) if response.extensions().get::<NotRun>().is_some() => {
+                crate::metrics::placement_received(app, "refused");
+                crate::cluster::mark_refused(response)
+            }
+            Ok(response) => {
+                // Handed to the guest: acquired here. An access answer
+                // (403, 404) is the client's and carries no mark.
+                if response.headers().contains_key(SERVED_BY) {
+                    reservation.accepted();
+                    crate::metrics::placement_received(app, "acquired");
+                }
+                response
+            }
         }
     }
 
@@ -338,7 +581,7 @@ impl ActorService {
     pub(super) async fn dispatch<B>(
         &self,
         address: ActorAddress,
-        mut req: Request<B>,
+        req: Request<B>,
         chain: Chain,
         outside: bool,
     ) -> Result<Response<HyperOutgoingBody>, Box<Handback<B>>>
@@ -346,7 +589,29 @@ impl ActorService {
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
     {
-        if let Some(owner) = self.inner.remote_owner(&address).await {
+        self.dispatch_routed(address, req, chain, outside, None)
+            .await
+    }
+
+    /// [`Self::dispatch`], with the route already read for this request
+    /// (`routed`), so that a placement's decision costs no second read.
+    pub(super) async fn dispatch_routed<B>(
+        &self,
+        address: ActorAddress,
+        mut req: Request<B>,
+        chain: Chain,
+        outside: bool,
+        routed: Option<Cold>,
+    ) -> Result<Response<HyperOutgoingBody>, Box<Handback<B>>>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<wasmtime_wasi_http::Error>,
+    {
+        let route = match routed {
+            Some(route) => route,
+            None => self.inner.cold_route(&address).await,
+        };
+        if let Cold::Owner(owner) = route {
             return Err(Box::new(Handback {
                 node: owner,
                 req,
@@ -372,6 +637,9 @@ impl ActorService {
         let event = tokio::spawn(event);
         match response_rx.await {
             Ok(Outcome::Served(mut response)) => {
+                // The host's mark only (ADR 0041): a guest cannot make a
+                // placed event's sender run it a second time.
+                response.headers_mut().remove(crate::cluster::PLACED);
                 if let Some(cluster) = &self.inner.cluster
                     && let Ok(v) = hyper::header::HeaderValue::from_str(&cluster.node_id)
                 {
@@ -406,9 +674,9 @@ impl ActorService {
             Ok(Outcome::Refused(why)) => {
                 tracing::debug!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), %why, "event refused");
                 crate::metrics::refused(crate::metrics::Refusal::Unavailable);
-                Ok(crate::cluster::unavailable(
+                Ok(not_run(crate::cluster::unavailable(
                     "this node cannot run the actor now; retry\n",
-                ))
+                )))
             }
             Ok(Outcome::Missing) => {
                 crate::metrics::refused(crate::metrics::Refusal::Access);
@@ -424,7 +692,7 @@ impl ActorService {
             Err(_) => Ok(match event.await {
                 Ok(Err(MailboxError::Capacity(_))) => {
                     crate::metrics::refused(crate::metrics::Refusal::Capacity);
-                    capacity_response()
+                    not_run(capacity_response())
                 }
                 Ok(Err(MailboxError::Full(_))) => {
                     crate::metrics::refused(crate::metrics::Refusal::Overloaded);

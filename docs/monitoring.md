@@ -170,6 +170,10 @@ its first request.
 | `wasmkeep_instantiate_seconds` | histogram | Creating an actor's instance: the wake cost. |
 | `wasmkeep_wakes_total`, `wasmkeep_hibernations_total` | counters | Actor instances created (first request or wake) and dropped (hibernated, evicted, discarded after a trap, replaced by a new version, shut down): is the idle timeout right? |
 | `wasmkeep_forwards_total{kind}` | counter | Requests (`request`), sockets (`websocket`) and calls (`call`) sent to the node owning the actor: placement efficiency. |
+| `wasmkeep_placements_total{tenant,app,kind,outcome}` | counter | Wake-ups of an actor nobody held that this node sent to a lighter node ([placement at wake-up](#placement-at-wake-up)), by `kind` (`request`, `call`) and how the hop ended: `placed` (an answer came back, returned as it is), `refused` (the node did not take it: run here), `unsent` (never read: run here), `failed` (it may have run there: a 503 or `failed`). |
+| `wasmkeep_placements_received_total{tenant,app,outcome}` | counter | Placed wake-ups this node received: `acquired` (it ran here), `fuller` (this node's own count said it was not the lighter one), `returned` (it had just placed one on the sender), `refused` (any other reason: draining, a move, no slot, another holder, an invalid mark). |
+| `wasmkeep_placement_kept_total{tenant,app,reason}` | counter | Placeable wake-ups this node kept: `floor` (under a fifth of its room), `band` (not 25% fuller than the lighter candidate), `budget` (its share of the candidate's gap spent for that heartbeat), `no_candidate` (no fresh node of the app announcing `place`), `unsigned` (the hop could not carry its proof). |
+| `wasmkeep_placement_fill{tenant,app,kind}` | gauge | This node id's fill in thousandths (`residents`, `sockets`), as of its last heartbeat. |
 | `wasmkeep_failover_waits_total{kind,outcome}` | counter | Requests (`request`) and WebSocket upgrades (`websocket`) for an actor whose node was dead or stopping that this node kept until the actor could be taken over, instead of answering 503 at once ([what a caller sees when a node dies](cluster.md#when-a-node-dies-what-a-caller-sees)), by how the wait ended: `served` (this node took the actor and answered), `forwarded` (another node took it first; sent there once), `owner_alive` (the owner wrote its lease again or restarted; sent to it as usual), `expired` (the wait ran out: 503), `shutdown` and `lease_lost` (this node began to stop, or its own lease ran out: 503), `left` (the client closed its connection: never run), `answered_other` (asked for the actor here and answered otherwise: the node full, the takeover failed, an access rule; or the client left during that try). `over_cap` counts requests that would have been kept and got the 503 at once because the node already kept a quarter of its connection limit, or 64 for that actor. `expired` rising when a node dies: the wait is shorter than the takeover (`--failover-wait-secs`), or no node could fence the dead one. |
 | `wasmkeep_durable_write_seconds` | histogram | `exec-durable` until durable: the bucket's health as actors feel it. |
 | `wasmkeep_requests_abandoned_total` | counter | Requests and actor calls not run because their sender had gone while they waited in the actor's queue (behind a long event, or a takeover's restore): a client that closed its connection, or a caller whose call timed out. Nobody would get the answer, and nothing they would have written was acknowledged. A request that has started runs to its end. Seen only for a request received whole (no body, or one that arrived in the server's first read, about 8 KiB): one whose body is still streaming (larger, chunked, or waiting for `100 Continue`) runs as before. |
@@ -250,6 +254,32 @@ Watch `status="error"`; the other two are part of normal operation. A
 listing counts once per call, however many pages it took: S3 and R2 return
 1,000 keys a page, so a restore of an actor with 10,000 objects in the
 bucket counts 2 `list` requests here but bills about 22.
+
+### Placement at wake-up
+
+A node about to wake an actor nobody holds sends that one wake-up to a
+clearly lighter node of the app ([ADR 0041](adr/0041-placement-at-wake-up.md),
+[how it scales](failover-and-scaling.md#placement-at-wake-up)). Read the
+four `wasmkeep_placement*` series together:
+
+- An idle cluster, or one an even hash keeps level, shows only `floor`
+  and `band` in `wasmkeep_placement_kept_total`, and no placements.
+- A node that joined shows `acquired` rising in
+  `wasmkeep_placements_received_total` while its `wasmkeep_placement_fill`
+  climbs, then quiet once it is within the band.
+- `refused` or `fuller` in `wasmkeep_placements_received_total` beside
+  `refused` in the senders' `wasmkeep_placements_total` is a number that
+  was behind: each costs one hop, and the event ran where it woke.
+  Steadily rising, the heartbeats are late (see `wasmkeep_listing_seconds`).
+- `failed` in `wasmkeep_placements_total` counts client-visible 503s: a
+  chosen node died or stopped answering between its heartbeat and the
+  hop.
+- `no_candidate` everywhere with fills apart: the other nodes do not
+  announce `place` (an older version, or `--no-placement`), or their
+  heartbeats are stale.
+
+Every placed hop also counts in `wasmkeep_forwards_total`, and each
+request for a placed actor costs a forward while it stays resident.
 
 ### Failovers
 

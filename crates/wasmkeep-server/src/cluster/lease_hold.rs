@@ -1227,6 +1227,24 @@ impl Cluster {
             .await
     }
 
+    /// [`Self::other_owner`]'s read in three answers (ADR 0041, section
+    /// 1): only `Nobody` may lead to a placement.
+    pub(crate) async fn route(
+        &self,
+        address: &ActorAddress,
+    ) -> Result<wasmkeep_cluster::node_lease::Route, AcquireError> {
+        let key = self.owner_key(address);
+        self.owners
+            .route(&key, |node, instance| {
+                self.peers
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(node)
+                    .is_some_and(|p| p.instance.as_deref() == Some(instance))
+            })
+            .await
+    }
+
     /// Whether `address`'s record names this process, at any generation
     /// (one read; ADR 0024, section 3).
     pub(crate) async fn names_this_instance(

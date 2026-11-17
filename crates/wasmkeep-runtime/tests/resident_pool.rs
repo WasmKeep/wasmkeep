@@ -155,3 +155,55 @@ async fn a_waiter_at_its_own_cap_does_not_spin() {
     gate.notify_one();
     busy.await.unwrap().unwrap();
 }
+
+/// ADR 0041, section 2: what each app's resident room is computed from,
+/// per app and bounded by the process. One app filling the pool leaves
+/// the other its floor; each has its own cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_app_reads_its_own_share_of_the_pool() {
+    use wasmkeep_runtime::ResidentShare;
+    let pool = ResidentPool::new(8);
+    let (a, _) = app(&pool, None);
+    let (b, _) = app(&pool, Some(3));
+    fill(&a, &["1", "2", "3", "4", "5", "6", "7", "8"]).await;
+    assert_eq!(
+        a.resident_share(),
+        ResidentShare {
+            residents: 8,
+            cap: usize::MAX,
+            // The default floor: 8 / (2 * 2).
+            floor: 2,
+            limit: 8,
+            process: 8,
+        }
+    );
+    assert_eq!(
+        b.resident_share(),
+        ResidentShare {
+            residents: 0,
+            cap: usize::MAX,
+            floor: 3,
+            limit: 8,
+            process: 8,
+        }
+    );
+    // A mailbox in no pool: its cap is its limit, its residents the process.
+    let alone = Mailboxes::new(
+        MailboxConfig {
+            max_resident: 5,
+            ..MailboxConfig::default()
+        },
+        |_| async { Ok::<_, BoxError>(Live(Arc::new(AtomicUsize::new(1)))) },
+    );
+    alone.submit(&addr("1"), touch).await.unwrap();
+    assert_eq!(
+        alone.resident_share(),
+        ResidentShare {
+            residents: 1,
+            cap: 5,
+            floor: 0,
+            limit: 5,
+            process: 1,
+        }
+    );
+}
