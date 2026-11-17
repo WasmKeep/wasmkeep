@@ -16,7 +16,10 @@ mod bucket;
 mod disk;
 pub(crate) mod host;
 pub(crate) mod keys;
+pub mod links;
+pub(crate) mod serve;
 mod streams;
+pub(crate) mod token;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,6 +48,8 @@ pub(crate) struct Blobs {
     backend: Backend,
     /// One file's largest size, streamed (`--max-blob-bytes`).
     max_file: u64,
+    /// How links are made and checked; `None`: no links.
+    links: Option<links::Links>,
 }
 
 #[derive(Debug)]
@@ -89,6 +94,7 @@ impl Blobs {
         Self {
             backend,
             max_file: max_file.min(MAX_FILE_CEILING),
+            links: None,
         }
     }
 
@@ -97,7 +103,94 @@ impl Blobs {
         Self {
             backend: Backend::Disk(disk::Disk::new(app_dir.join("blobs").join(epoch))),
             max_file: max_file.min(MAX_FILE_CEILING),
+            links: None,
         }
+    }
+
+    /// The same files, with links made and checked by `links`.
+    pub(crate) fn with_links(mut self, links: links::Links) -> Self {
+        self.links = Some(links);
+        self
+    }
+
+    pub(crate) fn links(&self) -> Option<&links::Links> {
+        self.links.as_ref()
+    }
+
+    /// The largest file a node-link upload may create: a create-if-absent
+    /// write, which on a bucket is one PUT of at most 16 MiB (a multipart
+    /// upload takes no condition here).
+    pub(crate) fn max_upload(&self) -> u64 {
+        match &self.backend {
+            Backend::Bucket(_) => MAX_BUFFERED.min(self.max_file),
+            _ => self.max_file,
+        }
+    }
+
+    /// A download link of `key`, attachment or inline (section 4).
+    pub(crate) async fn link_download(
+        &self,
+        ns: &Namespace,
+        key: &str,
+        inline: bool,
+        filename: Option<&str>,
+        secs: u32,
+    ) -> Result<String, BlobError> {
+        let links = self
+            .links
+            .as_ref()
+            .ok_or_else(|| BlobError::Unavailable("this node makes no links".into()))?;
+        // Inline only for a type a browser cannot run: the stored one.
+        let content_type = if inline {
+            let Some(info) = self.head(ns, key).await? else {
+                return Err(BlobError::NotAllowed(
+                    "an inline link needs the file: no file has this key".into(),
+                ));
+            };
+            if !links::inline_safe(&info.content_type) {
+                return Err(BlobError::NotAllowed(format!(
+                    "{} is not shown inline: only images, audio, video and plain text",
+                    info.content_type
+                )));
+            }
+            info.content_type
+        } else {
+            keys::DEFAULT_CONTENT_TYPE.to_owned()
+        };
+        let name = links::filename(filename, key);
+        if let (Some(signer), Backend::Bucket(b)) = (&links.settings.presigner, &self.backend) {
+            let disposition = links::disposition(inline, &name);
+            return links
+                .presigned_download(signer, &b.path(ns, key)?, secs, &disposition, &content_type)
+                .await;
+        }
+        let grant = token::Grant::Download {
+            inline,
+            filename: (!inline).then_some(name),
+        };
+        links.node_link(ns, key, secs, grant).map(|(url, _)| url)
+    }
+
+    /// An upload link creating `key`: exactly `size` bytes of
+    /// `content_type` (checked), always a node link.
+    pub(crate) fn link_upload(
+        &self,
+        ns: &Namespace,
+        key: &str,
+        size: u64,
+        content_type: &str,
+        secs: u32,
+    ) -> Result<(String, u64), BlobError> {
+        let links = self
+            .links
+            .as_ref()
+            .ok_or_else(|| BlobError::Unavailable("this node makes no links".into()))?;
+        let content_type = keys::content_type(Some(content_type)).map_err(BlobError::NotAllowed)?;
+        if size > self.max_upload() {
+            return Err(BlobError::TooLarge);
+        }
+        let grant = token::Grant::Upload { size, content_type };
+        links.node_link(ns, key, secs, grant)
     }
 
     pub(crate) async fn head(

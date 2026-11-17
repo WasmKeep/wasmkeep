@@ -61,7 +61,10 @@ rustix = { workspace = true, features = ["thread"] }
 toml.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+# io-util: the fake S3 server of the link proof's tests reads and writes its sockets.
+tokio = { workspace = true, features = ["test-util", "io-util"] }
+# HMAC-SHA256 for that server's SigV4 check, independent of object_store's signer; already in the tree.
+ring.workspace = true
 # Enforce a LIST/GET-only source in backup race tests; already in workspace.
 async-trait = "=0.1.92"
 tempfile.workspace = true

@@ -44,7 +44,7 @@
 //!   `x-upstream-range: NAMES`, the names of the upstream's headers in
 //!   the `x-wasmkeep-` range, comma-separated; or 502 and the error
 //! - the files routes of `../blob-routes.rs` (`/b/`, `/head/`, `/list`,
-//!   `/stream/`), over the front's own namespace
+//!   `/stream/`, `/link/`, `/upload-link/`), over the front's own namespace
 //! - anything else: `front ok`
 
 use std::io::Write as _;
@@ -257,7 +257,7 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
     fn handle(request: IncomingRequest, out: ResponseOutparam) {
         let full = request.path_with_query().unwrap_or_default();
         let (path, query) = full.split_once('?').unwrap_or((full.as_str(), ""));
-        if ["/b/", "/head/", "/stream/"]
+        if ["/b/", "/head/", "/stream/", "/link/", "/upload-link/"]
             .iter()
             .any(|p| path.starts_with(p))
             || path == "/list"

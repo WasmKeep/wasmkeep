@@ -653,3 +653,209 @@ async fn files_sit_under_the_root_the_rest_of_the_state_spells() {
         1
     );
 }
+
+/// Signs nothing: a URL naming what a real signer binds, to read back.
+#[derive(Debug)]
+struct Recording;
+
+#[async_trait::async_trait]
+impl object_store::signer::Signer for Recording {
+    async fn signed_url(
+        &self,
+        method: object_store::signer::Method,
+        path: &StorePath,
+        expires_in: std::time::Duration,
+    ) -> object_store::Result<object_store::signer::Url> {
+        self.signed_url_opts(method, path, expires_in, &Default::default())
+            .await
+    }
+
+    async fn signed_url_opts(
+        &self,
+        method: object_store::signer::Method,
+        path: &StorePath,
+        expires_in: std::time::Duration,
+        options: &object_store::signer::SignedUrlOptions,
+    ) -> object_store::Result<object_store::signer::Url> {
+        let mut url =
+            object_store::signer::Url::parse(&format!("https://bucket.example/{}", path.as_ref()))
+                .unwrap();
+        url.query_pairs_mut()
+            .append_pair("method", method.as_str())
+            .append_pair("expires", &expires_in.as_secs().to_string())
+            .extend_pairs(options.extra_query.iter());
+        Ok(url)
+    }
+}
+
+fn with_links(f: Fixture, presigned: bool) -> (tempfile::TempDir, Arc<Blobs>) {
+    let Fixture { _tmp, blobs } = f;
+    let blobs = Arc::into_inner(blobs)
+        .unwrap()
+        .with_links(links::Links::new(
+            "acme",
+            "shop",
+            "00112233aabbccdd",
+            links::LinkSettings {
+                presigner: presigned
+                    .then(|| Arc::new(Recording) as Arc<dyn object_store::signer::Signer>),
+                base: Some("https://shop.example.com".into()),
+            },
+            links::MacSource::Key(token::mac_key(b"k", "acme", "shop").unwrap()),
+        ));
+    (_tmp, Arc::new(blobs))
+}
+
+fn download(
+    inline: bool,
+    name: Option<&str>,
+    secs: Option<u32>,
+) -> wasmkeep_wit::wasmkeep::actor::blobs::DownloadOptions {
+    use wasmkeep_wit::wasmkeep::actor::blobs::{Disposition, DownloadOptions};
+    DownloadOptions {
+        expires_in_secs: secs,
+        disposition: if inline {
+            Disposition::Inline
+        } else {
+            Disposition::Attachment(name.map(str::to_owned))
+        },
+    }
+}
+
+#[tokio::test]
+async fn presigned_downloads_override_every_stored_header() {
+    let (_tmp, blobs) = with_links(bucket(), true);
+    let mut c = Caller::new(Some(blobs), Namespace::actor("c", "n", "0"), Gate::Free);
+    c.put(
+        "a~b/pic.png".into(),
+        b"x".to_vec(),
+        opts(Some("image/png"), Condition::Any),
+    )
+    .await
+    .unwrap();
+    c.put(
+        "page.html".into(),
+        b"x".to_vec(),
+        opts(Some("text/html"), Condition::Any),
+    )
+    .await
+    .unwrap();
+    let url = c
+        .link_download("a~b/pic.png".into(), download(false, Some("Été.png"), None))
+        .await
+        .unwrap();
+    let url = object_store::signer::Url::parse(&url).unwrap();
+    let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        url.path(),
+        format!(
+            "/p/state/acme/shop/blobs/00112233aabbccdd/c/{}/0/a~b/pic.png",
+            keys::name_id("n")
+        )
+    );
+    assert_eq!(q["method"], "GET");
+    assert_eq!(q["expires"], "300");
+    assert_eq!(q["response-content-type"], "application/octet-stream");
+    assert_eq!(
+        q["response-content-disposition"],
+        "attachment; filename=\"_t_.png\"; filename*=UTF-8''%C3%89t%C3%A9.png"
+    );
+    assert_eq!(q["response-cache-control"], "private, max-age=300");
+    assert_eq!(q["response-content-encoding"], "identity");
+    let url = c
+        .link_download("a~b/pic.png".into(), download(true, None, Some(60)))
+        .await
+        .unwrap();
+    let url = object_store::signer::Url::parse(&url).unwrap();
+    let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        (
+            q["response-content-type"].as_str(),
+            q["response-content-disposition"].as_str()
+        ),
+        ("image/png", "inline")
+    );
+    assert_eq!(q["expires"], "60");
+    // Inline only for what a browser cannot run, and for a file there.
+    for key in ["page.html", "missing.png"] {
+        assert!(matches!(
+            c.link_download(key.into(), download(true, None, None))
+                .await,
+            Err(BlobError::NotAllowed(_))
+        ));
+    }
+    // Uploads stay node links, under the configured base.
+    let up = c
+        .link_upload(
+            "u/1".into(),
+            wasmkeep_wit::wasmkeep::actor::blobs::UploadOptions {
+                size: 3,
+                content_type: "image/png".into(),
+                expires_in_secs: None,
+            },
+        )
+        .unwrap();
+    assert!(
+        up.url
+            .starts_with("https://shop.example.com/_wasmkeep/blobs/v1/"),
+        "{}",
+        up.url
+    );
+    assert_eq!(
+        (up.method.as_str(), up.headers.clone()),
+        ("PUT", vec![("content-type".into(), "image/png".into())])
+    );
+}
+
+#[tokio::test]
+async fn links_need_what_writes_need_and_stop_at_1000_an_event() {
+    let (_tmp, blobs) = with_links(disk_with(DEFAULT_MAX_FILE), false);
+    let upload = |size| wasmkeep_wit::wasmkeep::actor::blobs::UploadOptions {
+        size,
+        content_type: "image/png".into(),
+        expires_in_secs: None,
+    };
+    let mut c = Caller::new(
+        Some(Arc::clone(&blobs)),
+        Namespace::actor("c", "n", "0"),
+        Gate::Unheld,
+    );
+    assert!(matches!(
+        c.link_upload("u".into(), upload(1)),
+        Err(BlobError::NotAllowed(_))
+    ));
+    // A download is a read: no hold needed.
+    let url = c
+        .link_download("k".into(), download(false, None, None))
+        .await
+        .unwrap();
+    assert!(url.starts_with("https://shop.example.com/_wasmkeep/blobs/v1/"));
+    c.new_event(Gate::Free);
+    assert!(matches!(
+        c.link_upload("u".into(), upload(DEFAULT_MAX_FILE + 1)),
+        Err(BlobError::TooLarge)
+    ));
+    for _ in 0..999 {
+        c.link_download("k".into(), download(false, None, None))
+            .await
+            .unwrap();
+    }
+    // The refused upload above counted; the 1,001st link of the event is refused.
+    assert!(matches!(
+        c.link_download("k".into(), download(false, None, None))
+            .await,
+        Err(BlobError::NotAllowed(_))
+    ));
+    c.new_event(Gate::Free);
+    c.link_download("k".into(), download(false, None, None))
+        .await
+        .unwrap();
+    // A bucket's node-link upload is one conditional PUT: 16 MiB at most.
+    let (_t, blobs) = with_links(bucket(), false);
+    let mut c = Caller::new(Some(blobs), Namespace::front(), Gate::Free);
+    assert!(matches!(
+        c.link_upload("u".into(), upload(MAX_BUFFERED + 1)),
+        Err(BlobError::TooLarge)
+    ));
+    c.link_upload("u".into(), upload(MAX_BUFFERED)).unwrap();
+}

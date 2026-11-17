@@ -218,6 +218,15 @@ fn invalid_values_are_refused_naming_the_field() {
         ("allow-outbound-port = [0]", "allow-outbound-port"),
         ("allow-outbound-port = [70000]", "allow-outbound-port"),
         ("no-alarms = \"yes\"", "no-alarms"),
+        ("blob-link-base = \"shop.example.com\"", "blob-link-base"),
+        (
+            "blob-link-base = \"https://shop.example.com/files\"",
+            "blob-link-base",
+        ),
+        (
+            "blob-link-base = \"https://user@shop.example.com\"",
+            "blob-link-base",
+        ),
         ("[app.env]\n_front = [\"f.env\"]", "env"),
         ("[app.env]\ncart = \"f.env\"", "env"),
         ("[app.access]\ncart = \"everyone\"", "access"),
@@ -715,4 +724,24 @@ fn several_apps_without_a_socket_ceiling_are_warned_about() {
     assert!(some.warnings().is_empty());
     let one = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
     assert!(one.warnings().is_empty());
+}
+
+#[test]
+fn blob_link_base_is_an_apps_field() {
+    let file = parse(
+        &format!(
+            "{LISTEN}{}",
+            app(
+                "acme/shop",
+                "shop-1",
+                "blob-link-base = \"https://files.example.net/\""
+            )
+        ),
+        at(),
+    )
+    .unwrap();
+    assert_eq!(
+        file.apps[0].blob_link_base.as_deref(),
+        Some("https://files.example.net")
+    );
 }

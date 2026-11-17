@@ -219,6 +219,10 @@ pub struct ActorConfig {
     /// [`crate::apps::AppRef::prepare_local`] returns it). By default the
     /// epoch of an app with neither marker.
     pub blob_epoch: String,
+    /// How this app runtime makes links (ADR 0030, section 4): the
+    /// process's start proof decides whether downloads are presigned, and
+    /// the node file or the flags give node links' base.
+    pub blob_links: crate::blobs::links::LinkSettings,
     /// One file's largest size, streamed (`--max-blob-bytes`): by default
     /// [`crate::blobs::DEFAULT_MAX_FILE`], at most
     /// [`crate::blobs::MAX_FILE_CEILING`].
@@ -270,6 +274,7 @@ impl ActorConfig {
             local_assets: None,
             assets_cache: crate::assets::default_cache(),
             blob_epoch: crate::blobs::epoch(None, None),
+            blob_links: crate::blobs::links::LinkSettings::default(),
             max_blob_bytes: crate::blobs::DEFAULT_MAX_FILE,
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,
@@ -666,6 +671,16 @@ impl ActorService {
             .cluster
             .as_ref()
             .is_some_and(|c| c.app_unchecked())
+    }
+
+    /// Answers a node link (`/_wasmkeep/blobs/v1/<token>`, ADR 0030,
+    /// section 4) under this app runtime's key.
+    pub(crate) async fn blob_link(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+    ) -> Response<HyperOutgoingBody> {
+        let deleted = *self.inner.app_deleted.borrow();
+        crate::blobs::serve::serve(&self.inner.blobs, deleted, req).await
     }
 
     /// The app's files (ADR 0030), for the front's `blobs` calls.

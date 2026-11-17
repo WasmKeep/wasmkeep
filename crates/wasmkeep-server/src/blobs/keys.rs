@@ -196,6 +196,23 @@ impl Namespace {
         }
     }
 
+    /// The namespace a node-link token names, once its MAC was checked:
+    /// the host wrote it there, from [`Self::rel`].
+    pub(crate) fn from_token(rel: &str) -> Option<Self> {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let ok = parts.len() == 3
+            && parts.iter().all(|p| {
+                !p.is_empty()
+                    && *p != "."
+                    && *p != ".."
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            });
+        ok.then(|| Self {
+            rel: rel.to_owned(),
+        })
+    }
+
     /// `<class>/<name id>/<incarnation>`, relative to the epoch's folder.
     pub(crate) fn rel(&self) -> &str {
         &self.rel

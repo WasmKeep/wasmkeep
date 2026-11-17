@@ -3603,6 +3603,7 @@ dependencies = [
  "object_store",
  "parquet",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustix",
  "serde_json",

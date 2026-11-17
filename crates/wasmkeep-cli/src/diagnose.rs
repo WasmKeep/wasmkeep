@@ -11,6 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Args;
@@ -38,6 +39,15 @@ pub(crate) struct DiagnoseArgs {
     /// deletes).
     #[arg(long)]
     skip_paging: bool,
+
+    /// Skip the `blob-links` checks (presigned download links).
+    #[arg(long)]
+    skip_links: bool,
+
+    /// The bucket's endpoint as browsers reach it, for the `blob-links`
+    /// checks (default: as for `serve`).
+    #[arg(long, value_name = "URL")]
+    link_endpoint: Option<String>,
 
     /// Print JSON instead of lines, for scripts.
     #[arg(long)]
@@ -1644,6 +1654,68 @@ fn scratch_prefix(url_prefix: &str, scratch: &str) -> Option<String> {
 
 /// `wasmkeep cluster diagnose`: the exit code (0 safe, 1 not safe, 2 not
 /// run, not finished, or safe but not cleaned up).
+/// The `blob-links` group (ADR 0030, section 10): a failure is a warning,
+/// never `FAIL`, since nodes then use node links.
+async fn link_checks(
+    args: &DiagnoseArgs,
+    store: &Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> Vec<Check> {
+    const NAMES: [&str; 2] = ["presigned-download", "presigned-expiry"];
+    if args.skip_links {
+        return NAMES
+            .iter()
+            .map(|n| check(n, Status::Skipped, "--skip-links"))
+            .collect();
+    }
+    let signer = match wasmkeep_cli::blob_links::signer(&args.bucket, args.link_endpoint.as_deref())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return NAMES
+                .iter()
+                .map(|n| check(n, Status::Error, format!("{e:#}")))
+                .collect();
+        }
+    };
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(h) => h,
+        Err(e) => {
+            return NAMES
+                .iter()
+                .map(|n| check(n, Status::Error, e.to_string()))
+                .collect();
+        }
+    };
+    let mut out: Vec<Check> = wasmkeep_cli::blob_links::checks(
+        signer.as_ref(),
+        store,
+        &format!("{prefix}/"),
+        &http,
+        (Duration::from_secs(2), Duration::from_secs(4)),
+    )
+    .await
+    .into_iter()
+    .map(|(name, r)| match r {
+        Ok(v) => check(name, Status::Pass, v),
+        Err(e) => check(
+            name,
+            Status::Warn,
+            format!("{e}: presigned links: not safe on this bucket; nodes use node links (--blob-links node)"),
+        ),
+    })
+    .collect();
+    out.push(check(
+        "presigned-upload",
+        Status::Skipped,
+        "uploads are node links: a presigned PUT cannot bind its size",
+    ));
+    out
+}
+
 pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
     let fail = |msg: String| {
         eprintln!("error: {msg}");
@@ -1675,7 +1747,7 @@ pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
         Ok(rt) => rt,
         Err(e) => return fail(format!("starting a runtime: {e}")),
     };
-    let target = ObjectStoreBucket::new(store, prefix.clone());
+    let target = ObjectStoreBucket::new(Arc::clone(&store), prefix.clone());
     let options = Options::production(args.skip_paging);
     let report = match rt.block_on(run(&target, &options)) {
         Ok(r) => r,
@@ -1689,6 +1761,10 @@ pub(crate) fn command(args: &DiagnoseArgs) -> i32 {
             return fail(format!("listing {scratch_url}: {why}"));
         }
     };
+    let mut report = report;
+    report
+        .checks
+        .extend(rt.block_on(link_checks(args, &store, &prefix)));
     if args.json {
         println!("{:#}", report.to_json(&args.bucket, &scratch_url));
     } else {

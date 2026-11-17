@@ -33,6 +33,9 @@ struct Shared {
     store: Arc<dyn object_store::ObjectStore>,
     prefix: String,
     bucket: String,
+    /// Presigns downloads when the start proof passed, once per process
+    /// (ADR 0030, section 4): every app runtime, a restarted one included.
+    presigner: Option<Arc<dyn object_store::signer::Signer>>,
 }
 
 /// Serves the apps `file` lists, `base` holding the process's flags.
@@ -111,7 +114,15 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         Some(name) => wasmkeep_server::Supervisor::named(name),
         None => wasmkeep_server::Supervisor::new(),
     };
+    let presigner = rt.block_on(wasmkeep_cli::blob_links::presigner(
+        base.blob_links,
+        &bucket,
+        base.blob_link_endpoint.as_deref(),
+        &store,
+        &prefix,
+    ))?;
     let shared = Arc::new(Shared {
+        presigner,
         assets_cache: wasmkeep_server::assets::Cache::new(base.assets_cache_bytes),
         runtime,
         cache,
@@ -127,7 +138,8 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         bucket: bucket.clone(),
     });
     let mut specs = Vec::new();
-    for (i, (args, hostnames)) in entries.into_iter().enumerate() {
+    for (i, (mut args, hostnames)) in entries.into_iter().enumerate() {
+        args.blob_link_base = crate::link_base(&args, &hostnames);
         let floors = (file.apps[i].min_resident, file.apps[i].max_resident);
         let (tenant, name) = args.app.clone().context("an [[app]] names its app")?;
         // Before anything reads or writes the app's state (ADR 0022).
@@ -230,6 +242,10 @@ async fn start_runtime(
     config.app = name.clone();
     config.blob_epoch = blob_epoch;
     config.max_blob_bytes = args.max_blob_bytes;
+    config.blob_links = wasmkeep_server::blobs::links::LinkSettings {
+        presigner: shared.presigner.clone(),
+        base: args.blob_link_base.clone(),
+    };
     config.egress = egress.clone();
     config.guest_log = shared.guest_log.clone();
     config.storage.max_sql_cpu_per_event = std::time::Duration::from_millis(args.sql_cpu_budget_ms);

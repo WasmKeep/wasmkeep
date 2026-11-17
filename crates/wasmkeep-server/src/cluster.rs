@@ -1363,6 +1363,12 @@ impl Cluster {
             .map(String::as_str)
     }
 
+    /// The cluster secret if this node already loaded it ([`Self::load_secret`]):
+    /// never fetched here.
+    pub(crate) fn loaded_secret(&self) -> Option<&str> {
+        self.secret.get().map(String::as_str)
+    }
+
     /// Loads the secret now (at startup), so that checking an incoming
     /// call never touches the bucket: a forged header must not make this
     /// node fetch or create anything.

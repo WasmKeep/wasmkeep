@@ -25,9 +25,19 @@ async fn blob_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>) -> Node 
     blob_node_with(Some((id, store)), data).await
 }
 
-/// [`blob_node`], or with `None` a node alone: no bucket, its files on its
-/// own disk.
+/// [`blob_node_with`], or with `None` a node alone.
 async fn blob_node_with(cluster: Option<(&str, &Arc<dyn ObjectStore>)>, data: &Path) -> Node {
+    class_node(cluster, data, "blob", blob_actor_wasm()).await
+}
+
+/// A node serving `class` from `wasm` and the test front; with `None`
+/// alone: no bucket, its files on its own disk.
+async fn class_node(
+    cluster: Option<(&str, &Arc<dyn ObjectStore>)>,
+    data: &Path,
+    class: &str,
+    wasm: &[u8],
+) -> Node {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let runtime = Runtime::new(&RuntimeConfig {
@@ -35,8 +45,10 @@ async fn blob_node_with(cluster: Option<(&str, &Arc<dyn ObjectStore>)>, data: &P
         ..RuntimeConfig::default()
     })
     .unwrap();
-    let component = guests::compile(&runtime, blob_actor_wasm());
+    let component = guests::compile(&runtime, wasm);
     let mut config = ActorConfig::new(data);
+    // Node links name this node: from configuration, never a request.
+    config.blob_links.base = Some(format!("http://{addr}"));
     if let Some((id, store)) = cluster {
         let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
         cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
@@ -48,7 +60,7 @@ async fn blob_node_with(cluster: Option<(&str, &Arc<dyn ObjectStore>)>, data: &P
     let service = ActorService::new(
         runtime.clone(),
         config,
-        vec![("blob".into(), component, blob_actor_wasm().to_vec())],
+        vec![(class.into(), component, wasm.to_vec())],
     )
     .unwrap();
     let component = guests::compile(&runtime, front_wasm());
@@ -519,19 +531,11 @@ fn files_ts_wasm(file: &str) -> Option<Vec<u8>> {
 
 /// What an SDK's files calls do against the host, the same in each SDK:
 /// conditions, types, a paged listing over several pages, deletes, key
-/// refusals and the host's refusal of links (they come later) passed back.
+/// refusals and links.
 async fn sdk_contract(wasm: &[u8]) -> (Node, tempfile::TempDir) {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let d = tempfile::tempdir().unwrap();
-    let node = node_with(
-        "a",
-        d.path(),
-        &store,
-        Duration::from_secs(30),
-        "files",
-        wasm,
-    )
-    .await;
+    let node = class_node(Some(("a", &store)), d.path(), "files", wasm).await;
     let f = |p: &str| format!("/actor/files/alice{p}");
     let r = call(
         node.addr,
@@ -626,14 +630,14 @@ async fn sdk_contract(wasm: &[u8]) -> (Node, tempfile::TempDir) {
     assert_eq!((r.status, r.body.as_str()), (404, "none"));
     let r = call(node.addr, "PUT", &f("/files/a//b"), "", b"x").await;
     assert_eq!((r.status, r.body.as_str()), (400, "err:invalid-key"));
+    // Links: a download of a file there, and an upload of a new one.
     for link in ["/link/photos/1.txt", "/upload-link/u/1"] {
         let r = call(node.addr, "GET", &f(link), "", b"").await;
-        assert_eq!(
-            (r.status, r.body.as_str()),
-            (403, "err:not-allowed"),
-            "{link}"
-        );
+        assert_eq!(r.status, 200, "{link}: {}", r.body);
+        link_path(&node, r.body.trim());
     }
+    let r = call(node.addr, "GET", &f("/link/a//b"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (400, "err:invalid-key"));
     (node, d)
 }
 
@@ -679,4 +683,246 @@ async fn the_typescript_sdk_keeps_files_on_starlingmonkey() {
     if let Some(wasm) = files_ts_wasm("files-starlingmonkey.wasm") {
         sdk_contract(&wasm).await;
     }
+}
+
+/// The path of a node link made for `node`, checked to start with its
+/// configured base.
+fn link_path(node: &Node, url: &str) -> String {
+    let base = format!("http://{}", node.addr);
+    let path = url
+        .strip_prefix(&base)
+        .unwrap_or_else(|| panic!("{url} is not under {base}"));
+    assert!(path.starts_with("/_wasmkeep/blobs/v1/"), "{path}");
+    path.to_owned()
+}
+
+async fn make_link(node: &Node, query: &str) -> String {
+    // A forged Host never reaches a link.
+    let r = call(
+        node.addr,
+        "GET",
+        &format!("{A}{query}"),
+        "Host: evil.example\r\n",
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{query}: {}", r.body);
+    let url = r
+        .body
+        .split_whitespace()
+        .find(|w| w.starts_with("http"))
+        .unwrap()
+        .to_owned();
+    link_path(node, &url)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn download_links_serve_the_file_with_the_headers_of_section_8() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = blob_node("a", d1.path(), &store).await;
+    let b = blob_node("b", d2.path(), &store).await;
+    settle().await;
+    for (key, ty, body) in [
+        ("doc.html", "text/html", "<script>alert(1)</script>"),
+        ("pic.png", "image/png", "PNG"),
+        ("pic.svg", "image/svg+xml", "<svg/>"),
+    ] {
+        let r = call(
+            a.addr,
+            "PUT",
+            &format!("{A}/b/{key}?type={ty}"),
+            "",
+            body.as_bytes(),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    // An attachment: always bytes, under the name asked for.
+    let path = make_link(&a, "/link/doc.html?name=report.html").await;
+    for node in [&a, &b] {
+        let r = call(node.addr, "GET", &path, "", b"").await;
+        assert_eq!(
+            (r.status, r.body.as_str()),
+            (200, "<script>alert(1)</script>")
+        );
+        for (name, want) in [
+            ("content-type", "application/octet-stream"),
+            ("x-content-type-options", "nosniff"),
+            ("content-security-policy", "sandbox; default-src 'none'"),
+            ("cross-origin-resource-policy", "same-origin"),
+        ] {
+            assert_eq!(r.header(name).as_deref(), Some(want), "{name}");
+        }
+        assert_eq!(
+            r.header("content-disposition").as_deref(),
+            Some("attachment; filename=\"report.html\"; filename*=UTF-8''report.html")
+        );
+        let cache = r.header("cache-control").unwrap();
+        assert!(
+            cache.starts_with("private, max-age=") && !cache.ends_with("=0"),
+            "{cache}"
+        );
+    }
+    // Inline: an image, with its type; never HTML or SVG.
+    let path = make_link(&a, "/link/pic.png?inline").await;
+    let r = call(b.addr, "GET", &path, "", b"").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-type").as_deref(), Some("image/png"));
+    assert_eq!(r.header("content-disposition").as_deref(), Some("inline"));
+    for key in ["doc.html", "pic.svg"] {
+        let r = call(a.addr, "GET", &format!("{A}/link/{key}?inline"), "", b"").await;
+        assert_eq!(r.status, 403, "{key}: {}", r.body);
+        assert!(r.body.starts_with("err:not-allowed:"), "{}", r.body);
+    }
+    // GET only.
+    for method in ["HEAD", "PUT", "POST", "DELETE"] {
+        let r = call(a.addr, method, &path, "", b"").await;
+        assert_eq!(r.status, 405, "{method}");
+    }
+    // A changed token, a query, or another path is refused.
+    let mut tampered = path.clone().into_bytes();
+    let last = tampered.len() - 1;
+    tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(tampered).unwrap();
+    for bad in [
+        tampered.as_str(),
+        &format!("{path}?x=1"),
+        "/_wasmkeep/blobs/v1/",
+        "/_wasmkeep/blobs/v1/abc",
+    ] {
+        let r = call(a.addr, "GET", bad, "", b"").await;
+        assert_eq!(r.status, 403, "{bad}: {}", r.body);
+    }
+    // Expired.
+    let path = make_link(&a, "/link/pic.png?secs=1").await;
+    assert_eq!(call(a.addr, "GET", &path, "", b"").await.status, 200);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let r = call(a.addr, "GET", &path, "", b"").await;
+    assert_eq!(
+        (r.status, r.body.as_str()),
+        (403, "this link has expired\n")
+    );
+    // Bounds on a link's life.
+    for secs in [0, 3_601] {
+        let r = call(
+            a.addr,
+            "GET",
+            &format!("{A}/link/pic.png?secs={secs}"),
+            "",
+            b"",
+        )
+        .await;
+        assert_eq!(r.status, 403, "{secs}");
+    }
+    // A link to the file is the file's: deleted, it is gone.
+    let path = make_link(&a, "/link/pic.png").await;
+    call(a.addr, "DELETE", &format!("{A}/b/pic.png"), "", b"").await;
+    assert_eq!(call(b.addr, "GET", &path, "", b"").await.status, 404);
+}
+
+async fn put_raw(addr: SocketAddr, path: &str, headers: &str, body: &[u8]) -> Reply {
+    let mut req = format!("PUT {path} HTTP/1.1\r\nHost: t\r\n{headers}Connection: close\r\n\r\n")
+        .into_bytes();
+    req.extend_from_slice(body);
+    exchange_bytes(addr, &req).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_links_create_one_file_of_the_size_and_type_allowed() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = blob_node("a", d1.path(), &store).await;
+    let b = blob_node("b", d2.path(), &store).await;
+    settle().await;
+    let r = call(
+        a.addr,
+        "GET",
+        &format!("{A}/upload-link/up/1?size=5&type=image/png"),
+        "",
+        b"",
+    )
+    .await;
+    assert!(r.body.starts_with("PUT http://"), "{}", r.body);
+    assert!(r.body.ends_with(" 1"), "one header to send: {}", r.body);
+    let path = make_link(&a, "/upload-link/up/1?size=5&type=image/png").await;
+    // Refused before the body: another size, another type, none, chunked.
+    for (headers, body) in [
+        (
+            "Content-Type: image/png\r\nContent-Length: 4\r\n",
+            &b"PNGx"[..],
+        ),
+        (
+            "Content-Type: image/png\r\nContent-Length: 6\r\n",
+            b"PNGxyz",
+        ),
+        ("Content-Type: text/html\r\nContent-Length: 5\r\n", b"PNGxy"),
+        ("Content-Length: 5\r\n", b"PNGxy"),
+        (
+            "Content-Type: image/png\r\nTransfer-Encoding: chunked\r\n",
+            b"5\r\nPNGxy\r\n0\r\n\r\n",
+        ),
+    ] {
+        let r = put_raw(b.addr, &path, headers, body).await;
+        assert_eq!(r.status, 400, "{headers:?}: {}", r.body);
+    }
+    // GET is not what the link allows.
+    assert_eq!(call(a.addr, "GET", &path, "", b"").await.status, 405);
+    // The right one lands, on any node of the app, once.
+    let ok = "Content-Type: image/png\r\nContent-Length: 5\r\n";
+    let r = put_raw(b.addr, &path, ok, b"PNGxy").await;
+    assert_eq!(r.status, 201, "{}", r.body);
+    let r = put_raw(a.addr, &path, ok, b"PNGxy").await;
+    assert_eq!(r.status, 412, "{}", r.body);
+    let r = call(a.addr, "GET", &format!("{A}/head/up/1"), "", b"").await;
+    assert!(r.body.starts_with("5 image/png "), "{}", r.body);
+    // Not single-use: deleted, the key can be created again by the link.
+    call(a.addr, "DELETE", &format!("{A}/b/up/1"), "", b"").await;
+    assert_eq!(put_raw(a.addr, &path, ok, b"PNGxy").await.status, 201);
+    // Past its expiry.
+    let path = make_link(&a, "/upload-link/up/2?size=1&type=text/plain&secs=1").await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let r = put_raw(
+        a.addr,
+        &path,
+        "Content-Type: text/plain\r\nContent-Length: 1\r\n",
+        b"x",
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    // What a link may allow: a checked type, a size within the limit.
+    let r = call(
+        a.addr,
+        "GET",
+        &format!("{A}/upload-link/up/3?size=1&type=bad"),
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    let big = 16 * 1024 * 1024 + 1;
+    let r = call(
+        a.addr,
+        "GET",
+        &format!("{A}/upload-link/up/3?size={big}&type=image/png"),
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_str()), (413, "err:too-large"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_links_its_own_files_and_an_actors_token_names_the_actors() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let a = blob_node("a", d.path(), &store).await;
+    settle().await;
+    call(a.addr, "PUT", "/b/k", "", b"front").await;
+    call(a.addr, "PUT", &format!("{A}/b/k"), "", b"actor").await;
+    let r = call(a.addr, "GET", "/link/k", "", b"").await;
+    let front = link_path(&a, r.body.trim());
+    let actor = make_link(&a, "/link/k").await;
+    assert_eq!(call(a.addr, "GET", &front, "", b"").await.body, "front");
+    assert_eq!(call(a.addr, "GET", &actor, "", b"").await.body, "actor");
 }

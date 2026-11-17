@@ -118,6 +118,8 @@ async fn process_inner(
                 let mut config = ActorConfig::new(&data);
                 config.tenant = d.tenant.into();
                 config.app = d.app.into();
+                // As the CLI does: node links under the app's first hostname.
+                config.blob_links.base = d.hosts.first().map(|h| format!("https://{h}"));
                 config.mailbox.idle_timeout = Duration::from_secs(30);
                 if let Some(pool) = pool {
                     config.mailbox.max_resident = pool.limit();
@@ -1229,5 +1231,68 @@ async fn two_apps_with_the_same_class_name_and_key_keep_their_own_files() {
                 .any(|k| k.starts_with(&format!("state/acme/{app}/blobs/"))),
             "{files:?}"
         );
+    }
+}
+
+/// A node link is checked by the app runtime its hostname picks, under
+/// that app's key: another app's hostname refuses it, in this process or
+/// another; its own app's takes it in either (ADR 0030, section 8).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_link_works_only_under_its_own_apps_hostnames() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let blob = |node, app, host| Def {
+        blob: true,
+        ..def(node, "acme", app, host)
+    };
+    let p1 = process(
+        &store,
+        d1.path(),
+        &[
+            blob("shop-1", "shop", &["shop.test"]),
+            blob("blog-1", "blog", &["blog.test"]),
+        ],
+    )
+    .await;
+    let p2 = process(
+        &store,
+        d2.path(),
+        &[
+            blob("shop-2", "shop", &["shop.test"]),
+            blob("blog-2", "blog", &["blog.test"]),
+        ],
+    )
+    .await;
+    settle().await;
+    for host in ["shop.test", "blog.test"] {
+        let r = exchange(
+            p1.public,
+            &format!("PUT /actor/blob/alice/b/k HTTP/1.1\r\nHost: {host}\r\nContent-Length: 4\r\nConnection: close\r\n\r\n{}", &host[..4]),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let r = to_reachable(p1.public, "shop.test", "GET", "/actor/blob/alice/link/k").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let path = r
+        .body
+        .trim()
+        .strip_prefix("https://shop.test")
+        .unwrap()
+        .to_owned();
+    for (p, host, want) in [
+        (&p1, "shop.test", 200),
+        (&p2, "shop.test", 200),
+        (&p1, "blog.test", 403),
+        (&p2, "blog.test", 403),
+    ] {
+        let r = to(p.public, host, "GET", &path, "").await;
+        assert_eq!(r.status, want, "{host}: {}", r.body);
+        if want == 200 {
+            assert_eq!(r.body, "shop");
+        }
     }
 }

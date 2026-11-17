@@ -257,6 +257,40 @@ impl Spool {
         }
     }
 
+    /// Appends `data` to the spool file directly (a node-link upload's body,
+    /// not a guest's stream), within the limit.
+    pub(crate) async fn append(&self, data: bytes::Bytes) -> Result<(), BlobError> {
+        let file = {
+            let mut s = self.lock();
+            if s.closed {
+                return Err(BlobError::NotAllowed("the upload is closed".into()));
+            }
+            if s.written + data.len() as u64 > s.max {
+                s.failure = Some(Fail::TooLarge);
+                return Err(BlobError::TooLarge);
+            }
+            s.file
+                .take()
+                .ok_or_else(|| BlobError::Unavailable("the spool file is busy".into()))?
+        };
+        let n = data.len() as u64;
+        let wrote = tokio::task::spawn_blocking(move || {
+            let mut file = file;
+            file.write_all(&data).map(|()| file)
+        })
+        .await;
+        let mut s = self.lock();
+        match wrote {
+            Ok(Ok(file)) => {
+                s.written += n;
+                s.file = Some(file);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(unavailable(e)),
+            Err(e) => Err(unavailable(e)),
+        }
+    }
+
     /// Ends the body: what was written, fsynced, or why it cannot be a file.
     pub(crate) async fn finish(&self) -> Result<Spooled, BlobError> {
         let (file, pending, path, size) = {

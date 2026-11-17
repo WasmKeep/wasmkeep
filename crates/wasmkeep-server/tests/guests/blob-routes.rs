@@ -11,6 +11,8 @@
 //   written C at a time, `finish`; answers `ok SIZE`
 // - `GET /stream/KEY[?start=S&len=L]`: `open-read`, answers
 //   `size=SIZE read=N sum=SUM` (SUM: the bytes added up)
+// - `GET /link/KEY[?inline][&name=N][&secs=S]`: `link-download`, the URL
+// - `GET /upload-link/KEY?size=N&type=T[&secs=S]`: `link-upload`, the URL
 // Missing files answer 404 `none`; errors `err:KIND[:DETAIL]` with 400
 // (invalid-key), 413 (too-large), 507 (quota), 409 (conflict), 403
 // (not-allowed) or 503 (unavailable).
@@ -78,6 +80,30 @@ fn blob_route(
         match blobs::head(key) {
             Ok(Some(i)) => ok(format!("{} {} {}", i.size, i.content_type, i.etag)),
             Ok(None) => (404, b"none".to_vec()),
+            Err(e) => blob_error(e),
+        }
+    } else if let Some(key) = path.strip_prefix("/link/") {
+        let disposition = if query.split('&').any(|p| p == "inline") {
+            blobs::Disposition::Inline
+        } else {
+            blobs::Disposition::Attachment(blob_query(query, "name"))
+        };
+        let options = blobs::DownloadOptions {
+            expires_in_secs: blob_query(query, "secs").and_then(|s| s.parse().ok()),
+            disposition,
+        };
+        match blobs::link_download(key, &options) {
+            Ok(url) => ok(url),
+            Err(e) => blob_error(e),
+        }
+    } else if let Some(key) = path.strip_prefix("/upload-link/") {
+        let options = blobs::UploadOptions {
+            size: blob_query(query, "size").and_then(|s| s.parse().ok()).unwrap_or(0),
+            content_type: blob_query(query, "type").unwrap_or_default(),
+            expires_in_secs: blob_query(query, "secs").and_then(|s| s.parse().ok()),
+        };
+        match blobs::link_upload(key, &options) {
+            Ok(l) => ok(format!("{} {} {}", l.method, l.url, l.headers.len())),
             Err(e) => blob_error(e),
         }
     } else if path == "/list" {

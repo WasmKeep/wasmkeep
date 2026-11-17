@@ -141,6 +141,13 @@ pub(crate) fn run(options: DevOptions) -> anyhow::Result<()> {
     let served: Vec<&str> = projects.iter().map(|p| p.class.as_str()).collect();
     config.env = crate::load_env(&options.env, &served, true)?;
     config.access = crate::access_rules(&options.access, &served)?;
+    // Node links point at the dev server itself (ADR 0030, section 4).
+    let host = if options.listen.ip().is_unspecified() {
+        std::net::SocketAddr::from(([127, 0, 0, 1], options.listen.port()))
+    } else {
+        options.listen
+    };
+    config.blob_links.base = Some(format!("http://{host}"));
     let service = ActorService::new(runtime, config, classes)?;
 
     rt.block_on(async move {

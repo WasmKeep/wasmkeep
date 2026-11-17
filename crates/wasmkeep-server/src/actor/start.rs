@@ -260,21 +260,47 @@ impl ActorService {
         // The app's files (ADR 0030): in the bucket with a cluster, else on
         // this node's disk, under the app's epoch either way.
         let local_app_dir = data_dir.join(root.local_root(wasmkeep_storage::encode_segment));
-        let blobs = Arc::new(match &cluster {
-            Some(c) => crate::blobs::Blobs::on_bucket(
-                Arc::clone(&c.store),
-                root.prefix(),
-                &root.bucket(),
-                &config.blob_epoch,
-                local_app_dir.join(".blob-spool"),
-                config.max_blob_bytes,
-            ),
-            None => crate::blobs::Blobs::on_disk(
-                &local_app_dir,
-                &config.blob_epoch,
-                config.max_blob_bytes,
-            ),
-        });
+        // Links (ADR 0030, section 4): node links under a key per app
+        // runtime, from the cluster secret this node loads, or a key file
+        // of the node's own without a bucket.
+        let mac = match &cluster {
+            Some(c) => crate::blobs::links::MacSource::Cluster(Arc::clone(c)),
+            None => match crate::blobs::links::local_key(&local_app_dir).and_then(|secret| {
+                crate::blobs::token::mac_key(&secret, root.tenant(), root.app())
+                    .ok_or_else(|| "the key cannot be derived".to_owned())
+            }) {
+                Ok(key) => crate::blobs::links::MacSource::Key(key),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no key for node links: this node makes none");
+                    crate::blobs::links::MacSource::None(format!("no key for node links: {e}"))
+                }
+            },
+        };
+        let links = crate::blobs::links::Links::new(
+            root.tenant(),
+            root.app(),
+            &config.blob_epoch,
+            config.blob_links.clone(),
+            mac,
+        );
+        let blobs = Arc::new(
+            match &cluster {
+                Some(c) => crate::blobs::Blobs::on_bucket(
+                    Arc::clone(&c.store),
+                    root.prefix(),
+                    &root.bucket(),
+                    &config.blob_epoch,
+                    local_app_dir.join(".blob-spool"),
+                    config.max_blob_bytes,
+                ),
+                None => crate::blobs::Blobs::on_disk(
+                    &local_app_dir,
+                    &config.blob_epoch,
+                    config.max_blob_bytes,
+                ),
+            }
+            .with_links(links),
+        );
         let service = Self {
             inner: Arc::new(ServiceInner {
                 blobs,

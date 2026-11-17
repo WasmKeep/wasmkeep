@@ -106,7 +106,7 @@ impl Bucket {
         format!("{}{}/", self.base, ns.rel())
     }
 
-    fn path(&self, ns: &Namespace, key: &str) -> Result<Path, BlobError> {
+    pub(super) fn path(&self, ns: &Namespace, key: &str) -> Result<Path, BlobError> {
         // `parse`, not `from`: every byte of the key alphabet is kept as it
         // is, so a key has one spelling in the bucket (`from` escapes `~`).
         Path::parse(format!("{}{key}", self.ns_base(ns))).map_err(unavailable)

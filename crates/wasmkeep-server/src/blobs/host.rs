@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use wasmkeep_wit::wasmkeep::actor::blobs::{
-    BlobError, BlobInfo, Listing, Upload, UploadLink, WriteOptions,
+    BlobError, BlobInfo, Disposition, DownloadOptions, Listing, Upload, UploadLink, UploadOptions,
+    WriteOptions,
 };
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
@@ -53,6 +54,8 @@ pub(crate) struct Caller {
     alive: Alive,
     /// The streamed writes opened in this event, abandoned at the next.
     open: Vec<Spool>,
+    /// Links made in this event (at most 1,000).
+    links: u32,
 }
 
 impl std::fmt::Debug for Caller {
@@ -86,6 +89,7 @@ impl Caller {
             gate,
             alive: Arc::new(AtomicBool::new(true)),
             open: Vec::new(),
+            links: 0,
         }
     }
 
@@ -95,6 +99,7 @@ impl Caller {
         self.end_event();
         self.alive = Arc::new(AtomicBool::new(true));
         self.gate = gate;
+        self.links = 0;
     }
 
     /// The event ended: its streams read and write nothing more, and its
@@ -291,22 +296,66 @@ impl Caller {
     }
 }
 
+impl Caller {
+    fn count_link(&mut self) -> Result<(), BlobError> {
+        if self.links >= super::links::PER_EVENT {
+            return Err(BlobError::NotAllowed(format!(
+                "at most {} links an event",
+                super::links::PER_EVENT
+            )));
+        }
+        self.links += 1;
+        Ok(())
+    }
+
+    /// A link a browser downloads the file from (ADR 0030, section 4).
+    pub(crate) async fn link_download(
+        &mut self,
+        key: String,
+        options: DownloadOptions,
+    ) -> Result<String, BlobError> {
+        check_key(&key).map_err(invalid)?;
+        let secs = super::links::life(options.expires_in_secs, super::links::DOWNLOAD_SECS)?;
+        let (inline, filename) = match options.disposition {
+            Disposition::Inline => (true, None),
+            Disposition::Attachment(name) => (false, name),
+        };
+        let blobs = self.blobs()?;
+        self.count_link()?;
+        blobs
+            .link_download(&self.ns, &key, inline, filename.as_deref(), secs)
+            .await
+    }
+
+    /// A link a browser uploads one new file to: a write, so it needs the
+    /// hold as `put` does.
+    pub(crate) fn link_upload(
+        &mut self,
+        key: String,
+        options: UploadOptions,
+    ) -> Result<UploadLink, BlobError> {
+        check_key(&key).map_err(invalid)?;
+        let secs = super::links::life(options.expires_in_secs, super::links::UPLOAD_SECS)?;
+        let blobs = self.blobs()?;
+        self.may_write()?;
+        self.count_link()?;
+        let (url, expires_at_ms) =
+            blobs.link_upload(&self.ns, &key, options.size, &options.content_type, secs)?;
+        Ok(UploadLink {
+            url,
+            method: "PUT".into(),
+            headers: vec![("content-type".into(), options.content_type)],
+            expires_at_ms,
+        })
+    }
+}
+
 fn write(options: WriteOptions) -> Result<Write, BlobError> {
     Ok(Write {
         content_type: content_type(options.content_type.as_deref())
             .map_err(BlobError::NotAllowed)?,
         condition: options.condition,
     })
-}
-
-/// Links come with a later release (ADR 0030, slice B3).
-pub(crate) fn no_links() -> BlobError {
-    BlobError::NotAllowed("links are not available on this node yet".into())
-}
-
-/// `link-upload`'s answer until links come.
-pub(crate) fn no_upload_link() -> Result<UploadLink, BlobError> {
-    Err(no_links())
 }
 
 /// Implements `wasmkeep:actor/blobs` for a host type with a `blob` field
@@ -437,24 +486,24 @@ macro_rules! impl_blobs_host {
 
             async fn link_download(
                 &mut self,
-                _key: String,
-                _options: wasmkeep_wit::wasmkeep::actor::blobs::DownloadOptions,
+                key: String,
+                options: wasmkeep_wit::wasmkeep::actor::blobs::DownloadOptions,
             ) -> wasmtime::Result<Result<String, wasmkeep_wit::wasmkeep::actor::blobs::BlobError>>
             {
-                Ok(Err($crate::blobs::host::no_links()))
+                Ok(self.blob.link_download(key, options).await)
             }
 
             async fn link_upload(
                 &mut self,
-                _key: String,
-                _options: wasmkeep_wit::wasmkeep::actor::blobs::UploadOptions,
+                key: String,
+                options: wasmkeep_wit::wasmkeep::actor::blobs::UploadOptions,
             ) -> wasmtime::Result<
                 Result<
                     wasmkeep_wit::wasmkeep::actor::blobs::UploadLink,
                     wasmkeep_wit::wasmkeep::actor::blobs::BlobError,
                 >,
             > {
-                Ok($crate::blobs::host::no_upload_link())
+                Ok(self.blob.link_upload(key, options))
             }
         }
     };
