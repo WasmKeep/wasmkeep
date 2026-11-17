@@ -45,6 +45,15 @@ The text under a version's heading is its GitHub release text
   gains a public `headers` field (a struct literal of it needs the field).
   The older `headers` dicts and records still hold one value per name.
 
+- **Recorded-head follow-ups ([ADR 0035](docs/adr/0035-a-recorded-head-on-hand-over.md)),
+  for apps that enabled the format:** an idle expiry refused for
+  visibility keeps the actor's idle origin (`idle-since`), so it still
+  expires once its history is visible; a local database that claims the
+  recorded head with another checksum is set aside and the history
+  downloaded, instead of a 500; a link of the history still missing after
+  the bounded re-listing is reported as a corruption (500) instead of a
+  503 for ever.
+
 ## 0.5.0
 
 **Batched writes, data access and per-node limits.** A class can batch
