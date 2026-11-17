@@ -10,6 +10,13 @@
   contents and indexes; collection guarded by deploy and collection
   markers instead of refreshed ages; slices A1 to A7). Section 9 accepted
   and built (2026-11-17); the remaining sections stay proposed.
+  Sections 1 to 8 amended 2026-11-17 for `0.6.0`, against what shipped
+  since they were written (online backup and restore, batched writes,
+  the recorded head, several apps per process, operation ids): backups
+  copy files and assets; `actor restore` keeps the current incarnation;
+  the incarnation stays in the database; the sweep record's order in a
+  batched class; slices B1 to B8 (under "Plan"). Each change is marked
+  "Amendment (2026-11-17)" where it applies.
 - Date: 2026-11-14
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, after data access
   (`0.5.0`) and several apps per process
@@ -19,7 +26,12 @@
   app's root, `state/<tenant>/<app>/`), [ADR 0023](0023-the-front.md)
   (the front, routing), [ADR 0026](0026-the-project-file.md) (the project
   file), and [ADR 0028](0028-actors-that-end.md) (actors that end: the
-  delete routine, idle expiry and `app delete`).
+  delete routine, idle expiry and `app delete`). Since the amendment of
+  2026-11-17 also [ADR 0033](0033-data-access-export-and-online-backup.md)
+  (backup and restore), [ADR 0034](0034-batched-plain-writes.md) (batched
+  writes), [ADR 0035](0035-a-recorded-head-on-hand-over.md) (the recorded
+  head) and [ADR 0038](0038-several-apps-per-process.md) (the node file,
+  app runtimes).
 - Amends: [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)
   (two families under an app's root, `blobs/` and `blob-sweeps/`, and one
   beside its versions, `apps/<t>/<a>/_assets/`),
@@ -27,8 +39,11 @@
   `/_wasmkeep/blobs/`; `front-core` imports `blobs`),
   [ADR 0026](0026-the-project-file.md) (an `[assets]` section),
   [ADR 0012](0012-bucket-garbage-collection.md) (collecting unused
-  assets), and [ADR 0028](0028-actors-that-end.md) (a delete also ends
-  the actor's files).
+  assets), [ADR 0028](0028-actors-that-end.md) (a delete also ends
+  the actor's files), and
+  [ADR 0033](0033-data-access-export-and-online-backup.md) (a backup
+  copies files and assets, a restored app gets them back, and a restore
+  of one actor keeps its current files: section 5).
 
 ## Context
 
@@ -44,7 +59,7 @@ scripts and images reach the browser only through it: each request
 instantiates the front, and its component carries the files or fetches
 them. Nothing a node knows makes a request for `app.js` cheap.
 
-The roadmap ("Now", files and databases) asks for:
+The roadmap ("Next", `0.6.0`, files and static assets) asks for:
 
 - **files** for actors and the front, kept in the app's part of the
   bucket, with links a browser uploads to and downloads from directly;
@@ -56,7 +71,7 @@ What the code gives us to build on:
 
 - Every node opens the bucket with the `object_store` crate (0.14.2),
   through `AmazonS3Builder::from_env` and an `Arc<dyn ObjectStore>`
-  (`crates/wasmkeep-cli/src/main.rs`, `crates/wasmkeep-cluster/src/object_store.rs`).
+  (`crates/wasmkeep-cli/src/lib.rs`, `crates/wasmkeep-cluster/src/object_store.rs`).
   The concrete `AmazonS3` implements `object_store::signer::Signer`,
   whose `signed_url_opts` presigns one request with SigV4 and binds
   given headers and query parameters to the signature. The trait object
@@ -67,7 +82,10 @@ What the code gives us to build on:
 - `Manifest::parse` (`crates/wasmkeep-server/src/apps.rs`) returns `None`
   on any line it does not know, and a node that cannot read a version
   stays not ready. New lines need a new format and a capability word, as
-  the front had (ADR 0023, "Compatibility").
+  the front had (ADR 0023, "Compatibility"). Assets took format 7
+  (section 9). Files add no line: a deploy reads each component's
+  imports, as it does for `storage.flush` (ADR 0034, section 15), and
+  asks for the word `blobs` (section 11).
 - Deploy collection (`crates/wasmkeep-server/src/apps/collect.rs`) follows
   only plain version ids (lowercase letters and digits): a key beginning
   with `_` beside the versions is never taken for one.
@@ -132,6 +150,27 @@ Under the app's root `R = <prefix>state/<tenant>/<app>/` (ADR 0022):
   with the restored database. A new actor at a deleted address starts in
   a namespace no file of the old one can be in, whatever is still being
   swept or uploaded there.
+
+  **Amendment (2026-11-17): the incarnation stays in the database.**
+  `blob_incarnation` is one more host meta value beside `replaced`,
+  `operator_delete` and `operator_restore`, written into the empty
+  database by the routine that already writes those (`mark_deleted`,
+  `crates/wasmkeep-server/src/actor/collection.rs`), so every delete
+  carries it in its reset: `delete-self`, `delete-self-durable`, the
+  operator delete and idle expiry. It is **not** a field of the
+  ownership record (`wasmkeep-owner 2`, ADR 0035), although that record
+  now exists and is read at every acquisition. Three reasons. The record
+  is not the actor's state: a whole-app restore writes no ownership
+  records and `app delete --recreate` removes them, while the database
+  is what a backup copies and a restore brings back. A value in the
+  record could be acknowledged apart from the reset, and the rule above
+  ("durable exactly when the delete is") would need a second proof. And
+  the record's parser refuses fields it does not know, so a new field
+  would be a new record version and an app format change, for no gain.
+  A holder reads the incarnation once per hold, after its restore passed
+  the recorded-head gate where the app has it enabled, and before the
+  first event; a database without the value (an actor from before this
+  release, or never deleted) is at `0`.
 - **`<key>`**, the part the guest gives: 1 to 512 bytes of
   `[A-Za-z0-9._~-]` and `/`, made of segments of at most 255 bytes
   separated by single `/`, none empty, none `.` or `..`, not starting or
@@ -146,7 +185,9 @@ Under the app's root `R = <prefix>state/<tenant>/<app>/` (ADR 0022):
 - **A node without a bucket** (`serve` with a data directory only, and
   `wasmkeep dev`) does not map keys to paths: a file system cannot hold
   both `a` and `a/b`, and some fold case. Each namespace is a directory
-  `<data_dir>/state/<t>/<a>/blobs/<class>/<name id>/<incarnation>/` holding
+  `<data_dir>/state/<t>/<a>/blobs/<class>/<name id>/<incarnation>/`
+  (`<data_dir>` being the app's own when the node file gives it one,
+  ADR 0038, section 4) holding
   a small SQLite index (`index.db`: key, file id, size, type, ETag, time)
   and the contents as `f/<random id>`, written to `tmp/` beside them,
   fsynced, renamed into `f/`, then committed in the index; conditions are
@@ -155,15 +196,24 @@ Under the app's root `R = <prefix>state/<tenant>/<app>/` (ADR 0022):
   nothing below the namespace can be named by one.
 
 The app is still two prefixes, `apps/<t>/<a>/` and `state/<t>/<a>/`, for
-deleting, exporting, backups and access policies (ADR 0022).
+deleting, exporting, backups and access policies (ADR 0022). Of the keys
+above, `backup create` copies the files only: `blob-sweeps/` and
+`blob-usage` are state of the running cluster (section 5, "Backup and
+restore").
 
 ### 3. The interface: `wasmkeep:actor/blobs`
 
 A new interface in package `wasmkeep:actor@0.2.0`, imported by
 `actor-core` and `front-core`. The package version stays: an interface
 is added and nothing existing changes, so a component built before links
-as it did ([languages](../languages.md#versions)). All five WIT copies
-carry it.
+as it did ([languages](../languages.md#versions)), as `storage.flush`
+was added (ADR 0034, section 15). All five WIT copies carry it:
+`crates/wasmkeep-wit/wit/actor.wit`, `crates/wasmkeep-sdk/wit/`, and the
+TypeScript, Go and Python SDKs' copies. `actor-core` and `front-core`
+import no WASI interface today (the worlds `actor` and `front` add
+`wasi:http/proxy`), so both gain `wasi:io/streams@0.2.12` with `blobs`;
+and the comment on world `front`, "it has no storage", becomes "no
+database": a front has files and nothing else of its own.
 
 ```wit
 /// Files kept in the app's part of the bucket, in the caller's own
@@ -294,6 +344,12 @@ interface blobs {
   acknowledged the write (on a node without a bucket, once fsynced). A
   conditional write uses the bucket's `If-None-Match: *` and `If-Match`,
   which every node already proves at start (`bucket_check.rs`).
+  **Amendment (2026-11-17):** this holds in a class with batched writes
+  too (ADR 0034). A file call is never batched and never waits for the
+  actor's segment in flight: `put` returns with the file durable while
+  the row that names it, written by a plain `exec`, may still be unsent
+  for up to `--max-unsent-age` plus its upload. Section 6 says what that
+  leaves behind and what the docs tell apps to do.
 - **When.** In any event of an actor (`on-init`, requests, calls,
   alarms, socket events) and in any front request. Each call waits on the
   bucket and counts against the event's wall clock, not its CPU budget.
@@ -310,7 +366,9 @@ interface blobs {
   segment (`object_store` matches whole segments) with an offset, and
   filters the rest of the prefix on the node.
 - **Not transactional.** Blob calls are not part of the database's
-  transaction, may run inside one, and survive its rollback.
+  transaction, may run inside one, and survive its rollback. They are
+  not part of a batched class's segment either, and `storage.flush` does
+  not wait for them: they are durable on their own.
 - **Streams** use `wasi:io`, which every actor and front already links
   (it comes with `wasi:http`), so a front can splice a file into its
   response body without holding it in memory. A streamed write uses the
@@ -378,6 +436,11 @@ with it (SigV4 query signing):
   uses, `AWS_ENDPOINT` or the provider's). A node that reaches its
   bucket on a private address must set it; the signature binds the host,
   so a link to an unreachable address is useless, not unsafe.
+  **Amendment (2026-11-17):** with a node file (ADR 0038, section 4)
+  this stays a process setting on the command line, like the bucket and
+  its credentials, which every app of the process shares:
+  `--blob-link-endpoint`, `--blob-links` and `--max-blob-bytes` are the
+  process's; only `max-app-blob-bytes` is an `[[app]]` field (section 7).
 - **CORS** for uploads from a page is the bucket's configuration, the
   operator's to set (allowed origin the app's, method `PUT`, headers
   `content-type` and `if-none-match`). The docs give it per provider;
@@ -386,6 +449,19 @@ with it (SigV4 query signing):
 **Node links** (a node without a bucket, a bucket that failed the start
 proof, or `--blob-links node`). The URL is the node's own public port,
 `/_wasmkeep/blobs/v1/<token>`:
+
+- **Amendment (2026-11-17): the link's host.** A process that serves
+  several apps routes the public port by hostname first (ADR 0038,
+  section 6), `/_wasmkeep/` paths included, so a node link must carry a
+  hostname of its app. The host builds it from the authority of the
+  request being handled when there is one (the one the hostname table
+  matched), and otherwise (an alarm, a call from another actor) from the
+  first hostname the node file lists for the app; with one app and no
+  table, from `public-advertise`. The token is then checked by the app
+  runtime the hostname picked, under that app's MAC key: "a node of
+  another app" below also means another app's runtime in the same
+  process. A stopped runtime's hostnames answer 503 (ADR 0038,
+  section 3), node links included.
 
 - `<token>` is the base64url of a record (version, tenant, app,
   namespace, incarnation, key, method, expiry, and for an upload the
@@ -407,12 +483,19 @@ proof, or `--blob-links node`). The URL is the node's own public port,
   link's expiry plus one hour, or it is aborted.
 - They cost the node's bandwidth and a request slot each, and are
   counted (section 7). Rotating `cluster/secret` ends every node link.
+  In a process with several apps the connection counts in its app's
+  share of public connections (ADR 0038, section 8). A node link is a
+  plain request, never a socket session (ADR 0037).
 
 `--blob-links auto|presigned|node` (default `auto`): `auto` presigns on a
 bucket whose start proof passed, and uses node links otherwise; `presigned`
 refuses to start when the proof fails. **The start proof**, beside the
 conditional-write check every node runs on `probe/`, sends to the link
-endpoint, with links signed for it, every case a link relies on:
+endpoint, with links signed for it, every case a link relies on. It runs
+once per process, not once per app (amendment of 2026-11-17: the bucket,
+its credentials and the link endpoint are the process's, ADR 0038,
+section 2), and its result holds for every app runtime, including one
+the supervisor restarts in place:
 
 1. an upload of the right size, type and headers lands;
 2. the same link again is refused (the key exists);
@@ -451,6 +534,28 @@ gains two steps:
    those files fail from then on. A delete given up (the upload failed)
    leaves the record `pending` for the pass to judge.
 
+**Amendment (2026-11-17): the order in a class with batched writes**
+(ADR 0034). A reset is uploaded only at the acknowledged head with
+nothing in flight (ADR 0034, section 7), so every delete of a batched
+actor flushes first (`delete_recorded`, and the durable delete in its
+call). The two steps fit around that as follows:
+
+- the flush runs first. If it does not reach its `Flushed` barrier the
+  delete is not recorded, as today, and **no sweep record is written**:
+  nothing was decided;
+- step 1 runs between the barrier and `ship_reset`: the record is in the
+  bucket before any byte of the reset is sent, in a strict class as in a
+  batched one;
+- step 2 waits for the bucket's acknowledgement of the reset itself,
+  under a valid hold. A captured batch, a plain write's answer, or a
+  durable delete that answered `internal` while "still uploading"
+  (ADR 0034, section 4) is not that acknowledgement: the record stays
+  `pending`, and the pass below judges it from the bucket. Nothing is
+  ever swept on a delete the bucket has not recorded.
+
+The cost is the one already stated: one object more per delete, written
+after the flush and before the reset.
+
 **The sweep pass.** One node per app (the live node with the lowest id,
 as idle expiry chooses it, ADR 0028, section 4) lists `R blob-sweeps/`
 once a minute and, for each record:
@@ -466,6 +571,24 @@ once a minute and, for each record:
   from the record's, the delete happened: step 2. If it is the same, the
   delete did not happen, and no late reset can make it happen after the
   fence: the record is deleted and no file is touched.
+
+  **Amendment (2026-11-17): the judging job is an acquisition like any
+  other.** It goes through `ensure_owner_with`, as the operator delete
+  and idle expiry do (ADR 0035, section 6), so in an app with the
+  recorded head enabled its restore must prove the recorded floor before
+  the job reads anything. A refusal (the floor not proven within the
+  discovery bound, a missing link, a failed restore) judges nothing: the
+  record stays `pending`, the actor enters the shared retry cooldown,
+  and the next pass asks again. Only a verified restore followed by the
+  fence may answer "not deleted", since that answer removes the only
+  record of the old incarnation's files. The job runs no guest code and
+  must not count as activity: its hold has to release the record's
+  `idle-since` as it found it (ADR 0035 does so for a hold never
+  activated), so that judging does not keep an idle actor from
+  expiring. In a process with several apps the pass is
+  the app runtime's, on the lowest-id live node of that app that
+  announces `blobs` (the rule idle expiry uses with `ends`,
+  `crates/wasmkeep-server/src/actor/expiry.rs`).
 - **Swept**: the prefix is listed again, and what is there removed, when
   the record is one hour old and again at 25 hours (by its last-modified
   time): an upload started before its link expired may land well after,
@@ -489,6 +612,23 @@ run and found nothing: a re-created app's actors start at incarnation
 `0`, the same keys as the old app's, and an old link must not reach
 them.
 
+**Amendment (2026-11-17): operation ids.** `app delete` prints
+`Operation ID: <id>`, the tombstone's id, and resumes with `--resume
+<id>` ([operations](../operations.md)). The command that finishes each
+listing is therefore `wasmkeep app delete --app T/A --bucket ... --resume
+<id>`, which reads the tombstone, sees which listing is due and runs it
+or says when it will be. The tombstone is created once and its body
+becomes the `recreated` marker (ADR 0028, section 5), so nothing is
+recorded in it: `deploy --recreate` judges by the tombstone's age on the
+bucket's clock. Younger than 25 hours, it refuses and says when; older,
+it lists `state/<t>/<a>/blobs/` itself, removes what it finds, and
+removes the tombstone only once that listing is empty, as it already
+requires of the two prefixes. An id is unknown after that, as today.
+The listings and the delay are skipped when no version the app kept at
+its delete had a class or front importing `blobs` and the first removal
+found nothing under `blobs/`: an app that never used files waits for
+nothing. Both rules are proposed here, to confirm (open question 1).
+
 **Garbage the host does not collect.** The host knows owners, not
 references. A file an actor wrote but never recorded (the event failed
 after `put`), or uploaded through a link nobody confirmed, stays until
@@ -498,16 +638,93 @@ first and the row after, give upload links unique keys
 it with `head` when the browser says it is done, and sweep pending ones
 past their expiry from an alarm.
 
-**Restoring history to a point before a delete** (from a bucket that
-keeps versions, or a backup) brings back the old incarnation's rows but
-not its files, which were swept. Such a restore takes the files from the
-same backup.
+**Restoring one actor: `actor restore` rewinds the database only**
+(amendment of 2026-11-17; this replaces the earlier paragraph, which
+sent such a restore to "the same backup" for its files).
+`wasmkeep actor restore` (ADR 0033, section 6) writes a past state of
+the database as a new segment on the live head. It never touches a
+file, and **the replacement keeps the current `blob_incarnation`**: the
+job copies it from the database it replaces, with `operator_delete`,
+when it sets the staged database's host meta "for this actor now, not
+then" (step 6 there). It never takes the value the staged database
+held, whether that came from the live history or from a backup run.
+
+- A restore to a point before a delete therefore lands in the
+  incarnation the delete drew. The rows come back; the files they name
+  were swept, or are being swept, and stay gone. Nothing of the old
+  incarnation can be reached again, by the actor or by an old link.
+- A restore within one incarnation finds the files as they are now:
+  rows may name files deleted since, files written since have no row,
+  and a file overwritten since has its new bytes.
+- The sweep's judgement is unchanged by a restore: a record is judged
+  against the current incarnation, which a restore never moves.
+  `tests/cluster/restore.rs` and a simulation case prove it (slice B5).
+
+The docs say so beside `actor restore`: it restores rows, not files; an
+app checks a file with `head` before it trusts a restored row, and an
+operator who needs the files of that moment restores the app from a
+backup into a prefix of its own and copies them out.
+
+**Backup and restore of a whole app** (amendment of 2026-11-17: ADR 0033
+left files to this record).
+
+- **`backup create` copies an app's files and its assets.** After the
+  app's actors and before its deploys, the run lists `R blobs/` once and
+  copies every file it lists into the archive's `data/<sha-256>`, as it
+  copies history objects, recording in the run's manifest
+  (`runs/<run id>/files/<chunk>`) each file's source key, digest, size
+  and stored content type. With the deploys it copies, for each version
+  it keeps, the asset index the manifest's `assets` line names and every
+  content that index names, from `apps/<t>/<a>/_assets/index/` and
+  `_assets/content/` (section 9: never a marker). The source is still
+  only read.
+- **Files are copied as listed, not at each actor's database position.**
+  An actor's database is copied at its own moment, verified by replay
+  (ADR 0033, section 4); its files are copied later in the same run,
+  each at the moment it was read, with nothing tying a file to the row
+  that names it. So in a restored app **a file may be newer than the
+  rows that name it**, a row may name a file deleted before the listing,
+  and a file may have no row yet. The backup guide says so, with the
+  same advice as for one actor: check with `head`, and run the app's own
+  sweep of pending uploads after a restore. A file that is gone between
+  its listing and its read is left out, not an error; any other failure
+  makes the run partial, as a failed actor does.
+- **Incremental, verified, pruned like the rest.** A file whose key,
+  size and `ETag` match the previous complete run's entry is carried
+  over without a read. `backup verify` checks that each file's and each
+  asset's object is in the archive under its digest (all of them, or the
+  sample). `backup prune` counts their digests as referenced by every
+  run it keeps.
+- **Not copied**: `R blob-sweeps/` and `R blob-usage`, with the other
+  intents and counters of the running cluster (ADR 0033, section 4, "Not
+  copied, on purpose"). A `swept` record written back beside a restored
+  database of that very incarnation would make the pass remove a live
+  actor's files. The asset markers `_assets/deploying/` and
+  `_assets/collecting/` are not copied either.
+- **`backup restore` brings both back.** After the history (step 1 of
+  ADR 0033, section 5) and before the app is opened, it writes each file
+  back under its source key with its content type, and with the deploy
+  (`--deploy backup`) the indexes and contents of the restored versions.
+  It writes back **only the files of the incarnation each restored
+  database names**: the run's manifest records every actor's
+  `blob_incarnation` from the replay it already does, as it records the
+  alarm, and files of any other incarnation of that address (an actor
+  deleted between its copy and the listing of files) are left in the
+  archive. The front's namespace comes back whole. In place, step 4 has
+  already removed everything under `state/<t>/<a>/`, files and sweep
+  records included. `--deploy keep` leaves `_assets/` as it is.
+- **What comes back differs in two ways.** A file's `etag` and
+  `modified-ms` are those of the restoring write, not the original's, so
+  an app that stored an ETag for a conditional write reads it again. And
+  no link issued before the restore is revoked by it: see "Open
+  questions" for uploads that land after an in-place restore.
 
 **Versioning is not assumed.** WasmKeep never reads object versions. A
 bucket that keeps old versions keeps deleted files as old versions too:
 deleting from the app does not erase them from such a bucket, and the
-operator's lifecycle rule decides when they go. Backups follow the
-app's two prefixes (ADR 0022).
+operator's lifecycle rule decides when they go. The same holds for an
+archive: a deleted actor's files stay in every backup run that copied
+them until `backup prune` drops those runs, as its rows do (ADR 0033).
 
 ### 6. Consistency
 
@@ -530,6 +747,28 @@ app's two prefixes (ADR 0022).
 - **Moves and failover** move nothing: the files are in the bucket, and
   any holder reaches them. On a node without a bucket, files stay on
   that node's disk with the database.
+- **A row and its file can part** (amendment of 2026-11-17). A file call
+  is durable when it returns; a plain database write is not, and the gap
+  is wider in a class with batched writes (ADR 0034, section 12).
+  - *A row lost, its file kept.* The node dies after `put`, or after a
+    browser's upload was confirmed, and before the row that names the
+    file reached the bucket: in a strict class between the commit and
+    the end of its event, in a batched class for as long as the write is
+    unsent or in flight. The file is an orphan (section 5, "Garbage the
+    host does not collect"). The docs say to make the row durable right
+    after recording an upload: `storage.flush`, or `exec-durable` for
+    the row itself. A later event of a batched actor can also hand out a
+    link to a file whose row is then lost.
+  - *A file deleted, its row kept.* `delete` is durable at once while
+    the row's removal can be lost the same way, leaving a row that names
+    nothing. The docs give the order: remove the row, make it durable,
+    then delete the file; and treat a `head` that finds nothing as a row
+    to drop.
+  - Neither case can cross an incarnation, and neither is the host's to
+    repair: it knows owners, not references.
+- **Restores** move rows, never files, for one actor; for a whole app
+  they bring back files copied at another moment than the rows
+  (section 5).
 
 ### 7. Limits, quotas and metrics
 
@@ -552,14 +791,19 @@ known at that moment. Once an hour the sweep node lists
 `state/<t>/<a>/blobs/` and writes the app's stored bytes and file count
 to `R blob-usage`, which every node of the app reads once a minute. With `--max-app-blob-bytes`, writes and upload links are refused
 with `quota-exceeded` while the last count is over it, until a count is
-under it again. The quota can be exceeded by up to an hour of writes
+under it again. (Amendment of 2026-11-17: in a node file the limit is the
+`[[app]]` field `max-app-blob-bytes`, as every per-app `serve` flag is,
+ADR 0038, section 4; `--max-blob-bytes` is the process's. A restored app
+has no `blob-usage` until its first count, an hour at most after its
+nodes start, and is not refused meanwhile.) The quota can be exceeded by up to an hour of writes
 plus every upload link outstanding; the docs say so. Per-actor totals
 are the app's to keep (in its database), not the host's. On a node
 without a bucket the same count walks the directory, and the disk's own
 readiness check (`/_wasmkeep/ready`) stays the hard stop.
 
 **Metrics** (with `tenant` and `app`, like the other series of an app's
-work):
+work, ADR 0038, section 9; `wasmkeep_blob_links_mode` alone is the
+process's and carries no app label, since the start proof is):
 
 - `wasmkeep_blob_ops_total{op, outcome}`: `op` one of `head`, `get`,
   `put`, `read`, `write`, `delete`, `list`; `outcome` one of `ok`,
@@ -586,6 +830,14 @@ work):
   object key; a node link names its app and is refused by any other app's
   node. Neither can be widened: SigV4 binds the key, method, signed
   headers and expiry, and the token's MAC covers every field.
+  (Amendment of 2026-11-17.) Apps that share a process (ADR 0038) share
+  its bucket credentials, as they share its engine: what keeps one app's
+  code from another's files is the host building every key under the
+  caller's own root, not the credentials. The node-link MAC key is per
+  app, derived with the app's name, so a token minted under one app's
+  hostname fails under another's even inside one process. Presigned
+  links of every app of a process are signed by the same access key id;
+  a link discloses it, as below, to holders of any of those apps' links.
 - **Links in the wild.** A URL leaks through history, logs, `Referer` and
   screenshots. Short defaults, create-only uploads, the expiry ceiling
   and the sweep after a delete bound the damage; the docs advise
@@ -1215,7 +1467,11 @@ to add. The existing checks and their verdict do not change.
   `assets`.
   - A deploy of a class or front that imports `wasmkeep:actor/blobs` is
     refused while a live node of the app lacks `blobs`: such a node
-    could not link it, and would stay not ready. A deploy writing
+    could not link it, and would stay not ready. This is an import check
+    only (`deploy` reads each component's imports, as it does for
+    `storage.flush`, ADR 0034, section 15): files add no manifest line
+    and no manifest format, and a version with them keeps the format its
+    other lines need. A deploy writing
     format 7 is refused while a live node lacks `assets` (section 9,
     "Mixed versions"). Neither has a
     `--force`, as for `front`. A rollback to such a version is checked
@@ -1227,6 +1483,15 @@ to add. The existing checks and their verdict do not change.
     class, so it does not serve it, and ADR 0028 leaves a request to the
     nodes that serve the class; the delete job and idle expiry also
     check, on the node that runs them, that it has the word.
+  - **Restores and backups** (amendment of 2026-11-17). `actor restore`
+    of an actor whose class imports `blobs` is carried out only by a
+    node with the word, checked as `actor-restore` is (ADR 0033,
+    section 6): a node without it would write the staged database's
+    incarnation, an older one. A CLI from before this release copies no
+    file and no asset into a backup and restores none; the backup guide
+    says to back up an app that uses either with a CLI of this release,
+    and `backup restore` of this release says when the run it restores
+    holds no file manifest although the app's version imports `blobs`.
   - The TypeScript engine (ADR 0018) must import `blobs` only in builds
     that use it, or every TypeScript deploy would wait for the word
     during an upgrade; checked when built.
@@ -1243,7 +1508,8 @@ to add. The existing checks and their verdict do not change.
   - `/_wasmkeep/blobs/v1/` answers on the public port;
   - the delete routine writes one more object before the reset, and the
     lowest live node of an app lists `blob-sweeps/` once a minute;
-  - nodes run two more requests at start on `probe/` (the link proof).
+  - nodes run about ten more requests at start on `probe/` (the link
+    proof, section 4), once per process.
 
 ## Consequences
 
@@ -1331,13 +1597,96 @@ to add. The existing checks and their verdict do not change.
   rule does not depend on it.
 - The SDKs other than Rust and TypeScript.
 
+## Open questions (files)
+
+Left by the amendment of 2026-11-17; none blocks slices B1 to B3. Four
+rules in the amended text go beyond what was decided before it and are
+**proposed, to confirm**: `--recreate` judging by the tombstone's age,
+and skipping the wait for an app without files (question 1); `backup
+restore` writing back only the files of the incarnation each database
+names, with the incarnation in the run's manifest (question 10); and
+how a node link gets its host (question 7).
+
+1. **A namespace epoch instead of the 25-hour wait.** `--recreate` is
+   refused until the tombstone is 25 hours old because a re-created
+   app's actors start at incarnation `0` again; this amendment proposes
+   that it judge by the tombstone's age and skip the wait for an app
+   that never imported `blobs` (section 5). If the starting incarnation were
+   derived from the app's `recreated` marker (ADR 0028, section 5)
+   instead of being the constant `0`, no key of the old app could be a
+   key of the new one, the wait could go, and a late upload would be a
+   stray under a prefix nothing names. The same question covers an
+   **in-place `backup restore`**: its root is cleared with the nodes
+   stopped, but an upload link issued up to an hour before may still
+   land afterwards. For an actor in the run that is a file with no row,
+   as any unconfirmed upload. For an actor absent from the run, which
+   starts empty at incarnation `0`, it is a file of the old actor in the
+   new one's namespace. The `restored` marker could carry an epoch the
+   same way. Until this is settled the backup guide states the window:
+   wait an hour between stopping the app's nodes and an in-place
+   restore if upload links may be outstanding.
+2. **A delete under a version that no longer imports `blobs`.** The
+   delete routine writes a sweep record when the actor's class imports
+   `blobs`. A class that imported it, wrote files, and was then deployed
+   without the import is deleted with no record and no new incarnation:
+   its files leak, and a later version with the import finds them at the
+   same incarnation. Candidates: write the record on every delete while
+   any version the app keeps imports `blobs` (one object more per
+   delete); or record "has had files" in the database, which a batched
+   class could lose. Not settled.
+3. **Files of an incarnation nothing names.** A stray upload under a
+   swept incarnation after the 25-hour pass, or files left by question 1,
+   are under no record. The hourly count lists everything under `blobs/`
+   and could report namespaces whose incarnation is not the actor's, but
+   knowing that takes a read of each actor's database. Today the bucket's
+   lifecycle rule is the only backstop.
+4. **Large files into a content-addressed archive.** `data/<sha-256>`
+   needs the digest before the write, and a file may be 5 GiB. B6 spools
+   a file larger than 16 MiB to the run's cache directory, then uploads
+   it; whether a server-side copy within one provider is worth a second
+   path is open, and so is a size above which a run should refuse
+   without `--cache`.
+5. **Stored headers on restore.** The run records the content type. An
+   upload link also stores `cache-control: private, no-store`, and an
+   uploader may have stored more; downloads override all of them
+   (section 4), so B6 restores the content type alone. To confirm
+   against a store that returns other attributes.
+6. **A restored app's ETags.** Whether `backup restore` should offer a
+   map of old to new ETags, for apps that keep them in rows, or the
+   guide's "read them again" is enough.
+7. **A node link's host** (section 4, proposed): the authority of the
+   request being handled, else the first hostname the node file lists
+   for the app. The first is the caller's `Host` as the hostname table
+   matched it; the second is a guess when an app has several. A per-app
+   `blob-link-host` field would settle both.
+8. **The judging job's hold and idle expiry**: the amendment requires
+   that it leaves `idle-since` as found. ADR 0035 states this for a hold
+   never activated; B4 must check that the fence the job uploads does
+   not count as activation.
+9. **TypeScript streams** (section 3) and the engine importing `blobs`
+   only when used (section 11) are still "to be checked when built", in
+   B2.
+10. **The restore filter** (section 5, proposed). `backup create` copies
+    files as listed; `backup restore` is proposed to write back only
+    those under the incarnation each restored database names, which
+    needs that value in the run's manifest. The alternative is to write
+    back everything listed and leave files of other incarnations under
+    prefixes nothing names (question 3). Sweep records are not restored
+    either way.
+
 ## Tests (to build)
 
 - **`sim/`**: deletes with files among takeovers and late uploads:
   `deleted_actors_files_never_reach_the_next_incarnation`, and an unsafe
   variant without the incarnation that must be caught; the sweep record
   written, the delete failing after it, and the record dropped with no
-  file touched.
+  file touched. Since the amendment of 2026-11-17 the same case also
+  runs with a batched holder (the record between the flush and the
+  reset, `swept` only after the acknowledgement), with a restore of one
+  actor between a delete and its sweep, and with a judging acquisition
+  refused by the recorded-head gate; two more unsafe variants must be
+  caught: `swept` written on a captured, unacknowledged reset, and a
+  restore that brings back the staged database's incarnation.
 - **Cluster** (`tests/cluster/blobs.rs`, plain and TLS): put, get, head,
   list and delete with conditions; a write refused without a hold; an
   actor's files swept after `actor delete`, a download link failing
@@ -1361,10 +1710,28 @@ to add. The existing checks and their verdict do not change.
 | Slice | Size |
 | --- | --- |
 | This record | S |
-| WIT `blobs`, the host on a bucket and on disk, Rust and TypeScript SDKs | L |
-| Links: presigned, node links, the start proof, `cluster diagnose` | M |
-| Incarnations, sweep records and the sweep pass (with ADR 0028's routine) | M |
-| Counting, `--max-app-blob-bytes`, metrics | S |
+| Files: slices B1 to B8 below | L |
 | Assets: deploy, index, format 7, collection (section 9, A1 to A3) | M |
 | Assets: serving, cache, `not-found`, `dev` (section 9, A4 to A7) | M |
 | Sim cases, cluster and CLI tests, adversarial review | M |
+
+**Slices for files (B1 to B8, amendment of 2026-11-17).** Each is one
+change with its proof. Order: B1, then B2 and B3 in either order, B4,
+B5, then B6 and B7 in either order, B8 last. The word `blobs` and
+the deploy's import check arrive together in B5, and no build between
+B1 and B5 is released: a node announces the word only once it can end
+an actor's files and carry an incarnation through a restore
+(section 11). One adversarial review, after B4 and B5 (the slices
+that delete objects and touch restore).
+
+| Slice | What | Where | Proof |
+| --- | --- | --- | --- |
+| B1 | The interface `blobs` in the five WIT copies, `wasi:io/streams` in both core worlds; the host on a bucket and on disk: `head`, `get`, `put`, `delete`, `list`, `open-read`, `open-write` and `finish`; key validation, the limits of section 7, the hold check on writes; namespaces at incarnation `0` | `crates/wasmkeep-wit/wit/actor.wit` and its copies, new `crates/wasmkeep-server/src/blobs/`, `crates/wasmkeep-server/src/actor/host.rs`, `crates/wasmkeep-server/src/front.rs` | unit tests of every key refusal and of the disk index (a crash between rename and commit leaves no visible file); new `crates/wasmkeep-server/tests/cluster/blobs.rs`, plain and TLS: put, get, head, list by prefix and page, delete, each condition, `too-large`, a write refused without a hold, a front and an actor each seeing only their own namespace, two apps in one process with the same class, name and key reading their own bytes; `crates/wasmkeep-wit/tests/bindings.rs` and `api_reference.rs` |
+| B2 | Rust and TypeScript SDKs: the buffered calls, the paged iterator, `open_read` and `open_write` in Rust; the API reference lists the other SDKs as missing | `crates/wasmkeep-sdk`, `sdks/typescript`, `docs/reference/api.md` | SDK tests against the host of B1; an example actor that stores and lists files, in both languages, run by the cluster test; a TypeScript component that does not use files imports no `blobs` (its imports read back) |
+| B3 | Links: `link-download` and `link-upload`, presigned with a signer-only client, node links with their token, MAC key and host; the start proof, once per process; `--blob-links`, `--blob-link-endpoint`; the `blob-links` checks of `cluster diagnose` (section 10) | `crates/wasmkeep-server/src/blobs/`, `crates/wasmkeep-server/src/http.rs`, `crates/wasmkeep-server/src/supervisor.rs`, `crates/wasmkeep-cluster/src/bucket_check.rs`, `crates/wasmkeep-cli/src/diagnose.rs` | the five cases of the proof against a local S3 server that enforces signed headers, and a store wrapper that ignores each condition in turn: the node falls back to node links and says so; `blobs.rs`: an upload link used twice, with another size, another type and after its expiry, a download link with each disposition, `inline` refused for `text/html`, node links end to end, a token of another app refused in another process and under another hostname of the same process (`two_apps.rs`), the response headers of section 8 |
+| B4 | `blob_incarnation` in the reset's host meta, read once per hold; the sweep record before the reset and `swept` after its acknowledgement, strict and batched; the sweep pass and its judging job behind `ensure_owner_with`; idle expiry and the operator delete through the same routine; `app delete`'s two listings, resumed by operation id, and the `--recreate` refusal | `crates/wasmkeep-server/src/actor/{collection,state,deletes,expiry}.rs`, new `crates/wasmkeep-server/src/blobs/sweep.rs`, `crates/wasmkeep-server/src/apps/delete.rs`, `crates/wasmkeep-server/src/apps.rs`, `sim/` | the simulation case `deleted_actors_files_never_reach_the_next_incarnation` with its batched, takeover and late-upload schedules, and its unsafe variants caught (no incarnation; `swept` on an unacknowledged reset); `blobs.rs`: files gone and a download link failing after `actor delete`, `delete-self`, `delete-self-durable` and idle expiry, a new actor at the address listing nothing, a delete whose reset fails leaving a `pending` record that the pass drops with every file kept, the same in a batched class with the flush failing (no record at all); `recorded_head.rs`: a judging acquisition refused by the gate leaves the record `pending`; `app_delete.rs`: the listings resumed with `--resume`, `--recreate` refused before the second, not delayed for an app without files |
+| B5 | `actor restore` carries the current `blob_incarnation` into the replacement; refused on a node without `blobs` when the class imports it; then the word `blobs` and the deploy's import check | `crates/wasmkeep-server/src/actor/restores.rs`, `crates/wasmkeep-server/src/apps.rs`, `crates/wasmkeep-cluster/src/membership.rs` | `crates/wasmkeep-server/tests/cluster/restore.rs`: a restore to a point before a delete keeps the incarnation the delete drew, lists none of the old files and keeps the new ones; a restore within one incarnation keeps every current file; a restore from a backup run does the same; a `pending` sweep record judged after a restore gives the same answer as before it; the simulation's unsafe variant (the staged incarnation restored) caught; a deploy importing `blobs` refused while a live node lacks the word |
+| B6 | `backup create` copies `blobs/` as listed and the indexes and contents of kept versions, with each actor's incarnation in the manifest; incremental carry-over; `backup verify` and `backup prune` cover them; `backup restore` writes files of the named incarnations and the assets back, in place too | `crates/wasmkeep-cli/src/backup.rs`, `crates/wasmkeep-cli/src/backup/{restore,prune}.rs` | `crates/wasmkeep-cli/src/backup/tests.rs` on in-memory buckets: a run with files and assets restored into an empty prefix serves the same bytes, types and asset names; a file changed after its actor was copied comes back newer than its row, and the run says nothing is wrong; files of an incarnation the restored database does not name are not written; no `blob-sweeps/`, `blob-usage` or asset marker in a run or a restored root; a second run reads no unchanged file; `prune` keeps a file a kept run names and deletes one none does; `verify` fails on a missing file object; the backup drill extended with one file and one asset |
+| B7 | The hourly count and `R blob-usage`, `max-app-blob-bytes` as a flag and a node-file field, `quota-exceeded`, the metrics of section 7 with their labels | `crates/wasmkeep-server/src/blobs/`, `crates/wasmkeep-server/src/metrics.rs`, `crates/wasmkeep-cli/src/node_file.rs` | unit tests of the count on a bucket and on disk; `blobs.rs`: writes and upload links refused over the limit and accepted again after a delete and a count; `two_apps.rs`: each app's series carry its own labels and one app over its limit does not refuse the other; `node_file_tests.rs`: the field, and an unknown one refused |
+| B8 | The guides | new `docs/files.md`, `docs/deploy/backup-and-restore.md`, `docs/actor-data-access.md`, `docs/reference/node-file.md`, `docs/monitoring.md`, `docs/deploy/upgrading-to-0.6.md`, `docs/deploy/buckets.md` | each statement this record says "the docs say": flush after recording an upload and the order for a delete; a file may be newer than its rows after `backup restore`; `actor restore` restores rows, not files; CORS and the link endpoint per provider; the lifecycle rules for strays and incomplete multipart uploads; idle expiry ignores downloads; the quota's lag. The guide's examples are the SDK examples of B2, run by their tests |
+
