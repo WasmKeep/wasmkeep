@@ -9,6 +9,23 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Placement at wake-up** ([ADR 0041](docs/adr/0041-placement-at-wake-up.md)):
+  a node about to wake an actor nobody holds sends that one event to a
+  clearly lighter node of the app (a resident fill of at least 20%, more
+  than 25% above the lighter of two rendezvous candidates, within a
+  budget per heartbeat), which acquires it unless its own count, read on
+  arrival, says it is not the lighter one; then the event runs where it
+  woke. Outside requests with no body or one of 64 KiB or less, and
+  `actors.call`, are placed; WebSocket upgrades, alarms and streamed
+  bodies never are, and a running actor never moves. The heartbeat's load
+  line gains `actor_room` and `socket_room` per app (older readers skip
+  them), nodes announce `place`, the hop carries a signed
+  `x-wasmkeep-placed` mark, and `wasmkeep cluster status` shows each
+  node's fill. On by default; `serve --no-placement` or `[process]
+  placement = false` turns it off. New metrics:
+  `wasmkeep_placements_total`, `wasmkeep_placements_received_total`,
+  `wasmkeep_placement_kept_total`, `wasmkeep_placement_fill`.
+
 - `backup restore` warns when the selected app version imports files but the backup predates file manifests.
 
 - **Actor SQL/export verification:** apply SQLite authorization, schema checks,

@@ -55,7 +55,9 @@ this order.
    with room, accounting for app limits and sockets. Nodes that join
    or return fill as actors sleep and wake. Running actors stay
    where they are unless an operator moves them or drains a node
-   ([how](docs/cluster.md)).
+   ([ADR 0041](docs/adr/0041-placement-at-wake-up.md), accepted; built,
+   on by default, see [how it scales](docs/failover-and-scaling.md#placement-at-wake-up);
+   the release's benchmark confirms the default with a hashing balancer).
 7. **Inspection and application clients** (M): an authenticated,
    read-only inspector, typed Rust clients alongside TypeScript,
    and a complete framework example with reconnect and recovery.

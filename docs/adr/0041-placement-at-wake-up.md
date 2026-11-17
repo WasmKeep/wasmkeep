@@ -1,8 +1,10 @@
 # 0041. Placement at wake-up
 
-- Status: proposed (2026-11-17), revised the same day from the
-  simulation: sections 3 to 6 and 8, and the properties. The decision
-  function and its simulation exist (P2, P3); nothing is wired.
+- Status: accepted (2026-11-17), as built: revised the same day from the
+  simulation (sections 3 to 6 and 8, and the properties), then wired
+  (P1, P4) and documented (P5). On by default; the release's benchmark
+  pass with a hashing balancer confirms the default, the floor and the
+  band (open questions below).
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, item 6
 - Follows: [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) (a
@@ -631,3 +633,30 @@ Each slice is one change and says what it proves.
   touches the path to ownership.
 - **P5. Docs and status.** The pages above; this record becomes
   "accepted, as built".
+
+## As built
+
+- The route's three answers come from one read (`Owners::route`); an
+  outside request reads it once in `handle`, and `dispatch` reuses that
+  answer, so placement adds no read.
+- The receiver counts placed events it accepted and has not registered
+  yet into `actors` (taking them from the room) under the same lock as
+  the arrival check, so two hops arriving at once cannot both pass it on
+  the same count.
+- The mark is believed only with a sender bound to the signature and
+  checked live in the app (`x-wasmkeep-sender`): no-return needs one. A
+  forward's proof is checked on its original path, before routing cuts
+  `/actor/<class>/<name>` off it.
+- Besides the reasons of section 6, a receiver marks as refused the
+  `503`s it gives a placed hop before reading it: a forward proof or a
+  call's sender that does not check, and a hop for another app. None of
+  them ran the event. A sender treats only a `503` with the mark as a
+  refusal; any other answer (a `403` for a call's body that does not
+  match its signature, say) is returned as it is.
+- A placed hop that gets no answer in time answers `503` with
+  `Retry-After`, as section 6 says, where an ordinary forward answers
+  `504`.
+- The cluster tests' nodes run with placement off, but for the
+  placement tests and the golden trace, which runs both ways; with it on,
+  b has one resident slot like a, so a full node's wake-up of another
+  actor is evaluated and kept (a share of 0), and the trace is the same.

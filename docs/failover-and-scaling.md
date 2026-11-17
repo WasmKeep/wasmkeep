@@ -140,7 +140,10 @@ handles one event at a time; different actors run in parallel, on every
 node.
 
 - **Where an actor runs.** The node that receives the first request for an
-  actor nobody holds takes it. A load balancer that
+  actor nobody holds takes it, unless that node is clearly fuller than
+  another node of the app: then it sends that one wake-up there, which
+  takes it (placement at wake-up, [below](#placement-at-wake-up)). A load
+  balancer that
   [hashes the actor's path](deploy/front-door.md#route-by-actor-recommended)
   sends every request for one actor to the same node, so actors spread
   over the nodes as their names hash, and little is forwarded.
@@ -148,17 +151,56 @@ node.
   node id, and add it to the load balancer. With a consistent hash, a
   share of the actor paths now reach the new node. An actor still in
   memory elsewhere stays there (the new node forwards to it); once it
-  hibernates, its next request starts it on the new node.
+  hibernates, its next request starts it on the new node. The other
+  nodes also send it their wake-ups while they are clearly fuller, so it
+  fills as actors wake, even from calls between actors and a balancer
+  that does not hash.
+
+### Placement at wake-up
+
+Three kinds of wake-up ignore a hashing balancer: a call from another
+actor, a call from the front, and a balancer that does not hash. So a
+node that is about to wake an actor nobody holds compares its own
+resident fill with what the other nodes of its app published in their
+last heartbeats ([ADR 0041](adr/0041-placement-at-wake-up.md)):
+
+- It keeps the actor while it is under a fifth of its room, or not more
+  than 25% fuller than the lighter of two candidates chosen by the
+  actor's name. An idle cluster, or one an even hash keeps level,
+  forwards nothing.
+- Otherwise it sends the event once to that node, within a budget per
+  heartbeat shared with the other senders. The receiver takes it only if
+  its own count, read when the hop arrives, stays at 80% of the sender's
+  fill or less; else it refuses, and the sender runs the event as it
+  would have. A hop that was never read also runs where it woke; one
+  that failed after it was written answers `503`, as a failed forward
+  does, since it may have run.
+- A stale heartbeat (first seen three periods ago, 9 s), a node without
+  the `place` word, a node of another app, a draining node and a node
+  that just refused are never candidates. Two nodes never place on each
+  other within three periods.
+- Requests with a streamed or larger body (over 64 KiB), WebSocket
+  upgrades and alarms always wake their actor where they land.
+- A placed actor costs one forward per request until it hibernates,
+  when its balancer sends its requests elsewhere.
+
+`--no-placement` (or `[process] placement = false`) turns it off for a
+process. The `wasmkeep_placement*` metrics count what it did
+([monitoring](monitoring.md#placement-at-wake-up)).
 - **Removing a node.** Drain it, then stop it.
 
 ### What does not happen today
 
-- **No rebalancing by load.** Placement does not use node load. An
-  actor in memory stays on its node until it hibernates, until it is moved
-  with [`wasmkeep actor move`](cluster.md#moving-one-actor), until its
-  node is drained with [`wasmkeep cluster drain`](cluster.md#draining-a-node),
-  or until its node stops or dies. A move is not a pin: once the actor
-  hibernates, its next event starts it wherever that event lands.
+- **No moving of running actors by load.** Placement acts only when an
+  actor wakes. An actor in memory stays on its node until it hibernates,
+  until it is moved with
+  [`wasmkeep actor move`](cluster.md#moving-one-actor), until its node is
+  drained with [`wasmkeep cluster drain`](cluster.md#draining-a-node), or
+  until its node stops or dies. A move is not a pin: once the actor
+  hibernates, its next event starts it wherever that event lands, or is
+  placed. A cluster whose actors never hibernate does not fill a new node.
+- **No equalising.** Placement narrows a gap to the 25% band and stops
+  there (a few actors short of it); it does not make the nodes equal.
 - **No splitting of one actor.** An actor that receives more events than
   it can run one at a time fills its queue (1,024 events, then `429`). No
   setting changes that, and a second node does not help. The application
@@ -168,9 +210,10 @@ node.
   of its actors.
 
 Per-node load and saturation metrics are available, along with per-app
-metrics and load in `wasmkeep cluster status` ([monitoring](monitoring.md)).
-Automatic placement at wake-up and rebalancing remain on the
-[roadmap](../ROADMAP.md).
+metrics, load and fill in `wasmkeep cluster status`
+([monitoring](monitoring.md)). Moving running actors automatically
+remains on the [roadmap](../ROADMAP.md), only if placement at wake-up is
+not enough.
 
 ## Stateless components
 

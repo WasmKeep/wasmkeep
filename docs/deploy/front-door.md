@@ -57,6 +57,14 @@ arrives and forwarding all but disappears. It is only a hint: when nodes
 come and go, ownership still follows the leases, and a request that lands
 elsewhere is forwarded.
 
+With an even hash the nodes stay level and placement at wake-up
+([ADR 0041](../adr/0041-placement-at-wake-up.md)) sends nothing. When one
+node is clearly fuller (calls between actors woke their callees there, or
+a node just joined), it sends some cold wake-ups to a lighter node; each
+request for such an actor then costs one forward while it stays in
+memory, and the hash takes over again once it hibernates. A balancer that
+does not hash relies on placement alone to spread actors.
+
 **HAProxy**: `balance uri depth 3` hashes the first three path segments
 (`/actor`, the class, the name):
 

@@ -49,6 +49,27 @@ of what adding nodes does, read
   the client waiting meanwhile; see "A caller its peer briefly stopped
   trusting" below.) A release that fails is retried in the background;
   until it lands, the record keeps naming the node.
+- **Placement at wake-up** ([ADR 0041](adr/0041-placement-at-wake-up.md)):
+  a node about to wake an actor nobody holds (no record, or a released
+  one) keeps it, unless it is clearly fuller than another node of the
+  app. Then it sends that one event to the lighter node, once, and that
+  node acquires the actor as for any request. "Clearly fuller" is a
+  resident fill of at least 20% of the app's room on this node, more than
+  25% above the lighter of the two rendezvous candidates, within a
+  per-heartbeat budget. The candidates are the live, serving nodes of the
+  same app that announce `place`, whose heartbeat was first seen less
+  than three periods ago (9 s), and that are not backed off. The
+  receiver checks its own count when the hop arrives and refuses
+  (`503`, `x-wasmkeep-placed: refused`) unless it stays at 80% of the
+  sender's fill or less with the actor; the sender then runs the event
+  itself. A placed event is never placed or forwarded again, and two
+  nodes never place on each other within three periods. Only an outside
+  request with no body or one declared at 64 KiB or less, and
+  `actors.call`, are placed: never a WebSocket upgrade, an alarm, a
+  streamed body, a take or a drain's hand-over, and never an actor whose
+  record names a node. A running actor never moves because of it. Turn
+  it off per process with `--no-placement` or `[process] placement =
+  false` ([node file](reference/node-file.md)).
 - A node that stops cleanly (`SIGTERM` or Ctrl-C) finishes its in-flight
   events, then releases its actors: the next request for one of them
   starts it on another node at once. Last, it writes its heartbeat
@@ -440,6 +461,7 @@ curl -i -X POST localhost:8082/actor/counter/alice   # 2, forwarded to a
 | `--failover-wait-secs` | How long a `GET` or `HEAD` without a body, or a WebSocket upgrade, for an actor whose node died or is stopping is kept until another node took the actor over, instead of a 503 at once; default 25 (from the lease timing), 0 turns it off (see "When a node dies: what a caller sees") |
 | `--history-retention-secs` | How long old actor history stays in the bucket before garbage collection may delete it; default 3600, 0 allowed (see "History in the bucket") |
 | `--secrets-key FILE` | With `--app`: the key the app's secrets are sealed with (`wasmkeep secrets new-key`); given twice during a key change (see "Secrets in the bucket") |
+| `--no-placement` | Never send a wake-up of an actor nobody holds to a lighter node, nor receive one ([ADR 0041](adr/0041-placement-at-wake-up.md)): the node keeps every actor it wakes and does not announce `place`. Placement is on by default; `[process] placement = false` in a node file says the same |
 | `--no-alarms` | Never fire an actor's alarms on this node and sweep none from the bucket's index; requests are still served and the alarms stay pending for a node without the flag. For a node on a restored copy (see [backup and restore](deploy/backup-and-restore.md)). The node logs once at start that alarms are off |
 | `--no-secrets` | With `--app`: run without the app's secrets from the bucket (`--env` only); without it and without a key, a node refuses to start once the app has secrets |
 
@@ -1034,10 +1056,10 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 ```text
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS     WORDS
-a     yes   979ms  serving  12      3        840     310        0.5.1    acme/shop  http://a:8080  https://a:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
-b     yes   2.2s   serving  4       0        95      288        0.5.1    acme/shop  http://b:8080  -                plain   take front handoff ends flush rate_limits restore actor-restore recorded-head
-c     no    14m    -        -       -        -       -          0.5.1    acme/shop  http://c:8080  https://c:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
+NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  FILL   VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS     WORDS
+a     yes   979ms  serving  12      3        840     310        1.2%   0.6.0    acme/shop  http://a:8080  https://a:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head place
+b     yes   2.2s   serving  4       0        95      288        -      0.5.1    acme/shop  http://b:8080  -                plain   take front handoff ends flush rate_limits restore actor-restore recorded-head
+c     no    14m    -        -       -        -       -          -      0.5.1    acme/shop  http://c:8080  https://c:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
 
 APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT  FORMAT
 acme/shop  9cf4de9152d8dd29  1    16      yes    3
@@ -1075,12 +1097,19 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   same moment, so it lags what the node runs by at most one heartbeat
   period (3 s by default): an actor a node just took over shows at its
   next heartbeat. A node that crashed keeps showing its last load until
-  its heartbeat is older than the horizon. Nothing places actors by it.
+  its heartbeat is older than the horizon. **FILL** is its app's
+  resident fill: actors over actors plus `actor_room`, how many more
+  residents the app could have there now (its `max-resident`, its
+  `min-resident` floor and the process's limit counted); `-` from a
+  version before placement. Placement at wake-up (above) reads the rooms
+  of a heartbeat first seen less than three periods ago, to choose a
+  candidate, never to decide who holds an actor.
   A node not live shows `-` (a fenced or released heartbeat keeps the
   last load it wrote, which no longer holds), and so does a node of a
   version before 0.4.0 (`FRONT/MIN` also for a node of a version that
   did not publish it yet). In `--json`: `actors`, `sockets`,
-  `events_per_min` and `front_per_min`, `null` when unknown. Events and
+  `events_per_min`, `front_per_min`, `actor_room`, `socket_room` and
+  `fill` (thousandths), `null` when unknown. Events and
   front requests are counted per process, so nodes sharing one process
   (tests) share one count.
 - **Apps** come from `apps/<tenant>/<app>/current`: the deployed version and
