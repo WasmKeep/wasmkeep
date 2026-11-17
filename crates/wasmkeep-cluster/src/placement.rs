@@ -37,6 +37,8 @@ pub struct Peer<'a> {
     /// Elapsed on the sender's monotonic clock since FIRST observation.
     pub age: Duration,
     pub backoff_remaining: Duration,
+    /// Elapsed locally since accepting a placement from this peer.
+    pub accepted_age: Option<Duration>,
 }
 
 /// One sender's credit ledger, independent of every other sender.
@@ -123,6 +125,8 @@ pub fn decide<'a>(
                 || !p.place
                 || p.age >= period.saturating_mul(3)
                 || !p.backoff_remaining.is_zero()
+                || p.accepted_age
+                    .is_some_and(|age| age < period.saturating_mul(3))
             {
                 return None;
             }
@@ -163,13 +167,52 @@ pub fn decide<'a>(
     let t = s * 4 * cap / 5000;
     // A candidate implies N-1 >= 1. max(1) also makes malformed caller
     // input harmless; all arithmetic uses u128 to preserve u64 load counts.
-    let limit = (t.saturating_sub(actors) / (others.len() as u128).max(1)).max(1);
+    let limit = t.saturating_sub(actors) / (others.len() as u128).max(1);
     if k >= limit {
         return Decision::Keep(Reason::Budget);
     }
     Decision::Forward {
         node: p.node,
         reason: Reason::Lighter,
+    }
+}
+
+/// The pure receiver policy; other admission gates remain the caller's job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    Accept,
+    InvalidMark,
+    NoReturn,
+    Capacity,
+}
+
+/// `sender_fill` is the parsed whole-number placed mark. `verified` means
+/// the hop signature checked AND covered that value and sender identity.
+/// No signature verification or request-path wiring happens here (P4).
+/// Read `load` live and serialize this check with reserving the actor slot.
+/// `sent_age` is elapsed on this receiver's monotonic clock since its last
+/// send to this sender, regardless of that send's answer.
+pub fn receive(
+    load: RoomLoad,
+    sender_fill: u64,
+    verified: bool,
+    sent_age: Option<Duration>,
+    period: Duration,
+) -> Arrival {
+    if !verified || !(200..=1000).contains(&sender_fill) {
+        return Arrival::InvalidMark;
+    }
+    if sent_age.is_some_and(|age| age < period.saturating_mul(3)) {
+        return Arrival::NoReturn;
+    }
+    let Some(room) = load.actor_room else {
+        return Arrival::Capacity;
+    };
+    let t = u128::from(sender_fill) * 4 * capacity(load.load.actors, room) / 5000;
+    if u128::from(load.load.actors) + 1 > t {
+        Arrival::Capacity
+    } else {
+        Arrival::Accept
     }
 }
 
@@ -232,6 +275,7 @@ mod tests {
             heartbeat: "h1",
             age: Duration::ZERO,
             backoff_remaining: Duration::ZERO,
+            accepted_age: None,
         }
     }
     fn run(actors: u64, peers: &[Peer<'static>]) -> Decision<'static> {
@@ -255,10 +299,72 @@ mod tests {
         assert_eq!(run(199, &[peer("a", 0)]), Decision::Keep(Reason::Floor));
         assert_eq!(run(200, &[peer("a", 0)]), forward("a"));
         assert_eq!(run(500, &[peer("a", 400)]), Decision::Keep(Reason::Band));
-        assert_eq!(run(501, &[peer("a", 400)]), forward("a"));
+        assert_eq!(run(501, &[peer("a", 400)]), Decision::Keep(Reason::Budget));
         assert_eq!(run(500, &[peer("a", 399)]), forward("a"));
         assert_eq!(run(500, &[peer("a", 401)]), Decision::Keep(Reason::Band));
     }
+    #[test]
+    fn arrival_uses_live_capacity_verified_fill_and_wide_arithmetic() {
+        assert_eq!(
+            receive(load(39, 61), 500, true, None, PERIOD),
+            Arrival::Accept
+        );
+        assert_eq!(
+            receive(load(40, 60), 500, true, None, PERIOD),
+            Arrival::Capacity
+        );
+        assert_eq!(
+            receive(load(0, 1), 200, true, None, PERIOD),
+            Arrival::Capacity
+        );
+        assert_eq!(
+            receive(load(0, 0), 1000, true, None, PERIOD),
+            Arrival::Capacity
+        );
+        assert_eq!(
+            receive(load(u64::MAX, u64::MAX), 1000, true, None, PERIOD),
+            Arrival::Accept
+        );
+        for s in [0, 199, 1001, u64::MAX] {
+            assert_eq!(
+                receive(load(0, 100), s, true, None, PERIOD),
+                Arrival::InvalidMark
+            );
+        }
+        assert_eq!(
+            receive(load(0, 100), 500, false, None, PERIOD),
+            Arrival::InvalidMark
+        );
+        let mut unknown = load(0, 100);
+        unknown.actor_room = None;
+        assert_eq!(receive(unknown, 500, true, None, PERIOD), Arrival::Capacity);
+    }
+
+    #[test]
+    fn no_return_filters_before_rendezvous_and_expires_at_three_periods() {
+        let mut peers = [peer("a", 0), peer("b", 0), peer("c", 0), peer("d", 0)];
+        let before = PERIOD * 3 - Duration::from_nanos(1);
+        peers[2].accepted_age = Some(before);
+        peers[3].accepted_age = Some(before);
+        assert_eq!(
+            decide(local(900), &peers, "k", PERIOD, &Budget::default()),
+            forward("b")
+        );
+        peers[2].accepted_age = Some(PERIOD * 3);
+        assert_eq!(
+            decide(local(900), &peers, "k", PERIOD, &Budget::default()),
+            forward("c")
+        );
+        assert_eq!(
+            receive(load(0, 100), 500, true, Some(before), PERIOD),
+            Arrival::NoReturn
+        );
+        assert_eq!(
+            receive(load(0, 100), 500, true, Some(PERIOD * 3), PERIOD),
+            Arrival::Accept
+        );
+    }
+
     #[test]
     fn empty_self_and_disabled() {
         assert_eq!(run(900, &[]), Decision::Keep(Reason::NoCandidate));
@@ -369,7 +475,7 @@ mod tests {
         assert_eq!(budget.sent("b", "h1"), 0);
     }
     #[test]
-    fn estimated_fill_includes_credit_and_budget_has_minimum_one() {
+    fn estimated_fill_includes_credit_and_zero_share_keeps() {
         let mut budget = Budget::default();
         let peers = [peer("a", 399)];
         budget.charge("a", "h1");
@@ -383,7 +489,7 @@ mod tests {
         }];
         assert_eq!(
             decide(local(200), &tiny, "k", PERIOD, &Budget::default()),
-            forward("a")
+            Decision::Keep(Reason::Budget)
         );
     }
     #[test]

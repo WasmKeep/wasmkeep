@@ -1,7 +1,7 @@
 //! ADR 0041 P3: real pure policy, modelled admission/hops/heartbeats, real
 //! node-lease acquisition. No production routing is wired by these tests.
 //! The eight numbered oracles below retain the ADR's exact bounds. Directed
-//! counterexamples are expected failures of those *claims*, not relaxed bounds.
+//! mutations are expected failures of the revised properties, not relaxed bounds.
 //! RUSTFLAGS='--cfg madsim' cargo test -j 4 -p wasmkeep-sim
 //!   --test madsim_placement --target-dir target/madsim
 #![cfg(madsim)]
@@ -20,7 +20,7 @@ use wasmkeep_cluster::{
     lease::{Bucket, BucketError, Clock, LeaseConfig, Version},
     membership::{DrainState, Load},
     node_lease::{NodeLease, Owners, operator_fence},
-    placement::{Budget, Decision, Local, Peer, RoomLoad, decide},
+    placement::{Arrival, Budget, Decision, Local, Peer, RoomLoad, decide, receive},
 };
 use wasmkeep_sim::{check::double_ownership, driver::Claim, rng::Rng};
 
@@ -62,6 +62,7 @@ fn peer<'a>(node: &'a str, l: RoomLoad, heartbeat: &'a str, age: Duration) -> Pe
         heartbeat,
         age,
         backoff_remaining: Duration::ZERO,
+        accepted_age: None,
     }
 }
 fn local(node: &str, l: RoomLoad) -> Local<'_> {
@@ -115,9 +116,6 @@ impl Event {
 
 #[derive(Clone, Debug)]
 struct Sent {
-    from: usize,
-    to: usize,
-    at: u64,
     sender_fill: u64,
     seen_fill: u64,
     age_ms: u64,
@@ -126,8 +124,7 @@ struct Sent {
 struct Evidence {
     violations: Vec<(u8, String)>,
     sent: Vec<Sent>,
-    fullest: [u64; 4],
-    direct: [u64; 4],
+
     claims: BTreeMap<usize, Vec<Claim>>,
     resident_nodes: BTreeMap<usize, usize>,
     woke: u64,
@@ -172,44 +169,33 @@ impl Evidence {
         );
         // Freshness is additionally checked, not silently substituted for P4.
         assert!(s.age_ms < HORIZON_MS, "a stale peer was selected: {s:?}");
-        self.fullest[s.to] = self.fullest[s.to].max(s.sender_fill);
-        // 6. No opposite placements within three periods, including repeats
-        // across distinct heartbeat identities.
-        let reversed = self
-            .sent
-            .iter()
-            .any(|p| p.from == s.to && p.to == s.from && s.at - p.at < HORIZON_MS);
-        self.check(6, !reversed, || {
-            format!("opposite placements within 9s: {s:?}")
-        });
+
         self.sent.push(s);
     }
-    // 5. At arrival (after adding the new resident), exact integer count at
-    // 80% of the fullest sender, N-2, plus direct wakes. No extra rounding slack.
-    fn arrival(&mut self, node: usize, residents: u64, capacity: u64, n: u64) {
-        let bound = self.fullest[node] * 4 * capacity / 5000 + (n - 2) + self.direct[node];
+    // 5(a): the signed sending fill and live capacity, with no allowance.
+    fn arrival(&mut self, sender_fill: u64, residents: u64, capacity: u64) {
+        let bound = sender_fill * 4 * capacity / 5000;
         self.check(5, residents <= bound, || {
-            format!("receiver {node}: {residents} > {bound}")
+            format!("accepted {residents} > {bound}")
         });
     }
-    // 7a. The actual deadline, not eventual convergence.
-    fn filled(&mut self, joined_at: u64, now: u64, joining: u64, lightest: u64) {
-        self.check(
-            7,
-            now - joined_at <= 2 * IDLE_MS + 10 * 3000 && joining * 5 >= lightest * 4,
-            || {
-                format!(
-                    "join fill {joining}, lightest {lightest}, elapsed {}",
-                    now - joined_at
-                )
-            },
-        );
+    // 5(b): count attempts, including refusals, under the same heartbeat.
+    fn herd(&mut self, sent: u64, t_max: u64, actors: u64) {
+        self.check(5, sent <= t_max.saturating_sub(actors), || {
+            format!("sent {sent} > gap {}", t_max.saturating_sub(actors))
+        });
     }
-    // 7b. Once filled, every pair inside the band means no placements.
-    fn quiet(&mut self, fills: &[u64], placements: usize) {
+    // 6: independent local-clock gates on sending and accepting.
+    fn no_return(&mut self, age: Option<u64>, happened: bool) {
+        self.check(6, !happened || age.is_none_or(|a| a >= HORIZON_MS), || {
+            format!("return at {age:?} ms")
+        });
+    }
+    // 7(b): actual fills BEFORE admission, and accepted placements only.
+    fn quiet(&mut self, fills: &[u64], accepted: usize) {
         let in_band = fills.iter().max().unwrap() * 4 <= fills.iter().min().unwrap() * 5;
-        self.check(7, !in_band || placements == 0, || {
-            "placement inside the band".into()
+        self.check(7, !in_band || accepted == 0, || {
+            "accepted inside the band".into()
         });
     }
     // 8. Idle cluster silent, checked against actual local loads.
@@ -250,7 +236,9 @@ async fn filling(seed: u64) -> Evidence {
     });
     let mut deliveries = Vec::<(u64, usize, usize, RoomLoad, String)>::new();
     let start = Instant::now();
-    let mut reached = None;
+    let mut sent_at = [[None; 4]; 4];
+    let mut accepted_at = [[None; 4]; 4];
+    let mut backoff_until = [[0_u64; 4]; 4];
     for tick in 0..=600 {
         sleep(Duration::from_millis(100)).await;
         let now = u64::try_from(start.elapsed().as_millis()).unwrap();
@@ -291,12 +279,17 @@ async fn filling(seed: u64) -> Evidence {
             let source = actor % 3;
             let peers: Vec<_> = (0..4)
                 .map(|p| {
-                    peer(
+                    let mut pview = peer(
                         NAMES[p],
                         seen[source][p].load,
                         &seen[source][p].heartbeat,
                         Duration::from_millis(now - seen[source][p].first_seen),
-                    )
+                    );
+                    pview.accepted_age =
+                        accepted_at[source][p].map(|at| Duration::from_millis(now - at));
+                    pview.backoff_remaining =
+                        Duration::from_millis(backoff_until[source][p].saturating_sub(now));
+                    pview
                 })
                 .collect();
             out.stale += peers.iter().filter(|p| p.age >= PERIOD * 3).count() as u64;
@@ -309,14 +302,11 @@ async fn filling(seed: u64) -> Evidence {
                 &budgets[source],
             );
             let before = out.sent.len();
-            let fills_before: Vec<_> = counts.iter().map(|c| c * 10).collect();
+
             let destination = if let Some(node) = decision {
                 let dest = NAMES.iter().position(|n| *n == node).unwrap();
                 budgets[source].charge(node, &seen[source][dest].heartbeat);
                 out.direction(Sent {
-                    from: source,
-                    to: dest,
-                    at: now,
                     sender_fill: fill(me.load),
                     seen_fill: fill(seen[source][dest].load),
                     age_ms: now - seen[source][dest].first_seen,
@@ -333,12 +323,31 @@ async fn filling(seed: u64) -> Evidence {
                         .is_none()
                 );
                 event.check(&mut out);
-                counts[dest] += 1;
-                out.arrival(dest, counts[dest], 100, 4);
-                dest
+                out.no_return(accepted_at[source][dest].map(|at| now - at), true);
+                sent_at[source][dest] = Some(now);
+                let accepted = receive(
+                    load(counts[dest], 100),
+                    fill(me.load),
+                    true,
+                    sent_at[dest][source].map(|at| Duration::from_millis(now - at)),
+                    PERIOD,
+                ) == Arrival::Accept;
+                out.no_return(sent_at[dest][source].map(|at| now - at), accepted);
+                out.quiet(&[fill(me.load), counts[dest] * 10], usize::from(accepted));
+                if accepted {
+                    accepted_at[dest][source] = Some(now);
+                    counts[dest] += 1;
+                    out.arrival(fill(me.load), counts[dest], 100);
+                    dest
+                } else {
+                    backoff_until[source][dest] = now + 10_000;
+                    event.fallback();
+                    counts[source] += 1;
+                    source
+                }
             } else {
                 counts[source] += 1;
-                out.direct[source] += 1;
+
                 event.check(&mut out);
                 source
             };
@@ -347,17 +356,6 @@ async fn filling(seed: u64) -> Evidence {
             *state = (destination, now + IDLE_MS + rng.below(1000));
             let fills: Vec<_> = counts.iter().map(|c| c * 10).collect();
             out.idle(&fills, out.sent.len() - before);
-            if reached.is_some() {
-                out.quiet(&fills_before, out.sent.len() - before);
-            }
-        }
-        let lightest = *counts[..3].iter().min().unwrap() * 10;
-        if reached.is_none() && counts[3] * 10 * 5 >= lightest * 4 {
-            reached = Some((now, counts[3] * 10, lightest));
-        }
-        if tick == 419 {
-            let (at, joining, lightest) = reached.unwrap_or((now, counts[3] * 10, lightest));
-            out.filled(0, at, joining, lightest);
         }
     }
     assert!(out.woke > 1000 && out.slept > 1000 && out.delayed > 0 && out.stale > 0);
@@ -365,36 +363,17 @@ async fn filling(seed: u64) -> Evidence {
 }
 
 #[test]
-fn joining_node_fills_but_cached_loads_can_flap_and_delay_quiet() {
-    let mut counterexamples = [0; 8];
+fn joining_node_obeys_revised_properties() {
     for seed in 0..seeds() {
         Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
             let out = filling(seed).await;
-            // Convergence, direction and overshoot are checked without
-            // relaxation. As in the directed counterexamples, P6 and the
-            // quiet half of P7 can fail: actual loads are
-            // in-band while the latest heartbeat still advertises an empty
-            // joiner. Retain this exact P7 failure, rather than checking only
-            // published fills (which would weaken the ADR).
             assert!(
-                out.violations
-                    .iter()
-                    .all(|(p, why)| *p == 6 || (*p == 7 && why == "placement inside the band")),
+                out.violations.is_empty(),
                 "seed {seed}: {:?}",
                 out.violations
             );
-            assert!(!out.sent.is_empty(), "joining node must receive placements");
-            for (property, _) in &out.violations {
-                counterexamples[usize::from(*property - 1)] += 1;
-            }
+            assert!(!out.sent.is_empty());
         });
-    }
-    eprintln!(
-        "ADR counterexamples by property over {} seeds: {counterexamples:?}",
-        seeds()
-    );
-    if seeds() >= 200 {
-        assert!(counterexamples[5] > 0 && counterexamples[6] > 0);
     }
 }
 
@@ -432,18 +411,18 @@ fn herd(no_budget: bool) -> Evidence {
             ) {
                 budgets[source].charge(node, "h1");
                 out.direction(Sent {
-                    from: source,
-                    to: 3,
-                    at: round,
                     sender_fill: 600,
                     seen_fill: 0,
                     age_ms: 0,
                 });
-                residents += 1;
-                out.arrival(3, residents, 100, 4);
+                if receive(load(residents, 100), 600, true, None, PERIOD) == Arrival::Accept {
+                    residents += 1;
+                    out.arrival(600, residents, 100);
+                }
             }
         }
     }
+    out.herd(out.sent.len() as u64, 48, 0);
     out
 }
 #[test]
@@ -453,7 +432,9 @@ fn removing_budget_is_caught_by_property_five() {
             let correct = herd(false);
             assert_eq!(correct.sent.len(), 48);
             assert!(correct.violations.is_empty());
-            assert!(herd(true).violations.iter().any(|(p, _)| *p == 5));
+            let mutated = herd(true);
+            assert_eq!(mutated.sent.len(), 180);
+            assert!(mutated.violations.iter().any(|(p, _)| *p == 5));
         });
     }
 }
@@ -731,92 +712,6 @@ fn idle_cluster_is_silent() {
     }
 }
 
-#[test]
-fn adr_minimum_one_budget_counterexample_to_five_and_six() {
-    for seed in 0..seeds() {
-        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
-            let mut out = Evidence::default();
-            let p = [peer("b", load(0, 1), "h", Duration::ZERO)];
-            let d = decide(
-                local("a", load(1, 5)),
-                &p,
-                "tiny",
-                PERIOD,
-                &Budget::default(),
-            );
-            assert!(matches!(d, Decision::Forward { .. }));
-            out.direction(Sent {
-                from: 0,
-                to: 1,
-                at: 0,
-                sender_fill: 200,
-                seen_fill: 0,
-                age_ms: 0,
-            });
-            out.arrival(1, 1, 1, 2); // floor(.8*.2*1) + (2-2) = 0
-            sleep(Duration::from_millis(1)).await;
-            // Steady arrivals, no departure required: b is now 1000 permille
-            // and its next cold wake places back to a, still at 200 permille.
-            let back = [peer("a", load(1, 5), "h", Duration::from_millis(1))];
-            assert!(matches!(
-                decide(
-                    local("b", load(1, 1)),
-                    &back,
-                    "next",
-                    PERIOD,
-                    &Budget::default()
-                ),
-                Decision::Forward { .. }
-            ));
-            out.direction(Sent {
-                from: 1,
-                to: 0,
-                at: 1,
-                sender_fill: 1000,
-                seen_fill: 200,
-                age_ms: 1,
-            });
-            assert_eq!(
-                out.violations.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
-                [5, 6]
-            );
-        });
-    }
-}
-
-#[test]
-fn adr_seven_needs_an_arrival_rate_assumption() {
-    for seed in 0..seeds() {
-        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
-            // Three nodes with 600 active actors of capacity 1000. A steady
-            // one cold arrival/sec can provide only 42 actors by the deadline,
-            // even granting the joiner EVERY arrival. Hot actors do not idle.
-            let mut out = Evidence::default();
-            let mut joined = 0;
-            let mut budgets: [Budget; 3] = std::array::from_fn(|_| Budget::default());
-            for second in 0..42 {
-                sleep(Duration::from_secs(1)).await;
-                let h = format!("h{}", second / 3);
-                let p = [peer("joining", load(joined, 1000), &h, Duration::ZERO)];
-                let s = second as usize % 3;
-                if let Decision::Forward { node, .. } = decide(
-                    local(NAMES[s], load(600, 1000)),
-                    &p,
-                    &format!("slow/{second}"),
-                    PERIOD,
-                    &budgets[s],
-                ) {
-                    budgets[s].charge(node, &h);
-                    joined += 1;
-                }
-            }
-            out.filled(0, 42_000, joined, 600);
-            assert_eq!(joined, 42);
-            assert_eq!(out.violations[0].0, 7); // requires at least 480
-        });
-    }
-}
-
 async fn join<A: std::future::Future, B: std::future::Future>(
     a: A,
     b: B,
@@ -849,68 +744,348 @@ async fn join<A: std::future::Future, B: std::future::Future>(
 }
 
 #[test]
-fn filled_cluster_with_current_in_band_loads_stays_quiet() {
+fn minimum_one_mutation_fails_five_b() {
     for seed in 0..seeds() {
         Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
-            let mut evidence = Evidence::default();
-            // Once the joiner reaches 80%, a steady wake/hibernate stream
-            // leaves all pairs in-band. No decision may forward.
-            let counts = [50, 50, 50, 40];
-            evidence.filled(0, 6000, 400, 500);
-            for wake in 0..120 {
-                sleep(Duration::from_millis(100)).await;
-                let heartbeat = format!("h{}", wake / 30);
-                let peers: Vec<_> = (0..4)
-                    .map(|p| {
-                        peer(
-                            NAMES[p],
-                            load(counts[p], 100),
-                            &heartbeat,
-                            Duration::from_millis(wake % 30 * 100),
-                        )
-                    })
-                    .collect();
-                let sender = wake as usize % 4;
-                let mut event = Event::default();
-                // A resident hibernates immediately before its next wake.
-                let placed = event
-                    .choose(
-                        local(NAMES[sender], load(counts[sender] - 1, 100)),
-                        &peers,
-                        &format!("steady/{wake}"),
-                        &Budget::default(),
-                    )
-                    .is_some();
-                evidence.quiet(&[500, 500, 500, 400], usize::from(placed));
-                event.check(&mut evidence);
+            let peers = [peer("b", load(0, 1), "h", Duration::ZERO)];
+            let decision = decide(
+                local("a", load(1, 5)),
+                &peers,
+                "tiny",
+                PERIOD,
+                &Budget::default(),
+            );
+            assert_eq!(
+                decision,
+                Decision::Keep(wasmkeep_cluster::placement::Reason::Budget)
+            );
+            let mut correct = Evidence::default();
+            correct.herd(
+                u64::from(matches!(decision, Decision::Forward { .. })),
+                0,
+                0,
+            );
+            assert!(correct.violations.is_empty());
+            // Restore max(1) for this zero-share schedule: the first hop passes.
+            let mutated = if decision == Decision::Keep(wasmkeep_cluster::placement::Reason::Budget)
+            {
+                Decision::Forward {
+                    node: "b",
+                    reason: wasmkeep_cluster::placement::Reason::Lighter,
+                }
+            } else {
+                decision
+            };
+            let mut out = Evidence::default();
+            out.herd(u64::from(matches!(mutated, Decision::Forward { .. })), 0, 0);
+            assert_eq!(out.violations[0].0, 5);
+        });
+    }
+}
+
+fn mixed_heartbeats(remove_arrival: bool) -> (Evidence, u64, u64) {
+    let mut out = Evidence::default();
+    let mut residents = 0;
+    let mut refused = 0;
+    let mut budgets = [Budget::default(), Budget::default()];
+    // ADR 5(a): sender 1 sees h2 after its 24; sender 2 still sees h1.
+    for (source, published, heartbeat, attempts) in
+        [(0, 0, "h1", 24), (0, 24, "h2", 12), (1, 0, "h1", 24)]
+    {
+        let peers = [
+            peer(
+                "joining",
+                load(published, 100),
+                heartbeat,
+                Duration::from_millis(1),
+            ),
+            Peer {
+                reachable: false,
+                ..peer(NAMES[1 - source], load(60, 100), "other", Duration::ZERO)
+            },
+        ];
+        for _ in 0..attempts {
+            let d = decide(
+                local(NAMES[source], load(60, 100)),
+                &peers,
+                "mixed",
+                PERIOD,
+                &budgets[source],
+            );
+            assert!(matches!(
+                d,
+                Decision::Forward {
+                    node: "joining",
+                    ..
+                }
+            ));
+            budgets[source].charge("joining", heartbeat);
+            if remove_arrival
+                || receive(load(residents, 100), 600, true, None, PERIOD) == Arrival::Accept
+            {
+                residents += 1;
+                out.arrival(600, residents, 100);
+            } else {
+                refused += 1;
             }
-            assert!(evidence.violations.is_empty());
+        }
+    }
+    (out, residents, refused)
+}
+
+#[test]
+fn arrival_mutation_fails_five_a() {
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            // Attempts already in flight: refusal backoff cannot retract them.
+            let (correct, count, refused) = mixed_heartbeats(false);
+            assert_eq!((count, refused), (48, 12));
+            assert!(correct.violations.is_empty());
+            let (mutated, count, _) = mixed_heartbeats(true);
+            assert_eq!(count, 60);
+            assert!(mutated.violations.iter().all(|(p, _)| *p == 5));
+            assert_eq!(mutated.violations.len(), 12);
         });
     }
 }
 
 #[test]
-fn fresh_but_delayed_load_disproves_property_sevens_quiet_clause() {
+fn quiet_uses_live_count_and_refusal_backs_off_for_ten_seconds() {
     for seed in 0..seeds() {
         Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
-            let mut evidence = Evidence::default();
-            // Since its empty heartbeat, b has received 40 direct wakes.
-            // Now a=50/100 and b=40/100: filled and exactly in-band.
-            evidence.filled(0, 1, 400, 500);
-            let peers = [peer("b", load(0, 100), "empty", Duration::from_millis(1))];
+            let mut out = Evidence::default();
+            let mut budget = Budget::default();
+            let mut until: u64 = 0;
+            let mut attempts = 0;
+            // Fresh empty observations do not override placement backoff.
+            for now in [0_u64, 1, 8999, 9999, 10_000] {
+                let heartbeat = format!("h{now}");
+                let mut p = peer("b", load(0, 100), &heartbeat, Duration::ZERO);
+                p.backoff_remaining = Duration::from_millis(until.saturating_sub(now));
+                let d = decide(local("a", load(50, 100)), &[p], "quiet", PERIOD, &budget);
+                if let Decision::Forward { node, .. } = d {
+                    attempts += 1;
+                    budget.charge(node, &heartbeat);
+                    let accepted =
+                        receive(load(40, 100), 500, true, None, PERIOD) == Arrival::Accept;
+                    assert!(!accepted); // 41 > 40
+                    out.quiet(&[500, 400], usize::from(accepted));
+                    until = now + 10_000;
+                }
+                assert_eq!(attempts, if now < 10_000 { 1 } else { 2 });
+            }
+            assert!(out.violations.is_empty());
+            // Removing arrival admission makes the very same hop accepted.
+            out.quiet(&[500, 400], 1);
+            assert_eq!(out.violations[0].0, 7);
+        });
+    }
+}
+
+#[test]
+fn no_return_mutation_fails_six_and_both_gates_expire_exactly() {
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            let mut budget = Budget::default();
+            let peers = [peer("b", load(0, 100), "h1", Duration::ZERO)];
+            let mut b = 0;
+            for _ in 0..48 {
+                assert!(matches!(
+                    decide(
+                        local("a", load(60, 100)),
+                        &peers,
+                        "forward",
+                        PERIOD,
+                        &budget
+                    ),
+                    Decision::Forward { .. }
+                ));
+                budget.charge("b", "h1");
+                assert_eq!(
+                    receive(load(b, 100), 600, true, None, PERIOD),
+                    Arrival::Accept
+                );
+                b += 1;
+            }
+            // A hibernates 40 residents; B now wants to send back to A=20.
+            for age in [0, 1, 8999, 9000] {
+                let mut p = peer("a", load(20, 100), "h2", Duration::ZERO);
+                p.accepted_age = Some(Duration::from_millis(age));
+                let sent = matches!(
+                    decide(
+                        local("b", load(b, 100)),
+                        &[p],
+                        "back",
+                        PERIOD,
+                        &Budget::default()
+                    ),
+                    Decision::Forward { .. }
+                );
+                let accepted = receive(
+                    load(20, 100),
+                    480,
+                    true,
+                    Some(Duration::from_millis(age)),
+                    PERIOD,
+                ) == Arrival::Accept;
+                assert_eq!((sent, accepted), (age == 9000, age == 9000));
+                let mut correct = Evidence::default();
+                correct.no_return(Some(age), sent);
+                correct.no_return(Some(age), accepted);
+                assert!(correct.violations.is_empty());
+                if age < 9000 {
+                    // Remove both gates. The reverse hop is sent and accepted.
+                    p.accepted_age = None;
+                    let sent = matches!(
+                        decide(
+                            local("b", load(b, 100)),
+                            &[p],
+                            "back",
+                            PERIOD,
+                            &Budget::default()
+                        ),
+                        Decision::Forward { .. }
+                    );
+                    let accepted =
+                        receive(load(20, 100), 480, true, None, PERIOD) == Arrival::Accept;
+                    assert!(sent && accepted);
+                    correct.no_return(Some(age), sent);
+                    correct.no_return(Some(age), accepted);
+                    assert_eq!(correct.violations.len(), 2);
+                }
+            }
+            // Two hops cross: neither receiver has accepted yet. Sending
+            // alone is sufficient to refuse the opposite in-flight hop.
+            assert_eq!(
+                receive(load(20, 100), 600, true, Some(Duration::ZERO), PERIOD),
+                Arrival::NoReturn
+            );
+        });
+    }
+}
+
+#[test]
+fn directed_join_fills_at_the_offered_rate() {
+    use wasmkeep_cluster::placement::Reason;
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            for w in [1_u64, 3, 160, 200] {
+                let mut residents = 0;
+                let mut budgets: [Budget; 3] = std::array::from_fn(|_| Budget::default());
+                let deadline = 480_u64.div_ceil(3 * w) + 2;
+                let mut reached = None;
+                for period in 0..deadline {
+                    // All three see this heartbeat within one period; no
+                    // joiner hibernation, all senders stay at fill 600.
+                    let published = residents;
+                    let h = format!("h{period}");
+                    for _ in 0..w {
+                        for source in 0..3 {
+                            if residents >= 478 {
+                                break;
+                            }
+                            let peers: Vec<_> = (0..4)
+                                .map(|p| {
+                                    let mut view = peer(
+                                        NAMES[p],
+                                        load(
+                                            if p == 3 { published } else { 60 },
+                                            if p == 3 { 1000 } else { 100 },
+                                        ),
+                                        &h,
+                                        Duration::ZERO,
+                                    );
+                                    view.reachable = p == 3;
+                                    view
+                                })
+                                .collect();
+                            match decide(
+                                local(NAMES[source], load(60, 100)),
+                                &peers,
+                                "rate",
+                                PERIOD,
+                                &budgets[source],
+                            ) {
+                                Decision::Forward { node, .. } => {
+                                    budgets[source].charge(node, &h);
+                                    assert_eq!(
+                                        receive(load(residents, 1000), 600, true, None, PERIOD),
+                                        Arrival::Accept
+                                    );
+                                    residents += 1;
+                                }
+                                Decision::Keep(reason) => assert_eq!(reason, Reason::Budget),
+                            }
+                        }
+                    }
+                    if w == 1 && period == 13 {
+                        assert_eq!(residents, 42);
+                    }
+                    if residents >= 478 {
+                        reached = Some(period + 1);
+                        break;
+                    }
+                    sleep(PERIOD).await;
+                }
+                assert!(
+                    reached.is_some_and(|p| p <= deadline),
+                    "seed {seed}, w={w}, residents={residents}, deadline={deadline}"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn floor_and_skew_mutations_are_detected() {
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            let peers = [peer("b", load(0, 1000), "h", Duration::ZERO)];
+            assert_eq!(
+                decide(
+                    local("a", load(199, 1000)),
+                    &peers,
+                    "idle",
+                    PERIOD,
+                    &Budget::default()
+                ),
+                Decision::Keep(wasmkeep_cluster::placement::Reason::Floor)
+            );
+            // Without the floor, band and budget allow this first attempt:
+            // 199*4 > 0*5; floor(199*4*1000/5000) = 159 > 0.
+            let mut out = Evidence::default();
+            out.idle(&[199, 0], 1);
+            assert_eq!(out.violations[0].0, 8);
+
+            let mut stale = peers[0];
+            stale.age = Duration::from_millis(9000);
+            assert_eq!(
+                decide(
+                    local("a", load(600, 1000)),
+                    &[stale],
+                    "skew",
+                    PERIOD,
+                    &Budget::default()
+                ),
+                Decision::Keep(wasmkeep_cluster::placement::Reason::NoCandidate)
+            );
+            // Mutant trusts the peer's fast wall clock and thinks age is 0.
+            stale.age = Duration::ZERO;
             let sent = matches!(
                 decide(
-                    local("a", load(50, 100)),
-                    &peers,
-                    "one-more",
+                    local("a", load(600, 1000)),
+                    &[stale],
+                    "skew",
                     PERIOD,
                     &Budget::default()
                 ),
                 Decision::Forward { .. }
             );
-            evidence.quiet(&[500, 400], usize::from(sent));
-            assert_eq!(evidence.violations.len(), 1);
-            assert_eq!(evidence.violations[0].0, 7);
+            assert!(sent);
+            out.check(4, !sent, || {
+                "skew selected a locally stale heartbeat".into()
+            });
+            assert_eq!(out.violations[1].0, 4);
         });
     }
 }
