@@ -190,6 +190,7 @@ async fn poll_inner(
     }
     if let Some((_, _, committed, _)) = &recorded {
         recover(&out, *committed)?;
+        recover_visible(&mut db, &out, *committed)?;
     }
     let scratch = state.join("scratch");
     if scratch.exists() {
@@ -252,7 +253,7 @@ async fn poll_inner(
         let mut statement = scan.prepare("SELECT class || '/' || name || '/', class, generation, txid, identity, label, kind, incarnation FROM heads ORDER BY class || '/' || name || '/'")?;
         let mut rows = statement.query([])?;
         let saved = next_saved(&mut rows)?;
-        let groups = crate::actor_groups::actor_groups(store, &history_prefix);
+        let groups = crate::actor_groups::actor_groups_with_errors(store, &history_prefix);
         futures_util::pin_mut!(groups);
         {
             let history_prefix = history_prefix.as_str();
@@ -273,7 +274,7 @@ async fn poll_inner(
                         let old = saved.take().context("saved head missing")?;
                         let prefix = format!("{history_prefix}{}", old.key);
                         saved = next_saved(&mut rows)?;
-                        (prefix, BTreeMap::new(), Some(old), true)
+                        (prefix, Ok(BTreeMap::new()), Some(old), true)
                     } else if let Some((prefix, objects)) = group.take() {
                         let old = if saved
                             .as_ref()
@@ -532,6 +533,90 @@ fn recover(out: &std::path::Path, committed: u64) -> anyhow::Result<()> {
     sweep(&out.join("_wk_states"), out, committed)
 }
 
+/// Restore bookkeeping from reader-visible batches whose progress transaction
+/// rolled back. Empty identities force verification against the current bucket.
+fn recover_visible(
+    db: &mut Connection,
+    out: &std::path::Path,
+    committed: u64,
+) -> anyhow::Result<()> {
+    use parquet::{
+        basic::Type as PhysicalType,
+        file::reader::{FileReader, SerializedFileReader},
+        record::RowAccessor,
+    };
+    let dir = out.join("_wk_states");
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut batches = std::fs::read_dir(dir)?
+        .map(|entry| Ok(entry?.path()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    batches.sort();
+    for path in batches {
+        let seq: u64 = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .context("invalid state filename")?
+            .parse()?;
+        if seq <= committed {
+            continue;
+        }
+        let tx = db.transaction()?;
+        let reader = SerializedFileReader::new(std::fs::File::open(&path)?)?;
+        // Process one state row and one table schema at a time, not all data rows.
+        let mut tables = std::collections::BTreeSet::new();
+        // Existing heads already guarantee rediscovery; retain their precise
+        // labels/identities so retry classification uses the pre-crash position.
+        // A visible resurrection must clear an old deletion to allow absence
+        // detection if the actor disappears again before recovery.
+        for row in reader.get_row_iter(None)? {
+            let row = row?;
+            let class = row.get_string(2)?;
+            let name = encode_segment(row.get_string(3)?);
+            tx.execute(
+                "INSERT INTO heads (class,name,generation,txid,identity,seq,label,kind,incarnation) VALUES(?1,?2,?3,?4,'',?5,NULL,?6,(SELECT incarnation FROM feed WHERE id=1)) ON CONFLICT(class,name) DO UPDATE SET kind=excluded.kind WHERE heads.kind='deleted' AND excluded.kind!='deleted'",
+                params![class, name, row.get_ulong(7)? as i64, row.get_ulong(8)? as i64, seq as i64, row.get_string(5)?],
+            )?;
+            for table in serde_json::from_str::<Vec<String>>(row.get_string(10)?)? {
+                tables.insert((class.clone(), table));
+            }
+        }
+        for (class, table) in tables {
+            let file = out
+                .join("tables")
+                .join(encode_segment(&class))
+                .join(encode_segment(&table))
+                .join(format!("{seq:020}.parquet"));
+            let reader = SerializedFileReader::new(std::fs::File::open(file)?)?;
+            for column in reader.metadata().file_metadata().schema_descr().columns() {
+                let output = column.name();
+                let lower = output.to_ascii_lowercase();
+                if lower.starts_with("_wk_") {
+                    continue;
+                }
+                let name = if lower.starts_with("_app_wk_") {
+                    &output[4..]
+                } else {
+                    output
+                };
+                let kind = match column.physical_type() {
+                    PhysicalType::INT64 => writer::ColumnType::Integer,
+                    PhysicalType::DOUBLE => writer::ColumnType::Real,
+                    PhysicalType::BYTE_ARRAY if column.logical_type_ref().is_some() => {
+                        writer::ColumnType::Text
+                    }
+                    PhysicalType::BYTE_ARRAY => writer::ColumnType::Blob,
+                    other => anyhow::bail!("unsupported recovered feed type: {other:?}"),
+                };
+                tx.execute("INSERT INTO columns VALUES(?1,?2,?3,?4) ON CONFLICT(class,table_name,name) DO UPDATE SET kind=CASE WHEN columns.kind=2 THEN 2 WHEN columns.kind=1 AND excluded.kind=0 THEN 1 ELSE excluded.kind END", params![class,table,name,kind as u8])?;
+            }
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 struct Saved {
     key: String,
     position: SegmentId,
@@ -564,12 +649,13 @@ async fn read_changed(
     scratch: &std::path::Path,
     history_prefix: &str,
     actor_prefix: String,
-    mut objects: BTreeMap<String, ObjectMeta>,
+    objects: anyhow::Result<BTreeMap<String, ObjectMeta>>,
     old: Option<Saved>,
     incarnation: &str,
     app_changed: bool,
     missing: bool,
 ) -> anyhow::Result<Option<Changed>> {
+    let mut objects = objects?;
     let (tenant, app) = &args.app;
     let relative = actor_prefix
         .strip_prefix(history_prefix)
@@ -652,12 +738,20 @@ async fn read_changed(
     let connection =
         Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.pragma_update(None, "trusted_schema", false)?;
-    let tables = connection.prepare("SELECT name FROM pragma_table_list WHERE schema='main' AND type='table' AND name NOT LIKE 'sqlite_%' AND lower(substr(name,1,10)) != '_wasmkeep_' ORDER BY name")?.query_map([], |r| r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
+    let tables = connection.prepare("SELECT name FROM pragma_table_list WHERE schema='main' AND type='table' AND lower(substr(name,1,7)) != 'sqlite_' AND lower(substr(name,1,10)) != '_wasmkeep_' ORDER BY name")?.query_map([], |r| r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
     let mut data = Vec::new();
     for table in &tables {
         let mut stmt =
             connection.prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))?;
         let columns = stmt.column_names().map(str::to_owned).collect::<Vec<_>>();
+        // Reserve escaped metadata names for the escaping rule, even across
+        // actors in the same table batch, so publication cannot fail later.
+        ensure!(
+            !columns
+                .iter()
+                .any(|name| name.to_ascii_lowercase().starts_with("_app_wk_")),
+            "{relative}: table {table} has reserved escaped column prefix _app_wk_"
+        );
         let count = columns.len();
         let values = stmt
             .query_map([], |row| {

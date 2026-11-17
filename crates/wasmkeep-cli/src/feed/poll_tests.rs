@@ -434,3 +434,267 @@ async fn recorded_types_advance_with_heads() {
         assert_eq!(rows(&path)[0]["value"], expected);
     }
 }
+
+async fn replace_fixture_actor(store: &Arc<dyn ObjectStore>, sql: &str, txid: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = wasmkeep_storage::Storage::new(
+        wasmkeep_storage::StorageConfig::new(dir.path()),
+        wasmkeep_storage::StateDir {
+            dir: "actors".into(),
+            scratch: "scratch".into(),
+            tenant: "t".into(),
+        },
+    );
+    let mut actor = storage.open("c", "a").unwrap();
+    for statement in sql.split(';').filter(|s| !s.trim().is_empty()) {
+        actor.exec(statement, &[]).unwrap();
+    }
+    actor.start_capture().unwrap();
+    store
+        .put(
+            &Key::from(format!(
+                "state/t/a/actors/c/a/{}",
+                snapshot_key(SegmentId {
+                    generation: 1,
+                    txid
+                })
+            )),
+            actor
+                .snapshot()
+                .unwrap()
+                .to_ltx(1, txid, 100)
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn review_visible_actor_removed_before_recovery() {
+    visible_actor_removed_before_recovery(false).await;
+}
+
+#[tokio::test]
+async fn review_resurrected_actor_removed_before_recovery() {
+    visible_actor_removed_before_recovery(true).await;
+}
+
+async fn visible_actor_removed_before_recovery(previously_deleted: bool) {
+    let store = fixture().await;
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let args = args(out.path(), state.path());
+    if previously_deleted {
+        assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+        let empty: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        assert_eq!(poll(&args, &empty, "").await.unwrap(), 0);
+    }
+    assert!(
+        poll_with_checkpoint(&args, &store, "", &mut |step| {
+            anyhow::ensure!(step != "before_state", "injected crash");
+            Ok(())
+        })
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("injected crash")
+    );
+    let visible = files(&out.path().join("_wk_states"));
+    let row = rows(visible.keys().next_back().unwrap()).remove(0);
+    let (Field::Str(class), Field::Str(name)) = (&row["_wk_class"], &row["_wk_name"]) else {
+        panic!()
+    };
+    let keys: Vec<_> = store
+        .list(Some(&Key::from(format!(
+            "state/t/a/actors/{class}/{name}/"
+        ))))
+        .try_collect()
+        .await
+        .unwrap();
+    for key in keys {
+        store.delete(&key.location).await.unwrap();
+    }
+    store
+        .put(
+            &Key::from("apps/t/a/restored"),
+            b"new incarnation".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+    let all: Vec<_> = files(&out.path().join("_wk_states"))
+        .keys()
+        .flat_map(|p| rows(p))
+        .filter(|r| {
+            r["_wk_class"] == Field::Str(class.clone()) && r["_wk_name"] == Field::Str(name.clone())
+        })
+        .collect();
+    assert_eq!(
+        all.last().unwrap()["_wk_kind"],
+        Field::Str("deleted".into())
+    );
+    assert_eq!(
+        all.last().unwrap()["_wk_reason"],
+        Field::Str("absent".into())
+    );
+    for (path, bytes) in visible {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
+async fn review_literal_sqlite_prefix() {
+    let store = fixture().await;
+    replace_fixture_actor(
+        &store,
+        "CREATE TABLE sqliteXorders(value); INSERT INTO sqliteXorders VALUES(7)",
+        1,
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(
+        poll(&args(out.path(), state.path()), &store, "")
+            .await
+            .unwrap(),
+        0
+    );
+    let data = files(
+        &out.path()
+            .join("tables/c")
+            .join(encode_segment("sqliteXorders")),
+    );
+    assert_eq!(data.len(), 1);
+    assert_eq!(
+        rows(data.keys().next().unwrap())[0]["value"],
+        Field::Long(7)
+    );
+    let states: Vec<_> = files(&out.path().join("_wk_states"))
+        .keys()
+        .flat_map(|p| rows(p))
+        .collect();
+    assert!(
+        states
+            .iter()
+            .any(|r| r["_wk_tables"] == Field::Str("[\"sqliteXorders\"]".into()))
+    );
+}
+
+#[tokio::test]
+async fn review_large_actor_does_not_starve_later_actors() {
+    large_actor_does_not_starve(vec![]).await;
+}
+
+#[tokio::test]
+async fn review_excluded_large_actor_does_not_starve_later_actors() {
+    large_actor_does_not_starve(vec!["c".into(), "d".into()]).await;
+}
+
+async fn large_actor_does_not_starve(classes: Vec<String>) {
+    let store = fixture().await;
+    for i in 0..8000 {
+        store
+            .put(
+                &Key::from(format!("state/t/a/actors/b/large/history-{i:06}")),
+                Vec::new().into(),
+            )
+            .await
+            .unwrap();
+    }
+    {
+        let out = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut args = args(out.path(), state.path());
+        args.classes = classes;
+        assert_eq!(poll(&args, &store, "").await.unwrap(), 2);
+        let db = Connection::open(state.path().join("state.db")).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM heads", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM heads WHERE class='b'", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        projection(out.path());
+    }
+}
+
+#[tokio::test]
+async fn review_collision_does_not_poison_batch() {
+    let store = fixture().await;
+    replace_fixture_actor(
+        &store,
+        "CREATE TABLE items(_wk_name, _app_wk_name); INSERT INTO items VALUES('x','y')",
+        1,
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(
+        poll(&args(out.path(), state.path()), &store, "")
+            .await
+            .unwrap(),
+        2
+    );
+    let db = Connection::open(state.path().join("state.db")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM heads", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM heads WHERE class='c' AND name='a'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn review_visible_types_survive_bucket_change() {
+    let store = fixture().await;
+    replace_fixture_actor(
+        &store,
+        "CREATE TABLE amounts(value); INSERT INTO amounts VALUES(2.5)",
+        1,
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let args = args(out.path(), state.path());
+    assert!(
+        poll_inner(
+            &args,
+            &store,
+            "",
+            &mut |step| {
+                anyhow::ensure!(step != "before_state", "injected crash");
+                Ok(())
+            },
+            10_000,
+            1 << 30
+        )
+        .await
+        .is_err()
+    );
+    replace_fixture_actor(
+        &store,
+        "CREATE TABLE amounts(value); INSERT INTO amounts VALUES(2)",
+        1,
+    )
+    .await;
+    assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+    let data = files(&out.path().join("tables/c/amounts"));
+    assert_eq!(
+        rows(data.last_key_value().unwrap().0)[0]["value"],
+        Field::Double(2.0)
+    );
+}

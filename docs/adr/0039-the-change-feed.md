@@ -272,7 +272,7 @@ Each data file holds the table's own columns and, beside them,
 `_wk_tenant`, `_wk_app`, `_wk_name`, `_wk_seq`, `_wk_generation`,
 `_wk_txid` and `_wk_committed_at`: ADR 0033's columns plus `_wk_seq`.
 An app column whose name begins with `_wk_` is written as `_app` plus
-its name (`_app_wk_name`), with a warning.
+its name (`_app_wk_name`), with a warning; actors with app columns beginning with `_app_wk_` (case-insensitively) are refused before batching, reported on stderr with a non-zero poll exit, and left unadvanced while unrelated actors proceed.
 
 **Only ordinary app tables are written**: no host table, no view, no
 virtual table and no shadow table of a virtual table. The feed asks
@@ -339,6 +339,7 @@ the committed one:
   and any `.partial` file are removed;
 - a number with a `_wk_states` file was visible and is true (its data
   files were complete before it appeared). It is left exactly as it is.
+  Recovery restores its actor bookkeeping and widening types from the visible files with unknown identities forcing current-bucket verification, including an absent-state emission for actors removed before recovery.
   The state did not advance, so the same actors are found changed again
   and emitted under a new number. That is the "at least once" of
   ADR 0033: a state can appear twice, never half.
