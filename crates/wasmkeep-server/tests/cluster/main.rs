@@ -876,6 +876,8 @@ struct Flaky {
     /// none) for 800 ms; `lease_held` is set while it waits.
     hold_lease_get_at: Arc<std::sync::atomic::AtomicU32>,
     lease_held: Arc<AtomicBool>,
+    /// If set, the selected ownership read waits for this signal instead of 800 ms.
+    lease_get_release: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
     /// Listings of `control/` fail while set; everything else works.
     fail_control_list: Arc<AtomicBool>,
     /// Every read of a lease object waits this many ms first.
@@ -925,6 +927,7 @@ impl Flaky {
             lease_gets: Arc::default(),
             hold_lease_get_at: Arc::default(),
             lease_held: Arc::default(),
+            lease_get_release: std::sync::Mutex::default(),
             fail_control_list: Arc::default(),
             delay_lease_get_ms: Arc::default(),
             fail_owner_puts: Arc::default(),
@@ -1246,7 +1249,12 @@ impl ObjectStore for Flaky {
             let n = self.lease_gets.fetch_add(1, Ordering::SeqCst) + 1;
             if n == self.hold_lease_get_at.load(Ordering::SeqCst) {
                 self.lease_held.store(true, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(800)).await;
+                let release = self.lease_get_release.lock().unwrap().take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                }
                 self.lease_held.store(false, Ordering::SeqCst);
             }
         }
