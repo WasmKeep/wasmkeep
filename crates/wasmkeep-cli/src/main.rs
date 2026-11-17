@@ -44,6 +44,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Collect unused static assets and expired versions from an app's bucket.
+    #[command(subcommand)]
+    Assets(AssetsCommand),
     /// Export changed states to local Parquet files in one read-only poll.
     Feed(wasmkeep_cli::feed::CommandArgs),
     /// Create and verify lease-free online archives.
@@ -78,6 +81,47 @@ enum Command {
     /// Act on a whole app, through its bucket.
     #[command(subcommand)]
     App(AppCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum AssetsCommand {
+    /// Collect old versions and unused contents and indexes (ADR 0030).
+    Collect(AssetsCollectArgs),
+}
+
+#[derive(Debug, Args)]
+struct AssetsCollectArgs {
+    /// The app, TENANT/APP.
+    #[arg(long, value_parser = parse_app)]
+    app: (String, String),
+    /// Bucket shared by the cluster: s3://BUCKET[/PREFIX].
+    #[arg(long)]
+    bucket: String,
+    /// Minimum retention for old versions and unused assets, in seconds.
+    #[arg(long, default_value_t = 3600, value_name = "SECS")]
+    version_retention_secs: u64,
+}
+
+fn assets_collect(args: AssetsCollectArgs) -> anyhow::Result<()> {
+    let (store, prefix) = open_bucket(&args.bucket)?;
+    assets_collect_in(args, store, &prefix)
+}
+
+fn assets_collect_in(
+    args: AssetsCollectArgs,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    let app = AppRef::new(store, prefix, &args.app.0, &args.app.1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (versions, assets) = rt.block_on(app.collect(
+        wasmkeep_server::apps::KEEP_PREVIOUS,
+        std::time::Duration::from_secs(args.version_retention_secs),
+    ))?;
+    println!("removed {versions} old version(s) and {assets} asset object(s) from the bucket");
+    Ok(())
 }
 
 #[derive(Debug, Subcommand)]
@@ -1287,6 +1331,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Assets(AssetsCommand::Collect(args)) => assets_collect(args),
         Command::Serve(args) => serve(*args),
         Command::Deploy(args) => deploy(args),
         Command::Cluster(ClusterCommand::Status(args)) => cluster_status(args),
@@ -2419,11 +2464,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     // Old versions beyond what rollbacks need (ADR 0012). The deploy is
     // done either way: a failure here only leaves them for next time.
     let retention = std::time::Duration::from_secs(args.version_retention_secs);
-    match rt.block_on(app_ref.collect_versions(wasmkeep_server::apps::KEEP_PREVIOUS, retention)) {
-        Ok(0) => {}
-        Ok(n) => println!("removed {n} old version(s) from the bucket"),
+    match rt.block_on(app_ref.collect(wasmkeep_server::apps::KEEP_PREVIOUS, retention)) {
+        Ok((0, 0)) => {}
+        Ok((versions, assets)) => println!(
+            "removed {versions} old version(s) and {assets} asset object(s) from the bucket"
+        ),
         Err(e) => {
-            eprintln!("warning: removing old versions failed (the next deploy tries again): {e}")
+            eprintln!("warning: collection failed (the next deploy tries again): {e}")
         }
     }
     Ok(())

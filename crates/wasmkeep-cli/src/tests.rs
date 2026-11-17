@@ -1524,3 +1524,33 @@ fn assets_unchanged_report_counts_the_index_as_a_repair() {
         "t/a: unchanged, 2 repaired"
     );
 }
+
+#[test]
+fn assets_collect_command() {
+    use clap::Parser;
+    use object_store::{ObjectStoreExt as _, memory::InMemory, path::Path};
+    let parsed = crate::Cli::try_parse_from([
+        "wasmkeep",
+        "assets",
+        "collect",
+        "--app",
+        "acme/shop",
+        "--bucket",
+        "s3://bucket",
+        "--version-retention-secs",
+        "0",
+    ])
+    .unwrap();
+    let crate::Command::Assets(crate::AssetsCommand::Collect(args)) = parsed.command else {
+        panic!("wrong command");
+    };
+    let store = std::sync::Arc::new(InMemory::new());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let key = Path::from(format!("apps/acme/shop/_assets/content/{}", "a".repeat(64)));
+    runtime.block_on(store.put(&key, vec![].into())).unwrap();
+    crate::assets_collect_in(args, store.clone(), "").unwrap();
+    assert!(runtime.block_on(store.head(&key)).is_err());
+}

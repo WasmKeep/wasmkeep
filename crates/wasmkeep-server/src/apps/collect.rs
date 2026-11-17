@@ -1,5 +1,9 @@
 //! Garbage collection of old deploy artifacts (ADR 0012; layout
-//! from ADR 0013).
+//! from ADR 0013), and marker-protected static assets (ADR 0030).
+//!
+//! Asset collection marks before listing deploys, uses bucket time for
+//! retention, and reads every remaining version's manifest and index before
+//! deleting an unused object. Unknown or unreadable references stop the pass.
 //!
 //! Only versions in the current version's lineage (its `previous` chain)
 //! are candidates, never a directory outside it: one a concurrent deploy
@@ -24,7 +28,8 @@ impl AppRef {
     /// Deletes the versions in the current version's lineage beyond the
     /// current one and the `keep_previous` before it, once each stopped
     /// being current more than `retention` ago (when the version after it
-    /// was written). Returns how many versions were deleted.
+    /// was written), then collects unused assets. Returns the version count;
+    /// [`Self::collect`] also returns the asset count.
     ///
     /// Run by `wasmkeep deploy` after every deploy and rollback, never by
     /// nodes. The walk follows `previous` while it names a plain version id
@@ -39,6 +44,16 @@ impl AppRef {
         &self,
         keep_previous: usize,
         retention: Duration,
+    ) -> Result<usize, DeployError> {
+        Ok(self.collect(keep_previous, retention).await?.0)
+    }
+
+    async fn collect_versions_at(
+        &self,
+        keep_previous: usize,
+        retention: Duration,
+        now_ms: i64,
+        start: Option<tokio::time::Instant>,
     ) -> Result<usize, DeployError> {
         let Some(current) = self.current().await? else {
             return Ok(0);
@@ -67,11 +82,14 @@ impl AppRef {
             };
             lineage.push(version);
         }
-        let cutoff = crate::alarm::now_ms_i64()
-            .saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX));
+        let cutoff =
+            now_ms.saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX));
         let mut deleted = 0;
         // Oldest first; each with the version after it (its successor).
-        for index in (1 + keep_previous..lineage.len()).rev() {
+        for index in (keep_previous.saturating_add(1)..lineage.len()).rev() {
+            if start.is_some_and(expired) {
+                break;
+            }
             let (version, successor) = (&lineage[index], &lineage[index - 1]);
             match self.current().await? {
                 Some(now) if now.version == current.version && now.seq == current.seq => {}
@@ -95,6 +113,9 @@ impl AppRef {
                 Err(e) => return Err(bucket(e)),
             };
             // The manifest first: from here on no node loads this version.
+            if start.is_some_and(expired) {
+                break;
+            }
             match self.store.delete(&manifest).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(bucket(e)),
@@ -109,6 +130,9 @@ impl AppRef {
                 continue; // already gone
             }
             for object in rest {
+                if start.is_some_and(expired) {
+                    return Ok(deleted);
+                }
                 match self.store.delete(&object.location).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => return Err(bucket(e)),
@@ -399,4 +423,267 @@ mod tests {
             assert!(!is_version_id(bad), "{bad:?}");
         }
     }
+}
+
+#[cfg(test)]
+#[path = "collect_assets_tests.rs"]
+mod asset_tests;
+
+impl AppRef {
+    /// Collect old versions, then assets, under one bucket-clock marker.
+    /// Returns (versions removed, asset objects removed).
+    pub async fn collect(
+        &self,
+        keep_previous: usize,
+        retention: Duration,
+    ) -> Result<(usize, usize), DeployError> {
+        self.collect_run(Some(keep_previous), retention).await
+    }
+
+    /// Collect unused asset objects without removing version manifests.
+    pub async fn collect_assets(&self, retention: Duration) -> Result<usize, DeployError> {
+        Ok(self.collect_run(None, retention).await?.1)
+    }
+
+    async fn collect_run(
+        &self,
+        keep: Option<usize>,
+        retention: Duration,
+    ) -> Result<(usize, usize), DeployError> {
+        let current = self.current().await?;
+        let has_assets = if let Some(c) = &current {
+            self.manifest(&c.version).await?.assets.is_some()
+        } else {
+            false
+        };
+        let prefix = self.path("_assets");
+        if !has_assets
+            && self
+                .store
+                .list(Some(&prefix))
+                .try_next()
+                .await
+                .map_err(bucket)?
+                .is_none()
+        {
+            let versions = match keep {
+                Some(n) => {
+                    self.collect_versions_at(n, retention, crate::alarm::now_ms_i64(), None)
+                        .await?
+                }
+                None => 0,
+            };
+            return Ok((versions, 0));
+        }
+        let key = self.path(&format!(
+            "_assets/collecting/{}",
+            wasmkeep_cluster::control::new_request_id()
+        ));
+        let start = tokio::time::Instant::now();
+        self.store
+            .put_opts(
+                &key,
+                Vec::new().into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(bucket)?;
+        let result = async {
+            let tc = self
+                .store
+                .head(&key)
+                .await
+                .map_err(bucket)?
+                .last_modified
+                .timestamp_millis();
+            let deploying: Vec<_> = self
+                .store
+                .list(Some(&self.path("_assets/deploying")))
+                .try_collect()
+                .await
+                .map_err(bucket)?;
+            let mut active = false;
+            for marker in deploying {
+                // Unknown marker keys are never deleted, and conservatively block.
+                if direct_hex(&marker.location, &self.path("_assets/deploying"), 16)
+                    && marker.last_modified.timestamp_millis() <= tc.saturating_sub(3_600_000)
+                {
+                    if !expired(start) {
+                        // A concurrent renewal is a reason to stop, not evidence
+                        // that the old listing still describes a dead deploy.
+                        active |= !self.delete_candidate(&marker, start).await?;
+                    }
+                } else {
+                    active = true;
+                }
+            }
+            if active {
+                eprintln!("assets not collected: a deploy is in progress");
+                return Ok((0, 0));
+            }
+            let mut candidates = Vec::new();
+            for kind in ["content", "index"] {
+                let prefix = self.path(&format!("_assets/{kind}"));
+                let objects: Vec<_> = self
+                    .store
+                    .list(Some(&prefix))
+                    .try_collect()
+                    .await
+                    .map_err(bucket)?;
+                candidates.extend(
+                    objects
+                        .into_iter()
+                        .filter(|m| direct_hex(&m.location, &prefix, 64)),
+                );
+            }
+            let prefix = self.path("_assets/collecting");
+            let markers: Vec<_> = self
+                .store
+                .list(Some(&prefix))
+                .try_collect()
+                .await
+                .map_err(bucket)?;
+            for marker in markers {
+                if marker.location != key
+                    && direct_hex(&marker.location, &prefix, 16)
+                    && marker.last_modified.timestamp_millis() <= tc.saturating_sub(900_000)
+                    && !expired(start)
+                {
+                    self.delete_candidate(&marker, start).await?;
+                }
+            }
+            if expired(start) {
+                return Ok((0, 0));
+            }
+            let versions = match keep {
+                Some(n) => {
+                    self.collect_versions_at(n, retention, tc, Some(start))
+                        .await?
+                }
+                None => 0,
+            };
+            let used = self.used_assets().await?;
+            let cutoff =
+                tc.saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX));
+            let mut deleted = 0;
+            for candidate in candidates {
+                if expired(start) {
+                    break;
+                }
+                if used.contains(&candidate.location)
+                    || candidate.last_modified.timestamp_millis() > cutoff
+                {
+                    continue;
+                }
+                if deleted % 100 == 0 && self.current().await? != current {
+                    break;
+                }
+                // Check again after reads: a slow HEAD must not extend the deadline.
+                if self.delete_candidate(&candidate, start).await? {
+                    deleted += 1;
+                }
+            }
+            Ok((versions, deleted))
+        }
+        .await;
+        let cleanup = self.store.delete(&key).await.map_err(bucket);
+        match result {
+            Err(e) => Err(e),
+            Ok(value) => {
+                cleanup?;
+                Ok(value)
+            }
+        }
+    }
+
+    async fn used_assets(&self) -> Result<HashSet<object_store::path::Path>, DeployError> {
+        let current = self.current().await?;
+        let prefix = self.path("");
+        let objects: Vec<_> = self
+            .store
+            .list(Some(&prefix))
+            .try_collect()
+            .await
+            .map_err(bucket)?;
+        let mut used = HashSet::new();
+        for object in objects {
+            let Some(relative) = object.location.as_ref().strip_prefix(&format!("{prefix}/"))
+            else {
+                continue;
+            };
+            let Some(version) = relative.strip_suffix("/manifest") else {
+                continue;
+            };
+            if version.contains('/') {
+                continue;
+            }
+            // Read every version directory, even an unfamiliar id; never guess
+            // that an unreadable manifest names no assets.
+            let manifest = self.manifest(version).await?;
+            let Some(hash) = manifest.assets else {
+                continue;
+            };
+            let index_key = self.path(&format!("_assets/index/{hash}"));
+            match self.store.head(&index_key).await {
+                Err(object_store::Error::NotFound { .. }) => {
+                    if current.as_ref().is_some_and(|c| c.version == version) {
+                        return Err(DeployError::Refused("assets not collected: the index of the current version is missing; run the deploy again to repair it".into()));
+                    }
+                    eprintln!("version {version} has lost its assets and cannot be rolled back to");
+                    continue;
+                }
+                Err(e) => return Err(bucket(e)),
+                Ok(_) => {}
+            }
+            let index = self.read_assets_index(&hash).await?;
+            used.insert(index_key);
+            for file in index.files.values() {
+                for content in file.contents() {
+                    used.insert(self.path(&format!("_assets/content/{}", content.digest)));
+                }
+            }
+        }
+        Ok(used)
+    }
+
+    async fn delete_candidate(
+        &self,
+        candidate: &object_store::ObjectMeta,
+        start: tokio::time::Instant,
+    ) -> Result<bool, DeployError> {
+        match self.store.head(&candidate.location).await {
+            Ok(now) if now == *candidate && !expired(start) => {
+                // object_store 0.14.2 exposes no conditional delete. The marker
+                // protocol is the safety boundary; this HEAD additionally keeps
+                // replacements observed since listing. It is not an atomic CAS.
+                self.store
+                    .delete(&candidate.location)
+                    .await
+                    .map_err(bucket)?;
+                Ok(true)
+            }
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(bucket(e)),
+        }
+    }
+}
+fn expired(start: tokio::time::Instant) -> bool {
+    start.elapsed() >= Duration::from_secs(300)
+}
+fn direct_hex(
+    key: &object_store::path::Path,
+    prefix: &object_store::path::Path,
+    len: usize,
+) -> bool {
+    key.as_ref()
+        .strip_prefix(&format!("{prefix}/"))
+        .is_some_and(|tail| {
+            tail.len() == len
+                && tail
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
 }

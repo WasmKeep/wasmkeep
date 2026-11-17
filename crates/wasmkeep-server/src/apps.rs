@@ -1507,6 +1507,9 @@ impl AppRef {
             .clone()
             .ok_or(DeployError::Nothing("no previous version to roll back to"))?;
         let back = self.manifest(&previous).await?;
+        if let Some(hash) = &back.assets {
+            self.read_assets_index(hash).await?;
+        }
         let (access, config) = self.settings(&current.version, &manifest).await?;
         let now = Settings { access, config };
         let (access, config) = self.settings(&previous, &back).await?;
