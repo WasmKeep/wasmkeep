@@ -947,6 +947,55 @@ From [`…-0f2986f-soak-r2.csv`](../bench/results/2026-11-07-0f2986f-soak-r2.csv
   later OVHcloud runs above report PUT counts, and the idle measurement
   below records requests separately.
 
+### Two hours, strict and batched
+
+**Measured on `57b76c2`.** The same
+three OVH VPS and bucket as above, commit `57b76c2`, two hours each
+(7,203 s), 39 kills each, one run with every class strict and one with
+the soak's class batched (`SOAK_WRITES=batched`,
+[ADR 0034](adr/0034-batched-plain-writes.md)). Plain writes are the two
+clients' `exec` writes described above; in the batched run they are
+batched too.
+
+| | Strict | Batched |
+| --- | --- | --- |
+| Acknowledged durable writes lost | **0** | **0** |
+| Values handed out twice | **0** | **0** |
+| Durable writes acknowledged | 386,488 | 404,324 |
+| Durable write, as a client sees it (p50 / p99 / max) | 78.8 ms / 999 ms / 9.66 s | 76.8 ms / 920 ms / 11.60 s |
+| Writes that returned an error | 31,775 | 32,362 |
+| Actors taken over, none never writable again | 1,234 | 1,263 |
+| Writable again after its node died (p50 / p99 / max) | 18.15 / 22.48 / 24.93 s | 16.82 / 21.86 / 24.47 s |
+| Alarms delivered | **312 of 312** | **312 of 312** |
+| Alarm, after its node died (p50 / max) | 20.7 / 27.5 s | 19.4 / 31.0 s |
+| Restarted node ready | 0.40 s at most | 0.39 s at most |
+| Plain writes acknowledged | 208,101 | 1,237,008 |
+| Plain increments lost (values handed out again) | 2 (2) | 785 (785) |
+| Reads of a killed node's actors during takeover: answered / failed | 7,995 / 20 | 8,496 / 15 |
+| Takeover read, 99th percentile | 17.77 s | 16.86 s |
+| Takeover reads that were stale | **0** | **0** |
+
+From
+[`…-57b76c2-soak-ovh-bhs-3vps-2h-strict-57b76c2.csv`](../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-strict-57b76c2.csv)
+and
+[`…-57b76c2-soak-ovh-bhs-3vps-2h-batched-57b76c2-batched.csv`](../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-batched-57b76c2-batched.csv).
+
+- **Durable writes are never lost, in either mode.** No acknowledged
+  durable write was lost or handed out twice, every alarm fired, and no
+  actor stayed unwritable, in both runs.
+- **Plain writes are not durable acknowledgements.** The strict run lost 2
+  of its 208,101 acknowledged plain increments, the batched run 785 of
+  1,237,008: about 20 per kill, within what a batched class says a node's death can
+  lose. These are counts over all actors
+  and kills, so they are evidence about the cost of batching, not a proof
+  of the per-actor bound stated in the
+  [changelog](../CHANGELOG.md). The batched run acknowledged about six
+  times as many plain writes in the same time.
+- **Durable writes cost the same.** The medians and 99th percentiles of the
+  two runs are within 2 ms and 80 ms of each other, and the longest
+  takeover within half a second. Each mode ran once, so these differences
+  are not shown to be more than the run-to-run noise.
+
 ### Bucket requests at rest
 
 **Measured on 0.4.1.** The same three VPS and bucket, on `0bf0547`

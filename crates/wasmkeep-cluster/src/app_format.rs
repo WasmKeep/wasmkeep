@@ -7,9 +7,9 @@
 //! [`ENABLED_BODY`]: it has enabled the recorded-head format
 //! (`wasmkeep-owner 2`), one way. Anything else refuses service.
 //!
-//! This version reads the setting and fails closed on it; it does not yet
-//! enforce the format, so it serves an enabled app nowhere and offers no
-//! way to enable one.
+//! Servers and the CLI enforce it: an enabled app writes version 2
+//! records and is served only by nodes that announce `recorded-head`;
+//! `wasmkeep app format --enable` writes the setting.
 //!
 //! [ADR 0035]: ../../../docs/adr/0035-a-recorded-head-on-hand-over.md
 

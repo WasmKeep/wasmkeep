@@ -433,9 +433,10 @@ impl NodeInfo {
 
 impl NodeInfo {
     /// The capability words this node announces on line 11, in order
-    /// (`take`, `front`, `handoff`, `ends`, `flush`, `restore`). Readers ignore words
-    /// they do not know.
-    fn capabilities(&self) -> impl Iterator<Item = &'static str> {
+    /// (`take`, `front`, `handoff`, `ends`, `flush`, `rate_limits`, `restore`,
+    /// `actor-restore`, `recorded-head`). Readers ignore words they do not
+    /// know.
+    pub fn capabilities(&self) -> impl Iterator<Item = &'static str> {
         [
             (self.can_take, "take"),
             (self.can_front, "front"),

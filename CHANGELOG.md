@@ -7,9 +7,113 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
-## Unreleased
+## 0.5.0
 
-Since 0.4.2, in no release yet.
+**Batched writes, data access and per-node limits.** A class can batch
+its plain writes into one upload (`writes = "batched"`); an operator can
+export an actor as SQLite, query it read-only, back up an app while the
+cluster runs, prune old backups, restore a whole app or one actor, and
+check all of it with a backup and restore drill. A node enforces
+declarative rate limits from `wasmkeep.toml`, configurable socket caps
+and a file-descriptor budget. An app can opt in to a recorded head on
+hand-over, so that the next node serves only the state the last one
+acknowledged. TypeScript actor clients are typed. Still a **pre-alpha
+pre-release**.
+
+**Upgrade:** [upgrading to 0.5.0](docs/deploy/upgrading-to-0.5.md): the
+new capability words, the manifest formats a batched class and a rate
+limit write, the one-way recorded-head format, and what a rollback to
+0.4.2 needs.
+
+**Soak** of `57b76c2` on three OVH VPS, two hours and 39 kills in each
+mode ([strict](bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-strict-57b76c2.csv),
+[batched](bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-batched-57b76c2-batched.csv),
+[numbers](docs/benchmarks.md#two-hours-strict-and-batched)). Durable
+writes: 386,488 acknowledged in strict and 404,324 in batched, none lost
+or handed out twice in either; durable write p50 78.8 ms and 76.8 ms, p99
+999 ms and 920 ms; writable again after a kill p50 18.2 s and 16.8 s, p99
+22.5 s and 21.9 s, worst 24.9 s and 24.5 s; 312 alarms in each, none
+missed. Plain writes acknowledged and lost with their node: 2 of 208,101
+in strict and 785 of 1,237,008 in batched (about 20 per kill).
+
+**Rolling upgrade** from 0.4.2 to the release candidate `a391642`, on the
+fleet: node by node with writes flowing and actors moved between old and
+new nodes; a batched deploy refused while a 0.4.2 node was live;
+`app format --enable` refused while nodes ran the app; with strict
+current and the recorded head not enabled, one node rolled back to 0.4.2
+and forward again, actors written in batched mode included. Not tested:
+in-place restore markers, `restores/` and format 6 in a rollback
+([upgrading](docs/deploy/upgrading-to-0.5.md#rolling-back-to-042)).
+
+Date: 2026-11-17
+
+- **Per-node rate limits (0.5.0, [ADR 0036](docs/adr/0036-per-node-ingress-rate-limits.md)):**
+  `[limits.<name>]` rules in `wasmkeep.toml` by route, method and key (the
+  app, the client, or a header). A node checks them before it reads a
+  body or does any actor work, and answers 429 with `Retry-After`; a
+  refused direct request writes nothing to the bucket. Clients are told by
+  their TCP address only (an IPv6 one by its 64-bit prefix), never by a
+  forwarded header. A forwarded request is charged once, by the owner,
+  from a signed identity. An app with no rule skips all of it. A version
+  with a rule is manifest format 6: a deploy is refused while a live node
+  lacks `rate_limits`, and a node of 0.4.x reads it as corrupt and limits
+  nothing, so upgrade every node first
+  ([project file](docs/project-file.md#ingress-limits)).
+- **Socket caps and a descriptor budget (0.5.0, [ADR 0037](docs/adr/0037-socket-session-admission.md)):**
+  an upgrade holds a permit for its whole life, on the local path and on
+  relays, and over a cap it gets 503 with `Retry-After`. Sockets draw from
+  a budget derived from the soft open-file limit, with room kept for
+  SQLite files, the bucket client and listeners; at a limit of 1,024 that
+  is 144 sockets and 96 resident actors (192 before). A very low limit
+  starts degraded with a warning. A relay whose one direction ended keeps
+  delivering the other until the close wait, so the last frames and the
+  Close arrive.
+- **Online backup** ([ADR 0033](docs/adr/0033-data-access-export-and-online-backup.md),
+  [guide](docs/deploy/backup-and-restore.md)): `wasmkeep backup create`,
+  `list` and `verify`, and `actor history`. A backup reads the live bucket
+  with LIST and GET only: no lease, no ownership record, no write. Each
+  actor is replayed and verified before its record is written; runs are
+  content-addressed and end in a checksummed `complete`; `verify` works
+  from the destination alone. It detects corruption, not an attacker who
+  can rewrite the whole archive.
+- **`backup restore`:** restores a whole app from a verified run, into an
+  empty root or `--in-place` (a verified backup of the current state is
+  taken first and pinned as the undo). A fence is written before any state:
+  nodes refuse to serve the app while it stands, and `backup create`,
+  `app delete` and `deploy --recreate` refuse. Every phase is journaled, so
+  a rerun continues, and `--abort` cancels before the fence opens. Nodes
+  announce the word `restore`; `--force` waives old nodes only.
+- **`actor restore`:** restores one actor to a time, a transaction or a
+  backup while the cluster runs, as a new write at the next position,
+  never a rewrite. The owner runs it, closes the actor's sockets (1012),
+  and a later delete always wins over an older request. Needs
+  `actor-restore` on every node registered for the app, checked by the CLI
+  and by the owner. The strict golden trace is re-recorded: every delete
+  now labels its snapshot, with no change to a bucket request's key or
+  order.
+- **`backup prune --keep-runs N`:** keeps the newest N complete runs, the
+  latest, every complete run under 24 hours old and pinned runs (an
+  in-place restore's undo, a restore in progress), and deletes only what
+  no kept run references. It never touches the live bucket; a create
+  overlapping a prune fails rather than publishing a run with missing data,
+  and an interrupted prune is finished by a rerun.
+- **A backup and restore drill, and a `backup create` fix:**
+  `scripts/drills/backup-restore.sh` backs up a fixture app under write
+  load, verifies the run, restores it into an empty prefix, starts a
+  throwaway node there and checks that every acknowledged write is
+  present; `check.sh --s3` runs it against moto. It found that `backup
+  create` polled an ended actor listing again, which panics on a real
+  paginated S3 listing; the listing is fused now.
+- **Typed TypeScript clients and a structured error envelope:**
+  `defineOperation` and `defineContract` with codecs (a Zod-style
+  `{parse}` validator works), a client that returns values and a nine-kind
+  failure instead of throwing, `batch()` over `callMany` and `bind`
+  ([guide](docs/typed-clients.md)). Application errors may use an opt-in
+  envelope, `{"v":1,"code","message","details?"}` as
+  `application/vnd.wasmkeep.error+json`, written and read the same way by
+  the TypeScript and Rust SDKs (shared test vectors), with a hostile body
+  refused rather than trusted. `CallError` gains a closed `CallErrorKind`.
+  Additive; no WIT change.
 
 - **Recorded head on hand-over (0.5.0, [ADR 0035](docs/adr/0035-a-recorded-head-on-hand-over.md)):**
   an app enabled with `wasmkeep app format --enable` writes ownership

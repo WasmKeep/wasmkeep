@@ -101,6 +101,9 @@ pub(crate) struct App {
     /// manifest; `None` without a deployed version or when its manifest
     /// cannot be read (which is no error here: nodes refuse it).
     pub(crate) front: Option<bool>,
+    /// The deployed version's manifest format number (5 for a batched
+    /// class, 6 for a rate limit); `None` as for `front`.
+    pub(crate) manifest_format: Option<u8>,
 }
 
 /// Everything `cluster status` prints.
@@ -183,7 +186,7 @@ async fn read_apps(
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
                 Err(e) => Err(e.to_string()),
             };
-            let front = match &current {
+            let manifest = match &current {
                 Ok(Some(c)) => wasmkeep_server::apps::AppRef::new(
                     Arc::clone(store),
                     prefix,
@@ -192,14 +195,16 @@ async fn read_apps(
                 )
                 .manifest(&c.version)
                 .await
-                .ok()
-                .map(|m| m.front.is_some()),
+                .ok(),
                 _ => None,
             };
+            let front = manifest.as_ref().map(|m| m.front.is_some());
+            let manifest_format = manifest.as_ref().map(|m| m.format_number());
             apps.push(App {
                 name,
                 current,
                 front,
+                manifest_format,
             });
         }
     }
@@ -313,10 +318,11 @@ impl Report {
         for (app, (with, without)) in by_app {
             if !with.is_empty() && !without.is_empty() {
                 out.push(format!(
-                    "{app}: live nodes differ on the recorded-head ownership format: {} do not \
+                    "{app}: live nodes differ on the recorded-head ownership format: {} {} not \
                      support it; upgrade them before `wasmkeep app format --enable` (ADR 0035), \
                      and if it is enabled already, the app is refused service meanwhile",
-                    without.join(", ")
+                    without.join(", "),
+                    if without.len() == 1 { "does" } else { "do" }
                 ));
             }
         }
@@ -383,7 +389,7 @@ impl Report {
                 .map(|(v, ids)| format!("{v} on {}", ids.join(", ")))
                 .collect();
             out.push(format!(
-                "live nodes run different WasmKeep versions ({}): upgrade every node together",
+                "live nodes run different WasmKeep versions ({}): upgrade every node before you enable or deploy what needs a new capability word",
                 list.join("; ")
             ));
         }
@@ -408,6 +414,9 @@ impl Report {
                     "cluster_address": n.info.cluster_address,
                     "tls_pins": n.info.tls_pins.iter().map(membership::pin_hex).collect::<Vec<_>>(),
                     "tls": n.tls(),
+                    // Line 11's capability words, in the order a node
+                    // writes them.
+                    "words": n.info.capabilities().collect::<Vec<_>>(),
                     // Line 9, while live; null otherwise, or from a
                     // version without it.
                     "state": n.state().map(DrainState::as_str),
@@ -430,13 +439,13 @@ impl Report {
                 let actors = self.app_actors(&a.name);
                 match &a.current {
                     Ok(Some(c)) => {
-                        json!({"app": a.name, "version": c.version, "seq": c.seq, "actors": actors, "front": a.front})
+                        json!({"app": a.name, "version": c.version, "seq": c.seq, "actors": actors, "front": a.front, "manifest_format": a.manifest_format})
                     }
                     Ok(None) => {
-                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "front": null})
+                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "front": null, "manifest_format": null})
                     }
                     Err(e) => {
-                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "front": null, "error": e})
+                        json!({"app": a.name, "version": null, "seq": null, "actors": actors, "front": null, "manifest_format": null, "error": e})
                     }
                 }
             })
@@ -472,7 +481,7 @@ impl Report {
         if self.nodes.is_empty() {
             out.push_str("No nodes.\n");
         } else {
-            let rows: Vec<[String; 13]> = self
+            let rows: Vec<[String; 14]> = self
                 .nodes
                 .iter()
                 .map(|n| {
@@ -507,6 +516,7 @@ impl Report {
                             (true, k) => format!("pinned ({k})"),
                             (false, _) => "no address".to_owned(),
                         },
+                        or_dash(&n.info.capabilities().collect::<Vec<_>>().join(" ")),
                     ]
                 })
                 .collect();
@@ -526,6 +536,7 @@ impl Report {
                     "ADDRESS",
                     "CLUSTER ADDRESS",
                     "TLS",
+                    "WORDS",
                 ],
                 &rows,
             );
@@ -534,7 +545,7 @@ impl Report {
         if self.apps.is_empty() {
             out.push_str("No deployed apps.\n");
         } else {
-            let rows: Vec<[String; 5]> = self
+            let rows: Vec<[String; 6]> = self
                 .apps
                 .iter()
                 .map(|a| {
@@ -553,12 +564,21 @@ impl Report {
                             Some(false) => "no".to_owned(),
                             None => "-".to_owned(),
                         },
+                        a.manifest_format
+                            .map_or_else(|| "-".to_owned(), |f| f.to_string()),
                     ]
                 })
                 .collect();
             table(
                 &mut out,
-                ["APP", "DEPLOYED VERSION", "SEQ", "ACTORS", "FRONT"],
+                [
+                    "APP",
+                    "DEPLOYED VERSION",
+                    "SEQ",
+                    "ACTORS",
+                    "FRONT",
+                    "FORMAT",
+                ],
                 &rows,
             );
         }
@@ -823,7 +843,7 @@ mod tests {
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].starts_with("acme/shop: live nodes differ on the recorded-head")
-                && warnings[0].contains(": b do not support it"),
+                && warnings[0].contains(": b does not support it"),
             "{warnings:?}"
         );
         assert!(
@@ -1096,6 +1116,25 @@ mod tests {
                 "{i}"
             );
         }
+        // Each version's manifest format, and each node's capability words.
+        assert_eq!(j["apps"][0]["manifest_format"], 3);
+        assert_eq!(j["apps"][1]["manifest_format"], 1);
+        let words = j["nodes"][0]["words"].as_array().unwrap();
+        for w in [
+            "flush",
+            "rate_limits",
+            "restore",
+            "actor-restore",
+            "recorded-head",
+        ] {
+            assert!(words.iter().any(|x| x == w), "{w} in {words:?}");
+        }
+        let text = r.to_text();
+        assert!(text.contains("WORDS") && text.contains("FORMAT"), "{text}");
+        assert!(
+            text.contains("flush rate_limits restore actor-restore recorded-head"),
+            "{text}"
+        );
         assert_eq!(j["apps"][0]["actors"], 5);
         assert_eq!(j["apps"][1]["actors"], Value::Null);
         assert_eq!(j["apps"][0]["front"], true);
@@ -1132,16 +1171,16 @@ mod tests {
             assert_eq!(j["nodes"][i]["state"], Value::Null, "{i}");
         }
         assert!(
-            text.contains("APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT"),
+            text.contains("APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT  FORMAT"),
             "{text}"
         );
         assert_eq!(
             row("acme/shop"),
-            ["acme/shop", "0123456789abcdef", "4", "5", "yes"]
+            ["acme/shop", "0123456789abcdef", "4", "5", "yes", "3"]
         );
         assert_eq!(
             row("beta/new"),
-            ["beta/new", "fedcba9876543210", "1", "-", "no"]
+            ["beta/new", "fedcba9876543210", "1", "-", "no", "1"]
         );
     }
 
@@ -1161,7 +1200,11 @@ mod tests {
         let r = report(store);
         let w = r.warnings();
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("upgrade every node together"), "{}", w[0]);
+        assert!(
+            w[0].contains("upgrade every node before you enable or deploy"),
+            "{}",
+            w[0]
+        );
         assert!(w[0].contains("0.0.1 on b"), "{}", w[0]);
         assert_eq!(r.to_json()["summary"]["mixed_versions"], true);
         assert_eq!(r.to_json()["nodes"][1]["app"], "");
@@ -1201,15 +1244,15 @@ mod tests {
         assert_eq!(
             j["apps"],
             json!([
-                {"app": "acme/admin", "version": null, "seq": null, "actors": null, "front": null, "error": "unreadable current"},
+                {"app": "acme/admin", "version": null, "seq": null, "actors": null, "front": null, "manifest_format": null, "error": "unreadable current"},
                 // An unreadable manifest: not known, and no error.
-                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4, "actors": 7, "front": null},
-                {"app": "beta/new", "version": null, "seq": null, "actors": null, "front": null},
+                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4, "actors": 7, "front": null, "manifest_format": null},
+                {"app": "beta/new", "version": null, "seq": null, "actors": null, "front": null, "manifest_format": null},
             ])
         );
         let text = r.to_text();
         assert!(
-            text.contains("acme/shop   0123456789abcdef      4    7       -\n"),
+            text.contains("acme/shop   0123456789abcdef      4    7       -      -\n"),
             "{text}"
         );
     }
