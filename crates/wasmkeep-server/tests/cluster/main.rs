@@ -49,6 +49,8 @@ mod alarms;
 mod app_delete;
 #[path = "apps.rs"]
 mod apps;
+#[path = "assets.rs"]
+mod assets;
 #[path = "assets_deploy.rs"]
 mod assets_deploy;
 #[path = "batched.rs"]

@@ -114,11 +114,8 @@ async fn assets_first_unchanged_repair_size_and_verify() {
         2
     );
     assert!(
-        matches!(
-            app.version(&next.current.version).await,
-            Err(DeployError::Corrupt(_))
-        ),
-        "node must refuse until A4"
+        app.version(&next.current.version).await.is_ok(),
+        "node loads format 7 with its index"
     );
 }
 
@@ -294,4 +291,29 @@ async fn assets_immutable_refusal_no_assets_and_plan_cancel() {
             .any(|m| m.location.as_ref().contains("_assets/content/")),
         "removal does not collect assets in A2"
     );
+}
+
+#[tokio::test]
+async fn assets_node_loads_format_seven_and_rejects_missing_index() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let app = AppRef::new(store.clone(), "", "default", "shop");
+    let first = app
+        .deploy_changes(&runtime(), changes(b"abc"))
+        .await
+        .unwrap();
+    assert!(
+        app.version(&first.current.version).await.is_ok(),
+        "node must load format 7"
+    );
+    let manifest = app.manifest(&first.current.version).await.unwrap();
+    store
+        .delete(&app.path(&format!("_assets/index/{}", manifest.assets.unwrap())))
+        .await
+        .unwrap();
+    let error = app
+        .version(&first.current.version)
+        .await
+        .expect_err("missing index");
+    assert!(matches!(error, DeployError::Corrupt(_)), "{error}");
+    assert!(error.to_string().contains("(missing)"), "{error}");
 }

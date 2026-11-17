@@ -412,6 +412,10 @@ pub(crate) struct Metrics {
     /// `unconfigured`, `cpu_budget`, `wall`, `guest_error`); rendered with
     /// the node's tenant and app.
     pub(crate) front_requests: Family<AtomicU64>,
+    asset_requests: Family<AtomicU64>,
+    asset_fetches: Family<AtomicU64>,
+    asset_bytes: Family<AtomicU64>,
+    asset_cache: Family<AtomicU64>,
     /// How long front requests took, to the response's last byte; rendered
     /// with the node's tenant and app.
     pub(crate) front_request_seconds: Family<Histogram>,
@@ -577,6 +581,31 @@ pub(crate) fn app_labels(tenant: &str, app: &str) -> Arc<str> {
 
 /// One front request of the app `app` names ([`app_labels`]), ended
 /// with `outcome` ([`FRONT_REQUEST_OUTCOMES`]).
+pub(crate) fn asset_request(app: &str, outcome: &str) {
+    inc(&METRICS.asset_requests.get_in(app, &[("outcome", outcome)]));
+}
+pub(crate) fn asset_fetch(app: &str, outcome: &str) {
+    inc(&METRICS.asset_fetches.get_in(app, &[("outcome", outcome)]));
+}
+pub(crate) fn asset_bytes(app: &str, encoding: &str, bytes: u64) {
+    METRICS
+        .asset_bytes
+        .get_in(app, &[("encoding", encoding)])
+        .fetch_add(bytes, Ordering::Relaxed);
+}
+pub(crate) fn asset_cache_add(app: &str, bytes: u64) {
+    METRICS
+        .asset_cache
+        .get_in(app, &[])
+        .fetch_add(bytes, Ordering::Relaxed);
+}
+pub(crate) fn asset_cache_remove(app: &str, bytes: u64) {
+    METRICS
+        .asset_cache
+        .get_in(app, &[])
+        .fetch_sub(bytes, Ordering::Relaxed);
+}
+
 pub(crate) fn front_request(app: &str, outcome: &str) {
     inc(&METRICS.front_requests.get_in(app, &[("outcome", outcome)]));
 }
@@ -1324,6 +1353,21 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "wasmkeep_rate_limit_active_keys {}",
         crate::rate_limit::active_keys()
     );
+    for (name, kind, family) in [
+        (
+            "wasmkeep_asset_requests_total",
+            "counter",
+            &m.asset_requests,
+        ),
+        ("wasmkeep_asset_fetches_total", "counter", &m.asset_fetches),
+        ("wasmkeep_asset_bytes_total", "counter", &m.asset_bytes),
+        ("wasmkeep_asset_cache_bytes", "gauge", &m.asset_cache),
+    ] {
+        head(&mut out, name, kind, "Static assets, by tenant and app.");
+        family.each(|labels, value| {
+            let _ = writeln!(out, "{name}{{{labels}}} {}", value.load(Ordering::Relaxed));
+        });
+    }
     app_family(
         &mut out,
         "wasmkeep_front_requests_total",

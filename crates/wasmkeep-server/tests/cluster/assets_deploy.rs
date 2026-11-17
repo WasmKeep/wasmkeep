@@ -1,4 +1,4 @@
-//! Bucket-only proof for A2. Nodes deliberately do not announce assets until A4.
+//! Compatibility proof: deploy still refuses a live node without assets.
 use super::*;
 use wasmkeep_server::apps::{Changes, DeployError};
 use wasmkeep_server::assets::{Bundle, Change, Content, File, Index, digest};

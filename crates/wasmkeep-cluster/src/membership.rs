@@ -468,11 +468,11 @@ impl NodeInfo {
             (self.can_end, "ends"),
             (self.can_flush, "flush"),
             (self.can_rate_limits, "rate_limits"),
-            (self.can_assets, "assets"),
             (self.can_restore, "restore"),
             (self.can_actor_restore, "actor-restore"),
             (self.can_recorded_head, "recorded-head"),
             (self.can_multi_app, "multi-app"),
+            (self.can_assets, "assets"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -769,7 +769,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_end: true,
             can_flush: true,
             can_rate_limits: true,
-            can_assets: false,
+            can_assets: true,
             can_restore: true,
             can_actor_restore: true,
             can_recorded_head: true,
@@ -1669,7 +1669,7 @@ mod tests {
         assert_eq!(
             payload.lines().nth(8),
             Some(
-                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app"
+                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets"
             ),
             "{payload}"
         );
@@ -1755,14 +1755,13 @@ mod tests {
     }
 
     #[test]
-    fn assets_capability_is_read_but_not_announced_before_serving() {
+    fn assets_capability_is_announced_and_round_trips() {
         let mem = Mem::default();
         let t = Cell::new(0);
         let membership = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
-        let mut node = membership.info();
-        assert!(!node.can_assets);
-        assert!(!node.capabilities().any(|w| w == "assets"));
-        node.can_assets = true;
+        let node = membership.info();
+        assert!(node.can_assets);
+        assert!(node.capabilities().any(|w| w == "assets"));
         for bytes in [node.encode(), format3(&node, NodeState::Live, "beef")] {
             assert!(NodeInfo::decode(&bytes).unwrap().can_assets);
         }

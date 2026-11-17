@@ -241,8 +241,22 @@ impl ActorService {
             mailboxes.join_pool(pool, config.min_resident);
         }
 
+        let assets = Arc::new(crate::assets::State::new(
+            config.assets.clone(),
+            config
+                .storage
+                .data_dir
+                .join("assets")
+                .join(root.tenant())
+                .join(root.app()),
+            config.assets_cache.clone(),
+            app_labels.clone(),
+        ));
+        assets.initialize()?;
+        assets.clone().prefetch();
         let service = Self {
             inner: Arc::new(ServiceInner {
+                assets: std::sync::RwLock::new(assets),
                 app_labels,
                 app_name,
                 _shares: shares,

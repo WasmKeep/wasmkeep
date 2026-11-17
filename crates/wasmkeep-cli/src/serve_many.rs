@@ -19,6 +19,7 @@ use crate::{
 
 /// What the app runtimes of one process share.
 struct Shared {
+    assets_cache: Arc<wasmkeep_server::assets::Cache>,
     runtime: Runtime,
     cache: ComponentCache,
     guest_log: wasmkeep_server::GuestLog,
@@ -111,6 +112,7 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         None => wasmkeep_server::Supervisor::new(),
     };
     let shared = Arc::new(Shared {
+        assets_cache: wasmkeep_server::assets::Cache::new(base.assets_cache_bytes),
         runtime,
         cache,
         guest_log: wasmkeep_server::GuestLog::new(base.guest_log_rate),
@@ -233,6 +235,8 @@ async fn start_runtime(
     config.requires = deployed.requires;
     config.batched = deployed.batched;
     config.limits = deployed.limits;
+    config.assets = deployed.assets;
+    config.assets_cache = shared.assets_cache.clone();
     config.expire_after_idle = deployed
         .expire
         .iter()

@@ -1,0 +1,474 @@
+use super::*;
+use http_body_util::BodyExt;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+async fn fixture(mode: &str) -> (tempfile::TempDir, State) {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let mut index = Index {
+        not_found: mode.into(),
+        ..Index::default()
+    };
+    index.immutable.insert("assets/".into());
+    index.front_first.insert("api/".into());
+    for name in [
+        "index.html",
+        "404.html",
+        "assets/a.js",
+        "dir/index.html",
+        "api/a",
+    ] {
+        let mut contents = Vec::new();
+        for bytes in [b"plain content".as_slice(), b"brotli", b"gzip"] {
+            let hash = digest(bytes);
+            store
+                .put(
+                    &format!("apps/t/a/_assets/content/{hash}").into(),
+                    PutPayload::from(bytes.to_vec()),
+                )
+                .await
+                .unwrap();
+            contents.push(Content {
+                digest: hash,
+                size: bytes.len() as u64,
+            });
+        }
+        index.files.insert(
+            name.into(),
+            File {
+                content_type: "text/html;charset=utf-8".into(),
+                identity: contents[0].clone(),
+                br: Some(contents[1].clone()),
+                gzip: Some(contents[2].clone()),
+            },
+        );
+    }
+    let state = State::new(
+        Some(Deployed {
+            index: Arc::new(index),
+            previous: None,
+            app: crate::apps::AppRef::new(store, "", "t", "a"),
+        }),
+        dir.path().join("assets/t/a"),
+        Cache::new(1024),
+        crate::metrics::app_labels("t", "a"),
+    );
+    (dir, state)
+}
+async fn response(
+    state: &State,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Response<HyperOutgoingBody> {
+    let mut req = Request::builder().method(method).uri(path);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    state
+        .answer(&req.body(()).unwrap())
+        .await
+        .expect("asset response")
+}
+#[tokio::test]
+async fn assets_responses_status_headers_and_encodings() {
+    let (_dir, state) = fixture("front").await;
+    let plain_tag = format!("\"{}\"", &digest(b"plain content")[..32]);
+    let br_tag = format!("\"{}\"", &digest(b"brotli")[..32]);
+    for (headers, status, body, encoding) in [
+        (vec![], 200, b"plain content".as_slice(), None),
+        (
+            vec![("accept-encoding", "gzip, br")],
+            200,
+            b"brotli".as_slice(),
+            Some("br"),
+        ),
+        (
+            vec![("accept-encoding", "br;q=0, gzip")],
+            200,
+            b"gzip".as_slice(),
+            Some("gzip"),
+        ),
+        (vec![("if-none-match", "*")], 304, b"".as_slice(), None),
+        (
+            vec![("range", "bytes=0-4"), ("accept-encoding", "br")],
+            206,
+            b"plain".as_slice(),
+            None,
+        ),
+        (vec![("range", "bytes=999-")], 416, b"".as_slice(), None),
+        (
+            vec![
+                ("range", "bytes=0-4"),
+                ("if-range", br_tag.as_str()),
+                ("accept-encoding", "br"),
+            ],
+            200,
+            b"brotli".as_slice(),
+            Some("br"),
+        ),
+    ] {
+        let res = response(&state, "GET", "/assets/a.js", &headers).await;
+        assert_eq!(res.status().as_u16(), status);
+        assert_eq!(
+            res.headers()
+                .get("content-encoding")
+                .map(|v| v.to_str().unwrap()),
+            encoding
+        );
+        assert_eq!(res.headers()["vary"], "Accept-Encoding");
+        assert_eq!(
+            res.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        if status == 206 {
+            assert_eq!(res.headers()["content-range"], "bytes 0-4/13");
+            assert_eq!(res.headers()["etag"], plain_tag);
+        }
+        if status == 416 {
+            assert_eq!(res.headers()["content-range"], "bytes */13");
+        }
+        assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), body);
+    }
+    let weak = format!("\"other\", W/{plain_tag}");
+    assert_eq!(
+        response(&state, "GET", "/index.html", &[("if-none-match", &weak)])
+            .await
+            .status(),
+        304
+    );
+    let head = response(&state, "HEAD", "/index.html", &[]).await;
+    assert_eq!(head.status(), 200);
+    assert_eq!(head.headers()["content-length"], "13");
+    assert!(
+        head.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    let redirect = response(&state, "GET", "/dir?x=1", &[]).await;
+    assert_eq!(redirect.status(), 308);
+    assert_eq!(redirect.headers()["location"], "/dir/?x=1");
+    for path in ["/%61ctor/a", "/%5fwasmkeep/health"] {
+        assert_eq!(response(&state, "GET", path, &[]).await.status(), 400);
+    }
+}
+#[tokio::test]
+async fn assets_not_found_and_front_first() {
+    for mode in ["front", "spa", "404"] {
+        let (_dir, state) = fixture(mode).await;
+        for path in ["/api/a", "/bad%2fpath", "/../x"] {
+            assert!(
+                state
+                    .answer(&Request::get(path).body(()).unwrap())
+                    .await
+                    .is_none()
+            );
+        }
+        let req = Request::get("/missing.js").body(()).unwrap();
+        if mode == "404" {
+            let res = state.answer(&req).await.unwrap();
+            assert_eq!(res.status(), 404);
+            assert_eq!(res.headers()["cache-control"], "no-store");
+        } else {
+            assert!(state.answer(&req).await.is_none());
+        }
+        if mode == "spa" {
+            let res = response(&state, "GET", "/route", &[("accept", "text/html")]).await;
+            assert_eq!(res.status(), 200);
+            assert_eq!(res.headers()["cache-control"], "no-cache");
+            assert!(
+                res.headers()["vary"]
+                    .to_str()
+                    .unwrap()
+                    .contains("Sec-Fetch-Mode")
+            );
+        }
+        assert!(
+            state
+                .answer(&Request::post("/index.html").body(()).unwrap())
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn assets_cache_global_lru_integrity_and_restart() {
+    let (dir, mut state) = fixture("front").await;
+    state.cache = Cache::new(18);
+    let body = response(&state, "GET", "/index.html", &[])
+        .await
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(body, b"plain content".as_slice());
+    response(&state, "GET", "/index.html", &[("accept-encoding", "br")])
+        .await
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    {
+        let entries = state.cache.inner.lock().unwrap();
+        assert_eq!(entries.bytes, 6);
+        assert_eq!(entries.files.len(), 1);
+    }
+    assert!(!state.dir.join(digest(b"plain content")).exists());
+    // A sibling app cannot use the first app's cached digest, even within the same process budget.
+    let mut other = state.clone();
+    other.dir = dir.path().join("assets/t/other");
+    other.current.as_mut().unwrap().app = crate::apps::AppRef::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "",
+        "t",
+        "other",
+    );
+    assert_eq!(
+        response(&other, "GET", "/index.html", &[("accept-encoding", "br")])
+            .await
+            .status(),
+        503
+    );
+    // Startup rejects altered bytes and enforces the byte limit on retained files.
+    std::fs::write(state.dir.join(digest(b"brotli")), b"badbad").unwrap();
+    let restarted = State::new(
+        state.current.clone(),
+        state.dir.clone(),
+        Cache::new(4),
+        state.labels.clone(),
+    );
+    restarted.initialize().unwrap();
+    assert!(!state.dir.join(digest(b"brotli")).exists());
+    assert_eq!(restarted.cache.inner.lock().unwrap().bytes, 0);
+    // Files larger than the retained cache budget still stream after verification.
+    let res = response(&restarted, "GET", "/index.html", &[]).await;
+    assert_eq!(
+        res.into_body().collect().await.unwrap().to_bytes(),
+        b"plain content".as_slice()
+    );
+    assert_eq!(restarted.cache.inner.lock().unwrap().bytes, 0);
+    // Correct-sized tampering in the bucket cannot be served.
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &format!("apps/t/a/_assets/content/{}", digest(b"plain content")).into(),
+            b"wrong content".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    other.current.as_mut().unwrap().app = crate::apps::AppRef::new(store, "", "t", "a");
+    let res = response(&other, "GET", "/index.html", &[]).await;
+    assert_eq!(res.status(), 503);
+    assert_eq!(res.headers()["retry-after"], "1");
+}
+
+#[tokio::test]
+async fn assets_previous_index_survives_restart_and_rollback() {
+    let (_dir, state) = fixture("front").await;
+    state.persist().unwrap();
+    let old = state.current.clone();
+    let mut deployed = old.clone().unwrap();
+    let mut index = (*deployed.index).clone();
+    index
+        .files
+        .insert("assets/b.js".into(), index.files["assets/a.js"].clone());
+    index.files.remove("assets/a.js");
+    index.files.remove("index.html");
+    deployed.index = Arc::new(index);
+    let switched = state.switched(Some(deployed.clone())).unwrap();
+    assert_eq!(
+        response(&switched, "GET", "/assets/a.js", &[])
+            .await
+            .status(),
+        200
+    );
+    assert!(
+        switched
+            .answer(&Request::get("/index.html").body(()).unwrap())
+            .await
+            .is_none()
+    );
+    let restarted = State::new(
+        Some(deployed),
+        state.dir.clone(),
+        state.cache.clone(),
+        state.labels.clone(),
+    );
+    assert_eq!(
+        response(&restarted, "GET", "/assets/a.js", &[])
+            .await
+            .status(),
+        200
+    );
+    let rollback = restarted.switched(old).unwrap();
+    assert_eq!(
+        response(&rollback, "GET", "/index.html", &[])
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        response(&rollback, "GET", "/assets/b.js", &[])
+            .await
+            .status(),
+        200
+    );
+    assert!(
+        !rollback
+            .previous
+            .as_ref()
+            .unwrap()
+            .files
+            .contains_key("index.html")
+    );
+    let restarted = State::new(
+        rollback.current.clone(),
+        state.dir.clone(),
+        state.cache.clone(),
+        state.labels.clone(),
+    );
+    assert_eq!(
+        response(&restarted, "GET", "/assets/b.js", &[])
+            .await
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn assets_more_ranges_and_not_found_headers() {
+    let (_dir, mut state) = fixture("404").await;
+    for (range, expected, body) in [
+        ("bytes=-7", 206, "content"),
+        ("bytes=6-", 206, "content"),
+        ("bytes=0-999", 206, "plain content"),
+        ("bytes=0-1,4-5", 200, "plain content"),
+        ("invalid", 200, "plain content"),
+        ("bytes=-0", 416, ""),
+    ] {
+        let res = response(&state, "GET", "/index.html", &[("range", range)]).await;
+        assert_eq!(res.status().as_u16(), expected);
+        assert_eq!(
+            res.into_body().collect().await.unwrap().to_bytes(),
+            body.as_bytes()
+        );
+    }
+    let res = response(&state, "HEAD", "/index.html", &[("range", "bytes=1-2")]).await;
+    assert_eq!(res.status(), 206);
+    assert_eq!(res.headers()["content-length"], "2");
+    assert!(
+        res.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    Arc::make_mut(&mut state.current.as_mut().unwrap().index)
+        .files
+        .remove("404.html");
+    let res = response(&state, "HEAD", "/missing", &[]).await;
+    assert_eq!(res.status(), 404);
+    assert_eq!(res.headers()["cache-control"], "no-store");
+    assert_eq!(res.headers()["content-length"], "10");
+    assert!(
+        res.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn assets_cache_eviction_spans_app_directories_and_metrics_are_labeled() {
+    let (_a, mut first) = fixture("front").await;
+    let (_b, mut second) = fixture("front").await;
+    let cache = Cache::new(8);
+    first.cache = cache.clone();
+    second.cache = cache.clone();
+    first.labels = crate::metrics::app_labels("cache-test", "first");
+    second.labels = crate::metrics::app_labels("cache-test", "second");
+    response(&first, "GET", "/", &[("accept-encoding", "br")])
+        .await
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    response(&second, "GET", "/", &[("accept-encoding", "gzip")])
+        .await
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(cache.inner.lock().unwrap().bytes, 4);
+    assert!(!first.dir.join(digest(b"brotli")).exists());
+    assert!(second.dir.join(digest(b"gzip")).exists());
+    let page = crate::metrics::render(Default::default());
+    for row in [
+        "wasmkeep_asset_cache_bytes{tenant=\"cache-test\",app=\"first\"} 0",
+        "wasmkeep_asset_cache_bytes{tenant=\"cache-test\",app=\"second\"} 4",
+        "wasmkeep_asset_requests_total{tenant=\"cache-test\",app=\"first\",outcome=\"ok\"} 1",
+        "wasmkeep_asset_bytes_total{tenant=\"cache-test\",app=\"second\",encoding=\"gzip\"} 4",
+    ] {
+        assert!(page.contains(row), "missing {row}");
+    }
+}
+
+#[tokio::test]
+async fn assets_encoding_conditionals_and_exclusions() {
+    let (_dir, state) = fixture("front").await;
+    let br_tag = format!("\"{}\"", &digest(b"brotli")[..32]);
+    let weak = format!("W/{br_tag}");
+    let res = response(
+        &state,
+        "GET",
+        "/",
+        &[("accept-encoding", "br"), ("if-none-match", &weak)],
+    )
+    .await;
+    assert_eq!(res.status(), 304);
+    assert_eq!(res.headers()["etag"], br_tag);
+    for method in ["GET", "HEAD"] {
+        let res = response(
+            &state,
+            method,
+            "/",
+            &[("accept-encoding", "br;q=0,gzip;q=0,identity;q=0")],
+        )
+        .await;
+        assert_eq!(res.status(), 406);
+        assert_eq!(res.headers()["vary"], "Accept-Encoding");
+    }
+    let res = response(
+        &state,
+        "GET",
+        "/",
+        &[
+            ("range", "bytes=0-1"),
+            ("if-range", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ("accept-encoding", "gzip"),
+        ],
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["content-encoding"], "gzip");
+    let res = response(
+        &state,
+        "GET",
+        "/",
+        &[
+            ("range", "bytes=0-1"),
+            ("accept-encoding", "identity;q=0,br"),
+        ],
+    )
+    .await;
+    assert_eq!(res.status(), 206);
+    assert!(!res.headers().contains_key("content-encoding"));
+}

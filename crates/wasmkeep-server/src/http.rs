@@ -145,10 +145,42 @@ impl App {
         {
             return text_response(StatusCode::NOT_FOUND, "not found\n");
         }
-        match &self.front {
+        let assets = self
+            .actors
+            .as_ref()
+            .map(|actors| actors.asset_snapshot(&mut req));
+        if let Some(assets) = &assets
+            && let Some(response) = assets.answer(&req).await
+        {
+            return response;
+        }
+        let (spa, immutable, unmatched) = assets
+            .as_ref()
+            .map(|a| a.front_headers(&req))
+            .unwrap_or_default();
+        let host_not_found =
+            unmatched && self.front.as_ref().is_none_or(|front| !front.has_version());
+        let head_not_found = host_not_found && req.method() == hyper::Method::HEAD;
+        let mut response = match &self.front {
             Some(front) => front.serve(req, self.actors.as_ref()).await,
             None => text_response(StatusCode::NOT_FOUND, "not found\n"),
+        };
+        if spa {
+            response.headers_mut().append(
+                "vary",
+                hyper::header::HeaderValue::from_static("Sec-Fetch-Mode, Accept"),
+            );
         }
+        if host_not_found || (immutable && !response.status().is_success()) {
+            response.headers_mut().insert(
+                "cache-control",
+                hyper::header::HeaderValue::from_static("no-store"),
+            );
+        }
+        if head_not_found {
+            *response.body_mut() = text_response(StatusCode::NOT_FOUND, "").into_body();
+        }
+        response
     }
 }
 
@@ -1257,6 +1289,15 @@ mod cluster_port_tests {
     /// A server with both ports: the cluster port trusts `trusted` (and
     /// itself), with handshakes cut after `handshake`.
     async fn start(server: &Identity, trusted: &[&Identity], handshake: Duration) -> Running {
+        start_app(server, trusted, handshake, App::default()).await
+    }
+
+    async fn start_app(
+        server: &Identity,
+        trusted: &[&Identity],
+        handshake: Duration,
+        app: App,
+    ) -> Running {
         let pins = Arc::new(PinSet::default());
         let listed: Vec<(String, Vec<[u8; 32]>)> = trusted
             .iter()
@@ -1283,7 +1324,7 @@ mod cluster_port_tests {
         let done = tokio::spawn(serve_with_cluster(
             public,
             Some(port),
-            App::default(),
+            app,
             async {
                 let _ = stopped.await;
             },
@@ -1487,6 +1528,70 @@ mod cluster_port_tests {
             .unwrap();
         assert!(tokio::net::TcpStream::connect(run.cluster).await.is_err());
         assert!(tokio::net::TcpStream::connect(run.public).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn assets_are_public_only_and_admission_precedes_lookup() {
+        use crate::assets::{Content, Deployed, File, Index, digest};
+        use object_store::ObjectStoreExt;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let hash = digest(b"asset");
+        store
+            .put(
+                &format!("apps/default/default/_assets/content/{hash}").into(),
+                b"asset".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let mut index = Index::default();
+        index.files.insert(
+            "index.html".into(),
+            File {
+                content_type: "text/html".into(),
+                identity: Content {
+                    digest: hash,
+                    size: 5,
+                },
+                br: None,
+                gzip: None,
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::ActorConfig::new(dir.path());
+        config.assets = Some(Deployed {
+            index: Arc::new(index),
+            previous: None,
+            app: crate::apps::AppRef::new(store, "", "default", "default"),
+        });
+        config.limits.insert(
+            "assets".into(),
+            crate::apps::limits::Policy::parse("/*", "ip", None, "1/h", 1).unwrap(),
+        );
+        let service = ActorService::new(
+            wasmkeep_runtime::Runtime::new(&Default::default()).unwrap(),
+            config,
+            vec![],
+        )
+        .unwrap();
+        let server = Identity::generate("b", "b.test").unwrap();
+        let peer = Identity::generate("a", "a.test").unwrap();
+        let mut run = start_app(
+            &server,
+            &[&peer],
+            Duration::from_secs(5),
+            App::from(service),
+        )
+        .await;
+        assert_eq!(get_plain(run.public, "/index.html").await, 200);
+        assert_eq!(get_plain(run.public, "/index.html").await, 429);
+        assert_eq!(get_plain(run.public, HEALTH_PATH).await, 200);
+        assert_eq!(
+            get_tls(run.cluster, &peer, server.pin(), "/index.html").await,
+            Ok(404)
+        );
+        run.stop.take().unwrap().send(()).unwrap();
+        run.done.await.unwrap().unwrap();
     }
 
     #[test]

@@ -843,12 +843,28 @@ impl AppRef {
         version: &str,
         manifest: &Manifest,
     ) -> Result<Version, DeployError> {
-        // Until A4 no runtime may silently serve a version without its assets.
-        if manifest.assets.is_some() {
-            return Err(DeployError::Corrupt(format!(
-                "{version}/manifest (assets serving not supported)"
-            )));
-        }
+        let assets = match &manifest.assets {
+            Some(hash) => {
+                let index = self.node_assets_index(hash).await?;
+                let previous = if let Some(previous) = &manifest.previous {
+                    match self.manifest(previous).await {
+                        Ok(m) => match m.assets {
+                            Some(hash) => self.node_assets_index(&hash).await.ok(),
+                            None => None,
+                        },
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                Some(crate::assets::Deployed {
+                    index,
+                    previous,
+                    app: self.clone(),
+                })
+            }
+            None => None,
+        };
         let mut classes = Vec::new();
         for (class, digest) in &manifest.classes {
             let key = format!("{version}/{class}.wasm");
@@ -882,6 +898,7 @@ impl AppRef {
             None => None,
         };
         Ok(Version {
+            assets,
             classes,
             access,
             config,
@@ -891,6 +908,51 @@ impl AppRef {
             limits: manifest.limits.clone(),
             front,
         })
+    }
+
+    async fn node_assets_index(
+        &self,
+        hash: &str,
+    ) -> Result<Arc<crate::assets::Index>, DeployError> {
+        use object_store::ObjectStoreExt;
+        let key = format!("_assets/index/{hash}");
+        let object = self
+            .store
+            .get(&self.path(&key))
+            .await
+            .map_err(|e| match e {
+                object_store::Error::NotFound { .. } => {
+                    DeployError::Corrupt(format!("{key} (missing)"))
+                }
+                e => bucket(e),
+            })?;
+        if object.meta.size > crate::assets::MAX_INDEX as u64 {
+            return Err(DeployError::Corrupt(format!("{key} (size)")));
+        }
+        use futures_util::TryStreamExt;
+        let mut bytes = Vec::new();
+        let mut stream = object.into_stream();
+        while let Some(chunk) = stream.try_next().await.map_err(bucket)? {
+            if bytes.len().saturating_add(chunk.len()) > crate::assets::MAX_INDEX {
+                return Err(DeployError::Corrupt(format!("{key} (size)")));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if crate::assets::digest(&bytes) != hash {
+            return Err(DeployError::Corrupt(format!("{key} (digest)")));
+        }
+        crate::assets::Index::parse(&bytes)
+            .map(Arc::new)
+            .map_err(|_| DeployError::Corrupt(key))
+    }
+
+    pub(crate) async fn asset_content(
+        &self,
+        hash: &str,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.store
+            .get(&self.path(&format!("_assets/content/{hash}")))
+            .await
     }
 
     /// A version's access rules and configuration (digests checked),
@@ -1681,6 +1743,7 @@ impl AppRef {
         // outage alone is not evidence of a policy; a decoded policy is.
         service.set_rate_limits_pending(!manifest.limits.is_empty());
         let Version {
+            assets,
             classes,
             access,
             config,
@@ -1715,7 +1778,8 @@ impl AppRef {
             None => None,
         };
         service
-            .apply_deployed(
+            .apply_deployed_assets(
+                assets,
                 current.seq,
                 &compiled,
                 &service.effective_rules(current.marked, &access),
@@ -2277,6 +2341,8 @@ fn more_open(before: &AccessRules, after: &AccessRules, class: &str) -> bool {
 /// and sizes, never a configuration value.
 #[derive(Clone)]
 pub struct Version {
+    /// Verified static assets of this version.
+    pub assets: Option<crate::assets::Deployed>,
     /// Each class's component bytes.
     pub classes: Vec<(String, Vec<u8>)>,
     /// The version's access rules (classes not listed are open).
@@ -3003,6 +3069,7 @@ mod tests {
     #[test]
     fn version_debug_shows_no_value() {
         let v = Version {
+            assets: None,
             classes: vec![("c".into(), vec![0; 3])],
             access: AccessRules::default(),
             config: BTreeMap::from([(

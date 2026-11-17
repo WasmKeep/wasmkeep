@@ -1,4 +1,4 @@
-//! Static asset index wire format (ADR 0030). No node-side serving yet.
+//! Static asset index and host-only serving (ADR 0030).
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -253,3 +253,13 @@ pub enum Change {
 #[cfg(test)]
 #[path = "assets_tests.rs"]
 mod tests;
+
+mod serving;
+pub use serving::{Cache, Deployed, State};
+
+/// Default process budget for embedders using ActorConfig directly.
+pub fn default_cache() -> std::sync::Arc<Cache> {
+    static CACHE: std::sync::LazyLock<std::sync::Arc<Cache>> =
+        std::sync::LazyLock::new(|| Cache::new(1024 * 1024 * 1024));
+    CACHE.clone()
+}

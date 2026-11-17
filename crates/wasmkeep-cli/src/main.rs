@@ -595,6 +595,10 @@ struct DevArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ServeArgs {
+    /// Process-wide static asset disk cache ceiling in bytes.
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    assets_cache_bytes: u64,
+
     /// The front: a stateless component (.wasm exporting
     /// wasi:http/incoming-handler) for every path outside /actor/ and
     /// /_wasmkeep/. It may call the --actor classes with actors.call, and
@@ -1726,6 +1730,8 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             config.requires = deployed.requires;
             config.batched = deployed.batched;
             config.limits = deployed.limits;
+            config.assets = deployed.assets;
+            config.assets_cache = wasmkeep_server::assets::Cache::new(args.assets_cache_bytes);
             config.expire_after_idle = deployed
                 .expire
                 .iter()

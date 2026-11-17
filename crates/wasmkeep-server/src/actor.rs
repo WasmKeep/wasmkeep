@@ -204,6 +204,10 @@ pub struct ActorConfig {
     /// The front of the deployed version the node starts with, if it has
     /// one (ADR 0023): linked at start, then swapped with each version.
     pub front: Option<crate::front::DeployedFront>,
+    /// Version's static assets, with their app-scoped bucket source.
+    pub assets: Option<crate::assets::Deployed>,
+    /// Shared process-wide disk cache budget.
+    pub assets_cache: Arc<crate::assets::Cache>,
     /// Join a cluster: actors run only on the node holding their lease, and
     /// requests reaching another node are forwarded. `None` runs alone.
     pub cluster: Option<ClusterConfig>,
@@ -250,6 +254,8 @@ impl ActorConfig {
             max_front_requests: None,
             front_env: crate::env::Vars::new(),
             front: None,
+            assets: None,
+            assets_cache: crate::assets::default_cache(),
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,
         }
@@ -297,6 +303,7 @@ struct ServiceInner {
     /// The deployed version's front, swapped with its classes under the
     /// classes' lock; `None` while it has none.
     front: crate::front::FrontSlot,
+    assets: std::sync::RwLock<Arc<crate::assets::State>>,
     limits: std::sync::RwLock<crate::apps::limits::Policies>,
     rate_limiter: crate::rate_limit::Limiter,
     rate_limits_pending: std::sync::atomic::AtomicBool,
