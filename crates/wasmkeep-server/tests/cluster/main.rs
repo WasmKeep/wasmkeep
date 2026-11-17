@@ -831,6 +831,9 @@ struct Flaky {
     fail_wal: Arc<std::sync::atomic::AtomicU32>,
     /// Delay segment uploads by this many ms (applied before writing).
     delay_wal_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Hold WAL uploads until the test releases them, without a timed sleep.
+    hold_wal_puts: tokio::sync::watch::Sender<bool>,
+    held_wal_puts: Arc<AtomicUsize>,
     /// Delay alarm index entry uploads (`alarms/`) by this many ms.
     delay_alarm_puts_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The next this-many segment (`/wal/`) reads never answer: a request
@@ -942,6 +945,8 @@ impl Flaky {
             down,
             fail_wal: Arc::default(),
             delay_wal_ms: Arc::default(),
+            hold_wal_puts: tokio::sync::watch::channel(false).0,
+            held_wal_puts: Arc::default(),
             delay_alarm_puts_ms: Arc::default(),
             hang_wal_gets: Arc::default(),
             fail_wal_gets: Arc::default(),
@@ -1105,6 +1110,11 @@ impl ObjectStore for Flaky {
             }
         }
         if location.as_ref().contains("/wal/") {
+            let mut hold = self.hold_wal_puts.subscribe();
+            if *hold.borrow() {
+                self.held_wal_puts.fetch_add(1, Ordering::SeqCst);
+                let _ = hold.wait_for(|held| !*held).await;
+            }
             let delay = self.delay_wal_ms.load(Ordering::SeqCst);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;

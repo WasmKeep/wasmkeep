@@ -1788,6 +1788,8 @@ async fn restore_failure_at_each_mutation_can_resume_without_losing_generation_f
         let total = count.load(std::sync::atomic::Ordering::SeqCst);
         if result.is_err() {
             failures += 1;
+            // Undo publication also uses the destination's prune lock.
+            f.dest.delete(&Key::from("prune-lock")).await.unwrap();
             // Clearing an orphaned exclusive lock is the documented recovery
             // after a failure to release it. Never remove the fence/journal.
             if optional(&f.source, "apps/acme/shop/restore-lock")
@@ -2824,4 +2826,493 @@ async fn actor_restore_from_backup_replays_selected_position_and_rejects_tamperi
         .is_err()
     );
     assert!(!refused.exists());
+}
+
+fn prune_time() -> u128 {
+    now_ms().unwrap() + 25 * 60 * 60 * 1000
+}
+
+#[tokio::test]
+async fn prune_retention_latest_shared_objects_and_destination_only() {
+    let f = Fixture::new().await;
+    let first = f.create().await;
+    let second = f.create().await;
+    let before = list_bounded(&f.source, "").await.unwrap();
+    // Keep latest even if it is not the lexicographically newest run.
+    let root = read(&f.dest, &format!("runs/{first}/root"), META_MAX)
+        .await
+        .unwrap();
+    put(&f.dest, "latest", root, true).await.unwrap();
+    prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+    assert!(load(&f.dest, "", &first).await.is_ok());
+    assert!(load(&f.dest, "", &second).await.is_err());
+    verify(&f.dest, "", &first, None).await.unwrap();
+    assert_eq!(before, list_bounded(&f.source, "").await.unwrap());
+}
+
+#[tokio::test]
+async fn prune_pins_undo_and_restoring_runs() {
+    let f = Fixture::new().await;
+    let undo = f.create().await;
+    let restoring = f.create().await;
+    let latest = f.create().await;
+    put(
+        &f.dest,
+        "before-restore/nonce",
+        undo.as_bytes().to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    put(
+        &f.dest,
+        &format!("restoring/{restoring}"),
+        restoring.as_bytes().to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+    for id in [undo, restoring, latest] {
+        verify(&f.dest, "", &id, None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn prune_refuses_running_create_and_collects_abandoned_runs() {
+    let f = Fixture::new().await;
+    f.create().await;
+    json_put(
+        &f.dest,
+        "runs/abandoned/started",
+        &json!({"started_ms":now_ms().unwrap()}),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        prune::execute(&f.dest, "", 0, now_ms().unwrap())
+            .await
+            .is_err()
+    );
+    assert!(
+        optional(&f.dest, "runs/abandoned/started")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+    assert!(
+        optional(&f.dest, "runs/abandoned/started")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Finished markers must allow a subsequent create.
+    f.create().await;
+}
+
+#[tokio::test]
+async fn prune_age_floor_and_newest_n() {
+    let f = Fixture::new().await;
+    let a = f.create().await;
+    let b = f.create().await;
+    let c = f.create().await;
+    let orphan = format!("data/{}", digest(b"orphan"));
+    put(&f.dest, &orphan, b"orphan".to_vec(), false)
+        .await
+        .unwrap();
+    prune::execute(&f.dest, "", 0, now_ms().unwrap())
+        .await
+        .unwrap();
+    assert!(optional(&f.dest, &orphan).await.unwrap().is_some());
+    for id in [&a, &b, &c] {
+        assert!(load(&f.dest, "", id).await.is_ok());
+    }
+    prune::execute(&f.dest, "", 2, prune_time()).await.unwrap();
+    let mut ids = [a, b, c.clone()];
+    ids.sort();
+    for id in &ids[1..] {
+        assert!(load(&f.dest, "", id).await.is_ok());
+    }
+    if ids[0] != c {
+        assert!(load(&f.dest, "", &ids[0]).await.is_err());
+    }
+    assert!(optional(&f.dest, &orphan).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prune_interruption_each_mutation_and_lost_response() {
+    for lost in [false, true] {
+        let mut failures = 0;
+        for fail in 0..100 {
+            let f = Fixture::new().await;
+            let old = f.create().await;
+            let latest = f.create().await;
+            put(&f.dest, "data/orphan", b"orphan".to_vec(), false)
+                .await
+                .unwrap();
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let faulty: Store = Arc::new(FailMutation {
+                inner: f.dest.clone(),
+                count: count.clone(),
+                fail,
+                lost,
+                stray: false,
+            });
+            let result = prune::execute(&faulty, "", 0, prune_time()).await;
+            let mutations = count.load(std::sync::atomic::Ordering::SeqCst);
+            let exhausted = fail >= mutations;
+            if exhausted {
+                result.unwrap();
+            } else {
+                // An uncertain PUT can recover by reading back identical
+                // bytes (same_or_create); pre-write failures must propagate.
+                if !lost {
+                    assert!(result.is_err(), "mutation {fail} must report failure");
+                }
+                failures += 1;
+            }
+            // Simulate recovery after stopping the crashed process and draining its I/O.
+            f.dest.delete(&Key::from("prune-lock")).await.unwrap();
+            prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+            assert!(load(&f.dest, "", &old).await.is_err());
+            verify(&f.dest, "", &latest, None).await.unwrap();
+            if exhausted {
+                break;
+            }
+            assert!(fail < 99, "mutation sweep must reach a fault-free pass");
+        }
+        assert!(failures > 0, "mutation sweep must inject failures");
+    }
+}
+
+#[tokio::test]
+async fn prune_invalid_kept_manifest_fails_before_deleting() {
+    let f = Fixture::new().await;
+    let old = f.create().await;
+    let kept = f.create().await;
+    put(
+        &f.dest,
+        &format!("runs/{kept}/complete"),
+        b"{}".to_vec(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(prune::execute(&f.dest, "", 0, prune_time()).await.is_err());
+    assert!(load(&f.dest, "", &old).await.is_ok());
+}
+
+#[derive(Debug)]
+struct PrunePause {
+    inner: Store,
+    at: &'static str,
+    paused: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+impl std::fmt::Display for PrunePause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("prune interleaving")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for PrunePause {
+    async fn put_opts(
+        &self,
+        path: &Key,
+        payload: object_store::PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let result = self.inner.put_opts(path, payload, opts).await?;
+        let matches = path.as_ref().starts_with(self.at) || path.as_ref().ends_with(self.at);
+        if matches && !self.paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(result)
+    }
+    async fn put_multipart_opts(
+        &self,
+        _: &Key,
+        _: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        unreachable!()
+    }
+    async fn get_opts(
+        &self,
+        path: &Key,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(path, opts).await
+    }
+    fn list(
+        &self,
+        prefix: Option<&Key>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    fn delete_stream(
+        &self,
+        keys: futures_util::stream::BoxStream<'static, object_store::Result<Key>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Key>> {
+        self.inner.delete_stream(keys)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &Key,
+        to: &Key,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+#[tokio::test]
+async fn prune_concurrent_create_both_start_orders() {
+    for at_started in [true, false] {
+        let f = Fixture::new().await;
+        let latest = f.create().await;
+        let pause = Arc::new(PrunePause {
+            inner: f.dest.clone(),
+            at: if at_started { "/started" } else { "prunes/" },
+            paused: false.into(),
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        let store: Store = pause.clone();
+        if at_started {
+            let args = f.args();
+            let creating = create(&args, &f.source, "", &store, "");
+            let racing = async {
+                pause.entered.notified().await;
+                assert!(
+                    prune::execute(&f.dest, "", 0, now_ms().unwrap())
+                        .await
+                        .is_err()
+                );
+                pause.release.notify_one();
+            };
+            let (result, ()) = tokio::join!(creating, racing);
+            // The marker snapshot precedes started: even a fully finished
+            // refused prune must invalidate this create (the ABA case).
+            assert!(result.is_err());
+        } else {
+            let pruning = prune::execute(&store, "", 0, now_ms().unwrap());
+            let racing = async {
+                pause.entered.notified().await;
+                assert!(create(&f.args(), &f.source, "", &f.dest, "").await.is_err());
+                pause.release.notify_one();
+            };
+            let (result, ()) = tokio::join!(pruning, racing);
+            result.unwrap();
+        }
+        verify(&f.dest, "", &latest, None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn prune_removes_unshared_content_but_keeps_shared_app_objects() {
+    let f = Fixture::new().await;
+    let old = f.create().await;
+    put(
+        &f.source,
+        "apps/acme/shop/current",
+        b"v2 1 3\n".to_vec(),
+        true,
+    )
+    .await
+    .unwrap();
+    put(
+        &f.source,
+        "apps/acme/shop/v2/manifest",
+        b"wasmkeep-manifest 1\n".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    let kept = f.create().await;
+    prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+    assert!(load(&f.dest, "", &old).await.is_err());
+    assert!(
+        optional(&f.dest, &format!("data/{}", digest(b"v1 1 3\n")))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        optional(
+            &f.dest,
+            &format!("data/{}", digest(b"wasmkeep-manifest 1\n"))
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    verify(&f.dest, "", &kept, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn prune_protects_run_of_real_interrupted_restore_fence() {
+    let f = Fixture::new().await;
+    let restoring = f.create().await;
+    f.create().await;
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    let fault: Store = Arc::new(FailMutation {
+        inner: target.clone(),
+        count: Arc::new(0.into()),
+        fail: 3,
+        lost: false,
+        stray: false,
+    });
+    assert!(
+        restore::execute(
+            &restore_args(&restoring, false),
+            &f.dest,
+            "",
+            &fault,
+            "",
+            std::time::Duration::ZERO
+        )
+        .await
+        .is_err()
+    );
+    let bytes = optional(&target, "apps/acme/shop/restoring")
+        .await
+        .unwrap()
+        .expect("restore must have reached its fence");
+    let journal: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(journal["run"], restoring);
+    prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+    verify(&f.dest, "", &restoring, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn prune_excludes_other_pruners_and_restore_pin_during_scan() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let pause = Arc::new(PrunePause {
+        inner: f.dest.clone(),
+        at: "prunes/",
+        paused: false.into(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let store: Store = pause.clone();
+    let pruning = prune::execute(&store, "", 0, now_ms().unwrap());
+    let racing = async {
+        pause.entered.notified().await;
+        assert!(
+            prune::execute(&f.dest, "", 0, now_ms().unwrap())
+                .await
+                .is_err()
+        );
+        assert!(prune::pin(&f.dest, "", &id).await.is_err());
+        assert!(
+            optional(&f.dest, &format!("restoring/{id}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        pause.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(pruning, racing);
+    result.unwrap();
+    prune::pin(&f.dest, "", &id).await.unwrap();
+}
+
+#[tokio::test]
+async fn prune_prefix_isolation() {
+    let f = Fixture::new().await;
+    let outside = f.create().await;
+    let old = create(&f.args(), &f.source, "", &f.dest, "archive")
+        .await
+        .unwrap();
+    let kept = create(&f.args(), &f.source, "", &f.dest, "archive")
+        .await
+        .unwrap();
+    prune::execute(&f.dest, "archive", 0, prune_time())
+        .await
+        .unwrap();
+    assert!(load(&f.dest, "archive", &old).await.is_err());
+    verify(&f.dest, "archive", &kept, None).await.unwrap();
+    verify(&f.dest, "", &outside, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn prune_cannot_enter_between_create_complete_and_latest() {
+    let f = Fixture::new().await;
+    let previous = f.create().await;
+    let pause = Arc::new(PrunePause {
+        inner: f.dest.clone(),
+        at: "/complete",
+        paused: false.into(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let store: Store = pause.clone();
+    let args = f.args();
+    let creating = create(&args, &f.source, "", &store, "");
+    let racing = async {
+        pause.entered.notified().await;
+        assert_eq!(latest(&f.dest, "").await.unwrap(), Some(previous));
+        // Even treating all data as old cannot prune the unpublished run.
+        let error = prune::execute(&f.dest, "", 0, prune_time())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("prune locked"));
+        pause.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(creating, racing);
+    let id = result.unwrap();
+    assert_eq!(latest(&f.dest, "").await.unwrap(), Some(id.clone()));
+    verify(&f.dest, "", &id, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn prune_exact_age_boundary_preserves_then_collects() {
+    let f = Fixture::new().await;
+    f.create().await;
+    put(&f.dest, "runs/abandoned/started", b"{}".to_vec(), false)
+        .await
+        .unwrap();
+    let stamp = f
+        .dest
+        .head(&Key::from("runs/abandoned/started"))
+        .await
+        .unwrap()
+        .last_modified
+        .timestamp_millis() as u128;
+    let boundary = stamp + 24 * 60 * 60 * 1000;
+    assert!(prune::execute(&f.dest, "", 0, boundary).await.is_err());
+    prune::execute(&f.dest, "", 0, boundary + 1).await.unwrap();
+    assert!(
+        optional(&f.dest, "runs/abandoned/started")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    put(&f.dest, "data/orphan", b"orphan".to_vec(), false)
+        .await
+        .unwrap();
+    let stamp = f
+        .dest
+        .head(&Key::from("data/orphan"))
+        .await
+        .unwrap()
+        .last_modified
+        .timestamp_millis() as u128;
+    let boundary = stamp + 24 * 60 * 60 * 1000;
+    prune::execute(&f.dest, "", 0, boundary).await.unwrap();
+    assert!(optional(&f.dest, "data/orphan").await.unwrap().is_some());
+    prune::execute(&f.dest, "", 0, boundary + 1).await.unwrap();
+    assert!(optional(&f.dest, "data/orphan").await.unwrap().is_none());
 }

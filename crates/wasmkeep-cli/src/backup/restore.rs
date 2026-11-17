@@ -10,7 +10,11 @@ fn now_ms() -> anyhow::Result<u64> {
     Ok(u64::try_from(super::now_ms()?)?)
 }
 
-async fn same_or_create(store: &Store, path: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+pub(super) async fn same_or_create(
+    store: &Store,
+    path: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<()> {
     let path = Key::parse(path)?;
     match store
         .put_opts(
@@ -60,7 +64,7 @@ async fn replace_conditional(store: &Store, path: &str, bytes: Vec<u8>) -> anyho
     Ok(())
 }
 
-async fn acquire_lock(
+pub(super) async fn acquire_lock(
     store: &Store,
     path: &str,
     binding: &Value,
@@ -75,7 +79,7 @@ async fn acquire_lock(
             let bytes = current.bytes().await?;
             ensure!(
                 bytes.starts_with(b"unlocked "),
-                "restore already locked; stop the old CLI and wait 40 seconds before clearing only restore-lock"
+                "operation already locked at {path}; stop the old CLI and wait 40 seconds before clearing only this lock"
             );
             PutMode::Update(version)
         }
@@ -426,6 +430,7 @@ pub(super) async fn execute(
         (None, Some(id)) => id.to_owned(),
         (None, None) => latest(archive, ap).await?.context("no latest run")?,
     };
+    prune::pin(archive, ap, &id).await?;
     // Full verification is mandatory even on resume, before any target write.
     let root_key = key(ap, &format!("runs/{id}/root"));
     let root = read(archive, &root_key, META_MAX).await?;

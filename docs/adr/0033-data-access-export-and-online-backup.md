@@ -3,7 +3,8 @@
 - Status: partially implemented (2026-11-15): actor export and read-only
   actor SQL and history listing are built. Online backup create/list/verify
   have an initial implementation; the [backup guide](../deploy/backup-and-restore.md)
-  records its cache, concurrency and prune-coordination limits. Whole-app
+  records its cache and concurrency limits. Step 8 (`backup prune`) is implemented
+  with the retention and coordination refinement below. Whole-app
   backup restore (plan step 6) is implemented; the guide records its recovery
   journal, `restore` heartbeat capability, partial-undo force warning and
   phase-specific abort/undo recovery. Single-actor
@@ -415,7 +416,8 @@ idempotent by design).
 source and nothing else, never a node, never a write: a credential
 that can read but not write or delete the bucket is enough. The
 destination needs PUT: objects are created with `If-None-Match: *`,
-and only `latest` and `runs/<id>/verified` are ever replaced. Only `prune`
+and only `latest`, `runs/<id>/verified` and the conditional publication lock
+are replaced. Only `prune`
 needs DELETE there, and is meant to run with another credential. The
 destination's credentials come from `--to-env FILE` (the variables
 `object_store` reads, in an env file), so that the nodes' credentials
@@ -432,7 +434,10 @@ backup guide already asks.
 | `runs/<run id>/app/<tenant>/<app>` | The deploy version and the secrets version the run copied for that app, with their keys. |
 | `runs/<run id>/complete` | Written last: the run's summary and the SHA-256 of every chunk. A run is **restorable** only if this object exists and its chunks match it. |
 | `latest` | The id and completion record SHA-256 of the newest complete run (a checked hint; `backup list` lists `runs/`). |
-| `prunes/<id>` | Written by `prune` before it deletes anything (below). |
+| `prunes/<id>` | Permanent marker written by `prune` before scanning or deleting (below). |
+| `prune-done/<id>` | Closes the corresponding marker after pending requests drain. |
+| `prune-lock` | Conditional lock shared by pruning and backup publication; retained as an unlocked record after release. |
+| `before-restore/<nonce>`, `restoring/<run>` | Permanent undo labels and restore pins containing the protected run ID. |
 
 A run id is the start time (UTC, to the second) and 8 random hex
 digits, so two runs never share one. The destination is an archive,
@@ -626,21 +631,42 @@ checked. `create` has already replayed what it read from the source;
 reads.
 
 **`backup prune --keep-runs N`** deletes runs beyond the newest `N`
-complete ones: `complete` and `verified` first, so a run being pruned is
-never listed as restorable, then its chunks and `started`. It then
-deletes the `data/` objects that no kept run names. **Prune and create
-exclude each other.** Prune writes `prunes/<id>` before it deletes
-anything. It refuses while any run has `started` without `complete`
-and is younger than 24 hours. Older ones are abandoned, and are pruned
-like any other. It also deletes only `data/` objects older than 24
-hours. Before writing `complete`, a run lists `prunes/`. If a prune
-started after the run's `started`, the run checks with a HEAD each
-object it carried over or skipped as present, and copies again any
-that is gone. That listing of every kept manifest is the
-costly part (section 8). Pruning is also how a delete reaches the
-backups: a deleted actor's data stays in the runs from before its
-delete until they are pruned. The docs say so beside `actor delete`.
-`delete-self` and idle expiry erase the live bucket, not the backups.
+complete ones (ordered by run ID), except `latest`, complete runs started within
+24 hours, and permanent undo/restore pins. `N = 0` still retains these exceptions.
+`before-restore/<nonce>` labels and archive `restoring/<run>` pins contain the run
+ID and never expire automatically. Whole-app and backup-backed actor restore
+publish a destination pin before reading a run or changing a target; undo backup
+pins its result before publication. Finish older CLI restores before enabling
+prune: their live-bucket fences cannot be discovered from the destination alone.
+
+Prune validates every kept manifest and computes their union of content hashes
+across actors and apps before deleting anything. It deletes `complete` and
+`verified` first, then the other run metadata, with `started` last. It collects
+only unreferenced `data/` objects older than 24 hours. It refuses while a run has
+`started` without `complete` and is at most 24 hours old; older incomplete runs
+are abandoned. Create refuses publication after 24 hours. Ages use the bucket's
+modification time against the CLI clock, which must be synchronized.
+
+**Coordination refinement (step 8).** Prune writes a permanent `prunes/<nonce>`
+marker before scanning. `prune-done/<nonce>` records its completion after pending
+requests drain, even when the pass refused. Create checks for active markers
+before starting and compares the permanent marker set before publishing. Any
+intervening prune refuses completion rather than attempting the originally
+proposed HEAD-and-recopy recovery. Keeping completed markers closes the race
+where an entire prune fits between a create's two listings. A conditional
+`prune-lock` serializes prune deletion and create's `complete`/`root`/`latest`
+publication. No new dependency is required.
+
+Retries recompute reachability; no stale deletion plan is replayed. A killed
+process leaves the lock held: stop it, wait 40 seconds for pending requests,
+clear only `prune-lock`, and retry. This follows whole-app restore's recovery
+convention and fails closed rather than expiring a live lock. Ordinary returned
+errors attempt to unlock. Markers and pins must not be removed as routine cleanup.
+The [operator guide](../deploy/backup-and-restore.md#prune-an-online-archive)
+records these recovery and upgrade requirements.
+
+Pruning is how a delete reaches the backups: deleted actors' data remains in
+kept runs. `delete-self` and idle expiry erase the live bucket, not the backups.
 
 **What this changes in the rule of the backup guide.** "Restorable only
 with the cluster stopped" becomes:
@@ -1067,7 +1093,7 @@ bounds: against 0.4.2's floor these tools weigh more.
 | `actor sql` with a warm cache | ⌈n/1000⌉ | new segments only | 0 | 0 |
 | A retry after collection (section 1) | +⌈n/1000⌉ | up to +64 | 0 | 0 |
 | `backup create`, first run, `head` | ⌈K/1000⌉ + 1 (`prunes/`) | Σ (2 + s) over actors, + deploy and secrets objects | the same, in the destination, + C + 4 | 0 |
-| `backup create`, later run, `head` | ⌈K/1000⌉ + 1 | per moved actor: new objects of its plan (+ one HEAD per carried object if a prune ran meanwhile) | the same, + C + 4 | 0 |
+| `backup create`, later run, `head` | ⌈K/1000⌉ + 1 | per moved actor: new objects of its plan (publication refused if a prune ran meanwhile) | the same, + C + 4 | 0 |
 | `backup create`, `all` | ⌈K/1000⌉ | one per object written since the last run | the same | 0 |
 | `backup verify` | 0 (manifest) | Σ (2 + s) in the destination, or for the sample | 1 | 0 |
 | `backup restore` | 2 (nodes, empty check); in place, + a backup run's and ⌈old keys/1000⌉ per listing until empty | Σ (2 + s) from the destination; in place, + one record read per old actor | Σ (2 + s) + one marker per actor + one or two per alarm + deploy + `restoring` and `restored` | 1 (`restoring`); in place, + every old key |
@@ -1185,8 +1211,8 @@ What follows from it:
    databases are local files, and SQLite's online backup API would
    export them. It is not part of this record.
 8. **The change feed's discovery, schema drift and scale** (section 7).
-9. **Pruning runs that share objects across apps** with `--all`, and a
-   retention rule for `before-restore` runs.
+9. Resolved by step 8: shared objects are retained by the union of kept
+   manifests; `before-restore` pins have no automatic expiry.
 
 ## Tests (to build)
 
@@ -1204,6 +1230,12 @@ What follows from it:
 - a position before the newest delete reports as erased, not missing;
 - the destination's carry-over refuses a plan key whose size or `ETag`
   changed (a recreated app's keys come back with other bytes).
+
+**Prune unit tests** (`wasmkeep-cli`, in-memory stores): retention and age
+boundaries, `latest`, shared and unshared content, undo labels, a real interrupted
+restore fence, malformed kept manifests, archive-prefix isolation, both
+create/prune start orders, concurrent pruners and pin admission, and a fault
+before/after each mutation (including lost responses) followed by recovery.
 
 **Simulation** (`sim/tests/madsim_backup.rs`, new). Backup ordering
 against collection is the kind of interleaving CLAUDE.md asks a
@@ -1319,7 +1351,8 @@ One PR each, with tests that fail before it:
 7. `actor restore`: the `restores/` family, the job, `AfterRestore`,
    `operator_restore` carried by every delete, and the two simulation
    additions; an adversarial review of the job.
-8. `backup prune`.
+8. `backup prune` (implemented; destination-only retention, permanent pins,
+   marker handshake and conditional publication/deletion lock).
 9. The drill in `check.sh --s3` and in the soak; section 8 measured.
 10. The change feed, after its open questions are answered in a record
     of its own.

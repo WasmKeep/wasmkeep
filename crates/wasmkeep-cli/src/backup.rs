@@ -35,6 +35,7 @@ pub enum Command {
     List(From),
     Verify(Verify),
     Restore(Restore),
+    Prune(Prune),
 }
 #[derive(Debug, Args)]
 pub struct Create {
@@ -69,6 +70,14 @@ pub struct From {
     from: String,
 }
 #[derive(Debug, Args)]
+pub struct Prune {
+    #[arg(long)]
+    from: String,
+    /// Keep the newest N complete runs, plus latest, recent runs and pins.
+    #[arg(long)]
+    keep_runs: usize,
+}
+#[derive(Debug, Args)]
 pub struct Verify {
     #[arg(long)]
     from: String,
@@ -77,6 +86,7 @@ pub struct Verify {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     sample: Option<u64>,
 }
+mod prune;
 mod restore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -396,6 +406,10 @@ fn disjoint(source: (&str, &str, &str), dest: (&str, &str, &str)) -> anyhow::Res
 pub fn run(command: &Command) -> anyhow::Result<()> {
     crate::run_async(async {
         match command {
+            Command::Prune(args) => {
+                let (store, prefix, _) = configured(&args.from, None, None)?;
+                prune::execute(&store, &prefix, args.keep_runs, now_ms()?).await
+            }
             Command::Restore(args) => {
                 let (archive, ap, ae) = configured(&args.from, None, None)?;
                 let (target, tp, te) = configured(&args.bucket, None, None)?;
@@ -1673,6 +1687,7 @@ async fn create_undo(
     dp: &str,
     undo_fence: Option<&[u8]>,
 ) -> anyhow::Result<String> {
+    let started_at = now_ms()?;
     let nonce = tempfile::tempdir()?;
     let seconds = i64::try_from(now_ms()? / 1000)?;
     let stamp = chrono::DateTime::from_timestamp(seconds, 0)
@@ -1712,6 +1727,7 @@ async fn create_undo(
         )?;
         starts.insert(name, marker);
     }
+    let prunes = prune::markers(dest, dp).await?;
     let started_hash = json_put(
         dest,
         &key(&base, "started"),
@@ -1719,7 +1735,6 @@ async fn create_undo(
         false,
     )
     .await?;
-    let prunes = list_bounded(dest, &format!("{}/", key(dp, "prunes"))).await?;
     let previous = match optional(dest, &key(dp, "latest")).await? {
         Some(_) => Some(
             load(
@@ -1857,17 +1872,27 @@ async fn create_undo(
         app_records.push(json!({"key":path,"sha256":hash}));
     }
     flush_chunk(dest, &base, &mut chunks, &mut actors).await?;
-    let after = list_bounded(dest, &format!("{}/", key(dp, "prunes"))).await?;
+    // Serialize publication with deletion, including the complete -> latest gap.
+    let publication_lock = key(dp, "prune-lock");
+    let (lock_version, lock_nonce) = restore::acquire_lock(
+        dest,
+        &publication_lock,
+        &json!({"operation":"create", "run":id}),
+    )
+    .await?;
+    let result: anyhow::Result<String> = async {
     ensure!(
-        prunes.keys().eq(after.keys()),
+        prunes == prune::markers(dest, dp).await?,
         "prune started during create; refusing completion, retry the run"
     );
-    // A pre-existing recent prune may still be running. Refuse rather than
-    // publishing references it can remove; prune is a later ADR slice.
     ensure!(
-        after.is_empty(),
-        "destination has prune markers; completion refused until prune coordination is available"
+        now_ms()?.saturating_sub(started_at) < 24 * 60 * 60 * 1000,
+        "backup exceeded 24 hours; refusing completion"
     );
+    // Pin undo runs before publishing them, not after returning to restore.
+    if undo_fence.is_some() {
+        prune::pin(dest, dp, &id).await?;
+    }
     // Recheck every app at the end of the entire run, including apps copied
     // before a later app took a long time.
     for (app, started) in &starts {
@@ -1916,6 +1941,24 @@ async fn create_undo(
         failures.is_empty() || undo_fence.is_some(),
         "partial backup; failed actors are recorded, verification will refuse it"
     );
+    Ok(id)
+    }.await;
+    #[cfg(not(test))]
+    if result.is_err() {
+        tokio::time::sleep(wasmkeep_server::apps::LATE_WRITES).await;
+    }
+    let unlock = dest
+        .put_opts(
+            &Key::parse(publication_lock)?,
+            format!("unlocked {lock_nonce}").into_bytes().into(),
+            PutOptions {
+                mode: PutMode::Update(lock_version),
+                ..Default::default()
+            },
+        )
+        .await;
+    let id = result?;
+    unlock?;
     Ok(id)
 }
 
@@ -2081,6 +2124,7 @@ async fn export_actor_from_store(
             .await?
             .context("backup has no complete run")?,
     };
+    prune::pin(store, prefix, &id).await?;
     let run = load(store, prefix, &id).await?;
     let (_, source_prefix) = crate::parse_bucket(text(&run.complete, "source")?)?;
     let suffix = format!(
