@@ -193,3 +193,24 @@ fn dev_assets_refuses_only_the_bad_name_and_never_compresses() {
     assert!(file.br.is_none() && file.gzip.is_none());
     assert!(result.warnings.iter().any(|s| s.contains("link")));
 }
+
+#[test]
+fn review_compression_backend_and_version_contract() {
+    let manifest = include_str!("../Cargo.toml");
+    let dependency = manifest
+        .lines()
+        .find(|line| line.starts_with("flate2 ="))
+        .unwrap();
+    assert!(dependency.contains("default-features = false"));
+    assert!(dependency.contains("features = [\"rust_backend\"]"));
+    let lock = include_str!("../../../Cargo.lock");
+    let resolved = lock
+        .split("[[package]]")
+        .find(|package| package.contains("name = \"flate2\""))
+        .unwrap();
+    assert!(resolved.contains("\"miniz_oxide\""));
+    assert!(!resolved.contains("\"zlib-rs\""));
+    let docs = include_str!("../../../docs/static-assets.md");
+    assert!(docs.contains("compressed variants depend on the CLI version"));
+    assert!(docs.contains("unchanged deploy into a changed deploy"));
+}

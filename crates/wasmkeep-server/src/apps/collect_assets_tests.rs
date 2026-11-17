@@ -17,6 +17,8 @@ struct Bucket {
     inner: Arc<InMemory>,
     ages: Arc<Mutex<BTreeMap<Path, Duration>>>,
     pause: Arc<AtomicBool>,
+    s3_metadata: Arc<AtomicBool>,
+    fail_marker_delete: Arc<AtomicBool>,
     listed: Arc<tokio::sync::Notify>,
     resume: Arc<tokio::sync::Notify>,
 }
@@ -35,6 +37,12 @@ impl Bucket {
                 .get(&m.location)
                 .copied()
                 .unwrap_or_default();
+        if self.s3_metadata.load(Ordering::SeqCst) {
+            m.last_modified -=
+                Duration::from_nanos(u64::from(m.last_modified.timestamp_subsec_nanos()));
+            m.last_modified += Duration::from_millis(123);
+            m.version = None;
+        }
         m
     }
     fn age(&self, key: Path, seconds: u64) {
@@ -58,15 +66,38 @@ impl ObjectStore for Bucket {
         self.inner.put_multipart_opts(p, o).await
     }
     async fn get_opts(&self, p: &Path, o: GetOptions) -> Result<GetResult> {
+        let head = o.head;
         let mut r = self.inner.get_opts(p, o).await?;
         r.meta = self.meta(r.meta);
+        if head && self.s3_metadata.load(Ordering::SeqCst) {
+            r.meta.version = Some("version-id".into());
+            r.meta.last_modified = r.meta.last_modified
+                - Duration::from_nanos(u64::from(r.meta.last_modified.timestamp_subsec_nanos()));
+        }
         Ok(r)
     }
     fn delete_stream(
         &self,
         p: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        self.inner.delete_stream(p)
+        let this = self.clone();
+        p.then(move |p| {
+            let this = this.clone();
+            async move {
+                let p = p?;
+                if this.fail_marker_delete.load(Ordering::SeqCst)
+                    && p.as_ref().contains("_assets/deploying/")
+                {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "marker delete failed".into(),
+                    });
+                }
+                this.inner.delete(&p).await?;
+                Ok(p)
+            }
+        })
+        .boxed()
     }
     fn list(&self, p: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let this = self.clone();
@@ -177,6 +208,7 @@ async fn every_version_including_orphan_keeps_index_and_content() {
 #[tokio::test]
 async fn fresh_deploy_blocks_stale_killed_deploy_does_not() {
     let (s, a) = setup();
+    s.s3_metadata.store(true, Ordering::SeqCst);
     let c = content(&s, &a, 7200).await;
     s.pause.store(true, Ordering::SeqCst);
     let ad = a.clone();
@@ -449,4 +481,100 @@ async fn assets_are_collected_after_their_last_version_is_collected() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn review_s3_head_list_metadata_and_stale_marker() {
+    let (s, a) = setup();
+    s.s3_metadata.store(true, Ordering::SeqCst);
+    let c = content(&s, &a, 7200).await;
+    let marker = a.path("_assets/deploying/0123456789abcdef");
+    s.put(&marker, vec![].into()).await.unwrap();
+    s.age(marker.clone(), 7200);
+    let listed = s
+        .list(Some(&a.path("_assets/content")))
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+    let head = s.head(&c).await.unwrap();
+    assert_eq!(listed.version, None);
+    assert_eq!(head.version.as_deref(), Some("version-id"));
+    assert_ne!(listed.last_modified, head.last_modified);
+    assert_eq!(a.collect_assets(Duration::ZERO).await.unwrap(), 1);
+    assert!(s.head(&c).await.is_err());
+    assert!(s.head(&marker).await.is_err());
+}
+
+#[tokio::test]
+async fn review_marker_cleanup_failure_is_success_and_collection_explains_skip() {
+    let (s, a) = setup();
+    s.fail_marker_delete.store(true, Ordering::SeqCst);
+    let runtime =
+        wasmkeep_runtime::Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+    let deployed = a
+        .deploy_changes(
+            &runtime,
+            Changes {
+                assets: Change::Set(bundle()),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(a.current().await.unwrap().unwrap(), deployed.current);
+    assert_eq!(a.collect(0, Duration::ZERO).await.unwrap(), (0, 0));
+}
+
+#[test]
+fn review_orphan_manifest_is_named() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "apps::collect::asset_tests::every_version_including_orphan_keeps_index_and_content",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("orphan") && stderr.contains("manifest"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn review_marker_cleanup_warning_and_collection_reason_are_reported() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "apps::collect::asset_tests::review_marker_cleanup_failure_is_success_and_collection_explains_skip", "--nocapture"])
+        .output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning: deploy is done"), "{stderr}");
+    assert!(
+        stderr.contains("assets not collected: a deploy is in progress"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn review_recheck_keeps_changed_etag_or_size() {
+    let (s, a) = setup();
+    let key = content(&s, &a, 7200).await;
+    let original = s.head(&key).await.unwrap();
+    for change_size in [false, true] {
+        let mut candidate = original.clone();
+        if change_size {
+            candidate.size += 1;
+        } else {
+            candidate.e_tag = Some("old-etag".into());
+        }
+        assert!(
+            !a.delete_candidate(&candidate, tokio::time::Instant::now())
+                .await
+                .unwrap()
+        );
+        assert!(s.head(&key).await.is_ok());
+    }
 }

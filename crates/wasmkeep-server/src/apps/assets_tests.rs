@@ -317,3 +317,73 @@ async fn assets_node_loads_format_seven_and_rejects_missing_index() {
     assert!(matches!(error, DeployError::Corrupt(_)), "{error}");
     assert!(error.to_string().contains("(missing)"), "{error}");
 }
+
+#[tokio::test]
+async fn review_unchanged_format_six_skips_reader_checks() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let app = AppRef::new(store.clone(), "", "default", "shop");
+    let runtime = runtime();
+    let first = app
+        .deploy_changes(
+            &runtime,
+            Changes {
+                classes: Some(vec![]),
+                limits: Some(BTreeMap::from([(
+                    "login".into(),
+                    limits::Policy::parse("/login", "ip", None, "1/s", 1).unwrap(),
+                )])),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        app.manifest(&first.current.version)
+            .await
+            .unwrap()
+            .format_number(),
+        6
+    );
+    super::tests::heartbeat(&store, "old", "take front ends flush").await;
+    let before = keys(&store).await;
+    let next = app
+        .deploy_changes_with(&runtime, Changes::default(), |_| {
+            panic!("unchanged must not ask")
+        })
+        .await
+        .unwrap();
+    assert!(next.unchanged);
+    assert_eq!(before, keys(&store).await);
+}
+
+#[tokio::test]
+async fn review_changed_immutable_deploy_repairs_lost_old_index() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let app = AppRef::new(store.clone(), "", "default", "shop");
+    let runtime = runtime();
+    let first = app.deploy_changes(&runtime, changes(b"abc")).await.unwrap();
+    let hash = app
+        .manifest(&first.current.version)
+        .await
+        .unwrap()
+        .assets
+        .unwrap();
+    store
+        .delete(&app.path(&format!("_assets/index/{hash}")))
+        .await
+        .unwrap();
+    let mut b = bundle(b"different");
+    b.index.immutable.insert("static/".into());
+    let next = app
+        .deploy_changes(
+            &runtime,
+            Changes {
+                assets: Change::Set(b),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!next.unchanged);
+    assert!(app.version(&next.current.version).await.is_ok());
+}

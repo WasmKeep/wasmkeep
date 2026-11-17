@@ -608,6 +608,19 @@ impl AppRef {
             .try_collect()
             .await
             .map_err(bucket)?;
+        let mut lineage = HashSet::new();
+        let mut at = current.as_ref().map(|c| c.version.clone());
+        while let Some(version) = at {
+            if !is_version_id(&version) || !lineage.insert(version.clone()) {
+                break;
+            }
+            at = match self.manifest(&version).await {
+                Ok(manifest) => manifest.previous,
+                // Collection can leave a missing ancestor after pruning.
+                Err(DeployError::Corrupt(_)) => None,
+                Err(e) => return Err(e),
+            };
+        }
         let mut used = HashSet::new();
         for object in objects {
             let Some(relative) = object.location.as_ref().strip_prefix(&format!("{prefix}/"))
@@ -623,6 +636,9 @@ impl AppRef {
             // Read every version directory, even an unfamiliar id; never guess
             // that an unreadable manifest names no assets.
             let manifest = self.manifest(version).await?;
+            if !lineage.contains(version) {
+                eprintln!("assets retained by orphan directory {version}: manifest is present");
+            }
             let Some(hash) = manifest.assets else {
                 continue;
             };
@@ -655,7 +671,11 @@ impl AppRef {
         start: tokio::time::Instant,
     ) -> Result<bool, DeployError> {
         match self.store.head(&candidate.location).await {
-            Ok(now) if now == *candidate && !expired(start) => {
+            Ok(now)
+                if now.e_tag == candidate.e_tag
+                    && now.size == candidate.size
+                    && !expired(start) =>
+            {
                 // object_store 0.14.2 exposes no conditional delete. The marker
                 // protocol is the safety boundary; this HEAD additionally keeps
                 // replacements observed since listing. It is not an atomic CAS.

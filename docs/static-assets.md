@@ -156,3 +156,9 @@ Asset collection compares bucket timestamps, stops after five minutes,
 and refuses unreadable manifests or indexes. See [ADR 0030, section
 9](adr/0030-files-and-static-assets.md#9-static-assets) for the protocol
 and its bounded timeout assumptions.
+
+The compressed variants depend on the CLI version, including its pinned compression
+crate versions and backend (gzip uses pure Rust `miniz_oxide`). A newer CLI can
+turn an unchanged deploy into a changed deploy even when the source files are
+identical: different compressed bytes produce a different index digest. To repair
+assets with `unchanged, N repaired`, use the same CLI version that deployed them.

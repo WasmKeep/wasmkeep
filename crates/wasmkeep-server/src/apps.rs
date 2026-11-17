@@ -1134,17 +1134,22 @@ impl AppRef {
                 }
                 let hash = crate::assets::digest(&bundle.index.bytes());
                 // An unchanged index can repair itself even when its stored copy
-                // is lost. A different index must prove immutable names unchanged.
+                // is lost. Compare immutable names when the old index survives.
                 if let Some(old_hash) = base.as_ref().and_then(|(_, m, _)| m.assets.as_ref())
                     && old_hash != &hash
                     && !bundle.index.immutable.is_empty()
                 {
-                    let old = self.read_assets_index(old_hash).await?;
+                    let old = self.read_assets_index_if_present(old_hash).await?;
+                    if old.is_none() {
+                        eprintln!(
+                            "warning: old assets index {old_hash} is missing; immutable names cannot be compared; deploying supplied --assets"
+                        );
+                    }
                     for (name, file) in &bundle.index.files {
                         if bundle.index.immutable.iter().any(|p| name.starts_with(p))
                             && old
-                                .files
-                                .get(name)
+                                .as_ref()
+                                .and_then(|old| old.files.get(name))
                                 .is_some_and(|f| f.identity.digest != file.identity.digest)
                         {
                             return Err(DeployError::Refused(format!(
@@ -1443,8 +1448,10 @@ impl AppRef {
         if let Some((current, _, _)) = &base {
             manifest.previous = Some(current.version.clone());
         }
-        self.check_readers(&manifest).await?;
-        self.check_imports(Some(runtime), &imports, &kept).await?;
+        if !unchanged {
+            self.check_readers(&manifest).await?;
+            self.check_imports(Some(runtime), &imports, &kept).await?;
+        }
         if !unchanged && !plan(&diff) {
             return Err(DeployError::Stopped);
         }

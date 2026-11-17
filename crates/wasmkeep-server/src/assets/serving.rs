@@ -12,8 +12,10 @@ use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 #[derive(Debug)]
 pub struct Cache {
     limit: u64,
+    #[cfg(test)]
+    before_hash: Option<fn(&Cache)>,
     inner: std::sync::Mutex<Entries>,
-    fetch: tokio::sync::Mutex<()>,
+    fetch: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 #[derive(Debug, Default)]
 struct Entries {
@@ -32,6 +34,8 @@ impl Cache {
     pub fn new(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             limit,
+            #[cfg(test)]
+            before_hash: None,
             inner: Default::default(),
             fetch: Default::default(),
         })
@@ -62,8 +66,12 @@ impl Cache {
     fn register(&self, dir: &std::path::Path, labels: &Arc<str>) -> std::io::Result<()> {
         use std::io::Read;
         std::fs::create_dir_all(dir)?;
-        let mut entries = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let first_start = entries.registered.insert(dir.to_path_buf());
+        let first_start = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .registered
+            .insert(dir.to_path_buf());
         for file in std::fs::read_dir(dir)? {
             let file = file?;
             let name = file.file_name();
@@ -78,9 +86,11 @@ impl Cache {
                 continue;
             }
             let path = file.path();
-            if let Some(entry) = entries.files.remove(&path) {
-                entries.bytes -= entry.size;
-                crate::metrics::asset_cache_remove(&entry.labels, entry.size);
+            {
+                let entries = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if entries.files.contains_key(&path) {
+                    continue;
+                }
             }
             let meta = match file.metadata() {
                 Ok(meta) => meta,
@@ -91,8 +101,16 @@ impl Cache {
                 std::fs::remove_file(path)?;
                 continue;
             }
+            #[cfg(test)]
+            if let Some(hook) = self.before_hash {
+                hook(self);
+            }
             let mut hash = sha2::Sha256::new();
-            let mut input = std::fs::File::open(&path)?;
+            let mut input = match std::fs::File::open(&path) {
+                Ok(input) => input,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
             let mut buf = [0u8; 64 * 1024];
             loop {
                 let n = input.read(&mut buf)?;
@@ -103,6 +121,11 @@ impl Cache {
             }
             if format!("{:x}", hash.finalize()) != name {
                 std::fs::remove_file(path)?;
+                continue;
+            }
+            let mut entries = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            // A concurrent fetch/register may already have admitted this digest.
+            if entries.files.contains_key(&path) || !path.is_file() {
                 continue;
             }
             self.evict(&mut entries, meta.len())?;
@@ -128,10 +151,8 @@ impl Cache {
         content: &Content,
         prefetch: bool,
     ) -> Result<tokio::fs::File, String> {
-        // Serializes cache misses across apps, including concurrent requests for a digest.
-        let _fetch = self.fetch.lock().await;
         let path = state.dir.join(&content.digest);
-        let cached = {
+        let cached = || -> Result<Option<std::fs::File>, String> {
             let mut entries = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             entries.tick += 1;
             let tick = entries.tick;
@@ -140,12 +161,31 @@ impl Cache {
                     return Err("cached content size differs from index".into());
                 }
                 entry.used = tick;
-                Some(std::fs::File::open(&path).map_err(|e| e.to_string())?)
+                Ok(Some(std::fs::File::open(&path).map_err(|e| e.to_string())?))
             } else {
-                None
+                Ok(None)
             }
         };
-        if let Some(file) = cached {
+        // Hits do not acquire a download lock or wait for any bucket request.
+        if let Some(file) = cached()? {
+            return Ok(tokio::fs::File::from_std(file));
+        }
+        let fetch = {
+            let mut paths = self.fetch.lock().unwrap_or_else(|p| p.into_inner());
+            paths.retain(|_, lock| lock.strong_count() != 0);
+            paths
+                .entry(path.clone())
+                .or_default()
+                .upgrade()
+                .unwrap_or_else(|| {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    paths.insert(path.clone(), Arc::downgrade(&lock));
+                    lock
+                })
+        };
+        let _fetch = fetch.lock().await;
+        // The preceding fetch may have filled this path while we waited.
+        if let Some(file) = cached()? {
             return Ok(tokio::fs::File::from_std(file));
         }
         tokio::fs::create_dir_all(&state.dir)
@@ -511,6 +551,37 @@ impl State {
             crate::metrics::asset_request(&self.labels, "not_found");
             return Some(response);
         };
+        // Dev files can change between polls. Snapshot bytes before deriving
+        // headers/ranges so even a concurrent rewrite cannot truncate the body.
+        let local_bytes = if let Some(local) = &self.local {
+            let read = async {
+                let input = local.open(&name)?;
+                let mut input = tokio::fs::File::from_std(input).take(MAX_FILE + 1);
+                let mut bytes = Vec::new();
+                input.read_to_end(&mut bytes).await?;
+                Ok::<_, std::io::Error>(bytes)
+            }
+            .await;
+            match read {
+                Ok(bytes) if bytes.len() as u64 <= MAX_FILE => Some(Bytes::from(bytes)),
+                _ => return Some(unavailable(&self.labels)),
+            }
+        } else {
+            None
+        };
+        let mut local_file;
+        let file = if let Some(bytes) = &local_bytes {
+            local_file = file.clone();
+            local_file.identity = Content {
+                digest: digest(bytes),
+                size: bytes.len() as u64,
+            };
+            local_file.br = None;
+            local_file.gzip = None;
+            &local_file
+        } else {
+            file
+        };
         let plain_tag = etag(&file.identity);
         let range = if status == 200 && header(req, "if-range").is_none_or(|h| h == plain_tag) {
             header(req, "range").and_then(|h| byte_range(h, file.identity.size))
@@ -607,17 +678,20 @@ impl State {
         response
             .headers_mut()
             .insert("content-length", length.into());
-        {
-            let opened = if let Some(local) = &self.local {
-                local
-                    .open(&name)
-                    .map(tokio::fs::File::from_std)
-                    .map_err(|e| e.to_string())
-            } else {
-                self.cache
-                    .open(self, self.current.as_ref()?, content, false)
-                    .await
-            };
+        if let Some(bytes) = local_bytes {
+            if req.method() != hyper::Method::HEAD {
+                *response.body_mut() = http_body_util::Full::new(
+                    bytes.slice(start as usize..(start + length) as usize),
+                )
+                .map_err(|never| match never {})
+                .boxed_unsync();
+                crate::metrics::asset_bytes(&self.labels, encoding, length);
+            }
+        } else {
+            let opened = self
+                .cache
+                .open(self, self.current.as_ref()?, content, false)
+                .await;
             match opened {
                 Ok(mut file) => {
                     if req.method() == hyper::Method::HEAD {

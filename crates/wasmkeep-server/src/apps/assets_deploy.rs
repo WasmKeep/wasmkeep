@@ -71,20 +71,35 @@ impl AppRef {
         match result {
             Err(e) => Err(e),
             Ok(value) => {
-                cleanup?;
+                if let Err(error) = cleanup {
+                    eprintln!(
+                        "warning: deploy is done, but its assets marker could not be removed: {error}; collection may wait until the marker expires"
+                    );
+                }
                 Ok(value)
             }
         }
     }
 
     pub(super) async fn read_assets_index(&self, hash: &str) -> Result<Index, DeployError> {
+        self.read_assets_index_if_present(hash)
+            .await?
+            .ok_or_else(|| {
+                DeployError::Refused(format!(
+                    "_assets/index/{hash} missing; deploy again with --assets"
+                ))
+            })
+    }
+
+    pub(super) async fn read_assets_index_if_present(
+        &self,
+        hash: &str,
+    ) -> Result<Option<Index>, DeployError> {
         let key = format!("_assets/index/{hash}");
         let object = match self.store.get(&self.path(&key)).await {
             Ok(object) => object,
             Err(object_store::Error::NotFound { .. }) => {
-                return Err(DeployError::Refused(format!(
-                    "{key} missing; deploy again with --assets"
-                )));
+                return Ok(None);
             }
             Err(e) => return Err(bucket(e)),
         };
@@ -97,7 +112,9 @@ impl AppRef {
                 "{key} digest mismatch; deploy again with --assets"
             )));
         }
-        Index::parse(&bytes).map_err(|e| DeployError::Corrupt(format!("{key}: {e}")))
+        Index::parse(&bytes)
+            .map(Some)
+            .map_err(|e| DeployError::Corrupt(format!("{key}: {e}")))
     }
 
     pub(super) async fn prepare_assets(

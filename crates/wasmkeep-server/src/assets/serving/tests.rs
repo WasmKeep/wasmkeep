@@ -500,7 +500,7 @@ async fn dev_assets_live_reads_headers_modes_and_symlink_replacement() {
         // Reads come from disk even before the next table rebuild.
         std::fs::write(dir.path().join("index.html"), b"fresh content").unwrap();
         let r = response(&state, "GET", "/", &[]).await;
-        assert_eq!(r.headers()["etag"], old_tag);
+        assert_ne!(r.headers()["etag"], old_tag);
         assert_eq!(
             r.into_body().collect().await.unwrap().to_bytes(),
             "fresh content"
@@ -559,4 +559,202 @@ async fn dev_assets_live_reads_headers_modes_and_symlink_replacement() {
         assert_eq!(response(&state, "GET", "/dir/", &[]).await.status(), 503);
         assert!(!dir.path().join("unused").exists());
     }
+}
+
+#[tokio::test]
+async fn review_dev_edits_between_polls_have_current_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = Index::default();
+    index.files.insert(
+        "index.html".into(),
+        File {
+            content_type: "text/plain".into(),
+            identity: Content {
+                digest: digest(b"old"),
+                size: 3,
+            },
+            br: None,
+            gzip: None,
+        },
+    );
+    std::fs::write(dir.path().join("index.html"), b"old").unwrap();
+    let local = Local::new(dir.path(), index).unwrap();
+    let state = State::new(None, dir.path().join("unused"), Cache::new(0), "".into())
+        .with_local(Some(local));
+    for body in ["longer than the old file", "x"] {
+        std::fs::write(dir.path().join("index.html"), body).unwrap();
+        for method in ["GET", "HEAD"] {
+            let r = response(&state, method, "/", &[]).await;
+            assert_eq!(r.headers()["content-length"], body.len().to_string());
+            assert_eq!(
+                r.into_body().collect().await.unwrap().to_bytes(),
+                if method == "HEAD" { "" } else { body }
+            );
+        }
+        let r = response(&state, "GET", "/", &[("range", "bytes=0-99")]).await;
+        assert_eq!(
+            r.headers()["content-range"],
+            format!("bytes 0-{}/{}", body.len() - 1, body.len())
+        );
+        assert_eq!(r.into_body().collect().await.unwrap().to_bytes(), body);
+    }
+}
+
+#[test]
+fn review_register_hashes_without_shared_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(digest(b"cached")), b"cached").unwrap();
+    let mut cache = Cache::new(1024);
+    Arc::get_mut(&mut cache).unwrap().before_hash = Some(|cache| {
+        assert!(
+            cache.inner.try_lock().is_ok(),
+            "cache hashing holds shared serving lock"
+        );
+    });
+    cache.register(dir.path(), &Arc::from("review")).unwrap();
+    assert_eq!(cache.inner.lock().unwrap().bytes, 6);
+}
+
+#[derive(Debug)]
+struct StalledStore {
+    inner: object_store::memory::InMemory,
+    started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    gets: std::sync::atomic::AtomicUsize,
+}
+impl std::fmt::Display for StalledStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stalled store")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for StalledStore {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        b: PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(p, b, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !o.head
+            && p.as_ref().contains("apps/t/a/")
+            && p.filename() == Some(digest(b"plain content").as_str())
+        {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            self.resume.notified().await;
+        }
+        self.inner.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &object_store::path::Path,
+        b: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(a, b, o).await
+    }
+}
+#[tokio::test]
+async fn review_cold_get_does_not_block_other_paths_or_hits() {
+    let (_dir, mut first) = fixture("front").await;
+    let store = Arc::new(StalledStore {
+        inner: Default::default(),
+        started: Default::default(),
+        resume: Default::default(),
+        gets: Default::default(),
+    });
+    for app in ["a", "b"] {
+        for bytes in [b"plain content".as_slice(), b"brotli", b"gzip"] {
+            store
+                .put(
+                    &format!("apps/t/{app}/_assets/content/{}", digest(bytes)).into(),
+                    bytes.to_vec().into(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    first.current.as_mut().unwrap().app = crate::apps::AppRef::new(store.clone(), "", "t", "a");
+    let mut second = first.clone();
+    second.dir = first.dir.with_file_name("b");
+    second.current.as_mut().unwrap().app = crate::apps::AppRef::new(store.clone(), "", "t", "b");
+    // Warm hits in each app before stalling a different representation/path.
+    for state in [&first, &second] {
+        assert_eq!(
+            response(state, "GET", "/", &[("accept-encoding", "gzip")])
+                .await
+                .status(),
+            200
+        );
+    }
+    let cold_state = first.clone();
+    let cold = tokio::spawn(async move { response(&cold_state, "GET", "/", &[]).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), store.started.notified())
+        .await
+        .unwrap();
+    let duplicate_state = first.clone();
+    let duplicate = tokio::spawn(async move { response(&duplicate_state, "GET", "/", &[]).await });
+    for state in [&first, &second] {
+        for encoding in ["gzip", "br"] {
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                response(
+                    state,
+                    "GET",
+                    "/assets/a.js",
+                    &[("accept-encoding", encoding)],
+                ),
+            )
+            .await
+            .expect("unrelated hit/cold path blocked");
+            assert_eq!(r.status(), 200);
+            r.into_body().collect().await.unwrap();
+        }
+    }
+    assert_eq!(response(&second, "GET", "/", &[]).await.status(), 200);
+    store.resume.notify_one();
+    assert_eq!(cold.await.unwrap().status(), 200);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), duplicate)
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(store.gets.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
