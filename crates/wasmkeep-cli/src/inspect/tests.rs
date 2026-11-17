@@ -82,7 +82,8 @@ async fn http_authentication_covers_page_api_and_assets() {
                 prefix: String::new(),
                 bucket: "memory".into(),
                 app: ("t".into(), "a".into()),
-                token,
+                bootstrap: std::sync::Mutex::new(Some(Token(secret.clone()))),
+                token: Token::new().unwrap(),
                 address,
                 work: Arc::new(tokio::sync::Semaphore::new(1)),
             });
@@ -116,27 +117,34 @@ async fn http_authentication_covers_page_api_and_assets() {
                     assert!(!r.headers().contains_key("access-control-allow-origin"));
                 }
             }
+            let cookie_only = client
+                .get(&base)
+                .header("cookie", format!("wasmkeep_inspect={secret}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(cookie_only.status(), StatusCode::UNAUTHORIZED);
             let r = client
                 .get(format!("{base}/?token={secret}"))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(r.status(), StatusCode::SEE_OTHER);
-            assert_eq!(r.headers()["location"], "/");
-            let cookie = r.headers()["set-cookie"].to_str().unwrap();
-            assert!(cookie.contains("HttpOnly; SameSite=Strict"));
-            let cookie = cookie.split(';').next().unwrap();
-            let r = client
-                .get(&base)
-                .header("cookie", cookie)
+            assert_eq!(r.status(), StatusCode::OK);
+            assert!(!r.headers().contains_key("set-cookie"));
+            assert_eq!(r.text().await.unwrap(), PAGE);
+            let exchange = client
+                .post(format!("{base}/bootstrap"))
+                .bearer_auth(&secret)
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(r.status(), StatusCode::OK);
-            assert_eq!(r.text().await.unwrap(), PAGE);
+            assert_eq!(exchange.status(), StatusCode::OK);
+            assert!(!exchange.headers().contains_key("set-cookie"));
+            let session: Value = serde_json::from_slice(&exchange.bytes().await.unwrap()).unwrap();
+            let secret = session["bearer"].as_str().unwrap();
             let r = client
                 .get(&base)
-                .bearer_auth(&secret)
+                .bearer_auth(secret)
                 .header("Host", "rebind.example:80")
                 .send()
                 .await
@@ -144,7 +152,7 @@ async fn http_authentication_covers_page_api_and_assets() {
             assert_eq!(r.status(), StatusCode::FORBIDDEN);
             let r = client
                 .get(&base)
-                .bearer_auth(&secret)
+                .bearer_auth(secret)
                 .header("Origin", "https://evil.example")
                 .send()
                 .await
@@ -152,7 +160,7 @@ async fn http_authentication_covers_page_api_and_assets() {
             assert_eq!(r.status(), StatusCode::BAD_REQUEST);
             let r = client
                 .post(format!("{base}/api"))
-                .bearer_auth(&secret)
+                .bearer_auth(secret)
                 .header("Content-Type", "application/json")
                 .body(r#"{"op":"classes"}"#)
                 .send()
@@ -185,6 +193,7 @@ async fn bucket_listing_pages_are_scoped_to_app_and_class() {
         bucket: "memory".into(),
         app: ("t".into(), "a".into()),
         token: Token::new().unwrap(),
+        bootstrap: std::sync::Mutex::new(Some(Token::new().unwrap())),
         address: "127.0.0.1:1".parse().unwrap(),
         work: Arc::new(tokio::sync::Semaphore::new(1)),
     };
@@ -249,6 +258,7 @@ async fn sql_and_history_use_verified_bucket_replay() {
         bucket: "memory".into(),
         app: ("t".into(), "a".into()),
         token: Token::new().unwrap(),
+        bootstrap: std::sync::Mutex::new(Some(Token::new().unwrap())),
         address: "127.0.0.1:1".parse().unwrap(),
         work: Arc::new(tokio::sync::Semaphore::new(1)),
     };
@@ -277,4 +287,229 @@ async fn sql_and_history_use_verified_bucket_replay() {
             .await
             .is_err()
     );
+}
+
+#[test]
+fn csp_authenticates_embedded_script() {
+    let r = response(StatusCode::OK, "text/html", PAGE);
+    let csp = r.headers()["content-security-policy"].to_str().unwrap();
+    assert!(!csp.contains("script-src 'unsafe-inline'"));
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let script = PAGE
+        .split_once("<script>")
+        .unwrap()
+        .1
+        .split_once("</script>")
+        .unwrap()
+        .0;
+    let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(script));
+    assert!(csp.contains(&format!("script-src 'sha256-{hash}'")));
+    assert!(PAGE.contains("history.replaceState"));
+    assert!(!PAGE.contains("document.cookie"));
+    assert!(!PAGE.contains("localStorage"));
+    assert!(PAGE.contains("credentials:'omit'"));
+}
+#[tokio::test]
+async fn bootstrap_cannot_be_reused() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let token = Token::new().unwrap();
+            let secret = token.0.clone();
+            let state = Arc::new(State {
+                store: Arc::new(object_store::memory::InMemory::new()),
+                prefix: String::new(),
+                bucket: "memory".into(),
+                app: ("t".into(), "a".into()),
+                bootstrap: std::sync::Mutex::new(Some(Token(secret.clone()))),
+                token: Token::new().unwrap(),
+                address,
+                work: Arc::new(tokio::sync::Semaphore::new(1)),
+            });
+            let server = tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let state = state.clone();
+                    tokio::task::spawn_local(async move {
+                        let service = service_fn(move |r| handle(r, state.clone()));
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let base = format!("http://{address}");
+            for path in ["/", "/api", "/favicon.ico"] {
+                for authorization in ["", "Bearer incorrect"] {
+                    let r = client
+                        .get(format!("{base}{path}"))
+                        .header("authorization", authorization)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+                    assert_eq!(r.headers()["cache-control"], "no-store");
+                    assert!(!r.headers().contains_key("access-control-allow-origin"));
+                }
+            }
+            let r = client
+                .get(format!("{base}/?token={secret}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                !r.headers().contains_key("set-cookie"),
+                "no cookie can be stolen across ports"
+            );
+            let exchange = client
+                .post(format!("{base}/bootstrap"))
+                .bearer_auth(&secret)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(exchange.status(), StatusCode::OK);
+            assert!(!exchange.headers().contains_key("set-cookie"));
+            let reused = client
+                .post(format!("{base}/bootstrap"))
+                .bearer_auth(&secret)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+            server.abort();
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn excess_listing_is_reported() {
+    use object_store::ObjectStoreExt;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    for i in 0..10_001 {
+        store
+            .put(
+                &Key::from(format!("state/t/a/actors/room/a/{i}")),
+                Bytes::new().into(),
+            )
+            .await
+            .unwrap();
+    }
+    let state = State {
+        store,
+        prefix: String::new(),
+        bucket: "memory".into(),
+        app: ("t".into(), "a".into()),
+        token: Token::new().unwrap(),
+        bootstrap: std::sync::Mutex::new(None),
+        address: "127.0.0.1:1".parse().unwrap(),
+        work: Arc::new(tokio::sync::Semaphore::new(1)),
+    };
+    for op in ["classes", "actors", "history"] {
+        let error = api(
+            &state,
+            json!({"op": op, "class": "room", "actor": "a"}),
+            state.work.clone().acquire_owned().await.unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("listing exceeds 10000 object limit"),
+            "{op}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hostile_checksum_valid_snapshot_fails_inspect_and_export() {
+    use object_store::ObjectStoreExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hostile.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE VIEW _wasmkeep_meta AS WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n) SELECT 'replaced' AS key, CAST(sum(x) AS TEXT) AS value FROM n").unwrap();
+    let page_size: u32 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    let capture = wasmkeep_storage::wal::WalCapture::start(&path, page_size).unwrap();
+    let snapshot = capture.snapshot().unwrap().to_ltx(1, 1, 100).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let root = StateRoot::new("", "t", "a");
+    let key =
+        wasmkeep_cluster::replication::snapshot_key(wasmkeep_cluster::replication::SegmentId {
+            generation: 1,
+            txid: 1,
+        });
+    store
+        .put(
+            &Key::from(format!(
+                "{}/{key}",
+                root.bucket_key(Family::History, "room/a")
+            )),
+            snapshot.into(),
+        )
+        .await
+        .unwrap();
+    let state = State {
+        store,
+        prefix: String::new(),
+        bucket: "memory".into(),
+        app: ("t".into(), "a".into()),
+        token: Token::new().unwrap(),
+        bootstrap: std::sync::Mutex::new(None),
+        address: "127.0.0.1:1".parse().unwrap(),
+        work: Arc::new(tokio::sync::Semaphore::new(1)),
+    };
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        api(
+            &state,
+            json!({"op":"sql", "class":"room", "actor":"a", "sql":"SELECT 1"}),
+            state.work.clone().acquire_owned().await.unwrap(),
+        ),
+    )
+    .await
+    .expect("inspect deadline")
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("host metadata schema"),
+        "{error}"
+    );
+    // actor sql and actor export both use export_with_options before executing SQL.
+    let actor = wasmkeep_runtime::ActorAddress::new("t", "room", "a").unwrap();
+    for operation in ["actor-sql", "export"] {
+        let output = dir.path().join(operation);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            history::export_with_options(
+                &state.store,
+                &root,
+                &actor,
+                history::Point::Head,
+                &output,
+                history::Options {
+                    max_bytes: 1 << 20,
+                    tmpdir: None,
+                    require_owner_match: false,
+                },
+            ),
+        )
+        .await
+        .expect("export deadline")
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("host metadata schema"),
+            "{operation}: {error}"
+        );
+        assert!(!output.exists());
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }

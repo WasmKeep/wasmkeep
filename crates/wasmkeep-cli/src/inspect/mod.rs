@@ -70,6 +70,7 @@ struct State {
     bucket: String,
     app: (String, String),
     token: Token,
+    bootstrap: std::sync::Mutex<Option<Token>>,
     address: SocketAddr,
     work: Arc<tokio::sync::Semaphore>,
 }
@@ -86,19 +87,19 @@ pub(crate) fn run(args: Args) -> anyhow::Result<()> {
     wasmkeep_cli::run_async(tokio::task::LocalSet::new().run_until(async move {
         let listener = tokio::net::TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
+        let bootstrap = Token::new()?;
+        let secret = bootstrap.0.clone();
         let state = Arc::new(State {
             store,
             prefix,
             bucket,
             app: args.app,
             token: Token::new()?,
+            bootstrap: std::sync::Mutex::new(Some(bootstrap)),
             address,
             work: Arc::new(tokio::sync::Semaphore::new(1)),
         });
-        println!(
-            "Inspector (read-only): http://{address}/?token={}",
-            state.token.0
-        );
+        println!("Inspector (read-only): http://{address}/?token={}", secret);
         let connections = Arc::new(tokio::sync::Semaphore::new(16));
         loop {
             let permit = connections.clone().acquire_owned().await?;
@@ -128,15 +129,20 @@ fn response(
         ("referrer-policy", "no-referrer"),
         ("x-content-type-options", "nosniff"),
         ("x-frame-options", "DENY"),
-        (
-            "content-security-policy",
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-        ),
     ] {
         reply
             .headers_mut()
             .insert(name, hyper::header::HeaderValue::from_static(value));
     }
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    // A malformed embedded page fails closed: its scripts cannot match this hash.
+    let script = PAGE
+        .split_once("<script>")
+        .and_then(|(_, rest)| rest.split_once("</script>"))
+        .map_or("", |(script, _)| script);
+    let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(script.as_bytes()));
+    reply.headers_mut().insert("content-security-policy", format!("default-src 'none'; script-src 'sha256-{hash}'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'").parse().unwrap_or_else(|_| hyper::header::HeaderValue::from_static("default-src 'none'")));
     reply
 }
 async fn handle(
@@ -181,50 +187,44 @@ async fn serve(req: Request<Incoming>, state: Arc<State>) -> anyhow::Result<Resp
         .query_pairs()
         .find(|(k, _)| k == "token")
         .map(|(_, v)| v.into_owned());
-    let cookie = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split(';')
-                .find_map(|part| part.trim().strip_prefix("wasmkeep_inspect="))
-        });
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
-    if !(state.token.accepts(cookie)
-        || state.token.accepts(bearer)
-        || (req.method() == hyper::Method::GET
-            && url.path() == "/"
-            && state.token.accepts(boot.as_deref())))
+    if req.method() == hyper::Method::POST && url.path() == "/bootstrap" {
+        let mut bootstrap = state
+            .bootstrap
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Bootstrap lock poisoned"))?;
+        if bootstrap
+            .as_ref()
+            .is_some_and(|token| token.accepts(bearer))
+        {
+            bootstrap.take();
+            return Ok(response(
+                StatusCode::OK,
+                "application/json",
+                serde_json::to_vec(&json!({"bearer":state.token.0}))?,
+            ));
+        }
+    } else if req.method() == hyper::Method::GET
+        && url.path() == "/"
+        && (state
+            .bootstrap
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Bootstrap lock poisoned"))?
+            .as_ref()
+            .is_some_and(|token| token.accepts(boot.as_deref()))
+            || state.token.accepts(bearer))
     {
+        return Ok(response(StatusCode::OK, "text/html; charset=utf-8", PAGE));
+    }
+    if !state.token.accepts(bearer) || boot.is_some() || url.path() == "/bootstrap" {
         return Ok(response(
             StatusCode::UNAUTHORIZED,
             "text/plain",
-            "Inspector token required",
+            "Inspector bearer required (bootstrap is single-use)",
         ));
-    }
-    if boot.is_some() {
-        ensure!(
-            url.path() == "/"
-                && req.method() == hyper::Method::GET
-                && state.token.accepts(boot.as_deref()),
-            "Invalid token exchange"
-        );
-        let mut reply = response(StatusCode::SEE_OTHER, "text/plain", "");
-        reply.headers_mut().insert("location", "/".parse()?);
-        reply.headers_mut().insert(
-            "set-cookie",
-            format!(
-                "wasmkeep_inspect={}; HttpOnly; SameSite=Strict; Path=/",
-                state.token.0
-            )
-            .parse()?,
-        );
-        return Ok(reply);
-    }
-    if req.method() == hyper::Method::GET && url.path() == "/" {
-        return Ok(response(StatusCode::OK, "text/html; charset=utf-8", PAGE));
     }
     ensure!(
         req.method() == hyper::Method::POST && url.path() == "/api",
@@ -287,6 +287,8 @@ fn query(path: &std::path::Path, sql: &str) -> anyhow::Result<Value> {
         .collect();
     Ok(json!({"columns":rows.columns,"rows":values}))
 }
+const MAX_LIST_OBJECTS: usize = 10_000;
+
 async fn api(
     state: &State,
     input: Value,
@@ -299,12 +301,13 @@ async fn api(
             wasmkeep_server::DEFAULT_HEARTBEAT,
             &wasmkeep_cluster::lease::LeaseConfig::default_safe(),
         );
-        return Ok(crate::status::read(
+        return Ok(crate::status::read_bounded(
             state.store.clone(),
             &state.prefix,
             &state.bucket,
             crate::status::now_ms(),
             horizon,
+            MAX_LIST_OBJECTS,
         )
         .await?
         .to_json());
@@ -315,28 +318,27 @@ async fn api(
             wasmkeep_runtime::ActorAddress::new(&state.app.0, class, "validation")?;
         }
         let prefix = root.bucket_key(Family::History, if op == "actors" { class } else { "" });
-        let listing = state
-            .store
-            .list_with_delimiter(Some(&Key::from(prefix.trim_end_matches('/'))))
-            .await?;
-        // ObjectStore::Path::from escapes '%' and '~' once more than the
-        // actor's filesystem encoding. Undo only that transport layer.
+        let objects =
+            history::list_objects_bounded(&state.store, &prefix, MAX_LIST_OBJECTS).await?;
         let mut names = Vec::new();
-        for path in listing.common_prefixes {
-            let decoded = Key::from_url_path(path.as_ref())?;
-            if let Some(name) = decoded.filename() {
-                names.push(name.to_owned());
+        for key in objects.keys() {
+            if let Some((name, _)) = key.split_once('/') {
+                let decoded = Key::from_url_path(name)?;
+                names.push(decoded.as_ref().to_owned());
             }
         }
         if op == "classes" {
-            let app = wasmkeep_server::apps::AppRef::new(
-                state.store.clone(),
-                &state.prefix,
-                &state.app.0,
-                &state.app.1,
+            let app = Key::from(
+                format!("{}/apps/{}/{}", state.prefix, state.app.0, state.app.1)
+                    .trim_start_matches('/'),
             );
-            if let Some(current) = app.current().await? {
-                names.extend(app.manifest(&current.version).await?.classes.into_keys());
+            if let Some(current) = crate::status::current(&state.store, &app).await? {
+                names.extend(
+                    crate::status::manifest(&state.store, &app, &current.version)
+                        .await?
+                        .classes
+                        .into_keys(),
+                );
             }
         }
         return Ok(page(names, input["after"].as_str()));
@@ -353,7 +355,8 @@ async fn api(
             "{}/",
             root.bucket_key(Family::History, &format!("{class}/{encoded}"))
         );
-        let objects = history::list_objects(&state.store, &prefix).await?;
+        let objects =
+            history::list_objects_bounded(&state.store, &prefix, MAX_LIST_OBJECTS).await?;
         let listing = Listing::from_keys(objects.keys().map(String::as_str));
         let plan = plan_restore(&listing)?;
         let chain = history::ancestry(&listing, plan.head());

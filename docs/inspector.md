@@ -11,8 +11,9 @@ The embedded page shows the cluster's nodes, processes and apps, deployed
 classes and classes with retained history, actors in pages of 50, and a
 selected actor's head, retained ancestry and recent history objects. Actor
 names are shown in their encoded bucket form. Classes and actors use a
-lexical cursor; concurrent bucket changes can affect later pages. The
-underlying delimiter listing is materialized by the object-store client.
+lexical cursor; concurrent bucket changes can affect later pages. Listings stop with an explicit error above 10,000 objects, including
+objects scanned to discover classes and apps. Metadata bodies (current,
+manifest and heartbeat) are capped at 4 MiB before buffering.
 There is no CDN, framework, node endpoint or new listener on nodes.
 
 ## Read-only SQL
@@ -41,17 +42,24 @@ while it is being read; the exporter retries or reports failure. See
 
 ## Local access
 
-The launch URL contains a fresh 256-bit random capability. Treat it as a
-secret. On the first request, the server exchanges it for an HttpOnly,
-SameSite=Strict session cookie and redirects to a URL without the token.
-The cookie is scoped to `/`; cookies are not isolated by port, so avoid
-running untrusted local HTTP services on the same loopback address while
-using the inspector. HTTP loopback does not use a Secure cookie.
-Restarting the inspector invalidates the old capability.
+The launch URL contains a fresh 256-bit random, one-time bootstrap token.
+The page immediately removes it from the current browser history entry with
+`history.replaceState`, then exchanges it once for an independent session
+bearer. The bearer stays in the page script's memory and is sent only in the
+Authorization header, never a cookie or URL. Reloading requires restarting
+the inspector for a new bootstrap URL. A server on another loopback port
+receives no inspector credential from the browser.
 
-Every request, including unknown asset paths, requires the capability.
-API clients may instead use `Authorization: Bearer TOKEN`. The exact
-loopback address and bound port must appear in Host; `localhost` and DNS
+Treat the launch URL as a secret: it remains exposed in terminal output,
+terminal recording and copied logs, and browser-launch command arguments
+(argv). Browser tooling or history synchronization may observe it before
+replacement; history replacement is not guaranteed erasure from those
+systems. A stolen unused token can win the first exchange. Restarting the
+inspector invalidates both credentials.
+
+The page requires a valid bootstrap or session bearer; API requests require
+the session bearer. Scripts are authorized by a CSP SHA-256 hash.
+The exact loopback address and bound port must appear in Host; `localhost` and DNS
 names are rejected. Cross-origin requests are rejected, no CORS headers
 are emitted, and responses use `Cache-Control: no-store` and
 `Referrer-Policy: no-referrer`. This is a local operator tool, not a public

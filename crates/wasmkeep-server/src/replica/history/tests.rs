@@ -458,3 +458,18 @@ async fn short_bodies_retry_and_exhaust_as_read_errors() {
         assert_eq!(*reader.short_reads.lock().unwrap(), 0);
     }
 }
+
+#[tokio::test]
+async fn shared_listing_returns_more_than_ten_thousand_objects() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    for i in 0..10_001 {
+        store
+            .put(
+                &StorePath::from(format!("large/{i}")),
+                bytes::Bytes::new().into(),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(list_objects(&store, "large").await.unwrap().len(), 10_001);
+}

@@ -36,6 +36,82 @@ fn immutable(path: &Path) -> Result<Connection, SqlError> {
     Ok(conn)
 }
 
+// Install before any verification SQL, including schema and host metadata reads.
+fn verification_connection(path: &Path) -> Result<Connection, SqlError> {
+    let mut conn = immutable(path)?;
+    limits(&mut conn)?;
+    conn.authorizer(Some(|ctx: AuthContext<'_>| {
+        verification_authorizer(ctx, &[])
+    }))?;
+    let invalid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE lower(substr(name,1,10)) = '_wasmkeep_' AND (type != 'table' OR upper(substr(sql,1,20)) = 'CREATE VIRTUAL TABLE'))", [], |r| r.get(0))?;
+    if invalid {
+        return Err(SqlError::new(
+            SqlErrorKind::NotAllowed,
+            "verification rejects non-table host metadata schema",
+        ));
+    }
+    // R-tree xConnect prepares shadow-table writes even on a read-only
+    // connection. Permit only those preparations; immutable + query_only still
+    // reject their execution. User SQL never receives this exception.
+    let virtuals = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND upper(substr(sql,1,20))='CREATE VIRTUAL TABLE'")?
+        .query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let shadows: Vec<String> = virtuals
+        .iter()
+        .flat_map(|name| {
+            [
+                format!("{name}_node"),
+                format!("{name}_parent"),
+                format!("{name}_rowid"),
+            ]
+        })
+        .collect();
+    conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+        verification_authorizer(ctx, &shadows)
+    }))?;
+    Ok(conn)
+}
+
+fn verification_authorizer(ctx: AuthContext<'_>, shadows: &[String]) -> Authorization {
+    if ctx.accessor.is_some() {
+        return Authorization::Deny;
+    }
+    match ctx.action {
+        AuthAction::Select | AuthAction::Read { .. } => Authorization::Allow,
+        AuthAction::Pragma {
+            pragma_name: "integrity_check" | "foreign_key_check" | "data_version",
+            pragma_value: None,
+        } => Authorization::Allow,
+        AuthAction::Function { function_name } if safe_function(function_name) => {
+            Authorization::Allow
+        }
+        AuthAction::Insert { table_name }
+        | AuthAction::Delete { table_name }
+        | AuthAction::Update { table_name, .. }
+            if shadows.iter().any(|name| name == table_name) =>
+        {
+            Authorization::Allow
+        }
+        _ => Authorization::Deny,
+    }
+}
+
+fn limits(conn: &mut Connection) -> Result<(), SqlError> {
+    use rusqlite::limits::Limit;
+    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, 1 << 20)?;
+    conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20)?;
+    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 256)?;
+    conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut steps = 0u32;
+    conn.progress_handler(
+        1000,
+        Some(move || {
+            steps += 1;
+            steps > 10_000 || std::time::Instant::now() >= deadline
+        }),
+    )?;
+    Ok(())
+}
 /// Checks the raw file, then converts this private copy to a rollback journal.
 /// The caller must verify its LTX checksum before calling this function.
 pub fn verify_and_make_portable(path: &Path) -> Result<Verification, SqlError> {
@@ -46,7 +122,7 @@ pub fn verify_and_make_portable(path: &Path) -> Result<Verification, SqlError> {
 
 /// Verify a raw replay without modifying its bytes, suitable for backup caches.
 pub fn verify(path: &Path) -> Result<Verification, SqlError> {
-    let conn = immutable(path)?;
+    let conn = verification_connection(path)?;
     let mut stmt = conn.prepare("PRAGMA integrity_check")?;
     let mut rows = stmt.query([])?;
     let mut ok = false;
@@ -121,30 +197,12 @@ fn make_portable(path: &Path) -> Result<(), SqlError> {
 /// to five seconds or ten million VM instructions. Host and schema tables,
 /// extension loading, PRAGMAs and all non-read authorizer actions are denied.
 pub fn query(path: &Path, sql: &str) -> Result<Rows, SqlError> {
-    use rusqlite::limits::Limit;
     let mut conn = immutable(path)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, 1 << 20)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 256)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
-    let started = std::time::Instant::now();
-    let mut steps = 0u32;
-    conn.progress_handler(
-        1000,
-        Some(move || {
-            steps += 1;
-            steps > 10_000 || started.elapsed() > std::time::Duration::from_secs(5)
-        }),
-    )?;
+    limits(&mut conn)?;
     conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
         AuthAction::Read { table_name, .. } if !hidden(table_name) => Authorization::Allow,
-        AuthAction::Function { function_name }
-            if !matches!(
-                function_name.to_ascii_lowercase().as_str(),
-                "load_extension" | "fts3_tokenizer" | "readfile" | "writefile" | "eval"
-            ) && !function_name.to_ascii_lowercase().starts_with("pragma_") =>
-        {
+        AuthAction::Function { function_name } if safe_function(function_name) => {
             Authorization::Allow
         }
         _ => Authorization::Deny,
@@ -197,6 +255,14 @@ pub fn query(path: &Path, sql: &str) -> Result<Rows, SqlError> {
     Ok(Rows { columns, values })
 }
 
+fn safe_function(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !matches!(
+        name.as_str(),
+        "load_extension" | "fts3_tokenizer" | "readfile" | "writefile" | "eval"
+    ) && !name.starts_with("pragma_")
+}
+
 fn hidden(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.starts_with("_wasmkeep_") || name.starts_with("sqlite_") || name.starts_with("pragma_")
@@ -205,7 +271,7 @@ fn hidden(name: &str) -> bool {
 /// Alarm state from a verified private database; no guest SQL or write access.
 pub fn backup_alarm(path: &Path) -> Result<(Option<i64>, Option<String>), SqlError> {
     use rusqlite::OptionalExtension;
-    let conn = immutable(path)?;
+    let conn = verification_connection(path)?;
     let has = |table: &str| -> Result<bool, rusqlite::Error> {
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
@@ -237,7 +303,7 @@ pub fn backup_alarm(path: &Path) -> Result<(Option<i64>, Option<String>), SqlErr
 /// Original address recorded by the host, including names shortened in keys.
 pub fn backup_address(path: &Path) -> Result<Option<String>, SqlError> {
     use rusqlite::OptionalExtension;
-    let conn = immutable(path)?;
+    let conn = verification_connection(path)?;
     Ok(conn
         .query_row(
             "SELECT value FROM _wasmkeep_meta WHERE key='address'",
@@ -303,4 +369,41 @@ mod tests {
             assert!(query(&path, sql).is_err());
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn verification_rejects_host_views_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hostile.db");
+    let conn = Connection::open(&path).unwrap();
+    // Rejected from sqlite_schema before executing the recursive view.
+    conn.execute_batch("CREATE VIEW _wasmkeep_meta AS WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n) SELECT 'replaced' AS key, CAST(sum(x) AS TEXT) AS value FROM n").unwrap();
+    drop(conn);
+    assert!(
+        verify(&path).is_err(),
+        "host metadata views must be rejected"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn verification_of_virtual_tables_cannot_write_shadow_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("virtual.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE spatial USING rtree(id,min,max); INSERT INTO spatial VALUES(1,2,3); CREATE VIRTUAL TABLE search USING fts5(text)",
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    verify(&path).unwrap();
+    let conn = verification_connection(&path).unwrap();
+    assert!(conn.execute("DELETE FROM spatial_node", []).is_err());
+    assert!(
+        conn.execute("INSERT INTO spatial_rowid VALUES(2,1)", [])
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }

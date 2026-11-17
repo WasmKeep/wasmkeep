@@ -422,11 +422,17 @@ async fn attempt_from_objects(
         ));
     }
     drop(capture);
-    let verification = if raw {
-        readonly::verify(&path)?
-    } else {
-        readonly::verify_and_make_portable(&path)?
-    };
+    let verify_path = path.clone();
+    let (verification, _scratch) = tokio::task::spawn_blocking(move || {
+        let verification = if raw {
+            readonly::verify(&verify_path)
+        } else {
+            readonly::verify_and_make_portable(&verify_path)
+        };
+        verification.map(|verification| (verification, scratch))
+    })
+    .await
+    .map_err(|e| Error::Corrupt(format!("verification worker: {e}")))??;
     let file = std::fs::File::open(&path)?;
     file.sync_all()?;
     let bytes = file.metadata()?.len();
@@ -700,6 +706,24 @@ pub async fn list_objects(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
 ) -> Result<BTreeMap<String, ObjectMeta>, Error> {
+    list_objects_with_limit(store, prefix, None).await
+}
+
+/// List at most `max` objects, returning an error rather than partial results.
+/// Intended for bounded operator views; history readers remain unbounded.
+pub async fn list_objects_bounded(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    max: usize,
+) -> Result<BTreeMap<String, ObjectMeta>, Error> {
+    list_objects_with_limit(store, prefix, Some(max)).await
+}
+
+async fn list_objects_with_limit(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    max: Option<usize>,
+) -> Result<BTreeMap<String, ObjectMeta>, Error> {
     let base = StorePath::from(prefix.trim_end_matches('/'));
     let encoded = if base.as_ref().is_empty() {
         String::new()
@@ -709,9 +733,16 @@ pub async fn list_objects(
     'attempts: for _ in 0..super::READ_ATTEMPTS {
         let mut stream = store.list(Some(&base));
         let mut objects = BTreeMap::new();
+        let mut count = 0;
         loop {
             match tokio::time::timeout(super::READ_IDLE, stream.next()).await {
                 Ok(Some(Ok(meta))) => {
+                    count += 1;
+                    if let Some(max) = max
+                        && count > max
+                    {
+                        return Err(Error::Bucket(format!("listing exceeds {max} object limit")));
+                    }
                     if let Some(key) = meta.location.as_ref().strip_prefix(&encoded) {
                         objects.insert(key.to_owned(), meta);
                     }
