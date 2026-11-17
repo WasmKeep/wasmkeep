@@ -817,6 +817,16 @@ pub fn is_live(node: &NodeInfo, now_ms: u64, horizon_ms: u64) -> bool {
         && now_ms.saturating_sub(node.written_at_ms) <= horizon_ms
 }
 
+/// Whether `node` may serve the app `served` (`tenant/app`): its heartbeat
+/// names it (every node of this version writes its state root's
+/// `tenant/app`, the implicit app's included), or names no app, as a
+/// heartbeat in format 1 from an older binary does: such a node counts
+/// for any app named `default`, conservatively, its tenant not being in
+/// the heartbeat.
+pub fn serves(node: &NodeInfo, served: &str) -> bool {
+    node.app == served || (node.app.is_empty() && served.ends_with("/default"))
+}
+
 /// The live nodes serving `served` (`tenant/app`) that do not announce
 /// `recorded-head` (ADR 0035, section 5): an app that enabled the format
 /// refuses service while any is found.
@@ -828,7 +838,7 @@ pub fn without_recorded_head<'a>(
 ) -> Vec<&'a str> {
     nodes
         .iter()
-        .filter(|n| n.app == served && !n.can_recorded_head && is_live(n, now_ms, horizon_ms))
+        .filter(|n| serves(n, served) && !n.can_recorded_head && is_live(n, now_ms, horizon_ms))
         .map(|n| n.id.as_str())
         .collect()
 }
@@ -1623,6 +1633,11 @@ mod tests {
             without_recorded_head(&nodes, "acme/shop", 10_500, 15_000),
             vec!["old"]
         );
+        // A heartbeat naming no app (format 1) counts for a `default` app.
+        let mut format1 = nodes[1].clone();
+        format1.app = String::new();
+        assert!(serves(&format1, "acme/default"));
+        assert!(!serves(&format1, "acme/shop"));
         // Stale: no longer live.
         assert!(without_recorded_head(&nodes, "acme/shop", 99_000, 15_000).is_empty());
     }

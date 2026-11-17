@@ -114,7 +114,10 @@ pub(crate) fn enable_check(
     horizon_ms: u64,
     late_ms: u64,
 ) -> Result<(), String> {
-    let mine: Vec<_> = nodes.iter().filter(|n| n.app == served).collect();
+    let mine: Vec<_> = nodes
+        .iter()
+        .filter(|n| wasmkeep_cluster::membership::serves(n, served))
+        .collect();
     let old: Vec<&str> = mine
         .iter()
         .filter(|n| !n.can_recorded_head)

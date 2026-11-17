@@ -4187,3 +4187,37 @@ async fn a_floor_collected_away_is_proven_by_a_later_generation() {
     .unwrap();
     assert_eq!(restored.head(), p);
 }
+
+/// Review question on ADR 0035: the app string a real heartbeat carries
+/// must match what the capability checks compare (`tenant/app` from the
+/// node's state root). A node of the implicit app writes it empty.
+#[tokio::test]
+async fn heartbeats_name_the_app_the_capability_checks_compare() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let nodes = wasmkeep_cluster::membership::all_heartbeats(&a.control_keys)
+        .await
+        .unwrap();
+    let me = nodes.iter().find(|n| n.id == "a").expect("a's heartbeat");
+    let served = format!("{}/{}", a.root.tenant(), a.root.app());
+    assert!(
+        wasmkeep_cluster::membership::serves(me, &served),
+        "heartbeat app {:?} vs {served:?}",
+        me.app
+    );
+    // As an older binary would announce it: found by the check.
+    let mut old = me.clone();
+    old.can_recorded_head = false;
+    assert_eq!(
+        wasmkeep_cluster::membership::without_recorded_head(
+            &[old],
+            &served,
+            now_ms(),
+            a.heartbeat_horizon_ms
+        ),
+        vec!["a"]
+    );
+}
