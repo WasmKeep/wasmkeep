@@ -49,7 +49,9 @@ no-secrets = true
 "#;
 
 /// A cluster node's `[listen]`, for entries with a node id.
-const LISTEN: &str = "[listen]\npublic-advertise = \"http://10.0.0.1:8080\"\n";
+const LISTEN: &str = "[listen]\npublic-advertise = \"http://10.0.0.1:8080\"\ncluster = \"0.0.0.0:7443\"\ncluster-advertise = \"https://10.0.0.1:7443\"\n";
+/// The same without a cluster listener.
+const PLAIN: &str = "[listen]\npublic-advertise = \"http://10.0.0.1:8080\"\n";
 
 fn at() -> &'static Path {
     Path::new("/etc/wasmkeep/wasmkeep-node.toml")
@@ -450,6 +452,7 @@ const EVERY_APP_FLAG: &[&str] = &[
     "32",
     "--front-cpu-budget-ms",
     "70",
+    "--no-alarms",
 ];
 
 #[test]
@@ -525,6 +528,7 @@ secrets-key = ["k/shop.key", "k/shop-next.key"]
 max-sockets = 20000
 max-front-requests = 32
 front-cpu-budget-ms = 70
+no-alarms = true
 allow-outbound = ["127.0.0.1/32"]
 allow-outbound-port = [587]
 outbound-ca = ["ca.pem"]
@@ -583,7 +587,6 @@ fn fields_this_version_cannot_honour_are_refused_when_serving() {
         "hostnames = [\"shop.example.com\"]",
         "min-resident = 1",
         "max-resident = 10",
-        "no-alarms = true",
     ] {
         let text = app("acme/shop", "x", rest).replace("node-id = \"x\"\n", "");
         let file = parse(&text, at()).expect(rest);
@@ -611,6 +614,7 @@ fn the_node_file_flag_refuses_the_flags_it_replaces() {
         &["--env", "c=f"],
         &["--front-cpu-budget-ms", "5"],
         &["--max-sockets-per-app", "5"],
+        &["--no-alarms"],
         &["--actor", "c=c.wasm"],
     ] {
         let mut argv = vec!["--bucket", "s3://b", "--node-file", "f"];
@@ -630,4 +634,62 @@ fn the_node_file_flag_refuses_the_flags_it_replaces() {
         ])
         .is_ok()
     );
+}
+
+/// Several apps in one process (ADR 0038, section 5): node hops use the
+/// cluster port only, so a file of several apps needs a cluster listener,
+/// and `--cluster-plaintext accept` is refused with it.
+#[test]
+fn several_apps_need_the_cluster_port_and_refuse_plain_http_between_nodes() {
+    let two = format!(
+        "{PLAIN}{}{}",
+        app("acme/shop", "shop-1", ""),
+        app("acme/blog", "blog-1", "")
+    );
+    let e = err_any(&two);
+    assert!(e.contains("cluster listener"), "{e}");
+    let tls = "[listen]\npublic-advertise = \"http://10.0.0.1:8080\"\ncluster = \"0.0.0.0:7443\"\ncluster-advertise = \"https://10.0.0.1:7443\"\n";
+    let two = format!(
+        "{tls}{}{}",
+        app("acme/shop", "shop-1", ""),
+        app("acme/blog", "blog-1", "")
+    );
+    let file = parse_any(&two, at()).unwrap();
+    assert!(file.check_plaintext(false).is_ok());
+    let e = file.check_plaintext(true).unwrap_err();
+    assert!(e.contains("--cluster-plaintext accept"), "{e}");
+    // One app keeps today's behaviour in both modes.
+    let one = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
+    assert!(one.check_plaintext(true).is_ok());
+}
+
+/// Several apps and none sets a socket ceiling: one app can take every
+/// session, which start logs (ADR 0038, section 8).
+#[test]
+fn several_apps_without_a_socket_ceiling_are_warned_about() {
+    let tls = "[listen]\npublic-advertise = \"http://10.0.0.1:8080\"\ncluster = \"0.0.0.0:7443\"\ncluster-advertise = \"https://10.0.0.1:7443\"\n";
+    let none = parse_any(
+        &format!(
+            "{tls}{}{}",
+            app("acme/shop", "shop-1", ""),
+            app("acme/blog", "blog-1", "")
+        ),
+        at(),
+    )
+    .unwrap();
+    let w = none.warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("max-sockets"), "{w:?}");
+    let some = parse_any(
+        &format!(
+            "{tls}{}{}",
+            app("acme/shop", "shop-1", "max-sockets = 100"),
+            app("acme/blog", "blog-1", "")
+        ),
+        at(),
+    )
+    .unwrap();
+    assert!(some.warnings().is_empty());
+    let one = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
+    assert!(one.warnings().is_empty());
 }

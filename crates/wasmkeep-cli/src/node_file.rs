@@ -435,6 +435,18 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
             "no [[app]]: the file lists at least one app",
         );
     }
+    // Node hops use the cluster port only with several apps (ADR 0038,
+    // section 5).
+    if let Some(second) = file.apps.get(1)
+        && file.listen.cluster.is_none()
+    {
+        return Err(format!(
+            "{}: a second [[app]] ({}/{}) needs a cluster listener ([listen] cluster and \
+             cluster-advertise): several apps in one process talk to other nodes on the \
+             cluster port only",
+            second.at, second.tenant, second.name
+        ));
+    }
     file.check_entries()?;
     Ok(file)
 }
@@ -620,6 +632,33 @@ impl NodeFile {
         Ok(())
     }
 
+    /// Refuses `--cluster-plaintext accept` (`accept`) with several apps
+    /// (ADR 0038, section 5); one app keeps today's behaviour.
+    pub(crate) fn check_plaintext(&self, accept: bool) -> Result<(), String> {
+        if accept && self.apps.len() > 1 {
+            return Err(format!(
+                "{}: several apps in one process talk to other nodes on the cluster port only: \
+                 --cluster-plaintext accept is refused with them (finish moving the cluster to \
+                 TLS first)",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// What start logs as warnings about the file.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.apps.len() > 1 && self.apps.iter().all(|a| a.max_sockets.is_none()) {
+            out.push(format!(
+                "{}: several apps and none sets max-sockets: one app can take every socket \
+                 session of the node",
+                self.path.display()
+            ));
+        }
+        out
+    }
+
     /// Refuses resident floors whose sum exceeds the process's resident
     /// limit (known once the instance pool and descriptors are).
     pub(crate) fn check_resident_floors(&self, resident_limit: usize) -> Result<(), String> {
@@ -674,7 +713,7 @@ impl NodeFile {
                 max_front_requests: args.max_front_requests,
                 front_cpu_budget_ms: Some(args.front_cpu_budget_ms),
                 data_dir: None,
-                no_alarms: false,
+                no_alarms: args.no_alarms,
             }],
         })
     }
@@ -713,12 +752,6 @@ impl NodeFile {
                 "resident caps come with several apps per process",
             ));
         }
-        if a.no_alarms {
-            return Err(not_yet(
-                "no-alarms",
-                "serve has no way yet to skip an app's alarms",
-            ));
-        }
         args.app = Some((a.tenant.clone(), a.name.clone()));
         args.node_id.clone_from(&a.node_id);
         args.advertise.clone_from(&self.listen.public_advertise);
@@ -743,6 +776,7 @@ impl NodeFile {
         args.outbound_ca.clone_from(&a.outbound_ca);
         args.max_sockets_per_app = a.max_sockets;
         args.max_front_requests = a.max_front_requests;
+        args.no_alarms = a.no_alarms;
         if let Some(ms) = a.front_cpu_budget_ms {
             args.front_cpu_budget_ms = ms;
         }

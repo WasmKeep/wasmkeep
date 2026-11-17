@@ -73,6 +73,13 @@ fn call(to: &str, path: &str, sender: Option<&str>) -> hyper::HeaderMap {
 const PATH: &str = "/actor/c/x/";
 
 #[test]
+fn a_hops_proofs_never_reach_a_guest() {
+    for name in [INTERNAL, SENDER, CALLER, CHAIN, UPGRADE_MARK] {
+        assert!(HOP_PROOFS.contains(&name), "{name}");
+    }
+}
+
+#[test]
 fn a_sender_is_bound_to_its_hop() {
     let mac = "11".repeat(32);
     let value = sender_value(SECRET, "internal", &mac, "a");

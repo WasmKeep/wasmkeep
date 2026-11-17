@@ -47,6 +47,9 @@ const LAPSED_WAIT: Duration = Duration::from_secs(3);
 /// the heartbeats.
 #[derive(Debug)]
 pub(crate) struct ClusterTls {
+    /// The name its certificate was made for (the process's, ADR 0038).
+    #[cfg_attr(not(test), allow(dead_code))]
+    name: String,
     identity: Identity,
     /// The cluster listener's address as published (`https://host:port`).
     advertise: String,
@@ -95,11 +98,18 @@ impl ClusterTls {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         Ok(Self {
             identity: Identity::generate(node_id, host)?,
+            name: node_id.to_owned(),
             advertise: advertise.trim_end_matches('/').to_owned(),
             pins: Arc::new(PinSet::default()),
             by_address: RwLock::new(HashMap::new()),
             listed: tokio::sync::watch::Sender::new(0),
         })
+    }
+
+    /// The name its certificate was made for.
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     /// The cluster address this node publishes.

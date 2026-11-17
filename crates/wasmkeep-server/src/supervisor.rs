@@ -47,6 +47,14 @@ impl Supervisor {
         }
     }
 
+    /// A supervisor for the process named `name` (`[process] id`): its
+    /// certificate is named for it.
+    pub fn named(name: &str) -> Self {
+        Self {
+            process: NodeProcess::named(name),
+        }
+    }
+
     /// The process its app's cluster joins ([`crate::ClusterConfig::process`]).
     pub fn process(&self) -> Arc<NodeProcess> {
         Arc::clone(&self.process)

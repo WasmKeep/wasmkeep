@@ -96,6 +96,12 @@ pub(crate) const CHAIN: &str = "x-wasmkeep-chain";
 /// node of an older version). Stripped from anything a guest or a client
 /// sends, and never reaches a guest.
 pub(crate) const APP: &str = "x-wasmkeep-app";
+
+/// What only nodes send each other on a hop, removed before a guest sees
+/// the request (a call, or a WebSocket's open): the signature, the
+/// sender's proof (ADR 0038), the caller and chain it vouches for, and a
+/// hand-off's upgrade mark.
+pub(crate) const HOP_PROOFS: [&str; 5] = [INTERNAL, SENDER, CALLER, CHAIN, UPGRADE_MARK];
 /// The app name of nodes given classes on the command line (`serve
 /// --actor`, `dev`): with their tenant, `default`, the implicit app
 /// `default/default` (ADR 0022).

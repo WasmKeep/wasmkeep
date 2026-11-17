@@ -32,8 +32,8 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 use crate::Error;
 use crate::alarm::{self, AlarmHandle, Delivery, now_ms};
 use crate::cluster::{
-    ALARM_HANDOFF, CALLER, CHAIN, Cluster, ClusterConfig, INTERNAL, LeaseHold, OwnershipError,
-    SERVED_BY, decode_address, encode_address,
+    ALARM_HANDOFF, CALLER, CHAIN, Cluster, ClusterConfig, LeaseHold, OwnershipError, SERVED_BY,
+    decode_address, encode_address,
 };
 use crate::http::text_response;
 use crate::replica::{Replica, ReplicaError};

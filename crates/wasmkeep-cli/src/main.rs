@@ -568,7 +568,7 @@ struct ServeArgs {
         "cluster_advertise", "metrics_listen", "max_sockets_per_node", "max_sockets_per_app",
         "data_dir", "secrets_keys", "no_secrets", "env", "front_env", "access",
         "allow_outbound", "allow_outbound_port", "outbound_ca", "max_front_requests",
-        "front_cpu_budget_ms",
+        "front_cpu_budget_ms", "no_alarms",
     ])]
     node_file: Option<PathBuf>,
 
@@ -1382,6 +1382,11 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
     let node_file = match args.node_file.take() {
         Some(path) => {
             let file = node_file::read(&path)?;
+            file.check_plaintext(args.cluster_plaintext == ClusterPlaintext::Accept)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for w in file.warnings() {
+                tracing::warn!("{w}");
+            }
             file.apply_to(&mut args)?;
             tracing::info!(file = %path.display(), "node file read");
             Some(file)
@@ -1563,7 +1568,10 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
     let mut app = App::default();
     // The process's listeners, shutdown and transport to other nodes
     // (ADR 0038): one app.
-    let supervisor = wasmkeep_server::Supervisor::new();
+    let supervisor = match node_file.as_ref().and_then(|f| f.process.id.as_deref()) {
+        Some(name) => wasmkeep_server::Supervisor::named(name),
+        None => wasmkeep_server::Supervisor::new(),
+    };
     // One for the node: guests share its node-wide line budget.
     let guest_log = wasmkeep_server::GuestLog::new(args.guest_log_rate);
     let front_env = load_front_env(&args.front_env)?;

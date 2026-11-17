@@ -93,7 +93,8 @@ impl ActorService {
                 Opener::Front
             }
         };
-        for name in [INTERNAL, CALLER, CHAIN, crate::cluster::UPGRADE_MARK] {
+        // Never to the guest's open (ADR 0038: the sender's proof too).
+        for name in crate::cluster::HOP_PROOFS {
             req.headers_mut().remove(name);
         }
         self.open_socket(class, name, req, opener).await

@@ -22,6 +22,8 @@ use crate::cluster_tls::{ClusterConnector, ClusterTls};
 /// and given to the app's [`ClusterConfig::process`]; a cluster made
 /// without one has a process of its own.
 pub struct NodeProcess {
+    /// The process's name ([`NodeProcess::named`]): its certificate's.
+    name: Option<String>,
     transport: Mutex<Option<Arc<Transport>>>,
 }
 
@@ -37,8 +39,26 @@ impl NodeProcess {
     /// A process serving no app yet.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            name: None,
             transport: Mutex::new(None),
         })
+    }
+
+    /// A process named `name` (`[process] id`, ADR 0038): its one
+    /// certificate is the process's, named for it, whichever of its apps
+    /// made it.
+    pub fn named(name: &str) -> Arc<Self> {
+        Arc::new(Self {
+            name: Some(name.to_owned()),
+            transport: Mutex::new(None),
+        })
+    }
+
+    /// The name of its certificate, once made: the process's, or the
+    /// node id of the app that made it.
+    #[cfg(test)]
+    pub(crate) fn certificate_name(&self) -> Option<String> {
+        self.transport()?.tls.as_ref().map(|t| t.name().to_owned())
     }
 
     /// The node id of the app this process serves, once its cluster was
@@ -83,8 +103,11 @@ impl NodeProcess {
         }
         let tls = match &config.cluster_tls {
             Some(t) => Some(Arc::new(
-                ClusterTls::generate(&config.node_id, &t.advertise)
-                    .map_err(crate::Error::ClusterTls)?,
+                ClusterTls::generate(
+                    self.name.as_deref().unwrap_or(&config.node_id),
+                    &t.advertise,
+                )
+                .map_err(crate::Error::ClusterTls)?,
             )),
             None => None,
         };
@@ -160,6 +183,27 @@ mod tests {
         let mut config = ClusterConfig::new(id, format!("http://{id}"), Arc::clone(store));
         config.process = Some(Arc::clone(process));
         config
+    }
+
+    #[tokio::test]
+    async fn the_certificate_is_named_for_the_process() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let tls = |id: &str, process: &Arc<NodeProcess>| {
+            let mut c = config(id, &store, process);
+            c.cluster_tls = Some(crate::cluster::ClusterTlsConfig::new("https://n.test:7443"));
+            c
+        };
+        let named = NodeProcess::named("edge-1");
+        Cluster::new(&tls("shop-1", &named), &StateRoot::new("", "acme", "shop")).unwrap();
+        assert_eq!(named.certificate_name().as_deref(), Some("edge-1"));
+        // Unnamed (`serve --app`): the app's node id, as before.
+        let unnamed = NodeProcess::new();
+        Cluster::new(
+            &tls("shop-2", &unnamed),
+            &StateRoot::new("", "acme", "shop"),
+        )
+        .unwrap();
+        assert_eq!(unnamed.certificate_name().as_deref(), Some("shop-2"));
     }
 
     #[tokio::test]
