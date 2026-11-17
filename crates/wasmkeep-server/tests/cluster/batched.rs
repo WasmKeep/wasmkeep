@@ -1,5 +1,4 @@
-//! Batched plain writes on a cluster (ADR 0034, slice S9), in a binary
-//! built with `batched-writes`: an event's writes go up after its answer,
+//! Batched plain writes on a cluster (ADR 0034, slice S9): an event's writes go up after its answer,
 //! several events to a segment; `flush` and `exec-durable` wait for the
 //! acknowledged head, until the wall less one second; a failed upload
 //! gives the actor up; the event-start rule holds a busy actor whose

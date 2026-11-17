@@ -2,8 +2,7 @@
 
 Decide what your caller may rely on before sending "saved". A successful
 SQL statement, a durable write and a response received by the client are
-different points. This guide describes today's behavior; `flush` and
-batched plain writes below are **planned**, under
+different points. This guide describes today's behavior, including `flush` and batched plain writes, both under
 [ADR 0034](adr/0034-batched-plain-writes.md).
 
 ## Choose the acknowledgement
@@ -13,7 +12,7 @@ batched plain writes below are **planned**, under
 | Keep replaceable state, such as a cursor or a regenerable draft | Plain `exec` | Committed locally; it may be lost on failure |
 | Tell a caller an order or edit is saved | `exec-durable` before the response | Durable in this actor's storage |
 | Save several related changes together | `exec("BEGIN")`, statements with `exec`, then `exec-durable("COMMIT")` | The whole transaction is durable |
-| Make earlier committed writes durable without another SQL statement | No dedicated call today; `storage.flush` is planned | The proposed call waits for all this actor's commits before it |
+| Make earlier committed writes durable without another SQL statement | `storage.flush` | Every write this actor committed before the call is durable |
 
 An event is not an implicit transaction. Outside `BEGIN` ... `COMMIT`,
 each statement commits separately. A trap rolls back a transaction still
@@ -198,39 +197,62 @@ so retain a business operation key in the payload too. The
 batches durable when answered, but a lost answer is still ambiguous.
 Neither pattern supplies a transaction with the caller's own database.
 
-## Planned: flush earlier commits
+## Flush earlier commits
 
-[ADR 0034](adr/0034-batched-plain-writes.md) proposes `storage.flush`:
-success would mean every write this actor committed before the call is
-durable, in the bucket while the hold was valid, or fsynced locally
-without a bucket. It would be refused inside an open transaction; use
-a durable `COMMIT` there. It would not make another actor's state or an
-external service's work part of the same transaction.
+`storage.flush` ([ADR 0034](adr/0034-batched-plain-writes.md)) returns
+once every write this actor committed before the call is durable: in the
+bucket while the hold was valid, or fsynced locally without a bucket. It
+is refused with `not-allowed` inside an open transaction; use a durable
+`COMMIT` there. It does not make another actor's state or an external
+service's work part of the same transaction.
 
-**It is not in the current SDKs.** The Rust and TypeScript examples
-above use today's durable commit instead. Do not add a `flush` call or
-deploy a component expecting that import yet.
+In the Rust SDK it is `wasmkeep_sdk::storage::flush()`, and in the
+TypeScript SDK `storage.flush()`, which throws `SqlError`. It is in the
+`wasmkeep:actor@0.2.0` interface, so other languages can import it from
+the WIT; their SDKs have no wrapper for it yet. A component that imports it
+needs nodes that have it: a deploy is refused while a live node lacks it.
+An `internal` error whose message starts `not durable: still uploading`
+means the wait ran out while the upload went on (see the next section);
+any other `internal` means replication stopped, so fail the request.
 
-## Planned: opt in to batched plain writes
+## Opt in to batched plain writes
 
-The same ADR proposes per-class `writes = "batched"` for `0.5.0`, with
-today's strict behavior remaining the default. This is not an available
-configuration yet. A batched actor would run later events while an
-upload is in flight, then combine their commits into the next segment.
-Without a bucket, this mode would change nothing.
+Each class chooses how its plain writes reach the bucket. `strict` is the
+default: an event's writes are uploaded before the actor's next event
+starts. `writes = "batched"` in the class's section of `wasmkeep.toml`
+(or `deploy --writes CLASS=batched`, or `serve --writes CLASS=batched` for
+a class given with `--actor`) uploads them behind the events instead: the
+actor runs later events while an upload is in flight, and their commits
+go up together in the next segment. Without a bucket, this mode changes
+nothing. See [the project file](project-file.md).
 
-That trades a wider loss window for throughput: several completed
-events could be lost, and later events could read and broadcast state
-that a new owner never sees. Reads could go backwards after failover,
-and locally allocated sequence numbers could be handed out again.
-The proposed unsent-age control is backpressure, not a promise to save
-within that time; upload time and event duration matter too.
+What each call means in a batched class:
 
-Successful durable calls would retain their guarantee. The proposed
-batched `flush` or `exec-durable` could instead report `internal` with
-`not durable: still uploading`: its wait ended, but its writes stayed
-local and could become durable later. That remains an unknown outcome,
-not permission to answer success or retry blindly.
+- Plain `exec`: committed locally and answered at once. Its upload
+  follows, so it is the one that can be lost. Several completed events
+  can be lost when the node dies, later events can have read and
+  broadcast state that a new owner never sees, reads can go backwards
+  after a failover, and locally allocated sequence numbers can be handed
+  out again. A node's death loses the segment in flight plus the
+  commits not yet captured: about two upload round trips plus one event
+  with a healthy bucket, up to `--max-unsent-age` (500 ms by default) plus
+  one event after a bucket stalls. In the soak's 2 h and 39 kills, 785 of
+  1,237,008 acknowledged plain writes were lost in aggregate (evidence, not
+  a proof of that bound), and no durable write
+  ([strict](../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-strict-57b76c2.csv) and [batched](../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-batched-57b76c2-batched.csv)). `--max-unsent-age` is
+  backpressure checked at event boundaries, not a promise to save within
+  that time.
+- `exec-durable` and `flush`: keep their guarantee. Success means the
+  writes are in the bucket, at the cost of up to one more round trip. They
+  can instead report `internal` with `not durable: still uploading`: the
+  wait ended, but the writes stayed local and can become durable later.
+  That is an unknown outcome, not permission to answer success or retry
+  blindly.
+- A drain, a move, hibernation and a clean stop flush first and lose
+  nothing with a healthy bucket.
+
+In a strict class, plain `exec` loses at most the one event uploading
+when the node dies, and `exec-durable` is as before.
 
 Use plain writes for state whose loss the application can repair, and
 durable operations for promises it must keep. For throughput changes

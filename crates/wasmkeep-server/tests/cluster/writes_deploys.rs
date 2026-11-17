@@ -1,7 +1,6 @@
 //! A class's mode of writes and the deploy's import check (ADR 0034,
-//! sections 1 and 15). Batched writes run only in a binary built with
-//! `batched-writes`: without it a deploy refuses them. A strict class, said or not, is written exactly as before; a
-//! component that imports `storage.flush` (or `storage.delete-self-durable`)
+//! sections 1 and 15). A strict class, said or not, is written exactly as
+//! before; a batched class is written in format 5. A component that imports `storage.flush` (or `storage.delete-self-durable`)
 //! is refused while a live node of the app lacks it.
 
 use object_store::ObjectStoreExt as _;
@@ -92,15 +91,15 @@ async fn a_strict_class_keeps_the_manifest_bytes() {
     assert!(again.unchanged);
 }
 
-/// Batched writes run only in a binary built with `batched-writes` (ADR
-/// 0034, section 15). Without it a deploy refuses them before anything is
-/// written, naming the class; with it the version is written in format 5.
+/// A deploy that names a batched class writes the version in format 5 (ADR
+/// 0034, section 15); a mode for a class the version does not have is a
+/// mistake.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_batched_class_is_refused_unless_built_with_the_flag() {
+async fn a_batched_class_is_deployed_in_format_5() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let rt = deploy_runtime();
     let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
-    let deployed = app
+    let done = app
         .deploy_changes(
             &rt,
             Changes {
@@ -109,21 +108,11 @@ async fn a_batched_class_is_refused_unless_built_with_the_flag() {
                 ..Changes::default()
             },
         )
-        .await;
-    if wasmkeep_server::apps::BATCHED_BUILT {
-        let done = deployed.unwrap();
-        let text = manifest_text(&store, "shop", &done.current.version).await;
-        assert!(text.starts_with("wasmkeep-manifest 5\n"), "{text}");
-        assert!(text.contains("writes c batched\n"), "{text}");
-        return;
-    }
-    let e = deployed.unwrap_err();
-    assert!(
-        matches!(&e, DeployError::BatchedNotYet(c) if c == "c"),
-        "{e}"
-    );
-    assert!(e.to_string().contains("not yet available"), "{e}");
-    assert!(bucket_keys(&store).await.is_empty(), "nothing written");
+        .await
+        .unwrap();
+    let text = manifest_text(&store, "shop", &done.current.version).await;
+    assert!(text.starts_with("wasmkeep-manifest 5\n"), "{text}");
+    assert!(text.contains("writes c batched\n"), "{text}");
     // A mode for a class the version does not have is a mistake.
     let e = app
         .deploy_changes(
@@ -276,12 +265,9 @@ async fn a_mode_change_is_a_line_of_the_plan() {
     };
     let first = deploy(vec![], Some(counter_wasm())).await.unwrap();
     assert!(first.diff.writes.is_empty(), "{:?}", first.diff.writes);
-    let batched = deploy(vec![("c".into(), Writes::Batched)], None).await;
-    if !wasmkeep_server::apps::BATCHED_BUILT {
-        assert!(batched.is_err());
-        return;
-    }
-    let batched = batched.unwrap();
+    let batched = deploy(vec![("c".into(), Writes::Batched)], None)
+        .await
+        .unwrap();
     assert_eq!(batched.diff.writes, vec!["c: strict -> batched".to_owned()]);
     assert!(
         batched

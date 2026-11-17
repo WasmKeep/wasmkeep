@@ -133,7 +133,11 @@ included), `wasmkeep_admission_refused_total`,
 `wasmkeep_websocket_owner_closes_total`,
 `wasmkeep_websocket_sweep_unreadable_total`,
 `wasmkeep_parked_releases_total`, `wasmkeep_plain_events_dropped_total`,
-`wasmkeep_batched_waits_total` and the front's two counters. So a
+`wasmkeep_batched_waits_total` and the front's two counters. The batched
+metrics (`wasmkeep_segment_*`, `wasmkeep_unsent_age_seconds`,
+`wasmkeep_flush_seconds`, `wasmkeep_upload_budget_bytes_in_use`) are on
+every node's page; they stay empty while no class is batched (strict is
+the default). So a
 query or a rule can be checked against the page before anything
 happened, and `increase()` counts the first event. Series with a `class`
 label appear at that class's first event, and the front's histogram at
@@ -187,7 +191,7 @@ its first request.
 | `wasmkeep_expiry_kept_total{reason}` | counter | Candidates not deleted, by `reason`: `changed` (the record changed since the listing: woken meanwhile, or held, as a long-resident actor is), `alarm` (its database holds a pending alarm), `socket` (a WebSocket is open), `active` (resident or parked here, or a name that cannot be told back) and `failed` (the bucket or the restore; tried again on a later pass). A record found changed or held is not tried again until it is written again. |
 | `wasmkeep_parked_wakes_total` | counter | Wakes of a parked room on this node, each an acquisition at a new generation (the record's read and write). |
 | `wasmkeep_parked_releases_total{reason}` | counter | Parked records given up, counted when the release is sent (one that does not land waits in the pending releases, retried), by `reason`: `last_socket` (the room's last socket here went), `drain`, `move`, `lapse` (this node's lease ran out: the release is pending, retried) and `stop` (a clean stop). |
-| `wasmkeep_plain_events_dropped_total{reason}` | counter | Events whose writes were committed but not acknowledged when a hold ended without a flush ([ADR 0034](adr/0034-batched-plain-writes.md), sections 6 and 10), by `reason`: `stop` (a clean stop's deadline passed), `failure` (an upload, a capture or the database worker failed), `lapse` (the hold lapsed), `lost_lease` (the node lease was lost or fenced), `panic` (an event panicked), `app_deleted` and `unbarriered` (a hold dropped without a barrier: a bug). It counts batched holds only: a strict class uploads each event's writes before the next starts, so it never counts here (a failed upload is reported where it fails). Batched classes run only on nodes built with `batched-writes`. |
+| `wasmkeep_plain_events_dropped_total{reason}` | counter | Events whose writes were committed but not acknowledged when a hold ended without a flush ([ADR 0034](adr/0034-batched-plain-writes.md), sections 6 and 10), by `reason`: `stop` (a clean stop's deadline passed), `failure` (an upload, a capture or the database worker failed), `lapse` (the hold lapsed), `lost_lease` (the node lease was lost or fenced), `panic` (an event panicked), `app_deleted` and `unbarriered` (a hold dropped without a barrier: a bug). It counts batched holds only: a strict class uploads each event's writes before the next starts, so it never counts here (a failed upload is reported where it fails). |
 | `wasmkeep_unsent_age_seconds` | histogram | For batched classes: the oldest uncaptured commit's age at each capture, what `--max-unsent-age` bounds ([ADR 0034](adr/0034-batched-plain-writes.md), section 3). |
 | `wasmkeep_segment_events` | histogram | Events per batched segment (buckets 1 to 1,000). |
 | `wasmkeep_segment_bytes` | histogram | Encoded bytes per batched segment (buckets 4 KiB to 256 MiB). |

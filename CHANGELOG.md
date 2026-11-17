@@ -69,14 +69,14 @@ Since 0.4.2, in no release yet.
   the deploy. Upgrade every node, then deploy.
 - **A class's `writes` in `wasmkeep.toml`** (ADR 0034, section 1):
   `"strict"`, the default and every release's behaviour, or `"batched"`,
-  which `deploy` refuses for now ("not yet available"). `"strict"`
-  written or not makes the same version, byte for byte. A version with a
-  batched class will be written as manifest format 5, which this release
-  reads and a deploy holds back while a live node lacks `flush`; each
-  hold keeps the mode it was acquired with until its writes are flushed
-  ([project file](docs/project-file.md)). Until batched writes are built,
-  a node of this release runs a batched class's events as strict ones.
-  No `deploy --writes` flag yet: the project file only.
+  which every build of this release deploys and runs (strict stays the
+  default). `"strict"` written or not makes the same version, byte for
+  byte. A version with a batched class is written as manifest format 5,
+  which a deploy holds back while a live node lacks `flush`; each hold
+  keeps the mode it was acquired with until its writes are flushed
+  ([project file](docs/project-file.md)). `deploy --writes CLASS=MODE`
+  and `serve --writes` set it from the command line, and `--max-unsent-age`
+  bounds how long a committed write waits unsent. In a batched class, what a node's death can lose is the segment in flight plus the commits not yet captured: with a healthy bucket about two upload round trips plus one event (2r + e), and with a stalled bucket up to about `--max-unsent-age` (500 ms by default) plus one event after the stall began. Durable writes (`exec-durable`, `flush`) are never lost. Measured on three OVH VPS, 2 h and 39 kills per mode ([strict](bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-strict-57b76c2.csv) and [batched](bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-batched-57b76c2-batched.csv)): durable writes lost 0 in both; plain writes lost 2 of 208,101 acknowledged in strict and 785 of 1,237,008 in batched (about 20 per kill, at about 172 plain writes a second across the cluster); durable write p50 and p99 78.8 ms and 999 ms in strict, 76.8 ms and 920 ms in batched; failover p99 22.5 s and 21.9 s; no alarm missed. As aggregate counts over all actors and kills, they are evidence, not a proof of the per-actor bound.
 - **`cluster diagnose` requires listings that are strongly consistent
   after a write.** A node taking an actor over plans its restore from one
   listing of the actor's history, and after a voluntary hand-over it may

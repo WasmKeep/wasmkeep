@@ -192,12 +192,8 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
         Duration::from_secs(30),
         "",
         |c| {
-            #[cfg(feature = "batched-writes")]
-            {
-                c.batched.insert("t".into());
-                c.max_unsent_age = Duration::from_secs(5);
-            }
-            let _ = c;
+            c.batched.insert("t".into());
+            c.max_unsent_age = Duration::from_secs(5);
         },
     )
     .await;
@@ -251,7 +247,6 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
     );
     // Leave plain events pending on a batched hold. The restore must flush
     // them before it can select its reset position.
-    #[cfg(feature = "batched-writes")]
     flaky.hold_wal_puts.send_replace(true);
     for n in 1..=3 {
         assert_eq!(
@@ -262,7 +257,6 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
             n.to_string()
         );
     }
-    #[cfg(feature = "batched-writes")]
     eventually("a plain upload is held", async || {
         flaky.held_wal_puts.load(Ordering::SeqCst) > 0
     })
@@ -294,7 +288,6 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
         )
         .await
         .unwrap();
-    #[cfg(feature = "batched-writes")]
     {
         // Admission closes before the restore job enters the mailbox. Keep
         // the upload blocked until then, so completion cannot flush all the

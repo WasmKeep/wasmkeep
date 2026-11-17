@@ -34,7 +34,6 @@ mod websocket;
 pub use socket_limits::{SocketBudget, SocketLimits};
 
 pub use access::{Access, AccessRules};
-#[cfg(feature = "batched-writes")]
 #[doc(hidden)]
 pub use actor::hold_node_upload_budget;
 pub use actor::{ActorConfig, ActorService};

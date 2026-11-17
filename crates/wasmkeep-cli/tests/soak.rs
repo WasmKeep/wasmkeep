@@ -334,7 +334,7 @@ fn check_batched(addrs: &[SocketAddr], nodes: &Nodes) {
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "WASMKEEP_SOAK_WRITES=batched, but the nodes upload no batched segment: \
-             are they built with batched-writes and started with --writes t=batched?"
+             are they started with --writes t=batched?"
         );
         std::thread::sleep(Duration::from_millis(500));
     }
