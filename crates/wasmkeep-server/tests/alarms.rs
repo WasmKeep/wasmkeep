@@ -22,6 +22,10 @@ fn wasm() -> &'static [u8] {
 }
 
 fn service(data: &Path, idle: Duration) -> ActorService {
+    service_with(data, idle, false)
+}
+
+fn service_with(data: &Path, idle: Duration, no_alarms: bool) -> ActorService {
     let runtime = Runtime::new(&RuntimeConfig {
         max_instances: 32,
         ..RuntimeConfig::default()
@@ -31,6 +35,7 @@ fn service(data: &Path, idle: Duration) -> ActorService {
     let mut config = ActorConfig::new(data);
     config.mailbox.idle_timeout = idle;
     config.alarm_retry_initial = Duration::from_millis(50);
+    config.no_alarms = no_alarms;
     ActorService::new(
         runtime,
         config,
@@ -167,6 +172,32 @@ async fn an_alarm_set_before_a_crash_fires_exactly_once_after_restart() {
     // Do not touch the actor: the startup scan alone must re-arm the alarm.
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(number(addr, "/fired").await, 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(number(addr, "/attempts").await, 1, "fired more than once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_without_alarms_leaves_a_due_alarm_pending_for_a_normal_node() {
+    let data = tempfile::tempdir().unwrap();
+    {
+        let (addr, stop) = start(service_with(data.path(), Duration::from_millis(50), true)).await;
+        ok(addr, "POST", "/alarm?in=150").await;
+        // Well past due: a normal node would have fired it by now.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            number(addr, "/fired").await,
+            0,
+            "fired on a --no-alarms node"
+        );
+        assert_eq!(number(addr, "/attempts").await, 0);
+        // Still recorded and pending, and the node still answers requests.
+        assert_ne!(call(addr, "GET", "/alarm").await.1, "none");
+        drop(stop);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A normal node on the same data fires it, once, from the startup scan.
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    wait_fired(addr, 1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(number(addr, "/attempts").await, 1, "fired more than once");
 }

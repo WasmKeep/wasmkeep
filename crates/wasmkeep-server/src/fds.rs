@@ -109,9 +109,79 @@ pub fn budget_with_socket_priority(
     }
 }
 
+/// Why the socket sessions a node admits are fewer than were requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketClamp {
+    /// Every requested session fits.
+    None,
+    /// Only the default request (`--max-sockets-per-node` not given) was cut:
+    /// startup says so at INFO, with the effective number.
+    Default,
+    /// An explicit request was cut: startup warns.
+    Requested,
+}
+
+/// What, if anything, cut the requested socket sessions down to the
+/// effective ones (ADR 0037).
+pub fn socket_clamp(requested: Budget, effective: Budget, explicit: bool) -> SocketClamp {
+    if effective.socket_sessions >= requested.socket_sessions {
+        SocketClamp::None
+    } else if explicit {
+        SocketClamp::Requested
+    } else {
+        SocketClamp::Default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defaults of `wasmkeep serve` with an actor and a front: 1,000
+    /// instances (100 front requests), 10,000 connections, 50,000 sockets.
+    fn defaults(cluster_connections: usize) -> Budget {
+        Budget {
+            public_connections: 10_000,
+            cluster_connections,
+            resident_actors: resident_limit(1_000, default_front_requests(1_000)),
+            socket_sessions: 50_000,
+        }
+    }
+
+    #[test]
+    fn the_default_sockets_at_65536_open_files_are_an_info_not_a_warning() {
+        // (cluster connections, effective sessions): 25,778 on a cluster node.
+        for (cluster, sessions) in [(0, 26_290), (CLUSTER_CONNECTIONS, 25_778)] {
+            let requested = defaults(cluster);
+            let effective = budget_with_socket_priority(65_536, requested, false);
+            assert_eq!(effective.socket_sessions, sessions);
+            // Everything but the sockets is granted in full.
+            assert_eq!(
+                Budget {
+                    socket_sessions: requested.socket_sessions,
+                    ..effective
+                },
+                requested
+            );
+            assert_eq!(
+                socket_clamp(requested, effective, false),
+                SocketClamp::Default
+            );
+            // The same cut from an explicit request still warns.
+            assert_eq!(
+                socket_clamp(requested, effective, true),
+                SocketClamp::Requested
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_clamped_when_the_request_fits() {
+        let requested = defaults(CLUSTER_CONNECTIONS);
+        let effective = budget(1 << 20, requested);
+        assert_eq!(socket_clamp(requested, effective, false), SocketClamp::None);
+        assert_eq!(socket_clamp(requested, effective, true), SocketClamp::None);
+    }
 
     #[test]
     fn default_sockets_keep_a_share_at_1024() {

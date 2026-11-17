@@ -138,6 +138,12 @@ pub struct ActorConfig {
     pub alarm_retry_initial: Duration,
     /// Longest retry delay.
     pub alarm_retry_max: Duration,
+    /// `--no-alarms`: never fire an actor's alarms on this node (no timer
+    /// delivery, no sweep of the bucket's alarm index, no re-arming at
+    /// start). Alarms stay recorded and pending, so a node without this
+    /// setting fires them later. For a node on a restored copy, which must
+    /// not run the app's side effects a second time.
+    pub no_alarms: bool,
     /// Which addresses actors' outbound HTTP may reach: public ones, plus
     /// the ranges this allows.
     pub egress: crate::egress::EgressPolicy,
@@ -217,6 +223,7 @@ impl ActorConfig {
             wall_per_event: Duration::from_secs(30),
             alarm_retry_initial: Duration::from_secs(1),
             alarm_retry_max: Duration::from_secs(300),
+            no_alarms: false,
             cluster: None,
             egress: crate::egress::EgressPolicy::default(),
             guest_log: crate::guest_log::GuestLog::default(),

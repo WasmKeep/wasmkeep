@@ -40,6 +40,16 @@ EOF propagates a write-half shutdown while the reverse stream keeps draining.
 The configured WebSocket close wait bounds the entire wind-down, including
 shutdown, before transport teardown releases the ingress permit.
 
+Amendment (0.5.1): with the default request (50,000 sessions per node), a node
+whose soft limit is 65,536 admits about 25,800 sessions (25,778 with the
+cluster port, 26,290 without). That is the budget working as designed, not a
+misconfiguration, so startup no longer warns. When only the default request is
+cut, it logs one INFO line stating the effective number (and does not emit the
+generic "descriptor admission estimate reduced" warning for it). The warning
+stays for an explicit `--max-sockets-per-node` that does not fit, and for any
+cut of actors or connections. The default stays 50,000 rather than a number
+that fits 65,536, so nodes with higher limits keep their capacity.
+
 ## Consequences
 
 Relays now consume the node ceiling, tightening the previous behavior. No wire

@@ -440,6 +440,7 @@ curl -i -X POST localhost:8082/actor/counter/alice   # 2, forwarded to a
 | `--failover-wait-secs` | How long a `GET` or `HEAD` without a body, or a WebSocket upgrade, for an actor whose node died or is stopping is kept until another node took the actor over, instead of a 503 at once; default 25 (from the lease timing), 0 turns it off (see "When a node dies: what a caller sees") |
 | `--history-retention-secs` | How long old actor history stays in the bucket before garbage collection may delete it; default 3600, 0 allowed (see "History in the bucket") |
 | `--secrets-key FILE` | With `--app`: the key the app's secrets are sealed with (`wasmkeep secrets new-key`); given twice during a key change (see "Secrets in the bucket") |
+| `--no-alarms` | Never fire an actor's alarms on this node and sweep none from the bucket's index; requests are still served and the alarms stay pending for a node without the flag. For a node on a restored copy (see [backup and restore](deploy/backup-and-restore.md)). The node logs once at start that alarms are off |
 | `--no-secrets` | With `--app`: run without the app's secrets from the bucket (`--env` only); without it and without a key, a node refuses to start once the app has secrets |
 
 **Node ids must be unique.** A node may take back its own lease at once

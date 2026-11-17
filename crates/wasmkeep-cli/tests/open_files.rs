@@ -316,7 +316,7 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
         said.contains("descriptor admission estimate reduced requested limits"),
         "missing descriptor-cap warning"
     );
-    assert!(said.contains("socket session capacity reduced by descriptor budget"));
+    assert!(said.contains("socket session capacity limited by the open-files limit"));
     let lower = said.to_ascii_lowercase();
     assert!(
         !lower.contains("too many open files")
@@ -417,5 +417,5 @@ fn a_256_open_files_limit_still_serves_an_actor() {
     assert_eq!(value(addr, "POST", 0), 1);
     let said = std::fs::read_to_string(log).unwrap();
     assert!(said.contains("degraded"));
-    assert!(said.contains("socket session capacity reduced by descriptor budget"));
+    assert!(said.contains("socket session capacity limited by the open-files limit"));
 }
