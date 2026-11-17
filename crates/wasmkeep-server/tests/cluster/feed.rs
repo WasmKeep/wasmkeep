@@ -665,10 +665,7 @@ async fn feed_f4_delete_restore_and_absent() {
         4
     );
     assert_eq!(
-        send(node.addr, "POST", "/actor/t/a/durable", "")
-            .await
-            .body
-            .trim(),
+        write_after_delete(node.addr, "/actor/t/a/durable").await,
         "1"
     );
     assert_eq!(poll(&args, &reader, "").await.unwrap(), 0);
@@ -680,10 +677,7 @@ async fn feed_f4_delete_restore_and_absent() {
         200
     );
     assert_eq!(
-        send(node.addr, "POST", "/actor/t/a/durable", "")
-            .await
-            .body
-            .trim(),
+        write_after_delete(node.addr, "/actor/t/a/durable").await,
         "1"
     );
     assert_eq!(poll(&args, &reader, "").await.unwrap(), 0);
@@ -1310,4 +1304,20 @@ async fn feed_f4_late_tip_collection_and_generation_zero() {
     let (reader, _) = Counted::over(&znew);
     assert_eq!(poll(&args, &reader, "").await.unwrap(), 0);
     assert_eq!(latest_kind(out.path(), "a"), ("state".into(), None));
+}
+
+/// A write right after the actor's own delete may get the retryable 503
+/// ("this node cannot run the actor now; retry") while the deleted actor is
+/// torn down; a client retries it, as here, for up to 10 s.
+async fn write_after_delete(addr: std::net::SocketAddr, path: &str) -> String {
+    let started = std::time::Instant::now();
+    loop {
+        let r = send(addr, "POST", path, "").await;
+        if r.status == 503 && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        assert_eq!(r.status, 200, "{}", r.body);
+        return r.body.trim().to_owned();
+    }
 }
