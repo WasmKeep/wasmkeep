@@ -7,7 +7,8 @@
   content-addressed, the fallback index the one served before)
 - Date: 2026-11-14
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, after data access
-  and several apps per process in `0.5.0`
+  (`0.5.0`) and several apps per process
+  ([ADR 0038](0038-several-apps-per-process.md), earlier in `0.6.0`)
 - Follows: [ADR 0021](0021-the-app-model.md) (the app is the unit),
   [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (the
   app's root, `state/<tenant>/<app>/`), [ADR 0023](0023-the-front.md)
@@ -995,7 +996,7 @@ to add. The existing checks and their verdict do not change.
 - Moving a node's local files into a bucket when it joins a cluster.
 - Encryption of files by WasmKeep: files are stored as written, like the
   actors' history; the bucket's server-side encryption applies.
-- Several apps on the same nodes (0.5.0): the hostname then picks the
+- Several apps on the same nodes (0.6.0, [ADR 0038](0038-several-apps-per-process.md)): the hostname then picks the
   app's assets, and node links name their app already.
 - The SDKs other than Rust and TypeScript.
 

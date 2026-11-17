@@ -22,7 +22,10 @@ this order.
 
 1. **Several apps per process** (L): one supervisor owns the node's
    three ports and routes by app, with an operator-managed hostname
-   table. Add per-app limits, accounting and suspension. This is for
+   table ([ADR 0038](docs/adr/0038-several-apps-per-process.md),
+   proposed). Add per-app limits and accounting; an app leaves a node
+   by its node file and a restart, and cluster-wide app suspension is
+   not part of 0.6.0. This is for
    one owner's apps and trusted tenants, not hostile-tenant isolation
    ([security](docs/security.md)). The website moves onto the fleet
    after this is demonstrated, as the first deploy of its kind.
