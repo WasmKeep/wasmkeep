@@ -417,3 +417,28 @@ impl CloneParts for Request<()> {
         r
     }
 }
+
+/// Review item 4: asking whether a wake-up would be placed charges no
+/// credit and stamps no send, so reading a slow body first costs nothing.
+#[tokio::test(start_paused = true)]
+async fn asking_first_charges_nothing() {
+    let a = placing_node("a").await;
+    set_peer(&a, "b", peer(true, Some(load(0, 10)), 1));
+    let x = actor("x");
+    for _ in 0..10 {
+        assert!(a.would_place(&x, load(50, 50), true));
+    }
+    // Nothing sent to b: a placed event from b is not refused for no return.
+    let from_b = Mark {
+        fill: Some(1000),
+        sender: "b".into(),
+    };
+    assert!(a.arrive(&from_b, || load(0, 100)).is_ok());
+    // The whole budget of 4 is still there.
+    for _ in 0..4 {
+        assert!(matches!(
+            a.choose_placement(&x, load(50, 50), true),
+            Choice::Place { .. }
+        ));
+    }
+}

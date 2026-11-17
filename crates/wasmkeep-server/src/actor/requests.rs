@@ -118,6 +118,13 @@ impl ActorService {
             .and_then(|cluster| cluster.placed_mark(&req, signed_body.as_ref()));
         req.headers_mut().remove(crate::cluster::APP);
         if !read(&self.inner.classes).contains_key(class) {
+            // A placed wake-up for a class this node does not serve yet (a
+            // deploy adding it is still on its way here): the sender, which
+            // serves it, runs it (review item 1).
+            if placed.is_some() {
+                crate::metrics::placement_received(&self.inner.app_labels, "refused");
+                return crate::cluster::placed_refusal("no such actor class here yet\n");
+            }
             return text_response(StatusCode::NOT_FOUND, "no such actor class\n");
         }
         let address = match ActorAddress::new(&self.inner.tenant, class, name) {
@@ -304,12 +311,9 @@ impl ActorService {
         };
         let body = body.to_bytes();
         if crate::cluster::body_sha256(&body) != signed.body {
-            return crate::cluster::refuse_if_placed(
-                &parts.headers,
-                text_response(
-                    StatusCode::FORBIDDEN,
-                    "the body does not match the node's signature\n",
-                ),
+            return text_response(
+                StatusCode::FORBIDDEN,
+                "the body does not match the node's signature\n",
             );
         }
         // Spent only now: a copy sent ahead with another body was refused
@@ -320,10 +324,7 @@ impl ActorService {
             .as_ref()
             .is_none_or(|cluster| !cluster.first_use(&signed, handoff || take));
         if replayed {
-            return crate::cluster::refuse_if_placed(
-                &parts.headers,
-                text_response(StatusCode::FORBIDDEN, "signature already used\n"),
-            );
+            return text_response(StatusCode::FORBIDDEN, "signature already used\n");
         }
         if handoff {
             return self.accept_alarm(&address, &body);
@@ -365,26 +366,46 @@ impl ActorService {
         let app = &self.inner.app_labels;
         // The forward's proof needs the client's address (ADR 0038).
         let signable = req.extensions().get::<crate::http::PeerAddress>().is_some();
-        let (node, fill) =
-            match cluster.choose_placement(address, super::load::rooms(&self.inner), signable) {
-                Choice::NotPlaceable => return Err(Box::new(req)),
-                Choice::Keep(reason) => {
-                    crate::metrics::placement_kept(app, reason);
-                    return Err(Box::new(req));
-                }
-                Choice::Place { node, fill } => (node, fill),
-            };
+        // Asked first, charging nothing: the body is read only for a
+        // wake-up that would be placed, and the credit is charged once it
+        // has arrived (review item 4). Kept, the request streams as ever.
+        if !cluster.would_place(address, super::load::rooms(&self.inner), signable) {
+            if let Choice::Keep(reason) =
+                cluster.choose_placement(address, super::load::rooms(&self.inner), signable)
+            {
+                crate::metrics::placement_kept(app, reason);
+            }
+            return Err(Box::new(req));
+        }
         // Read into memory, so that a refusal can run it here (section 6).
+        // No deadline of its own: the server's limits apply, as to a body
+        // streamed to the actor here.
         let (parts, body) = req.into_parts();
         let max = usize::try_from(crate::cluster::MAX_PLACED_BODY).unwrap_or(usize::MAX);
         let read = http_body_util::BodyExt::collect(http_body_util::Limited::new(body, max));
-        let Ok(Ok(body)) = tokio::time::timeout(SIGNED_BODY_TIMEOUT, read).await else {
+        let Ok(body) = read.await else {
             return Ok(text_response(
                 StatusCode::BAD_REQUEST,
                 "request body unreadable or too large\n",
             ));
         };
         let body = body.to_bytes();
+        let (node, fill) =
+            match cluster.choose_placement(address, super::load::rooms(&self.inner), signable) {
+                Choice::Place { node, fill } => (node, fill),
+                // Its numbers moved while the body arrived: run here.
+                Choice::Keep(reason) => {
+                    crate::metrics::placement_kept(app, reason);
+                    return Ok(self
+                        .run_buffered(cluster, address, parts, body, chain, outside)
+                        .await);
+                }
+                Choice::NotPlaceable => {
+                    return Ok(self
+                        .run_buffered(cluster, address, parts, body, chain, outside)
+                        .await);
+                }
+            };
         let hop = Request::from_parts(parts.clone(), http_body_util::Full::new(body.clone()));
         let sent = cluster.forward_placed(&node, hop, fill).await;
         crate::metrics::placement_sent(app, "request", sent.outcome());
@@ -505,7 +526,10 @@ impl ActorService {
             Ok(response) => {
                 // Handed to the guest: acquired here. An access answer
                 // (403, 404) is the client's and carries no mark.
-                if response.headers().contains_key(SERVED_BY) {
+                // An actor error (500) ran here too (review item 8).
+                if response.headers().contains_key(SERVED_BY)
+                    || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+                {
                     reservation.accepted();
                     crate::metrics::placement_received(app, "acquired");
                 }
@@ -701,7 +725,12 @@ impl ActorService {
                 Ok(Err(e)) => {
                     tracing::warn!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), error = %e, "event not run");
                     crate::metrics::refused(crate::metrics::Refusal::Unavailable);
-                    text_response(StatusCode::SERVICE_UNAVAILABLE, "actor unavailable\n")
+                    // Not run (the mailboxes closed: a stop): a placed
+                    // event's sender runs it (review item 2).
+                    not_run(text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "actor unavailable\n",
+                    ))
                 }
                 _ => text_response(StatusCode::INTERNAL_SERVER_ERROR, "actor error\n"),
             }),

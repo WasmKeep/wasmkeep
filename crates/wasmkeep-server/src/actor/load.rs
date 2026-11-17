@@ -129,7 +129,9 @@ pub(super) fn rooms(inner: &ServiceInner) -> Load {
     let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
     let share = inner.mailboxes.resident_share();
     Load {
-        actors: n(inner.mailboxes.resident()),
+        // Counted as the room is (review item 8): residents with what is
+        // still closing, so actors plus room is the app's capacity here.
+        actors: n(share.residents),
         sockets: n(inner.sockets.len()),
         events_per_min: None,
         front_per_min: None,

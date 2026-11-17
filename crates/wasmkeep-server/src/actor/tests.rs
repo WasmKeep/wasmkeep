@@ -124,3 +124,29 @@ async fn socket_registration_restore_gate_is_not_capacity() {
     );
     assert_eq!(service.inner.sockets.reserved_by(&address), 0);
 }
+
+/// Review item 2 (ADR 0041, section 6): an event a stopping node never
+/// ran (its mailboxes closed) is marked as not run, so a placed event's
+/// receiver refuses it with the mark and its sender runs it.
+#[tokio::test]
+async fn an_event_a_stopping_node_never_ran_is_marked_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        wasmkeep_runtime::Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+    let service = ActorService::new(runtime, ActorConfig::new(dir.path()), vec![]).unwrap();
+    service.inner.mailboxes.close();
+    let address = ActorAddress::new("default", "t", "late").unwrap();
+    let req = Request::get("/").body(http_body_util::BodyExt::map_err(
+        http_body_util::Empty::<bytes::Bytes>::new(),
+        |never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} },
+    ));
+    let response = match service
+        .dispatch(address, req.unwrap(), Arc::from(Vec::new()), true)
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => panic!("handed back"),
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.extensions().get::<requests::NotRun>().is_some());
+}

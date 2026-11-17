@@ -647,16 +647,25 @@ Each slice is one change and says what it proves.
   checked live in the app (`x-wasmkeep-sender`): no-return needs one. A
   forward's proof is checked on its original path, before routing cuts
   `/actor/<class>/<name>` off it.
-- Besides the reasons of section 6, a receiver marks as refused the
-  `503`s it gives a placed hop before reading it: a forward proof or a
-  call's sender that does not check, and a hop for another app. None of
-  them ran the event. A sender treats only a `503` with the mark as a
-  refusal; any other answer (a `403` for a call's body that does not
-  match its signature, say) is returned as it is.
+- Besides the reasons of section 6, a receiver refuses with the mark a
+  placed hop for a class it does not serve yet (a deploy adding it on
+  its way: the sender serves it), and marks the `503`s it gives before
+  the event reached the guest: a forward proof or a call's sender that
+  does not check, a hop for another app, and an event its closed
+  mailboxes never ran (a stop without a drain). A sender treats only a
+  `503` with the mark as a refusal; any other answer (a `403` for a
+  call's body that does not match its signature, say) is returned as it
+  is.
+- A request asks first, charging nothing, and reads its declared body
+  only if it would be placed; it then decides again and charges. A body
+  that is slow or never comes costs no credit and no no-return time, and
+  one whose numbers moved meanwhile runs here.
 - A placed hop that gets no answer in time answers `503` with
   `Retry-After`, as section 6 says, where an ordinary forward answers
   `504`.
-- The cluster tests' nodes run with placement off, but for the
-  placement tests and the golden trace, which runs both ways; with it on,
-  b has one resident slot like a, so a full node's wake-up of another
-  actor is evaluated and kept (a share of 0), and the trace is the same.
+- The cluster tests' nodes run with placement on, the default. The
+  golden trace runs both ways (with it on, b has one resident slot like
+  a, so a full node's wake-up of another actor is evaluated and kept, a
+  share of 0, and the trace is the same), and a second trace records a
+  placed life: one read of the record on the sender, then the receiver's
+  ordinary acquisition, the same operations a first event makes there.

@@ -196,6 +196,21 @@ impl Cluster {
         local: Load,
         signable: bool,
     ) -> Choice {
+        self.choose(address, local, signable, true)
+    }
+
+    /// [`Self::choose_placement`]'s answer now, charging nothing: a
+    /// request reads its declared body only when this says it would be
+    /// placed, then decides again (section 6), so a body that is slow or
+    /// never comes costs no credit and no no-return time.
+    pub(crate) fn would_place(&self, address: &ActorAddress, local: Load, signable: bool) -> bool {
+        matches!(
+            self.choose(address, local, signable, false),
+            Choice::Place { .. }
+        )
+    }
+
+    fn choose(&self, address: &ActorAddress, local: Load, signable: bool, commit: bool) -> Choice {
         if !self.place
             || self.draining()
             || self.secrets_blocked()
@@ -296,8 +311,10 @@ impl Cluster {
                     .find(|(id, ..)| *id == node)
                     .map(|(.., beat)| beat.clone())
                     .unwrap_or_default();
-                state.budget.charge(&node, &beat);
-                state.sent.insert(node.clone(), now);
+                if commit {
+                    state.budget.charge(&node, &beat);
+                    state.sent.insert(node.clone(), now);
+                }
                 Choice::Place { node, fill: s }
             }
         }

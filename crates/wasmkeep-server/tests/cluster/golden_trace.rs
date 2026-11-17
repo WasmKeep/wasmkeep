@@ -168,6 +168,9 @@ struct Keys {
     history: String,
     owner: String,
     alarms: String,
+    /// Reads of the ownership record are recorded too (the placed life:
+    /// placement must add none).
+    owner_reads: bool,
 }
 
 impl Keys {
@@ -176,6 +179,7 @@ impl Keys {
             history: format!("{}/", test_key(Family::History, "t/x")),
             owner: test_key(Family::Owners, "t/x"),
             alarms: test_key(Family::Alarms, ""),
+            owner_reads: false,
         }
     }
 
@@ -220,8 +224,9 @@ impl Recording {
         let history = self.keys.is_history(key);
         let owner = key == self.keys.owner;
         let alarm = self.keys.is_alarm(key);
-        let wanted =
-            history || ((owner || alarm) && matches!(method, "PUT" | "DELETE" | "COPY" | "RENAME"));
+        let wanted = history
+            || ((owner || alarm) && matches!(method, "PUT" | "DELETE" | "COPY" | "RENAME"))
+            || (owner && self.keys.owner_reads && matches!(method, "GET" | "HEAD"));
         if !wanted {
             return None;
         }
@@ -862,6 +867,119 @@ async fn the_bucket_operations_are_the_same_with_placement_on() {
     assert!(
         want == got,
         "placement changed the actor's bucket operations (- expected, + now):\n{}",
+        diff(&want, &got)
+    );
+}
+
+/// Where the placed life's trace lives.
+const PLACED_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/cluster/golden_trace_placed.txt"
+);
+
+/// A placed life (ADR 0041): a is full, b has room, both place. x's first
+/// event, sent to a, is placed on b: one read of x's record on a (the
+/// read routing makes anyway), then b's ordinary acquisition and first
+/// write; the next request follows the owner hint to b with no read on a.
+/// Reads of the record are recorded here, unlike the main trace.
+async fn placed_life() -> String {
+    let mut keys = Keys::new();
+    keys.owner_reads = true;
+    let log = Arc::new(Log::default());
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let recording = |node: &'static str| -> Arc<dyn ObjectStore> {
+        Arc::new(Recording {
+            inner: Arc::clone(&shared),
+            node,
+            log: Arc::clone(&log),
+            keys: keys.clone(),
+        })
+    };
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let adjust = |resident: usize| {
+        move |config: &mut ActorConfig| {
+            config.mailbox.max_resident = resident;
+            let cluster = config.cluster.as_mut().unwrap();
+            cluster.lease = LeaseConfig::new(6_000, 500, 1_000, 100).unwrap();
+            cluster.placement = true;
+        }
+    };
+    let idle = Duration::from_secs(600);
+    let wall = Duration::from_secs(30);
+    let (seen_by_a, seen_by_b) = (recording("a"), recording("b"));
+    let a = node_configured(
+        "a",
+        dirs.0.path(),
+        &seen_by_a,
+        idle,
+        &["t"],
+        test_actor_wasm(),
+        wall,
+        "",
+        adjust(1),
+    )
+    .await;
+    let b = node_configured(
+        "b",
+        dirs.1.path(),
+        &seen_by_b,
+        idle,
+        &["t"],
+        test_actor_wasm(),
+        wall,
+        "",
+        adjust(usize::MAX),
+    )
+    .await;
+    settle().await;
+    // a's only slot: another actor (not recorded) fills it.
+    let r = run(&a, "GET", "/actor/t/w/plain").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("a")),
+        "{}",
+        r.head
+    );
+    settle().await;
+    log.quiet().await;
+    log.ops.lock().unwrap().clear();
+
+    log.step("placed: a, full, sends x's first event to b, which takes x");
+    let r = run(&a, "POST", "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("b")),
+        "{}",
+        r.head
+    );
+    assert_eq!(r.body.trim(), "1");
+    settled(&log, &b).await;
+    log.step("the next request to a follows the hint to b");
+    let r = run(&a, "POST", "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("b")),
+        "{}",
+        r.head
+    );
+    assert_eq!(r.body.trim(), "2");
+    settled(&log, &b).await;
+
+    let ops = log.ops.lock().unwrap().clone();
+    drop((a, b));
+    render(&ops, &keys, &sha256_hex(test_actor_wasm()))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bucket_operations_of_a_placed_life() {
+    if over_tls() {
+        return;
+    }
+    let got = placed_life().await;
+    let want = std::fs::read_to_string(PLACED_FIXTURE).unwrap_or_default();
+    assert!(
+        want == got,
+        "the placed life's bucket operations changed (- expected, + now):\n{}",
         diff(&want, &got)
     );
 }

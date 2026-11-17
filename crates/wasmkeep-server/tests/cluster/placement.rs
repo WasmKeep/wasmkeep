@@ -25,22 +25,56 @@ async fn placing_node_with(
     resident: usize,
     placement: bool,
 ) -> Node {
+    placing_node_full(id, data, store, resident, placement, &["t"], None).await
+}
+
+/// `classes` served; `view_every`: this node's heartbeat period (how often
+/// it reads the others' heartbeats), the harness's 100 ms if `None`.
+async fn placing_node_full(
+    id: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    resident: usize,
+    placement: bool,
+    classes: &[&str],
+    view_every: Option<Duration>,
+) -> Node {
     node_configured(
         id,
         data,
         store,
         Duration::from_secs(600),
-        &["t"],
+        classes,
         test_actor_wasm(),
         Duration::from_secs(30),
         "",
         move |config: &mut ActorConfig| {
             config.mailbox.max_resident = resident;
-            config.cluster.as_mut().unwrap().placement = placement;
+            let cluster = config.cluster.as_mut().unwrap();
+            cluster.placement = placement;
+            if let Some(every) = view_every {
+                // A lease that allows a 3 s period. A node whose heartbeat
+                // is written that rarely is fenced by a peer with the
+                // harness's 1 s lease: both take this one.
+                if every > Duration::from_millis(100) {
+                    cluster.heartbeat = every;
+                }
+                cluster.lease = LeaseConfig::new(9_000, 200, 200, 100).unwrap();
+            }
         },
     )
     .await
 }
+
+/// The value of one series of this process's metrics page (0 if absent).
+fn metric(series: &str) -> u64 {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    page.lines()
+        .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+const APP: &str = r#"tenant="default",app="default""#;
 
 /// Wakes `t/<name>` on `node` and returns the reply.
 async fn wake(node: &Node, name: &str) -> Reply {
@@ -492,4 +526,161 @@ async fn a_joining_node_fills_from_wake_ups_without_flapping() {
         );
     }
     drop(c);
+}
+
+/// Review item 1: a placed wake-up for a class the receiver does not serve
+/// yet (a deploy adding it on its way) is refused with the mark, and the
+/// sender, which serves the class, runs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_class_the_receiver_lacks_runs_on_the_sender() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = placing_node_full("a", dirs.0.path(), &store, 10, true, &["t", "u"], None).await;
+    let b = placing_node_full("b", dirs.1.path(), &store, 10, true, &["t"], None).await;
+    settle().await;
+    let refused = |o| {
+        metric(&format!(
+            r#"wasmkeep_placements_total{{{APP},kind="request",outcome="{o}"}}"#
+        ))
+    };
+    for i in 0..30 {
+        let r = send(a.addr, "GET", &format!("/actor/u/z{i}/fired"), "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("a")),
+            "z{i}: {}",
+            r.head
+        );
+        if refused("refused") > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(refused("refused") >= 1, "never placed on b");
+    assert_eq!(refused("placed"), 0);
+    drop(b);
+}
+
+/// Review item 7: a real receiver's own count refuses a hop its heartbeat
+/// did not show coming (`fuller`), and the sender runs the event: a
+/// request, or an `actors.call`. a reads the others' heartbeats every 3 s,
+/// so it still sees b empty while b fills from its own requests.
+async fn fuller_then_run_here(call: bool) {
+    // b, reading heartbeats every 100 ms, sees a's (every 3 s) as stale:
+    // over TLS that also drops a's pins there. Plain HTTP only.
+    if over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let every = Duration::from_secs(3);
+    let a = placing_node_full("a", dirs.0.path(), &store, 10, true, &["t"], Some(every)).await;
+    // Its view's periods count from its start check.
+    let started = tokio::time::Instant::now();
+    // Alone: a keeps its nine (no candidate).
+    for i in 0..9 {
+        assert_eq!(wake(&a, &format!("a{i}")).await.node.as_deref(), Some("a"));
+    }
+    let b = placing_node_full(
+        "b",
+        dirs.1.path(),
+        &store,
+        10,
+        true,
+        &["t"],
+        Some(Duration::from_millis(100)),
+    )
+    .await;
+    // a's next view after b started (a reads every 3 s from its start)
+    // shows b empty.
+    let mut seen = started + every;
+    while seen < tokio::time::Instant::now() + Duration::from_millis(200) {
+        seen += every;
+    }
+    tokio::time::sleep_until(seen + Duration::from_millis(800)).await;
+    // b fills itself: a is fuller, so b keeps all seven.
+    for i in 0..7 {
+        assert_eq!(wake(&b, &format!("b{i}")).await.node.as_deref(), Some("b"));
+    }
+    assert!(
+        seen.elapsed() < every - Duration::from_millis(500),
+        "too slow to test"
+    );
+    let fuller = || {
+        metric(&format!(
+            r#"wasmkeep_placements_received_total{{{APP},outcome="fuller"}}"#
+        ))
+    };
+    let kind = if call { "call" } else { "request" };
+    let refused = || {
+        metric(&format!(
+            r#"wasmkeep_placements_total{{{APP},kind="{kind}",outcome="refused"}}"#
+        ))
+    };
+    // a at 9 of 10 (900) with b seen at 0: t = 7, a share of 7, sent;
+    // b holds 7, so the actor would put it at 8, above 7: refused.
+    let r = if call {
+        send(a.addr, "POST", "/actor/t/a0/call?to=t%2Fz", "").await
+    } else {
+        wake(&a, "z").await
+    };
+    assert_eq!(
+        r.status,
+        200,
+        "{}: {} (fuller {}, refused {})",
+        r.head,
+        r.body,
+        fuller(),
+        refused()
+    );
+    assert_eq!((fuller(), refused()), (1, 1));
+    if !call {
+        assert_eq!(r.node.as_deref(), Some("a"));
+    }
+    assert_eq!(lease_holder(&store, "z").await.as_deref(), Some("a"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_the_receiver_finds_fuller_runs_here() {
+    fuller_then_run_here(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_the_receiver_finds_fuller_runs_here() {
+    fuller_then_run_here(true).await;
+}
+
+/// Review item 7: an alarm due for an actor not in memory on a full node
+/// is delivered as alarms are (ADR 0009), never placed, while a lighter
+/// node announcing `place` is there.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alarm_on_a_full_node_is_never_placed() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = placing_node("a", dirs.0.path(), &store, 3).await;
+    let due = epoch_ms() + 3_000;
+    let r = send(a.addr, "POST", &format!("/actor/t/x/alarm?at={due}"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    for name in ["f1", "f2"] {
+        assert_eq!(wake(&a, name).await.node.as_deref(), Some("a"));
+    }
+    let b = placing_node("b", dirs.1.path(), &store, 10).await;
+    settle().await;
+    // A WebSocket (never placed) takes x's slot on the full node.
+    assert_eq!(upgrade_status(a.addr, "/actor/t/f3").await, 101);
+    eventually("the alarm was delivered", async || {
+        index_entries_for(&store, "x").await.is_empty()
+    })
+    .await;
+    let placed: u64 = ["request", "call"]
+        .iter()
+        .flat_map(|k| ["placed", "refused", "unsent", "failed"].map(move |o| (k, o)))
+        .map(|(k, o)| {
+            metric(&format!(
+                r#"wasmkeep_placements_total{{{APP},kind="{k}",outcome="{o}"}}"#
+            ))
+        })
+        .sum();
+    assert_eq!(placed, 0, "something was placed");
+    drop(b);
 }
