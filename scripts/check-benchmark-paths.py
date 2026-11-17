@@ -92,6 +92,14 @@ REVIEWED_PATHS = {
         "/backup/$db",
     },
     "docs/tutorials/first-actor.md": {"/?who=alice"},
+    # The React tutorial's source files: URL paths and a regular expression
+    # literal, and the dev server's proxy address, none of them files.
+    "docs/build/react.md": {
+        "/${input.id}", "/input.id/toggle", "/src/main.tsx", "/actor", "/l/groceries", "/l/{name}", "/assets/",
+        "/^/", "/.exec", "/toggle$/.exec", "/?$/.exec", "/^/l/",
+    },
+
+
     # Paths inside the toolchain image's container, not on a machine.
     "docs/deploy/toolchain.md": {"/src", "/src/counter", "/tmp", "/tmp/cargo", "/tmp/.npm", "/root/.npm"},
 }

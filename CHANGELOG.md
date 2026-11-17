@@ -9,6 +9,16 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **A React quickstart:** `examples/react-todos` is a TypeScript actor
+  and a React + Vite page over one typed contract, with Vite proxying to
+  `wasmkeep dev` and the built page deployed as static assets
+  (`not-found = "spa"`); the tutorial is
+  [docs/build/react.md](docs/build/react.md), run as written by
+  `scripts/tutorials/react.sh`. `wasmkeep-ts build` now resolves
+  `@wasmkeep/sdk/contracts` and `@wasmkeep/sdk/room-client`, as it did
+  `@wasmkeep/sdk/front`: before, an actor could not import a contract file
+  from the contracts entry.
+
 - **Typed Rust clients:** the `client` feature of `wasmkeep-sdk` adds
   `contract!` (a plain `macro_rules!` macro) and `record!`: declare an actor
   class's operations with typed inputs, answers and declared errors, and get a

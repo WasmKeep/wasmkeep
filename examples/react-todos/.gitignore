@@ -1,0 +1,6 @@
+node_modules/
+todos.wasm
+web/dist/
+.wasmkeep/
+.env.local
+secrets.key

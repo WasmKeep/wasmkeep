@@ -82,6 +82,9 @@ for ex in examples/ts-*/; do
   echo "-- $ex"
   (cd "$ex" && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm run --silent build:starlingmonkey)
 done
+# A TypeScript actor and a React page over one contract (docs/build/react.md).
+echo '-- examples/react-todos/'
+(cd examples/react-todos && { [ -d node_modules ] || npm ci --silent; } && npm run --silent build && npm test --silent)
 for ex in examples/c-*/ examples/py-*/ examples/go-*/ examples/d-*/; do
   [ "$ex" = examples/go-std-counter/ ] && continue
   echo "-- $ex"

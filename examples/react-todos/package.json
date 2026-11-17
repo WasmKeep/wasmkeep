@@ -1,0 +1,25 @@
+{
+  "name": "wasmkeep-example-react-todos",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite web",
+    "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
+    "test": "node scripts/test.mjs",
+    "build:actor": "wasmkeep-ts build src/todos.ts -o todos.wasm",
+    "build:web": "tsc -p web/tsconfig.json && vite build web",
+    "build": "npm run build:actor && npm run build:web"
+  },
+  "dependencies": {
+    "@wasmkeep/sdk": "file:../../sdks/typescript",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.8"
+  }
+}

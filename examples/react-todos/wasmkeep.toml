@@ -1,0 +1,22 @@
+# The project file (docs/project-file.md): one class, `todos`, and the built
+# React page as static assets. Run `npm ci` here once (after `npm ci` in
+# sdks/typescript), then `wasmkeep dev`; the tutorial is docs/build/react.md.
+[app]
+tenant = "acme"
+name = "react-todos"
+
+[assets]
+dir = "web/dist"
+build = "npm run build:web"
+watch = ["web/src", "web/index.html", "src/contract.ts"]
+not-found = "spa"
+immutable = ["assets/"]
+
+[classes.todos]
+component = "todos.wasm"
+access = "open"
+build = "npm run build:actor"
+watch = ["src"]
+
+[dev]
+port = 8080

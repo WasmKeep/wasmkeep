@@ -32,8 +32,9 @@ passed=(); skipped=(); failed=()
 for name in "${names[@]}"; do
   test=scripts/tutorials/$name.sh
   page=docs/tutorials/$name.md
+  [ -f "$page" ] || page=docs/build/$name.md
   [ -f "$test" ] || { echo "no test $test" >&2; exit 2; }
-  [ -f "$page" ] || { echo "no page $page for $test" >&2; exit 2; }
+  [ -f "$page" ] || { echo "no page docs/tutorials/$name.md or docs/build/$name.md for $test" >&2; exit 2; }
   printf '\n== tutorial %s\n' "$name"
   set +e
   TUTORIAL=$page timeout --signal=TERM --kill-after=30 "${TUTORIAL_TIMEOUT:-900}" \
