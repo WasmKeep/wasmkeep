@@ -252,7 +252,7 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
     // Leave plain events pending on a batched hold. The restore must flush
     // them before it can select its reset position.
     #[cfg(feature = "batched-writes")]
-    flaky.delay_wal_ms.store(1500, Ordering::SeqCst);
+    flaky.hold_wal_puts.send_replace(true);
     for n in 1..=3 {
         assert_eq!(
             send(a.addr, "POST", "/actor/t/rewind/plain", "")
@@ -262,6 +262,15 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
             n.to_string()
         );
     }
+    #[cfg(feature = "batched-writes")]
+    eventually("a plain upload is held", async || {
+        flaky.held_wal_puts.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    // Keep the request after a's successful replacement so b must replay it.
+    // This deterministically exercises the race with the observer of `.done`:
+    // a replay fences at a newer generation and publishes that head there.
+    flaky.fail_request_deletes.store(true, Ordering::SeqCst);
     let key = control::checked_restore_key(&root, "t", "rewind", "0123456789abcdef").unwrap();
     let request = Request {
         source: "live history".into(),
@@ -285,31 +294,91 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
         )
         .await
         .unwrap();
+    #[cfg(feature = "batched-writes")]
+    {
+        // Admission closes before the restore job enters the mailbox. Keep
+        // the upload blocked until then, so completion cannot flush all the
+        // writes before the restore is even queued.
+        eventually(
+            "restore admission closes with an upload pending",
+            async || {
+                // An incomplete upgrade checks admission without opening a
+                // socket or queueing an event behind the blocked restore.
+                let reply = send(a.addr, "GET", "/actor/t/rewind", "Upgrade: websocket\r\n").await;
+                reply.status == 503 && reply.body.trim() == "actor restore pending"
+            },
+        )
+        .await;
+        assert!(store.head(&Key::from(format!("{key}.done"))).await.is_err());
+        flaky.hold_wal_puts.send_replace(false);
+    }
     tokio::time::timeout(Duration::from_secs(20), async {
-        while store.head(&Key::from(format!("{key}.done"))).await.is_err() {
+        loop {
+            if let Ok(done) = store.get(&Key::from(format!("{key}.done"))).await {
+                let bytes = done.bytes().await.unwrap();
+                let done = std::str::from_utf8(&bytes).unwrap();
+                let (generation, _) = done.split_once(':').unwrap();
+                if generation.parse::<u64>().unwrap() > export.position.generation {
+                    break;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("restore never acknowledged");
-    let done = store
-        .get(&Key::from(format!("{key}.done")))
-        .await
-        .unwrap()
-        .bytes()
+    .expect("second node never acknowledged the replay");
+    // `.done` is the latest acknowledgement, not the original replacement's
+    // position. The durable marker retains its txid across a replay. Check
+    // that exact history boundary so a valid hold abandoned before the reset
+    // still fails, even though the replay legitimately changes generations.
+    let replaced = actor_restore_meta(&store, "rewind", "replaced")
         .await
         .unwrap();
-    let done = std::str::from_utf8(&done).unwrap();
-    let (generation, txid) = done.split_once(':').unwrap();
+    let txid = replaced
+        .strip_prefix("restore ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(txid > export.position.txid, "history was rewound");
+    let replacement = wasmkeep_server::history::export_raw(
+        &store,
+        &root,
+        &address,
+        wasmkeep_server::history::Point::Txid(txid),
+        &saved.path().join("replacement.db"),
+        1024 * 1024,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        generation.parse::<u64>().unwrap(),
-        export.position.generation,
+        replacement.position.generation, export.position.generation,
         "restore abandoned a valid hold instead of flushing it"
     );
-    flaky.delay_wal_ms.store(0, Ordering::SeqCst);
-    assert!(
-        txid.parse::<u64>().unwrap() > export.position.txid,
-        "history was rewound"
+    // Prove the full flush, not just that the replacement kept its hold:
+    // all three plain writes must be replayable immediately before the reset.
+    let flushed_path = saved.path().join("flushed.db");
+    wasmkeep_server::history::export(
+        &store,
+        &root,
+        &address,
+        wasmkeep_server::history::Point::Txid(txid - 1),
+        &flushed_path,
+        1024 * 1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        wasmkeep_storage::readonly::query(
+            &flushed_path,
+            "SELECT value FROM config WHERE key = 'plain'"
+        )
+        .unwrap()
+        .values,
+        vec![vec![wasmkeep_storage::SqlValue::Integer(3)]],
+        "restore did not flush every plain write before the replacement"
     );
     let old_path = saved.path().join("old-still-replayable.db");
     wasmkeep_server::history::export_raw(
