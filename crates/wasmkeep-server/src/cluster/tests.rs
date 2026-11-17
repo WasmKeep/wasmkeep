@@ -98,6 +98,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         load: None,
         can_recorded_head: false,
         can_multi_app: false,
+        can_place: false,
         process: None,
     };
     let nodes = [
@@ -748,6 +749,8 @@ async fn only_serving_peers_of_the_same_app_that_are_not_draining_are_chosen() {
         can_end: false,
         can_blobs: false,
         instance: None,
+        can_place: false,
+        seen: None,
     };
     let serving = Some(DrainState::Serving);
     *me.peers.write().unwrap() = HashMap::from([
@@ -809,6 +812,8 @@ async fn only_nodes_that_deliver_this_apps_alarms_share_the_sweep() {
         can_end: false,
         can_blobs: false,
         instance: None,
+        can_place: false,
+        seen: None,
     };
     let serving = Some(DrainState::Serving);
     *me.peers.write().unwrap() = HashMap::from([
@@ -863,6 +868,8 @@ async fn live_nodes_split_the_alarm_sweep_between_them() {
             can_end: false,
             can_blobs: false,
             instance: None,
+            can_place: false,
+            seen: None,
         };
         *c.peers.write().unwrap() = HashMap::from([
             ("a".to_owned(), peer("http://a")),
@@ -935,6 +942,8 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_end: false,
                     can_blobs: false,
                     instance: None,
+                    can_place: false,
+                    seen: None,
                 },
             ),
             (
@@ -949,6 +958,8 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_end: false,
                     can_blobs: false,
                     instance: None,
+                    can_place: false,
+                    seen: None,
                 },
             ),
             (
@@ -963,6 +974,8 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_end: false,
                     can_blobs: false,
                     instance: None,
+                    can_place: false,
+                    seen: None,
                 },
             ),
         ]);
@@ -1061,6 +1074,8 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 can_end: false,
                 can_blobs: false,
                 instance: None,
+                can_place: false,
+                seen: None,
             },
         ),
         (
@@ -1075,6 +1090,8 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 can_end: false,
                 can_blobs: false,
                 instance: None,
+                can_place: false,
+                seen: None,
             },
         ),
     ]);
@@ -2752,6 +2769,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         load: None,
         can_recorded_head: false,
         can_multi_app: false,
+        can_place: false,
         process: None,
     };
     a.note_future_leases(&[lease(now_ms())]);
@@ -2875,6 +2893,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         load: None,
         can_recorded_head: false,
         can_multi_app: false,
+        can_place: false,
         process: None,
     }
 }
@@ -4602,4 +4621,85 @@ async fn a_missing_link_behind_slow_listings_stays_retryable() {
     .await
     .unwrap();
     assert_eq!(restored.verified_head(), h);
+}
+
+/// ADR 0041, section 3: a peer's load is fresh for three periods from
+/// when this node first saw that heartbeat, on its own monotonic clock; a
+/// heartbeat read again keeps its age, a new one starts again.
+#[tokio::test(start_paused = true)]
+async fn a_peer_load_is_fresh_for_three_periods_from_its_first_sighting() {
+    let period = Duration::from_secs(3);
+    let info = |written_at_ms: u64, actors: u64| NodeInfo {
+        load: Some(wasmkeep_cluster::membership::Load {
+            actors,
+            actor_room: Some(100 - actors),
+            socket_room: Some(10),
+            ..Default::default()
+        }),
+        can_place: true,
+        written_at_ms,
+        instance: Some("beef".into()),
+        ..node_info("p")
+    };
+    let view = |n: &NodeInfo| HashMap::from([("p".to_owned(), Peer::of(n).unwrap())]);
+    let first = view(&info(1_000, 40));
+    let peer = &first["p"];
+    assert!(peer.can_place);
+    let seen = peer.seen.as_ref().unwrap();
+    assert_eq!((seen.load.actors, seen.load.actor_room), (40, Some(60)));
+    assert!(seen.fresh(period).is_some());
+    // The same heartbeat read again 8 s later: still the first sighting.
+    tokio::time::advance(Duration::from_secs(8)).await;
+    let mut again = view(&info(1_000, 40));
+    carry_first_seen(&first, &mut again);
+    assert!(again["p"].seen.as_ref().unwrap().fresh(period).is_some());
+    // At three periods exactly it is stale: keep it.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(again["p"].seen.as_ref().unwrap().fresh(period).is_none());
+    // A new heartbeat (another `written_at`) is fresh again, even with
+    // the same numbers, whatever its own clock says.
+    let mut next = view(&info(500, 40));
+    carry_first_seen(&again, &mut next);
+    assert!(next["p"].seen.as_ref().unwrap().fresh(period).is_some());
+    // A node of a version without rooms has a load but no room: the
+    // decision treats it as no candidate (section 4).
+    let old = NodeInfo {
+        load: Some(wasmkeep_cluster::membership::Load::default()),
+        can_place: false,
+        ..node_info("p")
+    };
+    let peer = Peer::of(&old).unwrap();
+    assert!(!peer.can_place);
+    assert_eq!(peer.seen.unwrap().load.actor_room, None);
+}
+
+fn node_info(id: &str) -> NodeInfo {
+    NodeInfo {
+        id: id.into(),
+        address: "http://x".into(),
+        version: "0".into(),
+        written_at_ms: 0,
+        app: "t/default".into(),
+        cluster_address: None,
+        tls_pins: Vec::new(),
+        drain: Some(DrainState::Serving),
+        reads_secrets: false,
+        can_take: false,
+        can_front: false,
+        can_handoff: false,
+        can_end: false,
+        can_flush: false,
+        can_rate_limits: false,
+        can_assets: false,
+        can_blobs: false,
+        can_restore: false,
+        can_actor_restore: false,
+        instance: None,
+        lease: None,
+        load: None,
+        can_recorded_head: false,
+        can_multi_app: false,
+        can_place: false,
+        process: None,
+    }
 }

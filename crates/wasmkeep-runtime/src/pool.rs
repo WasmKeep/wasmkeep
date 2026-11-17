@@ -81,6 +81,15 @@ impl ResidentPool {
             .collect()
     }
 
+    /// The floor of `member` (by its address), as [`Self::make_room`]
+    /// counts it: its own, or the default for the members alive now.
+    pub(crate) fn floor_of(&self, member: *const ()) -> usize {
+        self.members()
+            .into_iter()
+            .find(|(m, _)| std::ptr::eq(Arc::as_ptr(m).cast::<()>(), member))
+            .map_or(0, |(_, floor)| floor)
+    }
+
     /// Called by a member whose wake-up found the pool full (`extra`: that
     /// caller, if it is not counted among the waiters): evicts the least
     /// recently active idle resident of a member above its floor, unless

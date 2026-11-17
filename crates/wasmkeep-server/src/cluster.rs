@@ -564,6 +564,53 @@ pub(crate) struct Peer {
     /// The process its heartbeat names: routing trusts a record only if
     /// it names this one (ADR 0020).
     pub(crate) instance: Option<String>,
+    /// It may receive a placed wake-up (heartbeat line 11, `place`, ADR
+    /// 0041, section 9).
+    pub(crate) can_place: bool,
+    /// Its heartbeat's load, and when this node first saw that heartbeat
+    /// (ADR 0041, section 3); `None` from a node without a load line.
+    pub(crate) seen: Option<Seen>,
+}
+
+/// A peer's load as one heartbeat published it, with the moment this node
+/// first saw that heartbeat on its own monotonic clock (ADR 0041, section
+/// 3): the heartbeat's own time is the peer's clock, never used here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub(crate) load: wasmkeep_cluster::membership::Load,
+    /// Which heartbeat: its process token and its `written_at`.
+    pub(crate) beat: (Option<String>, u64),
+    pub(crate) at: tokio::time::Instant,
+}
+
+/// How many heartbeat periods a peer's load stays fresh, and how long no
+/// return lasts (ADR 0041, sections 3 and 5): a constant in 0.6.0.
+#[allow(dead_code)] // Read by placement's wiring (ADR 0041, P4).
+pub(crate) const FRESH_PERIODS: u32 = 3;
+
+impl Seen {
+    /// The load, if this heartbeat was first seen less than
+    /// [`FRESH_PERIODS`] periods ago: stale means keep it.
+    #[allow(dead_code)] // Read by placement's wiring (ADR 0041, P4).
+    pub(crate) fn fresh(&self, period: Duration) -> Option<&wasmkeep_cluster::membership::Load> {
+        (self.at.elapsed() < period.saturating_mul(FRESH_PERIODS)).then_some(&self.load)
+    }
+}
+
+/// Carries each peer's first-seen moment over from the last refresh when
+/// it still shows the same heartbeat: a heartbeat read again is not seen
+/// anew, so its age keeps counting (ADR 0041, section 3).
+pub(crate) fn carry_first_seen(old: &HashMap<String, Peer>, new: &mut HashMap<String, Peer>) {
+    for (id, peer) in new.iter_mut() {
+        let Some(seen) = peer.seen.as_mut() else {
+            continue;
+        };
+        if let Some(before) = old.get(id).and_then(|p| p.seen.as_ref())
+            && before.beat == seen.beat
+        {
+            seen.at = before.at;
+        }
+    }
 }
 
 impl Peer {
@@ -583,6 +630,12 @@ impl Peer {
             can_end: node.can_end,
             can_blobs: node.can_blobs,
             instance: node.instance.clone(),
+            can_place: node.can_place,
+            seen: node.load.map(|load| Seen {
+                load,
+                beat: (node.instance.clone(), node.written_at_ms),
+                at: tokio::time::Instant::now(),
+            }),
         })
     }
 }

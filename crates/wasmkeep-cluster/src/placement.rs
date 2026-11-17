@@ -1,4 +1,5 @@
-//! Pure ADR 0041 placement policy. Not connected to routing or membership.
+//! Pure ADR 0041 placement policy: the rooms a node publishes, the
+//! sender's decision and the receiver's arrival check. No I/O.
 
 use crate::membership::{DrainState, Load};
 use std::{collections::BTreeMap, time::Duration};
@@ -10,6 +11,45 @@ pub struct RoomLoad {
     pub load: Load,
     pub actor_room: Option<u64>,
     pub socket_room: Option<u64>,
+}
+
+impl From<Load> for RoomLoad {
+    fn from(load: Load) -> Self {
+        Self {
+            load,
+            actor_room: load.actor_room,
+            socket_room: load.socket_room,
+        }
+    }
+}
+
+/// `actor_room` (ADR 0041, section 2): how many more residents an app may
+/// have on this node now. `cap` is its own `max-resident` (the process
+/// limit if unset), `floor` its `min-resident` in the process's pool (0
+/// alone), `limit` the pool's limit and `process` the residents of every
+/// app of the process: `min(cap - actors, max(floor - actors, limit -
+/// process))`, each difference stopping at 0. An app below its floor may
+/// evict another app's idle resident, so a full process is not full for it.
+pub fn actor_room(actors: u64, cap: u64, floor: u64, limit: u64, process: u64) -> u64 {
+    cap.saturating_sub(actors).min(
+        floor
+            .saturating_sub(actors)
+            .max(limit.saturating_sub(process)),
+    )
+}
+
+/// `socket_room` (ADR 0041, section 2): `min(app ceiling - app sockets,
+/// node ceiling - process sockets)`, stopping at 0.
+pub fn socket_room(app_ceiling: u64, app_sockets: u64, node_ceiling: u64, process: u64) -> u64 {
+    app_ceiling
+        .saturating_sub(app_sockets)
+        .min(node_ceiling.saturating_sub(process))
+}
+
+/// A fill in thousandths, rounded down: `count * 1000 / (count + room)`,
+/// 1000 when there is no room at all (ADR 0041, section 2).
+pub fn fill(count: u64, room: u64) -> u64 {
+    u64::try_from(ratio(u128::from(count), capacity(count, room))).unwrap_or(1000)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -292,6 +332,45 @@ mod tests {
             node,
             reason: Reason::Lighter,
         }
+    }
+
+    #[test]
+    fn rooms_count_the_cap_the_floor_and_the_full_process() {
+        // Alone (floor 0, limit = cap, process = actors): the cap's gap.
+        assert_eq!(actor_room(30, 100, 0, 100, 30), 70);
+        // Its own cap binds first, whatever the process has free.
+        assert_eq!(actor_room(40, 50, 0, 1000, 40), 10);
+        // A full process: no room above the floor...
+        assert_eq!(actor_room(10, 100, 25, 100, 100), 15);
+        assert_eq!(actor_room(30, 100, 25, 100, 100), 0);
+        // ...but its floor still counts, capped by its own max.
+        assert_eq!(actor_room(0, 10, 25, 100, 100), 10);
+        // Another app holds most of the pool: what is left of it.
+        assert_eq!(actor_room(5, 100, 0, 100, 90), 10);
+        // At or above the cap (a lowered limit): 0, never negative.
+        assert_eq!(actor_room(120, 100, 0, 100, 120), 0);
+        assert_eq!(actor_room(u64::MAX, u64::MAX, 0, u64::MAX, u64::MAX), 0);
+        // Sockets: the app's ceiling and the process's.
+        assert_eq!(socket_room(100, 10, 1000, 500), 90);
+        assert_eq!(socket_room(100, 10, 1000, 950), 50);
+        assert_eq!(socket_room(100, 100, 1000, 100), 0);
+        assert_eq!(socket_room(100, 10, 1000, 2000), 0);
+        // Fills, rounded down; no room at all is full.
+        assert_eq!(fill(30, 70), 300);
+        assert_eq!(fill(1, 2), 333);
+        assert_eq!(fill(0, 0), 1000);
+        assert_eq!(fill(5, 0), 1000);
+        assert_eq!(fill(0, 10), 0);
+        assert_eq!(fill(u64::MAX, u64::MAX), 500);
+        // The view's load turns into the decision's input as published.
+        let load = Load {
+            actors: 3,
+            actor_room: Some(7),
+            socket_room: None,
+            ..Load::default()
+        };
+        let room = RoomLoad::from(load);
+        assert_eq!((room.actor_room, room.socket_room), (Some(7), None));
     }
 
     #[test]
