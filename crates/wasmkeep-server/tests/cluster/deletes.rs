@@ -362,7 +362,18 @@ async fn pending_delete_replacement(restore: bool) {
                 .status,
             200
         );
-        write(a.addr, "pending", 1).await;
+        // The actor is torn down after its own delete: a request that
+        // arrives meanwhile may get the retryable 503, as a client would.
+        let started = std::time::Instant::now();
+        loop {
+            let r = send(a.addr, "POST", "/actor/t/pending/durable", "").await;
+            if r.status == 503 && started.elapsed() < Duration::from_secs(10) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+            break;
+        }
     }
     assert!(exists(&store, &request).await, "A must still be pending");
     flaky.hide_delete_requests.store(false, Ordering::SeqCst);
