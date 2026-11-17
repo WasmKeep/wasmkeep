@@ -212,6 +212,18 @@ The metrics endpoint still registers `wasmkeep_rate_limit_requests_total` and
 record label in `wasmkeep_signatures_refused_full_total`. These metrics are the
 intentional exception to no-policy compatibility.
 
+### `[assets]` (optional)
+
+`dir` is required, relative to the project file. `build` is an optional
+shell command, run before the front and classes; `watch` lists paths
+whose changes rerun that build in `dev`. `not-found` is `front` (default),
+`spa` (requires root `index.html` at deploy), or `404`. `front-first` and
+`immutable` are arrays of whole-segment prefixes ending in `/`.
+
+The directory replaces the version's assets; omitting `[assets]` removes
+them. An assets-only project is valid. See [static assets](static-assets.md)
+for matching, headers, limits, the type table, repair and collection.
+
 ### `[dev]` (optional, `wasmkeep dev` only)
 
 | Key | Default | |
@@ -233,7 +245,7 @@ names the `[dev] env` file, by any path or link, is refused). The bucket is
 wasmkeep deploy --bucket s3://my-bucket/prod
 ```
 
-1. Runs every `build` (the front's first, then the classes' in name
+1. Runs every `build` (assets first, then the front and the classes in name
    order). A failed build stops the deploy before the bucket is opened.
    `--no-build` skips them. `--bucket`, and that every `config` file is
    there, are checked first. A build's output goes to stderr (stdout is
@@ -260,7 +272,8 @@ acme/todo: version 3c2f0a9e41d5b7a0 is current (deploy 7)
 removed. A class without `access` is `internal`. A class or front without
 `config`, `requires` or `expire-after-idle` has none, even if a deploy
 with flags set some.
-Deploying the same file again changes nothing. A removed class's actors
+Deploying the same file again keeps the version identity. With assets,
+it still repairs missing objects; `--assets-verify` also checks digests. A removed class's actors
 keep their state in the bucket; a later deploy that brings the class back
 finds it.
 
@@ -323,3 +336,8 @@ configuration files:
 Changes to `wasmkeep.toml` or `.env.local` need a restart. Beside a file,
 crate directories, `--access` and `--env` are refused; `wasmkeep dev
 --no-project CRATE...` runs crates as before.
+
+
+With `[assets]`, dev also serves files directly from disk and rebuilds
+their table on directory changes. Asset builds run before front/class
+builds when their `watch` paths change. See [local asset development](static-assets.md#local-development).

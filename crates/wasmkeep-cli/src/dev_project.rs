@@ -101,11 +101,14 @@ fn requires(project: &Project) -> BTreeMap<String, std::collections::BTreeSet<St
         .collect()
 }
 
-pub(crate) fn run(project: Project, options: Options) -> anyhow::Result<()> {
+pub(crate) fn run(mut project: Project, options: Options) -> anyhow::Result<()> {
     if options.no_huge_pages {
         crate::huge_pages(crate::HugePages::Off);
     }
     project::run_builds(&project)?;
+    if let Some(assets) = &mut project.assets {
+        assets.dir = assets.dir.canonicalize().context("assets directory")?;
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -132,6 +135,18 @@ pub(crate) fn run(project: Project, options: Options) -> anyhow::Result<()> {
     config.batched = batched(&project);
     config.limits = project.limits.clone();
     config.front = loaded.front.clone();
+    config.local_assets = project
+        .assets
+        .as_ref()
+        .map(|assets| {
+            let local = wasmkeep_server::assets::Local::new(&assets.dir, assets.rules.clone())?;
+            let scan = crate::assets::scan_dev_at(&local.directory()?, assets.rules.clone())?;
+            scan.print();
+            local.replace(scan.bundle.index);
+            Ok::<_, anyhow::Error>(local)
+        })
+        .transpose()?;
+    let local_assets = config.local_assets.clone();
     let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
     let front_requests = wasmkeep_server::fds::default_front_requests(pool).max(1);
     config.max_front_requests = Some(front_requests);
@@ -170,7 +185,13 @@ pub(crate) fn run(project: Project, options: Options) -> anyhow::Result<()> {
             project::FILE_NAME,
             project.dev.env.display()
         );
-        let watcher = tokio::spawn(watch(project, service.clone(), rules, options.poll));
+        let watcher = tokio::spawn(watch(
+            project,
+            service.clone(),
+            rules,
+            options.poll,
+            local_assets,
+        ));
         let served = wasmkeep_server::serve_with(
             listener,
             app,
@@ -211,6 +232,30 @@ fn fingerprint<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Fingerprint {
     (latest, count)
 }
 
+/// Includes every entry, so a rename or an edit to a non-newest file is visible.
+/// Symlink metadata is hashed but never traversed.
+fn asset_fingerprint(root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        path.hash(&mut hash);
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            meta.len().hash(&mut hash);
+            meta.modified().ok().hash(&mut hash);
+            meta.is_symlink().hash(&mut hash);
+            if meta.is_dir()
+                && let Ok(entries) = std::fs::read_dir(&path)
+            {
+                let mut paths: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+                paths.sort();
+                pending.extend(paths);
+            }
+        }
+    }
+    hash.finish()
+}
+
 /// What a reload reads: every component and configuration file. The local
 /// values are read at start only.
 fn inputs(project: &Project) -> Vec<PathBuf> {
@@ -234,12 +279,20 @@ fn watched(project: &Project) -> Vec<Fingerprint> {
 struct Builds {
     seen: Vec<Fingerprint>,
     failed: std::collections::BTreeSet<usize>,
+    assets_seen: Vec<u64>,
+    assets_failed: bool,
 }
 
 impl Builds {
     fn new(project: &Project) -> Self {
         Self {
             seen: watched(project),
+            assets_seen: project
+                .assets
+                .as_ref()
+                .map(|a| a.watch.iter().map(|p| asset_fingerprint(p)).collect())
+                .unwrap_or_default(),
+            assets_failed: false,
             failed: std::collections::BTreeSet::new(),
         }
     }
@@ -255,6 +308,21 @@ impl Builds {
         project: &Project,
         mut build: impl FnMut(&str, &str) -> anyhow::Result<()>,
     ) -> bool {
+        if let Some(assets) = &project.assets {
+            let now: Vec<_> = assets.watch.iter().map(|p| asset_fingerprint(p)).collect();
+            if now != self.assets_seen {
+                self.assets_seen = now;
+                if let Some(cmd) = &assets.build {
+                    self.assets_failed = match build("assets", cmd) {
+                        Ok(()) => false,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "assets build failed");
+                            true
+                        }
+                    };
+                }
+            }
+        }
         let now = watched(project);
         for (i, (what, item)) in project::items(project).into_iter().enumerate() {
             if item.watch.is_empty() || now[i] == self.seen[i] {
@@ -275,7 +343,7 @@ impl Builds {
                 }
             }
         }
-        self.failed.is_empty()
+        self.failed.is_empty() && !self.assets_failed
     }
 }
 
@@ -287,10 +355,12 @@ async fn watch(
     service: ActorService,
     rules: wasmkeep_server::AccessRules,
     poll: Duration,
+    local_assets: Option<std::sync::Arc<wasmkeep_server::assets::Local>>,
 ) {
     let mut builds = Builds::new(&project);
     let mut seen_inputs = fingerprint(inputs(&project).iter().map(PathBuf::as_path));
     let requires = requires(&project);
+    let mut assets_seen = project.assets.as_ref().map(|a| asset_fingerprint(&a.dir));
     let mut seq = 1;
     loop {
         tokio::time::sleep(poll).await;
@@ -299,6 +369,24 @@ async fn watch(
                 project::run_build(&project.dir, what, cmd)
             })
         });
+        if let (Some(assets), Some(local)) = (&project.assets, &local_assets) {
+            let now = Some(asset_fingerprint(&assets.dir));
+            if now != assets_seen {
+                assets_seen = now;
+                match tokio::task::block_in_place(|| {
+                    crate::assets::scan_dev_at(&local.directory()?, assets.rules.clone())
+                }) {
+                    Ok(scan) => {
+                        scan.print();
+                        local.replace(scan.bundle.index);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "assets directory unavailable");
+                        local.replace(assets.rules.clone());
+                    }
+                }
+            }
+        }
         // Not seen while a build has failed: the reload comes once every
         // changed item builds.
         let inputs_now = fingerprint(inputs(&project).iter().map(PathBuf::as_path));

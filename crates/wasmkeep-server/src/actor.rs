@@ -206,6 +206,8 @@ pub struct ActorConfig {
     pub front: Option<crate::front::DeployedFront>,
     /// Version's static assets, with their app-scoped bucket source.
     pub assets: Option<crate::assets::Deployed>,
+    /// Live project assets used by the development server only.
+    pub local_assets: Option<Arc<crate::assets::Local>>,
     /// Shared process-wide disk cache budget.
     pub assets_cache: Arc<crate::assets::Cache>,
     /// Join a cluster: actors run only on the node holding their lease, and
@@ -255,6 +257,7 @@ impl ActorConfig {
             front_env: crate::env::Vars::new(),
             front: None,
             assets: None,
+            local_assets: None,
             assets_cache: crate::assets::default_cache(),
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,

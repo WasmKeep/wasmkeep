@@ -764,10 +764,27 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
   versions a rollback stepped back from, and a version whose manifest
   this WasmKeep cannot read. Those stay in the bucket (they are small).
 
+### Deploying static assets
+
+Use `[assets] dir`, `build`, `watch`, `not-found`, `front-first` and
+`immutable` in the [project file](project-file.md#assets-optional).
+Without a project file, `--assets DIR` replaces files and `--no-assets`
+removes them; with neither flag, the current index is preserved. The optional
+`--assets-not-found`, `--assets-front-first` and `--assets-immutable`
+flags require `--assets` and conflict with project-file deployment and
+rollback. `--assets-verify` reads objects back and repairs digest failures.
+An unchanged asset deploy still repairs missing objects.
+
+`wasmkeep assets collect --app acme/shop --bucket s3://my-bucket
+--version-retention-secs 3600` runs version and asset collection separately.
+An asset pass uses the bucket's clock for both, and markers coordinate
+it with deploys. Every retained manifest protects its files. See
+[static assets](static-assets.md) for the full serving and storage rules.
+
 ### Deploying the front
 
 An app's front ([ADR 0023](adr/0023-the-front.md)) is the stateless
-`wasi:http` component that answers every path outside `/actor/` and
+`wasi:http` component that answers paths not served by [static assets](static-assets.md), outside `/actor/` and
 `/_wasmkeep/`, and calls the app's actors with `actors.call`. It ships
 in the app's version, with the classes:
 

@@ -472,3 +472,91 @@ async fn assets_encoding_conditionals_and_exclusions() {
     assert_eq!(res.status(), 206);
     assert!(!res.headers().contains_key("content-encoding"));
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn dev_assets_live_reads_headers_modes_and_symlink_replacement() {
+    for mode in ["front", "spa", "404"] {
+        let (dir, deployed) = fixture(mode).await;
+        let mut index = (*deployed.current.as_ref().unwrap().index).clone();
+        for (name, file) in &mut index.files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"plain content").unwrap();
+            file.br = None;
+            file.gzip = None;
+        }
+        let local = Local::new(dir.path(), index.clone()).unwrap();
+        let state = State::new(None, dir.path().join("unused"), Cache::new(0), "".into())
+            .with_local(Some(local.clone()));
+        let r = response(&state, "GET", "/", &[("accept-encoding", "gzip, br")]).await;
+        assert_eq!(r.status(), 200);
+        assert!(!r.headers().contains_key("content-encoding"));
+        let old_tag = r.headers()["etag"].clone();
+        assert_eq!(
+            r.into_body().collect().await.unwrap().to_bytes(),
+            "plain content"
+        );
+        // Reads come from disk even before the next table rebuild.
+        std::fs::write(dir.path().join("index.html"), b"fresh content").unwrap();
+        let r = response(&state, "GET", "/", &[]).await;
+        assert_eq!(r.headers()["etag"], old_tag);
+        assert_eq!(
+            r.into_body().collect().await.unwrap().to_bytes(),
+            "fresh content"
+        );
+        index.files.get_mut("index.html").unwrap().identity.digest = digest(b"fresh content");
+        local.replace(index);
+        let r = response(&state, "HEAD", "/", &[]).await;
+        assert_ne!(r.headers()["etag"], old_tag);
+        assert_eq!(r.headers()["content-length"], "13");
+        assert!(r.into_body().collect().await.unwrap().to_bytes().is_empty());
+        let r = response(&state, "GET", "/", &[("range", "bytes=0-4")]).await;
+        assert_eq!(r.status(), 206);
+        assert_eq!(r.into_body().collect().await.unwrap().to_bytes(), "fresh");
+        let req = Request::builder()
+            .uri("/missing")
+            .header("accept", "text/html")
+            .body(())
+            .unwrap();
+        let r = state.answer(&req).await;
+        match mode {
+            "front" => assert!(r.is_none()),
+            "spa" => {
+                let r = r.unwrap();
+                assert_eq!(r.status(), 200);
+                assert_eq!(r.headers()["cache-control"], "no-cache");
+                assert_eq!(
+                    r.into_body().collect().await.unwrap().to_bytes(),
+                    "fresh content"
+                );
+            }
+            _ => {
+                let r = r.unwrap();
+                assert_eq!(r.status(), 404);
+                assert_eq!(r.headers()["cache-control"], "no-store");
+            }
+        }
+        assert!(
+            state
+                .answer(&Request::builder().uri("/api/a").body(()).unwrap())
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            response(&state, "GET", "/dir?q=1", &[]).await.headers()["location"],
+            "/dir/?q=1"
+        );
+        assert_eq!(
+            response(&state, "GET", "/assets/a.js", &[]).await.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        std::fs::remove_file(dir.path().join("index.html")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("index.html")).unwrap();
+        assert_eq!(response(&state, "GET", "/", &[]).await.status(), 503);
+        std::fs::remove_dir_all(dir.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink("/etc", dir.path().join("dir")).unwrap();
+        assert_eq!(response(&state, "GET", "/dir/", &[]).await.status(), 503);
+        assert!(!dir.path().join("unused").exists());
+    }
+}

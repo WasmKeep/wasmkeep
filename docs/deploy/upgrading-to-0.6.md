@@ -36,3 +36,20 @@ node ids), restart it with one app, then downgrade. A binary older than
 0.6.0 must never run while a process of several apps is live in its
 cluster: it cannot check the sender of a hop, and reads several node ids
 at one address as it always has.
+
+
+## Static assets
+
+Upgrade every app node before deploying [static assets](../static-assets.md).
+Nodes announce `assets` and read manifest formats 1 through 7. Only
+versions with assets use format 7; versions without them retain their
+previous format and identity. Deploy and rollback refuse a version with
+assets while any live app node lacks `assets`; there is no force option.
+Older CLIs cannot read format 7 and stop without deploying or collecting.
+
+If an older node starts later, it cannot load format 7 and reports not
+ready (503) until upgraded. Before downgrading binaries, deploy without
+assets (`--no-assets`, or remove `[assets]` from the project), wait for
+every node to apply it, and only then downgrade. Do not roll back to a
+retained format 7 version on older nodes. Existing `_assets` objects may
+remain; older version collectors do not treat `_assets` as a version.

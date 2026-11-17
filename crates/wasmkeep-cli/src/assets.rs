@@ -151,7 +151,14 @@ fn walk_path(dir: &Path, prefix: &str, out: &mut Walk) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn scan(dir: &Path, mut rules: Index) -> anyhow::Result<Scan> {
+pub(crate) fn scan(dir: &Path, rules: Index) -> anyhow::Result<Scan> {
+    scan_inner(dir, rules, false)
+}
+#[cfg(test)]
+pub(crate) fn scan_dev(dir: &Path, rules: Index) -> anyhow::Result<Scan> {
+    scan_inner(dir, rules, true)
+}
+fn scan_inner(dir: &Path, mut rules: Index, dev: bool) -> anyhow::Result<Scan> {
     rules.validate_rules().map_err(anyhow::Error::msg)?;
     rules.files.clear();
     let root = dir
@@ -163,11 +170,27 @@ pub(crate) fn scan(dir: &Path, mut rules: Index) -> anyhow::Result<Scan> {
     walk(&std::fs::File::open(&root)?, "", &mut found)?;
     #[cfg(not(unix))]
     walk_path(&root, "", &mut found)?;
+    finish_scan(found, rules, dev)
+}
+
+pub(crate) fn scan_dev_at(root: &std::fs::File, rules: Index) -> anyhow::Result<Scan> {
+    rules.validate_rules().map_err(anyhow::Error::msg)?;
+    let mut found = Walk::default();
+    #[cfg(unix)]
+    walk(root, "", &mut found)?;
+    #[cfg(not(unix))]
+    anyhow::bail!("safe dev asset scanning requires Unix");
+    finish_scan(found, rules, true)
+}
+
+fn finish_scan(mut found: Walk, mut rules: Index, dev: bool) -> anyhow::Result<Scan> {
+    rules.files.clear();
     ensure!(
-        found.errors.is_empty(),
+        dev || found.errors.is_empty(),
         "assets refused:\n{}",
         found.errors.join("\n")
     );
+    found.warnings.append(&mut found.errors);
     let mut contents = BTreeMap::new();
     for (name, bytes) in &found.files {
         if [".br", ".gz"].iter().any(|ext| {
@@ -189,7 +212,7 @@ pub(crate) fn scan(dir: &Path, mut rules: Index) -> anyhow::Result<Scan> {
             br: None,
             gzip: None,
         };
-        for (ext, is_br) in [("br", true), ("gz", false)] {
+        for (ext, is_br) in [("br", true), ("gz", false)].into_iter().filter(|_| !dev) {
             let variant = match found.files.get(&format!("{name}.{ext}")) {
                 Some(compressed) => {
                     let reader: Box<dyn Read> = if is_br {
@@ -235,7 +258,16 @@ pub(crate) fn scan(dir: &Path, mut rules: Index) -> anyhow::Result<Scan> {
         }
         rules.files.insert(name.clone(), file);
     }
-    rules.validate().map_err(anyhow::Error::msg)?;
+    // A missing root index during a build must not end the dev session.
+    if !dev {
+        rules.validate().map_err(anyhow::Error::msg)?;
+    } else if rules.bytes().len() > wasmkeep_server::assets::MAX_INDEX {
+        found
+            .warnings
+            .push("assets index exceeds 8 MiB; no files served".into());
+        rules.files.clear();
+        contents.clear();
+    }
     found.skipped.sort();
     found.warnings.sort();
     Ok(Scan {

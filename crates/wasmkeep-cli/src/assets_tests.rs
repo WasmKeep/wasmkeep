@@ -178,3 +178,18 @@ fn supplied_variants_match_exactly_and_orphans_are_files() {
             .contains_key("x.txt.gz")
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn dev_assets_refuses_only_the_bad_name_and_never_compresses() {
+    let d = tempfile::tempdir().unwrap();
+    put(d.path(), "index.html", &vec![b'x'; 4096]);
+    put(d.path(), "index.html.gz", b"unchecked in dev");
+    put(d.path(), ".secret", b"secret");
+    std::os::unix::fs::symlink("/etc/passwd", d.path().join("link")).unwrap();
+    let result = scan_dev(d.path(), Index::default()).unwrap();
+    assert_eq!(result.bundle.index.files.len(), 1);
+    let file = &result.bundle.index.files["index.html"];
+    assert!(file.br.is_none() && file.gzip.is_none());
+    assert!(result.warnings.iter().any(|s| s.contains("link")));
+}

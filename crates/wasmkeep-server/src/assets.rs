@@ -263,3 +263,6 @@ pub fn default_cache() -> std::sync::Arc<Cache> {
         std::sync::LazyLock::new(|| Cache::new(1024 * 1024 * 1024));
     CACHE.clone()
 }
+
+mod local;
+pub use local::Local;

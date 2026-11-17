@@ -22,6 +22,7 @@
 - [Exporting and querying an actor](actor-data-access.md)
 - [Querying the change feed with DuckDB](change-feed.md)
 - [The project file](project-file.md)
+- [Static assets](static-assets.md)
 - [When a node dies, and how it scales](failover-and-scaling.md)
 - [Key-value and queues](kv-and-queues.md)
 - [Workflows](workflows.md)

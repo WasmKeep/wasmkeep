@@ -276,6 +276,7 @@ pub struct Deployed {
 #[derive(Clone, Debug)]
 pub struct State {
     current: Option<Deployed>,
+    local: Option<Arc<Local>>,
     previous: Option<Arc<Index>>,
     dir: PathBuf,
     cache: Arc<Cache>,
@@ -289,6 +290,7 @@ impl State {
         labels: Arc<str>,
     ) -> Self {
         let mut state = Self {
+            local: None,
             previous: current.as_ref().and_then(|d| d.previous.clone()),
             current,
             dir,
@@ -303,6 +305,20 @@ impl State {
         }
         state
     }
+    pub fn with_local(mut self, local: Option<Arc<Local>>) -> Self {
+        if local.is_some() {
+            self.current = None;
+            self.previous = None;
+        }
+        self.local = local;
+        self
+    }
+    fn index(&self) -> Option<Arc<Index>> {
+        self.local
+            .as_ref()
+            .map(|l| l.index())
+            .or_else(|| self.current.as_ref().map(|d| d.index.clone()))
+    }
     fn record(&self) -> PathBuf {
         self.dir.join("indexes")
     }
@@ -316,6 +332,9 @@ impl State {
         Ok(next)
     }
     pub(crate) fn initialize(&self) -> std::io::Result<()> {
+        if self.local.is_some() {
+            return Ok(());
+        }
         if self.dir.exists() {
             self.cache.register(&self.dir, &self.labels)?;
         }
@@ -372,23 +391,23 @@ impl State {
     }
     /// Headers the front must retain for an unmatched asset request.
     pub(crate) fn front_headers<B>(&self, req: &Request<B>) -> (bool, bool, bool) {
-        let Some(d) = &self.current else {
+        let Some(index) = self.index() else {
             return (false, false, false);
         };
         let Some(path) = request_path(req.uri().path()) else {
             return (false, false, false);
         };
-        if !eligible(req) || under(&d.index.front_first, &path) {
+        if !eligible(req) || under(&index.front_first, &path) {
             return (false, false, false);
         }
         (
-            d.index.not_found == "spa",
-            under(&d.index.immutable, &path),
+            index.not_found == "spa",
+            under(&index.immutable, &path),
             true,
         )
     }
     pub async fn answer<B>(&self, req: &Request<B>) -> Option<Response<HyperOutgoingBody>> {
-        let source = self.current.as_ref()?;
+        let index = self.index()?;
         let raw = req.uri().path();
         // Check aliases even on non-GET requests, before sending anything to code.
         if let Some(decoded) = decode(raw.trim_start_matches('/'))
@@ -402,7 +421,6 @@ impl State {
             ));
         }
         let path = request_path(raw)?;
-        let index = &source.index;
         if under(&index.front_first, &path) || !eligible(req) {
             return None;
         }
@@ -454,13 +472,15 @@ impl State {
         if file.is_none() {
             match index.not_found.as_str() {
                 "spa" if navigation(req, &path) => {
-                    file = index.files.get("index.html");
+                    name = "index.html".into();
+                    file = index.files.get(&name);
                     cache_control = "no-cache";
                     navigation_vary = true;
                     outcome = "spa";
                 }
                 "404" => {
-                    file = index.files.get("404.html");
+                    name = "404.html".into();
+                    file = index.files.get(&name);
                     status = 404;
                     cache_control = "no-store";
                     outcome = "not_found";
@@ -588,7 +608,17 @@ impl State {
             .headers_mut()
             .insert("content-length", length.into());
         {
-            match self.cache.open(self, source, content, false).await {
+            let opened = if let Some(local) = &self.local {
+                local
+                    .open(&name)
+                    .map(tokio::fs::File::from_std)
+                    .map_err(|e| e.to_string())
+            } else {
+                self.cache
+                    .open(self, self.current.as_ref()?, content, false)
+                    .await
+            };
+            match opened {
                 Ok(mut file) => {
                     if req.method() == hyper::Method::HEAD {
                         crate::metrics::asset_request(&self.labels, outcome);
