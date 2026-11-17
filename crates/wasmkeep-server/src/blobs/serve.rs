@@ -44,6 +44,14 @@ fn secure(r: &mut Response<HyperOutgoingBody>) {
         .or_insert(hyper::header::HeaderValue::from_static("private, no-store"));
 }
 
+/// The app is over its stored-bytes limit (`--max-app-blob-bytes`).
+fn over_quota() -> Response<HyperOutgoingBody> {
+    refuse(
+        StatusCode::INSUFFICIENT_STORAGE,
+        "the app is over its storage limit\n",
+    )
+}
+
 /// Answers a node link. `deleted`: the app's tombstone was seen, and every
 /// token is refused.
 pub(crate) async fn serve(
@@ -72,21 +80,27 @@ pub(crate) async fn serve(
             );
         }
     };
+    let bad = || {
+        crate::metrics::blob_node_link(blobs.labels(), "bad_token");
+        refuse(StatusCode::FORBIDDEN, "this link is not valid\n")
+    };
     let Ok(token) = Token::open(spelled, key) else {
-        return refuse(StatusCode::FORBIDDEN, "this link is not valid\n");
+        return bad();
     };
     // Under this app's key, so its own; the fields are checked anyway.
     if token.tenant != links.tenant || token.app != links.app || token.epoch != links.epoch {
+        crate::metrics::blob_node_link(blobs.labels(), "wrong_app");
         return refuse(StatusCode::FORBIDDEN, "this link is not valid\n");
     }
     let Some(ns) = Namespace::from_token(&token.namespace) else {
-        return refuse(StatusCode::FORBIDDEN, "this link is not valid\n");
+        return bad();
     };
     if keys::check_key(&token.key).is_err() {
-        return refuse(StatusCode::FORBIDDEN, "this link is not valid\n");
+        return bad();
     }
     let now = now_ms();
     if now >= token.expires_at_ms {
+        crate::metrics::blob_node_link(blobs.labels(), "expired");
         return refuse(StatusCode::FORBIDDEN, "this link has expired\n");
     }
     match &token.grant {
@@ -163,6 +177,7 @@ async fn download(
         format!("private, max-age={left}"),
     );
     secure(&mut r);
+    crate::metrics::blob_node_link(blobs.labels(), "ok");
     r
 }
 
@@ -226,6 +241,7 @@ async fn upload(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if length != Some(size) {
+        crate::metrics::blob_node_link(blobs.labels(), "wrong_size");
         return refuse(
             StatusCode::BAD_REQUEST,
             "this link takes a body of another size\n",
@@ -234,6 +250,7 @@ async fn upload(
     let types: Vec<&hyper::header::HeaderValue> =
         h.get_all(hyper::header::CONTENT_TYPE).iter().collect();
     if types.len() != 1 || types[0].as_bytes() != content_type.as_bytes() {
+        crate::metrics::blob_node_link(blobs.labels(), "wrong_size");
         return refuse(
             StatusCode::BAD_REQUEST,
             "this link takes another Content-Type\n",
@@ -241,7 +258,10 @@ async fn upload(
     }
     match blobs.head(ns, &token.key).await {
         Ok(None) => {}
-        Ok(Some(_)) => return refuse(StatusCode::PRECONDITION_FAILED, "the file exists\n"),
+        Ok(Some(_)) => {
+            crate::metrics::blob_node_link(blobs.labels(), "exists");
+            return refuse(StatusCode::PRECONDITION_FAILED, "the file exists\n");
+        }
         Err(_) => {
             return refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -251,6 +271,7 @@ async fn upload(
     }
     let spool = match blobs.spool(ns).await {
         Ok(s) => s,
+        Err(BlobError::QuotaExceeded) => return over_quota(),
         Err(_) => {
             return refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -289,6 +310,9 @@ async fn upload(
     match received {
         Ok(Ok(())) => {}
         Ok(Err(status)) => {
+            if status == StatusCode::BAD_REQUEST {
+                crate::metrics::blob_node_link(blobs.labels(), "wrong_size");
+            }
             spool.abandon();
             return refuse(status, "the upload's body is not the one this link takes\n");
         }
@@ -314,8 +338,15 @@ async fn upload(
         condition: Condition::Absent,
     };
     match blobs.commit(ns, &token.key, spooled, write).await {
-        Ok(_) => refuse(StatusCode::CREATED, "created\n"),
-        Err(BlobError::Conflict) => refuse(StatusCode::PRECONDITION_FAILED, "the file exists\n"),
+        Ok(_) => {
+            crate::metrics::blob_node_link(blobs.labels(), "ok");
+            refuse(StatusCode::CREATED, "created\n")
+        }
+        Err(BlobError::Conflict) => {
+            crate::metrics::blob_node_link(blobs.labels(), "exists");
+            refuse(StatusCode::PRECONDITION_FAILED, "the file exists\n")
+        }
+        Err(BlobError::QuotaExceeded) => over_quota(),
         Err(BlobError::TooLarge) => refuse(StatusCode::PAYLOAD_TOO_LARGE, "too large\n"),
         Err(_) => refuse(
             StatusCode::SERVICE_UNAVAILABLE,

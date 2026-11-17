@@ -242,6 +242,7 @@ async fn start_runtime(
     config.app = name.clone();
     config.blob_epoch = blob_epoch;
     config.max_blob_bytes = args.max_blob_bytes;
+    config.max_app_blob_bytes = args.max_app_blob_bytes;
     config.blob_links = wasmkeep_server::blobs::links::LinkSettings {
         presigner: shared.presigner.clone(),
         base: args.blob_link_base.clone(),

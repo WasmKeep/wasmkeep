@@ -38,6 +38,13 @@ struct Row {
     modified: u64,
 }
 
+impl Disk {
+    /// `<data_dir>/state/<t>/<a>/blobs/<epoch>`.
+    pub(super) fn base(&self) -> &Path {
+        &self.base
+    }
+}
+
 impl Row {
     fn info(&self, key: &str) -> BlobInfo {
         BlobInfo {

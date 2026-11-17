@@ -21,6 +21,7 @@ pub(crate) mod serve;
 mod streams;
 pub(crate) mod sweep;
 pub(crate) mod token;
+mod usage;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,6 +52,10 @@ pub(crate) struct Blobs {
     max_file: u64,
     /// How links are made and checked; `None`: no links.
     links: Option<links::Links>,
+    /// The last count of the app's files, and its limit.
+    usage: usage::Usage,
+    /// The app's metric labels ([`crate::metrics::app_labels`]).
+    labels: Arc<str>,
 }
 
 #[derive(Debug)]
@@ -95,6 +100,8 @@ impl Blobs {
             backend,
             max_file: max_file.min(MAX_FILE_CEILING),
             links: None,
+            usage: usage::Usage::default(),
+            labels: Arc::from(""),
         }
     }
 
@@ -104,6 +111,8 @@ impl Blobs {
             backend: Backend::Disk(disk::Disk::new(app_dir.join("blobs").join(epoch))),
             max_file: max_file.min(MAX_FILE_CEILING),
             links: None,
+            usage: usage::Usage::default(),
+            labels: Arc::from(""),
         }
     }
 
@@ -111,6 +120,17 @@ impl Blobs {
     pub(crate) fn with_links(mut self, links: links::Links) -> Self {
         self.links = Some(links);
         self
+    }
+
+    /// The same files, their work counted under `labels`.
+    pub(crate) fn with_labels(mut self, labels: Arc<str>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// The app's metric labels.
+    pub(crate) fn labels(&self) -> &str {
+        &self.labels
     }
 
     pub(crate) fn links(&self) -> Option<&links::Links> {
@@ -129,6 +149,21 @@ impl Blobs {
 
     /// A download link of `key`, attachment or inline (section 4).
     pub(crate) async fn link_download(
+        &self,
+        ns: &Namespace,
+        key: &str,
+        inline: bool,
+        filename: Option<&str>,
+        secs: u32,
+    ) -> Result<String, BlobError> {
+        let r = self.make_download(ns, key, inline, filename, secs).await;
+        if r.is_ok() {
+            crate::metrics::blob_link(&self.labels, "download");
+        }
+        r
+    }
+
+    async fn make_download(
         &self,
         ns: &Namespace,
         key: &str,
@@ -189,8 +224,13 @@ impl Blobs {
         if size > self.max_upload() {
             return Err(BlobError::TooLarge);
         }
+        self.quota()?;
         let grant = token::Grant::Upload { size, content_type };
-        links.node_link(ns, key, secs, grant)
+        let r = links.node_link(ns, key, secs, grant);
+        if r.is_ok() {
+            crate::metrics::blob_link(&self.labels, "upload");
+        }
+        r
     }
 
     pub(crate) async fn head(
@@ -198,11 +238,13 @@ impl Blobs {
         ns: &Namespace,
         key: &str,
     ) -> Result<Option<BlobInfo>, BlobError> {
-        match &self.backend {
+        let r = match &self.backend {
             Backend::Bucket(b) => b.head(ns, key).await,
             Backend::Disk(d) => d.head(ns, key).await,
             Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
-        }
+        };
+        self.count_op("head", found(&r));
+        r
     }
 
     pub(crate) async fn get(
@@ -210,11 +252,16 @@ impl Blobs {
         ns: &Namespace,
         key: &str,
     ) -> Result<Option<(BlobInfo, Vec<u8>)>, BlobError> {
-        match &self.backend {
+        let r = match &self.backend {
             Backend::Bucket(b) => b.get(ns, key).await,
             Backend::Disk(d) => d.get(ns, key).await,
             Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
+        };
+        self.count_op("get", found(&r));
+        if let Ok(Some((_, body))) = &r {
+            crate::metrics::blob_bytes(&self.labels, "out", body.len() as u64);
         }
+        r
     }
 
     pub(crate) async fn put(
@@ -224,22 +271,33 @@ impl Blobs {
         body: Vec<u8>,
         write: Write,
     ) -> Result<BlobInfo, BlobError> {
-        if body.len() as u64 > MAX_BUFFERED {
-            return Err(BlobError::TooLarge);
+        let n = body.len() as u64;
+        let r = if n > MAX_BUFFERED {
+            Err(BlobError::TooLarge)
+        } else if let Err(e) = self.quota() {
+            Err(e)
+        } else {
+            match &self.backend {
+                Backend::Bucket(b) => b.put(ns, key, body.into(), &write).await,
+                Backend::Disk(d) => d.put(ns, key, body, write).await,
+                Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
+            }
+        };
+        self.count_op("put", outcome(&r));
+        if r.is_ok() {
+            crate::metrics::blob_bytes(&self.labels, "in", n);
         }
-        match &self.backend {
-            Backend::Bucket(b) => b.put(ns, key, body.into(), &write).await,
-            Backend::Disk(d) => d.put(ns, key, body, write).await,
-            Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
-        }
+        r
     }
 
     pub(crate) async fn delete(&self, ns: &Namespace, key: &str) -> Result<(), BlobError> {
-        match &self.backend {
+        let r = match &self.backend {
             Backend::Bucket(b) => b.delete(ns, key).await,
             Backend::Disk(d) => d.delete(ns, key).await,
             Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
-        }
+        };
+        self.count_op("delete", outcome(&r));
+        r
     }
 
     /// At most `limit` files whose key starts with `prefix`, after `after`,
@@ -251,11 +309,13 @@ impl Blobs {
         after: Option<&str>,
         limit: u32,
     ) -> Result<(Vec<BlobInfo>, Option<String>), BlobError> {
-        match &self.backend {
+        let r = match &self.backend {
             Backend::Bucket(b) => b.list(ns, prefix, after, limit).await,
             Backend::Disk(d) => d.list(ns, prefix, after, limit).await,
             Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
-        }
+        };
+        self.count_op("list", outcome(&r));
+        r
     }
 
     /// The file's information and a stream of its bytes `[start, start +
@@ -266,15 +326,29 @@ impl Blobs {
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<Option<(BlobInfo, streams::Source)>, BlobError> {
-        match &self.backend {
+        let r = match &self.backend {
             Backend::Bucket(b) => b.open_read(ns, key, range).await,
             Backend::Disk(d) => d.open_read(ns, key, range).await,
             Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
+        };
+        self.count_op("read", found(&r));
+        // The bytes a read opens, counted when it opens: a stream dropped
+        // early still counts its range.
+        if let Ok(Some((info, _))) = &r {
+            let out = range.map_or(info.size, |(start, length)| {
+                length.min(info.size.saturating_sub(start))
+            });
+            crate::metrics::blob_bytes(&self.labels, "out", out);
         }
+        r
     }
 
     /// A file to spool a streamed write to, until [`Self::commit`].
     pub(crate) async fn spool(&self, ns: &Namespace) -> Result<streams::Spool, BlobError> {
+        if let Err(e) = self.quota() {
+            self.count_op("write", "quota");
+            return Err(e);
+        }
         let path = match &self.backend {
             Backend::Bucket(b) => b.spool_path(),
             Backend::Disk(d) => d.spool_path(ns).await?,
@@ -291,11 +365,44 @@ impl Blobs {
         spooled: streams::Spooled,
         write: Write,
     ) -> Result<BlobInfo, BlobError> {
-        match &self.backend {
-            Backend::Bucket(b) => b.commit(ns, key, spooled, &write).await,
-            Backend::Disk(d) => d.commit(ns, key, spooled, write).await,
-            Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
+        let r = if let Err(e) = self.quota() {
+            Err(e)
+        } else {
+            match &self.backend {
+                Backend::Bucket(b) => b.commit(ns, key, spooled, &write).await,
+                Backend::Disk(d) => d.commit(ns, key, spooled, write).await,
+                Backend::Off(why) => Err(BlobError::Unavailable(why.clone())),
+            }
+        };
+        self.count_op("write", outcome(&r));
+        if let Ok(info) = &r {
+            crate::metrics::blob_bytes(&self.labels, "in", info.size);
         }
+        r
+    }
+
+    fn count_op(&self, op: &str, outcome: &str) {
+        crate::metrics::blob_op(&self.labels, op, outcome);
+    }
+}
+
+/// A call's `outcome` label.
+fn outcome<T>(r: &Result<T, BlobError>) -> &'static str {
+    match r {
+        Ok(_) => "ok",
+        Err(BlobError::Conflict) => "conflict",
+        Err(BlobError::TooLarge) => "too_large",
+        Err(BlobError::QuotaExceeded) => "quota",
+        Err(BlobError::InvalidKey(_) | BlobError::NotAllowed(_)) => "not_allowed",
+        Err(BlobError::Unavailable(_)) => "unavailable",
+    }
+}
+
+/// `not_found` for an absent file, else [`outcome`].
+fn found<T>(r: &Result<Option<T>, BlobError>) -> &'static str {
+    match r {
+        Ok(None) => "not_found",
+        r => outcome(r),
     }
 }
 

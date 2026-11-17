@@ -228,6 +228,15 @@ pub struct ActorConfig {
     /// [`crate::blobs::DEFAULT_MAX_FILE`], at most
     /// [`crate::blobs::MAX_FILE_CEILING`].
     pub max_blob_bytes: u64,
+    /// The app's stored-bytes limit (`max-app-blob-bytes`, ADR 0030,
+    /// section 7): writes and upload links are refused with
+    /// `quota-exceeded` while the last hourly count is over it. `None`: no
+    /// limit.
+    pub max_app_blob_bytes: Option<u64>,
+    /// How often the app's files are counted on a node without a bucket
+    /// (an hour; on a bucket the cluster's `blob_epochs_every`). Tests
+    /// shorten it.
+    pub blob_count_every: Duration,
     /// How long a WebSocket client may stay silent before the server pings
     /// it: 25 s, under a load balancer's usual 60 s idle timeout. Tests
     /// shorten it.
@@ -277,6 +286,8 @@ impl ActorConfig {
             blob_epoch: crate::blobs::epoch(None, None),
             blob_links: crate::blobs::links::LinkSettings::default(),
             max_blob_bytes: crate::blobs::DEFAULT_MAX_FILE,
+            max_app_blob_bytes: None,
+            blob_count_every: Duration::from_secs(60 * 60),
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,
         }

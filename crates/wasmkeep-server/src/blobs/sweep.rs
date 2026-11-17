@@ -85,7 +85,7 @@ impl Bucket {
 }
 
 impl Blobs {
-    fn bucket(&self) -> Option<&Bucket> {
+    pub(super) fn bucket(&self) -> Option<&Bucket> {
         match &self.backend {
             Backend::Bucket(b) => Some(b),
             _ => None,

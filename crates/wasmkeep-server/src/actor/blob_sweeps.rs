@@ -85,11 +85,11 @@ impl ActorState {
         if judged == Judged::NotDeleted {
             let blobs = self.blobs()?;
             match blobs.drop_record_if_listed(&listed).await {
-                Ok(true) => crate::metrics::blob_sweep("not_deleted"),
+                Ok(true) => crate::metrics::blob_sweep(blobs.labels(), "not_deleted"),
                 Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "blob sweep: dropping a record failed");
-                    crate::metrics::blob_sweep("failed");
+                    crate::metrics::blob_sweep(blobs.labels(), "failed");
                 }
             }
         }
@@ -115,16 +115,23 @@ pub(super) async fn sweep_loop(service: std::sync::Weak<ServiceInner>, cluster: 
         if inner.mailboxes.is_closed() {
             return;
         }
-        if !inner.blobs.on_a_bucket()
-            || cluster.app_refusal().is_some()
-            || !cluster.collects_blob_sweeps()
-        {
+        if !inner.blobs.on_a_bucket() || cluster.app_refusal().is_some() {
+            continue;
+        }
+        // Every node takes the app's last count (section 7).
+        match inner.blobs.read_usage().await {
+            Ok(Some(count)) => inner.blobs.note_usage(&count),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "reading the app's file count failed"),
+        }
+        if !cluster.collects_blob_sweeps() {
             continue;
         }
         pass(&inner, &cluster, &mut bodies).await;
         if tokio::time::Instant::now() >= epochs_due {
             epochs_due = tokio::time::Instant::now() + cluster.blob_epochs_every;
             epochs_pass(&inner, &cluster).await;
+            count_pass(&inner, &cluster).await;
         }
     }
 }
@@ -188,7 +195,7 @@ pub(super) async fn pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, bodi
         let done = match blob_sweep::outcome(action, judged, age, ages) {
             blob_sweep::Outcome::Skip | blob_sweep::Outcome::Drop => Ok(()),
             blob_sweep::Outcome::AgeOut => {
-                crate::metrics::blob_sweep("aged_out");
+                crate::metrics::blob_sweep(inner.blobs.labels(), "aged_out");
                 tracing::warn!(class = %l.class, "blob sweep: a record nobody could judge for 25 hours is dropped; its files, if any, stay");
                 blobs.drop_record(&l).await
             }
@@ -199,13 +206,13 @@ pub(super) async fn pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, bodi
                 {
                     Ok(_) => match then {
                         Some(state) => {
-                            crate::metrics::blob_sweep("swept");
+                            crate::metrics::blob_sweep(inner.blobs.labels(), "swept");
                             blobs
                                 .write_record(&l.class, &record.name, &l.incarnation, state)
                                 .await
                         }
                         None => {
-                            crate::metrics::blob_sweep("final");
+                            crate::metrics::blob_sweep(inner.blobs.labels(), "final");
                             blobs.drop_record(&l).await
                         }
                     },
@@ -214,7 +221,7 @@ pub(super) async fn pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, bodi
             }
         };
         if let Err(e) = done {
-            crate::metrics::blob_sweep("failed");
+            crate::metrics::blob_sweep(inner.blobs.labels(), "failed");
             tracing::warn!(class = %l.class, error = %e, "blob sweep: a record was not acted on; the next pass tries again");
         }
     }
@@ -248,6 +255,49 @@ async fn judge_one(
         inner.mailboxes.hibernate(&address);
     }
     judged
+}
+
+/// The hourly count of the app's files, written for every node, by the
+/// node that collects: only while its epoch is still the app's.
+async fn count_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>) {
+    let blobs = Arc::clone(&inner.blobs);
+    let root = cluster.state_root();
+    match blobs
+        .fresh_epoch(root.prefix(), root.tenant(), root.app())
+        .await
+    {
+        Ok(fresh) if Some(fresh.as_str()) == blobs.epoch() => {}
+        _ => return,
+    }
+    match blobs.count().await {
+        Ok(count) => {
+            if let Err(e) = blobs.publish_usage(&count).await {
+                tracing::warn!(error = %e, "writing the app's file count failed");
+            }
+            blobs.note_usage(&count);
+        }
+        Err(e) => tracing::warn!(error = %e, "counting the app's files failed"),
+    }
+}
+
+/// On a node without a bucket: counts the app's files at start, then every
+/// `every`. Runs until the service is dropped.
+pub(super) async fn disk_count_loop(service: std::sync::Weak<ServiceInner>, every: Duration) {
+    loop {
+        {
+            let Some(inner) = service.upgrade() else {
+                return;
+            };
+            if inner.mailboxes.is_closed() {
+                return;
+            }
+            match inner.blobs.count().await {
+                Ok(count) => inner.blobs.note_usage(&count),
+                Err(e) => tracing::debug!(error = %e, "counting the app's files failed"),
+            }
+        }
+        tokio::time::sleep(every).await;
+    }
 }
 
 /// Removes the files of every epoch other than the app's own, once the
@@ -285,6 +335,7 @@ pub(super) async fn epochs_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster
         }
         match blobs.remove_epoch(&other).await {
             Ok(n) if n > 0 => {
+                crate::metrics::blob_sweep(blobs.labels(), "old_epoch");
                 tracing::info!(epoch = %other, removed = n, "removed the files of an earlier epoch of the app")
             }
             Ok(_) => {}

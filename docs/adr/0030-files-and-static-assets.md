@@ -907,7 +907,8 @@ process's and carries no app label, since the start proof is):
 - `wasmkeep_blob_stored_bytes` and `wasmkeep_blob_stored_files`: the last
   hourly count.
 - `wasmkeep_blob_sweeps_total{outcome}`: `swept`, `not_deleted`,
-  `final`, `aged_out`, `failed`.
+  `final`, `aged_out`, `failed`, `old_epoch` (slice B7: with the app's
+  labels like the rest; a node link over the limit answers `507`).
 
 ### 8. Security
 

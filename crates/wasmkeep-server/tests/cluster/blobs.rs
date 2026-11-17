@@ -1604,3 +1604,70 @@ async fn without_the_recorded_head_an_idle_actor_is_not_acquired_and_its_record_
     );
     assert_eq!(file_keys(&store).await.0.len(), 1, "no file touched");
 }
+
+/// A node of a bucket's cluster whose app may store `limit` bytes; with
+/// `counts`, it is the one that counts (the collecting node), every 100 ms.
+async fn quota_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>, limit: u64) -> Node {
+    class_node_with(Some((id, store)), data, "blob", blob_actor_wasm(), |c| {
+        c.max_app_blob_bytes = Some(limit);
+        let cluster = c.cluster.as_mut().unwrap();
+        cluster.blob_sweep_every = Duration::from_millis(100);
+        cluster.blob_epochs_every = Duration::from_millis(100);
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_the_apps_limit_writes_and_upload_links_are_refused_until_a_count_is_under_it() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = quota_node("a", d1.path(), &store, 10).await;
+    let b = quota_node("b", d2.path(), &store, 10).await;
+    settle().await;
+    // Over the limit at once: nothing refuses it until a count says so.
+    let r = call(a.addr, "PUT", &format!("{A}/b/big"), "", &[7u8; 12]).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    for node in [&a, &b] {
+        eventually("the count reaches every node", async || {
+            let r = call(node.addr, "PUT", "/actor/blob/bob/b/x", "", b"1").await;
+            (r.status, r.body.as_str()) == (507, "err:quota-exceeded")
+        })
+        .await;
+    }
+    let r = call(
+        b.addr,
+        "GET",
+        &format!("{A}/upload-link/up/1?size=1&type=image/png"),
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_str()), (507, "err:quota-exceeded"));
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    let stored: Vec<&str> = page
+        .lines()
+        .filter(|l| l.starts_with("wasmkeep_blob_"))
+        .collect();
+    assert!(
+        // 12, and bob's one byte if it was written before the first count.
+        stored
+            .iter()
+            .any(|l| l.starts_with("wasmkeep_blob_stored_bytes{")
+                && l.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()) >= Some(12)),
+        "{stored:#?}"
+    );
+    // Reads and deletes are never refused; the next count frees writes.
+    let r = call(a.addr, "GET", &format!("{A}/b/big"), "", b"").await;
+    assert_eq!(r.status, 200);
+    let r = call(b.addr, "DELETE", &format!("{A}/b/big"), "", b"").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    for node in [&a, &b] {
+        eventually("writes accepted again after a count", async || {
+            call(node.addr, "PUT", "/actor/blob/bob/b/x", "", b"1")
+                .await
+                .status
+                == 200
+        })
+        .await;
+    }
+}

@@ -299,7 +299,9 @@ impl ActorService {
                     config.max_blob_bytes,
                 ),
             }
-            .with_links(links),
+            .with_links(links)
+            .with_quota(config.max_app_blob_bytes)
+            .with_labels(Arc::clone(&app_labels)),
         );
         let service = Self {
             inner: Arc::new(ServiceInner {
@@ -410,6 +412,13 @@ impl ActorService {
             tokio::spawn(socket_owners::sweep_sockets(
                 Arc::downgrade(&service.inner),
                 cluster.socket_sweep,
+            ));
+        } else {
+            // The hourly count of the app's files on this node's disk
+            // (ADR 0030, section 7).
+            tokio::spawn(blob_sweeps::disk_count_loop(
+                Arc::downgrade(&service.inner),
+                config.blob_count_every,
             ));
         }
 

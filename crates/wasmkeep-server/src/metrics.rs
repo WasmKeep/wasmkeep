@@ -371,8 +371,23 @@ pub(crate) struct Metrics {
     pub(crate) actor_deletes: Family<AtomicU64>,
     /// Actor deletes that failed to be recorded, by `how`.
     pub(crate) actor_delete_failures: Family<AtomicU64>,
-    /// Sweep records the blob sweep acted on, by `outcome` (ADR 0030).
+    /// Sweep records the blob sweep acted on, by app and `outcome` (ADR
+    /// 0030, section 7).
     pub(crate) blob_sweeps: Family<AtomicU64>,
+    /// File calls, by app, `op` and `outcome`.
+    pub(crate) blob_ops: Family<AtomicU64>,
+    /// Bytes of files through the host, by app and `direction`.
+    pub(crate) blob_bytes: Family<AtomicU64>,
+    /// Links made, by app and `kind`.
+    pub(crate) blob_links: Family<AtomicU64>,
+    /// Node-link requests answered, by app and `outcome`.
+    pub(crate) blob_node_links: Family<AtomicU64>,
+    /// The last hourly count of an app's files: bytes, and files.
+    pub(crate) blob_stored_bytes: Family<AtomicU64>,
+    pub(crate) blob_stored_files: Family<AtomicU64>,
+    /// 1 when downloads are presigned (the start proof passed), else 0:
+    /// the process's.
+    pub(crate) blob_links_mode: AtomicU64,
     /// Idle-expiry passes this node ran as the collector (ADR 0028).
     pub(crate) expiry_passes: AtomicU64,
     /// Idle actors those passes found (candidates acted on).
@@ -690,12 +705,70 @@ pub(crate) const DELETE_HOWS: [&str; 4] = ["self", "self_durable", "operator", "
 /// the actor is at its incarnation (`not_deleted`) or after its last
 /// listing (`final`), one nobody could judge for 25 hours (`aged_out`),
 /// and a step that failed (`failed`).
-pub(crate) const BLOB_SWEEP_OUTCOMES: [&str; 5] =
-    ["swept", "not_deleted", "final", "aged_out", "failed"];
+/// `old_epoch` counts an earlier epoch's files removed by the hourly pass.
+pub(crate) const BLOB_SWEEP_OUTCOMES: [&str; 6] = [
+    "swept",
+    "not_deleted",
+    "final",
+    "aged_out",
+    "failed",
+    "old_epoch",
+];
+/// `outcome` of `wasmkeep_blob_node_link_requests_total`.
+pub(crate) const BLOB_NODE_LINK_OUTCOMES: [&str; 6] = [
+    "ok",
+    "expired",
+    "bad_token",
+    "wrong_app",
+    "exists",
+    "wrong_size",
+];
 
-/// Counts a sweep record acted on.
-pub(crate) fn blob_sweep(outcome: &str) {
-    inc(&METRICS.blob_sweeps.get(&[("outcome", outcome)]));
+/// Counts a sweep record of the app `app` names acted on.
+pub(crate) fn blob_sweep(app: &str, outcome: &str) {
+    inc(&METRICS.blob_sweeps.get_in(app, &[("outcome", outcome)]));
+}
+/// One file call of `app` ([`app_labels`]): `op` (`head`, `get`, `put`,
+/// `read`, `write`, `delete`, `list`) ended with `outcome`.
+pub(crate) fn blob_op(app: &str, op: &str, outcome: &str) {
+    inc(&METRICS
+        .blob_ops
+        .get_in(app, &[("op", op), ("outcome", outcome)]));
+}
+/// `n` bytes of `app`'s files through the host, `in` or `out`.
+pub(crate) fn blob_bytes(app: &str, direction: &str, n: u64) {
+    if n > 0 {
+        METRICS
+            .blob_bytes
+            .get_in(app, &[("direction", direction)])
+            .fetch_add(n, Ordering::Relaxed);
+    }
+}
+/// A link of `app` made, `download` or `upload`.
+pub(crate) fn blob_link(app: &str, kind: &str) {
+    inc(&METRICS.blob_links.get_in(app, &[("kind", kind)]));
+}
+/// A node link of `app` answered with `outcome`
+/// ([`BLOB_NODE_LINK_OUTCOMES`]).
+pub(crate) fn blob_node_link(app: &str, outcome: &str) {
+    inc(&METRICS.blob_node_links.get_in(app, &[("outcome", outcome)]));
+}
+/// The last count of `app`'s files.
+pub(crate) fn blob_stored(app: &str, bytes: u64, files: u64) {
+    METRICS
+        .blob_stored_bytes
+        .get_in(app, &[])
+        .store(bytes, Ordering::Relaxed);
+    METRICS
+        .blob_stored_files
+        .get_in(app, &[])
+        .store(files, Ordering::Relaxed);
+}
+/// Whether this process presigns downloads (`wasmkeep_blob_links_mode`).
+pub(crate) fn blob_links_mode(presigned: bool) {
+    METRICS
+        .blob_links_mode
+        .store(u64::from(presigned), Ordering::Relaxed);
 }
 
 /// `reason` of `wasmkeep_expiry_kept_total` (ADR 0028).
@@ -788,7 +861,6 @@ impl Metrics {
         one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
         one(&m.actor_deletes, "how", &DELETE_HOWS);
         one(&m.actor_delete_failures, "how", &DELETE_HOWS);
-        one(&m.blob_sweeps, "outcome", &BLOB_SWEEP_OUTCOMES);
         one(&m.expiry_kept, "reason", &EXPIRY_KEPT_REASONS);
         one(
             &m.websocket_sweep_unreadable,
@@ -1194,12 +1266,6 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "Actor deletes that failed to be recorded (the data stays), by how they were asked for.",
         &m.actor_delete_failures,
     );
-    family(
-        &mut out,
-        "wasmkeep_blob_sweeps_total",
-        "Sweep records of deleted actors' files this node acted on, by outcome.",
-        &m.blob_sweeps,
-    );
     counter(
         &mut out,
         "wasmkeep_expiry_passes_total",
@@ -1390,6 +1456,68 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
             let _ = writeln!(out, "{name}{{{labels}}} {}", value.load(Ordering::Relaxed));
         });
     }
+    app_family(
+        &mut out,
+        "wasmkeep_blob_sweeps_total",
+        "Sweep records of deleted actors' files this node acted on, by tenant, app and outcome.",
+        &m.blob_sweeps,
+        &BLOB_SWEEP_OUTCOMES,
+    );
+    app_family(
+        &mut out,
+        "wasmkeep_blob_node_link_requests_total",
+        "Node-link requests answered, by tenant, app and outcome.",
+        &m.blob_node_links,
+        &BLOB_NODE_LINK_OUTCOMES,
+    );
+    for (name, kind, help, family) in [
+        (
+            "wasmkeep_blob_ops_total",
+            "counter",
+            "File calls, by tenant, app, op and outcome.",
+            &m.blob_ops,
+        ),
+        (
+            "wasmkeep_blob_bytes_total",
+            "counter",
+            "Bytes of files through the host, node links included, by tenant, app and direction.",
+            &m.blob_bytes,
+        ),
+        (
+            "wasmkeep_blob_links_total",
+            "counter",
+            "Links to files made, by tenant, app and kind.",
+            &m.blob_links,
+        ),
+        (
+            "wasmkeep_blob_stored_bytes",
+            "gauge",
+            "Bytes of an app's files at its last hourly count.",
+            &m.blob_stored_bytes,
+        ),
+        (
+            "wasmkeep_blob_stored_files",
+            "gauge",
+            "Files of an app at its last hourly count.",
+            &m.blob_stored_files,
+        ),
+    ] {
+        head(&mut out, name, kind, help);
+        family.each(|labels, value| {
+            let _ = writeln!(out, "{name}{{{labels}}} {}", value.load(Ordering::Relaxed));
+        });
+    }
+    head(
+        &mut out,
+        "wasmkeep_blob_links_mode",
+        "gauge",
+        "1 when this process presigns downloads (the start proof passed), 0 for node links only.",
+    );
+    let _ = writeln!(
+        out,
+        "wasmkeep_blob_links_mode {}",
+        m.blob_links_mode.load(Ordering::Relaxed)
+    );
     app_family(
         &mut out,
         "wasmkeep_front_requests_total",
@@ -1760,7 +1888,9 @@ mod tests {
                         || l.contains("{tenant=\"acme\",app=\"shop\","),
                     "{l}"
                 );
-            } else if l.starts_with("wasmkeep_front_") && !l.starts_with("wasmkeep_front_slots") {
+            } else if (l.starts_with("wasmkeep_front_") && !l.starts_with("wasmkeep_front_slots"))
+                || (l.starts_with("wasmkeep_blob_") && !l.starts_with("wasmkeep_blob_links_mode"))
+            {
                 assert!(l.contains("{tenant=\"default\",app=\"default\","), "{l}");
             } else if !l.starts_with("wasmkeep_info{") {
                 assert!(!l.contains("tenant=") && !l.contains("app="), "{l}");
@@ -1988,11 +2118,6 @@ mod tests {
                 &DELETE_HOWS[..],
             ),
             (
-                "wasmkeep_blob_sweeps_total",
-                "outcome",
-                &BLOB_SWEEP_OUTCOMES[..],
-            ),
-            (
                 "wasmkeep_parked_releases_total",
                 "reason",
                 &PARKED_RELEASE_REASONS[..],
@@ -2010,6 +2135,11 @@ mod tests {
         for o in FRONT_REQUEST_OUTCOMES {
             expected.push(format!(
                 "wasmkeep_front_requests_total{{tenant=\"default\",app=\"default\",outcome=\"{o}\"}} 0"
+            ));
+        }
+        for o in BLOB_SWEEP_OUTCOMES {
+            expected.push(format!(
+                "wasmkeep_blob_sweeps_total{{tenant=\"default\",app=\"default\",outcome=\"{o}\"}} 0"
             ));
         }
         for o in FRONT_CALL_OUTCOMES {

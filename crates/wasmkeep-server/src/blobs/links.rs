@@ -109,6 +109,7 @@ impl Links {
         settings: LinkSettings,
         mac: MacSource,
     ) -> Self {
+        crate::metrics::blob_links_mode(settings.presigner.is_some());
         Self {
             tenant: tenant.to_owned(),
             app: app.to_owned(),

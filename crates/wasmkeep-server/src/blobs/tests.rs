@@ -859,3 +859,92 @@ async fn links_need_what_writes_need_and_stop_at_1000_an_event() {
     ));
     c.link_upload("u".into(), upload(MAX_BUFFERED)).unwrap();
 }
+
+fn with_quota(f: Fixture, limit: u64) -> Fixture {
+    let Fixture { _tmp, blobs } = f;
+    Fixture {
+        _tmp,
+        blobs: Arc::new(Arc::into_inner(blobs).unwrap().with_quota(Some(limit))),
+    }
+}
+
+#[tokio::test]
+async fn the_hourly_count_sums_the_current_epoch_and_the_quota_follows_it() {
+    for f in [
+        with_quota(bucket(), 10),
+        with_quota(disk_with(DEFAULT_MAX_FILE), 10),
+    ] {
+        let (_t, blobs) = with_links(f, false);
+        let mut c = Caller::new(
+            Some(Arc::clone(&blobs)),
+            Namespace::actor("photos", "alice", "0"),
+            Gate::Free,
+        );
+        let front = Caller::new(Some(Arc::clone(&blobs)), Namespace::front(), Gate::Free);
+        c.put("a".into(), vec![1; 6], any()).await.unwrap();
+        front.put("b".into(), vec![2; 6], any()).await.unwrap();
+        // Over the limit, but nothing counted yet: not refused.
+        assert!(!blobs.over_quota());
+        let n = blobs.count().await.unwrap();
+        assert_eq!((n.bytes, n.files), (12, 2));
+        blobs.note_usage(&n);
+        assert!(blobs.over_quota());
+        assert!(matches!(
+            c.put("c".into(), vec![3], any()).await,
+            Err(BlobError::QuotaExceeded)
+        ));
+        assert!(matches!(
+            c.link_upload(
+                "u".into(),
+                wasmkeep_wit::wasmkeep::actor::blobs::UploadOptions {
+                    size: 1,
+                    content_type: "image/png".into(),
+                    expires_in_secs: None,
+                }
+            ),
+            Err(BlobError::QuotaExceeded)
+        ));
+        // A delete frees nothing until the next count.
+        c.delete("a".into()).await.unwrap();
+        assert!(matches!(
+            c.put("c".into(), vec![3], any()).await,
+            Err(BlobError::QuotaExceeded)
+        ));
+        let n = blobs.count().await.unwrap();
+        assert_eq!((n.bytes, n.files), (6, 1));
+        blobs.note_usage(&n);
+        c.put("c".into(), vec![3], any()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_bucket_count_is_written_for_every_node_and_other_epochs_are_not_counted() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let f = with_quota(bucket_with(Arc::clone(&store), DEFAULT_MAX_FILE), 5);
+    let c = caller(&f, Namespace::front());
+    c.put("a".into(), vec![1; 6], any()).await.unwrap();
+    store
+        .put_opts(
+            &StorePath::from("p/state/acme/shop/blobs/ffffffffffffffff/_front/main/0/old"),
+            PutPayload::from(vec![0u8; 100]),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let n = f.blobs.count().await.unwrap();
+    assert_eq!((n.bytes, n.files), (6, 1));
+    f.blobs.publish_usage(&n).await.unwrap();
+    // Another node of the app reads it.
+    let other = with_quota(bucket_with(Arc::clone(&store), DEFAULT_MAX_FILE), 5);
+    assert!(!other.blobs.over_quota());
+    let read = other.blobs.read_usage().await.unwrap().unwrap();
+    assert_eq!((read.bytes, read.files), (6, 1));
+    other.blobs.note_usage(&read);
+    assert!(other.blobs.over_quota());
+    // A count of another epoch (an earlier life of the app) is ignored.
+    let stale = with_quota(bucket_with(Arc::clone(&store), DEFAULT_MAX_FILE), 5);
+    let mut wrong = read.clone();
+    wrong.epoch = "ffffffffffffffff".into();
+    stale.blobs.note_usage(&wrong);
+    assert!(!stale.blobs.over_quota());
+}

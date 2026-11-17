@@ -649,7 +649,7 @@ struct ServeArgs {
         "cluster_advertise", "metrics_listen", "max_sockets_per_node", "max_sockets_per_app",
         "data_dir", "secrets_keys", "no_secrets", "env", "front_env", "access",
         "allow_outbound", "allow_outbound_port", "outbound_ca", "max_front_requests",
-        "front_cpu_budget_ms", "no_alarms", "blob_link_base",
+        "front_cpu_budget_ms", "no_alarms", "blob_link_base", "max_app_blob_bytes",
     ])]
     node_file: Option<PathBuf>,
 
@@ -816,6 +816,15 @@ struct ServeArgs {
     #[arg(long, value_name = "BYTES", default_value_t = wasmkeep_server::blobs::DEFAULT_MAX_FILE,
           value_parser = clap::value_parser!(u64).range(1..=wasmkeep_server::blobs::MAX_FILE_CEILING))]
     max_blob_bytes: u64,
+
+    /// The app's stored-bytes limit (ADR 0030, section 7): once the
+    /// hourly count of its files is over it, writes and upload links are
+    /// refused with `quota-exceeded` until a count is under it again. It
+    /// lags by up to an hour of writes plus the upload links outstanding.
+    /// By default none. In a node file, the `[[app]]` field
+    /// `max-app-blob-bytes`.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    max_app_blob_bytes: Option<u64>,
 
     /// Links to actors' and the front's files (ADR 0030): `auto` presigns
     /// downloads on a bucket whose start proof passed and uses node links
@@ -1724,6 +1733,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
         }
         let mut config = ActorConfig::new(&args.data_dir);
         config.max_blob_bytes = args.max_blob_bytes;
+        config.max_app_blob_bytes = args.max_app_blob_bytes;
         config.blob_links.base = link_base(&args, &[]);
         // With --app: whether rules were ever deployed (ADR 0013), and the
         // version's own.
