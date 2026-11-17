@@ -754,7 +754,10 @@ left files to this record).
   same advice as for one actor: check with `head`, and run the app's own
   sweep of pending uploads after a restore. A file that is gone between
   its listing and its read is left out, not an error; any other failure
-  makes the run partial, as a failed actor does.
+  fails the run (slice B6: a partial run records failed actors only, and
+  a run with a file missing must not look whole). The undo run of an
+  in-place restore copies the epoch from before that restore wrote
+  `restored`, which its journal records.
 - **Incremental, verified, pruned like the rest.** A file whose key,
   size and `ETag` match the previous complete run's entry is carried
   over without a read. `backup verify` checks that each file's and each

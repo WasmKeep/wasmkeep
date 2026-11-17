@@ -165,6 +165,9 @@ async fn collect(store: &Store, prefix: &str, keep: usize, now: u128) -> anyhow:
             for object in array(app, "objects")? {
                 retain(&mut hashes, &mut used, object)?;
             }
+            for entry in files::entries(store, prefix, app).await? {
+                retain(&mut hashes, &mut used, &entry)?;
+            }
         }
     }
     // Finish every read/validation before deleting anything. Data listing is

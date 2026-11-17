@@ -87,6 +87,7 @@ pub struct Verify {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     sample: Option<u64>,
 }
+mod files;
 mod prune;
 mod restore;
 
@@ -1289,7 +1290,9 @@ impl Copier<'_> {
         let keys = history::copy_keys(&listing, &plan)?;
         let old = previous.and_then(|p| p["objects"].as_object());
         let unchanged = previous.is_some_and(|p| {
-            p["generation"].as_u64() == Some(plan.head().generation)
+            // A run before files recorded no namespace: read it again.
+            p.get("blob_namespace").is_some()
+                && p["generation"].as_u64() == Some(plan.head().generation)
                 && p["txid"].as_u64() == Some(plan.head().txid)
         }) && keys.iter().all(|k| {
             listed
@@ -1405,7 +1408,12 @@ impl Copier<'_> {
             staged.as_file().sync_all()?;
             staged.persist(target).map_err(|e| e.error)?;
         }
-        let mut actor = json!({"prefix":prefix,"generation":result.position.generation,"txid":result.position.txid,"checksum":result.raw_checksum,"timestamp_ms":result.timestamp_ms,"replayed_objects":result.objects,"plan":keys,"objects":copied,"replacement":result.verification.replaced,"foreign_key_violations":result.verification.foreign_key_violations,"alarm":alarm,"alarm_indexed":alarm_indexed});
+        let blob_namespace = files::actor_namespace(
+            prefix,
+            &tmp.path().join("actor.db"),
+            result.verification.replaced.as_deref(),
+        )?;
+        let mut actor = json!({"prefix":prefix,"blob_namespace":blob_namespace,"generation":result.position.generation,"txid":result.position.txid,"checksum":result.raw_checksum,"timestamp_ms":result.timestamp_ms,"replayed_objects":result.objects,"plan":keys,"objects":copied,"replacement":result.verification.replaced,"foreign_key_violations":result.verification.foreign_key_violations,"alarm":alarm,"alarm_indexed":alarm_indexed});
         actor["ranges"] = json!(recoverable_ranges(&actor)?);
         actor["gaps"] = json!([]);
         if self.all {
@@ -1540,6 +1548,52 @@ async fn app_metadata(
                                 save_blob(dest, dp, &path, bytes, None, None).await?,
                             )?;
                         }
+                        // The version's assets: its index and every content
+                        // it names, never a marker (ADR 0030, section 9).
+                        if let Some(hash) = &manifest.assets {
+                            let index_key = key(&base, &format!("_assets/index/{hash}"));
+                            if !objects.contains_key(&index_key) {
+                                let bytes = read(
+                                    source,
+                                    &index_key,
+                                    wasmkeep_server::assets::MAX_INDEX as u64,
+                                )
+                                .await?;
+                                ensure!(digest(&bytes) == *hash, "assets index digest mismatch");
+                                let index = wasmkeep_server::assets::Index::parse(&bytes)
+                                    .map_err(anyhow::Error::msg)?;
+                                insert_metadata(
+                                    &mut objects,
+                                    &mut metadata_bytes,
+                                    index_key.clone(),
+                                    save_blob(dest, dp, &index_key, bytes, None, None).await?,
+                                )?;
+                                for file in index.files.values() {
+                                    for content in file.contents() {
+                                        let path = key(
+                                            &base,
+                                            &format!("_assets/content/{}", content.digest),
+                                        );
+                                        if objects.contains_key(&path) {
+                                            continue;
+                                        }
+                                        let bytes =
+                                            read(source, &path, wasmkeep_server::assets::MAX_FILE)
+                                                .await?;
+                                        ensure!(
+                                            digest(&bytes) == content.digest,
+                                            "asset digest mismatch"
+                                        );
+                                        insert_metadata(
+                                            &mut objects,
+                                            &mut metadata_bytes,
+                                            path.clone(),
+                                            save_blob(dest, dp, &path, bytes, None, None).await?,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
                         version = manifest.previous;
                     }
                 } else {
@@ -1672,6 +1726,12 @@ async fn create_undo(
         )?;
         starts.insert(name, marker);
     }
+    let files_epoch = match undo_fence {
+        Some(fence) => serde_json::from_slice::<Value>(fence)?["files_epoch"]
+            .as_str()
+            .map(str::to_owned),
+        None => None,
+    };
     let prunes = prune::markers(dest, dp).await?;
     let started_hash = json_put(
         dest,
@@ -1796,7 +1856,34 @@ async fn create_undo(
             actors.push(actor);
             flush_chunk(dest, &base, &mut chunks, &mut actors).await?;
         }
+        let mut previous_files = BTreeMap::new();
+        if compatible {
+            for old_app in previous.iter().flat_map(|r| &r.apps) {
+                if old_app["app"] == format!("{t}/{a}") {
+                    for entry in files::entries(dest, dp, old_app).await? {
+                        previous_files.insert(text(&entry, "source")?.to_owned(), entry);
+                    }
+                }
+            }
+        }
+        let copied_files = files::copy_app(
+            source,
+            sp,
+            dest,
+            dp,
+            &base,
+            &t,
+            &a,
+            &previous_files,
+            args.cache.as_deref(),
+            files_epoch.as_deref(),
+        )
+        .await?;
+        drop(previous_files);
         let mut app = app_metadata(source, sp, dest, dp, &t, &a).await?;
+        for (field, value) in copied_files.as_object().context("file fields")? {
+            app[field] = value.clone();
+        }
         app["run"] = json!(id);
         app["started_sha256"] = json!(started_hash);
         app["actors"] = json!(actor_count - app_start);
@@ -1995,6 +2082,29 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
                 "configuration mismatch"
             );
         }
+        if let Some(hash) = &manifest.assets {
+            let bytes = blob(
+                store,
+                dp,
+                objects
+                    .get(&key(&base, &format!("_assets/index/{hash}")))
+                    .context("assets index missing")?,
+            )
+            .await?;
+            ensure!(digest(&bytes) == *hash, "assets index mismatch");
+            let index =
+                wasmkeep_server::assets::Index::parse(&bytes).map_err(anyhow::Error::msg)?;
+            for file in index.files.values() {
+                for content in file.contents() {
+                    ensure!(
+                        objects
+                            .get(&key(&base, &format!("_assets/content/{}", content.digest)))
+                            .is_some_and(|o| o["sha256"] == content.digest),
+                        "asset content missing"
+                    );
+                }
+            }
+        }
         version = manifest.previous;
     }
     if let Some(bytes) = objects.get(&key(&base, "secrets/current")) {
@@ -2005,6 +2115,7 @@ async fn verify_app(store: &Store, dp: &str, sp: &str, app: &Value) -> anyhow::R
             "sealed secrets missing"
         );
     }
+    files::verify(store, dp, app).await?;
     Ok(())
 }
 
