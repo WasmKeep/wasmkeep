@@ -187,6 +187,7 @@ is one durable write per wake of an idle room.
   older epoch knows it is void (section 6).
 
 `epochs` keeps the rows of the last 64 epochs.
+A retained row validates its exact `(epoch, number)` cursor even after that epoch leaves the 64-entry ledger, allowing reset recovery to paginate without changing the wire format. The browser bounds pending live work to 64 frames and 1 MiB of conservatively accounted string storage, cancels obsolete recovery on overflow, and reconnects from the last applied position; each history page including throttling has a 30-second deadline.
 
 **How much can be lost.** With `confirm = false` (the default) a push
 goes out before its messages are in the bucket: a crash loses what
@@ -207,7 +208,7 @@ answers from the client's `(e, n)`:
 |---|---|
 | on the line, inside the window | the messages after it, at most 256 KiB, `more`, and the head |
 | above the `base` of a later epoch `e'` (lost) | `lost: {e: e', base}`, then the messages from `base + 1` |
-| older than the window, or older than the 64 epochs kept | `reset: {e, n}` of the first message kept, then the messages from there |
+| older than the window, or older than the 64 epochs kept without an exact retained row | `reset: {e, n}` of the first message kept, then the messages from there |
 | absent (a new client) | the head only; `last = k` asks for the last `k` messages instead |
 
 ### 4. The push

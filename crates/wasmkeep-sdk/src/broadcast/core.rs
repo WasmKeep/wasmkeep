@@ -252,7 +252,7 @@ impl<S: Store> Core<S> {
                 h.lost = Some(b);
                 n = b.base;
             }
-            if p.e < oldest
+            if (p.e < oldest && !rows.iter().any(|m| m.position == p))
                 || rows
                     .first()
                     .is_some_and(|m| n.saturating_add(1) < m.position.n)

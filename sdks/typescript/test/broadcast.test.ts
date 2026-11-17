@@ -86,7 +86,7 @@ test("shared history vectors and epoch retention", () => {
         r = room();
         r.history();
     }
-    assert(r.history({ e: 1n, n: 1n }).reset);
+    assert(r.history({ e: 1n, n: 0n }).reset);
     assert.equal(db.query("SELECT * FROM wasmkeep_room_epochs", []).values.length, 64);
     db.close();
 });
@@ -103,5 +103,26 @@ test("UTF-8 byte window, bounded history and invalid batch atomicity", () => {
     assert.equal(h.more, true);
     assert.throws(() => r.publish([{ body: "valid" }, { body: body + "x" }], 0n));
     assert.equal(r.history().head.n, 129n);
+    db.close();
+});
+import { Receiver, historyJSON } from "../src/room-client";
+test("four retained 64-KiB messages recover across pages after 64 cold wakes", async () => {
+    db.install(":memory:");
+    let r = room();
+    r.init();
+    r.publish(Array.from({ length: 4 }, () => ({ body: "x".repeat(65536) })), 0n);
+    for (let i = 0; i < 64; i++) {
+        r = room();
+        r.wake();
+    }
+    const first = r.history({ e: 1n, n: 0n });
+    assert.equal(first.messages.length, 3);
+    assert(first.more);
+    assert(first.reset);
+    const seen: number[] = [];
+    const receiver = new Receiver({ history: async (p) => historyJSON(r.history(p && { e: BigInt(p.e), n: BigInt(p.n) })), onMessage: p => { seen.push(p.n); } }, { e: 1, n: 0 });
+    await receiver.receive({ t: "behind", e: 65, n: 4 });
+    assert.deepEqual(seen, [1, 2, 3, 4]);
+    assert.deepEqual(receiver.last, { e: 65, n: 4 });
     db.close();
 });

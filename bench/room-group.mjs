@@ -43,6 +43,7 @@ class Histogram {
 }
 const delivery = new Histogram(), reconnect = new Histogram();
 const counters = { deliveries: 0, repeats: 0, history_requests: 0, gaps_recovered: 0, recovered_messages: 0, void_numbers: 0, resets: 0, reconnect_attempts: 0, close_4801: 0, close_4802: 0, errors: 0, publish_ok: 0, publish_failed: 0, publish_retries: 0, forced_disconnects: 0, smoke_dropped_frames: 0 };
+const acknowledged = [];
 const run = randomUUID().slice(0, 8), clients = [], sockets = new Set(), samples = [];
 let stopped = false;
 const stop = new AbortController();
@@ -115,8 +116,13 @@ try {
       for (let k = 0; k < 3 && performance.now() < end && !stopped; k++) {
         try {
           const r = await boundedFetch(endpoint('publish', `p${run}-${publisher}`), { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+          if (r.ok) {
+            const positions = await r.json();
+            if (!Array.isArray(positions) || positions.length !== 1 || positions.some(p => !Number.isSafeInteger(p.e) || p.e < 1 || !Number.isSafeInteger(p.n) || p.n < 1)) throw Error('invalid publish acknowledgement');
+            acknowledged.push(...positions);
+            ok = true; break;
+          }
           await r.arrayBuffer();
-          if (r.ok) { ok = true; break; }
           if (![429, 503].includes(r.status)) break;
           const retry = r.headers.get('retry-after') ?? '0';
           const delay = Number.isFinite(Number(retry)) ? Number(retry) * 1000 : Math.max(0, Date.parse(retry) - Date.now());
@@ -150,14 +156,18 @@ try {
     await sleep(Math.min(1000, Math.max(0, end - performance.now())));
   }
   await Promise.all(tasks);
-  await sleep(v.smoke ? 500 : 2000);
+  const reached = p => p && acknowledged.every(a => p.e >= a.e && p.n >= a.n);
+  const drainDeadline = performance.now() + (v.smoke ? 3000 : 10000);
+  while (clients.some(c => !reached(c.client.last)) && performance.now() < drainDeadline) await sleep(50);
+  const finalCursors = clients.map(c => c.client.last ?? null);
+  const incomplete = finalCursors.flatMap((p, i) => reached(p) ? [] : [i]);
   let commit = 'unknown';
   try { commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(); if (execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim()) commit += '-dirty'; } catch {}
-  const result = { schema: 1, date: new Date().toISOString(), commit, node: process.version, smoke: !!v.smoke, clients: count, duration_s: duration, rate_per_s: rate, publishers, ready_at_start: readyAtStart, ready_at_end: clients.filter(c => c.ready()).length, counters, delivery_latency: delivery.summary(), reconnect_latency: reconnect.summary(), samples };
+  const result = { schema: 1, acknowledged_positions: acknowledged, final_cursors: finalCursors, incomplete_clients: incomplete, date: new Date().toISOString(), commit, node: process.version, smoke: !!v.smoke, clients: count, duration_s: duration, rate_per_s: rate, publishers, ready_at_start: readyAtStart, ready_at_end: clients.filter(c => c.ready()).length, counters, delivery_latency: delivery.summary(), reconnect_latency: reconnect.summary(), samples };
   await writeFile(`${v.out}.partial`, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
   await rename(`${v.out}.partial`, v.out);
   console.log(JSON.stringify({ counters, delivery_latency: result.delivery_latency, reconnect_latency: result.reconnect_latency }));
-  if (!readyAtStart || !counters.publish_ok || !delivery.count || (v.smoke && (readyAtStart !== count || counters.errors || counters.publish_failed))) process.exitCode = 1;
+  if (counters.void_numbers || incomplete.length || !readyAtStart || !counters.publish_ok || !delivery.count || (v.smoke && (readyAtStart !== count || counters.errors || counters.publish_failed))) process.exitCode = 1;
 } finally {
   stopped = true; stop.abort(); for (const { client } of clients) client.close();
   await Promise.allSettled(tasks);

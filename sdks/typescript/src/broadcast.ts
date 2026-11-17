@@ -9,7 +9,7 @@ import type { ActorDefinition, ActorRequest, ActorResponse } from "./index";
 import { Reader, Writer, header } from "./wire";
 export { Client } from "./broadcast-client";
 export * from "./broadcast-core";
-const PREFIX = "/wasmkeep-room/v1/", enc = new TextEncoder(), dec = new TextDecoder("utf-8", { fatal: true });
+const PREFIX = "/wasmkeep-room/v1/", enc = new TextEncoder(), dec = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 function number(r: Reader): bigint {
     const n = r.u64();
     if (n === undefined)

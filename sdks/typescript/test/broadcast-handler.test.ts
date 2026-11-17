@@ -36,5 +36,22 @@ test("room front client and internal handler round trip, restart and access", ()
     assert.deepEqual(c.publish([{ body: "replacement" }]), [{ e: 2n, n: 2n }]);
     assert.equal(c.history({ e: 2n, n: 1n }).messages[0].body, "replacement");
     assert.equal(request("/wasmkeep-room/v1/publish", new Uint8Array([255])).status, 400);
+    assert.deepEqual(c.publish([{ id: "x", body: "plain" }, { id: "\uFEFFx", body: "\uFEFFbody" }]), [{ e: 2n, n: 3n }, { e: 2n, n: 4n }]);
+    const unicode = c.history({ e: 2n, n: 2n }).messages;
+    assert.deepEqual(unicode.map(m => [m.id, m.body]), [["x", "plain"], ["\uFEFFx", "\uFEFFbody"]]);
     db.close();
+});
+import { readFileSync } from "node:fs";
+import { historyJSON } from "../src/broadcast-client";
+test("Rust room wire vectors preserve distinct BOM IDs and body through TypeScript front", () => {
+    const vectors = readFileSync("../../crates/wasmkeep-sdk/src/broadcast/unicode-vectors.txt", "utf8").trim().split("\n").map(s => Uint8Array.from(s.match(/../g)!, h => parseInt(h, 16)));
+    host((_address, req) => {
+        const i = req.path.endsWith("publish") ? 0 : 2;
+        assert.deepEqual(req.body, vectors[i]);
+        return { status: 200, headers: [], body: vectors[i + 1] };
+    });
+    const c = new Client("room/rust");
+    assert.deepEqual(c.publish([{ id: "x", body: "plain" }, { id: "\uFEFFx", body: "\uFEFFbody" }]), [{ e: 1n, n: 1n }, { e: 1n, n: 2n }]);
+    const h = historyJSON(c.history({ e: 1n, n: 0n }));
+    assert.deepEqual(h.messages.map(m => [m.id, m.body]), [["x", "plain"], ["\uFEFFx", "\uFEFFbody"]]);
 });

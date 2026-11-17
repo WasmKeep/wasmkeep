@@ -174,7 +174,7 @@ fn shared_history_vectors_and_epoch_retention() {
     }
     assert_eq!(r.epochs().unwrap().len(), 64);
     assert!(
-        r.history(Some(Position { e: 1, n: 1 }), 100, None)
+        r.history(Some(Position { e: 1, n: 0 }), 100, None)
             .unwrap()
             .reset
             .is_some()
@@ -203,4 +203,62 @@ fn byte_window_and_limits_are_atomic() {
     r.db.flush_error = Some("fatal storage failure".into());
     r.confirm = true;
     assert!(r.before_push(0).is_err());
+}
+
+#[test]
+fn four_retained_messages_after_64_cold_wakes() {
+    let mut r = Core::new(Db::new(), false);
+    r.init().unwrap();
+    r.publish(&vec![message(&"x".repeat(65536), None); 4], 0)
+        .unwrap();
+    for _ in 0..64 {
+        r = Core::new(r.db, false);
+        r.wake().unwrap();
+    }
+    let first = r
+        .history(Some(Position { e: 1, n: 0 }), 2000, None)
+        .unwrap();
+    assert!(first.reset.is_some() && first.more);
+    assert_eq!(first.messages.len(), 3);
+    let second = r
+        .history(Some(first.messages[2].position), 2000, None)
+        .unwrap();
+    assert!(second.reset.is_none());
+    assert!(!second.more);
+    assert_eq!(
+        second
+            .messages
+            .iter()
+            .map(|m| m.position.n)
+            .collect::<Vec<_>>(),
+        vec![4]
+    );
+}
+
+#[cfg(feature = "actor")]
+#[test]
+fn unicode_room_wire_vectors_for_typescript_front() {
+    let vectors: Vec<Vec<u8>> = include_str!("unicode-vectors.txt")
+        .lines()
+        .map(|s| {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        })
+        .collect();
+    let mut room = Core::new(Db::new(), false);
+    room.init().unwrap();
+    assert_eq!(
+        super::super::protocol::serve(&mut room, "publish", &vectors[0], 0).unwrap(),
+        vectors[1]
+    );
+    assert_eq!(
+        super::super::protocol::serve(&mut room, "history", &vectors[2], 0).unwrap(),
+        vectors[3]
+    );
+    let messages = room.messages().unwrap();
+    assert_eq!(messages[0].id.as_deref(), Some("x"));
+    assert_eq!(messages[1].id.as_deref(), Some("\u{feff}x"));
+    assert_eq!(messages[1].body, "\u{feff}body");
 }

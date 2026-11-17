@@ -162,7 +162,7 @@ export class Core {
                 h.lost = boundary;
                 n = boundary.base;
             }
-            if (after.e < epochs[0].e || (rows[0] && n + 1n < rows[0].position.n)) {
+            if ((after.e < epochs[0].e && !rows.some(m => m.position.e === after.e && m.position.n === after.n)) || (rows[0] && n + 1n < rows[0].position.n)) {
                 h.reset = rows[0]?.position ?? head;
                 start = 0;
             }

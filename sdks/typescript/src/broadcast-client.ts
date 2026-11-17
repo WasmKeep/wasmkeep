@@ -1,7 +1,7 @@
 import { Reader, Writer } from "./wire";
 import { call } from "./call";
 import type { Position, Publish, History, Message } from "./broadcast-core";
-const PREFIX = "/wasmkeep-room/v1/", enc = new TextEncoder(), dec = new TextDecoder("utf-8", { fatal: true });
+const PREFIX = "/wasmkeep-room/v1/", enc = new TextEncoder(), dec = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 function number(r: Reader): bigint {
     const n = r.u64();
     if (n === undefined)

@@ -19,7 +19,7 @@ export type Frame = {
     n: number;
 };
 export interface ReceiverOptions {
-    history(after?: Position): Promise<History>;
+    history(after?: Position, signal?: AbortSignal): Promise<History>;
     onMessage?(p: Position, body: string, id?: string, at?: number): void;
     /** An item discarded because its position was already applied. */
     onRepeat?(p: Position): void;
@@ -60,12 +60,57 @@ export function joinURL(url: string, last?: Position): string {
 /** Serializes live frames behind gap recovery, including multi-page history. */
 export class Receiver {
     last?: Position;
-    private work: Promise<void> = Promise.resolve();
+    private work?: Promise<void>;
+    private queue: {
+        frame: Frame;
+        bytes: number;
+    }[] = [];
+    private bytes = 0;
+    private abort = new AbortController();
+    /** Includes the in-flight frame. Strings are conservatively charged as UTF-16. */
+    get pending() { return { frames: this.queue.length, bytes: this.bytes }; }
     constructor(private options: ReceiverOptions, last?: Position) { this.last = last; }
+    cancel() {
+        this.abort.abort();
+        this.abort = new AbortController();
+        this.queue = [];
+        this.bytes = 0;
+        this.work = undefined;
+    }
     receive(frame: Frame): Promise<void> {
-        const next = this.work.then(() => { validateFrame(frame); return this.apply(frame); });
-        this.work = next.catch(() => { });
-        return next;
+        validateFrame(frame);
+        const bytes = 128 + (frame.t === "m" ? frame.m.reduce((n, m) => n + 64 + 2 * (m.d.length + (m.i?.length ?? 0)), 0) : 0);
+        if (this.queue.length >= 64 || this.bytes + bytes > 1024 * 1024) {
+            this.cancel();
+            throw Error("live backlog overflow");
+        }
+        this.queue.push({ frame, bytes });
+        this.bytes += bytes;
+        if (!this.work) {
+            const signal = this.abort.signal;
+            this.work = Promise.resolve().then(async () => {
+                try {
+                    while (this.queue.length) {
+                        signal.throwIfAborted();
+                        const item = this.queue[0];
+                        await this.apply(item.frame, signal);
+                        signal.throwIfAborted();
+                        this.queue.shift();
+                        this.bytes -= item.bytes;
+                    }
+                }
+                catch (error) {
+                    if (!signal.aborted)
+                        this.cancel();
+                    throw error;
+                }
+                finally {
+                    if (!signal.aborted)
+                        this.work = undefined;
+                }
+            });
+        }
+        return this.work;
     }
     private message(p: Position, body: string, id?: string, at?: number) {
         if (this.last && (p.e < this.last.e || (p.e === this.last.e && p.n <= this.last.n))) {
@@ -75,10 +120,11 @@ export class Receiver {
         this.options.onMessage?.(p, body, id, at);
         this.last = p;
     }
-    private async recover() {
+    private async recover(signal: AbortSignal) {
         for (;;) {
             const before = this.last;
-            const h = await this.options.history(this.last);
+            const h = await this.options.history(this.last, signal);
+            signal.throwIfAborted();
             validateHistory(h);
             if (h.lost) {
                 if (this.last && h.lost.base < this.last.n)
@@ -111,18 +157,21 @@ export class Receiver {
             }
         }
     }
-    private async apply(f: Frame) {
+    private async apply(f: Frame, signal: AbortSignal) {
+        signal.throwIfAborted();
         if (f.t === "ready" && !this.last && f.n !== null) {
             this.last = { e: f.e, n: f.n };
             return;
         }
         if (f.t !== "m") {
             if (f.t === "behind" || f.n === null || !this.last || f.e !== this.last.e || f.n !== this.last.n)
-                await this.recover();
+                await this.recover(signal);
+            signal.throwIfAborted();
             return;
         }
         if (!this.last || f.e > this.last.e + 1)
-            await this.recover();
+            await this.recover(signal);
+        signal.throwIfAborted();
         if (this.last && f.e === this.last.e + 1) {
             if (f.b < this.last.n) {
                 this.options.onLost?.(f.b + 1, this.last.n);
@@ -135,11 +184,13 @@ export class Receiver {
             for (let i = 0; i < f.m.length && f.n + i <= this.last.n; i++)
                 this.options.onRepeat?.({ e: f.e, n: f.n + i });
             if (f.n + f.m.length - 1 > this.last.n)
-                await this.recover();
+                await this.recover(signal);
+            signal.throwIfAborted();
             return;
         }
         if (!this.last || f.n > this.last.n + 1)
-            await this.recover();
+            await this.recover(signal);
+        signal.throwIfAborted();
         for (let i = 0; i < f.m.length; i++) {
             const m = f.m[i], p = { e: f.e, n: f.n + i };
             if (this.last && p.e === this.last.e && p.n > this.last.n + 1)
@@ -192,7 +243,7 @@ export class RoomClient {
     constructor(private options: ClientOptions) {
         this.clock = options.clock ?? { now: Date.now, set: (fn, ms) => setTimeout(fn, ms), clear: id => clearTimeout(id as ReturnType<typeof setTimeout>) };
         this.random = options.random ?? Math.random;
-        this.receiver = new Receiver({ ...options, history: p => this.history(p) }, options.last);
+        this.receiver = new Receiver({ ...options, history: (p, signal) => this.history(p, signal) }, options.last);
     }
     get last() { return this.receiver.last; }
     private later(fn: () => void, ms: number) {
@@ -201,12 +252,18 @@ export class RoomClient {
         return id;
     }
     private cancel(id: unknown) { this.clock.clear(id); this.timers.delete(id); }
-    connect() { if (!this.stopped)
-        return; this.stopped = false; this.abort = new AbortController(); this.open(); }
+    connect() {
+        if (!this.stopped)
+            return;
+        this.stopped = false;
+        this.abort = new AbortController();
+        this.open();
+    }
     close() {
         this.stopped = true;
         this.generation++;
         this.abort.abort();
+        this.receiver.cancel();
         for (const id of this.timers)
             this.clock.clear(id);
         this.timers.clear();
@@ -223,6 +280,7 @@ export class RoomClient {
             if (ended || generation !== this.generation || this.stopped)
                 return;
             ended = true;
+            this.receiver.cancel();
             this.cancel(this.heartbeat);
             this.cancel(this.stable);
             this.options.onState?.("disconnected");
@@ -244,8 +302,10 @@ export class RoomClient {
                     this.heartbeat = this.later(() => { disconnected(1006); ws.close(); }, 10000);
                 }, 45000);
             };
-            ws.onopen = () => { if (!ended && generation === this.generation && !this.stopped)
-                keepalive(); };
+            ws.onopen = () => {
+                if (!ended && generation === this.generation && !this.stopped)
+                    keepalive();
+            };
             ws.onmessage = event => {
                 if (ended || generation !== this.generation)
                     return;
@@ -258,7 +318,13 @@ export class RoomClient {
                         this.cancel(this.stable);
                         this.stable = this.later(() => { this.attempt = 0; }, 10000);
                     }
-                    void this.receiver.receive(frame).catch(e => { this.options.onError?.(e); disconnected(1006); ws.close(); });
+                    void this.receiver.receive(frame).catch(e => {
+                        if (ended || generation !== this.generation || this.stopped)
+                            return;
+                        this.options.onError?.(e);
+                        disconnected(1006);
+                        ws.close();
+                    });
                 }
                 catch (e) {
                     this.options.onError?.(e);
@@ -274,12 +340,25 @@ export class RoomClient {
             disconnected(1006);
         }
     }
-    private async history(p?: Position): Promise<History> {
+    private async history(p?: Position, recovery?: AbortSignal): Promise<History> {
+        const deadline = new AbortController();
+        const timer = this.later(() => deadline.abort(Error("history deadline exceeded")), 30000);
+        const signal = AbortSignal.any([this.abort.signal, deadline.signal, ...(recovery ? [recovery] : [])]);
+        try {
+            return await this.fetchHistory(p, signal);
+        }
+        finally {
+            this.cancel(timer);
+        }
+    }
+    private async fetchHistory(p: Position | undefined, signal: AbortSignal): Promise<History> {
         const url = new URL(this.options.history);
         if (p)
             url.searchParams.set("after", `${p.e}.${p.n}`);
         for (let k = 0;; k++) {
-            const response = await (this.options.fetch ?? fetch)(url.toString(), { signal: this.abort.signal });
+            signal.throwIfAborted();
+            const response = await (this.options.fetch ?? fetch)(url.toString(), { signal });
+            signal.throwIfAborted();
             if (response.status !== 429 && response.status !== 503) {
                 if (!response.ok)
                     throw Error(`history answered ${response.status}`);
@@ -288,7 +367,6 @@ export class RoomClient {
             const retry = response.headers.get("Retry-After") ?? "0";
             const seconds = Number(retry), delay = Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(retry) - this.clock.now());
             await new Promise<void>((resolve, reject) => {
-                const signal = this.abort.signal;
                 const aborted = () => { this.cancel(id); reject(Error("closed")); };
                 const id = this.later(() => { signal.removeEventListener("abort", aborted); resolve(); }, Math.max(0, delay || 0) + backoff(k, this.random));
                 signal.addEventListener("abort", aborted, { once: true });

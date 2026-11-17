@@ -37,7 +37,12 @@ fn optional(r: &mut Reader<'_>) -> Result<bool, String> {
     }
 }
 #[cfg(feature = "actor")]
-fn serve<S: Store>(core: &mut Core<S>, op: &str, body: &[u8], now: u64) -> Result<Vec<u8>, String> {
+pub(super) fn serve<S: Store>(
+    core: &mut Core<S>,
+    op: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Vec<u8>, String> {
     let mut r = Reader::new(body);
     let mut w = Writer::default();
     match op {

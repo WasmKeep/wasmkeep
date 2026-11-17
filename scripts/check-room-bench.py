@@ -43,6 +43,9 @@ def main():
                                 '--reconnect-every', '1', '--smoke', '--out', str(out)],
                                cwd=ROOT, check=True, timeout=max(1, deadline - time.monotonic()))
                 result = json.loads(out.read_text())
+                assert result['incomplete_clients'] == []
+                assert len(result['final_cursors']) == 24
+                assert len(result['acknowledged_positions']) == result['counters']['publish_ok']
                 assert result['ready_at_start'] == 24
                 assert result['counters']['deliveries'] >= 24
                 assert result['counters']['reconnect_attempts'] > 0

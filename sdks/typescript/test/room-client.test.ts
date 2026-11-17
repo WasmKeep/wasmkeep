@@ -66,14 +66,18 @@ class FakeClock implements Clock {
     now() { return this.time; }
     set(fn: () => void, ms: number) { const id = ++this.next; this.tasks.set(id, { at: this.time + ms, fn }); return id; }
     clear(id: unknown) { this.tasks.delete(id as number); }
-    tick(ms: number) { const end = this.time + ms; for (;;) {
-        const task = [...this.tasks].sort((a, b) => a[1].at - b[1].at)[0];
-        if (!task || task[1].at > end)
-            break;
-        this.time = task[1].at;
-        this.tasks.delete(task[0]);
-        task[1].fn();
-    } this.time = end; }
+    tick(ms: number) {
+        const end = this.time + ms;
+        for (;;) {
+            const task = [...this.tasks].sort((a, b) => a[1].at - b[1].at)[0];
+            if (!task || task[1].at > end)
+                break;
+            this.time = task[1].at;
+            this.tasks.delete(task[0]);
+            task[1].fn();
+        }
+        this.time = end;
+    }
 }
 class FakeSocket implements Socket {
     onopen: Socket["onopen"] = null;
@@ -86,8 +90,10 @@ class FakeSocket implements Socket {
     close() { this.closed = true; }
     frame(f: unknown) { this.onmessage?.({ data: JSON.stringify(f) }); }
 }
-const settle = async () => { for (let i = 0; i < 20; i++)
-    await Promise.resolve(); };
+const settle = async () => {
+    for (let i = 0; i < 20; i++)
+        await Promise.resolve();
+};
 test("clock: keepalive, timeout, moved jitter, stable reset, cancellation", async () => {
     const clock = new FakeClock(), sockets: FakeSocket[] = [], urls: string[] = [];
     const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", clock, random: () => .5, socket: url => { urls.push(url); const s = new FakeSocket(); sockets.push(s); return s; } });
@@ -197,9 +203,91 @@ test('repeat counter includes live items superseded by HTTP catch-up', async () 
     const r = new Receiver({
         onMessage: p => { seen.push(p.n); },
         onRepeat: p => { repeats.push(p.n); },
-        history: async () => ({head:{e:1,n:3},more:false,messages:[1,2,3].map(n=>({position:{e:1,n},at:0,body:String(n)}))}),
-    }, {e:1,n:1});
-    await r.receive({t:'m',e:1,b:0,n:3,m:[{a:0,d:'3'}]});
-    assert.deepEqual(seen,[2,3]);
-    assert.deepEqual(repeats,[1,3]);
+        history: async () => ({ head: { e: 1, n: 3 }, more: false, messages: [1, 2, 3].map(n => ({ position: { e: 1, n }, at: 0, body: String(n) })) }),
+    }, { e: 1, n: 1 });
+    await r.receive({ t: 'm', e: 1, b: 0, n: 3, m: [{ a: 0, d: '3' }] });
+    assert.deepEqual(seen, [2, 3]);
+    assert.deepEqual(repeats, [1, 3]);
+});
+for (const mode of ["stalled", "throttled"] as const)
+    for (const bodySize of [1, 65536])
+        test(`bounded live backlog during ${mode} history (${bodySize} bytes) recovers from applied position`, async () => {
+            const clock = new FakeClock(), sockets: FakeSocket[] = [], queries: string[] = [], signals: AbortSignal[] = [], seen: number[] = [];
+            const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", last: { e: 1, n: 1 }, clock, random: () => .5,
+                socket: () => { const s = new FakeSocket(); sockets.push(s); return s; }, onMessage: p => { seen.push(p.n); },
+                fetch: (async (url, init) => {
+                    queries.push(String(url));
+                    signals.push(init!.signal!);
+                    if (queries.length === 1) {
+                        if (mode === "throttled")
+                            return new Response(null, { status: 429, headers: { "Retry-After": "3600" } });
+                        return new Promise<Response>((_, reject) => init!.signal!.addEventListener("abort", () => reject(Error("aborted")), { once: true }));
+                    }
+                    return new Response(JSON.stringify({ head: { e: 1, n: 3 }, more: false, messages: [2, 3].map(n => ({ position: { e: 1, n }, body: "recovered", at: 0 })) }));
+                }) as typeof fetch });
+            c.connect();
+            sockets[0].frame({ t: "behind", e: 1, n: 3 });
+            await settle();
+            for (let i = 0; i < 100; i++)
+                sockets[0].frame({ t: "m", e: 1, b: 0, n: 3, m: [{ a: 0, d: "x".repeat(bodySize) }] });
+            await settle();
+            assert(c.receiver.pending.frames <= 64);
+            assert(c.receiver.pending.bytes <= 1024 * 1024);
+            assert(sockets[0].closed, "overflow closes live transport");
+            assert(signals[0].aborted, "obsolete history is cancelled");
+            assert.deepEqual(c.last, { e: 1, n: 1 });
+            clock.tick(250);
+            await settle();
+            sockets[1].frame({ t: "behind", e: 1, n: 3 });
+            await settle();
+            assert(queries[1].endsWith("after=1.1"));
+            assert.deepEqual(seen, [2, 3]);
+            c.close();
+            assert.equal(clock.tasks.size, 0);
+        });
+test("history deadline cancels a stalled fetch despite healthy live keepalives", async () => {
+    const clock = new FakeClock(), ws = new FakeSocket();
+    let signal: AbortSignal | undefined;
+    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", last: { e: 1, n: 1 }, clock, random: () => .5, socket: () => ws,
+        fetch: (async (_url, init) => {
+            signal = init!.signal!;
+            return new Promise<Response>((_, reject) => signal!.addEventListener("abort", () => reject(Error("aborted")), { once: true }));
+        }) as typeof fetch });
+    c.connect();
+    ws.frame({ t: "behind", e: 1, n: 2 });
+    await settle();
+    for (let i = 0; i < 3; i++) {
+        clock.tick(9999);
+        ws.frame({ t: "pong", e: 1, n: 2 });
+        await settle();
+    }
+    assert(!ws.closed);
+    clock.tick(3);
+    await settle();
+    assert(signal!.aborted);
+    assert(ws.closed);
+    assert.deepEqual(c.last, { e: 1, n: 1 });
+    c.close();
+});
+test("cancelled history cannot apply a late response or queued frames", async () => {
+    let release!: (h: any) => void;
+    const seen: number[] = [];
+    const r = new Receiver({ history: () => new Promise(resolve => { release = resolve; }), onMessage: p => { seen.push(p.n); } }, { e: 1, n: 1 });
+    const old = r.receive({ t: "behind", e: 1, n: 2 });
+    await settle();
+    r.receive({ t: "m", e: 1, b: 0, n: 3, m: [{ a: 0, d: "stale" }] });
+    r.cancel();
+    release({ head: { e: 1, n: 2 }, more: false, messages: [{ position: { e: 1, n: 2 }, at: 0, body: "stale" }] });
+    let rejected = false;
+    try {
+        await old;
+    }
+    catch {
+        rejected = true;
+    }
+    assert(rejected);
+    assert.deepEqual(seen, []);
+    assert.deepEqual(r.last, { e: 1, n: 1 });
+    await r.receive({ t: "m", e: 1, b: 0, n: 2, m: [{ a: 0, d: "fresh" }] });
+    assert.deepEqual(seen, [2]);
 });
