@@ -306,6 +306,7 @@ async fn release_lobby_behind(store: &Arc<dyn ObjectStore>) {
     let released = wasmkeep_cluster::node_lease::OwnerRecord {
         holder: None,
         generation: generation + 1,
+        recorded: None,
     };
     store.put(&key, released.encode().into()).await.unwrap();
 }

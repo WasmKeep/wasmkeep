@@ -44,6 +44,7 @@
   [0014](0014-draining-a-node-and-moving-an-actor.md) and
   [0017](0017-moving-one-actor.md): ownership is a node lease plus an
   ownership record per actor.
+- Amended by [ADR 0035](0035-a-recorded-head-on-hand-over.md) (2026-11-17): acknowledgement and ending share the hold cell's lock; ended holds register their frozen head locally before release, and a same-process re-acquire carries it; ownership records have a version 2 (`wasmkeep-owner 2`), gated per app by `formats/<tenant>/<app>/recorded-head` and the capability word `recorded-head`, read by every reader beside version 1.
 
 ## Context
 

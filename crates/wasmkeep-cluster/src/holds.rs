@@ -116,7 +116,7 @@ impl PendingEntry {
             AcquireError::Unresolved { generation, before } => Some(Self::Unresolved {
                 key: key.to_owned(),
                 generation: *generation,
-                before: before.clone(),
+                before: before.as_deref().cloned(),
                 until_ms: owners.unresolved_until_ms(),
             }),
             _ => None,
@@ -263,6 +263,8 @@ impl<T> Parked<T> {
                 | AcquireError::Unavailable
                 | AcquireError::LeaseInvalid
                 | AcquireError::Corrupt
+                | AcquireError::FormatMismatch
+                | AcquireError::LocalHold
                 | AcquireError::Changed,
             ) => None,
         }
@@ -388,6 +390,7 @@ mod tests {
             generation,
             version: crate::lease::Version(format!("v{generation}")),
             previous: None,
+            head: Default::default(),
         }
     }
 
@@ -510,10 +513,12 @@ mod tests {
         let nobody = |generation| OwnerRecord {
             holder: None,
             generation,
+            recorded: None,
         };
         let mine = |generation| OwnerRecord {
             holder: Some(("a".into(), "i1".into())),
             generation,
+            recorded: None,
         };
         let read = |key: &str| {
             let (body, _) = run((&mem).get(key)).unwrap().unwrap();
@@ -565,6 +570,7 @@ mod tests {
                 OwnerRecord {
                     holder: Some(("b".into(), "i2".into())),
                     generation: 4,
+                    recorded: None,
                 },
                 nobody(4),
             ),
@@ -573,6 +579,7 @@ mod tests {
                 OwnerRecord {
                     holder: Some(("b".into(), "i2".into())),
                     generation: 5,
+                    recorded: None,
                 },
             ),
         ] {

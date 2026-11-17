@@ -298,6 +298,28 @@ impl Report {
                 stuck.join(", ")
             ));
         }
+        // ADR 0035: an app whose live nodes differ on `recorded-head`
+        // cannot enable the format, and if it did, refuses service.
+        let mut by_app: std::collections::BTreeMap<&str, (Vec<&str>, Vec<&str>)> =
+            std::collections::BTreeMap::new();
+        for n in self.live() {
+            let e = by_app.entry(n.info.app.as_str()).or_default();
+            if n.info.can_recorded_head {
+                e.0.push(n.info.id.as_str());
+            } else {
+                e.1.push(n.info.id.as_str());
+            }
+        }
+        for (app, (with, without)) in by_app {
+            if !with.is_empty() && !without.is_empty() {
+                out.push(format!(
+                    "{app}: live nodes differ on the recorded-head ownership format: {} do not \
+                     support it; upgrade them before `wasmkeep app format --enable` (ADR 0035), \
+                     and if it is enabled already, the app is refused service meanwhile",
+                    without.join(", ")
+                ));
+            }
+        }
         let old = self.old_format_running();
         if !old.is_empty() {
             out.push(format!(
@@ -796,9 +818,16 @@ mod tests {
         assert!(text.contains("yes (old format)"), "{text}");
         assert!(text.contains("no (retired, old format)"), "{text}");
         let warnings = r.warnings();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // The old binary also lacks `recorded-head` beside a (current) a
+        // that announces it: both said (ADR 0035).
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            warnings[0].contains("an older WasmKeep version runs: b "),
+            warnings[0].starts_with("acme/shop: live nodes differ on the recorded-head")
+                && warnings[0].contains(": b do not support it"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("an older WasmKeep version runs: b "),
             "{warnings:?}"
         );
     }
@@ -957,7 +986,14 @@ mod tests {
                 &Value::Null
             ]
         );
-        let w = r.warnings();
+        // These hand-written heartbeats announce no capability words, so
+        // the recorded-head warning comes first (ADR 0035); the drain one
+        // is what this test checks.
+        let w: Vec<String> = r
+            .warnings()
+            .into_iter()
+            .filter(|w| !w.contains("recorded-head"))
+            .collect();
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].starts_with("draining but stuck: b "), "{}", w[0]);
         let text = r.to_text();

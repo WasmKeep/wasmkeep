@@ -18,9 +18,14 @@
 use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use wasmkeep_cluster::app_format::{self, AppFormat};
+use wasmkeep_cluster::hold_cell::{self, Late};
 pub(super) use wasmkeep_cluster::holds::PendingEntry;
 use wasmkeep_cluster::holds::{Parked, Retried, Validity};
+use wasmkeep_cluster::local_heads::{LocalHeads, Requirement};
+use wasmkeep_cluster::node_lease::OwnerRecord;
 use wasmkeep_cluster::node_lease::{AcquireError, Hold, Released};
+use wasmkeep_cluster::recorded_head::Position;
 
 use super::*;
 
@@ -110,6 +115,17 @@ pub(crate) struct Pending {
     /// Holds parked by hibernations with sockets open (ADR 0024), each
     /// with its actor's address. Locked after `holds`, never before.
     parked: Mutex<Parked<ActorAddress>>,
+    /// The heads ended holds froze, by key (ADR 0035, section 2).
+    /// Locked after `holds`, never before, and never with `entries` or
+    /// `parked` held.
+    local: Mutex<LocalHeads>,
+    /// The app's ownership format as last read, and the lease epoch it
+    /// was read in (ADR 0035, section 5): read again in each new epoch.
+    format: Mutex<Option<(u64, AppFormat)>>,
+    /// Per actor key, successive visibility refusals and until when the
+    /// next cycle waits (ADR 0035, section 3). Kept until a verified
+    /// activation or shutdown.
+    cooldowns: Mutex<HashMap<String, (u32, tokio::time::Instant)>>,
 }
 
 /// Records the parked set's size moving from `before` to `after` in the
@@ -177,6 +193,88 @@ impl Pending {
             .is_empty()
     }
 
+    fn local(&self) -> std::sync::MutexGuard<'_, LocalHeads> {
+        self.local.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The preparation of an acquisition of `key` at `attempted` (ADR
+    /// 0035, section 2), after its authoritative read found `record`:
+    /// refused while a live hold of the actor remains here (it is ending:
+    /// its frozen head is not registered yet); otherwise the local
+    /// evidence, retired if the record proves a remote successor, and
+    /// reserved until the acquisition finishes.
+    fn prepare(
+        &self,
+        key: &str,
+        record: Option<&OwnerRecord>,
+        attempted: u64,
+        node: &str,
+        instance: &str,
+    ) -> Result<Option<(Requirement, u64)>, AcquireError> {
+        let holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        if holds
+            .get(key)
+            .is_some_and(|c| c.lock().unwrap_or_else(|p| p.into_inner()).is_some())
+        {
+            return Err(AcquireError::LocalHold);
+        }
+        let mut local = self.local();
+        // With the generation of the hold that froze it: `Owners` combines
+        // it with the record's own by lineage.
+        Ok(local
+            .prepare(key, record, attempted, node, instance)
+            .zip(local.get(key).map(|e| e.generation)))
+    }
+
+    /// Whether `key` is cooling down after visibility refusals (ADR 0035,
+    /// section 3): how long until its next cycle may start.
+    pub(crate) fn cooldown(&self, key: &str) -> Option<Duration> {
+        let cooldowns = self.cooldowns.lock().unwrap_or_else(|p| p.into_inner());
+        let (_, until) = cooldowns.get(key)?;
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// A visibility refusal of `key`: the next cycle waits 1, 2, 4, 8, 16,
+    /// then 30 s, with up to 20 percent more.
+    pub(crate) fn refused(&self, key: &str) {
+        const STEPS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+        let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = cooldowns
+            .entry(key.to_owned())
+            .or_insert((0, tokio::time::Instant::now()));
+        let step = STEPS[usize::try_from(entry.0)
+            .unwrap_or(usize::MAX)
+            .min(STEPS.len() - 1)];
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = tokio::time::Instant::now() + crate::replica::jittered(Duration::from_secs(step));
+    }
+
+    /// A verified activation of `key`: its cooldown ends.
+    pub(crate) fn clear_cooldown(&self, key: &str) {
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key);
+    }
+
+    /// A release of `hold` landed: its frozen head's entry ends, once no
+    /// acquisition that read it is unfinished.
+    fn release_landed(&self, hold: &Hold) {
+        self.local().released(&hold.key, hold.generation);
+    }
+
+    /// An acquisition of `key` that prepared finished without a hold.
+    fn acquisition_finished(&self, key: &str) {
+        self.local().finished(key);
+    }
+
+    /// The local evidence of `key` (tests).
+    #[cfg(test)]
+    pub(crate) fn local_head(&self, key: &str) -> Option<Requirement> {
+        self.local().get(key).map(|e| e.requirement)
+    }
+
     fn parked(&self) -> std::sync::MutexGuard<'_, Parked<ActorAddress>> {
         self.parked.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -195,7 +293,10 @@ impl Pending {
         valid: impl Fn() -> bool,
     ) -> Option<Hold> {
         let mut holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
-        let hold = cell.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let hold = hold_cell::end(cell);
+        if let Some(hold) = &hold {
+            self.local().register(hold);
+        }
         if holds.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
             holds.remove(key);
         }
@@ -268,11 +369,42 @@ impl Pending {
             .insert(key.to_owned(), Arc::clone(cell));
     }
 
-    fn unregister(&self, key: &str, cell: &Cell) {
+    /// Freezes `cell` and removes it from the live set in one step under
+    /// the live set's lock (the order [`Self::end_all`] and [`Self::park`]
+    /// use): the hold, its head frozen, if it was still there.
+    fn take_out(&self, key: &str, cell: &Cell) -> Option<Hold> {
         let mut holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        let hold = hold_cell::end(cell);
+        if let Some(hold) = &hold {
+            self.local().register(hold);
+        }
         if holds.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
             holds.remove(key);
         }
+        hold
+    }
+
+    /// The heads of `key`'s pending releases and parked hold, as frozen
+    /// when each ended (tests of ADR 0035, section 2).
+    #[cfg(test)]
+    pub(crate) fn frozen_heads(&self, key: &str) -> Vec<Option<Position>> {
+        let mut heads: Vec<Option<Position>> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|e| match e {
+                PendingEntry::Release(hold) if hold.key == key => Some(hold.head.acknowledged),
+                _ => None,
+            })
+            .collect();
+        heads.extend(
+            self.parked()
+                .iter()
+                .filter(|(hold, _)| hold.key == key)
+                .map(|(hold, _)| hold.head.acknowledged),
+        );
+        heads
     }
 
     /// Whether this node holds the actor whose record is `key`.
@@ -287,25 +419,25 @@ impl Pending {
     /// Ends every hold at once: each becomes a pending release if
     /// `release`, and is dropped otherwise (a lost lease: the fence or the
     /// other process frees the records; a clean stop: `released` does).
+    ///
+    /// Each cell is frozen (its hold, acknowledged head included, taken out
+    /// under the cell's lock, ADR 0035 section 2) and its release queued
+    /// while the live set's lock is still held: a hold is never out of the
+    /// live set before it is frozen and in the pending set. Lock order: the
+    /// live set, then a cell, then the pending set; an acknowledgement
+    /// takes only its cell.
     pub(super) fn end_all(&self, release: bool) {
-        let cells: Vec<Cell> = self
-            .holds
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .drain()
-            .map(|(_, c)| c)
-            .collect();
-        for cell in cells {
-            let hold = cell.lock().unwrap_or_else(|p| p.into_inner()).take();
-            if let Some(hold) = hold
-                && release
-            {
-                self.push(PendingEntry::Release(hold));
+        let mut holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, cell) in holds.drain() {
+            if let Some(hold) = hold_cell::end(&cell) {
+                self.local().register(&hold);
+                if release {
+                    self.push(PendingEntry::Release(hold));
+                }
             }
         }
         // Parked records too (ADR 0024, section 3), under the live set's
         // lock as parking takes it: a park cannot land after this.
-        let holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
         let parked = {
             let mut parked = self.parked();
             let before = parked.len();
@@ -466,21 +598,42 @@ impl LeaseHold {
         if let Some(why) = cluster.app_refusal() {
             return Err(OwnershipError::Refused(why.into()));
         }
+        cluster.format_gate(epoch).await?;
+        if let Some(left) = cluster.pending.cooldown(&key) {
+            return Err(OwnershipError::Unavailable(format!(
+                "the actor's recorded head was not visible in the bucket; retry in {} s",
+                left.as_secs().max(1)
+            )));
+        }
+        // ADR 0035, section 2: after the authoritative read, before the
+        // write, this process's local evidence goes into the attempt.
+        let mut prepared = false;
+        let prepare = |record: Option<&OwnerRecord>, attempted: u64| {
+            prepared = true;
+            cluster.pending.prepare(
+                &key,
+                record,
+                attempted,
+                cluster.owners.node(),
+                cluster.owners.instance(),
+            )
+        };
         let acquired = match listed {
             None => {
                 cluster
                     .owners
-                    .acquire(
+                    .acquire_prepared(
                         &key,
                         || cluster.validity.valid_in(epoch),
                         async || cluster.seed_generation(address).await,
+                        prepare,
                     )
                     .await
             }
             Some(listed) => {
                 cluster
                     .owners
-                    .acquire_unchanged(
+                    .acquire_unchanged_prepared(
                         &key,
                         |v| {
                             let read = v.0.split('\n').next().unwrap_or_default();
@@ -488,10 +641,17 @@ impl LeaseHold {
                                 == wasmkeep_cluster::expiry::etag(listed)
                         },
                         || cluster.validity.valid_in(epoch),
+                        prepare,
                     )
                     .await
             }
         };
+        // A prepared acquisition's reservation ends now unless a hold
+        // inherits it (below) or its write is unresolved (the resolver
+        // ends it).
+        if prepared && !matches!(acquired, Ok(_) | Err(AcquireError::Unresolved { .. })) {
+            cluster.pending.acquisition_finished(&key);
+        }
         // A parked hold of this actor (ADR 0024): dropped if this write may
         // have moved the record.
         if cluster.pending.after_wake(&key, &acquired) && acquired.is_ok() {
@@ -503,8 +663,11 @@ impl LeaseHold {
                     crate::metrics::inc(&crate::metrics::METRICS.failovers);
                     tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), from = %previous, generation = hold.generation, "took over an actor whose node stopped");
                 }
+                let generation = hold.generation;
                 let cell = Arc::new(Mutex::new(Some(hold)));
                 cluster.pending.register(&key, &cell);
+                // The new hold carries the local evidence now.
+                cluster.pending.local().transferred(&key, generation);
                 Ok(Self {
                     cell,
                     epoch,
@@ -530,6 +693,25 @@ impl LeaseHold {
             Err(AcquireError::Corrupt) => Err(OwnershipError::Broken(
                 "the ownership record or a node lease is unreadable".into(),
             )),
+            // ADR 0035, section 5: a record in the recorded-head format on
+            // an app this node does not write it for. Never overwritten.
+            Err(AcquireError::LocalHold) => Err(OwnershipError::Unavailable(
+                "this node is still ending its previous hold of the actor; retry".into(),
+            )),
+            Err(AcquireError::FormatMismatch) => {
+                // The setting may have been enabled since it was read:
+                // read again before the next acquisition.
+                *cluster
+                    .pending
+                    .format
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                Err(OwnershipError::Unavailable(
+                    "the ownership record is in the recorded-head format (wasmkeep-owner 2), \
+                     which this node had not seen the app enable: reading the setting again"
+                        .into(),
+                ))
+            }
             Err(AcquireError::Unavailable) => Err(OwnershipError::Unavailable(
                 "the bucket did not answer".into(),
             )),
@@ -634,10 +816,10 @@ impl LeaseHold {
 
     /// Takes the hold out: this node stops acting as owner before any
     /// release is sent.
+    /// The hold comes out with its acknowledged head frozen (ADR 0035,
+    /// section 2), under the live set's lock, then the cell's.
     fn take(&self) -> Option<Hold> {
-        let hold = self.cell.lock().unwrap_or_else(|p| p.into_inner()).take();
-        self.cluster.pending.unregister(&self.key, &self.cell);
-        hold
+        self.cluster.pending.take_out(&self.key, &self.cell)
     }
 }
 
@@ -732,7 +914,10 @@ impl LeaseHold {
                 cluster.released_after_lapse(&hold.key);
             }
             match sent {
-                Released::Released => return LeaseReturn::Released,
+                Released::Released => {
+                    cluster.pending.release_landed(&hold);
+                    return LeaseReturn::Released;
+                }
                 Released::Superseded => return LeaseReturn::Superseded,
                 Released::Pending | Released::Unchanged
                     if tokio::time::Instant::now() >= deadline =>
@@ -750,6 +935,95 @@ impl LeaseHold {
 }
 
 impl Cluster {
+    /// The app's ownership-format setting (ADR 0035, section 5), read
+    /// once per lease epoch (so again after a lapse), before any
+    /// acquisition. Absent: version 1, as before. Enabled: version 2
+    /// records, and the acquirer gate. Unreadable: refused. Unanswered:
+    /// retry.
+    async fn format_gate(&self, epoch: u64) -> Result<(), OwnershipError> {
+        let cached = *self
+            .pending
+            .format
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let format = match cached {
+            Some((e, format)) if e == epoch => format,
+            _ => {
+                let key = StorePath::from(app_format::key_of(&self.root));
+                let read = tokio::time::timeout(self.lease_attempt, async {
+                    match self.store.get(&key).await {
+                        Ok(got) => got.bytes().await.map(Some),
+                        Err(object_store::Error::NotFound { .. }) => Ok(None),
+                        Err(e) => Err(e),
+                    }
+                })
+                .await;
+                let body = match read {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(e)) => {
+                        return Err(OwnershipError::Unavailable(format!(
+                            "reading the app's ownership-format setting: {e}"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(OwnershipError::Unavailable(
+                            "reading the app's ownership-format setting: no answer".into(),
+                        ));
+                    }
+                };
+                let format = app_format::decode(body.as_deref())
+                    .map_err(|e| OwnershipError::Broken(e.to_string()))?;
+                if format == AppFormat::RecordedHead {
+                    self.recorded_head_peers().await?;
+                }
+                *self
+                    .pending
+                    .format
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some((epoch, format));
+                format
+            }
+        };
+        // Enabled: acquisitions and releases write version 2, and every
+        // activation proves the recorded floor (ADR 0035, sections 1-3).
+        self.owners
+            .set_recorded_head(format == AppFormat::RecordedHead);
+        Ok(())
+    }
+
+    /// An app that enabled the recorded-head format is served only while
+    /// every live node of it announces `recorded-head` (ADR 0035, section
+    /// 5): one that does not (an older binary started by mistake) would
+    /// neither write version 2 nor prove the floor. Refused until it stops:
+    /// the operator's to fix, never bypassed.
+    async fn recorded_head_peers(&self) -> Result<(), OwnershipError> {
+        let nodes = tokio::time::timeout(
+            self.lease_attempt,
+            wasmkeep_cluster::membership::all_heartbeats(&self.control_keys),
+        )
+        .await;
+        let Ok(Ok(nodes)) = nodes else {
+            return Err(OwnershipError::Unavailable(
+                "listing the app's nodes for their capabilities: no answer".into(),
+            ));
+        };
+        let served = format!("{}/{}", self.root.tenant(), self.root.app());
+        let old = wasmkeep_cluster::membership::without_recorded_head(
+            &nodes,
+            &served,
+            now_ms(),
+            self.heartbeat_horizon_ms,
+        );
+        if old.is_empty() {
+            return Ok(());
+        }
+        Err(OwnershipError::Refused(format!(
+            "the app enabled the recorded-head ownership format, but live nodes of it do not \
+             support it ({}): stop or upgrade them",
+            old.join(", ")
+        )))
+    }
+
     /// The ownership record of an actor (ADR 0020). The name is encoded
     /// like the database file name, so any actor name is a safe key.
     pub(crate) fn owner_key(&self, address: &ActorAddress) -> String {
@@ -826,6 +1100,9 @@ impl Cluster {
             .unwrap_or(Released::Pending);
         if invalid && sent == Released::Released {
             self.released_after_lapse(&hold.key);
+        }
+        if sent == Released::Released {
+            self.pending.release_landed(hold);
         }
         sent
     }
@@ -1089,8 +1366,24 @@ impl Cluster {
                     return Tried::Refused;
                 }
                 let retried = match entry {
-                    entry @ PendingEntry::Release(_) => {
-                        self.retry_bounded(entry, |_, _| false).await
+                    // As `holds::retry` does, keeping apart a release that
+                    // landed (its frozen head's entry ends) from one
+                    // superseded (it stays, ADR 0035 section 2).
+                    PendingEntry::Release(hold) => {
+                        let sent =
+                            tokio::time::timeout(self.lease_attempt, self.owners.release(&hold))
+                                .await
+                                .unwrap_or(Released::Pending);
+                        match sent {
+                            Released::Released => {
+                                self.pending.release_landed(&hold);
+                                Retried::Ended
+                            }
+                            Released::Superseded => Retried::Ended,
+                            Released::Pending | Released::Unchanged => {
+                                Retried::Pending(PendingEntry::Release(hold))
+                            }
+                        }
                     }
                     entry @ PendingEntry::Unresolved { .. } => {
                         let lock = self.pending.lock_of(entry.key());
@@ -1107,6 +1400,7 @@ impl Cluster {
                             })
                             .await;
                         if retried == Retried::Ended {
+                            self.pending.acquisition_finished(&key);
                             self.forget_parked_behind(&key, tried).await;
                         }
                         retried
@@ -1191,6 +1485,11 @@ impl LeaseView {
                 generation,
                 version: wasmkeep_cluster::lease::Version(String::new()),
                 previous: None,
+                // Verified at the explicit pre-history position.
+                head: wasmkeep_cluster::hold_cell::HoldHead {
+                    acknowledged: Some(wasmkeep_cluster::recorded_head::Position::Empty),
+                    ..Default::default()
+                },
             }))),
             epoch: 0,
             validity: Arc::new(validity),
@@ -1204,6 +1503,58 @@ impl LeaseView {
         let view = Self::always_valid(generation);
         let validity = Arc::clone(&view.validity);
         (view, validity)
+    }
+
+    /// The acknowledgement critical section (ADR 0035, section 2): under
+    /// the hold cell's lock, the hold must still be here and valid in its
+    /// epoch; then `advance`, if given, becomes its acknowledged head.
+    /// `None` only checks (a periodic snapshot, the snapshot after a
+    /// reset). Refused: [`ReplicaError::Late`](crate::replica::ReplicaError).
+    pub(crate) fn acknowledge(&self, advance: Option<Position>) -> Result<(), Late> {
+        let (validity, epoch) = (&self.validity, self.epoch);
+        hold_cell::acknowledge(&self.cell, || validity.valid_in(epoch), advance)
+    }
+
+    /// After a successful restore: the verified head, set under the cell's
+    /// lock and validity check before activation.
+    pub(crate) fn verify(&self, position: Position) -> Result<(), Late> {
+        let (validity, epoch) = (&self.validity, self.epoch);
+        hold_cell::verify(&self.cell, || validity.valid_in(epoch), position)
+    }
+
+    /// The hold's acknowledged head while it lives (`None`: ended, or not
+    /// verified yet). Tests.
+    #[cfg(test)]
+    pub(crate) fn acknowledged_head(&self) -> Option<Position> {
+        self.cell
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|h| h.head.acknowledged)
+    }
+
+    /// What the hold's restore must reach before activation (ADR 0035,
+    /// section 3): its inherited requirement, in an app that writes the
+    /// recorded-head format (`None` otherwise), and its record's key.
+    pub(crate) fn floor(&self) -> (Option<Requirement>, Option<String>) {
+        let cell = self.cell.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(hold) = cell.as_ref() else {
+            return (None, None);
+        };
+        (
+            hold.head.inherited.filter(|_| hold.head.recorded),
+            Some(hold.key.clone()),
+        )
+    }
+
+    /// The requirement the hold inherited at acquisition (tests).
+    #[cfg(test)]
+    pub(crate) fn inherited(&self) -> Option<wasmkeep_cluster::local_heads::Requirement> {
+        self.cell
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|h| h.head.inherited)
     }
 
     /// Whether this node may still act as the owner: the hold exists here

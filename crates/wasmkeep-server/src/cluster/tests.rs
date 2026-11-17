@@ -94,6 +94,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         instance: None,
         lease: None,
         load: None,
+        can_recorded_head: false,
     };
     let nodes = [
         n("me", "acme/shop"),
@@ -2109,6 +2110,7 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         OwnerRecord {
             holder: holder.map(|i| ("a".to_owned(), i.to_owned())),
             generation,
+            recorded: None,
         }
         .encode()
     };
@@ -2139,6 +2141,7 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         before: Some(OwnerRecord {
             holder: None,
             generation: 4,
+            recorded: None,
         }),
         until_ms: now_ms() + 30_000,
     });
@@ -2148,7 +2151,8 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         read(&key).await,
         OwnerRecord {
             holder: None,
-            generation: 5
+            generation: 5,
+            recorded: None,
         }
     );
     assert!(a.nothing_pending());
@@ -2162,6 +2166,7 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         before: Some(OwnerRecord {
             holder: None,
             generation: 5,
+            recorded: None,
         }),
         until_ms: now_ms() + 30_000,
     });
@@ -2172,7 +2177,8 @@ async fn the_resolver_releases_a_landed_acquire_but_never_a_live_hold() {
         read(&key).await,
         OwnerRecord {
             holder: Some(("a".to_owned(), instance.clone())),
-            generation: 6
+            generation: 6,
+            recorded: None,
         }
     );
     assert!(hold.is_valid());
@@ -2210,6 +2216,7 @@ async fn the_resolver_waits_for_a_write_that_lands_late() {
     let nobody = |generation| OwnerRecord {
         holder: None,
         generation,
+        recorded: None,
     };
     let key = a.owner_key(&ActorAddress::new("t", "c", "late").unwrap());
     put(&key, nobody(4)).await;
@@ -2231,6 +2238,7 @@ async fn the_resolver_waits_for_a_write_that_lands_late() {
         OwnerRecord {
             holder: Some(("a".to_owned(), instance.clone())),
             generation: 5,
+            recorded: None,
         },
     )
     .await;
@@ -2728,6 +2736,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         instance: Some("iz".into()),
         lease: Some(wasmkeep_cluster::node_lease::NodeState::Live),
         load: None,
+        can_recorded_head: false,
     };
     a.note_future_leases(&[lease(now_ms())]);
     assert!(!logged(), "a lease within the skew reported");
@@ -2846,6 +2855,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         instance: Some("0011223344556677".to_owned()),
         lease: Some(state),
         load: None,
+        can_recorded_head: false,
     }
 }
 
@@ -3230,6 +3240,7 @@ async fn a_landed_unresolved_wake_supersedes_the_parked_hold() {
     let woken = OwnerRecord {
         holder: Some(("a".to_owned(), instance)),
         generation: parked_at + 1,
+        recorded: None,
     };
     store
         .put(&StorePath::from(key.as_str()), woken.encode().into())
@@ -3246,7 +3257,8 @@ async fn a_landed_unresolved_wake_supersedes_the_parked_hold() {
         owner_record(&store, &key).await,
         OwnerRecord {
             holder: None,
-            generation: parked_at + 1
+            generation: parked_at + 1,
+            recorded: None,
         }
     );
     assert!(!a.is_parked(&x), "the superseded parked hold was kept");
@@ -3412,5 +3424,800 @@ async fn many_releases_in_one_lapse_are_each_counted_and_logged_once() {
     assert!(
         !a.invalid_releases.count(),
         "a sixth would be logged again before the lease is valid"
+    );
+}
+
+/// ADR 0035, section 2, on a real hold: the hold cell's acknowledged head
+/// is verified by `Replica::restore`, advanced by a first snapshot, a
+/// strict segment and a reset (with the database checksum after each),
+/// never by a periodic snapshot, and frozen into the pending release a
+/// lapse leaves and the parked hold a hibernation leaves. A restore from
+/// that history into an empty directory verifies the same head and
+/// checksum; a lapse before the verification makes the restore late.
+#[tokio::test]
+async fn a_real_hold_carries_its_acknowledged_head_into_every_ending() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::recorded_head::Position;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let first_dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(first_dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let view = hold.view();
+    assert_eq!(view.acknowledged_head(), Some(Position::Empty));
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    let all = db.snapshot().unwrap();
+    assert!(
+        replica
+            .ship_snapshot(&all, SnapshotKind::First)
+            .await
+            .unwrap()
+    );
+    assert_eq!(view.acknowledged_head(), Some(replica.verified_head()));
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    let changes = db.take_changes().unwrap().unwrap();
+    replica.ship(&changes).await.unwrap();
+    let segment = replica.verified_head();
+    assert!(
+        matches!(segment, Position::Known { txid: 2, .. }),
+        "{segment:?}"
+    );
+    assert_eq!(view.acknowledged_head(), Some(segment));
+    // A periodic snapshot at the head checks; it never advances.
+    let at_head = db.snapshot().unwrap();
+    replica
+        .ship_snapshot(&at_head, SnapshotKind::Periodic)
+        .await
+        .unwrap();
+    assert_eq!(view.acknowledged_head(), Some(segment));
+    // A reset (after `delete-self`) is a new position.
+    db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+    let _ = db.take_changes().unwrap();
+    replica.ship_reset(db.snapshot().unwrap()).await.unwrap();
+    let reset = replica.verified_head();
+    assert_ne!(reset, segment);
+    assert_eq!(view.acknowledged_head(), Some(reset));
+    drop(db);
+
+    // A lapse ends the hold into a pending release that carries it.
+    a.pending.end_all(true);
+    assert_eq!(a.pending.frozen_heads(&key), vec![Some(reset)]);
+    assert_eq!(view.acknowledged_head(), None, "ended");
+    drop((hold, replica));
+    assert!(a.releases_done(Duration::from_secs(5)).await);
+
+    // Restored from that history into an empty directory: the same head
+    // and checksum, verified into the new hold's cell.
+    let second_dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(second_dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let restored = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.verified_head(), reset);
+    assert_eq!(hold.view().acknowledged_head(), Some(reset));
+    // A hibernation with sockets open parks it, head and all.
+    drop(restored);
+    hold.park(&x);
+    assert_eq!(a.pending.frozen_heads(&key), vec![Some(reset)]);
+    a.release_all_parked("stop").await;
+
+    // A lapse between the restore and its verification: late (answered
+    // 503 by `ActorState::ensure_owner_with`).
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let view = hold.view();
+    let generation = hold.generation().unwrap();
+    a.validity.invalidate();
+    let third_dir = tempfile::tempdir().unwrap();
+    let late = Replica::restore(
+        &a,
+        &x,
+        view,
+        generation,
+        storage_in(third_dir.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(matches!(late, Err(ReplicaError::Late)), "{:?}", late.err());
+}
+
+/// ADR 0035, section 2, simulation case 2 on the real code: a same-process
+/// re-acquire while the old hold's release is queued (dropped, its task
+/// not run yet), pending (a lapse ended it), or the hold parked, with the
+/// record still naming the old hold, inherits the head it froze.
+#[tokio::test]
+async fn a_re_acquire_inherits_the_head_its_predecessor_froze() {
+    use crate::replica::{Replica, SnapshotKind};
+    use wasmkeep_cluster::recorded_head::Completeness;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(
+        StorageConfig::new(dir.path()),
+        crate::state_dir(&StateRoot::new("", "t", "default")),
+    );
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let generation = hold.generation().unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        generation,
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    let all = db.snapshot().unwrap();
+    replica
+        .ship_snapshot(&all, SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    drop((db, replica));
+
+    let inherited = |hold: &LeaseHold| hold.view().inherited();
+    // Queued: dropped, its release task not run yet.
+    drop(hold);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let carried = inherited(&hold).expect("the queued release's head is carried");
+    assert_eq!(carried.head, h);
+    assert_eq!(
+        carried.set_at, generation,
+        "stamped with the hold that froze it"
+    );
+    assert_eq!(carried.completeness, Completeness::Complete);
+    // Pending: a lapse ended it into a pending release; never verified,
+    // the new hold re-freezes what it inherited, stamp unchanged.
+    a.pending.end_all(true);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let again = inherited(&hold).expect("the pending release's head is carried");
+    assert_eq!(again, carried);
+    // Parked, then woken.
+    hold.park(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(inherited(&hold), Some(carried));
+    assert_eq!(a.pending.local_head(&key), None, "transferred to the hold");
+    drop(hold);
+    assert!(a.releases_done(Duration::from_secs(5)).await);
+    // Its release landed: the entry ends (the record would carry it once
+    // releases write the recorded head).
+    assert_eq!(a.pending.local_head(&key), None);
+}
+
+/// ADR 0035, section 5: the app's format setting. Unreadable, it fails
+/// closed without writing a record; absent, records are version 1;
+/// enabled, version 2 (an acquisition over nothing carries no evidence).
+#[tokio::test]
+async fn the_app_format_setting_decides_the_record_version() {
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::recorded_head::RecordedHead;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let record = StorePath::from(a.owner_key(&x));
+    let setting = StorePath::from(app_format::key("", "t", "default"));
+    store
+        .put(&setting, b"wasmkeep-recorded-head 9\n".to_vec().into())
+        .await
+        .unwrap();
+    a.validity.bump_epoch();
+    let got = LeaseHold::acquire(&a, &x).await;
+    assert!(
+        matches!(&got, Err(OwnershipError::Broken(why)) if why.contains("setting")),
+        "{:?}",
+        got.as_ref().map(|_| ())
+    );
+    assert!(matches!(
+        store.head(&record).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    // Absent: version 1.
+    store.delete(&setting).await.unwrap();
+    a.validity.bump_epoch();
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(owner_record(&store, &a.owner_key(&x)).await.recorded, None);
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // Enabled: the v1 record is converted, with no evidence.
+    store
+        .put(&setting, app_format::ENABLED_BODY.to_vec().into())
+        .await
+        .unwrap();
+    a.validity.bump_epoch();
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(
+        owner_record(&store, &a.owner_key(&x)).await.recorded,
+        Some(RecordedHead::UNKNOWN)
+    );
+    drop(hold);
+}
+
+/// A bucket whose listings leave out history keys written while `lag` is
+/// on (a LIST that lags its PUTs), until `reveal`.
+#[derive(Debug)]
+struct LaggingList {
+    inner: Arc<dyn ObjectStore>,
+    lag: std::sync::atomic::AtomicBool,
+    hidden: Mutex<std::collections::BTreeSet<String>>,
+    lists: std::sync::atomic::AtomicU64,
+}
+
+impl LaggingList {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            lag: std::sync::atomic::AtomicBool::new(false),
+            hidden: Mutex::default(),
+            lists: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn reveal(&self) {
+        self.hidden.lock().unwrap().clear();
+    }
+}
+
+impl std::fmt::Display for LaggingList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LaggingList")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for LaggingList {
+    async fn put_opts(
+        &self,
+        location: &StorePath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self.lag.load(std::sync::atomic::Ordering::SeqCst)
+            && location.as_ref().contains("/actors/")
+        {
+            self.hidden
+                .lock()
+                .unwrap()
+                .insert(location.as_ref().to_owned());
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &StorePath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &StorePath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<'static, object_store::Result<StorePath>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<StorePath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        use futures_util::StreamExt as _;
+        if prefix.is_some_and(|p| p.as_ref().contains("/actors/")) {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let hidden = self.hidden.lock().unwrap().clone();
+        self.inner
+            .list(prefix)
+            .filter(move |m| {
+                let keep = m
+                    .as_ref()
+                    .map_or(true, |m| !hidden.contains(m.location.as_ref()));
+                std::future::ready(keep)
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &StorePath,
+        to: &StorePath,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// ADR 0035, sections 1 and 3, the bug itself: with the recorded-head
+/// format enabled, a release records its head in a version 2 record; a
+/// node whose listing still hides that history refuses to activate (503,
+/// after the bounded re-list) instead of restoring an older head, and
+/// activates once the history is visible.
+#[tokio::test]
+async fn a_lagging_listing_cannot_hide_a_recorded_head() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::recorded_head::{Completeness, Position};
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let lagging = LaggingList::new();
+    let store: Arc<dyn ObjectStore> = Arc::clone(&lagging) as Arc<dyn ObjectStore>;
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    let b = fast_node("b", &store);
+    for n in [&a, &b] {
+        n.identity().await.unwrap();
+        wait_lease_valid(n).await;
+    }
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let a_dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(a_dir.path());
+    // a writes a first snapshot (visible), then a segment the listing
+    // hides, and releases.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let generation = hold.generation().unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        generation,
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    let all = db.snapshot().unwrap();
+    replica
+        .ship_snapshot(&all, SnapshotKind::First)
+        .await
+        .unwrap();
+    lagging.lag.store(true, std::sync::atomic::Ordering::SeqCst);
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    let record = owner_record(&store, &key).await;
+    let recorded = record.recorded.expect("a version 2 record");
+    assert_eq!(recorded.head, h);
+    assert_eq!(recorded.set_at, generation);
+    assert_eq!(recorded.completeness, Completeness::Complete);
+
+    // b's listing misses the segment: no activation from the older head.
+    let b_dir = tempfile::tempdir().unwrap();
+    let hold = LeaseHold::acquire(&b, &x).await.unwrap();
+    let floor = hold.view().inherited().expect("the record's floor");
+    assert_eq!(floor.head, h);
+    let lists = lagging.lists.load(std::sync::atomic::Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let refused = Replica::restore(
+        &b,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(b_dir.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ReplicaError::Visibility(_))),
+        "{:?}",
+        refused.err()
+    );
+    let listed = lagging.lists.load(std::sync::atomic::Ordering::SeqCst) - lists;
+    assert!((2..=10).contains(&listed), "{listed} listings");
+    assert!(started.elapsed() < Duration::from_secs(16));
+    // Given up, the floor intact in the record.
+    drop(hold);
+    assert!(b.releases_done(Duration::from_secs(5)).await);
+    let after = owner_record(&store, &key).await;
+    assert_eq!(after.recorded.map(|r| r.head), Some(h));
+    assert!(matches!(h, Position::Known { .. }));
+
+    // Visible now: b activates at H.
+    lagging.reveal();
+    b.pending.clear_cooldown(&key);
+    let hold = LeaseHold::acquire(&b, &x).await.unwrap();
+    let restored = Replica::restore(
+        &b,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(b_dir.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.verified_head(), h);
+}
+
+/// ADR 0035, section 6 (simulation case 13 on the real code): a
+/// replacement (`actor restore` writes past content as a reset at the
+/// live head's txid + 1, as does `delete-self`) is what the release
+/// records, never the historical source position; a listing that hides
+/// the replacement refuses activation rather than serve the older state.
+#[tokio::test]
+async fn a_replacement_is_the_recorded_head() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::recorded_head::Position;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let lagging = LaggingList::new();
+    let store: Arc<dyn ObjectStore> = Arc::clone(&lagging) as Arc<dyn ObjectStore>;
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let source = replica.verified_head();
+    db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    // The replacement, hidden from listings: past content as a new write.
+    lagging.lag.store(true, std::sync::atomic::Ordering::SeqCst);
+    db.exec("DELETE FROM t WHERE v = 2", &[]).unwrap();
+    let _ = db.take_changes().unwrap();
+    replica.ship_reset(db.snapshot().unwrap()).await.unwrap();
+    let replaced = replica.verified_head();
+    assert!(
+        matches!((source, replaced), (Position::Known { txid: s, .. }, Position::Known { txid: r, .. }) if r == s + 2),
+        "{source:?} then {replaced:?}"
+    );
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    assert_eq!(
+        owner_record(&store, &key).await.recorded.map(|r| r.head),
+        Some(replaced)
+    );
+    // A listing without the replacement shows the pre-replacement head:
+    // refused, not activated.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let refused = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(other.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ReplicaError::Visibility(_))),
+        "{:?}",
+        refused.err()
+    );
+}
+
+/// ADR 0035, section 5 (part of simulation case 11 on the real code): an
+/// app that enabled the recorded-head format is not served while a live
+/// node of it does not announce `recorded-head` (an older binary started
+/// by mistake); served again once that node is gone. Nothing is written
+/// meanwhile.
+#[tokio::test]
+async fn an_enabled_app_refuses_service_beside_an_incapable_peer() {
+    use wasmkeep_cluster::app_format;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let old = StorePath::from("nodes/old");
+    let body = format!(
+        "wasmkeep-node 3\nlive beef\n{}\nold\nhttp://old\n0.4.2\nt/default\n\n\nserving\n\ntake front\n",
+        now_ms()
+    );
+    store.put(&old, body.into_bytes().into()).await.unwrap();
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    a.validity.bump_epoch();
+    let got = LeaseHold::acquire(&a, &x).await;
+    assert!(
+        matches!(&got, Err(OwnershipError::Refused(why)) if why.contains("old")),
+        "{:?}",
+        got.as_ref().map(|_| ())
+    );
+    assert!(matches!(
+        store.head(&StorePath::from(a.owner_key(&x))).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    store.delete(&old).await.unwrap();
+    a.validity.bump_epoch();
+    LeaseHold::acquire(&a, &x).await.unwrap();
+}
+
+/// ADR 0035, section 3, simulation case 5 on the real code: liveness after
+/// collection on a strongly consistent bucket. A releases H (stamped g1);
+/// B inherits it, verifies, writes, snapshots at P and collects every
+/// object below P, H's included, then crashes (its record held, a lower
+/// bound H stamped g1). A fresh node must activate from P: P's generation
+/// is above the stamp, so it proves H though H's object is gone.
+#[tokio::test]
+async fn a_floor_collected_away_is_proven_by_a_later_generation() {
+    use crate::replica::{Replica, SnapshotKind};
+    use futures_util::StreamExt as _;
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::node_lease::OwnerRecord;
+    use wasmkeep_cluster::recorded_head::Completeness;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let mut db = storage.open("c", "x").unwrap();
+    // g1: H.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let g1 = hold.generation().unwrap();
+    let mut replica = Replica::restore(&a, &x, hold.view(), g1, storage.db_path("c", "x"), 1 << 30)
+        .await
+        .unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // g2: B writes on, snapshots at P, collects below it.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let g2 = hold.generation().unwrap();
+    let floor = hold.view().inherited().unwrap();
+    assert_eq!(floor.set_at, g1);
+    let mut replica = Replica::restore(&a, &x, hold.view(), g2, storage.db_path("c", "x"), 1 << 30)
+        .await
+        .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.start_capture().unwrap();
+    for v in 2..5 {
+        db.exec(&format!("INSERT INTO t VALUES ({v})"), &[])
+            .unwrap();
+        replica
+            .ship(&db.take_changes().unwrap().unwrap())
+            .await
+            .unwrap();
+    }
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::Periodic)
+        .await
+        .unwrap();
+    let p = replica.head();
+    let history = StorePath::from(format!("{}/", a.history_key(&x)));
+    let listed: Vec<_> = store.list(Some(&history)).collect().await;
+    let snapshot_p = format!("{:016x}-{:016x}.ltx", p.txid, p.generation);
+    for meta in listed.into_iter().map(Result::unwrap) {
+        if !meta.location.as_ref().ends_with(&snapshot_p) {
+            store.delete(&meta.location).await.unwrap();
+        }
+    }
+    drop((db, replica));
+    // B crashes: its record stays held, a lower bound H stamped g1, and its
+    // node is gone (this test forgets the hold and frees the record as a
+    // fence would).
+    std::mem::forget(hold);
+    let crashed = OwnerRecord {
+        holder: Some(("gone".into(), "dead".into())),
+        generation: g2,
+        recorded: Some(wasmkeep_cluster::local_heads::Requirement::stored(
+            Some(floor),
+            true,
+            None,
+        )),
+    };
+    assert_eq!(
+        crashed.recorded.unwrap().completeness,
+        Completeness::LowerBound
+    );
+    store
+        .put(&StorePath::from(key.clone()), crashed.encode().into())
+        .await
+        .unwrap();
+    let fenced = wasmkeep_cluster::node_lease::NodeLeaseObject {
+        state: wasmkeep_cluster::node_lease::NodeState::Fenced,
+        instance: Some("dead".into()),
+        written_at_ms: 0,
+    };
+    store
+        .put(&StorePath::from("nodes/gone"), fenced.encode().into())
+        .await
+        .unwrap();
+    // A fresh node, no local evidence: it activates from P.
+    let c = fast_node("c", &store);
+    c.identity().await.unwrap();
+    wait_lease_valid(&c).await;
+    let hold = LeaseHold::acquire(&c, &x).await.unwrap();
+    let carried = hold.view().inherited().unwrap();
+    assert_eq!((carried.head, carried.set_at), (floor.head, floor.set_at));
+    assert_eq!(carried.completeness, Completeness::LowerBound);
+    let other = tempfile::tempdir().unwrap();
+    let restored = Replica::restore(
+        &c,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(other.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.head(), p);
+}
+
+/// Review question on ADR 0035: the app string a real heartbeat carries
+/// must match what the capability checks compare (`tenant/app` from the
+/// node's state root). A node of the implicit app writes it empty.
+#[tokio::test]
+async fn heartbeats_name_the_app_the_capability_checks_compare() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let nodes = wasmkeep_cluster::membership::all_heartbeats(&a.control_keys)
+        .await
+        .unwrap();
+    let me = nodes.iter().find(|n| n.id == "a").expect("a's heartbeat");
+    let served = format!("{}/{}", a.root.tenant(), a.root.app());
+    assert!(
+        wasmkeep_cluster::membership::serves(me, &served),
+        "heartbeat app {:?} vs {served:?}",
+        me.app
+    );
+    // As an older binary would announce it: found by the check.
+    let mut old = me.clone();
+    old.can_recorded_head = false;
+    assert_eq!(
+        wasmkeep_cluster::membership::without_recorded_head(
+            &[old],
+            &served,
+            now_ms(),
+            a.heartbeat_horizon_ms
+        ),
+        vec!["a"]
     );
 }

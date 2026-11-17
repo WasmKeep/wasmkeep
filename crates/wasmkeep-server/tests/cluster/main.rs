@@ -88,6 +88,8 @@ mod migrate;
 mod node_leases;
 #[path = "project_file.rs"]
 mod project_file;
+#[path = "recorded_head.rs"]
+mod recorded_head;
 mod restore;
 #[path = "routing.rs"]
 mod routing;

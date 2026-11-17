@@ -10,6 +10,7 @@
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): in a class with batched writes a segment carries the commits of several events, one segment is in flight per actor, and snapshots and resets are taken only at the acknowledged head with nothing in flight. The checkpoint sentence under Capture is corrected in place (2026-11-15), whatever becomes of that record.
 - Date: 2026-11-02
 - Milestone: [M2](../../ROADMAP.md#m2-cluster-and-durability)
+- Amended by [ADR 0035](0035-a-recorded-head-on-hand-over.md) (2026-11-17, per app once enabled): a release records the acknowledged head in the ownership record, and a restore must prove it (the exact position on the selected chain, a later generation on it, or a listed floor the snapshot base links back to) before activation; a miss is listed again within a bound, then refused with 503. Strongly consistent listing remains the contract for crash recovery.
 
 ## Context
 

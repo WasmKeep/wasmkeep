@@ -25,11 +25,15 @@
 //!
 //! [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 
+use crate::hold_cell::HoldHead;
 use crate::lease::{Bucket, BucketError, Clock, LeaseConfig, Version};
+use crate::local_heads::Requirement;
+use crate::recorded_head::{OWNER_HEADER_V2, RecordedHead};
 
 /// The node lease's format header.
 const NODE_HEADER: &str = "wasmkeep-node 3";
-/// The ownership record's format header.
+/// The ownership record's version 1 format header (version 2:
+/// [`crate::recorded_head::OWNER_HEADER_V2`]).
 const OWNER_HEADER: &str = "wasmkeep-owner 1";
 
 /// A node lease's state.
@@ -731,38 +735,129 @@ pub async fn mark_old_lease<B: Bucket, C: Clock>(
     written.map(|_| seed).map_err(|_| AcquireError::Unavailable)
 }
 
-/// An ownership record.
+/// An ownership record, in version 1 or 2 ([ADR 0035]).
+///
+/// [ADR 0035]: ../../../docs/adr/0035-a-recorded-head-on-hand-over.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerRecord {
     /// The node id and instance holding it, or nobody.
     pub holder: Option<(String, String)>,
     /// The generation of the last acquisition.
     pub generation: u64,
+    /// The recorded head of a version 2 record; `None`: version 1, which
+    /// carries no head evidence.
+    pub recorded: Option<RecordedHead>,
 }
 
 impl OwnerRecord {
-    /// The stored form.
+    /// The stored form: version 1 without a recorded head (byte for byte
+    /// what earlier releases wrote), version 2 with one.
     pub fn encode(&self) -> Vec<u8> {
         let (id, instance) = self
             .holder
             .as_ref()
             .map_or(("-", "-"), |(n, i)| (n.as_str(), i.as_str()));
-        format!("{OWNER_HEADER}\n{id} {instance}\n{}\n", self.generation).into_bytes()
+        match &self.recorded {
+            None => format!("{OWNER_HEADER}\n{id} {instance}\n{}\n", self.generation).into_bytes(),
+            Some(recorded) => {
+                let mut out = format!("{OWNER_HEADER_V2}\n{id} {instance}\n{}\n", self.generation);
+                recorded.encode_lines(&mut out);
+                out.into_bytes()
+            }
+        }
     }
 
-    /// Parses a stored record.
+    /// Parses a stored record of either version; `None` for anything else,
+    /// a migration tombstone ([`OwnerObject`]) and unknown versions
+    /// included. Version 1 is read as it always was (its trailing lines
+    /// ignored); version 2 must be exactly its canonical form, with a
+    /// valid combination of fields.
     pub fn decode(body: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(body).ok()?;
         let mut lines = text.lines();
-        if lines.next()? != OWNER_HEADER {
+        let header = lines.next()?;
+        let v2 = match header {
+            OWNER_HEADER => false,
+            OWNER_HEADER_V2 => true,
+            _ => return None,
+        };
+        let (id, instance) = lines.next()?.split_once(' ')?;
+        let holder = (id != "-").then(|| (id.to_owned(), instance.to_owned()));
+        if !v2 {
+            let generation = lines.next()?.parse().ok()?;
+            return Some(Self {
+                holder,
+                generation,
+                recorded: None,
+            });
+        }
+        if (id == "-") != (instance == "-") || !holder_token(id) || !holder_token(instance) {
             return None;
         }
-        let (id, instance) = lines.next()?.split_once(' ')?;
-        let generation = lines.next()?.parse().ok()?;
-        Some(Self {
-            holder: (id != "-").then(|| (id.to_owned(), instance.to_owned())),
+        let generation = crate::recorded_head::number(lines.next()?)?;
+        let recorded = RecordedHead::decode_lines(lines)?;
+        if !recorded.valid_for(generation, holder.is_some()) {
+            return None;
+        }
+        let record = Self {
+            holder,
             generation,
-        })
+            recorded: Some(recorded),
+        };
+        // Strict: no extra, missing or non-canonical bytes.
+        (record.encode() == body).then_some(record)
+    }
+}
+
+/// A version 2 holder token (node id or instance, or `-`): nonempty, with
+/// no whitespace or control character. Version 1 keeps its historical,
+/// lenient parsing.
+fn holder_token(t: &str) -> bool {
+    !t.is_empty() && !t.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// The bytes of a record about to be written, only if they decode back
+/// to it: a version 2 record whose fields are not a valid combination
+/// would refuse the actor everywhere. Refused before anything is sent.
+fn checked(record: &OwnerRecord) -> Result<Vec<u8>, AcquireError> {
+    let body = record.encode();
+    if OwnerRecord::decode(&body).as_ref() == Some(record) {
+        Ok(body)
+    } else {
+        Err(AcquireError::Corrupt)
+    }
+}
+
+/// What an ownership key holds: a record of either version, or the
+/// migration tombstone ([`crate::migrate::TOMBSTONE_HEADER`]), which is
+/// dispatched first and is never an unknown ownership version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerObject {
+    /// An ownership record.
+    Record(OwnerRecord),
+    /// The actor moved to the root `to`; `unowned` when no record existed
+    /// at the source. Never acquirable here.
+    Tombstone {
+        /// Where the actor now lives.
+        to: String,
+        /// Written where no record existed.
+        unowned: bool,
+    },
+}
+
+impl OwnerObject {
+    /// Parses what an ownership key holds; `None` if unreadable.
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if let Some(to) = crate::migrate::tombstone_target(body) {
+            return Some(Self::Tombstone {
+                to: to.to_owned(),
+                unowned: crate::migrate::is_unowned(body),
+            });
+        }
+        if body.starts_with(crate::migrate::TOMBSTONE_HEADER.as_bytes()) {
+            return None;
+        }
+        OwnerRecord::decode(body).map(Self::Record)
     }
 }
 
@@ -780,6 +875,10 @@ pub struct Hold {
     /// failover: that node's process was fenced, released, or replaced),
     /// if another node.
     pub previous: Option<String>,
+    /// Its acknowledged head (ADR 0035, section 2), kept in the hold cell
+    /// and frozen when the hold ends: what its release, park or pending
+    /// release carries. Unverified at acquisition.
+    pub head: crate::hold_cell::HoldHead,
 }
 
 /// Why an acquisition did not give a hold.
@@ -802,10 +901,18 @@ pub enum AcquireError {
         generation: u64,
         /// The record the write was conditioned on (`None`: there was
         /// none). While the record is still that one, the write may land.
-        before: Option<OwnerRecord>,
+        before: Option<Box<OwnerRecord>>,
     },
     /// The record or a node lease is unreadable.
     Corrupt,
+    /// This process still has a live hold of the actor, ending or not
+    /// (ADR 0035, section 2): an acquisition waits for its frozen head.
+    /// Nothing written.
+    LocalHold,
+    /// The record is in version 2 (ADR 0035) and this node does not write
+    /// that format for the app: refused, nothing written. Never written
+    /// over with version 1.
+    FormatMismatch,
     /// No answer before writing: nothing written.
     Unavailable,
     /// An idle expiry's acquisition ([`Owners::acquire_unchanged`]): the
@@ -848,6 +955,9 @@ pub struct Owners<B, C> {
     nodes_prefix: String,
     config: LeaseConfig,
     unresolved_wait_ms: u64,
+    /// The app has enabled the recorded-head format (ADR 0035, section 5):
+    /// acquisitions and releases write version 2.
+    recorded_head: std::sync::atomic::AtomicBool,
 }
 
 impl<B: Bucket, C: Clock> Owners<B, C> {
@@ -869,6 +979,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             nodes_prefix: nodes_prefix.into(),
             config,
             unresolved_wait_ms: UNRESOLVED_WAIT_MS,
+            recorded_head: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -887,17 +998,83 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         self.clock.now_ms().saturating_add(self.unresolved_wait_ms)
     }
 
+    /// This node's id.
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// This process's instance token.
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
     /// This node's clock (ms).
     pub fn now_ms(&self) -> u64 {
         self.clock.now_ms()
     }
 
-    fn mine(&self, generation: u64) -> Vec<u8> {
+    /// Whether this app writes the recorded-head format, as its setting
+    /// was last read (ADR 0035, section 5). Only ever set by a reader of
+    /// the setting; never inferred from a record seen.
+    pub fn set_recorded_head(&self, enabled: bool) {
+        self.recorded_head
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether acquisitions and releases write version 2.
+    pub fn recorded_head(&self) -> bool {
+        self.recorded_head.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The record an acquisition at `generation` writes: version 1, or
+    /// version 2 with the requirement it carries.
+    fn mine(&self, generation: u64, recorded: Option<RecordedHead>) -> OwnerRecord {
         OwnerRecord {
             holder: Some((self.node.clone(), self.instance.clone())),
             generation,
+            recorded,
         }
-        .encode()
+    }
+
+    /// What a record already there lets an acquisition do in this app's
+    /// format: a version 2 record is refused unless the app enabled it;
+    /// any record is read under the enabled format.
+    fn format_allows(&self, record: &OwnerRecord) -> Result<(), AcquireError> {
+        if record.recorded.is_some() && !self.recorded_head() {
+            return Err(AcquireError::FormatMismatch);
+        }
+        Ok(())
+    }
+
+    /// The requirement an acquisition carries: this process's local
+    /// evidence (with the generation of the hold that froze it), combined
+    /// by lineage with the record's own when the format is enabled
+    /// ([`crate::local_heads::combine`]).
+    fn carried(
+        &self,
+        local: Option<(Requirement, u64)>,
+        record: Option<&OwnerRecord>,
+    ) -> Option<Requirement> {
+        if !self.recorded_head() {
+            return local.map(|(r, _)| r);
+        }
+        let recorded = record.and_then(|r| Requirement::of_record(r).map(|q| (q, r.generation)));
+        crate::local_heads::combine(local, recorded)
+    }
+
+    /// The version 2 fields of an acquisition carrying `inherited`, over
+    /// `before` (its idle origin carried), if the format is enabled.
+    fn acquiring(
+        &self,
+        inherited: Option<Requirement>,
+        before: Option<&OwnerRecord>,
+    ) -> Option<RecordedHead> {
+        self.recorded_head().then(|| {
+            let idle = before
+                .and_then(|b| b.recorded)
+                .and_then(|r| r.idle_since_ms);
+            Requirement::stored(inherited, true, idle)
+        })
     }
 
     /// Acquires the record at `key` at generation + 1 if it names nobody,
@@ -911,23 +1088,51 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         lease_valid: impl Fn() -> bool,
         first_generation: impl AsyncFnOnce() -> Result<u64, AcquireError>,
     ) -> Result<Hold, AcquireError> {
+        self.acquire_prepared(key, lease_valid, first_generation, |_, _| Ok(None))
+            .await
+    }
+
+    /// [`Self::acquire`] with a preparation hook (ADR 0035, section 2):
+    /// `prepare(record, generation)` runs after the authoritative read and
+    /// the eligibility checks (`record`: what the read decoded, `None` for
+    /// an absent record) and before the conditional write at
+    /// `generation`. It gives this process's local evidence
+    /// ([`crate::local_heads`]) with the generation of the hold that froze
+    /// it; combined with the record's (version 2), it is the new hold's
+    /// [`crate::hold_cell::HoldHead::inherited`]. An error refuses the
+    /// acquisition with nothing written.
+    pub async fn acquire_prepared(
+        &self,
+        key: &str,
+        lease_valid: impl Fn() -> bool,
+        first_generation: impl AsyncFnOnce() -> Result<u64, AcquireError>,
+        prepare: impl FnOnce(
+            Option<&OwnerRecord>,
+            u64,
+        ) -> Result<Option<(Requirement, u64)>, AcquireError>,
+    ) -> Result<Hold, AcquireError> {
         let read = self
             .bucket
             .get(key)
             .await
             .map_err(|_| AcquireError::Unavailable)?;
         let mut previous = None;
+        let inherited;
+        let attempted;
         let (generation, before, written) = match read {
             None => {
                 let first = first_generation().await?;
+                inherited = self.carried(prepare(None, first)?, None);
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                let written = self.bucket.create(key, self.mine(first)).await;
+                attempted = self.mine(first, self.acquiring(inherited, None));
+                let written = self.bucket.create(key, checked(&attempted)?).await;
                 (first, None, written)
             }
             Some((body, version)) => {
                 let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+                self.format_allows(&record)?;
                 if let Some((node, instance)) = &record.holder
                     && !(node == &self.node && instance == &self.instance)
                 {
@@ -952,25 +1157,33 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                     .generation
                     .checked_add(1)
                     .ok_or(AcquireError::Corrupt)?;
+                inherited = self.carried(prepare(Some(&record), generation)?, Some(&record));
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
+                attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
                 let written = self
                     .bucket
-                    .replace(key, self.mine(generation), &version)
+                    .replace(key, checked(&attempted)?, &version)
                     .await;
                 (generation, Some((version, record)), written)
             }
         };
         let version = match written {
             Ok(version) => version,
-            Err(_) => self.read_back(key, generation, before).await?,
+            Err(_) => self.read_back(key, &attempted, before).await?,
         };
         Ok(Hold {
             key: key.to_owned(),
             generation,
             version,
             previous,
+            head: HoldHead {
+                acknowledged: None,
+                inherited,
+                recorded: attempted.recorded.is_some(),
+                idle_since_ms: attempted.recorded.and_then(|r| r.idle_since_ms),
+            },
         })
     }
 
@@ -991,6 +1204,22 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         unchanged: impl Fn(&Version) -> bool,
         lease_valid: impl Fn() -> bool,
     ) -> Result<Hold, AcquireError> {
+        self.acquire_unchanged_prepared(key, unchanged, lease_valid, |_, _| Ok(None))
+            .await
+    }
+
+    /// [`Self::acquire_unchanged`] with the preparation hook of
+    /// [`Self::acquire_prepared`].
+    pub async fn acquire_unchanged_prepared(
+        &self,
+        key: &str,
+        unchanged: impl Fn(&Version) -> bool,
+        lease_valid: impl Fn() -> bool,
+        prepare: impl FnOnce(
+            Option<&OwnerRecord>,
+            u64,
+        ) -> Result<Option<(Requirement, u64)>, AcquireError>,
+    ) -> Result<Hold, AcquireError> {
         let Some((body, version)) = self
             .bucket
             .get(key)
@@ -1000,6 +1229,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             return Err(AcquireError::Changed);
         };
         let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+        self.format_allows(&record)?;
         if record.holder.is_some() || !unchanged(&version) {
             return Err(AcquireError::Changed);
         }
@@ -1007,17 +1237,19 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             .generation
             .checked_add(1)
             .ok_or(AcquireError::Corrupt)?;
+        let inherited = self.carried(prepare(Some(&record), generation)?, Some(&record));
         if !lease_valid() {
             return Err(AcquireError::LeaseInvalid);
         }
+        let attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
         let written = self
             .bucket
-            .replace(key, self.mine(generation), &version)
+            .replace(key, checked(&attempted)?, &version)
             .await;
         let version = match written {
             Ok(version) => version,
             Err(_) => {
-                self.read_back(key, generation, Some((version, record)))
+                self.read_back(key, &attempted, Some((version, record)))
                     .await?
             }
         };
@@ -1026,6 +1258,12 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             generation,
             version,
             previous: None,
+            head: HoldHead {
+                acknowledged: None,
+                inherited,
+                recorded: attempted.recorded.is_some(),
+                idle_since_ms: attempted.recorded.and_then(|r| r.idle_since_ms),
+            },
         })
     }
 
@@ -1043,20 +1281,28 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     async fn read_back(
         &self,
         key: &str,
-        generation: u64,
+        attempted: &OwnerRecord,
         before: Option<(Version, OwnerRecord)>,
     ) -> Result<Version, AcquireError> {
+        let generation = attempted.generation;
         let (before_version, before) = before.unzip();
-        let unresolved = AcquireError::Unresolved { generation, before };
+        let unresolved = AcquireError::Unresolved {
+            generation,
+            before: before.map(Box::new),
+        };
         let Ok(Some((body, version))) = self.bucket.get(key).await else {
             return Err(unresolved);
         };
         if before_version.as_ref() == Some(&version) {
             return Err(unresolved);
         }
-        match OwnerRecord::decode(&body).and_then(|r| r.holder.map(|h| (h, r.generation))) {
+        let decoded = OwnerRecord::decode(&body);
+        // This attempt's write only if exactly its bytes (holder,
+        // generation and, in version 2, the requirement it carried).
+        let exact = decoded.as_ref() == Some(attempted);
+        match decoded.and_then(|r| r.holder.map(|h| (h, r.generation))) {
             Some(((node, instance), g)) if node == self.node && instance == self.instance => {
-                if g == generation {
+                if g == generation && exact {
                     Ok(version)
                 } else {
                     Err(unresolved)
@@ -1114,8 +1360,19 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         let body = OwnerRecord {
             holder: None,
             generation: hold.generation,
+            // ADR 0035, section 1: a hold acquired in version 2 releases
+            // with what it froze (complete if verified, else what it
+            // inherited, stamp unchanged) and its carried idle origin.
+            recorded: hold.head.recorded.then(|| {
+                Requirement::stored(Requirement::frozen(hold), false, hold.head.idle_since_ms)
+            }),
         }
         .encode();
+        // Never a record no reader could decode (a permanent refusal of
+        // the actor): kept pending, nothing written.
+        if OwnerRecord::decode(&body).is_none() {
+            return Released::Pending;
+        }
         match self.bucket.replace(&hold.key, body, &hold.version).await {
             Ok(_) => Released::Released,
             Err(BucketError::Unavailable(_)) => Released::Pending,
@@ -1209,6 +1466,34 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     ) -> Released {
         match self.bucket.get(key).await {
             Ok(Some((body, version))) => match OwnerRecord::decode(&body) {
+                // A version 2 attempt of this process that landed: released
+                // with the requirement its bytes carried (ADR 0035, section
+                // 2), never reconstructed from an older floor. In an app
+                // that has not enabled the format, never released over.
+                Some(r)
+                    if r.recorded.is_some()
+                        && r.generation == generation
+                        && r.holder
+                            .as_ref()
+                            .is_some_and(|(n, i)| n == &self.node && i == &self.instance) =>
+                {
+                    if !self.recorded_head() {
+                        return Released::Pending;
+                    }
+                    let hold = Hold {
+                        key: key.to_owned(),
+                        generation,
+                        version,
+                        previous: None,
+                        head: HoldHead {
+                            acknowledged: None,
+                            inherited: Requirement::of_record(&r),
+                            recorded: true,
+                            idle_since_ms: r.recorded.and_then(|x| x.idle_since_ms),
+                        },
+                    };
+                    self.release(&hold).await
+                }
                 Some(r)
                     if r.generation == generation
                         && r.holder
@@ -1220,6 +1505,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                         generation,
                         version,
                         previous: None,
+                        head: Default::default(),
                     };
                     self.release(&hold).await
                 }
@@ -1326,10 +1612,12 @@ mod tests {
             OwnerRecord {
                 holder: Some(("a".into(), "i1".into())),
                 generation: 3,
+                recorded: None,
             },
             OwnerRecord {
                 holder: None,
                 generation: 9,
+                recorded: None,
             },
         ] {
             assert_eq!(OwnerRecord::decode(&r.encode()), Some(r));
@@ -1743,6 +2031,7 @@ mod tests {
             OwnerRecord {
                 holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
                 generation,
+                recorded: None,
             }
             .encode()
         };
@@ -1824,6 +2113,7 @@ mod tests {
             OwnerRecord {
                 holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
                 generation,
+                recorded: None,
             }
             .encode()
         };
@@ -1850,10 +2140,11 @@ mod tests {
                 run(a.acquire("owners/n", || true, async || Ok(1))),
                 Err(AcquireError::Unresolved {
                     generation: 5,
-                    before: Some(OwnerRecord {
+                    before: Some(Box::new(OwnerRecord {
                         holder: None,
-                        generation: 4
-                    }),
+                        generation: 4,
+                        recorded: None,
+                    })),
                 })
             );
         }
@@ -1879,6 +2170,7 @@ mod tests {
             OwnerRecord {
                 holder: Some((holder.0.to_owned(), holder.1.to_owned())),
                 generation,
+                recorded: None,
             }
             .encode()
         };
@@ -1886,10 +2178,11 @@ mod tests {
         let unresolved = |holder: Option<(&str, &str)>| {
             Err(AcquireError::Unresolved {
                 generation: 5,
-                before: Some(OwnerRecord {
+                before: Some(Box::new(OwnerRecord {
                     holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
                     generation: 4,
-                }),
+                    recorded: None,
+                })),
             })
         };
         // b's older instance i1 holds it (freed by b's live lease as i2);
@@ -1919,6 +2212,7 @@ mod tests {
                 &OwnerRecord {
                     holder: None,
                     generation: 4,
+                    recorded: None,
                 }
                 .encode(),
             ),
@@ -1938,6 +2232,7 @@ mod tests {
                     &OwnerRecord {
                         holder: None,
                         generation: 4,
+                        recorded: None,
                     }
                     .encode(),
                 ),
@@ -2001,5 +2296,134 @@ mod tests {
         // Fenced or released: only after written_at + ttl + grace.
         assert!(!frees("i1", Some(&fenced), 1_000 + 15_000, &c));
         assert!(frees("i1", Some(&fenced), 1_000 + 15_001, &c));
+    }
+
+    /// A version 2 record (ADR 0035) is read everywhere a version 1 record
+    /// is, but a node whose app has not enabled the format never writes
+    /// over one: acquisition (either path) refuses with a format mismatch,
+    /// and a release or a resolution over it writes nothing.
+    #[test]
+    fn a_version_2_record_is_read_but_never_written_over() {
+        use crate::lease::tests::{At, Mem, run};
+        use crate::recorded_head::{Completeness, Position, RecordedHead};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let mut lease = NodeLease::new(&mem, At(&t), "nodes/b", "i2", cfg());
+        run(lease.start(None)).unwrap();
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let recorded = RecordedHead {
+            head: Position::Known {
+                generation: 4,
+                txid: 9,
+                checksum: 0xfeed,
+            },
+            set_at: 5,
+            completeness: Completeness::Complete,
+            idle_since_ms: None,
+        };
+        let released = OwnerRecord {
+            holder: None,
+            generation: 5,
+            recorded: Some(recorded),
+        };
+        let read = |k: &str| run((&mem).get(k)).unwrap().unwrap();
+
+        mem.overwrite("owners/x", Some(&released.encode()));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::FormatMismatch)
+        );
+        let (_, version) = read("owners/x");
+        assert_eq!(
+            run(a.acquire_unchanged("owners/x", |v| v == &version, || true)),
+            Err(AcquireError::FormatMismatch)
+        );
+        assert_eq!(read("owners/x").0, released.encode());
+
+        // Held by this very process in version 2 (which this binary never
+        // writes): routing and the read helpers see it; a release or a
+        // resolution never replaces it with version 1 bytes.
+        let mine = OwnerRecord {
+            holder: Some(("a".into(), "i1".into())),
+            generation: 6,
+            recorded: Some(RecordedHead {
+                completeness: Completeness::LowerBound,
+                ..recorded
+            }),
+        };
+        mem.overwrite("owners/x", Some(&mine.encode()));
+        let (_, version) = read("owners/x");
+        assert_eq!(run(a.still_names_this("owners/x", 6)), Ok(true));
+        assert_eq!(run(a.names_this_instance("owners/x")), Ok(true));
+        let hold = Hold {
+            key: "owners/x".into(),
+            generation: 6,
+            version,
+            previous: None,
+            head: Default::default(),
+        };
+        let _ = hold;
+        assert_eq!(
+            run(a.resolve("owners/x", 6, None, false)),
+            Released::Pending
+        );
+        assert_eq!(read("owners/x").0, mine.encode());
+
+        // Another live node's version 2 record routes there.
+        let theirs = OwnerRecord {
+            holder: Some(("b".into(), "i2".into())),
+            generation: 7,
+            recorded: mine.recorded,
+        };
+        mem.overwrite("owners/x", Some(&theirs.encode()));
+        assert_eq!(
+            run(a.other_owner("owners/x", |n, i| n == "b" && i == "i2")),
+            Ok(Some("b".into()))
+        );
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::FormatMismatch)
+        );
+        // A tombstone stays unreadable as a record: never acquired.
+        mem.overwrite("owners/x", Some(&crate::migrate::tombstone("p2/")));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Corrupt)
+        );
+    }
+
+    /// A version 2 record whose fields would not decode (a stamp above its
+    /// generation, here) is never written: refused, nothing sent.
+    #[test]
+    fn an_invalid_version_2_record_is_never_written() {
+        use crate::lease::tests::{At, Mem, run};
+        use crate::local_heads::Requirement;
+        use crate::recorded_head::{Completeness, Position};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        a.set_recorded_head(true);
+        let bad = Requirement {
+            head: Position::Known {
+                generation: 9,
+                txid: 3,
+                checksum: 1,
+            },
+            set_at: 99,
+            completeness: Completeness::Complete,
+        };
+        let got = run(a.acquire_prepared(
+            "owners/x",
+            || true,
+            async || Ok(1),
+            |_, _| Ok(Some((bad, 1))),
+        ));
+        assert_eq!(got, Err(AcquireError::Corrupt));
+        assert!(
+            run((&mem).get("owners/x")).unwrap().is_none(),
+            "nothing written"
+        );
     }
 }

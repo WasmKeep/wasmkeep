@@ -36,17 +36,21 @@ mod version_tests {
 }
 
 pub mod alarm_index;
+pub mod app_format;
 pub mod bucket_check;
 pub mod control;
 pub mod expiry;
 pub mod failover;
+pub mod hold_cell;
 pub mod holds;
 pub mod lease;
+pub mod local_heads;
 pub mod membership;
 pub mod migrate;
 pub mod node_lease;
 #[cfg(feature = "object-store")]
 pub mod object_store;
+pub mod recorded_head;
 pub mod replication;
 pub mod restore_fence;
 pub mod state_root;

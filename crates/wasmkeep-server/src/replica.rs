@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use wasmkeep_cluster::local_heads::{Proof, Requirement, linked_back, prove};
+use wasmkeep_cluster::recorded_head::Position;
 use wasmkeep_cluster::replication::{
     EMPTY, Listing, Plan, Segment, SegmentId, collectable, plan_restore, segment_key, snapshot_key,
 };
@@ -581,6 +583,26 @@ pub(crate) enum ReplicaError {
     /// and replication stops, as for a fork.
     #[error("refused: {0}")]
     Refused(String),
+    /// The recorded head the hold inherited is not visible in the bucket's
+    /// listing within the bounded re-list (ADR 0035, section 3): nothing
+    /// activated, retryable (503).
+    #[error("the actor's recorded head is not visible yet: {0}")]
+    Visibility(String),
+}
+
+/// How long discovery of a recorded head may take, all listings and
+/// back-offs included (ADR 0035, section 3).
+const DISCOVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The pauses between the at most ten listings of that discovery (ms).
+const RELIST_MS: [u64; 9] = [100, 200, 400, 800, 1_600, 1_600, 1_600, 1_600, 1_600];
+
+/// `d` plus a uniform 0 to 20 percent (ADR 0035, section 3).
+pub(crate) fn jittered(d: std::time::Duration) -> std::time::Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |t| t.subsec_nanos());
+    d + d.mul_f64(f64::from(nanos % 1_000) / 5_000.0)
 }
 
 /// One actor's replication state, owned by the actor while it holds the
@@ -741,8 +763,54 @@ impl Replica {
         db_path: PathBuf,
         max_db_bytes: u64,
     ) -> Result<Self, ReplicaError> {
-        let restored =
-            Self::restore_within(cluster, address, lease, generation, db_path, max_db_bytes).await;
+        // ADR 0035, section 3: the floor the hold inherited (an app that
+        // writes the recorded-head format) must be proven by the selected
+        // chain; a listing that does not show it is listed again, at most
+        // ten times within the discovery deadline, then refused.
+        let (floor, key) = lease.floor();
+        let deadline = tokio::time::Instant::now() + DISCOVERY;
+        let mut attempt = 0;
+        let started = std::time::Instant::now();
+        let restored = loop {
+            let tried = Self::restore_within(
+                cluster,
+                address,
+                lease.clone(),
+                generation,
+                db_path.clone(),
+                max_db_bytes,
+                floor.as_ref(),
+            )
+            .await;
+            match tried {
+                Err(ReplicaError::Visibility(why)) if attempt < RELIST_MS.len() => {
+                    let pause = jittered(std::time::Duration::from_millis(RELIST_MS[attempt]));
+                    if tokio::time::Instant::now() + pause >= deadline || !lease.is_valid() {
+                        break Err(ReplicaError::Visibility(why));
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(pause).await;
+                }
+                other => break other,
+            }
+        };
+        if let (Err(ReplicaError::Visibility(why)), Some(key)) = (&restored, &key) {
+            cluster.pending.refused(key);
+            tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), generation, required = ?floor, attempts = attempt + 1, elapsed = ?started.elapsed(), reason = %why, "refused to activate: the recorded head is not visible");
+        }
+        let restored = restored.and_then(|replica| {
+            // The verified head goes into the hold cell, under its
+            // lock and validity check, before activation (ADR 0035,
+            // section 2): a hold that lapsed meanwhile is late.
+            replica
+                .lease
+                .verify(replica.verified_head())
+                .map_err(|_| ReplicaError::Late)?;
+            Ok(replica)
+        });
+        if let (Ok(_), Some(key)) = (&restored, &key) {
+            cluster.pending.clear_cooldown(key);
+        }
         if restored.is_err() {
             crate::metrics::inc(&crate::metrics::METRICS.restore_failures);
         }
@@ -756,6 +824,7 @@ impl Replica {
         generation: u64,
         db_path: PathBuf,
         max_db_bytes: u64,
+        floor: Option<&Requirement>,
     ) -> Result<Self, ReplicaError> {
         let store = Arc::clone(&cluster.store);
         let prefix = format!("{}/", cluster.history_key(address));
@@ -763,7 +832,45 @@ impl Replica {
         let keys: Vec<String> = sized.iter().map(|(k, _)| k.clone()).collect();
         let sizes: std::collections::HashMap<String, u64> = sized.into_iter().collect();
         let listing = Listing::from_keys(keys.iter().map(String::as_str));
-        let plan = plan_restore(&listing).map_err(|e| ReplicaError::Restore(e.to_string()))?;
+        let plan = plan_restore(&listing).map_err(|e| match e {
+            // ADR 0035, section 3: with a recorded floor to reach, a missing
+            // link is a listing behind its writes, listed again; without
+            // one, as before.
+            wasmkeep_cluster::replication::PlanError::Missing { .. }
+                if floor.is_some_and(|f| matches!(f.head, Position::Known { .. })) =>
+            {
+                ReplicaError::Visibility(e.to_string())
+            }
+            e => ReplicaError::Restore(e.to_string()),
+        })?;
+        // ADR 0035, section 3: what the listing alone proves of the floor,
+        // before any local file is used or changed.
+        let chain: Vec<(SegmentId, Option<u64>)> = plan
+            .snapshot
+            .into_iter()
+            .chain(plan.segments.iter().copied())
+            .map(|id| (id, None))
+            .collect();
+        let mut structural = prove(floor, &chain);
+        // Review M1: a snapshot above an exact floor hides it from the
+        // plan; the listing proves descent if it shows the floor and the
+        // links from the plan's base down to it. Nothing below the base is
+        // replayed, so the later checks have no floor left to see.
+        let mut floor = floor;
+        if structural == Proof::Missing
+            && let Some(base) = plan.snapshot
+            && linked_back(floor, base, &listing)
+        {
+            structural = Proof::Proven;
+            floor = None;
+        }
+        if structural == Proof::Missing {
+            return Err(ReplicaError::Visibility(format!(
+                "the listing's chain ends at {:?} and shows neither {:?} nor a later generation",
+                plan.head(),
+                floor.map(|f| f.head)
+            )));
+        }
         let mut replica = Self {
             store,
             prefix,
@@ -794,12 +901,29 @@ impl Replica {
             return Ok(replica);
         }
         if let Some(sum) = replica.local_is_at(&plan).await {
-            tracing::debug!(prefix = %replica.prefix, head = ?plan.head(), "local database is current");
-            replica.checksum = sum;
-            return Ok(replica);
+            // The local file is at the chain's head: it proves an exact
+            // floor only there (an earlier exact floor needs the replay).
+            let at_head = vec![(plan.head(), Some(sum.value()))];
+            let usable = match structural {
+                Proof::NeedsReplay => match prove(floor, &at_head) {
+                    Proof::Proven => true,
+                    Proof::Conflict => {
+                        return Err(ReplicaError::Restore(
+                            "the local database at the recorded head has another checksum".into(),
+                        ));
+                    }
+                    Proof::Missing | Proof::NeedsReplay => false,
+                },
+                _ => true,
+            };
+            if usable {
+                tracing::debug!(prefix = %replica.prefix, head = ?plan.head(), "local database is current");
+                replica.checksum = sum;
+                return Ok(replica);
+            }
         }
         replica.checksum = replica
-            .download(&plan, &keys, &sizes, cluster.restore_budget)
+            .download(&plan, &keys, &sizes, cluster.restore_budget, floor)
             .await?;
         Ok(replica)
     }
@@ -836,8 +960,18 @@ impl Replica {
         listed: &[String],
         sizes: &std::collections::HashMap<String, u64>,
         budget: std::time::Duration,
+        floor: Option<&Requirement>,
     ) -> Result<DbChecksum, ReplicaError> {
         let mut keys = Vec::with_capacity(plan.segments.len() + 1);
+        // Each object's position, and the database checksum after it once
+        // applied: the replay's proof of an exact floor (ADR 0035).
+        let mut chain: Vec<(SegmentId, Option<u64>)> = plan
+            .snapshot
+            .into_iter()
+            .chain(plan.segments.iter().copied())
+            .map(|id| (id, None))
+            .collect();
+        let mut applied_objects = 0usize;
         if let Some(id) = plan.snapshot {
             keys.push(snapshot_key(id));
         }
@@ -1024,7 +1158,26 @@ impl Replica {
             .await
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
             restorer = applied?;
+            if let Some(slot) = chain.get_mut(applied_objects) {
+                slot.1 = Some(restorer.checksum().value());
+            }
+            applied_objects += 1;
             deadline += applying.elapsed();
+        }
+        // Proven before anything is installed: a replay that does not
+        // reach the floor is discarded.
+        match prove(floor, &chain) {
+            Proof::Proven => {}
+            Proof::Conflict => {
+                return Err(ReplicaError::Restore(
+                    "the history at the recorded head has another checksum".into(),
+                ));
+            }
+            Proof::Missing | Proof::NeedsReplay => {
+                return Err(ReplicaError::Visibility(
+                    "the replayed chain does not reach the recorded head".into(),
+                ));
+            }
         }
         let head = plan.head();
         let sum = tokio::task::spawn_blocking(move || {
@@ -1118,7 +1271,9 @@ impl Replica {
                 let bound = periodic_snapshot_bound(self.upload_idle, bytes.len());
                 self.put_once(&key, bytes, bound).await
             } else {
-                self.put_bounded(&key, bytes, "snapshot").await
+                // After a delete: it confirms the reset position, which
+                // the reset segment's acknowledgement recorded.
+                self.put_bounded(&key, bytes, "snapshot", None).await
             };
             return match sent {
                 Ok(()) => {
@@ -1137,7 +1292,8 @@ impl Replica {
             };
         }
         self.fail(INTERRUPTED);
-        if let Err(e) = self.put_bounded(&key, bytes, "snapshot").await {
+        let advance = Some(position_of(position, all.post_apply));
+        if let Err(e) = self.put_bounded(&key, bytes, "snapshot", advance).await {
             if !matches!(e, ReplicaError::Exists) {
                 crate::metrics::inc(&crate::metrics::METRICS.snapshot_upload_failures);
             }
@@ -1171,6 +1327,12 @@ impl Replica {
     /// The position the bucket and the local database agree on.
     pub(crate) fn head(&self) -> SegmentId {
         self.head
+    }
+
+    /// The head with its database checksum, as the hold cell records it
+    /// (ADR 0035): the explicit pre-history position for an empty history.
+    pub(crate) fn verified_head(&self) -> Position {
+        position_of(self.head, self.checksum)
     }
 
     /// What a garbage-collection pass of this hold needs, detached so it
@@ -1250,7 +1412,12 @@ impl Replica {
         self.fail(INTERRUPTED);
         self.in_flight = Some(segment.id);
         let sent = self
-            .put_bounded(&segment_key(&segment), bytes, "segment")
+            .put_bounded(
+                &segment_key(&segment),
+                bytes,
+                "segment",
+                Some(position_of(segment.id, changes.post_apply)),
+            )
             .await;
         self.in_flight = None;
         if let Err(e) = sent {
@@ -1450,7 +1617,8 @@ impl Replica {
             .store
             .put_opts(&location, PutPayload::from(bytes), opts);
         let reason = match timeout_at(until, sent).await {
-            Ok(Ok(_)) => return self.acknowledged(),
+            // A snapshot at the head: a check, never an advance.
+            Ok(Ok(_)) => return self.acknowledged(None),
             Ok(Err(object_store::Error::AlreadyExists { .. })) => {
                 match timeout_at(until, self.store.head(&location)).await {
                     Ok(Ok(_)) => return Err(ReplicaError::Exists),
@@ -1489,13 +1657,18 @@ impl Replica {
     /// there"). A refusal with nothing there yet (a bucket answering 409
     /// to a create racing an earlier attempt still in flight) is sent
     /// again.
+    ///
+    /// `advance`: the position this upload makes durable, which its
+    /// acknowledgement moves the hold's head to; `None` for an upload at
+    /// the head (ADR 0035, section 2).
     async fn put_bounded(
         &self,
         key: &str,
         bytes: Vec<u8>,
         what: &'static str,
+        advance: Option<Position>,
     ) -> Result<(), ReplicaError> {
-        self.target().put_bounded(key, bytes, what).await
+        self.target().put_bounded(key, bytes, what, advance).await
     }
 
     /// Resolve a delete's ordering from the immutable reset, never a node clock.
@@ -1580,8 +1753,9 @@ impl UploadTarget {
         key: &str,
         bytes: Vec<u8>,
         what: &'static str,
+        advance: Option<Position>,
     ) -> Result<(), ReplicaError> {
-        self.put_bounded_by(key, bytes, what, None).await
+        self.put_bounded_by(key, bytes, what, advance, None).await
     }
 
     /// The upload's budget for `len` bytes: its base idle bounds plus a
@@ -1601,6 +1775,7 @@ impl UploadTarget {
         key: &str,
         bytes: Vec<u8>,
         what: &'static str,
+        advance: Option<Position>,
         cap: Option<tokio::time::Instant>,
     ) -> Result<(), ReplicaError> {
         use tokio::time::{Instant, timeout_at};
@@ -1636,12 +1811,12 @@ impl UploadTarget {
                 .store
                 .put_opts(&location, PutPayload::from(bytes.clone()), opts);
             match timeout_at(until, sent).await {
-                Ok(Ok(_)) => return self.acknowledged(),
+                Ok(Ok(_)) => return self.acknowledged(advance),
                 Ok(Err(object_store::Error::AlreadyExists { .. })) => {
                     match self.read_back(&location, &bytes, deadline).await {
                         ReadBack::Ours => {
                             tracing::info!(object = %location, what, "an upload had landed unanswered; acknowledged");
-                            return self.acknowledged();
+                            return self.acknowledged(advance);
                         }
                         ReadBack::Other => return Err(ReplicaError::Exists),
                         ReadBack::Refused(e) => return Err(e),
@@ -1719,6 +1894,20 @@ impl UploadTarget {
     }
 }
 
+/// A history position and the database checksum after it, as the hold
+/// cell records an acknowledged head (ADR 0035, section 2).
+pub(crate) fn position_of(head: SegmentId, checksum: DbChecksum) -> Position {
+    if head == EMPTY {
+        Position::Empty
+    } else {
+        Position::Known {
+            generation: head.generation,
+            txid: head.txid,
+            checksum: checksum.value(),
+        }
+    }
+}
+
 /// A failure no resend changes: the bucket refused the request itself (on
 /// an upload, `NotFound` is the bucket missing, and a precondition cannot
 /// fail a create). An attempt in flight, or a pause, still runs out
@@ -1782,20 +1971,21 @@ impl UploadTarget {
     }
 
     /// The acknowledgement rule: an upload counts only if it completed
-    /// while the hold could still act.
-    fn acknowledged(&self) -> Result<(), ReplicaError> {
-        if self.lease.is_valid() {
-            Ok(())
-        } else {
-            Err(ReplicaError::Late)
-        }
+    /// while the hold could still act. Checked and, with `advance`, the
+    /// hold's acknowledged head moved, in one critical section of the hold
+    /// cell (ADR 0035, section 2), so an ending hold freezes it or this is
+    /// late.
+    fn acknowledged(&self, advance: Option<Position>) -> Result<(), ReplicaError> {
+        self.lease
+            .acknowledge(advance)
+            .map_err(|_| ReplicaError::Late)
     }
 }
 
 impl Replica {
     /// See [`UploadTarget::acknowledged`].
-    fn acknowledged(&self) -> Result<(), ReplicaError> {
-        self.target().acknowledged()
+    fn acknowledged(&self, advance: Option<Position>) -> Result<(), ReplicaError> {
+        self.target().acknowledged(advance)
     }
 }
 
@@ -2706,6 +2896,38 @@ mod tests {
         );
         assert_eq!(r.head, head, "the head did not move");
         assert!(r.failed().is_some());
+    }
+
+    /// ADR 0035, section 2: the hold cell is the home of the acknowledged
+    /// head. A segment's acknowledgement advances it, with the database
+    /// checksum after it; a periodic snapshot's only checks validity; once
+    /// the lease lapsed, nothing advances it, and the hold ended carries
+    /// the last acknowledged head.
+    #[tokio::test]
+    async fn acknowledgements_advance_the_hold_cell_head() {
+        use wasmkeep_cluster::recorded_head::Position;
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        let (view, validity) = LeaseView::lapsable(1);
+        r.lease = view.clone();
+        let head = |v: &LeaseView| v.acknowledged_head();
+        assert_eq!(head(&view), Some(Position::Empty), "verified at the start");
+        r.ship(&changes(DbChecksum::from_value(7))).await.unwrap();
+        let after = Position::Known {
+            generation: 1,
+            txid: 2,
+            checksum: DbChecksum::from_value(9).value(),
+        };
+        assert_eq!(head(&view), Some(after));
+        // A snapshot at the head is a check, never an advance.
+        let all = at_head(&r);
+        assert!(r.ship_snapshot(&all, SnapshotKind::Periodic).await.unwrap());
+        assert_eq!(head(&view), Some(after));
+        validity.invalidate();
+        let mut next = changes(DbChecksum::from_value(9));
+        next.post_apply = DbChecksum::from_value(11);
+        assert!(r.ship(&next).await.is_err());
+        assert_eq!(head(&view), Some(after), "nothing advances after a lapse");
     }
 
     /// After the lease lapsed, nothing is acknowledged and nothing more is

@@ -406,6 +406,7 @@ async fn owner_match_is_enforced_before_publication() {
             let bytes = wasmkeep_cluster::node_lease::OwnerRecord {
                 generation,
                 holder: None,
+                recorded: None,
             }
             .encode();
             f.store

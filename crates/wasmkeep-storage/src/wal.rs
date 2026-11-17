@@ -719,6 +719,11 @@ impl Restorer {
         Ok(())
     }
 
+    /// The database checksum after the files applied so far.
+    pub fn checksum(&self) -> DbChecksum {
+        self.db
+    }
+
     /// Syncs the file; returns the database checksum.
     ///
     /// # Errors

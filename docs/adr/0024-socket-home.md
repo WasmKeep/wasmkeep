@@ -14,6 +14,7 @@
   host), [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) and
   [ADR 0017](0017-moving-one-actor.md) (drains and moves close sockets
   with 1012).
+- Amended by [ADR 0035](0035-a-recorded-head-on-hand-over.md) (2026-11-17): a parked hold keeps its frozen head, registered before it leaves the live set; a wake carries it, including through an unresolved acquisition.
 
 ## Context
 

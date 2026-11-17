@@ -586,7 +586,11 @@ impl ActorState {
                         // that cannot be restored, or local file trouble,
                         // is not.
                         Err(match e {
-                            crate::replica::ReplicaError::Bucket(_) => {
+                            // The hold lapsed before its verified head was
+                            // recorded (ADR 0035, section 2): retryable.
+                            crate::replica::ReplicaError::Bucket(_)
+                            | crate::replica::ReplicaError::Late
+                            | crate::replica::ReplicaError::Visibility(_) => {
                                 OwnershipError::Unavailable(e.to_string())
                             }
                             _ => OwnershipError::Broken(e.to_string()),

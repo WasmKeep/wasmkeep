@@ -157,7 +157,7 @@ async fn race(bucket: &ObjectStoreBucket, key: &str, config: LeaseConfig, round:
             // A conflict on the write: it may have landed, as far as that
             // node knows.
             (_, owners, Err(AcquireError::Unresolved { generation, before })) => {
-                unresolved.push((owners, generation, before));
+                unresolved.push((owners, generation, before.map(|b| *b)));
             }
             (node, _, Err(e)) => panic!("{round}: n{node}: unexpected error: {e:?}"),
         }
