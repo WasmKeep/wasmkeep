@@ -807,3 +807,13 @@ Each slice is one change; each says what it proves.
   bucket read), then the older files removed. Proves the views return
   the same rows before and after, that no data row of a deleted actor
   remains, and that its `deleted` row does (decision 3).
+
+  Implemented on the development branch as `wasmkeep feed compact --out OUT
+  --state STATE`. Reservation also records a compaction journal in `state.db`.
+  The new `_wk_states` rename is the switch, after durable data files, as in
+  section 7. Recovery under the lock rolls back an unpublished batch, or
+  advances the compacted heads, regenerates views using the new batch and
+  completes removal of older files. The journal is cleared only after durable
+  removal. Sequence numbers are never reused. Empty historical table schemas
+  survive without data rows, so the latest views remain queryable; their
+  `_wk_seq` changes to the compacted batch, and `_history` loses old states.

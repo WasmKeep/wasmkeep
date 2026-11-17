@@ -44,7 +44,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Export changed states to local Parquet files in one read-only poll.
-    Feed(wasmkeep_cli::feed::Args),
+    Feed(wasmkeep_cli::feed::CommandArgs),
     /// Create and verify lease-free online archives.
     #[command(subcommand)]
     Backup(backup::Command),

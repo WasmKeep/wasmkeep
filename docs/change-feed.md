@@ -3,7 +3,7 @@
 The change feed reads one app's bucket history and writes whole actor states
 as local Parquet files. It contacts no node and writes nothing to the bucket.
 This guide describes the implementation on the ADR 0039 development branch;
-continuous polling and compaction are not implemented yet.
+continuous polling (`--every`) is not implemented yet.
 
 ## Run a poll
 
@@ -54,7 +54,7 @@ identifiers containing spaces or punctuation with double quotes. Ambiguous
 view names (for example `a_b`/`c` and `a`/`b_c`, or a table named `items_history`
 beside `items`) are reported rather than silently overwriting another view.
 
-Reload `.read shop-feed/views.duckdb.sql` after **each poll**, including one
+Reload `.read shop-feed/views.duckdb.sql` after **each poll or compaction**, including one
 that recovers interrupted work. The script uses absolute file paths and an
 atomic transaction to replace the views. It enumerates committed files; an
 already loaded view does not discover new table files. Moving the directories
@@ -103,7 +103,35 @@ Do not sum `_history` as though it were a stream of row changes. A custom
 consumer should watch `_wk_states` as the commit record, then replace each
 actor's rows, including when its new state has no data rows.
 
-Old data remains on disk after deletion. Until compaction is implemented,
-erasure from feed files requires removing both directories and building again.
+## Compact the local files
+
+```sh
+wasmkeep feed compact --out shop-feed --state shop-feed-state
+```
+
+Compaction reads only the existing local files, without bucket credentials or
+requests. It takes the same exclusive lock as a poll and fails if another feed
+operation holds it. It writes one new batch containing each recorded actor's
+latest state, then removes superseded Parquet files. Deleted actors retain one
+`deleted` state row (including their name, position and reason), and no data
+rows. Empty and dropped table schemas remain available as empty views.
+
+The new batch uses a fresh, monotonically increasing sequence; positions,
+capture times and kinds are retained. Latest-state query results are unchanged
+apart from `_wk_seq`; `_history` now contains only the retained states. Reload
+`views.duckdb.sql` after compaction, and coordinate readers using old file paths
+with it: those files are removed. A file-loading consumer must treat the new
+batch as whole-state replacements, just as for a poll.
+
+New files are fsynced before the `_wk_states` rename makes the batch visible.
+A durable local journal distinguishes compaction from a poll. If interrupted,
+the next poll or compaction, under the lock, removes unpublished work or
+finishes the published switch and cleanup. Reserved numbers are never reused;
+committed files are never rewritten in place. Keep enough free space for both
+the old files and the new batch until publication completes.
+
+Old data remains on disk after deletion until compaction. Compaction removes
+that data from the feed's files; it retains deleted actor names as described
+above. Removing names requires building into new directories.
 The feed is an analytical projection, not a backup or a complete event log:
 heads between polls may be skipped, and batched writes appear only after upload.

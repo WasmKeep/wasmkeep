@@ -1,5 +1,6 @@
 //! ADR 0039: one read-only poll with durable, resumable batches.
 //! Kinds describe replacement labels, incarnations and retained ancestry.
+mod compact;
 mod views;
 pub mod writer;
 
@@ -20,6 +21,15 @@ enum Target {
 
 /// Export changed actor states; runs one poll and only reads the bucket.
 #[derive(Debug, clap::Args)]
+#[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
+pub struct CommandArgs {
+    #[command(subcommand)]
+    command: Option<FeedCommand>,
+    #[command(flatten)]
+    poll: Option<Args>,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct Args {
     #[arg(value_name = "TENANT/APP", value_parser = crate::parse_app)]
     app: (String, String),
@@ -37,7 +47,25 @@ pub struct Args {
     max_bytes: u64,
 }
 
-pub fn run(args: &Args) -> anyhow::Result<()> {
+#[derive(Debug, clap::Subcommand)]
+enum FeedCommand {
+    /// Keep each actor's latest state, without reading the bucket.
+    Compact {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        state: PathBuf,
+    },
+}
+
+pub fn run(command: &CommandArgs) -> anyhow::Result<()> {
+    if let Some(FeedCommand::Compact { out, state }) = &command.command {
+        return compact::compact(out, state, &mut |_| Ok(()));
+    }
+    let args = command
+        .poll
+        .as_ref()
+        .context("feed poll arguments required")?;
     let mut code = 0;
     crate::run_async(async {
         let (store, prefix) = crate::open_bucket_unchecked(&args.bucket)?;
@@ -189,7 +217,11 @@ async fn poll_inner(
             "new state requires an empty output directory"
         );
     }
-    if let Some((_, _, committed, _)) = &recorded {
+    if recorded.is_some() {
+        compact::recover_compaction(&mut db, &out, &mut |_| Ok(()))?;
+        let committed = &db.query_row("SELECT seq FROM feed WHERE id=1", [], |r| {
+            r.get::<_, i64>(0).map(|n| n as u64)
+        })?;
         recover(&out, *committed)?;
         recover_visible(&mut db, &out, *committed)?;
         views::publish(&out)?;
@@ -361,13 +393,27 @@ async fn poll_inner(
 fn commit_batch(
     db: &mut Connection,
     out: &std::path::Path,
+    changed: Vec<Changed>,
+    checkpoint: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    commit_batch_inner(db, out, changed, checkpoint, false)
+}
+
+fn commit_batch_inner(
+    db: &mut Connection,
+    out: &std::path::Path,
     mut changed: Vec<Changed>,
     checkpoint: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+    compacting: bool,
 ) -> anyhow::Result<()> {
     let tx = db.transaction()?;
     let reserved: i64 = tx.query_row("SELECT reserved FROM feed WHERE id=1", [], |r| r.get(0))?;
     let seq = reserved.checked_add(1).context("sequence exhausted")?;
     tx.execute("UPDATE feed SET reserved=?1,pending=1 WHERE id=1", [seq])?;
+    if compacting {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS compaction (seq INTEGER NOT NULL)")?;
+        tx.execute("INSERT INTO compaction VALUES(?1)", [seq])?;
+    }
     tx.commit()?;
     checkpoint("reserved")?;
     for actor in &mut changed {

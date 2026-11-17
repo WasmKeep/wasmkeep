@@ -865,3 +865,370 @@ async fn f5_recovers_interrupted_view_publication() {
         std::fs::read(out.path().join("views.duckdb.sql")).unwrap()
     );
 }
+
+#[tokio::test]
+async fn f7_compaction_recovers_and_poll_continues() {
+    let mut stops = vec![None];
+    let mut attempt = 0;
+    while attempt < stops.len() {
+        let stop = stops[attempt];
+        attempt += 1;
+        let out = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = fixture().await;
+        let args = args(out.path(), state.path());
+        poll(&args, &store, "").await.unwrap();
+        replace_fixture_actor(
+            &store,
+            "CREATE TABLE items(value, added); INSERT INTO items VALUES(2.5, 'new')",
+            1,
+        )
+        .await;
+        poll(&args, &store, "").await.unwrap();
+        replace_fixture_actor(
+            &store,
+            "CREATE TABLE items(value, added); INSERT INTO items VALUES('rebased', 'latest')",
+            1,
+        )
+        .await;
+        poll(&args, &store, "").await.unwrap();
+        for key in history::list_objects(&store, "state/t/a/actors/c/b/")
+            .await
+            .unwrap()
+            .keys()
+        {
+            store
+                .delete(&Key::from(format!("state/t/a/actors/c/b/{key}")))
+                .await
+                .unwrap();
+        }
+        poll(&args, &store, "").await.unwrap();
+        let expected_views = if stop.is_none() {
+            f7_view_rows(out.path())
+        } else {
+            None
+        };
+        let before = files(&out.path().join("_wk_states"));
+        let old_files = files(out.path());
+        let mut trace = Vec::new();
+        let result = compact::compact(out.path(), state.path(), &mut |step| {
+            trace.push(step.to_owned());
+            if stop == Some(trace.len() - 1) {
+                anyhow::bail!("injected {step}");
+            }
+            Ok(())
+        });
+        for (path, bytes) in &old_files {
+            if path.extension().is_some_and(|e| e == "parquet") && path.exists() {
+                assert_eq!(
+                    &std::fs::read(path).unwrap(),
+                    bytes,
+                    "committed file changed"
+                );
+            }
+        }
+        if stop.is_none() {
+            result.unwrap();
+            stops.extend((0..trace.len()).map(Some));
+            assert_eq!(f7_view_rows(out.path()), expected_views);
+        } else {
+            assert_eq!(
+                trace.len(),
+                stop.unwrap() + 1,
+                "checkpoint {stop:?} not reached: {result:?}"
+            );
+            assert!(result.is_err());
+        }
+        // A poll must finish or roll back compaction before examining the bucket.
+        poll(&args, &store, "").await.unwrap();
+        if trace.iter().any(|s| s == "states") {
+            assert_eq!(
+                files(&out.path().join("_wk_states")).len(),
+                1,
+                "poll did not complete interrupted compaction"
+            );
+        }
+        compact::compact(out.path(), state.path(), &mut |_| Ok(())).unwrap();
+        let states = files(&out.path().join("_wk_states"));
+        assert_eq!(states.len(), 1);
+        let latest = rows(states.keys().next().unwrap());
+        assert_eq!(latest.len(), 3);
+        assert!(
+            latest
+                .iter()
+                .any(|r| r["_wk_name"] == Field::Str("b".into())
+                    && r["_wk_kind"] == Field::Str("deleted".into()))
+        );
+        for path in files(&out.path().join("tables")).keys() {
+            assert!(!path.to_string_lossy().ends_with(".partial"));
+            if path.to_string_lossy().contains("/c/") {
+                assert!(
+                    rows(path)
+                        .iter()
+                        .all(|r| r["_wk_name"] != Field::Str("b".into()))
+                );
+            }
+        }
+        let data = files(&out.path().join("tables/c/items"));
+        let data = rows(data.keys().next().unwrap());
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["value"], Field::Str("rebased".into()));
+        let last = states
+            .keys()
+            .next()
+            .unwrap()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(
+            last > before
+                .keys()
+                .last()
+                .unwrap()
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        );
+        let snapshot = files(out.path());
+        poll(&args, &store, "").await.unwrap();
+        assert_eq!(
+            files(out.path()),
+            snapshot,
+            "unchanged poll duplicated compacted heads"
+        );
+        replace_fixture_actor(
+            &store,
+            "CREATE TABLE items(value); INSERT INTO items VALUES('next')",
+            1,
+        )
+        .await;
+        poll(&args, &store, "").await.unwrap();
+        let states = files(&out.path().join("_wk_states"));
+        assert_eq!(states.len(), 2);
+        assert!(
+            states
+                .keys()
+                .any(|p| p.file_name().unwrap() == format!("{:020}.parquet", last + 1).as_str())
+        );
+    }
+}
+
+// DuckDB remains optional, as in F5. The Python package is also a real DuckDB
+// engine and lets a local test dependency live outside the workspace/toolchain.
+fn f7_view_rows(out: &Path) -> Option<serde_json::Value> {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    if !Command::new("python3")
+        .args(["-c", "import duckdb"])
+        .output()
+        .is_ok_and(|r| r.status.success())
+    {
+        eprintln!("F7 DuckDB execution NOT RUN: Python duckdb unavailable");
+        return None;
+    }
+    let mut child = Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import duckdb, json, sys
+c = duckdb.connect()
+c.execute(sys.stdin.read())
+result = {}
+for (name,) in c.execute('SHOW TABLES').fetchall():
+    if name.endswith('_history'): continue
+    quoted = '"' + name.replace('"', '""') + '"'
+    q = c.execute('SELECT * EXCLUDE (_wk_seq) FROM ' + quoted + ' ORDER BY ALL')
+    result[name] = {'columns': [d[0:2] for d in q.description], 'rows': q.fetchall()}
+print(json.dumps(result, default=str))
+"#,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&std::fs::read(out.join("views.duckdb.sql")).unwrap())
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Some(serde_json::from_slice(&result.stdout).unwrap())
+}
+
+#[tokio::test]
+async fn f7_compaction_lock_binding_empty_and_all_deleted() {
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let args = args(out.path(), state.path());
+    poll(&args, &store, "").await.unwrap();
+    compact::compact(out.path(), state.path(), &mut |_| Ok(())).unwrap();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.path().join("lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    assert!(
+        compact::compact(out.path(), state.path(), &mut |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("locked")
+    );
+    assert!(
+        poll(&args, &store, "")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("locked")
+    );
+    drop(lock);
+    let other = tempfile::tempdir().unwrap();
+    assert!(
+        compact::compact(other.path(), state.path(), &mut |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("another output")
+    );
+    let store = fixture().await;
+    poll(&args, &store, "").await.unwrap();
+    for object in store.list(None).try_collect::<Vec<_>>().await.unwrap() {
+        store.delete(&object.location).await.unwrap();
+    }
+    poll(&args, &store, "").await.unwrap();
+    let before = f7_view_rows(out.path());
+    compact::compact(out.path(), state.path(), &mut |_| Ok(())).unwrap();
+    assert_eq!(f7_view_rows(out.path()), before);
+    let states = files(&out.path().join("_wk_states"));
+    assert_eq!(states.len(), 1);
+    assert!(
+        rows(states.keys().next().unwrap())
+            .iter()
+            .all(|r| r["_wk_kind"] == Field::Str("deleted".into()))
+    );
+    assert!(
+        files(&out.path().join("tables"))
+            .keys()
+            .all(|p| rows(p).is_empty())
+    );
+}
+
+#[tokio::test]
+async fn f7_compaction_preserves_cross_file_casts_and_column_spelling() {
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = fixture().await;
+    poll(&args(out.path(), state.path()), &store, "")
+        .await
+        .unwrap();
+    let mut db = Connection::open(state.path().join("state.db")).unwrap();
+    for (name, values) in [
+        (
+            "b",
+            vec![2.0, 1e-7, 1e16, -0.0]
+                .into_iter()
+                .map(SqlValue::Real)
+                .collect::<Vec<_>>(),
+        ),
+        ("a", vec![SqlValue::Text("latest".into())]),
+    ] {
+        let actor = writer::ActorTable {
+            tenant: "t".into(),
+            app: "a".into(),
+            name: name.into(),
+            seq: 0,
+            generation: 1,
+            txid: 2,
+            committed_at: 100,
+            rows: Rows {
+                columns: vec![],
+                values: vec![],
+            },
+        };
+        commit_batch(
+            &mut db,
+            out.path(),
+            vec![Changed {
+                class: "c".into(),
+                encoded: name.into(),
+                position: SegmentId {
+                    generation: 1,
+                    txid: 2,
+                },
+                identity: "test".into(),
+                label: None,
+                incarnation: "[null,null]".into(),
+                state: writer::State {
+                    actor,
+                    class: "c".into(),
+                    tables: vec!["items".into()],
+                    emitted_at: 200,
+                    kind: "state".into(),
+                    reason: None,
+                },
+                tables: vec![(
+                    "items".into(),
+                    Rows {
+                        columns: vec!["Value".into()],
+                        values: values.into_iter().map(|v| vec![v]).collect(),
+                    },
+                )],
+            }],
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    }
+    let before = f7_view_rows(out.path());
+    compact::compact(out.path(), state.path(), &mut |_| Ok(())).unwrap();
+    assert_eq!(f7_view_rows(out.path()), before);
+}
+
+#[tokio::test]
+async fn f7_compaction_adopts_visible_f3_batch_before_poll_retry() {
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = fixture().await;
+    let args = args(out.path(), state.path());
+    poll(&args, &store, "").await.unwrap();
+    replace_fixture_actor(
+        &store,
+        "CREATE TABLE items(value); INSERT INTO items VALUES('visible')",
+        1,
+    )
+    .await;
+    assert!(
+        poll_with_checkpoint(&args, &store, "", &mut |step| {
+            anyhow::ensure!(step != "before_state", "injected F3 crash");
+            Ok(())
+        })
+        .await
+        .is_err()
+    );
+    // SQL still names the previous batches; regenerate for the visible state.
+    views::publish(out.path()).unwrap();
+    let before = f7_view_rows(out.path());
+    compact::compact(out.path(), state.path(), &mut |_| Ok(())).unwrap();
+    assert_eq!(f7_view_rows(out.path()), before);
+    let states = files(&out.path().join("_wk_states"));
+    assert_eq!(states.len(), 1);
+    assert_eq!(rows(states.keys().next().unwrap()).len(), 3);
+    poll(&args, &store, "").await.unwrap();
+    let after = files(out.path());
+    poll(&args, &store, "").await.unwrap();
+    assert_eq!(files(out.path()), after);
+}
