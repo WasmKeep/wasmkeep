@@ -19,6 +19,7 @@ pub(crate) mod keys;
 pub mod links;
 pub(crate) mod serve;
 mod streams;
+pub(crate) mod sweep;
 pub(crate) mod token;
 
 use std::path::PathBuf;
@@ -85,8 +86,7 @@ impl Blobs {
                 prefix.len()
             ))
         } else {
-            match bucket::Bucket::new(store, format!("{prefix}{bucket_root}blobs/{epoch}/"), spool)
-            {
+            match bucket::Bucket::new(store, &format!("{prefix}{bucket_root}"), epoch, spool) {
                 Ok(b) => Backend::Bucket(b),
                 Err(e) => Backend::Off(e),
             }
@@ -305,7 +305,7 @@ fn now_ms() -> u64 {
 }
 
 /// 16 random lowercase hex digits.
-fn random_id() -> Result<String, BlobError> {
+pub(crate) fn random_id() -> Result<String, BlobError> {
     use ring::rand::SecureRandom as _;
     let mut b = [0u8; 8];
     ring::rand::SystemRandom::new()

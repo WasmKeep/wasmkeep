@@ -84,6 +84,31 @@ impl Disk {
         }
     }
 
+    /// Removes every incarnation of the actor `class/name` but `keep`
+    /// (all of them with `None`): on a node without a bucket the actor's
+    /// database names its incarnation, and no other one is reachable.
+    pub(super) async fn remove_actor(&self, class: &str, name: &str, keep: Option<String>) {
+        let actor = self.base.join(class).join(super::keys::name_id(name));
+        let opened = Arc::clone(&self.opened);
+        let _ = tokio::task::spawn_blocking(move || {
+            let Ok(entries) = std::fs::read_dir(&actor) else {
+                return;
+            };
+            let mut opened = opened.lock().unwrap_or_else(|p| p.into_inner());
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if keep.as_deref() == Some(name.as_str()) {
+                    continue;
+                }
+                let path = e.path();
+                opened.remove(&path);
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            let _ = fsync_dir(&actor);
+        })
+        .await;
+    }
+
     fn dir(&self, ns: &Namespace) -> PathBuf {
         self.base.join(ns.rel())
     }

@@ -369,6 +369,16 @@ impl ActorState {
             Ok(v) => v,
             Err(_) => return Restored::Retry,
         };
+        // The replacement keeps the current blob incarnation (ADR 0030,
+        // section 5), never the staged database's: a restore to a point
+        // before a delete stays in the incarnation the delete drew.
+        let incarnation = match self.restore_meta(BLOB_INCARNATION_KEY).await {
+            Ok(v) => match wasmkeep_cluster::blob_sweep::incarnation_of(v.as_deref()) {
+                Ok(i) => i,
+                Err(e) => return Restored::End("refused", e),
+            },
+            Err(_) => return Restored::Retry,
+        };
         let generation = slot.lock().await.generation();
         // Validate both fences before any externally visible disruption. They
         // are checked again on retries and immediately before the reset.
@@ -480,6 +490,12 @@ impl ActorState {
             ] {
                 db.set_meta(key, &value).map_err(|e| e.to_string())?;
             }
+            if incarnation == wasmkeep_cluster::blob_sweep::FIRST {
+                db.delete_meta(BLOB_INCARNATION_KEY)
+            } else {
+                db.set_meta(BLOB_INCARNATION_KEY, &incarnation)
+            }
+            .map_err(|e| e.to_string())?;
             db.start_capture().map_err(|e| e.to_string())?;
             db.snapshot().map_err(|e| e.to_string())
         })
@@ -752,8 +768,15 @@ mod tests {
                 },
             );
             let address = ActorAddress::new("t", "c", "a").unwrap();
-            let snapshot =
-                empty_database_snapshot(&storage, &address, None, marker, "delete 42 10").unwrap();
+            let snapshot = empty_database_snapshot(
+                &storage,
+                &address,
+                None,
+                marker,
+                "delete 42 10",
+                "00000000000000a1",
+            )
+            .unwrap();
             let path = storage.db_path("c", "a");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             let mut restorer = Restorer::create(&path, 1 << 20).unwrap();
@@ -764,7 +787,7 @@ mod tests {
             let mut db = storage.open("c", "a").unwrap();
             assert_eq!(db.meta(OPERATOR_RESTORE_KEY).unwrap(), None);
             let mut fresh = storage.open("c", "fresh").unwrap();
-            mark_deleted(&mut fresh, None, marker, "delete 42 10").unwrap();
+            mark_deleted(&mut fresh, None, marker, "delete 42 10", "00000000000000a1").unwrap();
             assert_eq!(fresh.meta(OPERATOR_RESTORE_KEY).unwrap(), None);
         }
     }
@@ -781,9 +804,15 @@ mod tests {
             },
         );
         let address = ActorAddress::new("t", "c", "a").unwrap();
-        let snapshot =
-            empty_database_snapshot(&storage, &address, Some("9 d"), Some("8 r"), "delete 42 10")
-                .unwrap();
+        let snapshot = empty_database_snapshot(
+            &storage,
+            &address,
+            Some("9 d"),
+            Some("8 r"),
+            "delete 42 10",
+            "00000000000000a1",
+        )
+        .unwrap();
         let file = snapshot.to_ltx(1, 42, 10).unwrap();
         let path = storage.db_path("c", "a");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -799,7 +828,14 @@ mod tests {
             db.meta("replaced").unwrap().as_deref(),
             Some("delete 42 10")
         );
-        mark_deleted(&mut db, Some("12 d2"), Some("8 r"), "delete 43 12").unwrap();
+        mark_deleted(
+            &mut db,
+            Some("12 d2"),
+            Some("8 r"),
+            "delete 43 12",
+            "00000000000000a2",
+        )
+        .unwrap();
         assert_eq!(
             db.meta(OPERATOR_RESTORE_KEY).unwrap().as_deref(),
             Some("8 r")

@@ -282,3 +282,46 @@ async fn a_mode_change_is_a_line_of_the_plan() {
         .unwrap();
     assert_eq!(strict.diff.writes, vec!["c: batched -> strict".to_owned()]);
 }
+
+/// A class or a front importing `wasmkeep:actor/blobs` needs every live
+/// node of the app to announce `blobs` (ADR 0030, section 11): such a node
+/// could not link it, nor end an actor's files with it. No `--force`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_component_using_files_waits_for_every_node_to_have_blobs() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = deploy_runtime();
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    node_with_words(&store, "new", "take front handoff ends flush blobs").await;
+    node_with_words(&store, "old", "take front handoff ends flush").await;
+    let before = bucket_keys(&store).await;
+    for changes in [
+        Changes {
+            classes: classes(super::blobs::blob_actor()),
+            ..Changes::default()
+        },
+        Changes {
+            classes: classes(counter_wasm()),
+            front: wasmkeep_server::apps::FrontChange::Set(super::blobs::test_front().to_vec()),
+            ..Changes::default()
+        },
+    ] {
+        let e = app.deploy_changes(&rt, changes).await.unwrap_err();
+        assert!(
+            matches!(&e, DeployError::NodesWithoutBlobs { nodes, .. } if nodes == "old"),
+            "{e}"
+        );
+        assert!(e.to_string().contains("wasmkeep:actor/blobs"), "{e}");
+        assert_eq!(bucket_keys(&store).await, before, "nothing written");
+    }
+    // Once every node has it, both deploy.
+    node_with_words(&store, "old", "take front handoff ends flush blobs").await;
+    app.deploy_changes(
+        &rt,
+        Changes {
+            classes: classes(super::blobs::blob_actor()),
+            ..Changes::default()
+        },
+    )
+    .await
+    .unwrap();
+}

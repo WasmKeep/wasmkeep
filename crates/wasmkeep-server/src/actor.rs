@@ -45,6 +45,7 @@ use wasmkeep_wit::wasmkeep::actor::websockets::{
 };
 
 mod alarm_delivery;
+mod blob_sweeps;
 mod classes;
 mod collection;
 mod deletes;
@@ -492,6 +493,9 @@ const DEPLOY_SEQ_KEY: &str = "deploy_seq";
 /// twice.
 const OPERATOR_DELETE_KEY: &str = "operator_delete";
 const OPERATOR_RESTORE_KEY: &str = "operator_restore";
+/// The actor's blob incarnation (ADR 0030, section 2): drawn by each
+/// delete and written in the empty database its reset carries.
+const BLOB_INCARNATION_KEY: &str = "blob_incarnation";
 
 /// `refresh_class`: the actor's class was removed by a deploy.
 const CLASS_GONE: &str = "class no longer served";

@@ -3,10 +3,13 @@
 //! SDK's own API comes later), plus `GET /self`: `class/name`, and
 //! `POST /alarm`: an alarm now, whose `on-alarm` writes `from-alarm`. An
 //! actor whose name starts with `init-` writes `from-init` from `on-init`.
+//! `POST /touch`: a plain SQL write; `POST /delete`: `delete-self`; `POST /delete-durable`:
+//! `delete-self-durable`, then a `put` of `after` (answers `deleted PUT`,
+//! PUT the put's outcome).
 
 use wasmkeep_sdk::front::bindings::wasmkeep::actor::blobs;
 use wasmkeep_sdk::http::{self, IncomingRequest, ResponseOutparam};
-use wasmkeep_sdk::{Actor, actors, alarms, now_ms};
+use wasmkeep_sdk::{Actor, actors, alarms, now_ms, storage};
 
 include!("../../blob-routes.rs");
 
@@ -39,6 +42,36 @@ fn write_from(key: &str) -> Result<(), String> {
 impl http::Guest for BlobActor {
     fn handle(request: IncomingRequest, out: ResponseOutparam) {
         let full = request.path_with_query().unwrap_or_default();
+        if full == "/touch" {
+            let done = storage::exec("CREATE TABLE IF NOT EXISTS t (x INTEGER)", &[])
+                .and_then(|_| storage::exec("INSERT INTO t VALUES (1)", &[]));
+            let body: &[u8] = if done.is_ok() { b"touched" } else { b"failed" };
+            http::respond(out, 200, "text/plain", body);
+            return;
+        }
+        if full == "/delete" {
+            storage::delete_self();
+            http::respond(out, 200, "text/plain", b"deleted");
+            return;
+        }
+        if full == "/delete-durable" {
+            let body = match storage::delete_self_durable() {
+                Ok(()) => {
+                    let after = blobs::put(
+                        "after",
+                        b"after",
+                        &blobs::WriteOptions {
+                            content_type: None,
+                            condition: blobs::Condition::Any,
+                        },
+                    );
+                    format!("deleted {}", if after.is_ok() { "put" } else { "refused" })
+                }
+                Err(e) => format!("err {e:?}"),
+            };
+            http::respond(out, 200, "text/plain", body.as_bytes());
+            return;
+        }
         if full == "/alarm" {
             alarms::set_alarm(now_ms());
             http::respond(out, 200, "text/plain", b"set");

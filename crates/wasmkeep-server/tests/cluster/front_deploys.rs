@@ -716,12 +716,13 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
             .format_number(),
         1
     );
-    // Upgraded (it now says `front`): the deploy goes through.
+    // Upgraded (it now says `front`, and `blobs`: the test front can keep
+    // files): the deploy goes through.
     store
         .put(
             &"nodes/old".into(),
             format!(
-                "wasmkeep-node 2\nold\nhttp://10.0.0.9:8080\n0.4.0\n{}\ndefault/shop\n\n\nserving\nsecrets\ntake front\n",
+                "wasmkeep-node 2\nold\nhttp://10.0.0.9:8080\n0.4.0\n{}\ndefault/shop\n\n\nserving\nsecrets\ntake front blobs\n",
                 now_ms()
             )
             .into_bytes()

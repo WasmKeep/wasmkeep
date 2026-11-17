@@ -90,6 +90,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         can_flush: false,
         can_rate_limits: false,
         can_assets: false,
+        can_blobs: false,
         can_restore: false,
         can_actor_restore: false,
         instance: None,
@@ -745,6 +746,7 @@ async fn only_serving_peers_of_the_same_app_that_are_not_draining_are_chosen() {
         can_take: false,
         can_handoff: false,
         can_end: false,
+        can_blobs: false,
         instance: None,
     };
     let serving = Some(DrainState::Serving);
@@ -805,6 +807,7 @@ async fn only_nodes_that_deliver_this_apps_alarms_share_the_sweep() {
         can_take: false,
         can_handoff: false,
         can_end: false,
+        can_blobs: false,
         instance: None,
     };
     let serving = Some(DrainState::Serving);
@@ -858,6 +861,7 @@ async fn live_nodes_split_the_alarm_sweep_between_them() {
             can_take: false,
             can_handoff: false,
             can_end: false,
+            can_blobs: false,
             instance: None,
         };
         *c.peers.write().unwrap() = HashMap::from([
@@ -929,6 +933,7 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_take: false,
                     can_handoff: false,
                     can_end: false,
+                    can_blobs: false,
                     instance: None,
                 },
             ),
@@ -942,6 +947,7 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_take: false,
                     can_handoff: false,
                     can_end: false,
+                    can_blobs: false,
                     instance: None,
                 },
             ),
@@ -955,6 +961,7 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_take: false,
                     can_handoff: false,
                     can_end: false,
+                    can_blobs: false,
                     instance: None,
                 },
             ),
@@ -1052,6 +1059,7 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 can_take: false,
                 can_handoff: false,
                 can_end: false,
+                can_blobs: false,
                 instance: None,
             },
         ),
@@ -1065,6 +1073,7 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 can_take: false,
                 can_handoff: false,
                 can_end: false,
+                can_blobs: false,
                 instance: None,
             },
         ),
@@ -2735,6 +2744,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         can_flush: false,
         can_rate_limits: false,
         can_assets: false,
+        can_blobs: false,
         can_restore: false,
         can_actor_restore: false,
         instance: Some("iz".into()),
@@ -2857,6 +2867,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         can_flush: false,
         can_rate_limits: false,
         can_assets: false,
+        can_blobs: false,
         can_restore: false,
         can_actor_restore: false,
         instance: Some("0011223344556677".to_owned()),

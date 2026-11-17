@@ -24,6 +24,7 @@ pub(super) async fn deploy(store: &Arc<dyn ObjectStore>) -> Result<(), DeployErr
             vec![
                 ("t".to_owned(), test_actor_wasm().to_vec()),
                 ("chat".to_owned(), chat_wasm().to_vec()),
+                ("blob".to_owned(), super::blobs::blob_actor().to_vec()),
             ],
         )
         .await
@@ -59,6 +60,7 @@ pub(super) async fn app_node_following(
     let mut config = ActorConfig::new(data);
     config.access = version.access;
     config.mailbox.idle_timeout = Duration::from_secs(30);
+    config.blob_links.base = Some(format!("http://{addr}"));
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     cluster.heartbeat = Duration::from_millis(100);
@@ -362,4 +364,41 @@ async fn delete_and_recreate_keep_the_app_format_setting() {
     assert!(app.recreate(Duration::from_millis(500)).await.unwrap());
     let body = store.get(&setting).await.unwrap().bytes().await.unwrap();
     assert_eq!(&body[..], app_format::ENABLED_BODY);
+}
+
+/// A seen tombstone refuses every node link (ADR 0030, section 4), and
+/// the command says when to run the listings that remove late uploads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_refuses_every_node_link() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _follows) = app_node_following("a", dir.path(), &store).await.unwrap();
+    settle().await;
+    let r = send_runnable(a.addr, "PUT", "/actor/blob/x/b/k", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = send_runnable(a.addr, "GET", "/actor/blob/x/link/k", "").await;
+    let url = r.body.trim().to_owned();
+    let path = url
+        .strip_prefix(&format!("http://{}", a.addr))
+        .unwrap()
+        .to_owned();
+    assert_eq!(send(a.addr, "GET", &path, "").await.status, 200);
+    let refused = async {
+        eventually(
+            "the link is refused once the tombstone is seen",
+            async || match try_send(a.addr, "GET", &path, "").await {
+                Ok(r) => r.status != 200,
+                Err(_) => true,
+            },
+        )
+        .await;
+        if let Ok(r) = try_send(a.addr, "GET", &path, "").await {
+            assert!(matches!(r.status, 403 | 503), "{} {}", r.status, r.body);
+        }
+    };
+    let (done, ()) = tokio::join!(delete(&store), refused);
+    let done = done.unwrap();
+    assert!(done.contains("--resume "), "{done}");
+    assert!(done.contains("in 60 min"), "{done}");
 }

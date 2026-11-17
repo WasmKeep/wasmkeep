@@ -119,6 +119,22 @@ pub enum DeployError {
         /// What needs it: the classes importing it, or the format.
         what: String,
     },
+    /// Live nodes of the app do not announce the capability word `blobs`
+    /// (ADR 0030, section 11) while a class or the front imports
+    /// `wasmkeep:actor/blobs`: they cannot link it, nor end an actor's
+    /// files with it. There is no `--force`.
+    #[error(
+        "live nodes of {app} do not have files ({nodes}), which {what} wasmkeep:actor/blobs: \
+         upgrade every node of the app first, then deploy (this check has no --force)"
+    )]
+    NodesWithoutBlobs {
+        /// `tenant/app`.
+        app: String,
+        /// Their ids, comma separated.
+        nodes: String,
+        /// The classes (or `_front`) importing it.
+        what: String,
+    },
     /// Live nodes of the app do not announce the capability word `ends`
     /// (ADR 0028) while a component imports `storage.delete-self-durable`
     /// (ADR 0034, section 1, exception 2): they cannot link it.
@@ -404,7 +420,9 @@ impl AppRef {
         given: &[(String, StorageImports)],
         kept: &[(String, String)],
     ) -> Result<(), DeployError> {
-        let needs_any = given.iter().any(|(_, i)| i.flush || i.delete_self_durable);
+        let needs_any = given
+            .iter()
+            .any(|(_, i)| i.flush || i.delete_self_durable || i.blobs);
         if !needs_any && kept.is_empty() {
             return Ok(());
         }
@@ -415,7 +433,10 @@ impl AppRef {
             &self.app,
         )
         .await?;
-        if nodes.iter().all(|n| n.can_flush && n.can_end) {
+        if nodes
+            .iter()
+            .all(|n| n.can_flush && n.can_end && n.can_blobs)
+        {
             return Ok(());
         }
         let mut imports = given.to_vec();
@@ -449,6 +470,7 @@ impl AppRef {
                 .collect()
         };
         let (flush, ends) = (classes(|i| i.flush), classes(|i| i.delete_self_durable));
+        let blobs = classes(|i| i.blobs);
         let app = format!("{}/{}", self.tenant, self.app);
         let lacking = |has: fn(&wasmkeep_cluster::membership::NodeInfo) -> bool| {
             nodes
@@ -459,6 +481,9 @@ impl AppRef {
                 .join(", ")
         };
         let what = |classes: &[&str]| {
+            if classes == [FRONT] {
+                return "the front imports".to_owned();
+            }
             let plural = if classes.len() == 1 { "" } else { "es" };
             format!(
                 "class{plural} {} import{}",
@@ -473,6 +498,16 @@ impl AppRef {
                     app,
                     nodes: without,
                     what: what(&flush),
+                });
+            }
+        }
+        if !blobs.is_empty() {
+            let without = lacking(|n| n.can_blobs);
+            if !without.is_empty() {
+                return Err(DeployError::NodesWithoutBlobs {
+                    app,
+                    nodes: without,
+                    what: what(&blobs),
                 });
             }
         }
@@ -1100,6 +1135,8 @@ impl AppRef {
             crate::front::validate(runtime, &component)
                 .await
                 .map_err(|e| DeployError::Front(error_chain(&e)))?;
+            // A front that keeps files needs `blobs` as a class does.
+            imports.push((FRONT.to_owned(), StorageImports::of(runtime, &component)));
         }
 
         let read = self.read_current().await?;
@@ -1182,6 +1219,7 @@ impl AppRef {
             FrontChange::Keep => match &base {
                 Some((current, manifest, _)) => manifest.front.clone().inspect(|_| {
                     copies.push((current.version.clone(), format!("{FRONT}.wasm")));
+                    kept.push((current.version.clone(), FRONT.to_owned()));
                 }),
                 None => None,
             },
@@ -1598,11 +1636,14 @@ impl AppRef {
         // Back to a version with a front: its readers are checked as a
         // deploy writing it checks them, and its components' imports too.
         self.check_readers(&back).await?;
-        let kept: Vec<(String, String)> = back
+        let mut kept: Vec<(String, String)> = back
             .classes
             .keys()
             .map(|c| (previous.clone(), c.clone()))
             .collect();
+        if back.front.is_some() {
+            kept.push((previous.clone(), FRONT.to_owned()));
+        }
         self.check_imports(None, &[], &kept).await?;
         // Rooted, so marked (ADR 0022).
         let marked = true;
@@ -2846,6 +2887,9 @@ pub struct StorageImports {
     pub flush: bool,
     /// `storage.delete-self-durable`: a node announcing `ends`.
     pub delete_self_durable: bool,
+    /// `wasmkeep:actor/blobs`, any function of it: a node announcing
+    /// `blobs` (ADR 0030, section 11).
+    pub blobs: bool,
 }
 
 impl StorageImports {
@@ -2861,6 +2905,10 @@ impl StorageImports {
             let ComponentItem::ComponentInstance(instance) = item.ty else {
                 continue;
             };
+            if name.starts_with("wasmkeep:actor/blobs@") {
+                found.blobs = true;
+                continue;
+            }
             if !name.starts_with("wasmkeep:actor/storage@") {
                 continue;
             }

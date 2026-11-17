@@ -384,6 +384,12 @@ impl ActorService {
                 Arc::downgrade(&service.inner),
                 Arc::clone(&cluster),
             ));
+            // Deleted actors' files and other epochs' (ADR 0030), on the
+            // same node.
+            tokio::spawn(blob_sweeps::sweep_loop(
+                Arc::downgrade(&service.inner),
+                Arc::clone(&cluster),
+            ));
             // Close sockets whose actor this node no longer owns.
             tokio::spawn(socket_owners::close_sockets_at_lapse(
                 Arc::downgrade(&sockets),

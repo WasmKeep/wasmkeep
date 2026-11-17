@@ -927,10 +927,13 @@ impl ActorState {
         operator_delete: Option<String>,
         operator_restore: Option<String>,
         erase_now: bool,
+        incarnations: (String, String),
     ) -> Result<(), String> {
         let Some(slot) = self.replica().cloned() else {
             return Ok(());
         };
+        let (old_incarnation, new_incarnation) = incarnations;
+        let new_for_reset = new_incarnation.clone();
         let replacement = {
             let replica = slot.lock().await;
             format!(
@@ -951,6 +954,7 @@ impl ActorState {
                     operator_delete.as_deref(),
                     operator_restore.as_deref(),
                     &replacement,
+                    &new_for_reset,
                 )
                 .map(|all| (None, all));
             }
@@ -964,6 +968,7 @@ impl ActorState {
                 operator_delete.as_deref(),
                 operator_restore.as_deref(),
                 &replacement,
+                &new_for_reset,
             )?;
             db.start_capture().map_err(|e| e.to_string())?;
             let all = db.snapshot().map_err(|e| e.to_string())?;
@@ -976,10 +981,40 @@ impl ActorState {
         let result = match opened {
             Ok((db, all)) => {
                 self.db = db;
+                // The sweep record first (ADR 0030, section 5): in the
+                // bucket before any byte of the reset, or no delete.
+                let recorded = match self.blobs() {
+                    Some(blobs) if blobs.on_a_bucket() => blobs
+                        .write_record(
+                            self.address.class(),
+                            self.address.name(),
+                            &old_incarnation,
+                            wasmkeep_cluster::blob_sweep::State::Pending,
+                        )
+                        .await
+                        .map_err(|e| format!("writing the sweep record: {e}")),
+                    _ => Ok(()),
+                };
                 let mut replica = slot.lock().await;
                 let empty = all.clone();
-                match replica.ship_reset(all).await {
+                let shipped = match recorded {
+                    Ok(()) => replica.ship_reset(all).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
+                match shipped {
                     Ok(()) => {
+                        // Acknowledged under a valid hold: the delete is
+                        // done, and the old namespace is swept.
+                        if self.held.as_ref().is_some_and(Held::is_valid)
+                            && let Some(blobs) = self.blobs()
+                        {
+                            crate::blobs::sweep::sweep_after_delete(
+                                blobs,
+                                self.address.class().to_owned(),
+                                self.address.name().to_owned(),
+                                old_incarnation.clone(),
+                            );
+                        }
                         // A snapshot of the empty database at the reset,
                         // then everything before it goes, whatever the
                         // retention window: erasing the data is the point
@@ -1027,7 +1062,7 @@ impl ActorState {
                         }
                         Ok(())
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e),
                 }
             }
             Err(e) => Err(e),
@@ -1111,6 +1146,13 @@ impl ActorState {
             .restore_meta(OPERATOR_RESTORE_KEY)
             .await
             .unwrap_or_default();
+        // The incarnation this delete ends, and the next one (ADR 0030,
+        // section 2): never defaulted from a value that cannot be read.
+        let old_incarnation = match self.restore_meta(BLOB_INCARNATION_KEY).await {
+            Ok(v) => wasmkeep_cluster::blob_sweep::incarnation_of(v.as_deref())?,
+            Err(e) => return Err(format!("reading the blob incarnation: {e}")),
+        };
+        let new_incarnation = crate::blobs::random_id().map_err(|e| format!("{e:?}"))?;
         if let Some(mut live) = self.live.take() {
             let _ = live.store.data_mut().drain_db().await;
         }
@@ -1128,8 +1170,24 @@ impl ActorState {
             }
         }
         let recorded = self
-            .replicate_delete(files_removed, operator_delete, operator_restore, erase_now)
+            .replicate_delete(
+                files_removed,
+                operator_delete,
+                operator_restore,
+                erase_now,
+                (old_incarnation, new_incarnation),
+            )
             .await;
+        // A node without a bucket: the database names its incarnation, and
+        // the next one draws another; the old files go now.
+        if files_removed
+            && self.replica().is_none()
+            && let Some(blobs) = self.blobs()
+        {
+            blobs
+                .remove_local(self.address.class(), self.address.name(), None)
+                .await;
+        }
         // Only once the delete is in the bucket.
         self.retire_alarm_entry(stale).await;
         if !files_removed {
@@ -1144,6 +1202,53 @@ impl ActorState {
             self.release_hold();
         }
         recorded
+    }
+
+    /// The actor's blob incarnation, read from its database once per
+    /// instance (after the restore). In a cluster an absent value is the
+    /// first incarnation, which only a delete moves; on a node without a
+    /// bucket the database is the only record of it, so a database without
+    /// one (a new actor, or the next one after a delete) draws a new one,
+    /// and the files of any other incarnation of the address go.
+    async fn blob_incarnation(
+        &mut self,
+        db: &mut ResidentDb,
+        blobs: Option<&crate::blobs::Blobs>,
+    ) -> Result<String, String> {
+        let stored = db
+            .meta(BLOB_INCARNATION_KEY)
+            .map_err(|e| format!("reading the blob incarnation: {e}"))?;
+        if let Some(blobs) = blobs
+            && !blobs.on_a_bucket()
+            && self.cluster.is_none()
+        {
+            let incarnation = match stored {
+                Some(v) => wasmkeep_cluster::blob_sweep::incarnation_of(Some(&v))?,
+                None => {
+                    let fresh = crate::blobs::random_id().map_err(|e| format!("{e:?}"))?;
+                    db.set_meta(BLOB_INCARNATION_KEY, &fresh)
+                        .map_err(|e| format!("writing the blob incarnation: {e}"))?;
+                    fresh
+                }
+            };
+            blobs
+                .remove_local(
+                    self.address.class(),
+                    self.address.name(),
+                    Some(&incarnation),
+                )
+                .await;
+            return Ok(incarnation);
+        }
+        wasmkeep_cluster::blob_sweep::incarnation_of(stored.as_deref())
+    }
+
+    /// The app's files, if the service is still there.
+    pub(super) fn blobs(&self) -> Option<Arc<crate::blobs::Blobs>> {
+        self.service
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|s| Arc::clone(&s.blobs))
     }
 
     /// Gives the actor up after a replication failure: everything local may
@@ -1269,7 +1374,12 @@ impl ActorState {
                     .map_err(|e| format!("{e:#}"))?
                 }
             };
-            let db = self.start_replication(db).await?;
+            let mut db = self.start_replication(db).await?;
+            // The incarnation this hold's files are under (ADR 0030,
+            // section 2), from the restored database: never defaulted
+            // from a value that cannot be read.
+            let blobs = self.blobs();
+            let incarnation = self.blob_incarnation(&mut db, blobs.as_deref()).await?;
             let mut host = ActorHost::new(db, Arc::clone(&self.sockets));
             host.replica = self.replica().cloned();
             host.deleter = Some((self.storage.clone(), self.address.clone()));
@@ -1282,11 +1392,12 @@ impl ActorState {
             // Its own namespace, at incarnation 0 until deletes draw new
             // ones (ADR 0030, slice B4); writes wait for the event's hold.
             host.blob = crate::blobs::host::Caller::new(
-                self.service
-                    .get()
-                    .and_then(std::sync::Weak::upgrade)
-                    .map(|s| Arc::clone(&s.blobs)),
-                crate::blobs::Namespace::actor(self.address.class(), self.address.name(), "0"),
+                blobs,
+                crate::blobs::Namespace::actor(
+                    self.address.class(),
+                    self.address.name(),
+                    &incarnation,
+                ),
                 crate::blobs::host::Gate::Unheld,
             );
             host.alarm_index = self

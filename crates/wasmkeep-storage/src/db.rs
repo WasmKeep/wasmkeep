@@ -1283,6 +1283,14 @@ impl ActorDb {
         })
     }
 
+    /// Removes a host metadata value, if there is one.
+    pub fn delete_meta(&mut self, key: &str) -> Result<(), SqlError> {
+        self.internal(|conn| {
+            conn.execute("DELETE FROM main._wasmkeep_meta WHERE key = ?1", [key])
+                .map(drop)
+        })
+    }
+
     /// The pending alarm (ms since the Unix epoch), if any.
     ///
     /// Alarm writes go through the same connection as the guest's

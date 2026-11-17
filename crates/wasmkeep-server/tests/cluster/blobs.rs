@@ -14,6 +14,10 @@ pub(crate) fn blob_actor() -> &'static [u8] {
     blob_actor_wasm()
 }
 
+pub(crate) fn test_front() -> &'static [u8] {
+    front_wasm()
+}
+
 fn front_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     WASM.get_or_init(|| guests::build_guest("tests/guests/test-front", "test_front"))
@@ -38,6 +42,17 @@ async fn class_node(
     class: &str,
     wasm: &[u8],
 ) -> Node {
+    class_node_with(cluster, data, class, wasm, |_| {}).await
+}
+
+/// [`class_node`], its configuration changed by `configure` last.
+async fn class_node_with(
+    cluster: Option<(&str, &Arc<dyn ObjectStore>)>,
+    data: &Path,
+    class: &str,
+    wasm: &[u8],
+    configure: impl FnOnce(&mut ActorConfig),
+) -> Node {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let runtime = Runtime::new(&RuntimeConfig {
@@ -57,6 +72,7 @@ async fn class_node(
         config.cluster = Some(cluster);
     }
     let cluster_port = cluster_listener(&mut config).await;
+    configure(&mut config);
     let service = ActorService::new(
         runtime.clone(),
         config,
@@ -491,12 +507,15 @@ async fn a_node_alone_keeps_files_on_its_disk_across_a_restart() {
     // On disk under the app's folder and epoch, by namespace; no file is
     // named after a key.
     let epoch = wasmkeep_server::blobs::epoch(None, None);
-    let dir = wasmkeep_server::local_app_dir(d.path(), "default", "default")
+    let actor = wasmkeep_server::local_app_dir(d.path(), "default", "default")
         .join("blobs")
         .join(&epoch)
         .join("blob")
-        .join(sha256_hex(b"alice"))
-        .join("0");
+        .join(sha256_hex(b"alice"));
+    // One incarnation, the one the actor's database names.
+    let incarnations: Vec<_> = std::fs::read_dir(&actor).unwrap().flatten().collect();
+    assert_eq!(incarnations.len(), 1);
+    let dir = incarnations[0].path();
     assert!(dir.join("index.db").exists(), "{}", dir.display());
     let files: Vec<_> = std::fs::read_dir(dir.join("f")).unwrap().collect();
     assert_eq!(files.len(), 2);
@@ -925,4 +944,544 @@ async fn a_front_links_its_own_files_and_an_actors_token_names_the_actors() {
     let actor = make_link(&a, "/link/k").await;
     assert_eq!(call(a.addr, "GET", &front, "", b"").await.body, "front");
     assert_eq!(call(a.addr, "GET", &actor, "", b"").await.body, "actor");
+}
+
+/// The keys under `blobs/` and `blob-sweeps/` of the implicit app.
+async fn file_keys(store: &Arc<dyn ObjectStore>) -> (Vec<String>, Vec<String>) {
+    let keys = bucket_keys(store).await;
+    let files = keys
+        .iter()
+        .filter(|k| k.contains("/blobs/"))
+        .cloned()
+        .collect();
+    let records = keys
+        .iter()
+        .filter(|k| k.contains("/blob-sweeps/"))
+        .cloned()
+        .collect();
+    (files, records)
+}
+
+/// After a delete of `name` (by `how`), the next actor at the address
+/// finds none of the old files, the old ones go, and a link to one fails.
+async fn a_delete_ends_the_files(how: &str) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let a = blob_node("a", d.path(), &store).await;
+    settle().await;
+    let n = "/actor/blob/doomed";
+    for k in ["k", "dir/k2"] {
+        let r = call(a.addr, "PUT", &format!("{n}/b/{k}"), "", b"old").await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let r = call(a.addr, "GET", &format!("{n}/link/k"), "", b"").await;
+    let link = link_path(&a, r.body.trim());
+    assert_eq!(call(a.addr, "GET", &link, "", b"").await.status, 200);
+    match how {
+        "delete-self" => {
+            let r = call(a.addr, "POST", &format!("{n}/delete"), "", b"").await;
+            assert_eq!(r.body, "deleted");
+        }
+        "delete-self-durable" => {
+            let r = call(a.addr, "POST", &format!("{n}/delete-durable"), "", b"").await;
+            // Nothing is written by the deleted actor after its delete.
+            assert_eq!(r.body, "deleted refused");
+        }
+        "operator" => {
+            request_delete_of(&store, "blob", "doomed").await;
+        }
+        _ => unreachable!(),
+    }
+    // The next actor at the address starts in another namespace.
+    eventually("the next actor lists none of the old files", async || {
+        let r = call(a.addr, "GET", &format!("{n}/list"), "", b"").await;
+        r.status == 200 && r.body == "next=-"
+    })
+    .await;
+    let r = call(a.addr, "GET", &format!("{n}/b/k"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (404, "none"));
+    // And the old files go, with any link to them.
+    eventually("the old files are swept", async || {
+        file_keys(&store).await.0.is_empty()
+    })
+    .await;
+    assert_eq!(call(a.addr, "GET", &link, "", b"").await.status, 404);
+    let (_, records) = file_keys(&store).await;
+    assert_eq!(records.len(), 1, "one record, swept: {records:?}");
+    let body = store
+        .get(&object_store::path::Path::from(records[0].as_str()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("\nswept\n"),
+        "{body:?}"
+    );
+    // The new actor's own files are its own.
+    let r = call(a.addr, "PUT", &format!("{n}/b/k"), "", b"new").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        call(a.addr, "GET", &format!("{n}/b/k"), "", b"").await.body,
+        "new"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_self_ends_the_actors_files() {
+    a_delete_ends_the_files("delete-self").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_self_durable_ends_the_actors_files() {
+    a_delete_ends_the_files("delete-self-durable").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_delete_ends_the_actors_files() {
+    a_delete_ends_the_files("operator").await;
+}
+
+/// A bucket that refuses, on demand, writes of the actors' history (a
+/// reset or segment that fails) and rewrites of sweep records after their
+/// first write.
+#[derive(Debug, Default)]
+struct Faulty {
+    inner: InMemory,
+    fail_history: AtomicBool,
+    fail_record_rewrites: AtomicBool,
+}
+
+impl std::fmt::Display for Faulty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Faulty")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Faulty {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        use object_store::ObjectStoreExt as _;
+        let key = location.as_ref();
+        let refuse = (self.fail_history.load(Ordering::SeqCst) && key.contains("/actors/"))
+            || (self.fail_record_rewrites.load(Ordering::SeqCst)
+                && key.contains("/blob-sweeps/")
+                && self.inner.head(location).await.is_ok());
+        if refuse {
+            return Err(object_store::Error::Generic {
+                store: "Faulty",
+                source: "refused".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(prefix)
+    }
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list_with_offset(prefix, offset)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A node whose sweep pass runs every 100 ms and acts at ages of
+/// 300 ms (judging), 600 ms (the second listing) and 900 ms (the last).
+async fn sweeping_node(data: &Path, store: &Arc<dyn ObjectStore>, batched: bool) -> Node {
+    sweeping_node_judging_at(data, store, batched, 300).await
+}
+
+/// [`sweeping_node`], judging `pending` records at `judge_after` ms.
+async fn sweeping_node_judging_at(
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    batched: bool,
+    judge_after: u64,
+) -> Node {
+    class_node_with(Some(("a", store)), data, "blob", blob_actor_wasm(), |c| {
+        let cluster = c.cluster.as_mut().unwrap();
+        cluster.blob_sweep_every = Duration::from_millis(100);
+        cluster.blob_epochs_every = Duration::from_millis(100);
+        cluster.blob_sweep_ages = wasmkeep_cluster::blob_sweep::Ages {
+            judge_after,
+            relist_after: 600,
+            last_after: 900,
+        };
+        if batched {
+            c.batched.insert("blob".into());
+        }
+    })
+    .await
+}
+
+async fn record_body(store: &Arc<dyn ObjectStore>) -> Option<String> {
+    let (_, records) = file_keys(store).await;
+    let key = records.first()?;
+    let body = store
+        .get(&object_store::path::Path::from(key.as_str()))
+        .await
+        .ok()?
+        .bytes()
+        .await
+        .ok()?;
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A `pending` record of the incarnation the actor still has (a delete
+/// that never happened): judged from a fenced restore, dropped, and no
+/// file is touched; in a strict class and in a batched one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_record_of_the_live_incarnation_is_dropped_and_keeps_every_file() {
+    for batched in [false, true] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let d = tempfile::tempdir().unwrap();
+        let a = sweeping_node(d.path(), &store, batched).await;
+        settle().await;
+        let n = "/actor/blob/kept";
+        call(a.addr, "PUT", &format!("{n}/b/k"), "", b"mine").await;
+        // A judgement needs the actor's history in the bucket (the fence).
+        assert_eq!(
+            call(a.addr, "POST", &format!("{n}/touch"), "", b"")
+                .await
+                .body,
+            "touched"
+        );
+        let id = sha256_hex(b"kept");
+        let record = wasmkeep_cluster::blob_sweep::Record {
+            state: wasmkeep_cluster::blob_sweep::State::Pending,
+            epoch: wasmkeep_server::blobs::epoch(None, None),
+            name: "kept".into(),
+        };
+        store
+            .put(
+                &object_store::path::Path::from(format!(
+                    "state/default/default/blob-sweeps/blob/{id}/0"
+                )),
+                record.encode().into_bytes().into(),
+            )
+            .await
+            .unwrap();
+        eventually("the record is dropped", async || {
+            file_keys(&store).await.1.is_empty()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (files, _) = file_keys(&store).await;
+        assert_eq!(files.len(), 1, "batched {batched}: {files:?}");
+        let r = call(a.addr, "GET", &format!("{n}/b/k"), "", b"").await;
+        assert_eq!(
+            (r.status, r.body.as_str()),
+            (200, "mine"),
+            "batched {batched}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_left_pending_is_judged_deleted_and_swept_then_listed_twice() {
+    let faulty = Arc::new(Faulty::default());
+    let store: Arc<dyn ObjectStore> = faulty.clone();
+    let d = tempfile::tempdir().unwrap();
+    let a = sweeping_node(d.path(), &store, false).await;
+    settle().await;
+    let n = "/actor/blob/gone";
+    call(a.addr, "PUT", &format!("{n}/b/k"), "", b"old").await;
+    // The reset lands; the record is never rewritten `swept`.
+    faulty.fail_record_rewrites.store(true, Ordering::SeqCst);
+    call(a.addr, "POST", &format!("{n}/delete"), "", b"").await;
+    eventually("the next actor starts empty", async || {
+        call(a.addr, "GET", &format!("{n}/list"), "", b"")
+            .await
+            .body
+            == "next=-"
+    })
+    .await;
+    assert!(record_body(&store).await.unwrap().contains("\npending\n"));
+    assert_eq!(file_keys(&store).await.0.len(), 1, "not swept yet");
+    faulty.fail_record_rewrites.store(false, Ordering::SeqCst);
+    // Judged deleted: swept.
+    eventually("the old files are swept", async || {
+        file_keys(&store).await.0.is_empty()
+    })
+    .await;
+    // A late upload under the old incarnation is removed by the next
+    // listing; then the record goes.
+    let (_, records) = file_keys(&store).await;
+    let old = records[0].replace(
+        "/blob-sweeps/",
+        &format!("/blobs/{}/", wasmkeep_server::blobs::epoch(None, None)),
+    );
+    store
+        .put(
+            &object_store::path::Path::from(format!("{old}/late")),
+            b"late".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    eventually(
+        "the late file is removed and the record dropped",
+        async || {
+            let (files, records) = file_keys(&store).await;
+            files.is_empty() && records.is_empty()
+        },
+    )
+    .await;
+    // The new actor's file was never touched.
+    call(a.addr, "PUT", &format!("{n}/b/k"), "", b"new").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        call(a.addr, "GET", &format!("{n}/b/k"), "", b"").await.body,
+        "new"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batched_delete_whose_flush_fails_writes_no_record() {
+    let faulty = Arc::new(Faulty::default());
+    let store: Arc<dyn ObjectStore> = faulty.clone();
+    let d = tempfile::tempdir().unwrap();
+    let a = sweeping_node(d.path(), &store, true).await;
+    settle().await;
+    let n = "/actor/blob/batched";
+    call(a.addr, "PUT", &format!("{n}/b/k"), "", b"mine").await;
+    faulty.fail_history.store(true, Ordering::SeqCst);
+    // A plain write that cannot be sent: the delete's flush fails, once
+    // its upload budget (about 21 s) runs out.
+    assert_eq!(
+        call(a.addr, "POST", &format!("{n}/touch"), "", b"")
+            .await
+            .body,
+        "touched"
+    );
+    call(a.addr, "POST", &format!("{n}/delete"), "", b"").await;
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    assert!(
+        file_keys(&store).await.1.is_empty(),
+        "no record: nothing was decided"
+    );
+    faulty.fail_history.store(false, Ordering::SeqCst);
+    let r = call(a.addr, "GET", &format!("{n}/b/k"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "mine"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_epochs_files_go_unless_this_runtime_is_stale() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let a = sweeping_node(d.path(), &store, false).await;
+    settle().await;
+    call(a.addr, "PUT", &format!("{A}/b/k"), "", b"mine").await;
+    let old =
+        object_store::path::Path::from("state/default/default/blobs/00000000000000ee/blob/x/0/k");
+    store.put(&old, b"old".to_vec().into()).await.unwrap();
+    eventually("the other epoch's file goes", async || {
+        store.head(&old).await.is_err()
+    })
+    .await;
+    assert_eq!(
+        call(a.addr, "GET", &format!("{A}/b/k"), "", b"").await.body,
+        "mine"
+    );
+    // The markers moved: this runtime is stale, and removes nothing.
+    store
+        .put(
+            &object_store::path::Path::from("apps/default/default/restored"),
+            b"r".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    store.put(&old, b"old".to_vec().into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert!(
+        store.head(&old).await.is_ok(),
+        "a stale runtime removes no epoch"
+    );
+    assert_eq!(file_keys(&store).await.0.len(), 2);
+}
+
+/// Judging a record runs no code and leaves the actor's idle age as it
+/// found it (ADR 0030, decision 8): an idle actor with a `pending` record
+/// judged late still expires on schedule, by its own idle origin.
+#[tokio::test(flavor = "multi_thread")]
+async fn judging_a_record_leaves_an_idle_actor_to_expire_on_schedule() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    store
+        .put(
+            &object_store::path::Path::from(wasmkeep_cluster::app_format::key(
+                "", "default", "default",
+            )),
+            wasmkeep_cluster::app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let limit = Duration::from_secs(4);
+    let a = class_node_with(
+        Some(("a", &store)),
+        d.path(),
+        "blob",
+        blob_actor_wasm(),
+        |c| {
+            c.mailbox.idle_timeout = Duration::from_millis(200);
+            c.expire_after_idle.insert("blob".into(), limit);
+            let cluster = c.cluster.as_mut().unwrap();
+            cluster.expiry_every = Duration::from_millis(300);
+            cluster.blob_sweep_every = Duration::from_millis(100);
+            cluster.blob_sweep_ages = wasmkeep_cluster::blob_sweep::Ages {
+                judge_after: 2_000,
+                relist_after: 60_000,
+                last_after: 60_000,
+            };
+        },
+    )
+    .await;
+    settle().await;
+    let n = "/actor/blob/sleepy";
+    call(a.addr, "PUT", &format!("{n}/b/k"), "", b"mine").await;
+    // A judgement needs the actor's history in the bucket (the fence).
+    assert_eq!(
+        call(a.addr, "POST", &format!("{n}/touch"), "", b"")
+            .await
+            .body,
+        "touched"
+    );
+    let id = sha256_hex(b"sleepy");
+    let record = wasmkeep_cluster::blob_sweep::Record {
+        state: wasmkeep_cluster::blob_sweep::State::Pending,
+        epoch: wasmkeep_server::blobs::epoch(None, None),
+        name: "sleepy".into(),
+    };
+    let idle_from = std::time::Instant::now();
+    store
+        .put(
+            &object_store::path::Path::from(format!(
+                "state/default/default/blob-sweeps/blob/{id}/0"
+            )),
+            record.encode().into_bytes().into(),
+        )
+        .await
+        .unwrap();
+    // Judged about 2 s in (not deleted: the record goes, the file stays).
+    eventually("the record is judged", async || {
+        file_keys(&store).await.1.is_empty()
+    })
+    .await;
+    assert_eq!(file_keys(&store).await.0.len(), 1);
+    // Expired by its own origin (about 4 s), not 4 s after the judging.
+    let deadline = idle_from + Duration::from_millis(5_500);
+    loop {
+        if file_keys(&store).await.0.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the judging hold made the idle actor look active"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Without a bucket the actor's database names its incarnation: a delete
+/// removes the files, the next actor draws another incarnation, and files
+/// of any other incarnation left by a crash between the two are removed
+/// when the actor starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_alone_ends_a_deleted_actors_files() {
+    if over_tls() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let node = blob_node_with(None, d.path()).await;
+    let n = "/actor/blob/local";
+    call(node.addr, "PUT", &format!("{n}/b/k"), "", b"old").await;
+    let actor_dir = wasmkeep_server::local_app_dir(d.path(), "default", "default")
+        .join("blobs")
+        .join(wasmkeep_server::blobs::epoch(None, None))
+        .join("blob")
+        .join(sha256_hex(b"local"));
+    let incarnations = || {
+        std::fs::read_dir(&actor_dir)
+            .map(|r| {
+                r.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let first = incarnations();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_ne!(first[0], "0", "a node alone draws its first incarnation");
+    for how in ["/delete", "/delete-durable"] {
+        call(node.addr, "POST", &format!("{n}{how}"), "", b"").await;
+        let r = call(node.addr, "GET", &format!("{n}/list"), "", b"").await;
+        assert_eq!(r.body, "next=-", "{how}");
+        call(node.addr, "PUT", &format!("{n}/b/k"), "", b"new").await;
+        let now = incarnations();
+        assert_eq!(now.len(), 1, "{how}: {now:?}");
+        assert!(!first.contains(&now[0]));
+    }
+    // A crash left another incarnation's files: gone at the next start.
+    let stray = actor_dir.join("0123456789abcdef").join("f");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join("x"), b"stray").unwrap();
+    stop_listening(node).await;
+    let node = blob_node_with(None, d.path()).await;
+    assert_eq!(
+        call(node.addr, "GET", &format!("{n}/b/k"), "", b"")
+            .await
+            .body,
+        "new"
+    );
+    assert_eq!(incarnations().len(), 1);
 }

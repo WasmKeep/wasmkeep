@@ -25,8 +25,12 @@ const LIST_HEADS: usize = 16;
 const PART: usize = 8 * 1024 * 1024;
 
 pub(super) struct Bucket {
-    store: Arc<dyn ObjectStore>,
-    /// `<prefix>state/<t>/<a>/blobs/<epoch>/`.
+    pub(super) store: Arc<dyn ObjectStore>,
+    /// `<prefix>state/<t>/<a>/`, spelled as the rest of the state spells it.
+    pub(super) root: String,
+    /// The epoch this runtime computed at its start.
+    pub(super) epoch: String,
+    /// `<root>blobs/<epoch>/`.
     base: String,
     /// Where streamed writes are spooled before they are uploaded.
     spool_dir: PathBuf,
@@ -81,9 +85,11 @@ fn info(key: &str, meta: &ObjectMeta, attributes: Option<&Attributes>) -> BlobIn
 }
 
 impl Bucket {
+    /// Files under `root` (`<prefix>state/<t>/<a>/`) and `epoch`.
     pub(super) fn new(
         store: Arc<dyn ObjectStore>,
-        base: String,
+        root: &str,
+        epoch: &str,
         spool_dir: PathBuf,
     ) -> Result<Self, String> {
         // What an earlier run of this process spooled is abandoned.
@@ -94,9 +100,12 @@ impl Bucket {
         // it (`Path::from`, which escapes bytes such as `~` in a prefix), so
         // files sit under the prefix that `app delete` and backups list;
         // only the part after it, the namespace and the key, is kept as is.
-        let base = format!("{}/", Path::from(base.as_str()).as_ref());
+        let root = format!("{}/", Path::from(root).as_ref());
+        let base = format!("{root}blobs/{epoch}/");
         Ok(Self {
             store,
+            root,
+            epoch: epoch.to_owned(),
             base,
             spool_dir,
         })

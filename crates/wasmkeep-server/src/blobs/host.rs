@@ -56,6 +56,8 @@ pub(crate) struct Caller {
     open: Vec<Spool>,
     /// Links made in this event (at most 1,000).
     links: u32,
+    /// The actor was deleted in this event: nothing more is written.
+    deleted: bool,
 }
 
 impl std::fmt::Debug for Caller {
@@ -90,7 +92,25 @@ impl Caller {
             alive: Arc::new(AtomicBool::new(true)),
             open: Vec::new(),
             links: 0,
+            deleted: false,
         }
+    }
+
+    /// The actor was deleted durably in this event: its files are being
+    /// swept, and every later write is refused.
+    pub(crate) fn deleted(&mut self) {
+        self.deleted = true;
+        self.end_event();
+    }
+
+    /// The app's files, for the delete routine.
+    pub(crate) fn handle(&self) -> Option<Arc<Blobs>> {
+        self.blobs.clone()
+    }
+
+    /// Whether the hold is valid now.
+    pub(crate) fn hold_valid(&self) -> bool {
+        self.gate.valid()
     }
 
     /// An event starts: what the last one left open is closed and
@@ -118,6 +138,11 @@ impl Caller {
     }
 
     fn may_write(&self) -> Result<(), BlobError> {
+        if self.deleted {
+            return Err(BlobError::NotAllowed(
+                "the actor was deleted in this event".into(),
+            ));
+        }
         if self.gate.valid() {
             Ok(())
         } else {
