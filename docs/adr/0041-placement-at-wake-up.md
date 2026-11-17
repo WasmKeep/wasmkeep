@@ -1,6 +1,8 @@
 # 0041. Placement at wake-up
 
-- Status: proposed (2026-11-17). Nothing is built.
+- Status: proposed (2026-11-17), revised the same day from the
+  simulation: sections 3 to 6 and 8, and the properties. The decision
+  function and its simulation exist (P2, P3); nothing is wired.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, item 6
 - Follows: [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) (a
@@ -39,9 +41,10 @@ because of it.
 
 A node that is about to wake an actor nobody holds keeps it, unless the
 node is clearly fuller than another node of the app. Then it sends the
-event there, once, with a signed mark, and that node acquires the actor
-as it would for any request. The rest of this section says exactly when,
-where and how.
+event there, once, with a signed mark that carries its own fill, and
+that node acquires the actor as it would for any request, unless its own
+count says it is not the lighter one. The rest of this section says
+exactly when, where and how.
 
 ### 1. What is placed, and what never is
 
@@ -139,6 +142,16 @@ candidate. If the bucket stops answering, the view is kept but nothing
 new is seen, so every load goes stale within three periods and every
 node keeps what it wakes. **Stale means keep it.**
 
+Fresh says how old the observation is, not that its numbers are current.
+A heartbeat first seen a millisecond ago can predate placements this
+node sent, placements other nodes sent, and wake-ups that reached the
+peer directly. The credit covers the first of these only, and only since
+the heartbeat was first seen. So a fresh load does two things and no
+more: it makes the peer a candidate, and it sizes the budget. Whether
+the peer takes the actor is decided by the peer, on its own count read
+from memory when the hop arrives (section 5, "On arrival"). **A fresh
+number can cost one refused hop. It cannot place an actor.**
+
 ### 4. Candidates
 
 The candidate set for an actor is the peers that:
@@ -148,9 +161,12 @@ The candidate set for an actor is the peers that:
 - can be reached the way node calls reach them;
 - announce the capability word `place` (section 9);
 - have a fresh load with both room fields, and a socket fill below 800;
-- are not in this node's placement backoff (section 6).
+- are not in this node's placement backoff (section 6);
+- have had no placed event from them accepted here in the last three
+  heartbeat periods (section 5, "No return").
 
-The node itself is never in the set. The two candidates are the two
+Every exclusion applies before the two are taken. The node itself is
+never in the set. The two candidates are the two
 highest rendezvous weights for the actor's encoded address over that set
 (`rendezvous`, the hash ADR 0014 uses). With one peer there is one
 candidate; with none, the node keeps the actor.
@@ -161,10 +177,14 @@ for the record, and a test can say in advance where an actor goes.
 
 ### 5. The rule
 
-With `s` this node's resident fill, and for a candidate `p` its published `actors`
-and `actor_room`, its credit `k` (placements this node sent it since that
-heartbeat was first seen) and `N` the number of nodes of the app that
-announce `place`, this node included:
+It has three parts: what the sender decides, what the receiver checks on
+arrival, and no return.
+
+**The sender.** With `s` this node's resident fill, and for a candidate
+`p` its published `actors` and `actor_room`, its credit `k` (placements
+this node sent it since that heartbeat was first seen, whatever the
+answer) and `N` the number of nodes of the app that announce `place`,
+this node included:
 
 1. **Floor.** If `s < 200`, keep it. A node under a fifth of its capacity
    never sends an actor away, so an idle cluster forwards nothing.
@@ -173,23 +193,64 @@ announce `place`, this node included:
    a tie, the higher rendezvous weight.
 3. **The 25% rule.** Keep it unless `s * 4 > c * 5`, with `c` that
    estimated fill: this node must be more than 25% above the candidate.
-4. **The budget.** Let `t = s * 4 * (actors + actor_room) / 5000`, the
-   resident count at which `p` would stand at 80% of this node's fill.
-   This node may send `p` at most `max(1, (t - actors) / (N - 1))`
-   actors per heartbeat of `p` it sees, `t - actors` stopping at 0. If
-   `k` has reached it, keep it.
+4. **The budget.** Let `t = s * 4 * (actors + actor_room) / 5000`,
+   rounded down: the highest resident count at which `p` stands at 80%
+   of this node's fill or less. This node may send `p` at most
+   `(t - actors) / (N - 1)` events per heartbeat of `p` it sees, rounded
+   down, `t - actors` stopping at 0. If `k` has reached it, keep it. A
+   share of 0 keeps it: **there is no minimum of one.**
 
 Otherwise the event is placed on `p` and `k` grows by one. A new
 heartbeat from `p` sets `k` back to 0.
 
-The budget is what makes a stale number safe. Up to `N - 1` nodes read
-the same heartbeat of a light node; each closes at most its share of its
-own gap, so together they bring it to at most 80% of the fullest sender's
-fill, plus one actor each when gaps are tiny. The receiver therefore
-never ends up above the senders, and has no reason to send anything back.
+Rule 4 is the stricter one at the integer edges: `k` below the share
+means `actors + k < t`, which means rule 3 passes. A sender at 501 with
+a peer at 400 of 1000 passes rule 3 (2004 > 2000), but `t` is 400 and
+the share is 0, so it keeps the actor, for the reason `budget`: one more
+resident would put the peer at 401, above 80% of 501. Rule 3 stays as
+the reason `band`.
 
-The three numbers (floor 200, the 5/4 ratio, three periods) are
-constants in 0.6.0, not settings.
+**On arrival.** The hop carries `s` in the placed mark (section 8). The
+receiver reads its own `actors` and `actor_room` from memory and
+computes the same `t = s * 4 * (actors + actor_room) / 5000`. It takes
+the event only if `actors + 1 <= t`. Otherwise it refuses (section 6)
+and the event runs where it woke. So an actor is placed only when the
+receiver, counting that actor, stands at 80% of the sender's fill or
+less **on the receiver's own current count**, whatever any heartbeat
+said.
+
+**No return.** Each node keeps, per peer and on its own monotonic clock,
+when it last accepted a placed event from that peer and when it last
+sent that peer one (any answer). For three heartbeat periods (9 s) after
+accepting one from `X`, `X` is no candidate (section 4). For three
+heartbeat periods after sending one to `X`, a placed event from `X` is
+refused. At three periods exactly, both are allowed again. The second
+half covers two hops that cross in flight.
+
+What each part is for:
+
+- The arrival check is what makes a stale or outrun number safe. A
+  sender cannot know what reached the receiver since its heartbeat:
+  other senders that hold another heartbeat, or wake-ups that arrived
+  directly. The receiver can.
+- The budget keeps the hops few. Up to `N - 1` nodes read the same
+  heartbeat of a light node; each sends at most its share of its own
+  gap, so together they send at most the gap of the fullest of them,
+  instead of each sending the whole gap and all but the first being
+  refused.
+- No return makes flapping impossible for a pair, not just unlikely:
+  fills can cross within seconds when residents hibernate on one node
+  and wake on the other.
+
+Two consequences of rounding down. A receiver whose gap is under
+`N - 1` actors gets nothing from a sender: placement stops up to
+`N - 2` actors short of `t`. And a capacity so small that 80% of the
+sender's fill is less than one resident never receives a placement:
+with two nodes, a sender at 1 of 5 (fill 200) and a receiver at 0 of 1,
+`t` is 0 and the actor is kept.
+
+The numbers (floor 200, the 5/4 ratio, three periods for freshness and
+for no return) are constants in 0.6.0, not settings.
 
 ### 6. The hop, and what happens when it is not taken
 
@@ -214,7 +275,9 @@ and acquires, or forwards to an owner that appeared meanwhile.
 **Backoff** is placement's own table: the node is no candidate for one
 heartbeat horizon (10 s by default). It is not ADR 0014's suspect list,
 which also decides drains and who collects expiries; a full node is not a
-suspect.
+suspect. A refusal for the arrival check backs the node off like any
+other, so a sender whose number is behind sends that node at most one
+refused hop per backoff.
 
 **The receiver** treats the hop as a forwarded request, so it never
 forwards it and never places it. It answers `503` with
@@ -222,7 +285,10 @@ forwards it and never places it. It answers `503` with
 event to the guest for one of these reasons: it is draining, cannot open
 the secrets, is moving the actor away, has no resident capacity, the hop's
 proof or sender did not check (ADR 0038 refuses such a hop; the mark
-tells the sender it did not run), or it found another holder. An access answer (`403`,
+tells the sender it did not run), it found another holder, its own
+count fails the arrival check (section 5), it sent the sender a placed
+event in the last three heartbeat periods (no return), or the mark's
+value is not a whole number from 200 to 1000. An access answer (`403`,
 `404`) is the client's answer and carries no mark: it would be the same
 here. The host sets the response mark; it is removed from a guest's
 response.
@@ -249,8 +315,9 @@ everything placeable.
 
 ### 8. The placed mark
 
-`x-wasmkeep-placed: 1` on the hop. It is added to the headers the hop's
-signature covers (`signature`'s list, as `x-wasmkeep-take` was), in the
+`x-wasmkeep-placed: <s>` on the hop, `s` being the sender's resident
+fill in thousandths at the decision (200 to 1000). It is added to the
+headers the hop's signature covers (`signature`'s list, as `x-wasmkeep-take` was), in the
 forward's proof (`x-wasmkeep-admitted`) and in a call's signature
 (`x-wasmkeep-internal`). The signature already binds the destination
 node, the method, the actor's path, the app, a timestamp and, through
@@ -262,8 +329,11 @@ A node that cannot sign the hop keeps the actor: the cluster secret is
 not loaded, or the request has no peer address to prove.
 
 What the mark grants: **nothing**. Any node acquires an actor nobody
-holds when a client's request for it arrives. The mark only takes a
-right away, the receiver's right to place. So:
+holds when a client's request for it arrives. The mark only takes
+rights away: the receiver's right to place, and, through its value, the
+right to run here when the receiver is not lighter. The arrival check,
+no return and the count of placements received apply only to a mark
+under a signature that checked. So:
 
 - a replay of a placed forward does what the same client request sent
   to that node's public port does, and needs no replay store of its
@@ -331,7 +401,9 @@ All with `tenant` and `app`:
 - `wasmkeep_placements_total{kind,outcome}`: decisions that sent an
   event. `kind`: `request`, `call`. `outcome`: `placed`, `refused`,
   `unsent`, `failed` (the four rows of section 6).
-- `wasmkeep_placements_received_total{outcome}`: `acquired`, `refused`.
+- `wasmkeep_placements_received_total{outcome}`: `acquired`, `fuller`
+  (the arrival check), `returned` (no return), `refused` (any other
+  reason of section 6).
 - `wasmkeep_placement_kept_total{reason}`: placeable wake-ups kept here:
   `floor`, `band`, `budget`, `no_candidate`, `unsigned`.
 - `wasmkeep_placement_fill{kind}`: this node id's fill, in thousandths
@@ -342,20 +414,26 @@ status` shows each node's fill and room.
 
 ## How a joining node fills
 
-A new node publishes a resident fill of 0. Each other node above the floor sends it its
-share of wake-ups, among the actors for which the new node is one of the
-two candidates, until the new node's next heartbeat shows where it
-stands. That repeats each period until the new node is within 25% of the
-senders. Actors already resident elsewhere stay; they reach the new node
-only after they hibernate and wake.
+A new node publishes a resident fill of 0. Each other node above the
+floor sends it its share of wake-ups, among the actors for which the new
+node is one of the two candidates, until the new node's next heartbeat
+shows where it stands. That repeats each period until the new node is
+within `N - 2` actors of `t` for the lightest sender. Actors already
+resident elsewhere stay; they reach the new node only after they
+hibernate and wake.
+
+So it fills at the rate at which actors wake cold, and no faster. A
+cluster whose actors never hibernate does not fill a new node at all.
 
 Placement narrows a gap to the band. It does not equalise.
 
 The simulation (`sim/tests/madsim_placement.rs`) runs the real decision
-function over simulated nodes, heartbeats that are late, lost or read at
-different times, and actors that wake and hibernate. It has a node that
+function and the real arrival check over simulated nodes, heartbeats
+that are late, lost or read at different times, wake-ups that reach a
+node directly, and actors that wake and hibernate. It has a node that
 joins three loaded ones, and one that returns after its actors were
-taken over. For every seed:
+taken over. A placement is **accepted** when the receiver took the
+event; the hop was **sent** whatever the answer. For every seed:
 
 1. **One hop.** No event is placed twice, and no placed event is
    forwarded again.
@@ -363,31 +441,102 @@ taken over. For every seed:
    holds with placement on.
 3. **Nothing resident moves.** An actor changes node only across a
    hibernation, a refusal before it ran, or a node's failure.
-4. **Direction.** Every placement leaves a node whose resident fill was
-   at least 200 and goes to a node whose last fill seen by the sender was below
-   80% of it.
-5. **No overshoot.** When a placed event arrives, the receiver's
-   residents are at most the count that puts it at 80% of the fullest
-   sender's fill at sending time, plus `N - 2` actors, plus the wake-ups
-   that reached it directly.
-6. **No flapping.** With steady arrivals, no two nodes place in both
-   directions within three heartbeat periods of each other.
-7. **It fills, then it is quiet.** With steady arrivals, and the other
-   nodes above the floor, the joining node's fill reaches 80% of the
-   lightest of them within two idle timeouts plus ten heartbeat periods,
-   and from then on no placement happens while every pair stays within
-   the band.
+4. **Direction.** Every hop sent leaves a node whose resident fill was
+   at least 200 and goes to a node whose last fill seen by the sender
+   was below 80% of it.
+5. **No overshoot, no herd.**
+   (a) When a placement is accepted, the receiver's residents, counting
+   that actor, are at most `s * 4 * capacity / 5000`, rounded down, with
+   `s` the fill the hop carried and `capacity` the receiver's own
+   `actors + actor_room` on arrival. No allowance is added: not `N - 2`,
+   not the wake-ups that reached it directly.
+   (b) Under one heartbeat of a node showing `a` residents, the nodes
+   that hold it send that node at most `t_max - a` events together,
+   stopping at 0, whatever it answers. `t_max` is rule 4's `t` for the
+   highest fill any of them had while holding it, and they count the
+   same `N`. Three senders at 600, capacity 100, a heartbeat showing 0:
+   16 each, 48.
+6. **No flapping.** For any arrivals, on each node's own clock: a node
+   that accepted a placement from a peer sends that peer no placed
+   event for the next 9000 ms, and a node that sent a peer a placed
+   event accepts none from it for the next 9000 ms. At 9000 ms exactly
+   both are allowed. So two nodes never have placements accepted in
+   both directions within three heartbeat periods.
+7. **It fills at the rate of the wake-ups, then it is quiet.** A
+   wake-up is **offered** to the joining node `j` when it is placeable,
+   wakes on another node at fill 200 or more that holds a fresh
+   heartbeat of `j`, and `j` is its lighter candidate. The **target** is
+   `t - (N - 2)` residents, `t` being rule 4's for the lightest other
+   node and `j`'s capacity.
+   (a) *Rate.* In the directed scenario (the other nodes' fills fixed,
+   every heartbeat of `j` seen by every other node within one period,
+   none of `j`'s residents hibernating), with each other node offered at
+   least `w >= 1` wake-ups per heartbeat of `j`: until `j` reaches the
+   target, every offered wake-up is accepted by `j` or kept for the
+   reason `budget`, none is refused, and `j` reaches the target within
+   `ceil(t / ((N - 1) * w)) + 2` heartbeat periods of its first
+   heartbeat. With capacity 1000 and three others at 600 (`N` = 4, `t` =
+   480, target 478): at one offered wake-up per second, one per node per
+   period, 162 periods (486 s), and after 42 s `j` holds exactly the 42
+   actors offered; at 160 or more per node per period, 3 periods (9 s).
+   `j` joins empty, so `t` is also its gap.
+   (b) *Quiet.* For every seed, no placement is accepted while the
+   sender's fill at sending and the receiver's fill on arrival are
+   within the band (`higher * 4 <= lower * 5`), whatever any heartbeat
+   says. With actual fills 500 and 400 of capacity 100 and a fresh
+   heartbeat that still shows 0, the hop is sent and refused (41 > 40).
+   Such a hop is sent at most once per sender and receiver per backoff
+   (10 s).
 8. **An idle cluster is silent.** With every node under the floor, no
    event is placed.
 
-Removing the budget must fail property 5, removing the floor property 8,
-and using the heartbeat's clock under skew property 4.
+Each rule has a mutation that must fail its property:
+
+- **The budget removed** fails 5(b): the three senders above send 180,
+  not 48.
+- **The minimum of one restored** fails 5(b): with two nodes, a sender
+  at 1 of 5 and a heartbeat showing 0 of 1, one hop is sent and
+  `t_max - a` is 0.
+- **The arrival check removed** fails 5(a) and 7(b). For 5(a): three
+  nodes, capacity 100, two senders at 600, so `t` = 48 and a share of
+  24. Sender 1 sends 24 under the first heartbeat. The next shows 24
+  and only sender 1 sees it: it sends 12 more. Sender 2 still holds the
+  first, fresh, and sends 24: 60 residents, above 48. For 7(b): the 500
+  and 400 case above.
+- **No return removed** fails 6: two nodes, capacity 100, A at 60 and B
+  at 0. A places 48 on B. Within 9 s, 40 of A's residents hibernate and
+  A's heartbeat shows 20. B, at fill 480, computes `t` = 38 for A and
+  places on it; A, at 21 counting the actor, accepts.
+- **The floor removed** fails 8, and **the heartbeat's own clock under
+  skew** fails 4.
+
+What the simulation disproved in the first version of this record, and
+what changed:
+
+- *A minimum budget of one* placed an actor on a receiver that it put
+  above the sender (sender 1 of 5, receiver 0 of 1), and the receiver
+  placed its next wake-up back 1 ms later. The minimum is gone, the
+  receiver checks its own count, and no return forbids the way back.
+- *An overshoot bound stated on heartbeats* (80% of the fullest sender
+  plus `N - 2`) does not hold when senders hold different heartbeats or
+  wake-ups arrive directly. The bound is now enforced where the count
+  is known, and has no allowance.
+- *A fill deadline in seconds* (two idle timeouts plus ten periods)
+  cannot hold: at one cold wake-up per second, 42 actors can arrive in
+  42 s where 480 were required. The property is now a rate.
+- *Quiet judged on heartbeats* fails when a fresh heartbeat still shows
+  an empty node that has filled since. Quiet is now judged on actual
+  fills, at the receiver.
 
 ## Consequences
 
 - A node that joins or returns fills from the others' wake-ups without
   an operator.
 - A placed actor costs a forward per request until it hibernates.
+- A node fills only as fast as actors wake cold, and stops up to
+  `N - 2` actors short of the band's edge.
+- A placement sent on a number that is behind costs one hop and a
+  refusal; the event then runs where it woke.
 - A request with a body above 64 KiB, an upgrade or an alarm always
   wakes its actor where it lands.
 - One more thing can go wrong at wake-up: a chosen node that dies
@@ -406,20 +555,33 @@ and using the heartbeat's clock under skew property 4.
 - **No mark, the forwarded mark alone.** It would work for routing. The
   mark lets the receiver refuse without running, lets it count what it
   received, and keeps "placed" out of what a plain forward means.
+- **A minimum resident count before the floor applies.** It would stop
+  the smallest sender, not the cause: a receiver whose capacity is too
+  small for the sender's 80%. Rounding the budget down and the arrival
+  check cover every capacity.
+- **A longer memory for the credit** (kept across heartbeats, or a
+  heartbeat sequence returned in the hop's answer). It would correct a
+  sender's view of its own placements, never of other senders' or of
+  direct wake-ups. The receiver's count needs none of it.
 - **Moving running actors.** On the roadmap, only if this is not enough.
 
 ## Tests (to build)
 
 - Load: room arithmetic with a cap, a floor and a full process; the line
   written and read; a frozen older reader skipping the fields.
-- Decision: the floor, the band at its integer edges, the budget, a
-  stale load, one candidate, none, the same pair chosen on every node.
+- Decision: the floor, the band at its integer edges, the budget
+  rounded down and a share of 0, a stale load, one candidate, none, the
+  same pair chosen on every node, a peer excluded for no return before
+  the two are taken; the arrival check at `actors + 1 = t` and
+  `t + 1`.
 - Routing: each "never placed" case of section 1; each row of section
-  6's table; the owner hint after a placement; the backoff; a call's
-  chain and re-entrancy kept across a placed call.
-- Signing: the mark inside both signatures, a stripped or added mark
-  refused, a guest unable to set either header, a node without `place`
-  never chosen, a process with placement off never chosen.
+  6's table; the owner hint after a placement; the backoff; a refusal
+  for the arrival check and for no return, each run where it woke; a
+  call's chain and re-entrancy kept across a placed call.
+- Signing: the mark and its value inside both signatures, a stripped,
+  added or altered mark refused, a guest unable to set either header,
+  a node without `place` never chosen, a process with placement off
+  never chosen.
 - Cluster: three nodes, one fuller; a fourth joins and fills; two apps
   in one process, one full, the other placed by its own room.
 - The simulation above.
@@ -437,8 +599,6 @@ and using the heartbeat's clock under skew property 4.
   is accepted.
 - On by default: confirmed only if the benchmark shows no loss with a
   hashing balancer.
-- The time bound in the simulation's property 7 is a first guess; the
-  simulation fixes it.
 - Whether a refused or unsent placement should also be offered to the
   second candidate. Not in 0.6.0: one attempt, then here.
 
@@ -453,9 +613,10 @@ Each slice is one change and says what it proves.
   `cluster/view.rs`); `place` parsed, not announced; `cluster status`
   shows fill. Proves the arithmetic and that older readers are
   unaffected.
-- **P2. The decision.** A pure function in `cluster/view.rs`:
-  candidates, the rule, the budget, freshness. Proves section 5 by unit
-  tests.
+- **P2. The decision.** Pure functions in `wasmkeep-cluster`'s
+  `placement.rs`: the sender's decision (candidates, the rule, the
+  budget, freshness, no return) and the receiver's arrival check.
+  Proves section 5 by unit tests.
 - **P3. The simulation.** `sim/tests/madsim_placement.rs`, before any
   wiring, so the constants can still change. Proves the eight
   properties.
@@ -463,8 +624,9 @@ Each slice is one change and says what it proves.
   `node_lease.rs`, `remote_owner` and `call` in `actor/routing.rs`,
   `dispatch` in `actor/requests.rs`), the mark in both signatures
   (`cluster/signing.rs`, `cluster/forwarding.rs`, `cluster.rs`), the
-  buffered body, the refusal mark, the fallback, the hint, the backoff,
-  the switch, the word announced, the metrics. Proves the routing,
+  buffered body, the mark's value and the arrival check, the two
+  no-return times, the refusal mark, the fallback, the hint, the
+  backoff, the switch, the word announced, the metrics. Proves the routing,
   signing and cluster tests. One adversarial review follows it: it
   touches the path to ownership.
 - **P5. Docs and status.** The pages above; this record becomes
