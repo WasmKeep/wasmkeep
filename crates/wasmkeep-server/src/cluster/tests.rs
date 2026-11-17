@@ -3685,6 +3685,8 @@ struct LaggingList {
     lag: std::sync::atomic::AtomicBool,
     hidden: Mutex<std::collections::BTreeSet<String>>,
     lists: std::sync::atomic::AtomicU64,
+    /// Each history listing waits this long before it answers (ms).
+    slow_lists_ms: std::sync::atomic::AtomicU64,
 }
 
 impl LaggingList {
@@ -3694,6 +3696,7 @@ impl LaggingList {
             lag: std::sync::atomic::AtomicBool::new(false),
             hidden: Mutex::default(),
             lists: std::sync::atomic::AtomicU64::new(0),
+            slow_lists_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -3756,19 +3759,28 @@ impl ObjectStore for LaggingList {
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
     {
         use futures_util::StreamExt as _;
-        if prefix.is_some_and(|p| p.as_ref().contains("/actors/")) {
+        let history = prefix.is_some_and(|p| p.as_ref().contains("/actors/"));
+        if history {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         let hidden = self.hidden.lock().unwrap().clone();
-        self.inner
-            .list(prefix)
-            .filter(move |m| {
-                let keep = m
-                    .as_ref()
-                    .map_or(true, |m| !hidden.contains(m.location.as_ref()));
-                std::future::ready(keep)
-            })
-            .boxed()
+        let slow = if history {
+            self.slow_lists_ms.load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
+        };
+        let listed = self.inner.list(prefix).filter(move |m| {
+            let keep = m
+                .as_ref()
+                .map_or(true, |m| !hidden.contains(m.location.as_ref()));
+            std::future::ready(keep)
+        });
+        futures_util::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(slow)).await;
+            listed
+        })
+        .flatten()
+        .boxed()
     }
 
     async fn list_with_delimiter(
@@ -4220,4 +4232,354 @@ async fn heartbeats_name_the_app_the_capability_checks_compare() {
         ),
         vec!["a"]
     );
+}
+
+/// ADR 0035 follow-up S3: an idle expiry whose cycle is refused (its
+/// restore cannot prove the floor) rewrites the record twice, acquire and
+/// release; the record must keep the idle origin the expiry judged, as
+/// `idle-since`, or a refused actor never ages into expiry again.
+#[tokio::test]
+async fn a_refused_expiry_cycle_keeps_the_idle_origin() {
+    use wasmkeep_cluster::app_format;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    assert_eq!(
+        owner_record(&store, &key)
+            .await
+            .recorded
+            .and_then(|r| r.idle_since_ms),
+        None,
+        "an ordinary release starts a new idle period"
+    );
+    // The expiry takes the record as listed, idle since 1234 by its
+    // listed last-modified time, and its cycle ends without activation.
+    let etag = store
+        .head(&StorePath::from(key.clone()))
+        .await
+        .unwrap()
+        .e_tag
+        .unwrap();
+    let hold = LeaseHold::acquire_with(&a, &x, Some((etag.as_str(), 1_234)))
+        .await
+        .unwrap();
+    assert_eq!(
+        owner_record(&store, &key)
+            .await
+            .recorded
+            .and_then(|r| r.idle_since_ms),
+        Some(1_234),
+        "carried by the expiry's acquisition"
+    );
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    assert_eq!(
+        owner_record(&store, &key)
+            .await
+            .recorded
+            .and_then(|r| r.idle_since_ms),
+        Some(1_234),
+        "kept by the release of a hold never activated"
+    );
+}
+
+/// ADR 0035 follow-up S4: a local file whose sidecar names the recorded
+/// head but whose checksum is another (a database changed outside
+/// replication) is not proof of a conflict in the bucket: it is set aside
+/// and the history downloaded, which proves the floor.
+#[tokio::test]
+async fn a_conflicting_local_file_is_set_aside_and_downloaded() {
+    use crate::replica::{Replica, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(
+        StorageConfig::new(dir.path()),
+        crate::state_dir(&StateRoot::new("", "t", "default")),
+    );
+    let path = storage.db_path("c", "x");
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path.clone(),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    let head = replica.head();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // Changed outside replication, its sidecar rewritten to match.
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("INSERT INTO t VALUES (99)", &[]).unwrap();
+    drop(db);
+    let page_size = 4096;
+    let sum = wasmkeep_storage::wal::WalCapture::start(&path, page_size)
+        .unwrap()
+        .checksum();
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(".replica");
+    std::fs::write(
+        std::path::PathBuf::from(sidecar),
+        format!("{} {} {}\n", head.generation, head.txid, sum.value()),
+    )
+    .unwrap();
+    assert_eq!(
+        wasmkeep_storage::local_is_at(&path, head.generation, head.txid),
+        Some(sum),
+        "the local file claims the recorded head"
+    );
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let restored = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path.clone(),
+        1 << 30,
+    )
+    .await
+    .expect("set aside and downloaded, not refused");
+    assert_eq!(restored.verified_head(), h);
+}
+
+/// ADR 0035 follow-up S6: with a recorded floor to reach, a missing link
+/// is first taken for a listing behind its writes and listed again; once
+/// the discovery bound is spent with the link still missing, it is
+/// reported as the corruption it then is (500), not a 503 for ever.
+#[tokio::test]
+async fn a_missing_link_past_the_bound_is_a_corruption() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use futures_util::StreamExt as _;
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    for v in 1..4 {
+        db.exec(&format!("INSERT INTO t VALUES ({v})"), &[])
+            .unwrap();
+        replica
+            .ship(&db.take_changes().unwrap().unwrap())
+            .await
+            .unwrap();
+    }
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // A middle segment is gone for good.
+    let history = StorePath::from(format!("{}/", a.history_key(&x)));
+    let mut wal: Vec<StorePath> = store
+        .list(Some(&history))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|m| m.unwrap().location)
+        .filter(|l| l.as_ref().contains("/wal/"))
+        .collect();
+    wal.sort();
+    store.delete(&wal[1]).await.unwrap();
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let got = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(other.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(&got, Err(ReplicaError::Restore(why)) if why.contains("missing")),
+        "{:?}",
+        got.err()
+    );
+}
+
+/// Review of S6: a missing link is a corruption only when every listing
+/// the bound allowed showed it missing. Listings slow enough to spend the
+/// deadline first prove nothing: refused as not yet visible (503), and
+/// the next request, once the link is listed, activates.
+#[tokio::test]
+async fn a_missing_link_behind_slow_listings_stays_retryable() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let lagging = LaggingList::new();
+    let store: Arc<dyn ObjectStore> = Arc::clone(&lagging) as Arc<dyn ObjectStore>;
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    // The middle link is not listed yet; the last one is.
+    lagging.lag.store(true, std::sync::atomic::Ordering::SeqCst);
+    db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    lagging
+        .lag
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    db.exec("INSERT INTO t VALUES (3)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // Listings slow enough that the deadline ends the discovery first.
+    lagging
+        .slow_lists_ms
+        .store(4_000, std::sync::atomic::Ordering::SeqCst);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let path = storage_in(other.path()).db_path("c", "x");
+    let got = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path.clone(),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(&got, Err(ReplicaError::Visibility(_))),
+        "{:?}",
+        got.err()
+    );
+    drop(hold);
+    assert!(a.releases_done(Duration::from_secs(5)).await);
+    // The link is listed now: the next request activates.
+    lagging.reveal();
+    lagging
+        .slow_lists_ms
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    a.pending.clear_cooldown(&a.owner_key(&x));
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let restored = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path,
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.verified_head(), h);
 }

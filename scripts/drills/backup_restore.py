@@ -126,10 +126,13 @@ def main():
             logs.append(log)
             # Follow restore fences through the rooted, audited fixture deploy.
             # The restored deploy is replaced with the clean local project below.
+            # The restored node is a throwaway copy: with alarms on, it would run
+            # the app's side effects a second time.
             child = subprocess.Popen([binary, "serve", "--no-secrets", "--app", "restore-drill/fixture",
                 "--bucket", root, "--node-id", name, "--listen", addr,
                 "--advertise", f"http://{addr}", "--cluster-plaintext", "accept",
-                "--metrics-listen", metrics, "--data-dir", str(directory / name)],
+                "--metrics-listen", metrics, "--data-dir", str(directory / name),
+                *(["--no-alarms"] if name == "restored" else [])],
                 stdout=log, stderr=log, env={**os.environ, "TOKIO_WORKER_THREADS": "2"})
             children.append(child)
             deadline = time.monotonic() + 60

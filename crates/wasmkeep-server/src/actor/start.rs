@@ -109,7 +109,13 @@ impl ActorService {
         let (alarms, fire_to) = {
             let slot: ServiceSlot = Arc::new(std::sync::OnceLock::new());
             let target = Arc::clone(&slot);
+            let no_alarms = config.no_alarms;
             let handle = alarm::spawn(move |address, at| {
+                // `--no-alarms`: nothing is delivered; the alarm stays
+                // committed (and indexed) for a node that fires them.
+                if no_alarms {
+                    return;
+                }
                 if let Some(inner) = target.get().and_then(std::sync::Weak::upgrade) {
                     ActorService { inner }.fire_alarm(address, at);
                 }
@@ -261,16 +267,24 @@ impl ActorService {
         );
         let _ = fire_to.set(Arc::downgrade(&service.inner));
         tokio::spawn(sample_disk(Arc::downgrade(&service.inner), data_dir));
-        // In a cluster, deliver alarms whose owner never fired them.
+        if config.no_alarms {
+            tracing::info!(
+                "alarms are off (--no-alarms): this node fires no alarm and sweeps none; \
+                 they stay pending for a node without the flag"
+            );
+        }
         if let Some(cluster) = service.inner.cluster.clone() {
             // Its load, read by every node lease write (payload line 10).
             cluster.set_load_source(load::load_source(Arc::downgrade(&service.inner)));
-            tokio::spawn(sweep_alarms(
-                Arc::downgrade(&service.inner),
-                Arc::clone(&cluster),
-                alarms.clone(),
-                limits.retry_max,
-            ));
+            // Deliver alarms whose owner never fired them.
+            if !config.no_alarms {
+                tokio::spawn(sweep_alarms(
+                    Arc::downgrade(&service.inner),
+                    Arc::clone(&cluster),
+                    alarms.clone(),
+                    limits.retry_max,
+                ));
+            }
             // While asked to drain, hand resident actors over (ADR 0014).
             tokio::spawn(drain::drain_loop(
                 Arc::downgrade(&service.inner),
@@ -304,7 +318,11 @@ impl ActorService {
             ));
         }
 
-        // Re-arm alarms persisted before a restart or crash.
+        // Re-arm alarms persisted before a restart or crash (not with
+        // `--no-alarms`: the timer would fire nothing).
+        if config.no_alarms {
+            return Ok(service);
+        }
         let known = Arc::clone(&service.inner.classes);
         tokio::spawn(async move {
             match tokio::task::spawn_blocking(move || storage.pending_alarms()).await {

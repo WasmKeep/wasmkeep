@@ -715,6 +715,14 @@ struct ServeArgs {
     #[arg(long, value_name = "N")]
     max_front_requests: Option<usize>,
 
+    /// Never fire an actor's alarms on this node: no delivery, no sweep of
+    /// the cluster's alarm index. Requests are still served, and alarms
+    /// stay recorded and pending, so a node started without this flag fires
+    /// them later. For a node on a restored copy (see the backup drill),
+    /// which must not run the app's side effects twice.
+    #[arg(long)]
+    no_alarms: bool,
+
     /// How a class given with --actor writes, as CLASS=MODE: `strict` (the
     /// default) or `batched` (ADR 0034: plain writes are uploaded
     /// behind the events). Not with --app: a deployed version names its classes' modes.
@@ -1437,7 +1445,15 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     "degraded startup: minimum service slots retained without reserved descriptor headroom; raise RLIMIT_NOFILE (ulimit -n or LimitNOFILE)"
                 );
             }
-            if effective != requested {
+            // A default socket request cut by the limit alone is the
+            // INFO below, not a warning about the node's setup.
+            if (wasmkeep_server::fds::Budget {
+                socket_sessions: requested.socket_sessions,
+                ..effective
+            }) != requested
+                || (args.max_sockets_per_node.is_some()
+                    && effective.socket_sessions < requested.socket_sessions)
+            {
                 tracing::warn!(
                     open_files = limit,
                     ?requested,
@@ -1445,13 +1461,30 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     "descriptor admission estimate reduced requested limits; raise LimitNOFILE to admit more"
                 );
             }
-            if effective.socket_sessions < requested.socket_sessions {
-                tracing::warn!(
-                    requested_sockets = requested.socket_sessions,
-                    effective_sockets = effective.socket_sessions,
-                    open_files = limit,
-                    "socket session capacity reduced by descriptor budget; raise RLIMIT_NOFILE (ulimit -n or LimitNOFILE) to admit more WebSockets"
-                );
+            match wasmkeep_server::fds::socket_clamp(
+                requested,
+                effective,
+                args.max_sockets_per_node.is_some(),
+            ) {
+                wasmkeep_server::fds::SocketClamp::None => {}
+                wasmkeep_server::fds::SocketClamp::Default => {
+                    tracing::info!(
+                        effective_sockets = effective.socket_sessions,
+                        default_sockets = requested.socket_sessions,
+                        open_files = limit,
+                        "socket session capacity limited by the open-files limit: this node admits {} WebSockets (default request {}); raise RLIMIT_NOFILE (ulimit -n or LimitNOFILE) to admit more",
+                        effective.socket_sessions,
+                        requested.socket_sessions
+                    );
+                }
+                wasmkeep_server::fds::SocketClamp::Requested => {
+                    tracing::warn!(
+                        requested_sockets = requested.socket_sessions,
+                        effective_sockets = effective.socket_sessions,
+                        open_files = limit,
+                        "socket session capacity reduced by descriptor budget; raise RLIMIT_NOFILE (ulimit -n or LimitNOFILE) to admit more WebSockets"
+                    );
+                }
             }
             effective
         }
@@ -1663,6 +1696,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         config.socket_limits.per_app = args.max_sockets_per_app.unwrap_or(requested_sockets);
         config.socket_budget = std::sync::Arc::clone(&socket_budget);
         config.max_front_requests = Some(front_requests);
+        config.no_alarms = args.no_alarms;
         config.max_unsent_age = std::time::Duration::from_millis(args.max_unsent_age_ms);
         config.front_env = front_env.clone();
         if let (Some(node_id), Some(advertise), Some(bucket)) =

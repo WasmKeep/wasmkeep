@@ -282,6 +282,14 @@ external effects can repeat, sockets reconnect, and old operator intents and
 ownership records are not restored. A restore drill is still required to
 validate your infrastructure and operational procedure.
 
+To look at a restored copy without running the app's side effects a second
+time, start its node with `wasmkeep serve --no-alarms`. Such a node serves
+requests but never fires an actor's alarm (no timer delivery, no sweep of the
+bucket's alarm index); the alarms stay recorded and pending, and a node started
+without the flag fires them later. The drill
+(`scripts/drills/backup-restore.sh`) starts its throwaway restored node this
+way. An alarm a request on that node sets is also left pending.
+
 ## Inspect one actor
 
 ```bash

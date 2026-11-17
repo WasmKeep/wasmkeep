@@ -250,6 +250,15 @@ impl Pending {
         entry.1 = tokio::time::Instant::now() + crate::replica::jittered(Duration::from_secs(step));
     }
 
+    /// Whether `key` was refused for visibility since its last verified
+    /// activation (its record may carry an earlier idle origin).
+    pub(crate) fn was_refused(&self, key: &str) -> bool {
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(key)
+    }
+
     /// A verified activation of `key`: its cooldown ends.
     pub(crate) fn clear_cooldown(&self, key: &str) {
         self.cooldowns
@@ -578,7 +587,7 @@ impl LeaseHold {
     pub(crate) async fn acquire_with(
         cluster: &Arc<Cluster>,
         address: &ActorAddress,
-        listed: Option<&str>,
+        listed: Option<(&str, u64)>,
     ) -> Result<Self, OwnershipError> {
         cluster.identity().await.map_err(OwnershipError::Refused)?;
         let key = cluster.owner_key(address);
@@ -630,7 +639,7 @@ impl LeaseHold {
                     )
                     .await
             }
-            Some(listed) => {
+            Some((listed, idle_origin_ms)) => {
                 cluster
                     .owners
                     .acquire_unchanged_prepared(
@@ -640,6 +649,7 @@ impl LeaseHold {
                             wasmkeep_cluster::expiry::etag(read)
                                 == wasmkeep_cluster::expiry::etag(listed)
                         },
+                        Some(idle_origin_ms),
                         || cluster.validity.valid_in(epoch),
                         prepare,
                     )
@@ -1022,6 +1032,29 @@ impl Cluster {
              support it ({}): stop or upgrade them",
             old.join(", ")
         )))
+    }
+
+    /// The idle origin an actor's version 2 record carries (`idle-since`,
+    /// ADR 0035), for an idle expiry pass: read only for actors this node
+    /// refused, whose refused cycles rewrote the record. `None`: none,
+    /// unreadable, or not refused here.
+    pub(crate) async fn carried_idle_since(&self, address: &ActorAddress) -> Option<u64> {
+        if !self.owners.recorded_head() {
+            return None;
+        }
+        let key = self.owner_key(address);
+        if !self.pending.was_refused(&key) {
+            return None;
+        }
+        let read = tokio::time::timeout(self.lease_attempt, async {
+            self.store.get(&StorePath::from(key)).await?.bytes().await
+        })
+        .await
+        .ok()?
+        .ok()?;
+        wasmkeep_cluster::node_lease::OwnerRecord::decode(&read)?
+            .recorded?
+            .idle_since_ms
     }
 
     /// The ownership record of an actor (ADR 0020). The name is encoded

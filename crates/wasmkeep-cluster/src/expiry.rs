@@ -92,6 +92,19 @@ pub struct Listed {
     /// must find unchanged; empty if the listing gave none, and then the
     /// record is never expired.
     pub version: String,
+    /// The idle origin a version 2 record carries (`idle-since`, ADR
+    /// 0035), read separately: earlier than `modified_ms` when refused
+    /// cycles rewrote the record without activity. `None`: the record's
+    /// last-modified time is its idle origin.
+    pub idle_since_ms: Option<u64>,
+}
+
+impl Listed {
+    /// Since when the actor has been idle.
+    pub fn idle_origin_ms(&self) -> u64 {
+        self.idle_since_ms
+            .map_or(self.modified_ms, |since| since.min(self.modified_ms))
+    }
 }
 
 /// The records of one listing an expiry pass acts on: last written more
@@ -110,13 +123,13 @@ pub fn candidates(
     let mut out: Vec<Listed> = listed
         .into_iter()
         .filter(|l| {
-            now_ms.saturating_sub(l.modified_ms) > idle_ms
+            now_ms.saturating_sub(l.idle_origin_ms()) > idle_ms
                 && !l.version.is_empty()
                 && !alarmed.contains(&l.name)
                 && !skip(l)
         })
         .collect();
-    out.sort_by(|a, b| (a.modified_ms, &a.name).cmp(&(b.modified_ms, &b.name)));
+    out.sort_by(|a, b| (a.idle_origin_ms(), &a.name).cmp(&(b.idle_origin_ms(), &b.name)));
     out.truncate(max);
     out
 }
@@ -175,6 +188,7 @@ mod tests {
             name: name.into(),
             modified_ms,
             version: version.into(),
+            idle_since_ms: None,
         }
     }
 
@@ -202,6 +216,24 @@ mod tests {
         // Exactly the limit is not past it.
         assert_eq!(names, ["older", "old"]);
         let got = candidates(all, &alarmed, |_| false, 10_000, 1_000, 1);
+        assert_eq!(got.len(), 1);
+    }
+
+    /// ADR 0035 S3: a record rewritten by refused cycles keeps its idle
+    /// origin in `idle-since`; it is a candidate by that, not by the
+    /// rewrite's time.
+    #[test]
+    fn a_carried_idle_origin_makes_a_candidate() {
+        let mut refused = listed("refused", 9_900, "v1");
+        refused.idle_since_ms = Some(1_000);
+        let got = candidates(
+            vec![refused],
+            &BTreeSet::new(),
+            |_| false,
+            10_000,
+            1_000,
+            10,
+        );
         assert_eq!(got.len(), 1);
     }
 

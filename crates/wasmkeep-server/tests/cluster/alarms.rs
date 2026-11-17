@@ -116,6 +116,61 @@ async fn an_alarm_fires_on_another_node_when_its_owner_is_gone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_node_without_alarms_does_not_sweep_but_a_normal_node_does() {
+    // a owns "Room 1" with an alarm pending, then is cut off for good. b
+    // runs with no_alarms: long after the alarm is overdue, its sweep has
+    // not delivered it (the entry stays in the bucket's index) and b still
+    // serves requests. A normal node c joining then delivers it.
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let down = Arc::new(AtomicBool::new(false));
+    let seen_by_a: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let idle = Duration::from_secs(30);
+    let a = node_with("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_configured(
+        "b",
+        db.path(),
+        &shared,
+        idle,
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |config| config.no_alarms = true,
+    )
+    .await;
+    settle().await;
+
+    let r = send(a.addr, "POST", "/actor/t/Room%201/alarm?in=1500", "").await;
+    assert_eq!((r.status, r.node.as_deref()), (200, Some("a")));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    down.store(true, Ordering::SeqCst);
+
+    // Overdue by about 2.7 s; give several sweep periods.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert!(
+        !index_entries_for(&shared, "Room 1").await.is_empty(),
+        "b delivered an alarm with alarms off"
+    );
+    let r = send(b.addr, "GET", "/actor/t/other/fired", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "0"), "b still serves");
+
+    let c = node_with("c", dc.path(), &shared, idle, "t", test_actor_wasm()).await;
+    wait_delivered(&shared, &["Room 1"]).await;
+    let r = send(c.addr, "GET", "/actor/t/Room%201/fired", "").await;
+    assert_eq!(
+        (r.status, r.body.trim()),
+        (200, "1"),
+        "the normal node fired it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn entries_nobody_can_act_on_do_not_hold_back_the_rest() {
     // More stuck entries (a class no node serves) than one sweep reads,
     // all older than the orphaned alarm: sweeps must get past them.

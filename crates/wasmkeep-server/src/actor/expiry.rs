@@ -51,7 +51,7 @@ impl ActorState {
     /// The expiry job: acquire the actor only as the listing showed its
     /// record (`listed`, its `ETag`), restore it, and delete it unless its
     /// database holds an alarm or it has a socket. Runs no guest code.
-    pub(super) async fn expire_idle(&mut self, listed: String) -> Expired {
+    pub(super) async fn expire_idle(&mut self, listed: String, idle_origin_ms: u64) -> Expired {
         let Some(cluster) = self.cluster.clone() else {
             return Expired::Refused("not in a cluster".into());
         };
@@ -64,7 +64,10 @@ impl ActorState {
             return Expired::Kept("socket");
         }
         self.owner_hint = None;
-        match self.ensure_owner_with(Some(&listed)).await {
+        match self
+            .ensure_owner_with(Some((&listed, idle_origin_ms)))
+            .await
+        {
             Ok(()) => {}
             Err(OwnershipError::Refused(why)) if why == RECORD_CHANGED => {
                 return Expired::Changed;
@@ -176,19 +179,32 @@ async fn pass(
         // Before the listing: a listing slow to come back never makes a
         // record look idler than it was when it was taken.
         let now = now_ms();
-        let listed = match cluster.list_owner_records(class).await {
+        let mut listed = match cluster.list_owner_records(class).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(%class, error = %e, "idle expiry: listing the ownership records failed");
                 continue;
             }
         };
+        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+        // ADR 0035: a record this node refused was rewritten by its refused
+        // cycles; its carried `idle-since` is its idle origin.
+        for l in &mut listed {
+            if now.saturating_sub(l.modified_ms) > idle_ms {
+                continue;
+            }
+            let Some(name) = wasmkeep_storage::decode_segment(&l.name) else {
+                continue;
+            };
+            if let Ok(address) = ActorAddress::new(&inner.tenant, class, &name) {
+                l.idle_since_ms = cluster.carried_idle_since(&address).await;
+            }
+        }
         let with_alarm: BTreeSet<String> = alarmed
             .iter()
             .filter(|(c, _)| c == class)
             .map(|(_, n)| n.clone())
             .collect();
-        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
         let chosen = candidates(
             listed,
             &with_alarm,
@@ -255,11 +271,12 @@ async fn expire_one(
         return Expired::Kept("active");
     }
     let etag = listed.version.clone();
+    let origin = listed.idle_origin_ms();
     let job =
         inner
             .mailboxes
             .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
-                Box::pin(state.expire_idle(etag))
+                Box::pin(state.expire_idle(etag, origin))
             });
     let outcome = match tokio::time::timeout(EXPIRE_WAIT, job).await {
         Ok(Ok(outcome)) => outcome,

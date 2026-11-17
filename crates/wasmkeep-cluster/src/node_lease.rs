@@ -1068,11 +1068,19 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         &self,
         inherited: Option<Requirement>,
         before: Option<&OwnerRecord>,
+        idle_origin_ms: Option<u64>,
     ) -> Option<RecordedHead> {
         self.recorded_head().then(|| {
+            // A carried origin, else the one the caller judged (an expiry's
+            // listed last-modified time): never a fresh one from a rewrite.
+            // Carried only from a released record: a held one may belong to
+            // a holder that activated the actor and crashed before its
+            // release could clear the origin.
             let idle = before
+                .filter(|b| b.holder.is_none())
                 .and_then(|b| b.recorded)
-                .and_then(|r| r.idle_since_ms);
+                .and_then(|r| r.idle_since_ms)
+                .or(idle_origin_ms);
             Requirement::stored(inherited, true, idle)
         })
     }
@@ -1126,7 +1134,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                attempted = self.mine(first, self.acquiring(inherited, None));
+                attempted = self.mine(first, self.acquiring(inherited, None, None));
                 let written = self.bucket.create(key, checked(&attempted)?).await;
                 (first, None, written)
             }
@@ -1161,7 +1169,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
+                attempted = self.mine(generation, self.acquiring(inherited, Some(&record), None));
                 let written = self
                     .bucket
                     .replace(key, checked(&attempted)?, &version)
@@ -1204,16 +1212,21 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         unchanged: impl Fn(&Version) -> bool,
         lease_valid: impl Fn() -> bool,
     ) -> Result<Hold, AcquireError> {
-        self.acquire_unchanged_prepared(key, unchanged, lease_valid, |_, _| Ok(None))
+        self.acquire_unchanged_prepared(key, unchanged, None, lease_valid, |_, _| Ok(None))
             .await
     }
 
     /// [`Self::acquire_unchanged`] with the preparation hook of
-    /// [`Self::acquire_prepared`].
+    /// [`Self::acquire_prepared`]. `idle_origin_ms` is the record's idle
+    /// origin as the expiry judged it (its listed last-modified time, or a
+    /// carried `idle-since`): a version 2 record that carries none is
+    /// rewritten with it, so a refused cycle does not restart the actor's
+    /// idle clock (ADR 0035, section 3).
     pub async fn acquire_unchanged_prepared(
         &self,
         key: &str,
         unchanged: impl Fn(&Version) -> bool,
+        idle_origin_ms: Option<u64>,
         lease_valid: impl Fn() -> bool,
         prepare: impl FnOnce(
             Option<&OwnerRecord>,
@@ -1241,7 +1254,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         if !lease_valid() {
             return Err(AcquireError::LeaseInvalid);
         }
-        let attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
+        let attempted = self.mine(
+            generation,
+            self.acquiring(inherited, Some(&record), idle_origin_ms),
+        );
         let written = self
             .bucket
             .replace(key, checked(&attempted)?, &version)
@@ -2425,5 +2441,56 @@ mod tests {
             run((&mem).get("owners/x")).unwrap().is_none(),
             "nothing written"
         );
+    }
+
+    /// Review of S3 (M1): an idle origin is carried only from a released
+    /// record. A record held by a node that crashed after activating the
+    /// actor (verified, writes served) still carries the origin its own
+    /// acquisition took; the takeover must not carry it on, or a recently
+    /// active actor would be expired as idle.
+    #[test]
+    fn an_idle_origin_is_carried_only_from_a_released_record() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let b = Owners::new(&mem, At(&t), "b", "i2", "nodes/", cfg());
+        for o in [&a, &b] {
+            o.set_recorded_head(true);
+        }
+        let idle = |k: &str| {
+            OwnerRecord::decode(&run((&mem).get(k)).unwrap().unwrap().0)
+                .unwrap()
+                .recorded
+                .and_then(|r| r.idle_since_ms)
+        };
+        // A refused expiry left the origin in a released record.
+        let released = OwnerRecord {
+            holder: None,
+            generation: 3,
+            recorded: Some(RecordedHead {
+                idle_since_ms: Some(1_234),
+                ..RecordedHead::UNKNOWN
+            }),
+        };
+        mem.overwrite("owners/x", Some(&released.encode()));
+        // B takes it (carried: the record was released), activates, and
+        // crashes holding it.
+        run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(idle("owners/x"), Some(1_234));
+        let fenced = NodeLeaseObject {
+            state: NodeState::Fenced,
+            instance: Some("i2".into()),
+            written_at_ms: 0,
+        };
+        mem.overwrite("nodes/b", Some(&fenced.encode()));
+        t.set(100_000);
+        // The takeover over B's held record carries no origin.
+        let hold = run(a.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(idle("owners/x"), None);
+        assert_eq!(hold.head.idle_since_ms, None);
+        assert_eq!(run(a.release(&hold)), Released::Released);
+        assert_eq!(idle("owners/x"), None, "released without the stale origin");
     }
 }

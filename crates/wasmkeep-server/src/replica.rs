@@ -588,6 +588,13 @@ pub(crate) enum ReplicaError {
     /// activated, retryable (503).
     #[error("the actor's recorded head is not visible yet: {0}")]
     Visibility(String),
+    /// A link of the chain is missing while a recorded floor is to be
+    /// reached: a listing behind its writes, listed again like
+    /// [`Self::Visibility`]; still missing once the discovery bound is
+    /// spent, it is reported as [`Self::Restore`] (ADR 0035, S6). Never
+    /// returned by [`Replica::restore`].
+    #[error("restore: {0}")]
+    MissingLink(String),
 }
 
 /// How long discovery of a recorded head may take, all listings and
@@ -596,6 +603,19 @@ const DISCOVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The pauses between the at most ten listings of that discovery (ms).
 const RELIST_MS: [u64; 9] = [100, 200, 400, 800, 1_600, 1_600, 1_600, 1_600, 1_600];
+
+/// What a discovery that used all ten listings reports: a link every one
+/// of them showed missing is a corruption (500); otherwise a retryable
+/// refusal (503) (ADR 0035, S6).
+fn gave_up(why: String, missing_link: bool) -> ReplicaError {
+    if missing_link {
+        ReplicaError::Restore(format!(
+            "{why}, still after the discovery bound: the history is incomplete"
+        ))
+    } else {
+        ReplicaError::Visibility(why)
+    }
+}
 
 /// `d` plus a uniform 0 to 20 percent (ADR 0035, section 3).
 pub(crate) fn jittered(d: std::time::Duration) -> std::time::Duration {
@@ -771,6 +791,9 @@ impl Replica {
         let deadline = tokio::time::Instant::now() + DISCOVERY;
         let mut attempt = 0;
         let started = std::time::Instant::now();
+        // Whether every listing so far showed a link missing: only all ten
+        // listings the bound allows, each so, make it a corruption.
+        let mut all_missing = true;
         let restored = loop {
             let tried = Self::restore_within(
                 cluster,
@@ -782,15 +805,27 @@ impl Replica {
                 floor.as_ref(),
             )
             .await;
+            all_missing &= matches!(tried, Err(ReplicaError::MissingLink(_)));
             match tried {
-                Err(ReplicaError::Visibility(why)) if attempt < RELIST_MS.len() => {
+                Err(ReplicaError::Visibility(why) | ReplicaError::MissingLink(why))
+                    if attempt < RELIST_MS.len() =>
+                {
+                    // The hold ended: late, whatever the listing showed.
+                    if !lease.is_valid() {
+                        break Err(ReplicaError::Late);
+                    }
                     let pause = jittered(std::time::Duration::from_millis(RELIST_MS[attempt]));
-                    if tokio::time::Instant::now() + pause >= deadline || !lease.is_valid() {
+                    // The deadline, spent before the ten listings: nothing
+                    // proven either way, retryable.
+                    if tokio::time::Instant::now() + pause >= deadline {
                         break Err(ReplicaError::Visibility(why));
                     }
                     attempt += 1;
                     tokio::time::sleep(pause).await;
                 }
+                // The tenth listing.
+                Err(ReplicaError::MissingLink(why)) => break Err(gave_up(why, all_missing)),
+                Err(ReplicaError::Visibility(why)) => break Err(ReplicaError::Visibility(why)),
                 other => break other,
             }
         };
@@ -839,7 +874,7 @@ impl Replica {
             wasmkeep_cluster::replication::PlanError::Missing { .. }
                 if floor.is_some_and(|f| matches!(f.head, Position::Known { .. })) =>
             {
-                ReplicaError::Visibility(e.to_string())
+                ReplicaError::MissingLink(e.to_string())
             }
             e => ReplicaError::Restore(e.to_string()),
         })?;
@@ -907,10 +942,12 @@ impl Replica {
             let usable = match structural {
                 Proof::NeedsReplay => match prove(floor, &at_head) {
                     Proof::Proven => true,
+                    // A file changed outside replication proves nothing of
+                    // the bucket (ADR 0035, S4): set aside, as the download
+                    // installs its result; the replay judges the history.
                     Proof::Conflict => {
-                        return Err(ReplicaError::Restore(
-                            "the local database at the recorded head has another checksum".into(),
-                        ));
+                        tracing::warn!(prefix = %replica.prefix, head = ?plan.head(), "the local database at the recorded head has another checksum; downloading instead");
+                        false
                     }
                     Proof::Missing | Proof::NeedsReplay => false,
                 },

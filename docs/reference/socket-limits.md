@@ -36,6 +36,13 @@ resident actor and cluster connection, with no socket capacity if none fits.
 It logs a degraded-start warning when reserved headroom cannot be met;
 raise the OS limit to restore capacity.
 
+With the defaults, a soft limit of 65,536 admits about 25,800 sessions per
+node (25,778 on a cluster node, 26,290 on a single node), not 50,000. The node
+logs one INFO line with the effective number and no warning, since nothing was
+asked for beyond the default. An explicit `--max-sockets-per-node` that does
+not fit is a warning ("socket session capacity reduced by descriptor budget").
+To admit more, raise `LimitNOFILE` (about two descriptors per session).
+
 The startup log and [metrics](../monitoring.md#open-files) expose requested
 and effective socket ceilings. The effective actor ceiling cannot exceed
 the app or process ceiling. Outbound clients and bucket activity are not all
