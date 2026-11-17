@@ -4,7 +4,11 @@
   (asset contents refreshed before reuse, a start proof of every link
   condition, fixed-length namespaces, the sweep judged only after a
   delete's outcome, stored headers overridden on download, indexes
-  content-addressed, the fallback index the one served before)
+  content-addressed, the fallback index the one served before);
+  section 9 amended 2026-11-17 for `0.6.0` (manifest format 7; the
+  hostname picks the app's assets; a bucket layout with separate
+  contents and indexes; collection guarded by deploy and collection
+  markers instead of refreshed ages; slices A1 to A7)
 - Date: 2026-11-14
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, after data access
   (`0.5.0`) and several apps per process
@@ -685,63 +689,230 @@ with its path relative to `DIR` as its name:
 **Storage: content-addressed, beside the versions.**
 
 ```
-apps/<t>/<a>/_assets/<sha256>      one object per distinct content, the indexes
-                                   included; immutable
+apps/<t>/<a>/_assets/content/<sha256>     one object per distinct content (a file, or a
+                                          compressed variant); immutable
+apps/<t>/<a>/_assets/index/<sha256>       one object per distinct set of assets; immutable
+apps/<t>/<a>/_assets/deploying/<id>       a deploy with assets is running (below)
+apps/<t>/<a>/_assets/collecting/<id>      a collection of assets is running (below)
 ```
 
-- The deploy lists `_assets/` and uploads only the contents not there,
-  each created with `If-None-Match: *` (an existing one is the same
-  bytes by its name). A deploy that changes one file uploads one object
-  and an index.
-- **Reused contents are refreshed.** Collection deletes a content by its
-  age, so a content the deploy reuses must be young: before writing its
-  manifest, the deploy writes again (a plain overwrite of the same bytes,
-  which it has) every reused content last modified more than half the
-  retention window ago, then heads each reused content and refuses to
-  switch `current` if any is missing or if more than half the window has
-  passed since its refreshes began. A content the deploy names is then
-  younger than the window until the manifest naming it exists, so a
-  collection that runs meanwhile, which has not seen that manifest, does
-  not delete it. Redeploying a site unchanged for longer than half the
-  window re-uploads its files once.
-- The index is text: a header with `not-found`, `front-first` and
-  `immutable`, then one line per file in name order: the percent-encoded
-  name, the type, and for each representation (`identity`, `br`, `gzip`)
-  its digest and size.
-- **Manifest format 4**, written only for a version with assets: format
-  3 plus one line, `assets <sha256 of the index>` (the index is
-  `_assets/<that digest>`), after the front line,
-  in the version's identity, so a deploy that changes only a file makes
-  a new version. A version without assets is written exactly as before.
-- `_assets` is not a version id (an `_`), so version collection never
-  treats it as one. ADR 0012's deploy collection gains a step after it
-  deletes versions: list `_assets/`, read the manifest of **every**
-  version directory and the index it names (not only the lineage: a
-  version a rollback stepped back from still counts), and delete the
-  contents none of them names, indexes included, last modified more than
-  the retention window ago (`--version-retention-secs`, at least one
-  hour). A manifest or index it cannot read, a format it does not know
-  included, stops the step with nothing deleted, and says which: a newer
-  CLI collects. A directory a failed deploy left keeps its contents
-  until someone removes it; the step names such directories.
+`<sha256>` is the 64 lowercase hex digits of the object's bytes; `<id>`
+is 16 random lowercase hex digits. Nothing else is written under
+`_assets/`, and no command deletes a key there that it does not
+recognise.
 
-**Serving.** `App::route` becomes:
+- **The index** is text, at most 8 MiB (a deploy whose index would be
+  larger is refused), with lines ending in LF:
+
+  ```
+  wasmkeep-assets 1
+  not-found spa
+  front-first api/
+  front-first auth/
+  immutable assets/
+  file index.html text/html;charset=utf-8 identity:<sha256>:<size> br:<sha256>:<size> gzip:<sha256>:<size>
+  file logo.png image/png identity:<sha256>:<size>
+  ```
+
+  `not-found` once (`front`, `spa` or `404`); `front-first` and
+  `immutable` lines sorted, without duplicates; then one `file` line per
+  name, sorted by the name's bytes: the name with every byte outside
+  `[A-Za-z0-9._~/-]` percent-encoded, the type without spaces, then
+  `identity` and, when the variant exists, `br` and `gzip`, in that
+  order, each with its content's digest and size in bytes. The form is
+  canonical, so one set of assets and rules has one index and one
+  digest. A node refuses (as a corrupt version) an index whose digest is
+  not the manifest's, with a first line or a line it does not know, out
+  of order, or over 8 MiB. A later index form takes a new first line and
+  a new manifest format.
+- **A deploy names its index by the index's digest.** **Manifest format
+  7**, written only for a version with assets: format 6's lines (ADR
+  0036) plus one, `assets <sha256 of the index>`, after the `front`
+  line and before `access`, in the version's identity, so a deploy that
+  changes only a file, or only a rule of `[assets]`, makes a new
+  version. The line appears at most once. A version without assets is
+  written exactly as before, in formats 1 to 6, with the same bytes and
+  id. Two versions with the same assets share one index object.
+- `_assets` is not a version id (an `_`), so version collection never
+  treats it as one, and a CLI from before this release never touches it.
+
+**What a deploy writes, in order.** Every deploy whose new manifest has
+an `assets` line does this, a deploy that keeps the current assets
+included (it has no files, so it uploads nothing in step 4):
+
+1. It scans `DIR`, builds the index, and stops with "unchanged" if the
+   new version's identity is the current one's. It checks the capability
+   word (section 11), prints the plan and waits for its confirmation.
+   Nothing is written before this point, and no deadline runs while
+   the prompt waits.
+2. It writes its marker, `_assets/deploying/<id>`, and notes the
+   marker's last-modified time `T0`, which is the bucket's clock. From
+   here to step 7 it writes the marker again every 10 minutes, through
+   the wait and the uploads.
+3. It lists `_assets/collecting/`. While a marker there is younger than
+   15 minutes, it says `waiting for a collection of assets to finish`,
+   waits 2 seconds and lists again. A marker's age is `T0`, plus the
+   time passed since on the deploy's monotonic clock, minus the
+   marker's last-modified time: so a marker an interrupted collection
+   left holds a deploy until it is 15 minutes old, never longer.
+4. Only then, it lists `_assets/content/` once, and uploads the contents
+   its index names that are not there, then the index if it is not
+   there, each with `If-None-Match: *` (an existing one is the same
+   bytes by its name, and "already exists" is success), eight at a time.
+   A deploy that changes one file uploads one content and one index.
+5. It heads the index and every content the index names, and refuses to
+   go on if one is missing or has another size. A deploy that keeps the
+   current assets and finds one missing says to deploy again with
+   `--assets`.
+6. It writes the classes, the front, the manifest and `current` as
+   today (ADR 0013). It refuses to write the manifest, or to switch
+   `current`, more than 30 minutes after it began the last write of the
+   marker that the bucket acknowledged, measured on its own monotonic
+   clock.
+7. It deletes its marker, whatever the outcome, and before the
+   collection the same run starts (or that collection would stop on
+   its own deploy's marker). A marker left by a deploy that was killed
+   is ignored once it is an hour old.
+
+Contents are never written again and never refreshed: what protects
+them is the marker, not their age.
+
+**Collection** (ADR 0012). `wasmkeep deploy` runs it after version
+collection, in the same run, after every deploy and rollback. Nodes
+never delete an asset. The rule:
+
+> An object under `_assets/content/` or `_assets/index/` is deleted only
+> if (a) no manifest of any version directory of the app names it,
+> directly (an index) or through its index (a content), (b) it was last
+> modified more than the retention window before the collection began,
+> and (c) no deploy marker younger than one hour existed when the
+> collection began. Otherwise it stays.
+
+The steps, whose order matters:
+
+1. The collector writes its marker, `_assets/collecting/<id>`, notes
+   its last-modified time `Tc` (the bucket's clock), and starts a
+   five-minute timer on its own monotonic clock from before it sent
+   that write.
+2. It lists `_assets/deploying/`. It deletes the markers last modified
+   an hour or more before `Tc`. If any other remains, a deploy is
+   running: it deletes its own marker and stops, having deleted
+   nothing, and says `assets not collected: a deploy is in progress`.
+   The next deploy or rollback collects.
+3. It lists `_assets/content/` and `_assets/index/`, with ages: these
+   are the only candidates, so nothing written after this listing can
+   be deleted by this pass. It also deletes the markers under
+   `_assets/collecting/` older than 15 minutes at `Tc`.
+4. It finds what is in use: it lists the app's version directories,
+   **every** one that has a `manifest`, in the lineage or not (a version
+   a rollback stepped back from, or one a failed deploy left, still
+   counts), reads each manifest, and for each `assets` line reads the
+   index and checks its digest. A manifest or an index it cannot read,
+   a format it does not know included, or an index that is missing,
+   stops the step with nothing deleted, and says which: a newer CLI
+   collects.
+5. It deletes the candidates that are not in use, whose name is 64 hex
+   digits, and that were last modified at or before `Tc` minus the
+   retention window (`--version-retention-secs`; 0 is allowed and means
+   no wait). Before each delete it checks its timer, and stops once
+   five minutes have passed; every 100 deletes it reads `current` again
+   and stops if it changed, as version collection does. What is left is
+   for the next pass.
+6. It deletes its marker, on success or failure.
+
+What this keeps, and why:
+
+- **The current deploy and the ones before it.** Version collection
+  keeps the current version and the five before it (ADR 0012), and
+  every kept version's manifest is read in step 4, so their indexes and
+  contents are in use. That covers the index a node served before its
+  current one (below), unless six deploys ran inside the retention
+  window. Collection of assets runs after version collection: the
+  contents only a version deleted in this same pass named are no longer
+  in use, and go in the same pass if they are old enough.
+- **A deploy in progress.** Either the deploy wrote its marker before
+  the collector listed the markers (step 2 of collection), and the
+  collector deletes nothing; or it wrote it after, and then the
+  collector's own marker, written before that listing, is there when
+  the deploy lists `_assets/collecting/` (step 3 of the deploy): the
+  deploy waits until that marker is gone or 15 minutes old, and the
+  collector stopped deleting at five. The deploy lists the contents
+  only after that, so whatever the collector removed, the deploy sees
+  missing and uploads. From then until its manifest exists, its marker
+  stops every later collector; once its manifest exists, step 4 finds
+  it. A deploy that keeps the current assets is covered the same way,
+  and also by `current`: its switch is conditional on the `current` it
+  read, whose version is kept.
+- **A rollback** writes no asset and takes no marker: it points
+  `current` at a kept version, whose manifest was in use throughout.
+- **Two collectors at once** are harmless: both delete only what no
+  manifest names, and a delete of a key already gone succeeds.
+
+What it assumes, said plainly:
+
+- The bucket lists its own writes at once (the read-after-write
+  listing `cluster diagnose` checks). A marker a listing does not show
+  yet is a marker not seen.
+- Ages compare two times of the bucket's own clock (`Tc`, `T0` and
+  last-modified times); the workstation's clock is never compared to
+  the bucket's. The two deadlines (five minutes, 30 minutes) run on the
+  local monotonic clock.
+- **The remaining race.** A delete the collector sent before its five
+  minutes ended, which the bucket applies more than ten minutes later,
+  could remove a content that a deploy, having waited the 15 minutes,
+  then found present. Likewise a deploy that stalls for more than 30
+  minutes between its last deadline check and the write of its
+  manifest could name a content a collector removed in between. Bucket
+  requests time out long before either bound, and nothing fences a
+  plain delete, so this is bounded, not excluded. If it happens, the
+  version is deployed with a content missing: nodes answer `503` for
+  that file only and count `wasmkeep_asset_fetches_total{outcome="unavailable"}`,
+  and the next `deploy --assets` uploads it again, since every deploy
+  lists the contents and uploads the missing ones.
+- A directory a failed deploy left, with a manifest, keeps its assets
+  until someone removes it; the step names such directories. Contents a
+  failed deploy uploaded before it had a manifest are not in use, and
+  go once they are older than the window.
+- `app delete` (ADR 0028) removes every key under the app's two
+  prefixes but its tombstone, assets and markers included. A backup copies the indexes and contents
+  that the versions it keeps name, never a marker.
+
+**Serving.** The hostname picks the app, then the path picks what
+answers. With several apps in a process
+([ADR 0038](0038-several-apps-per-process.md), section 6), the request's
+authority is looked up in the node file's table before anything else:
+an unknown host answers `421`, a stopped app's host `503`, and no
+request falls into another app's assets. Each app runtime holds its own
+index; nothing below looks at the host again, and `Forwarded` and
+`X-Forwarded-Host` are never read. With one app and no table, no `Host`
+is needed, as today. Inside the app, `App::route` becomes:
 
 1. `/_wasmkeep/...`: the server's, now with `/_wasmkeep/blobs/v1/`
    (section 4).
-2. `/actor/<class>/<name>...`: the actors.
-3. A path whose decoded form (below) is under one of `front-first`:
+2. Admission (ADR 0036): an app's ingress limits match asset paths as
+   any other, and a refused request answers `429` before any lookup.
+3. `/actor/<class>/<name>...`: the actors. No asset is ever served
+   under `/actor/`, and the deploy refuses a top-level `actor/`.
+4. A request that arrived on the cluster port: `404`, as today.
+5. A path whose decoded form (below) is under one of `front-first`:
    the front.
-4. **A `GET` or `HEAD` without `Upgrade`** whose path names an asset:
-   the asset, answered by the host. No code runs.
-5. A `GET` or `HEAD` without `Upgrade` that names none: the `not-found`
+6. **A `GET` or `HEAD` without `Upgrade`** whose path names an asset:
+   the asset, answered by the host. No code runs, no front slot is
+   taken, and a request body, if one is sent, is not read (one declared
+   larger than the node's limit is answered `413` before routing, as
+   today).
+7. A `GET` or `HEAD` without `Upgrade` that names none: the `not-found`
    rule.
-6. Everything else (other methods, upgrades per ADR 0027): the front, or
-   `404 not found` without one.
+8. Everything else (other methods, `OPTIONS` included, and upgrades per
+   ADR 0027): the front, or `404 not found` without one.
+
+So the precedence is: the server's paths, then actors, then
+`front-first`, then assets, then the front. A version without an
+`assets` line skips steps 5 to 7.
 
 Assets are served on the public port only, never on the cluster port,
 never forwarded. A path that fails the decoding below goes straight to
-step 6, whatever `not-found` says. A path whose decoded form starts with
+step 8, whatever `not-found` says. A path whose decoded form starts with
 `_wasmkeep/` or `actor/` while its raw form does not (`/%5Fwasmkeep/`,
 `/%61ctor/`) answers `400`: the reserved prefixes have one spelling. The
 front receives the raw path, as today.
@@ -779,9 +950,14 @@ not have a new file, and a cache must not keep that answer.
 
 **Responses.**
 
+- `HEAD` answers as `GET` does, with the same status and headers
+  (`Content-Length` included) and no body.
 - `Content-Type` from the index; `X-Content-Type-Options: nosniff`.
 - `ETag`: the strong tag `"<first 32 hex digits of the representation's
-  digest>"`; `If-None-Match` answers `304`. No `Last-Modified`.
+  digest>"`, so each encoding has its own. `If-None-Match` (a list, `*`,
+  weak comparison) answers `304` with the `ETag`, `Cache-Control` and
+  `Vary` the `200` would carry. No `Last-Modified`, and
+  `If-Modified-Since` is ignored.
 - `Cache-Control`: `public, max-age=31536000, immutable` for a name
   under an `immutable` prefix; `public, max-age=0, must-revalidate` for
   every other. The rule is the prefixes the app declares, never a guess
@@ -791,8 +967,16 @@ not have a new file, and a cache must not keep that answer.
   `q=0`; `Content-Encoding` as chosen, and `Vary: Accept-Encoding` on
   every response of a file that has a variant.
 - `Range`: one range of the plain file (`206`, `Accept-Ranges: bytes`),
-  with `If-Range` honoured only for a matching ETag. Several ranges get
-  the whole file.
+  with `If-Range` honoured only for a matching ETag. A request with a
+  usable `Range` gets the plain file whatever its `Accept-Encoding`; an
+  unsatisfiable one gets `416` with a `Content-Range` giving the
+  file's size and no range (RFC 9110, section 14.4).
+  Several ranges get the whole file.
+- No compression at request time: only the variants the deploy stored.
+- Bodies are streamed from the node's cache on disk, never held whole
+  in memory. The size limits are the deploy's (25 MiB a file, 512 MiB
+  and 20,000 files a version, an 8 MiB index); the node enforces the
+  index limit and each content's size from the index when it fetches.
 - The `spa` fallback answers with `Cache-Control: no-cache` and
   `Vary: Sec-Fetch-Mode, Accept`, and the host adds that `Vary` to the
   front's answers to unmatched `GET` and `HEAD` requests under `spa`, so
@@ -815,8 +999,12 @@ checked against the manifest line) under the same lock as the classes and the
 front (ADR 0023), and swaps it with them. Contents are fetched on first
 use, one fetch per digest at a time, verified against their digest
 before they are served or kept, and kept on disk in
-`<data_dir>/assets/<sha256>` up to `--assets-cache-bytes` (default
-1 GiB, least recently used out first). In the background the node
+`<data_dir>/assets/<tenant>/<app>/<sha256>` up to `--assets-cache-bytes`
+(default 1 GiB, least recently used out first). With several apps the
+directory is each app's own, never shared by digest: an index could
+name the digest of a file its app never uploaded, and must not be
+answered from another app's copy. The byte limit is the process's, one
+least-recently-used order across its apps. In the background the node
 fetches the rest of the version's contents while they fit. A content
 the bucket cannot give is `503` with `Retry-After: 1`. Since every
 byte fetched is checked against a digest the manifest chains to, a
@@ -846,17 +1034,97 @@ file asked of a node not yet switched falls to the `not-found` rule
 contents collection kept: the assets come back with the front and the
 classes, with no upload.
 
-**`wasmkeep dev`** serves `[assets] dir` from disk with the same rules,
-the deploy's refusals and skips included (no symbolic link is followed,
-no dotfile served), building its table from the directory and
-rereading it on change, and makes no compressed variants.
+**`wasmkeep dev`** serves `[assets] dir` from disk with the same rules:
+the same routing order, matching, `not-found` modes, `front-first`,
+types, `ETag`, ranges and `Cache-Control` values, and the deploy's
+refusals and skips (no symbolic link is followed, no dotfile served; a
+refusal is printed and the name is not served, the session goes on). It
+runs `[assets] build` at start and when a path under `[assets] watch`
+changes, builds its table from the directory, and rebuilds it when the
+directory changes. It differs in four ways: no compressed variant is
+made or served (a sibling `X.br` or `X.gz` is still hidden as a
+variant, unchecked); the immutable-name check against a previous
+version does not apply; there is no previous index; and files are read
+from the directory at each request, with the digest for the `ETag`
+computed when the table is built. It writes nothing to a bucket.
+
+**Mixed versions.** A node of this release announces the capability
+word `assets` on heartbeat line 11, after the words it has today, and
+reads manifest formats 1 to 7.
+
+- **The deploy** of a version with an `assets` line is refused, before
+  any write, while a live node of the app does not announce `assets`:
+  `live nodes of <tenant>/<app> cannot read a version with assets
+  (manifest format 7) (<node ids>): upgrade them first`
+  (`DeployError::NodesWithoutAssets`, beside `NodesWithoutEnds`). There
+  is no `--force`. A rollback to such a version is checked the same
+  way. Format 7 also inherits the checks of the formats below it.
+- **A node without the word** that meets a format 7 manifest all the
+  same (it started after the check) cannot parse it: `Manifest::parse`
+  returns nothing, the deploy follower fails with
+  `DeployError::Corrupt`, logged as `checking for a new deploy failed`
+  with `unreadable <version>/manifest`, and marks the node behind the
+  deploy: `/_wasmkeep/ready` answers `503` until it can apply the
+  version, and it retries with a growing wait, as for any version it
+  cannot read (ADR 0013). It never serves a format 7 version without
+  its assets. The same holds for a build of this release from before
+  slice A4: until the node serves assets, its loader refuses a manifest
+  with an `assets` line the same way, and does not announce the word.
+- **An older CLI** cannot read a format 7 manifest: it stops on
+  `current`, deploys nothing and collects nothing.
+- **Rolling back the release**: deploy a version without assets
+  (`--no-assets`, or no `[assets]`), which is written in format 6 or
+  below, then downgrade the nodes. The objects under `_assets/` stay
+  until a CLI of this release collects them.
+
+**Guests.** No guest reads, lists or writes an asset: there is no host
+function for them, `wasmkeep:actor/blobs` reaches only the caller's
+own namespace under `state/`, never `apps/<t>/<a>/_assets/`, and no
+guest names a bucket key (section 8). A front that needs a built file's
+bytes or name carries it in its component; the build order (assets,
+front, classes) is for that.
+
+**Security, for assets.**
+
+- **Path traversal.** At deploy, names come from walking `DIR` and are
+  refused with a `.` or `..` segment, `\`, a control character or
+  invalid UTF-8. At a request, the decoded path is refused the same
+  segments, and matching is a lookup in the index: no path of a file
+  system is ever built from a request. The cache on disk is named by
+  digests only.
+- **Symbolic links** are refused at deploy and by `dev`; only `DIR`
+  itself may be one, resolved once. Other non-regular files (devices, sockets, pipes)
+  are refused the same way. Hard links are regular files and are taken.
+- **No directory listing.** A path ending in `/` answers its
+  `index.html` or falls to `not-found`; the host never makes a listing.
+- **No header of the request picks the app or the file** but the
+  authority and the path.
+- **Integrity.** Every byte served was checked against a digest that
+  chains to the manifest, which chains to the version id.
+- Whoever can deploy the app decides its assets, as it decides its
+  code; the deploy's credentials are the check (ADR 0008).
 
 **Metrics**: `wasmkeep_asset_requests_total{outcome}` (`ok`,
 `not_modified`, `partial`, `redirect`, `spa`, `not_found`, `to_front`,
 `unavailable`), `wasmkeep_asset_bytes_total{encoding}`,
 `wasmkeep_asset_cache_bytes`, and
 `wasmkeep_asset_fetches_total{outcome}` (`ok`, `digest_mismatch`,
-`unavailable`).
+`unavailable`), each with `tenant` and `app`.
+
+**Slices.** Each is one change with its proof; A1 to A3 deploy and
+collect, A4 to A7 serve. The word `assets` is announced only from A4,
+so until then every format 7 deploy to a cluster is refused, and tests
+of A2 and A3 work on the bucket alone.
+
+| Slice | What | Where | Proof |
+| --- | --- | --- | --- |
+| A1 | The scan of `DIR` (refusals, skips, variants, types), the index text and its digest, `[assets]` in the project file and the `--assets*` flags, the plan's listing | new `crates/wasmkeep-cli/src/assets.rs`, `crates/wasmkeep-cli/src/{main,project}.rs` | CLI unit tests: every refusal and skip named above, a symbolic link, a variant that does not decompress to its file, an index that is byte-identical for the same directory walked in another order, an entry of `front-first` without `/` |
+| A2 | Format 7 (`assets` line, parse and write, identity), the index parser, the refusal while a node lacks `assets`, the deploy's steps 1 to 7 with the marker, keeping the current assets, `--no-assets` | `crates/wasmkeep-server/src/apps.rs`, new `crates/wasmkeep-server/src/assets.rs`, `crates/wasmkeep-cluster/src/membership.rs` | `apps.rs` unit tests: format 7 round trip, `assets` refused in format 6 and twice, a version without assets keeps its bytes and id, the fixtures that use `wasmkeep-manifest 7` as the unknown format moved to 8, `format_7_needs_assets_and_every_word_below_it`; on an in-memory bucket, a second deploy uploads only the changed content, a marker is there during the deploy and gone after, a deploy waits for a fresh collection marker and not for a stale one, a missing kept content refuses |
+| A3 | Collection of assets after version collection | `crates/wasmkeep-server/src/apps/collect.rs`, `crates/wasmkeep-cli/src/main.rs` | `collect.rs` unit tests on an in-memory bucket: unused contents and indexes deleted, used ones kept, a version outside the lineage keeps its assets, an unknown manifest format or a missing index deletes nothing, a fresh deploy marker deletes nothing and a stale one is removed, a key that is not 64 hex digits is never deleted, the five-minute stop; **the race**: a store wrapper pauses the collector after its listing of contents, a deploy that reuses an unused old content runs meanwhile and must wait, the collector resumes and deletes, the deploy then uploads the content again, and the deployed version has every content; the same with the deploy first, where the collector deletes nothing |
+| A4 | The node reads the index at a version switch, fetches and verifies contents, the cache on disk, the routing order, matching and responses, the word `assets` announced | `crates/wasmkeep-server/src/{assets,http,apps}.rs`, `crates/wasmkeep-server/src/actor/deploys.rs`, `crates/wasmkeep-cluster/src/membership.rs` | unit tests of matching and of every response header; new `crates/wasmkeep-server/tests/cluster/assets.rs` (registered in `main.rs`): a file, `index.html`, the `308`, `HEAD`, `304`, a range and `416`, `br` and `gzip` choice and `Vary`, escaped reserved prefixes `400`, an asset never under `/actor/`, a tampered content object refused by digest and `503`, no asset on the cluster port, a deploy refused while a node lacks the word |
+| A5 | `not-found` modes, `front-first`, `immutable` and the cache headers, the previous index and its persistence, rollback | `crates/wasmkeep-server/src/{assets,http}.rs` | `assets.rs`: `front`, `spa` (a navigation, a script, the `Vary`) and `404` with and without `404.html`; a `front-first` prefix reaching the front over a file; the previous version's immutable names served after a deploy and after a restart; `no-store` on not-found answers; rollback serving the old files with no upload |
+| A6 | Several apps: the hostname picks the index, the cache per app, metrics | `crates/wasmkeep-server/src/{assets,metrics}.rs` | `crates/wasmkeep-server/tests/cluster/two_apps.rs` (ADR 0038): two apps with the same asset names and other bytes each answer their own by host, an unknown host `421`, an index naming a digest only the other app holds answers `503`; the metrics carry the app |
+| A7 | `wasmkeep dev`, the docs (deploy guide, front page, upgrade notes, the type table), and the end-to-end collection proof | `crates/wasmkeep-cli/src/dev.rs`, `docs/` | a `dev` test serving a directory, a changed file and a symbolic link; `assets.rs`: seven deploys with retention 0 collect the first version's contents while every kept version still answers each of its files from every node, and **a deploy running during a collection**, both orders as in A3, against the cluster's bucket, after which every node answers every file of the new version |
 
 ### 10. `cluster diagnose`
 
@@ -892,7 +1160,8 @@ to add. The existing checks and their verdict do not change.
   - A deploy of a class or front that imports `wasmkeep:actor/blobs` is
     refused while a live node of the app lacks `blobs`: such a node
     could not link it, and would stay not ready. A deploy writing
-    format 4 is refused while a live node lacks `assets`. Neither has a
+    format 7 is refused while a live node lacks `assets` (section 9,
+    "Mixed versions"). Neither has a
     `--force`, as for `front`. A rollback to such a version is checked
     the same way.
   - **Deletes need the word too.** A delete of an actor whose class
@@ -905,8 +1174,8 @@ to add. The existing checks and their verdict do not change.
   - The TypeScript engine (ADR 0018) must import `blobs` only in builds
     that use it, or every TypeScript deploy would wait for the word
     during an upgrade; checked when built.
-  - A node and CLI of this release write and read formats 1 to 4. An
-    older CLI cannot read a format-4 `current` and stops, as with format
+  - A node and CLI of this release write and read formats 1 to 7. An
+    older CLI cannot read a format 7 manifest and stops, as with format
     3 before 0.4.0.
 - **Older deploys** are unchanged: a version without assets is served as
   before, and its manifest keeps its bytes and id.
@@ -938,8 +1207,9 @@ to add. The existing checks and their verdict do not change.
   their owner.
 - A deleted actor costs one more write and a sweep of its files; an app
   with many files costs one listing of them an hour.
-- Deploys with assets list `_assets/` once and upload only new
-  contents; collection reads every kept version's index.
+- Deploys with assets list `_assets/content/` once and upload only new
+  contents; collection reads every version directory's manifest and
+  index, and skips a pass while a deploy with assets is running.
 
 ## Alternatives
 
@@ -996,8 +1266,11 @@ to add. The existing checks and their verdict do not change.
 - Moving a node's local files into a bucket when it joins a cluster.
 - Encryption of files by WasmKeep: files are stored as written, like the
   actors' history; the bucket's server-side encryption applies.
-- Several apps on the same nodes (0.6.0, [ADR 0038](0038-several-apps-per-process.md)): the hostname then picks the
-  app's assets, and node links name their app already.
+- A trusted-proxy setting for the authority that picks the app's assets
+  (ADR 0038 leaves it open); until then only `Host` or `:authority`
+  counts.
+- A conditional delete (`If-Match` on the delete), where a bucket has
+  one, to close the remaining race of asset collection.
 - The SDKs other than Rust and TypeScript.
 
 ## Tests (to build)
@@ -1017,9 +1290,10 @@ to add. The existing checks and their verdict do not change.
   `308`, every `not-found` mode, `front-first`, `304`, ranges, `br` and
   `gzip` choice and `Vary`, a tampered content object refused by digest,
   the previous version's immutable names served, rollback, and
-  collection of unused contents with a concurrent deploy.
+  collection of unused contents with a concurrent deploy (section 9,
+  slices A3 and A7).
 - **CLI**: asset names refused and skipped, symbolic links, precompressed
-  variants that do not match, format 4 and the capability refusals.
+  variants that do not match, format 7 and the capability refusals.
 - **Diagnose**: the `blob-links` checks against a local S3 server that
   enforces signed headers, and a fake store that ignores them for the
   `warn` path.
@@ -1033,6 +1307,6 @@ to add. The existing checks and their verdict do not change.
 | Links: presigned, node links, the start proof, `cluster diagnose` | M |
 | Incarnations, sweep records and the sweep pass (with ADR 0028's routine) | M |
 | Counting, `--max-app-blob-bytes`, metrics | S |
-| Assets: deploy, index, format 4, collection | M |
-| Assets: serving, cache, `not-found`, `dev` | M |
+| Assets: deploy, index, format 7, collection (section 9, A1 to A3) | M |
+| Assets: serving, cache, `not-found`, `dev` (section 9, A4 to A7) | M |
 | Sim cases, cluster and CLI tests, adversarial review | M |
