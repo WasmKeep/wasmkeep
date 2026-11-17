@@ -185,3 +185,45 @@ fn empty_history_hole_sends_behind() {
     );
     assert!(io.frames.last().unwrap().contains("behind"));
 }
+
+#[test]
+fn r4_split_closes_moved_points_and_resumes_by_number() {
+    let mut edge = Edge::default();
+    let mut io = Io::default();
+    edge.push(
+        &Push {
+            messages: vec![],
+            head: 0,
+            ..push(1)
+        },
+        &mut io,
+    );
+    for id in 0..4 {
+        edge.open(id, None, &mut io);
+        edge.set_point(id, id << 62);
+    }
+    edge.push(&push(1), &mut io);
+    edge.range(0, Some(1 << 63), false, &[0, 1, 2, 3], &mut io);
+    assert_eq!(io.closed, vec![4801, 4801]);
+    let mut other = Edge::default();
+    other.push(&push(1), &mut io);
+    other.push(&push(2), &mut io);
+    other.open(9, Some(Position { e: 1, n: 1 }), &mut io);
+    assert!(io.frames.last().unwrap().contains("\"n\":2"));
+    other.range(0, None, true, &[9], &mut io);
+    assert_eq!(io.closed, vec![4801, 4801, 4801]);
+}
+#[test]
+fn r4_replayed_range_preserves_owned_sockets_and_closes_unknown_after_wake() {
+    let mut e = Edge::default();
+    let mut io = Io::default();
+    e.push(&push(1), &mut io);
+    e.open(1, None, &mut io);
+    e.set_point(1, 0);
+    e.range(0, Some(1 << 63), false, &[1, 2], &mut io);
+    assert_eq!(io.closed, vec![4801]);
+    e.range(0, Some(1 << 63), false, &[1], &mut io);
+    assert_eq!(io.closed, vec![4801]);
+    e.push(&push(2), &mut io);
+    assert!(io.frames.last().unwrap().contains("\"n\":2"));
+}

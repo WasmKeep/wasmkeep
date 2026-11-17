@@ -1,5 +1,6 @@
 /** Reconnecting room core. Export define() as an internal class. Fronts
  * authorize HTTP publish/history requests then use Client. Edges never call it. */
+import { ScaleHost, type ScaleOptions } from "./broadcast-scaling";
 import { Round } from "./broadcast-round";
 import * as storage from "wasmkeep:actor/storage@0.2.0";
 import * as alarms from "wasmkeep:actor/alarms@0.2.0";
@@ -84,13 +85,23 @@ function serve(core: Core, op: string, body: Uint8Array): Uint8Array {
 export function define(options: {
     confirm?: boolean;
     edges?: string[];
+    scaling?: ScaleOptions;
 } = {}): ActorDefinition {
     const core = new Core(storage, alarms, options.confirm);
+    if (options.scaling && options.edges?.length)
+        throw Error('invalid fixed and scaling edges');
     const round = new Round(options.edges ?? []);
+    let scale: ScaleHost | undefined, lastRound: number | undefined;
+    const scaler = () => scale ??= options.scaling ? new ScaleHost(options.scaling) : undefined;
     return { init() {
             core.init();
         }, alarm() {
-            round.run(core, Date.now());
+            const now = Date.now();
+            lastRound = now;
+            if (options.scaling)
+                scaler()!.run(round, core, now);
+            else
+                round.run(core, now);
         }, fetch(req: ActorRequest): ActorResponse {
             if (!header(req.headers, "x-wasmkeep-caller"))
                 return { status: 403, body: "inside callers only" };
@@ -102,6 +113,13 @@ export function define(options: {
                 const body = req.bytes(270 * 1024);
                 if (body === undefined)
                     throw Error("invalid body");
+                if (req.path === PREFIX + 'poke') {
+                    if (body.length)
+                        throw Error('invalid poke');
+                    if ((lastRound === undefined || Date.now() - lastRound > 1000) && alarms.getAlarm() === undefined)
+                        alarms.setAlarm(BigInt(Date.now()));
+                    return { status: 200 };
+                }
                 return { status: 200, body: serve(core, req.path.slice(PREFIX.length), body) };
             }
             catch (e) {
@@ -110,3 +128,4 @@ export function define(options: {
         } };
 }
 export { defineEdge } from "./broadcast-edge";
+export type { ScaleOptions } from "./broadcast-scaling";

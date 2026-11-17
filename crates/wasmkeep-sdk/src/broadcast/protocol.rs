@@ -99,6 +99,17 @@ fn serve<S: Store>(core: &mut Core<S>, op: &str, body: &[u8], now: u64) -> Resul
     }
     Ok(w.finish())
 }
+fn encode_client(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
 /// Front-side helper: publish and gap requests go over HTTP to the front,
 /// which authorizes them and calls this client. Never call it from an edge.
 #[derive(Debug)]
@@ -117,6 +128,64 @@ impl Client {
             return Err(format!("room answered {}", r.status));
         }
         Ok(r.body)
+    }
+    /// Authorize the client first. Directory lookup and the alarm-only poke
+    /// share one batch; a cold directory is retried once after that batch.
+    pub fn join(
+        &self,
+        directory: &str,
+        client: &str,
+        position: Option<Position>,
+    ) -> Result<crate::actors::Response, String> {
+        let point = crate::directory::point(client.as_bytes());
+        let mut w = Writer::default();
+        w.u64(point);
+        let lookup = crate::actors::Request {
+            method: "POST".into(),
+            path: "/wasmkeep-directory/v1/lookup".into(),
+            headers: vec![],
+            body: w.finish(),
+        };
+        let poke = crate::actors::Request {
+            method: "POST".into(),
+            path: format!("{PREFIX}poke"),
+            headers: vec![],
+            body: vec![],
+        };
+        let results = crate::calls::call_many(&[
+            (directory.into(), lookup.clone()),
+            (self.address.clone(), poke),
+        ]);
+        let mut reply = results
+            .into_iter()
+            .next()
+            .ok_or("missing lookup")?
+            .map_err(|e| format!("join lookup: {e:?}"))?;
+        if reply.status == 404 {
+            reply = crate::actors::call(directory, &lookup)
+                .map_err(|e| format!("join lookup: {e:?}"))?;
+        }
+        if reply.status != 200 {
+            return Err(format!("join lookup answered {}", reply.status));
+        }
+        let mut r = Reader::new(&reply.body);
+        number(&mut r)?;
+        let entry = crate::directory::decode_entry(&mut r).ok_or_else(bad)?;
+        end(&r)?;
+        let (class, name) = entry.target.split_once('/').ok_or_else(bad)?;
+        let mut path = format!("/?c={}&p={point:016x}", encode_client(client));
+        if let Some(p) = position {
+            if p.e > 9007199254740991 || p.n > 9007199254740991 {
+                return Err("invalid browser position".into());
+            }
+            path.push_str(&format!("&e={}&n={}", p.e, p.n));
+        }
+        let r = crate::front::hand_off(class, name, &path);
+        Ok(crate::actors::Response {
+            status: r.status,
+            headers: r.headers,
+            body: r.body,
+        })
     }
     pub fn publish(&self, messages: &[Publish]) -> Result<Vec<Position>, String> {
         let mut w = Writer::default();
@@ -196,7 +265,7 @@ impl Client {
 #[cfg(feature = "actor")]
 mod actor {
     use super::*;
-    thread_local! {static CORE:std::cell::RefCell<Core> = std::cell::RefCell::new(Core::new(Host,false));}
+    thread_local! {static LAST_ROUND:std::cell::Cell<Option<u64>>=const {std::cell::Cell::new(None)};static CORE:std::cell::RefCell<Core> = std::cell::RefCell::new(Core::new(Host,false));}
     /// Default room class (`confirm = false`). For confirmation, delegate your
     /// lifecycle to `handler::init(true)` and `handler::before_push`.
     #[derive(Debug)]
@@ -229,7 +298,24 @@ mod actor {
         }
         /// Run a fixed-edge round from the room's alarm.
         pub fn round(round: &mut Round) -> Result<(), String> {
+            LAST_ROUND.set(Some(crate::now_ms()));
             CORE.with_borrow_mut(|c| round.run(c, crate::now_ms()))
+        }
+        /// Run the R4 controller and direct-child round from on-alarm.
+        pub fn scaling(scale: &mut Scaling, round: &mut Round) -> Result<(), String> {
+            let now = crate::now_ms();
+            LAST_ROUND.set(Some(now));
+            CORE.with_borrow_mut(|c| scale.run(round, c, now))
+        }
+        pub fn poke() {
+            let now = crate::now_ms();
+            if LAST_ROUND
+                .get()
+                .is_none_or(|last| now.saturating_sub(last) > 1000)
+                && crate::alarms::get_alarm().is_none()
+            {
+                crate::alarms::set_alarm(now);
+            }
         }
         pub fn handle(req: crate::http::IncomingRequest, out: crate::http::ResponseOutparam) {
             if wire::caller(&req).is_none() {
@@ -247,7 +333,17 @@ mod actor {
             };
             let result = crate::http::read_body(&req, 270 * 1024)
                 .ok_or_else(bad)
-                .and_then(|b| CORE.with_borrow_mut(|c| serve(c, op, &b, crate::now_ms())));
+                .and_then(|b| {
+                    if op == "poke" {
+                        if !b.is_empty() {
+                            return Err(bad());
+                        }
+                        poke();
+                        Ok(vec![])
+                    } else {
+                        CORE.with_borrow_mut(|c| serve(c, op, &b, crate::now_ms()))
+                    }
+                });
             match result {
                 Ok(b) => crate::http::respond(out, 200, "application/octet-stream", &b),
                 Err(e) => {

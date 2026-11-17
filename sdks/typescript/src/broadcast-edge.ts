@@ -7,10 +7,13 @@ interface Config {
     room: string;
     lo: string;
     hi?: string;
-    state: "active";
+    state: "active" | "draining";
+    cap?: number;
+    e?: number;
+    n?: number;
 }
 export function defineEdge(): ActorDefinition {
-    const edge = new Edge({ send: trySend, close: (id, code) => host.close(id, code, "slow") });
+    const edge = new Edge({ send: trySend, close: (id, code) => host.close(id, code, code === 4801 ? "moved" : "slow") });
     let config: Config | undefined;
     let opens = 0, unknown = 0, moved = 0, full = 0;
     const load = () => {
@@ -26,7 +29,16 @@ export function defineEdge(): ActorDefinition {
             load();
             if (req.method !== "POST")
                 return { status: 405 };
-            if (req.path === "/wasmkeep-edge/v1/init") {
+            if (req.path === "/wasmkeep-edge/v1/end") {
+                if (config && config.room !== caller)
+                    return { status: 403 };
+                const force = req.text(32) === 'force';
+                if (config && (config.state !== 'draining' || (host.connections().length && !force)))
+                    return { status: 409 };
+                storage.deleteSelf();
+                return { status: 200, body: '{}' };
+            }
+            if (["init", "range", "drain"].some(op => req.path === `/wasmkeep-edge/v1/${op}`)) {
                 if (config && config.room !== caller)
                     return { status: 403 };
                 let next: Config;
@@ -36,12 +48,22 @@ export function defineEdge(): ActorDefinition {
                 catch {
                     return { status: 400 };
                 }
-                if (!next || next.room !== caller || next.lo !== "0000000000000000" || next.hi !== undefined || next.state !== "active")
+                if (!next || next.room !== caller || typeof next.lo !== 'string' || !/^[0-9a-f]{16}$/.test(next.lo) || (next.hi !== undefined && (typeof next.hi !== 'string' || !/^[0-9a-f]{16}$/.test(next.hi) || next.hi <= next.lo)) || !['active', 'draining'].includes(next.state) || (next.cap !== undefined && (!Number.isInteger(next.cap) || next.cap < 1 || next.cap > 500)) || ((next.e !== undefined || next.n !== undefined) && ![next.e, next.n].every(n => Number.isSafeInteger(n) && n! >= 0)))
                     return { status: 400 };
-                if (!config)
-                    storage.execDurable("INSERT INTO wasmkeep_edge(id,config) VALUES(1,?1)", [{ tag: "text", val: JSON.stringify(next) }]);
-                config = next;
-                return { status: 200, body: "{}" };
+                const init = req.path.endsWith('/init');
+                if (!init && !config)
+                    return { status: 409 };
+                if (!init || !config) {
+                    storage.execDurable("INSERT INTO wasmkeep_edge(id,config) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET config=excluded.config", [{ tag: "text", val: JSON.stringify(next) }]);
+                    config = next;
+                }
+                if (!edge.head && config!.e !== undefined) {
+                    edge.head = { e: config!.e, n: config!.n! };
+                    edge.floor = config!.n!;
+                }
+                if (!init)
+                    edge.range(BigInt('0x' + config!.lo), config!.hi === undefined ? undefined : BigInt('0x' + config!.hi), config!.state === 'draining', Array.from(host.connections()));
+                return { status: 200, body: JSON.stringify({ sockets: host.connections().length }) };
             }
             if (req.path !== "/wasmkeep-edge/v1/push")
                 return { status: 404 };
@@ -80,12 +102,13 @@ export function defineEdge(): ActorDefinition {
                 const query = (name: string): string | null => {
                     for (const pair of (path.split("?")[1] ?? "").split("&")) {
                         const at = pair.indexOf("=");
-                        if (at >= 0 && pair.slice(0, at) === name) return pair.slice(at + 1);
+                        if (at >= 0 && pair.slice(0, at) === name)
+                            return pair.slice(at + 1);
                     }
                     return null;
                 };
                 const point = query("p");
-                if (!point || !/^[0-9a-f]{16}$/.test(point) || !query("c")) {
+                if (!point || !/^[0-9a-f]{16}$/.test(point) || !query("c") || config.state === "draining" || point < config.lo || (config.hi !== undefined && point >= config.hi)) {
                     moved++;
                     throw Error("moved");
                 }
@@ -96,20 +119,23 @@ export function defineEdge(): ActorDefinition {
                 if (p && ![p.e, p.n].every(v => Number.isSafeInteger(v) && v >= 0))
                     throw Error("invalid position");
                 edge.adopt(Array.from(host.connections()).filter(other => other !== id));
-                if (host.connections().length > 500 || !edge.open(id, p)) {
+                if (host.connections().length > (config.cap ?? 500) || !edge.open(id, p)) {
                     full++;
                     throw Error("full");
                 }
+                edge.setPoint(id, BigInt("0x" + point));
                 opens++;
                 return true;
             },
-            message(id, data) { if (typeof data === "string") {
-                try {
-                    if (JSON.parse(data).t === "ping")
-                        edge.ping(id);
+            message(id, data) {
+                if (typeof data === "string") {
+                    try {
+                        if (JSON.parse(data).t === "ping")
+                            edge.ping(id);
+                    }
+                    catch { /* Unknown client frames have no effects. */ }
                 }
-                catch { /* Unknown client frames have no effects. */ }
-            } },
+            },
             close(id) { edge.forget(id); },
         },
     };

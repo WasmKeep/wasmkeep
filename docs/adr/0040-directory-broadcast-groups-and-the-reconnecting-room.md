@@ -1,8 +1,8 @@
 # 0040. Directory, broadcast groups and the reconnecting room
 
-- Status: partially implemented (2026-11-17). R1–R3 provide the directory,
-  room core, fixed edges and browser client. R4–R8 remain planned; dynamic
-  scaling, relays and the large-room example are not available yet.
+- Status: partially implemented (2026-11-17). R1–R4 provide the directory,
+  room core, edges, browser client and direct-edge scaling. R5–R8 remain
+  planned; relays and the large-room example are not available yet.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -600,3 +600,41 @@ permits: byte backpressure alone can leave room for `behind`. It verifies
 4802, reconnect, paged HTTP catch-up (including window reset), and resumed
 live delivery. The host close-slot fix is provided by main (#180); R3
 changes no WIT or server implementation.
+
+
+### R4 implementation notes
+
+TypeScript rooms opt in with `define({ scaling: { directory:
+"directory/bg:lobby", edgeClass: "edge", capacity: 500 } })`. Rust rooms
+keep a `Round` and call `handler::scaling(&mut scaling, &mut round)` from
+`on_alarm`, using `Scaling::new(ScaleHost { directory, room, capacity,
+head }, "edge/lobby", capacity)`. `room` is the full caller address;
+`head` is refreshed from the core on every alarm. Fixed R3 configurations
+remain supported. Capacity may be lowered for tests. Direct scaling stops
+at 16 children until R5 adds relays.
+
+After authorization, fronts use TypeScript `broadcast.join(roomAddress,
+directoryAddress, clientId, position)` or Rust `Client::join(directory,
+clientId, position)`. These return the hand-off response. The directory
+address names the room's own `bg:<room name>` map. Lookup and poke share
+one batch, followed by one lookup retry for 404; poke failure is ignored.
+Poke only schedules an alarm, including on a new room. Thus the first join
+may still answer unavailable until the alarm initializes the first edge
+and map; the reconnecting client retries. No join runs a delivery round.
+
+Metadata and the single pending operation row are committed together with
+`exec-durable`. Before executing any operation the room arms a retry alarm;
+each external step can be repeated after an unknown outcome, including
+initial creation and ending an already-ended edge. A successful checkpoint
+never depends on an in-memory operation object. After a range change,
+counts must be refreshed by a push before another scaling decision.
+The one-minute split/merge timestamps survive cold starts. A merge keeps
+both children in the push list until the drained edge can end (zero host
+sockets, or the 30-second timeout). Range changes close unknown points
+following hibernation as well as points that moved.
+
+R4 tests cover thresholds, adjacent merges, durable checkpoint failures,
+repeated steps, suspect backoff, and 4801/resume behavior. The real-node
+fixture uses four clients and capacity five, directory-based hand-offs,
+HTTP recovery during a split, the real one-minute hysteresis interval,
+and a drain that reconnects a remaining client after merging.

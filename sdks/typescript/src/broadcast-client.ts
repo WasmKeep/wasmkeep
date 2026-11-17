@@ -76,5 +76,36 @@ export class Client {
         return { head, lost, reset, more, messages };
     }
 }
-
 export { historyJSON } from "./room-history";
+import * as calls from 'wasmkeep:actor/calls@0.2.0';
+import * as actors from 'wasmkeep:actor/actors@0.2.0';
+import { point, readEntry, number as directoryNumber, end as directoryEnd } from './directory-state';
+import { handOff } from './request';
+/** Authorize first. An empty room is created on its alarm, so a first join
+ * can be unavailable until that alarm runs; the reconnecting client retries. */
+export function join(room: string, directory: string, client: string, after?: Position) {
+    const p = point(client), lookup = { method: 'POST', path: '/wasmkeep-directory/v1/lookup', headers: [] as [
+            string,
+            string
+        ][], body: new Writer().u64(p).finish() };
+    const results = calls.callMany([[directory, lookup], [room, { method: 'POST', path: PREFIX + 'poke', headers: [], body: new Uint8Array() }]]);
+    const first = results[0];
+    if (first.tag !== 'ok')
+        throw Error('join lookup failed');
+    let reply = first.val;
+    if (reply.status === 404)
+        reply = actors.call(directory, lookup);
+    if (reply.status !== 200)
+        throw Error(`join lookup answered ${reply.status}`);
+    const r = new Reader(reply.body);
+    directoryNumber(r);
+    const entry = readEntry(r);
+    directoryEnd(r);
+    const slash = entry.target.indexOf('/');
+    if (slash < 1)
+        throw Error('invalid join target');
+    if (after && (after.e > 9007199254740991n || after.n > 9007199254740991n || after.e < 0n || after.n < 0n))
+        throw Error('invalid browser position');
+    const path = `/?c=${encodeURIComponent(client)}&p=${p.toString(16).padStart(16, '0')}` + (after ? `&e=${after.e}&n=${after.n}` : '');
+    return handOff(entry.target.slice(0, slash), entry.target.slice(slash + 1), path);
+}

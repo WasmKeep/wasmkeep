@@ -170,6 +170,7 @@ pub struct Edge {
     pub(super) buffer: VecDeque<Buffered>,
     size: usize,
     cursors: BTreeMap<u64, Cursor>,
+    points: BTreeMap<u64, u64>,
     slow: u64,
     opens: u64,
     refusals: [u64; 3],
@@ -200,6 +201,29 @@ impl Ack {
     }
 }
 impl Edge {
+    pub fn set_point(&mut self, id: u64, point: u64) {
+        self.points.insert(id, point);
+    }
+    pub fn range(
+        &mut self,
+        lo: u64,
+        hi: Option<u64>,
+        drain: bool,
+        ids: &[u64],
+        io: &mut impl SocketIo,
+    ) {
+        for id in ids {
+            if drain
+                || self
+                    .points
+                    .get(id)
+                    .is_none_or(|p| *p < lo || hi.is_some_and(|hi| *p >= hi))
+            {
+                io.close(*id, 4801);
+                self.forget(*id);
+            }
+        }
+    }
     pub fn open(&mut self, id: u64, position: Option<Position>, io: &mut impl SocketIo) -> bool {
         if self.cursors.len() >= 500 {
             self.refuse(2);
@@ -236,6 +260,7 @@ impl Edge {
     }
     pub fn forget(&mut self, id: u64) {
         self.cursors.remove(&id);
+        self.points.remove(&id);
     }
     pub fn adopt(&mut self, ids: &[u64]) {
         if let Some(h) = self.head {

@@ -7,6 +7,7 @@
 //! The latest split/merge op id is retained: owners keep one pending operation
 //! and retry it before submitting the next. Reusing an older id is not a replay.
 use crate::wire::{self, Reader, Writer};
+#[cfg(feature = "actor")]
 use crate::{Value, params, storage};
 
 /// Maximum number of ranges in a map.
@@ -14,6 +15,7 @@ pub const MAX_ENTRIES: usize = 4096;
 /// Maximum owner metadata per entry, in bytes.
 pub const MAX_META: usize = 1024;
 const PREFIX: &str = "/wasmkeep-directory/v1/";
+#[cfg(feature = "actor")]
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
 /// A half-open range. `None` is the exclusive upper bound 2^64.
@@ -64,6 +66,7 @@ pub enum Change {
     },
 }
 impl Change {
+    #[cfg(any(feature = "actor", test))]
     fn condition(&self) -> (u64, &str) {
         match self {
             Self::Split { expect, op, .. } | Self::Merge { expect, op, .. } => (*expect, op),
@@ -86,6 +89,7 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+#[cfg(feature = "actor")]
 impl From<crate::SqlError> for Error {
     fn from(e: crate::SqlError) -> Self {
         Self::Storage(e.to_string())
@@ -120,6 +124,7 @@ pub fn point(key: &[u8]) -> u64 {
     h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     h ^ (h >> 33)
 }
+#[cfg(any(feature = "actor", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct State {
     owner: String,
@@ -127,6 +132,7 @@ struct State {
     last_op: Option<String>,
     last_result: Option<Vec<u8>>,
 }
+#[cfg(any(feature = "actor", test))]
 impl State {
     fn create(owner: &str, target: &str, meta: &[u8]) -> Result<Self, Error> {
         target_meta(target, meta)?;
@@ -222,6 +228,7 @@ impl State {
         Ok(next)
     }
 }
+#[cfg(any(feature = "actor", test))]
 fn encode_entry(w: &mut Writer, e: &Entry) {
     w.u64(e.lo)
         .u64(u64::from(e.hi.is_some()))
@@ -230,7 +237,7 @@ fn encode_entry(w: &mut Writer, e: &Entry) {
         .u64(e.version)
         .bytes(&e.meta);
 }
-fn decode_entry(r: &mut Reader<'_>) -> Option<Entry> {
+pub(crate) fn decode_entry(r: &mut Reader<'_>) -> Option<Entry> {
     let lo = r.u64()?;
     let has_hi = r.u64()?;
     let hi = r.u64()?;
@@ -251,6 +258,7 @@ fn decode_entry(r: &mut Reader<'_>) -> Option<Entry> {
         meta,
     })
 }
+#[cfg(any(feature = "actor", test))]
 fn encode_map(map: &Map) -> Vec<u8> {
     let mut w = Writer::default();
     w.u64(map.version).u64(map.entries.len() as u64);
@@ -316,12 +324,14 @@ fn encode_change(c: &Change) -> (&'static str, Vec<u8>) {
     };
     (operation, w.finish())
 }
+#[cfg(any(feature = "actor", test))]
 fn text(r: &mut Reader<'_>) -> Result<String, Error> {
     String::from_utf8(r.bytes().ok_or_else(invalid)?.to_vec()).map_err(|_| invalid())
 }
 fn number(r: &mut Reader<'_>) -> Result<u64, Error> {
     r.u64().ok_or_else(invalid)
 }
+#[cfg(any(feature = "actor", test))]
 fn decode_change(operation: &str, r: &mut Reader<'_>) -> Result<Change, Error> {
     let lo = number(r)?;
     Ok(if operation == "split" {
@@ -412,19 +422,23 @@ impl Client {
     }
 }
 /// Ready-made directory class: `wasmkeep_sdk::export!(Directory)`.
+#[cfg(feature = "actor")]
 #[derive(Debug)]
 pub struct Directory;
+#[cfg(feature = "actor")]
 impl crate::Actor for Directory {
     fn on_init() -> Result<(), String> {
         handler::init().map_err(|e| e.to_string())
     }
 }
+#[cfg(feature = "actor")]
 impl crate::http::Guest for Directory {
     fn handle(request: crate::http::IncomingRequest, out: crate::http::ResponseOutparam) {
         handler::handle(request, out);
     }
 }
 /// Handler functions for an application's own directory class.
+#[cfg(feature = "actor")]
 pub mod handler {
     use super::*;
     /// Initializes the two tables. There is no map until an inside caller creates it.

@@ -1,6 +1,6 @@
 use super::*;
-/// Fixed direct children. Recreate this in memory at component startup; the
-/// application's fixed addresses must be identical across wakes. No scaling.
+/// Direct-child delivery positions and suspect backoff, recreated after a wake.
+/// Use `new` for fixed edges or let `Scaling` synchronize its durable children.
 #[derive(Debug, Default)]
 pub struct Round {
     children: Vec<Child>,
@@ -10,10 +10,43 @@ struct Child {
     address: String,
     position: Option<Position>,
     initialized: bool,
+    suspect: Suspect,
+    sockets: Option<u64>,
+}
+#[derive(Debug, Default)]
+struct Suspect {
     failures: u32,
     due: u64,
 }
+impl Suspect {
+    fn fail(&mut self, now: u64) {
+        self.due = now.saturating_add(2000u64 << self.failures.min(3));
+        self.failures = self.failures.saturating_add(1);
+    }
+}
 impl Round {
+    pub fn sync(&mut self, children: &[ScaleChild]) {
+        self.children
+            .retain(|c| children.iter().any(|n| n.name == c.address));
+        for c in children {
+            if !self.children.iter().any(|n| n.address == c.name) {
+                self.children.push(Child {
+                    address: c.name.clone(),
+                    position: None,
+                    initialized: true,
+                    suspect: Suspect::default(),
+                    sockets: None,
+                });
+            }
+        }
+    }
+    pub fn count(&self, name: &str) -> Option<u64> {
+        self.children
+            .iter()
+            .find(|c| c.address == name)
+            .and_then(|c| c.sockets)
+    }
+
     pub fn new(addresses: &[&str]) -> Result<Self, String> {
         if addresses.len() > 16 {
             return Err("at most 16 fixed edges".into());
@@ -25,13 +58,16 @@ impl Round {
                     address: (*address).into(),
                     position: None,
                     initialized: false,
-                    failures: 0,
-                    due: 0,
+                    suspect: Suspect::default(),
+                    sockets: None,
                 })
                 .collect(),
         })
     }
     pub fn run<S: Store>(&mut self, core: &mut Core<S>, now: u64) -> Result<(), String> {
+        for child in &mut self.children {
+            child.sockets = None;
+        }
         if !core.before_push(now)? {
             return Ok(());
         }
@@ -42,7 +78,7 @@ impl Round {
         let mut indices = vec![];
         let mut requests = vec![];
         for (index, child) in self.children.iter().enumerate() {
-            if child.due > now {
+            if child.suspect.due > now {
                 continue;
             }
             let (path, body) = if !child.initialized {
@@ -123,22 +159,22 @@ impl Round {
                 }
                 let (p, more) = acknowledgment(&r.body, epoch.e, head)?;
                 child.position = Some(p);
+                child.sockets = crate::json::parse_unique(std::str::from_utf8(&r.body).ok()?)
+                    .and_then(|j| super::edge::number(&j, "sockets").ok());
                 Some(more)
             });
             if let Some(more) = ok {
-                child.failures = 0;
-                child.due = 0;
+                child.suspect = Suspect::default();
                 if more {
                     next = Some(now.saturating_add(20));
                 }
             } else {
-                child.failures = child.failures.saturating_add(1);
-                child.due = now.saturating_add(2000u64 << child.failures.saturating_sub(1).min(3));
+                child.suspect.fail(now);
             }
         }
         for c in &self.children {
-            if c.due > now {
-                next = Some(next.map_or(c.due, |n: u64| n.min(c.due)));
+            if c.suspect.due > now {
+                next = Some(next.map_or(c.suspect.due, |n: u64| n.min(c.suspect.due)));
             }
         }
         if let Some(at) = next {
@@ -163,6 +199,19 @@ fn acknowledgment(body: &[u8], epoch: u64, head: u64) -> Option<(Position, bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r4_suspect_backoff_and_success_reset() {
+        let mut s = Suspect::default();
+        let mut now = 0;
+        for delay in [2000, 4000, 8000, 16000, 16000] {
+            s.fail(now);
+            assert_eq!(s.due, now + delay);
+            now = s.due;
+        }
+        s = Suspect::default();
+        s.fail(now);
+        assert_eq!(s.due, now + 2000);
+    }
     #[test]
     fn old_epoch_ack_above_recovered_head_is_not_a_failed_child() {
         assert_eq!(

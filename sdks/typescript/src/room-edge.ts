@@ -40,9 +40,20 @@ export class Edge {
     private cursors = new Map<bigint, Cursor>();
     private size = 0;
     private slow = 0;
-    constructor(private io: SocketIO) { }
+    constructor(private io: SocketIO, readonly capacity = 500) { }
+    private points = new Map<bigint, bigint>();
+    setPoint(id: bigint, point: bigint) { this.points.set(id, point); }
+    range(lo: bigint, hi: bigint | undefined, drain: boolean, ids: bigint[]) {
+        for (const id of ids) {
+            const p = this.points.get(id);
+            if (drain || p === undefined || p < lo || (hi !== undefined && p >= hi)) {
+                this.io.close(id, 4801);
+                this.forget(id);
+            }
+        }
+    }
     open(id: bigint, position?: Position) {
-        if (this.cursors.size >= 500)
+        if (this.cursors.size >= this.capacity)
             return false;
         const resume = this.head && position?.e === this.head.e && position.n >= this.floor && position.n <= this.head.n;
         const n = resume ? position!.n : this.head?.n ?? 0;
@@ -51,14 +62,19 @@ export class Edge {
         this.deliver(id);
         return true;
     }
-    forget(id: bigint) { this.cursors.delete(id); }
+    forget(id: bigint) { this.cursors.delete(id); this.points.delete(id); }
     /** Existing host sockets after a cold wake start at the next known head. */
-    adopt(ids: bigint[]) { if (this.head)
-        for (const id of ids)
-            if (!this.cursors.has(id))
-                this.cursors.set(id, { n: this.head.n, lagging: false }); }
-    ping(id: bigint) { if (this.head)
-        this.send(id, { t: "pong", ...this.head }); this.deliver(id); }
+    adopt(ids: bigint[]) {
+        if (this.head)
+            for (const id of ids)
+                if (!this.cursors.has(id))
+                    this.cursors.set(id, { n: this.head.n, lagging: false });
+    }
+    ping(id: bigint) {
+        if (this.head)
+            this.send(id, { t: "pong", ...this.head });
+        this.deliver(id);
+    }
     private send(id: bigint, frame: unknown) { return this.io.send(id, JSON.stringify(frame)); }
     push(p: Push) {
         if (this.head && p.e < this.head.e)
@@ -76,7 +92,10 @@ export class Edge {
                 c.n = Math.min(c.n, p.b);
         }
         if (p.recover) {
-            this.buffer = []; this.size = 0; this.floor = p.head; this.head.n = p.head;
+            this.buffer = [];
+            this.size = 0;
+            this.floor = p.head;
+            this.head.n = p.head;
         }
         if (p.messages.length && p.first > this.head.n + 1) {
             this.buffer = [];
