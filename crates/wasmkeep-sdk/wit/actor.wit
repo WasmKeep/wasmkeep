@@ -400,16 +400,18 @@ interface blobs {
     link-upload: func(key: string, options: upload-options) -> result<upload-link, blob-error>;
 }
 
-/// WasmKeep's own part of the actor world: what the host bindings and the
-/// guest SDK are generated from.
-world actor-core {
+/// WasmKeep's own part of the actor world, without files: everything of
+/// `actor-core` but `blobs`. A component built for it imports no `blobs`,
+/// so it links on a node of any release since `blobs` came
+/// (docs/adr/0030-files-and-static-assets.md); the TypeScript and Python
+/// builds target it unless the code uses files.
+world actor-base {
     import storage;
     import alarms;
     import actors;
     import calls;
     import websockets;
     import env;
-    import blobs;
     use websockets.{message};
 
     /// Runs before the first event an instance handles with this component
@@ -442,22 +444,24 @@ world actor-core {
     export on-websocket-close: func(conn: u64, code: u16, reason: string);
 }
 
-/// The world actor components target: WasmKeep's interfaces plus the standard
-/// `wasi:http/proxy` world, whose `incoming-handler` receives requests and
-/// whose imports provide outbound HTTP, clocks, randomness and stdio.
-///
-/// This is also the capability list. Toolchains import more than they use
-/// (ComponentizeJS and componentize-py import `wasi:filesystem`, Python also
-/// `wasi:sockets`), so the host links those too, inert: no preopened
-/// directories, and sockets and name lookups refused.
-world actor {
-    include actor-core;
+/// WasmKeep's own part of the actor world: what the host bindings and the
+/// guest SDK are generated from.
+world actor-core {
+    include actor-base;
+    import blobs;
+}
+
+/// What actor and front components import beside WasmKeep's interfaces:
+/// the standard `wasi:http/proxy` world, whose `incoming-handler` receives
+/// requests and whose imports provide outbound HTTP, clocks, randomness and
+/// stdio, and the `wasi:cli` interfaces standard libraries import.
+world guest-wasi {
     include wasi:http/proxy@0.2.12;
 
     // Imported by the standard library of Rust (and most languages) on
-    // wasm32-wasip2. The host provides them empty: no arguments, no
-    // environment variables, no terminal. Configuration arrives through
-    // the `env` interface instead.
+    // wasm32-wasip2, and by ComponentizeJS. The host provides them empty:
+    // no arguments, no environment variables, no terminal. Configuration
+    // arrives through the `env` interface instead.
     import wasi:cli/environment@0.2.12;
     import wasi:cli/exit@0.2.12;
     import wasi:cli/terminal-input@0.2.12;
@@ -471,6 +475,31 @@ world actor {
     import wasi:random/insecure-seed@0.2.12;
 }
 
+/// The world actor components target: WasmKeep's interfaces plus
+/// `guest-wasi`.
+///
+/// This is also the capability list. Toolchains import more than they use
+/// (ComponentizeJS and componentize-py import `wasi:filesystem`, Python also
+/// `wasi:sockets`), so the host links those too, inert: no preopened
+/// directories, and sockets and name lookups refused.
+world actor {
+    include actor-core;
+    include guest-wasi;
+}
+
+/// World `actor` without files (`actor-base` instead of `actor-core`).
+world actor-without-files {
+    include actor-base;
+    include guest-wasi;
+}
+
+/// A front's own imports without files: `front-core` but `blobs`.
+world front-base {
+    import actors;
+    import calls;
+    import env;
+}
+
 /// What the host links for a front, besides WASI and `wasi:http`: an app's
 /// optional stateless component that receives every request outside
 /// `/actor/` and `/_wasmkeep/` (see docs/adr/0023-the-front.md). It calls
@@ -479,28 +508,21 @@ world actor {
 /// own values with `env.get`, and keeps files of its own with `blobs`.
 /// Its `self-address` is `{ tenant, class: "_front", name: "main" }`.
 world front-core {
-    import actors;
-    import calls;
-    import env;
+    include front-base;
     import blobs;
 }
 
-/// The world front components target: `front-core` plus the standard
-/// `wasi:http/proxy` world. A front exports only the incoming handler; it
-/// has no database, alarms or WebSockets: files are all it keeps. Every
-/// plain `wasi:http/proxy` component is a valid front.
+/// The world front components target: `front-core` plus `guest-wasi`. A
+/// front exports only the incoming handler; it has no database, alarms or
+/// WebSockets: files are all it keeps. Every plain `wasi:http/proxy`
+/// component is a valid front.
 world front {
     include front-core;
-    include wasi:http/proxy@0.2.12;
+    include guest-wasi;
+}
 
-    // The same as world `actor`'s, for the same reason: standard libraries
-    // and ComponentizeJS import them, and the host provides them empty.
-    import wasi:cli/environment@0.2.12;
-    import wasi:cli/exit@0.2.12;
-    import wasi:cli/terminal-input@0.2.12;
-    import wasi:cli/terminal-output@0.2.12;
-    import wasi:cli/terminal-stdin@0.2.12;
-    import wasi:cli/terminal-stdout@0.2.12;
-    import wasi:cli/terminal-stderr@0.2.12;
-    import wasi:random/insecure-seed@0.2.12;
+/// World `front` without files (`front-base` instead of `front-core`).
+world front-without-files {
+    include front-base;
+    include guest-wasi;
 }

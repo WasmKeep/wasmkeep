@@ -6,7 +6,9 @@
 // `defineActor({...})`, and turns it into a WebAssembly component
 // implementing the `wasmkeep:actor/actor` world; with `--world front`, a
 // front whose default export is `defineFront({...})` (from
-// `@wasmkeep/sdk/front`), implementing `wasmkeep:actor/front`. By default with
+// `@wasmkeep/sdk/front`), implementing `wasmkeep:actor/front`. Without
+// `@wasmkeep/sdk/blobs` (files), the world without files instead
+// (`actor-without-files`, `front-without-files`). By default with
 // componentize-qjs (the QuickJS engine: small, and light per actor), or
 // with ComponentizeJS (StarlingMonkey, with Web APIs such as fetch, URL
 // and crypto) under `--engine starlingmonkey`. Either way the engine is
@@ -91,11 +93,18 @@ const bundle = await build({
     // would otherwise look for under src/index.ts.
     "@wasmkeep/sdk/contracts": join(sdkRoot, "src", "pure.ts"),
     "@wasmkeep/sdk/room-client": join(sdkRoot, "src", "room-client.ts"),
+    "@wasmkeep/sdk/blobs": join(sdkRoot, "src", "blobs.ts"),
     "@wasmkeep/sdk": join(sdkRoot, "src", "index.ts"),
   },
   logLevel: "warning",
 });
 const source = bundle.outputFiles[0].text;
+// The engines import every interface of the world they build for, called
+// or not: a component that does not use files (`@wasmkeep/sdk/blobs`) is
+// built for the world without them, so it imports no `wasmkeep:actor/blobs`
+// and links on a node of any release (ADR 0030, decision 9).
+const usesFiles = /["']wasmkeep:actor\/blobs@/.test(source);
+const witWorld = usesFiles ? world : `${world}-without-files`;
 
 // Componentize with jco. QuickJS is built without component-model async
 // (`--backend-qjs-disable-async`): the host runs synchronous exports.
@@ -113,7 +122,7 @@ try {
       "--wit",
       join(sdkRoot, "wit"),
       "--world-name",
-      world,
+      witWorld,
       ...(engine === "quickjs" ? ["--backend", "quickjs", "--backend-qjs-disable-async"] : []),
       "-o",
       out,

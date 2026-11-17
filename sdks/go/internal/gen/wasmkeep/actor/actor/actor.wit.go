@@ -2,9 +2,8 @@
 
 // Package actor represents the world "wasmkeep:actor/actor@0.2.0".
 //
-// The world actor components target: WasmKeep's interfaces plus the standard
-// `wasi:http/proxy` world, whose `incoming-handler` receives requests and
-// whose imports provide outbound HTTP, clocks, randomness and stdio.
+// The world actor components target: WasmKeep's interfaces plus
+// `guest-wasi`.
 //
 // This is also the capability list. Toolchains import more than they use
 // (ComponentizeJS and componentize-py import `wasi:filesystem`, Python also

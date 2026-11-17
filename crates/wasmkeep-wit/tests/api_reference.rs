@@ -22,18 +22,43 @@ use wit_parser::{
 /// listed here (and implemented in the SDKs). An empty name: that SDK does
 /// not have it yet.
 const SDK_NAMES: &[(&str, [&str; 5])] = &[
-    // Files (ADR 0030): the SDKs come with slice B2.
-    ("blobs.head", ["", "", "", "", ""]),
-    ("blobs.get", ["", "", "", "", ""]),
-    ("blobs.put", ["", "", "", "", ""]),
-    ("blobs.open-read", ["", "", "", "", ""]),
-    ("blobs.open-write", ["", "", "", "", ""]),
-    ("blobs.upload.body", ["", "", "", "", ""]),
-    ("blobs.upload.finish", ["", "", "", "", ""]),
-    ("blobs.delete", ["", "", "", "", ""]),
-    ("blobs.list", ["", "", "", "", ""]),
-    ("blobs.link-download", ["", "", "", "", ""]),
-    ("blobs.link-upload", ["", "", "", "", ""]),
+    // Files (ADR 0030): Rust and TypeScript first, TypeScript without
+    // streams; "" is "not yet".
+    ("blobs.head", ["blobs::head", "blobs.head", "", "", ""]),
+    ("blobs.get", ["blobs::get", "blobs.get", "", "", ""]),
+    ("blobs.put", ["blobs::put", "blobs.put", "", "", ""]),
+    ("blobs.open-read", ["blobs::open_read", "", "", "", ""]),
+    ("blobs.open-write", ["blobs::open_write", "", "", "", ""]),
+    (
+        "blobs.upload.body",
+        ["blobs::Writer (io::Write)", "", "", "", ""],
+    ),
+    (
+        "blobs.upload.finish",
+        ["blobs::Writer::finish", "", "", "", ""],
+    ),
+    (
+        "blobs.delete",
+        ["blobs::delete", "blobs.delete", "", "", ""],
+    ),
+    (
+        "blobs.list",
+        [
+            "blobs::list, blobs::list_all",
+            "blobs.list, blobs.listAll",
+            "",
+            "",
+            "",
+        ],
+    ),
+    (
+        "blobs.link-download",
+        ["blobs::link_download", "blobs.linkDownload", "", "", ""],
+    ),
+    (
+        "blobs.link-upload",
+        ["blobs::link_upload", "blobs.linkUpload", "", "", ""],
+    ),
     // Exports: what an actor implements.
     (
         "on-init",
@@ -477,17 +502,20 @@ fn generate() -> String {
         function(&mut out, &resolve, f, &f.name);
     }
 
-    for item in world.imports.values() {
-        if let WorldItem::Interface { id, .. } = item {
-            let iface = &resolve.interfaces[*id];
-            // `wasi:io`, which `blobs` uses, is WASI's: see "Also available".
-            if iface.package != Some(package_id) {
-                continue;
-            }
-            let name = iface.name.as_deref().unwrap();
-            if name != "types" {
-                interface(&mut out, &resolve, name, iface);
-            }
+    // In the package's order, the one the WIT defines them in, whatever
+    // order the world's `include`s give its imports. `wasi:io`, which
+    // `blobs` uses, is WASI's: see "Also available".
+    let imported: Vec<_> = world
+        .imports
+        .values()
+        .filter_map(|item| match item {
+            WorldItem::Interface { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for (name, id) in &package.interfaces {
+        if name != "types" && imported.contains(id) {
+            interface(&mut out, &resolve, name, &resolve.interfaces[*id]);
         }
     }
     // The shared types, last: referenced from the interfaces above.
@@ -568,4 +596,58 @@ fn api_reference_is_up_to_date() {
         "{} is out of date; run WASMKEEP_BLESS=1 cargo nextest run -p wasmkeep-wit --test api_reference",
         path.display()
     );
+}
+
+/// A world's imports and exports, by name.
+fn items(resolve: &Resolve, world: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let package = resolve
+        .packages
+        .iter()
+        .find(|(_, p)| p.name.namespace == "wasmkeep")
+        .map(|(_, p)| p)
+        .unwrap();
+    let w = &resolve.worlds[package.worlds[world]];
+    let name = |k: &WorldKey| match k {
+        WorldKey::Name(n) => n.clone(),
+        WorldKey::Interface(id) => resolve.id_of(*id).unwrap(),
+    };
+    (
+        w.imports.keys().map(name).collect(),
+        w.exports.keys().map(name).collect(),
+    )
+}
+
+/// The worlds without files are the worlds with them, but `blobs` (and, in
+/// the core worlds, the `wasi:io` interfaces only `blobs` brings): what
+/// TypeScript and Python builds target unless the code uses files.
+#[test]
+fn the_worlds_without_files_lack_only_blobs() {
+    let (resolve, _) = load();
+    let blobs = "wasmkeep:actor/blobs@0.2.0".to_owned();
+    let io = [
+        "wasi:io/error@0.2.12",
+        "wasi:io/poll@0.2.12",
+        "wasi:io/streams@0.2.12",
+    ];
+    for (with, without, extra) in [
+        ("actor", "actor-without-files", &[][..]),
+        ("front", "front-without-files", &[][..]),
+        ("actor-core", "actor-base", &io[..]),
+        ("front-core", "front-base", &io[..]),
+    ] {
+        let (imports, exports) = items(&resolve, with);
+        let (imports_without, exports_without) = items(&resolve, without);
+        let mut gone: BTreeSet<String> = extra.iter().map(|s| (*s).to_owned()).collect();
+        gone.insert(blobs.clone());
+        let missing: BTreeSet<String> = imports.difference(&imports_without).cloned().collect();
+        assert_eq!(missing, gone, "{with} - {without}");
+        assert!(
+            imports_without.is_subset(&imports),
+            "{without} imports more than {with}"
+        );
+        assert_eq!(
+            exports, exports_without,
+            "{with} and {without} export the same"
+        );
+    }
 }

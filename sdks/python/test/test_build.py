@@ -2,8 +2,10 @@
 componentize-py generates (no host_stub here: each case is a new process)."""
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -49,6 +51,34 @@ class Outside(unittest.TestCase):
         done = _python("-c", "import wasmkeep; wasmkeep.Actor.exports()")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("only inside a component", done.stderr)
+
+
+_COUNTER = os.path.join(_ROOT, "..", "..", "examples", "py-counter")
+
+
+def _componentize_py_available():
+    import importlib.util
+
+    return importlib.util.find_spec("componentize_py") is not None or shutil.which("componentize-py") is not None
+
+
+@unittest.skipUnless(
+    _componentize_py_available() and shutil.which("wasm-tools"), "needs componentize-py and wasm-tools"
+)
+class Built(unittest.TestCase):
+    def test_a_component_imports_no_files(self):
+        # The SDK has no files yet (ADR 0030): it builds for the world
+        # without them, so its components link on a node of any release.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "counter.wasm")
+            done = _python("-m", "wasmkeep", "build", "app", "-p", _COUNTER, "-o", out)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            wit = subprocess.run(
+                ["wasm-tools", "component", "wit", out], capture_output=True, text=True, check=True
+            ).stdout
+        imports = [line.strip() for line in wit.splitlines() if line.strip().startswith("import ")]
+        self.assertIn("import wasmkeep:actor/storage@0.2.0;", imports)
+        self.assertNotIn("import wasmkeep:actor/blobs@0.2.0;", imports)
 
 
 if __name__ == "__main__":

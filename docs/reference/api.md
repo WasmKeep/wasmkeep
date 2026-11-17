@@ -560,7 +560,7 @@ head: func(key: string) -> result<option<blob-info>, blob-error>;
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::head` | `blobs.head` | not yet | not yet | not yet |
 
 ### `get`
 
@@ -572,7 +572,7 @@ The whole file, up to 16 MiB (else `too-large`; use `open-read`).
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::get` | `blobs.get` | not yet | not yet | not yet |
 
 ### `put`
 
@@ -584,7 +584,7 @@ Writes the whole file, up to 16 MiB. Returns once it is durable.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::put` | `blobs.put` | not yet | not yet | not yet |
 
 ### `open-read`
 
@@ -596,7 +596,7 @@ Streams a file, or the bytes `[start, start + length)` of it.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::open_read` | not yet | not yet | not yet | not yet |
 
 ### `open-write`
 
@@ -608,7 +608,7 @@ Starts a streamed write; nothing is visible until `finish`.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::open_write` | not yet | not yet | not yet | not yet |
 
 ### `upload.body`
 
@@ -620,7 +620,7 @@ The stream to write the body to; only once.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::Writer (io::Write)` | not yet | not yet | not yet | not yet |
 
 ### `upload.finish`
 
@@ -633,7 +633,7 @@ Dropping an upload without `finish` abandons it.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::Writer::finish` | not yet | not yet | not yet | not yet |
 
 ### `delete`
 
@@ -645,7 +645,7 @@ Removes the file if it exists. Durable when it returns.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::delete` | `blobs.delete` | not yet | not yet | not yet |
 
 ### `list`
 
@@ -661,7 +661,7 @@ key.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::list, blobs::list_all` | `blobs.list, blobs.listAll` | not yet | not yet | not yet |
 
 ### `link-download`
 
@@ -673,7 +673,7 @@ A link a browser downloads the file from, without this code.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::link_download` | `blobs.linkDownload` | not yet | not yet | not yet |
 
 ### `link-upload`
 
@@ -685,7 +685,7 @@ A link a browser uploads one new file to, without this code.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
-| not yet | not yet | not yet | not yet | not yet |
+| `blobs::link_upload` | `blobs.linkUpload` | not yet | not yet | not yet |
 
 ## Interface `types`
 

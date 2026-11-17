@@ -494,3 +494,189 @@ async fn a_node_alone_keeps_files_on_its_disk_across_a_restart() {
             .all(|p| p.file_name().is_none_or(|n| n != "k" && n != "s"))
     );
 }
+
+fn files_rust_wasm() -> &'static [u8] {
+    static WASM: OnceLock<Vec<u8>> = OnceLock::new();
+    WASM.get_or_init(|| guests::build_guest("tests/guests/files-rust", "files_rust"))
+}
+
+/// A TypeScript guest built beforehand (`npm run build` and `npm run
+/// build:starlingmonkey` in tests/guests/files-ts); with
+/// `WASMKEEP_REQUIRE_LANGS=1` a missing one fails instead of being skipped.
+fn files_ts_wasm(file: &str) -> Option<Vec<u8>> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/guests/files-ts")
+        .join(file);
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) if std::env::var_os("WASMKEEP_REQUIRE_LANGS").is_none() => {
+            eprintln!("{} not built; skipping", path.display());
+            None
+        }
+        Err(e) => panic!("{}: {e}", path.display()),
+    }
+}
+
+/// What an SDK's files calls do against the host, the same in each SDK:
+/// conditions, types, a paged listing over several pages, deletes, key
+/// refusals and the host's refusal of links (they come later) passed back.
+async fn sdk_contract(wasm: &[u8]) -> (Node, tempfile::TempDir) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let node = node_with(
+        "a",
+        d.path(),
+        &store,
+        Duration::from_secs(30),
+        "files",
+        wasm,
+    )
+    .await;
+    let f = |p: &str| format!("/actor/files/alice{p}");
+    let r = call(
+        node.addr,
+        "PUT",
+        &f("/files/photos/1.txt?type=text/plain"),
+        "If-None-Match: *\r\n",
+        b"hello",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let etag = etag_of(&r);
+    assert!(r.body.ends_with(" 5 text/plain"), "{}", r.body);
+    let r = call(
+        node.addr,
+        "PUT",
+        &f("/files/photos/1.txt"),
+        "If-None-Match: *\r\n",
+        b"x",
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_str()), (409, "err:conflict"));
+    let r = call(
+        node.addr,
+        "PUT",
+        &f("/files/photos/1.txt"),
+        "If-Match: \"no\"\r\n",
+        b"x",
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_str()), (409, "err:conflict"));
+    let r = call(
+        node.addr,
+        "PUT",
+        &f("/files/photos/1.txt?type=text/plain"),
+        &format!("If-Match: {etag}\r\n"),
+        b"hello!",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = call(node.addr, "GET", &f("/files/photos/1.txt"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "hello!"));
+    let r = call(node.addr, "GET", &f("/info/photos/1.txt"), "", b"").await;
+    assert_eq!(r.body, "6 text/plain");
+    for k in [
+        "photos/2.txt",
+        "photos/3.txt",
+        "photos/4.txt",
+        "photos/5.txt",
+        "docs/a",
+    ] {
+        let r = call(
+            node.addr,
+            "PUT",
+            &f(&format!("/files/{k}")),
+            "",
+            k.as_bytes(),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    // The iterator over pages of two.
+    let r = call(node.addr, "GET", &f("/all?prefix=photos/&page=2"), "", b"").await;
+    assert_eq!(
+        r.body,
+        "photos/1.txt\nphotos/2.txt\nphotos/3.txt\nphotos/4.txt\nphotos/5.txt"
+    );
+    let r = call(node.addr, "GET", &f("/all"), "", b"").await;
+    assert_eq!(r.body.lines().count(), 6);
+    let r = call(
+        node.addr,
+        "GET",
+        &f("/page?prefix=photos/&limit=2"),
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!(r.body, "photos/1.txt\nphotos/2.txt\nnext=photos/2.txt");
+    let r = call(
+        node.addr,
+        "GET",
+        &f("/page?prefix=photos/&limit=2&after=photos/4.txt"),
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!(r.body, "photos/5.txt\nnext=-");
+    let r = call(node.addr, "DELETE", &f("/files/docs/a"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "ok"));
+    let r = call(node.addr, "GET", &f("/files/docs/a"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (404, "none"));
+    let r = call(node.addr, "GET", &f("/info/docs/a"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (404, "none"));
+    let r = call(node.addr, "PUT", &f("/files/a//b"), "", b"x").await;
+    assert_eq!((r.status, r.body.as_str()), (400, "err:invalid-key"));
+    for link in ["/link/photos/1.txt", "/upload-link/u/1"] {
+        let r = call(node.addr, "GET", &f(link), "", b"").await;
+        assert_eq!(
+            (r.status, r.body.as_str()),
+            (403, "err:not-allowed"),
+            "{link}"
+        );
+    }
+    (node, d)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rust_sdk_keeps_files_and_streams_them() {
+    let (node, _data) = sdk_contract(files_rust_wasm()).await;
+    let f = |p: &str| format!("/actor/files/alice{p}");
+    let n: u64 = 16 * 1024 * 1024 + 7;
+    let r = call(
+        node.addr,
+        "POST",
+        &f(&format!("/stream/big?n={n}")),
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!((r.status, r.body.clone()), (200, format!("ok {n}")));
+    let r = call(node.addr, "GET", &f("/files/big"), "", b"").await;
+    assert_eq!((r.status, r.body.as_str()), (413, "err:too-large"));
+    let sum = |range: std::ops::Range<u64>| range.map(|i| i % 251).sum::<u64>();
+    let r = call(node.addr, "GET", &f("/stream/big"), "", b"").await;
+    assert_eq!(r.body, format!("read={n} sum={}", sum(0..n)));
+    let r = call(
+        node.addr,
+        "GET",
+        &f("/stream/big?start=100&len=70000"),
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!(r.body, format!("read=70000 sum={}", sum(100..70_100)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_typescript_sdk_keeps_files_on_quickjs() {
+    if let Some(wasm) = files_ts_wasm("files.wasm") {
+        sdk_contract(&wasm).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_typescript_sdk_keeps_files_on_starlingmonkey() {
+    if let Some(wasm) = files_ts_wasm("files-starlingmonkey.wasm") {
+        sdk_contract(&wasm).await;
+    }
+}

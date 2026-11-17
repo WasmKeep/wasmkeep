@@ -14,7 +14,7 @@ import (
 	incominghandler "github.com/wasmkeep/wasmkeep/sdks/go/internal/gen/wasi/http/incoming-handler"
 	httptypes "github.com/wasmkeep/wasmkeep/sdks/go/internal/gen/wasi/http/types"
 	"github.com/wasmkeep/wasmkeep/sdks/go/internal/gen/wasmkeep/actor/actor"
-	actorcore "github.com/wasmkeep/wasmkeep/sdks/go/internal/gen/wasmkeep/actor/actor-core"
+	actorbase "github.com/wasmkeep/wasmkeep/sdks/go/internal/gen/wasmkeep/actor/actor-base"
 )
 
 type hookResult = cm.Result[string, struct{}, string]
@@ -61,7 +61,7 @@ func init() {
 		}
 		return hookOK()
 	}
-	actor.Exports.OnWebsocketMessage = func(conn uint64, msg actorcore.Message) {
+	actor.Exports.OnWebsocketMessage = func(conn uint64, msg actorbase.Message) {
 		if current.Message == nil {
 			return
 		}

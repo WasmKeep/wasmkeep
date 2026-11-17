@@ -65,6 +65,7 @@ pub mod bindings {
     });
 }
 
+pub mod blobs;
 pub mod broadcast;
 #[cfg(feature = "client")]
 pub mod client;

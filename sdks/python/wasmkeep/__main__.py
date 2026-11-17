@@ -1,8 +1,8 @@
 """`python -m wasmkeep build APP -o actor.wasm`: builds a module into a
 WasmKeep actor, a WebAssembly component with CPython embedded.
 
-It runs componentize-py on the `actor` world of the WIT files this package
-carries (wasmkeep/wit), with this package on the module path, so an
+It runs componentize-py on the `actor-without-files` world (world `actor`
+less files) of the WIT files this package carries (wasmkeep/wit), with this package on the module path, so an
 installed `wasmkeep` is all a build needs: no clone, no WIT directory to
 name. componentize-py is the one installed with this package (its pinned
 requirement); from a source checkout without it, the `componentize-py`
@@ -55,7 +55,11 @@ def _build(args):
         os.path.isfile(os.path.join(path, top + ".py")) or os.path.isdir(os.path.join(path, top)) for path in paths
     ):
         sys.exit(f"wasmkeep: no module {top} in {', '.join(os.path.abspath(path) for path in paths)}")
-    command = _componentize_py() + ["-d", wit, "-w", "actor", "componentize", args.app]
+    # The world without files: this SDK has no files yet (ADR 0030), and
+    # componentize-py imports every interface of the world it builds for,
+    # so a component built for `actor` would import `blobs` unused and not
+    # link on a node of an earlier release.
+    command = _componentize_py() + ["-d", wit, "-w", "actor-without-files", "componentize", args.app]
     for path in paths:
         command += ["-p", path]
     command += ["-p", os.path.dirname(_PACKAGE), "-o", args.output]
