@@ -115,6 +115,25 @@ Date: 2026-11-17
   refused rather than trusted. `CallError` gains a closed `CallErrorKind`.
   Additive; no WIT change.
 
+- **Lossless HTTP headers in the guest SDKs (0.5.1):** the TypeScript,
+  Python and Rust SDKs keep headers as ordered (name, value) pairs, compare
+  names without case, and never join `Set-Cookie`. `get(name)` is the first
+  value, `getAll(name)` (`get_all`) every value in order, `append` adds and
+  `set` replaces all: `HeaderList` (TypeScript: `req.fields`,
+  `actors.call(...).fields`, `http.fetch(...).fields`), `Headers` (Python:
+  `req.fields`, `CallResponse.fields`, `req.header_list`) and
+  `wasmkeep_sdk::headers::Headers` (Rust). A response sets repeats with
+  `headerList` (TypeScript) or `header_list=` (Python); `actors.call` and
+  `http.fetch` accept a list value in a record, pairs or the new type;
+  `respond_headers` and `request_headers` are new in Rust. No WIT change.
+  Behaviour that changes: TypeScript's `http.fetch(...).headers` no longer
+  joins `Set-Cookie` values with `, ` (it holds the first; read all through
+  `fields`); a TypeScript response whose headers repeat `Content-Type` in
+  another case no longer gets a second default one; a TypeScript lookup in a
+  request without a header list is now case-insensitive. In Rust, `Fetched`
+  gains a public `headers` field (a struct literal of it needs the field).
+  The older `headers` dicts and records still hold one value per name.
+
 - **Recorded head on hand-over (0.5.0, [ADR 0035](docs/adr/0035-a-recorded-head-on-hand-over.md)):**
   an app enabled with `wasmkeep app format --enable` writes ownership
   records as `wasmkeep-owner 2`, carrying the position each releasing

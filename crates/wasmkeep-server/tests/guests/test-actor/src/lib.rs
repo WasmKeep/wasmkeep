@@ -37,6 +37,9 @@
 //!   `ok` or `err`
 //! - `POST /durable-commit`: BEGIN, adds 1 to `durable` with `exec`, then
 //!   `exec-durable("COMMIT")`; answers the new value (503 with the error)
+//! - `GET /cookies`: answers `cookies` with two `Set-Cookie` headers (the
+//!   first with a comma in its `Expires`) and an `x-one: 1`, through
+//!   `http::respond_headers`
 //! - `POST /caller`: the `x-wasmkeep-caller` header, or `none`
 //! - `GET /header?name=N`: the request's header N, or `none`
 //! - WebSockets: accepted (refused with "go away" when the path contains
@@ -562,6 +565,14 @@ impl http::Guest for TestActor {
                     &[],
                 );
                 "slept".to_owned()
+            }
+            (Method::Get, "/cookies") => {
+                let mut headers = wasmkeep_sdk::headers::Headers::new();
+                headers.append("Set-Cookie", "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT");
+                headers.append("x-one", "1");
+                headers.append("set-cookie", "b=2");
+                http::respond_headers(out, 200, &headers, b"cookies\n");
+                return;
             }
             (Method::Get, "/slept") => get("slept").to_string(),
             (Method::Post, "/caller") => request

@@ -118,6 +118,12 @@ sends more than a GET; bodies are written one after the other. The host
 lets an actor have 16 requests open at once: past 16, the rest start as
 earlier ones finish.
 
+Headers are ordered pairs whose names compare without case:
+`wasmkeep_sdk::headers::Headers` has `get` (the first value), `get_all`
+(every value in order), `append`, `set` (replaces all) and `remove`.
+`http::request_headers(&request)` and `Fetched::headers` give one, and
+`http::respond_headers` sends one, each `Set-Cookie` as its own header.
+
 ## A database kept by one actor
 
 `db` makes one actor the owner of an app's shared tables

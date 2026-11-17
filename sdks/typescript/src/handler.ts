@@ -14,6 +14,7 @@ import {
 import { poll, type Pollable } from "wasi:io/poll@0.2.12";
 import { Body, incomingSource, type BodySource } from "./body";
 import type { ActorRequest, ActorResponse } from "./request";
+import { HeaderList, fieldsToPairs, responsePairs } from "./headers";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -52,15 +53,13 @@ export function toRequest(request: IncomingRequest): ActorRequest {
     const b = body.read(limit);
     return b === undefined ? undefined : decoder.decode(b);
   }
-  const headerList = request
-    .headers()
-    .entries()
-    .map(([k, v]) => [k, decoder.decode(v)] as [string, string]);
+  const headerList = fieldsToPairs(request.headers().entries());
   const req: ActorRequest = {
     method: methodName(request.method()),
     path: request.pathWithQuery() ?? "/",
     headers: Object.fromEntries(headerList),
     headerList,
+    fields: new HeaderList(headerList),
     // `none` is `null` on QuickJS.
     authority: request.authority() ?? undefined,
     bytes,
@@ -76,10 +75,7 @@ export function respond(out: ResponseOutparam, response: ActorResponse): void {
   // (not `instanceof Uint8Array` here): any typed-array view is a body.
   const r = typeof response === "string" || ArrayBuffer.isView(response) ? { body: response as string | Uint8Array } : response;
   const body = typeof r.body === "string" ? encoder.encode(r.body) : (r.body ?? new Uint8Array());
-  const headers: Record<string, string> = { "content-type": "text/plain; charset=utf-8", ...r.headers };
-  const fields = Fields.fromList(
-    Object.entries(headers).map(([k, v]) => [k.toLowerCase(), encoder.encode(v)] as [string, Uint8Array]),
-  );
+  const fields = Fields.fromList(responsePairs(r.headers, "headerList" in r ? r.headerList : undefined).map(([k, v]) => [k, encoder.encode(v)] as [string, Uint8Array]));
   const outgoing = new OutgoingResponse(fields);
   outgoing.setStatusCode(r.status ?? 200);
   const outBody = outgoing.body();

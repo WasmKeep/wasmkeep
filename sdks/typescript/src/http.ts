@@ -29,6 +29,7 @@ import { poll, type Pollable } from "wasi:io/poll@0.2.12";
 import type { InputStream } from "wasi:io/streams@0.2.12";
 import { describe, describeStreamError as describeStreamErrorOf, dispose, streamErrorTag } from "./stream-error";
 import { FetchError, splitUrl } from "./url";
+import { HeaderList, fetchedRecord, fieldsToPairs, pairsOf, type HeadersInit } from "./headers";
 
 export { FetchError } from "./url";
 
@@ -36,7 +37,9 @@ export { FetchError } from "./url";
 export interface FetchOptions {
   /** `GET` unless given. */
   method?: string;
-  headers?: Record<string, string>;
+  /** A record (a list value sends one header per value), pairs in order, or a
+   * {@link HeaderList}. */
+  headers?: HeadersInit;
   body?: string | Uint8Array;
   /** Bounds connecting, the first byte of the response and each gap
    * between bytes; 10 s unless given. */
@@ -57,7 +60,13 @@ export type FetchResult = { ok: true; response: Fetched } | { ok: false; error: 
 /** A response. */
 export interface Fetched {
   status: number;
+  /** By lower-case name; repeats are joined with `, ` except `set-cookie`,
+   * which is its first value. Use `fields` for every value. */
   headers: Record<string, string>;
+  /** Every header in the order received, repeats included. */
+  headerList: [string, string][];
+  /** The same, with `get` and `getAll` (every `Set-Cookie`). */
+  fields: HeaderList;
   body: Uint8Array;
   /** The body as UTF-8 text. */
   text(): string;
@@ -115,7 +124,7 @@ interface Item {
   sending?: unknown;
   response?: IncomingResponse;
   status?: number;
-  headers?: Record<string, string>;
+  headers?: [string, string][];
   incoming?: IncomingBody;
   stream?: InputStream;
   chunks: Uint8Array[];
@@ -204,7 +213,7 @@ function start(it: Item): boolean {
     const { scheme, authority, path } = splitUrl(url);
     const encoder = new TextEncoder();
     const body = typeof options.body === "string" ? encoder.encode(options.body) : options.body;
-    const headers: [string, Uint8Array][] = Object.entries(options.headers ?? {}).map(([k, v]) => [
+    const headers: [string, Uint8Array][] = pairsOf(options.headers).map(([k, v]) => [
       k.toLowerCase(),
       encoder.encode(v),
     ]);
@@ -319,14 +328,9 @@ function advance(it: Item): void {
       const response = result.val.val;
       it.response = response;
       it.status = response.status();
-      const decoder = new TextDecoder();
-      const headers: Record<string, string> = {};
       const fields = response.headers();
-      for (const [k, v] of fields.entries()) {
-        headers[k] = headers[k] === undefined ? decoder.decode(v) : `${headers[k]}, ${decoder.decode(v)}`;
-      }
+      it.headers = fieldsToPairs(fields.entries());
       dispose(fields);
-      it.headers = headers;
       try {
         it.incoming = response.consume();
         it.stream = it.incoming.stream();
@@ -394,7 +398,9 @@ function fetched(it: Item): Fetched {
   const decoder = new TextDecoder();
   return {
     status: it.status!,
-    headers: it.headers!,
+    headers: fetchedRecord(it.headers!),
+    headerList: it.headers!.map(([n, v]) => [n, v]),
+    fields: new HeaderList(it.headers),
     body: bytes,
     text: () => decoder.decode(bytes),
     json: <T>() => JSON.parse(decoder.decode(bytes)) as T,

@@ -136,3 +136,10 @@ test("handOff names the actor in three headers, the name encoded as the host dec
   assert.equal(r.headers["x-wasmkeep-handoff-path"], "/ws?user=alice");
   assert.equal(encodeName("Az09-._~!*'()"), "Az09-._~%21%2A%27%28%29");
 });
+
+test("a header is found without case, in the list or the record", () => {
+  const fromList = request([["X-WasmKeep-Caller", "default/_front/main"]]);
+  assert.deepEqual(caller(fromList), { kind: "front" });
+  const fromRecord = { ...request([]), headerList: undefined, headers: { "X-WasmKeep-Caller": "default/_front/main" } };
+  assert.deepEqual(caller(fromRecord), { kind: "front" });
+});

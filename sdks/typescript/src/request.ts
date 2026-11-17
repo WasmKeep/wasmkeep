@@ -4,6 +4,9 @@
 
 import { CallError } from "./errors";
 import type { ActorAddress } from "./actors";
+import { HeaderList, type HeadersInit } from "./headers";
+
+export { HeaderList, type HeadersInit } from "./headers";
 
 /** An incoming request. The path includes the query; in an actor it is
  * relative to the actor (`/actor/<class>/<name>` removed). */
@@ -14,6 +17,8 @@ export interface ActorRequest {
   headers: Record<string, string>;
   /** Every header in the order received, repeats included. */
   headerList?: [string, string][];
+  /** The same with `get`, `getAll` (every `Set-Cookie`) and lookups without case. */
+  fields?: HeaderList;
   /** The request's authority: the client's `Host` (see `host`). */
   authority?: string;
   /** The body, read on first use (up to the host's limit, 16 MiB). With
@@ -37,6 +42,10 @@ export type ActorResponse =
   | {
       status?: number;
       headers?: Record<string, string>;
+      /** More headers, sent after `headers`, repeats and order kept: a record
+       * (a list value is one header per value), pairs, or a {@link HeaderList}.
+       * `headerList: [["set-cookie", "a=1"], ["set-cookie", "b=2"]]`. */
+      headerList?: HeadersInit;
       body?: string | Uint8Array;
     };
 
@@ -49,10 +58,12 @@ export function json(value: unknown, status = 200): ActorResponse {
  * front, another actor of the app, or a client (`outside`). */
 export type Caller = { kind: "front" } | { kind: "actor"; address: ActorAddress } | { kind: "outside" };
 
-/** The first value of header `name` (lower case). */
+/** The first value of header `name`, whatever its case. */
 function first(req: ActorRequest, name: string): string | undefined {
-  if (req.headerList) return req.headerList.find(([n]) => n.toLowerCase() === name)?.[1];
-  return req.headers[name];
+  const lower = name.toLowerCase();
+  if (req.fields) return req.fields.get(lower);
+  if (req.headerList) return req.headerList.find(([n]) => n.toLowerCase() === lower)?.[1];
+  return Object.entries(req.headers).find(([n]) => n.toLowerCase() === lower)?.[1];
 }
 
 function decodeName(s: string): string | undefined {

@@ -8,6 +8,7 @@ import "./text";
 
 export * as codec from "./codec";
 export { CodecError, type Codec, type Infer, type OptionalCodec } from "./codec";
+export { HeaderList, type HeadersInit } from "./headers";
 export { CALL_ERROR_KINDS, CallError, isCallErrorKind, type CallErrorKind } from "./errors";
 export {
   MAX_PROBLEM_BYTES,
