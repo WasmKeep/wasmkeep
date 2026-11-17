@@ -289,19 +289,11 @@ async fn actor_restore_replaces_at_a_new_head_and_survives_a_second_node() {
         .await
         .unwrap();
     {
-        // Admission closes before the restore job enters the mailbox. Keep
-        // the upload blocked until then, so completion cannot flush all the
-        // writes before the restore is even queued.
-        eventually(
-            "restore admission closes with an upload pending",
-            async || {
-                // An incomplete upgrade checks admission without opening a
-                // socket or queueing an event behind the blocked restore.
-                let reply = send(a.addr, "GET", "/actor/t/rewind", "Upgrade: websocket\r\n").await;
-                reply.status == 503 && reply.body.trim() == "actor restore pending"
-            },
-        )
-        .await;
+        // A pending upload is still preflight: it must not close upgrade
+        // admission. An incomplete handshake answers immediately without
+        // queueing an actor event behind the flush.
+        let reply = send(a.addr, "GET", "/actor/t/rewind", "Upgrade: websocket\r\n").await;
+        assert_eq!(reply.status, 400);
         assert!(store.head(&Key::from(format!("{key}.done"))).await.is_err());
         flaky.hold_wal_puts.send_replace(false);
     }
@@ -811,6 +803,195 @@ async fn actor_restore_closes_sockets_and_restores_alarm_with_fresh_index() {
     })
     .await
     .expect("restored alarm did not fire");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_restore_conflict_preserves_sockets_and_upgrade_admission() {
+    use futures_util::StreamExt as _;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "restore-conflict-socket",
+        dir.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    super::deletes::write(a.addr, "conflict", 1).await;
+    let mut stage = actor_restore_stage(&store, "conflict").await;
+    let url = format!("ws://{}/actor/t/conflict", a.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    stage.1.if_head = Some(wasmkeep_cluster::replication::SegmentId {
+        generation: 0,
+        txid: 0,
+    });
+    let key = actor_restore_submit(&store, "conflict", "aaaaaaaaaaaaaaaa", &stage).await;
+    tokio::select! {
+        _ = actor_restore_outcome(&store, &key, "conflict") => {},
+        message = ws.next() => panic!("refused restore disturbed the socket: {message:?}"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), ws.next())
+            .await
+            .is_err(),
+        "refused restore closed the existing socket"
+    );
+    let (second, response) = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    .expect("upgrade waited after refusal")
+    .unwrap();
+    assert_eq!(response.status().as_u16(), 101);
+    let mut extra_sockets = Vec::new();
+    for (i, kind) in ["size", "checksum", "page size", "corrupt"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut invalid = stage.clone();
+        invalid.1.if_head = None;
+        match kind {
+            "size" => invalid.1.size = u64::MAX,
+            "checksum" => invalid.1.checksum ^= 1,
+            "page size" => invalid.1.page_size = 512,
+            "corrupt" => invalid.0[0] ^= 1,
+            _ => unreachable!(),
+        }
+        let key = actor_restore_submit(&store, "conflict", &format!("{i:016x}"), &invalid).await;
+        tokio::select! {
+            _ = actor_restore_outcome(&store, &key, "refused") => {},
+            message = ws.next() => panic!("{kind} refusal disturbed the socket: {message:?}"),
+        }
+        let (socket, response) = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio_tungstenite::connect_async(&url),
+        )
+        .await
+        .expect("upgrade waited after refusal")
+        .unwrap();
+        assert_eq!(response.status().as_u16(), 101);
+        extra_sockets.push(socket);
+    }
+    assert_eq!(read(a.addr, "conflict").await, "1", "refusal changed state");
+    let objects =
+        wasmkeep_server::history::list_objects(&store, "state/default/default/actors/t/conflict/")
+            .await
+            .unwrap();
+    // Use the current bucket head, including both on-open callbacks.
+    let listing =
+        wasmkeep_cluster::replication::Listing::from_keys(objects.keys().map(String::as_str));
+    stage.1.if_head = Some(
+        wasmkeep_cluster::replication::plan_restore(&listing)
+            .unwrap()
+            .head(),
+    );
+    let key = actor_restore_submit(&store, "conflict", "bbbbbbbbbbbbbbbb", &stage).await;
+    let close = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) = ws.next().await
+            {
+                break frame.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(u16::from(close.code), 1012);
+    assert_eq!(close.reason, "actor restored");
+    drop(ws);
+    drop(second);
+    drop(extra_sockets);
+    actor_restore_outcome(&store, &key, "conflict").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_restore_if_head_conflicts_with_http_write_during_socket_drain() {
+    restore_if_head_drain_write(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_restore_if_head_survives_retry_after_socket_drain() {
+    restore_if_head_drain_write(true).await;
+}
+
+async fn restore_if_head_drain_write(retry: bool) {
+    use futures_util::StreamExt as _;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(store.clone(), Arc::new(AtomicBool::new(false))));
+    let seen: Arc<dyn ObjectStore> = flaky.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "restore-drain-cas",
+        dir.path(),
+        &seen,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    super::deletes::write(a.addr, "drain", 1).await;
+    let mut stage = actor_restore_stage(&store, "drain").await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/actor/t/drain", a.addr))
+        .await
+        .unwrap();
+    let objects =
+        wasmkeep_server::history::list_objects(&store, "state/default/default/actors/t/drain/")
+            .await
+            .unwrap();
+    let listing =
+        wasmkeep_cluster::replication::Listing::from_keys(objects.keys().map(String::as_str));
+    stage.1.if_head = Some(
+        wasmkeep_cluster::replication::plan_restore(&listing)
+            .unwrap()
+            .head(),
+    );
+    let key = actor_restore_submit(&store, "drain", "cccccccccccccccc", &stage).await;
+    let close = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(close, tokio_tungstenite::tungstenite::Message::Close(Some(ref frame)) if u16::from(frame.code) == 1012)
+    );
+    if retry {
+        // Fail the next pass's app/ownership preflight after 1012. A fresh
+        // handshake reaching normal validation proves admission reopened.
+        flaky.fail_node_list.store(true, Ordering::SeqCst);
+        eventually("retry reopens admission", async || {
+            send(a.addr, "GET", "/actor/t/drain", "Upgrade: websocket\r\n")
+                .await
+                .status
+                == 400
+        })
+        .await;
+        flaky.fail_node_list.store(false, Ordering::SeqCst);
+    }
+    // Seeing 1012 proves preflight accepted the head and entered its Busy sleep.
+    let write = send(a.addr, "POST", "/actor/t/drain/durable", "").await;
+    assert_eq!(write.status, 200);
+    assert_eq!(write.body.trim(), "2");
+    assert_eq!(read(a.addr, "drain").await, "2");
+    let _ = ws.close(None).await;
+    drop(ws);
+    eventually("restore ended", async || {
+        store.head(&Key::from(format!("{key}.done"))).await.is_ok()
+            || store
+                .head(&Key::from(format!("{key}.conflict")))
+                .await
+                .is_ok()
+    })
+    .await;
+    assert_eq!(
+        read(a.addr, "drain").await,
+        "2",
+        "acknowledged drain-window write was replaced"
+    );
+    actor_restore_outcome(&store, &key, "conflict").await;
+    assert!(store.head(&Key::from(format!("{key}.done"))).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]

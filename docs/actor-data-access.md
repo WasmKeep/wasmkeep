@@ -150,8 +150,15 @@ undo needs a retained position or a backup. An app restore fence or tombstone
 blocks the job. A request predating a later delete cannot resurrect that data;
 an intentional undo of a delete needs a new request, usually from a backup.
 
-Sockets close with 1012 before replacement; upgrades receive 503 while the
-request is pending. Restored alarms get fresh index entries before the upload
+Validation, the initial `--if-head` comparison and restore fences run before
+any socket disruption. Only once a validated replacement starts draining do
+sockets close with 1012 and upgrades receive 503 (`Retry-After: 1`). Before
+that, normal handshake validation applies, including 400 for an incomplete
+upgrade. `--if-head` is checked again after draining and across retries: any
+head movement, including close-callback writes, is a conflict and preserves
+the current data, even though sockets may already be closed. Without
+`--if-head`, the replacement still replaces whatever is there.
+Restored alarms get fresh index entries before the upload
 and can fire again. Effects outside the actor's database are not undone.
 The staged database must have the current database's page size and fit the
 node's database limit. Requests expire after 50 minutes by the bucket's clock. After a delete reset

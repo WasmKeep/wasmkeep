@@ -869,6 +869,9 @@ outcome written) deletes the request and its staged object, rewrites
 would expire, exactly as `end_delete_request` does for deletes, so that
 other nodes stop acting on their copies within a period.
 
+**Amendment (2026-11-17):** Steps 3–5 validate before disruption and preserve
+exact `--if-head` comparison through socket draining and retries.
+
 **The restore job**, in the actor's mailbox, no guest code:
 
 1. Forget any learned owner. `ensure_owner`: acquire and restore, or
@@ -907,29 +910,29 @@ other nodes stop acting on their copies within a period.
    ordinary collection under that retention policy, not external object
    deletion or a previously shorter retention. An operator who means to undo
    a delete asks again after it.
-3. **Sockets, first.** While an executable restore job is queued or running
-   on the node holding the actor, that node answers WebSocket upgrades for it with 503 and `Retry-After: 1`,
-   relayed or not, so no new socket opens on the state being replaced.
-   Sockets already open or closing are closed with **1012** ("service
-   restart"), once: the actor goes on existing, rewound, and clients
-   should reconnect, unlike a delete's 1000, which exists so that an
-   open class is not recreated by the reconnect. Their close events run
-   in the mailbox first, on the state being replaced, so their writes are
-   in the history before the replacement. The job answers `Busy` and is
-   queued again, waiting up to 5 s, as a delete's is. If sockets are
-   still open after three such waits, the outcome is `<id>.refused`.
-4. **`--if-head`**, checked now that the close events have run: if the
-   current head is not the one given, the outcome is `<id>.conflict`
-   with the current head, and nothing changes. Without it, the restore
-   replaces whatever was written since the operator looked, which the
-   history keeps for the window (undo, above).
-5. **Read the staged object** (GET), check its LTX trailer, its
-   post-apply checksum against the request, its size against the node's
-   `--max-db-bytes`, that its header says WAL mode, and that its page
-   size is the current database's: a replay refuses a change of page
-   size (`Restorer::begin`), so an acknowledged replacement of another
-   page size would leave the actor unrestorable. A refusal writes
-   `<id>.refused` with why.
+3. **Validate before disruption.** Read the request and compare `--if-head`
+   with the current head, if supplied. A mismatch ends as `<id>.conflict`
+   with the current head. Read the staged object (GET), check its LTX trailer,
+   post-apply checksum, size against `--max-db-bytes`, WAL mode and page size
+   against the current database. Invalid input ends as `<id>.refused` with
+   why. Check the app and ownership fences before closing admission or
+   sockets. Preflight refusals preserve sockets and upgrade admission.
+4. **Drain only a validated replacement.** The node now answers upgrades
+   with 503 and `Retry-After: 1`, including registrations that raced the
+   early gate. Sockets already open or closing receive **1012** ("service
+   restart"). Their close events run on the old state. Retain the validated
+   image and the head checked in step 3 while the job answers `Busy` and
+   waits 5 s between passes, up to three waits; sockets still present then
+   end as `<id>.refused`. Before this drain begins, normal handshake
+   validation applies (an incomplete upgrade can receive 400).
+5. **Keep `--if-head` exact.** In every later pass, including the drained
+   pass, compare the current head with the head checked in step 3 before
+   replacement. Retain that checked head across retryable failures too.
+   Any movement, including HTTP writes, alarms, actor calls, another restore,
+   ownership recovery or socket close callbacks, ends as `<id>.conflict`
+   with the current head and no replacement. Sockets may already have been
+   closed. Without `--if-head`, replace whatever is there; history retains
+   the intervening writes for its normal retention window.
 6. **Build the replacement**, in scratch space beside the database (as
    `delete-self-durable` builds its empty database). The staged database, with its host meta
    set for this actor now, not then:

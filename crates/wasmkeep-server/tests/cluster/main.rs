@@ -880,6 +880,8 @@ struct Flaky {
     lease_get_release: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
     /// Listings of `control/` fail while set; everything else works.
     fail_control_list: Arc<AtomicBool>,
+    /// Fail membership reads without disrupting lease renewal or actor writes.
+    fail_node_list: Arc<AtomicBool>,
     /// Every read of a lease object waits this many ms first.
     delay_lease_get_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Writes of ownership records (`owners/...`) fail while set.
@@ -931,6 +933,7 @@ impl Flaky {
             lease_held: Arc::default(),
             lease_get_release: std::sync::Mutex::default(),
             fail_control_list: Arc::default(),
+            fail_node_list: Arc::default(),
             delay_lease_get_ms: Arc::default(),
             fail_owner_puts: Arc::default(),
             hang_wal_puts: Arc::default(),
@@ -1333,7 +1336,10 @@ impl ObjectStore for Flaky {
     {
         use futures_util::StreamExt as _;
         let control = prefix.is_some_and(|p| p.as_ref().starts_with("control"));
-        if control && self.fail_control_list.load(Ordering::SeqCst) {
+        if (control && self.fail_control_list.load(Ordering::SeqCst))
+            || (prefix.is_some_and(|p| p.as_ref() == "nodes")
+                && self.fail_node_list.load(Ordering::SeqCst))
+        {
             return futures_util::stream::once(async {
                 Err(object_store::Error::Generic {
                     store: "flaky",

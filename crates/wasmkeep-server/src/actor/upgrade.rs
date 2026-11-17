@@ -8,8 +8,8 @@ use super::*;
 
 /// Why a socket was not opened before its 101.
 enum NotOpened {
-    /// Over a cap: others raced in since `can_open`. Nothing registered.
-    Full(crate::websocket::OpenError),
+    /// A cap or restore gate raced the early checks. Nothing registered.
+    Open(crate::websocket::OpenError),
     /// The actor refused a hand-off, or could not run its open event.
     Refused(Refused),
 }
@@ -139,6 +139,8 @@ impl ActorService {
             Ok(a) => a,
             Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
+        // Only a validated replacement closes this gate. Merely discovering
+        // or checking a restore request must leave upgrade admission alone.
         if self
             .inner
             .cluster
@@ -151,13 +153,7 @@ impl ActorService {
                 .unwrap_or_else(|p| p.into_inner())
                 .contains_key(&address)
         {
-            let mut response =
-                text_response(StatusCode::SERVICE_UNAVAILABLE, "actor restore pending\n");
-            response.headers_mut().insert(
-                hyper::header::RETRY_AFTER,
-                hyper::header::HeaderValue::from_static("1"),
-            );
-            return response;
+            return restore_pending_response();
         }
         let header = |name: &str| {
             req.headers()
@@ -393,7 +389,7 @@ impl ActorService {
             let accepted = match inner.accept_socket(opening.clone(), path, opener).await {
                 Ok(accepted) => accepted,
                 Err(e) => {
-                    let _ = opened_tx.send(Err(NotOpened::Full(e)));
+                    let _ = opened_tx.send(Err(NotOpened::Open(e)));
                     return;
                 }
             };
@@ -441,18 +437,9 @@ impl ActorService {
                     }
                 };
             }
-            Ok(Err(NotOpened::Full(e))) => {
-                // Over a cap after all: others raced in since `can_open`.
-                // Nothing was registered.
+            Ok(Err(NotOpened::Open(e))) => {
                 tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = ?e, "websocket refused");
-                crate::metrics::refused(crate::metrics::Refusal::Capacity);
-                let mut r =
-                    text_response(StatusCode::SERVICE_UNAVAILABLE, "too many connections\n");
-                r.headers_mut().insert(
-                    hyper::header::RETRY_AFTER,
-                    hyper::header::HeaderValue::from_static("5"),
-                );
-                return r;
+                return open_error_response(e);
             }
             Err(_) => {
                 // The task panicked.
@@ -476,4 +463,28 @@ impl ActorService {
         }
         response
     }
+}
+
+fn restore_pending_response() -> Response<HyperOutgoingBody> {
+    let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, "actor restore pending\n");
+    response.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    response
+}
+
+pub(super) fn open_error_response(
+    error: crate::websocket::OpenError,
+) -> Response<HyperOutgoingBody> {
+    if matches!(error, crate::websocket::OpenError::RestorePending) {
+        return restore_pending_response();
+    }
+    crate::metrics::refused(crate::metrics::Refusal::Capacity);
+    let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, "too many connections\n");
+    response.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("5"),
+    );
+    response
 }
