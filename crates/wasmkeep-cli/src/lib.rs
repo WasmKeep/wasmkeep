@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Context;
+mod actor_groups;
 pub mod backup;
 pub mod feed;
 

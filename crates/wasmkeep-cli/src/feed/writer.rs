@@ -376,3 +376,101 @@ fn text_value(value: &SqlValue) -> String {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+/// One verified whole-state replacement, including empty tables.
+#[derive(Debug)]
+pub struct State {
+    pub actor: ActorTable,
+    pub class: String,
+    pub tables: Vec<String>,
+    pub emitted_at: i64,
+}
+
+/// Write the batch's visibility record after all table files are complete.
+pub fn write_states(path: &Path, states: &[State]) -> anyhow::Result<()> {
+    let names = [
+        "_wk_tenant",
+        "_wk_app",
+        "_wk_class",
+        "_wk_name",
+        "_wk_seq",
+        "_wk_kind",
+        "_wk_reason",
+        "_wk_generation",
+        "_wk_txid",
+        "_wk_committed_at",
+        "_wk_tables",
+        "_wk_emitted_at",
+    ];
+    let kinds = names.map(|name| {
+        if matches!(
+            name,
+            "_wk_seq" | "_wk_generation" | "_wk_txid" | "_wk_committed_at" | "_wk_emitted_at"
+        ) {
+            ColumnType::Integer
+        } else {
+            ColumnType::Text
+        }
+    });
+    let fields = names
+        .iter()
+        .zip(kinds)
+        .map(|(name, kind)| {
+            let logical = if matches!(*name, "_wk_seq" | "_wk_generation" | "_wk_txid") {
+                Some(LogicalType::integer(64, false))
+            } else if matches!(*name, "_wk_committed_at" | "_wk_emitted_at") {
+                Some(LogicalType::timestamp(true, TimeUnit::MILLIS))
+            } else {
+                None
+            };
+            field(name, kind, *name != "_wk_reason", logical)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let schema = Arc::new(
+        Type::group_type_builder("wasmkeep_states")
+            .with_fields(fields)
+            .build()?,
+    );
+    let mut partial = path.as_os_str().to_os_string();
+    partial.push(".partial");
+    ensure!(!path.try_exists()?, "state file already exists");
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
+    let mut writer =
+        SerializedFileWriter::new(file, schema, Arc::new(WriterProperties::builder().build()))?;
+    let rows = states
+        .iter()
+        .map(|s| {
+            let a = &s.actor;
+            Ok(vec![
+                SqlValue::Text(a.tenant.clone()),
+                SqlValue::Text(a.app.clone()),
+                SqlValue::Text(s.class.clone()),
+                SqlValue::Text(a.name.clone()),
+                SqlValue::Integer(a.seq as i64),
+                SqlValue::Text("state".into()),
+                SqlValue::Null,
+                SqlValue::Integer(a.generation as i64),
+                SqlValue::Integer(a.txid as i64),
+                SqlValue::Integer(a.committed_at),
+                SqlValue::Text(serde_json::to_string(&s.tables)?),
+                SqlValue::Integer(s.emitted_at),
+            ])
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut group = writer.next_row_group()?;
+    for (i, kind) in kinds.iter().enumerate() {
+        let mut col = group.next_column()?.context("missing states column")?;
+        let values = rows.iter().map(|row| &row[i]).collect::<Vec<_>>();
+        write_values(&mut col, *kind, &values, names[i] == "_wk_reason")?;
+        col.close()?;
+    }
+    group.close()?;
+    writer.close()?;
+    File::open(&partial)?.sync_all()?;
+    std::fs::rename(&partial, path)?;
+    File::open(path.parent().context("states parent")?)?.sync_all()?;
+    Ok(())
+}

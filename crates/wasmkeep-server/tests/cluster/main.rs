@@ -2412,3 +2412,6 @@ impl wasmkeep_cluster::lease::Clock for WallClock {
         now_ms()
     }
 }
+
+#[path = "feed.rs"]
+mod feed;

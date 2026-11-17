@@ -43,6 +43,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Export changed states to local Parquet files in one read-only poll.
+    Feed(wasmkeep_cli::feed::Args),
     /// Create and verify lease-free online archives.
     #[command(subcommand)]
     Backup(backup::Command),
@@ -1287,6 +1289,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Backup(args) => backup::run(&args),
+        Command::Feed(args) => wasmkeep_cli::feed::run(&args),
         Command::Actor(ActorCommand::History(args)) => actor_read::history(&args),
         Command::Actor(ActorCommand::Export(args)) => actor_read::finish(actor_read::export(&args)),
         Command::Actor(ActorCommand::Sql(args)) => actor_read::finish(actor_read::sql(&args)),
