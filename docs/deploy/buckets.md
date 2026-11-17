@@ -20,6 +20,17 @@ those guarantees on a bucket before you trust a cluster to it.
 | **Last-modified times**, whole seconds at least, later for a write a second after another, the same in a head and a listing | `cluster migrate` compares them to tell writes after its commit from writes before; `cluster fence` checks this machine's clock against the bucket's |
 | **The clock**: the bucket's time and each node's within the lease's allowed skew of 1 s | Leases are measured on each node's clock ([how](../cluster.md#how-it-works)) |
 
+An app's [files](../files.md) live in the same bucket, under
+`state/<tenant>/<app>/blobs/`, and need nothing more than the above.
+Presigned downloads also need the bucket's endpoint reachable from
+browsers (`--blob-link-endpoint` when the nodes reach it on a private
+address, never a host under the app's own site); each node proves the
+cases a download link relies on at start, and uses node links when that
+proof fails. Two lifecycle rules are worth setting on a bucket that
+holds files: abort incomplete multipart uploads after a day, and, if no
+file must live that long, expire old objects under `state/*/*/blobs/`
+([the bucket's own rules](../files.md#the-buckets-own-rules)).
+
 Every node also proves the first two at start, on a throwaway object
 under `probe/`, and refuses to run on a store that ignores them. `cluster
 diagnose` goes further, and measures what the start check cannot.

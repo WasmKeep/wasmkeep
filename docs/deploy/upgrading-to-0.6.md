@@ -53,3 +53,26 @@ assets (`--no-assets`, or remove `[assets]` from the project), wait for
 every node to apply it, and only then downgrade. Do not roll back to a
 retained format 7 version on older nodes. Existing `_assets` objects may
 remain; older version collectors do not treat `_assets` as a version.
+
+## Files
+
+Upgrade every node of an app before deploying a version whose actors or
+front use [files](../files.md). Nodes of 0.6.0 announce `blobs`; a
+deploy (or a rollback) of a version that imports
+`wasmkeep:actor/blobs` is refused while a live node of the app lacks
+it, with no force option. A TypeScript or Python component that does
+not use files imports nothing new and deploys at any time.
+
+**Do not downgrade a node below 0.6.0** once an app it serves has had a
+version that uses files. An older node deletes an actor without the
+sweep record and the new file namespace a delete now writes: 0.6.0
+nodes notice it (the next start of that actor draws a fresh namespace,
+and the sweep removes nothing it cannot prove deleted), but files of
+the deleted actor would stay until the bucket's lifecycle rule takes
+them. Nothing can make an older binary refuse; this is the rule to
+follow.
+
+Also new on the public port: `/_wasmkeep/blobs/v1/` answers node links.
+Uploads are node links in 0.6.0, 16 MiB at most on a bucket
+([why](../files.md#links)). Back up apps that use files with the 0.6.0
+CLI ([files and assets](backup-and-restore.md#files-and-assets)).

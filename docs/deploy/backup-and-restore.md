@@ -126,6 +126,48 @@ fresh replay. Destination reads therefore exceed ADR 0033's optimized estimates.
 Concurrent prune markers refuse completion conservatively; completed markers
 permit later creates. The stopped-cluster copy and drill below remain available.
 
+### Files and assets
+
+An app's [files](../files.md) and its [static assets](../static-assets.md)
+are in the archive too. After an app's actors, `backup create` lists
+the app's files once and copies each into the archive's content store,
+recording its namespace, key, size, digest and content type; with the
+deploys it copies each kept version's asset index and every content it
+names. A file unchanged since the last run (same key, size and ETag) is
+carried over without a read; a file larger than 16 MiB is spooled to
+`--cache` (or the system's temporary directory) while its digest is
+computed. A file deleted between the listing and its read is left out;
+any other failure to read one fails the run. `backup verify` checks
+that every file's and every asset's object is in the archive, and
+`backup prune` keeps every digest a kept run names. The sweep records
+and the hourly count of the running cluster are never copied, nor the
+markers a deploy of assets leaves.
+
+`backup restore` writes the files back after the actors' history and
+before the app is opened, under the restored app's new file epoch
+(every link issued before the restore is dead), with their content
+types; `--deploy backup` writes the assets back with the deploys. It
+writes **only the files of the life of each actor that the restored
+database names**: files of an earlier or later life of that address (an
+actor deleted between its copy and the file listing) and files of an
+actor the run holds no database for stay in the archive. The front's
+files come back whole. In place, the restore has already removed every
+file of the app; an upload through a link issued before it lands where
+nothing reads it, and the app's hourly pass removes it.
+
+**A file may be newer than the rows that name it.** Each actor's
+database is copied at its own moment, its files later in the same run,
+each at the moment it was read: in a restored app a row may name a file
+deleted before the listing, or a file may be newer than its row, or
+have no row yet. Check a file with `head` before trusting a row that
+names it, and run the app's own sweep of pending uploads after a
+restore ([a row and its file](../files.md#a-row-and-its-file)). A
+restored file has a new `etag` and modified time: an app that stored an
+ETag for a conditional write reads it again.
+
+Back up an app that uses files or assets with a CLI of 0.6.0 or later:
+an older one copies neither and restores neither.
+
 ## Prune an online archive
 
 ```bash

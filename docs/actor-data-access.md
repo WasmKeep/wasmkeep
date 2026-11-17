@@ -170,6 +170,14 @@ alone does not. During a rolling upgrade, older nodes do not process restore
 requests or preserve their markers through deletes: finish upgrading before
 using this command.
 
+**Rows, not files.** An actor's [files](files.md) are not in its
+database: `actor restore` leaves them as they are now. A restored row
+may name a file deleted since (check it with `head` before trusting
+it), and a restore to a point before a delete brings the old rows back
+in a new, empty file namespace. The files of a past moment come from a
+backup of the whole app, restored into a prefix of its own
+([files and assets in backups](deploy/backup-and-restore.md#files-and-assets)).
+
 Restore requests print an operation ID before waiting. Use `--resume ID`
 instead of selecting a source again after interruption; see
 [operation recovery](operations.md).

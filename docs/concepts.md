@@ -220,7 +220,9 @@ first event ─▶ on-init ─▶ resident ──idle 30 s──▶ hibernated
   long, with no pending alarm and no open WebSocket, is deleted the same
   way, for sessions, carts and temporary rooms
   ([cluster](cluster.md#idle-expiry)). An event arriving as it expires
-  either keeps it (the expiry loses) or finds a new, empty actor.
+  either keeps it (the expiry loses) or finds a new, empty actor. Only
+  events count: a [file](files.md) downloaded through a link runs no
+  code and keeps no actor alive, and the actor's files go with it.
 - **A whole app** is deleted with `wasmkeep app delete`: its nodes stop
   serving it, then every actor, version and secret of it goes from the
   bucket ([cluster](cluster.md#deleting-an-app)).
