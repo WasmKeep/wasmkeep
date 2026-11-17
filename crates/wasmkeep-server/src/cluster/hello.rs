@@ -113,6 +113,7 @@ impl Cluster {
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
+        self.add_sender(headers, &secret, "internal", &mac);
         self.check_tls_target(&base)
             .map_err(|e| format!("node {peer}: {e}"))?;
         // A connection of its own, closed after the answer: a hello's must

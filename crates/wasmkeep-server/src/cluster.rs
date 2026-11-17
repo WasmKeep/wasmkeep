@@ -1235,6 +1235,7 @@ impl Cluster {
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
+        self.add_sender(headers, &secret, "internal", &mac);
         Ok(())
     }
 
@@ -1334,13 +1335,85 @@ impl Cluster {
                 self.note_refused("signed call on the public port, treated as from outside (--cluster-plaintext refuse)");
                 None
             }
-            Some(signed) => Some(signed),
+            Some(signed) => {
+                match self.sender_checked(headers, secret, "internal", given, path, on_cluster_port)
+                {
+                    Ok(_) => Some(signed),
+                    Err(why) => {
+                        self.note_refused(why);
+                        None
+                    }
+                }
+            }
             // Junk on the public port is an outside request like any other.
             None if public_port => None,
             None => {
                 self.note_refused("bad, expired or misaddressed signature (clock skew? another cluster's secret? a node of an older version?)");
                 None
             }
+        }
+    }
+
+    /// Whether the connection a signed hop came on (`peer`, on the cluster
+    /// port) is the one its [`SENDER`] names: that node's own live
+    /// heartbeat publishes the pin presented. A hop without a sender (a
+    /// node of an older version) or over plain HTTP passes here.
+    /// Names this node as the sender of a hop it signed (ADR 0038,
+    /// section 5), bound to the hop's own signature `mac`.
+    fn add_sender(&self, headers: &mut hyper::HeaderMap, secret: &str, kind: &str, mac: &str) {
+        if let Ok(v) =
+            hyper::header::HeaderValue::from_str(&sender_value(secret, kind, mac, &self.node_id))
+        {
+            headers.insert(SENDER, v);
+        }
+    }
+
+    /// The sender a signed hop names, checked (ADR 0038, section 5): bound
+    /// to the hop's signature (`given`, its [`INTERNAL`] or [`ADMITTED`]
+    /// value), named once, and a live node of this app. `Ok(None)`: no
+    /// sender (a node of an older version, rolling upgrade stage 1). A
+    /// hello may come from a node not listed yet (it asks for a listing);
+    /// over plain HTTP between nodes (`accept`) an unlisted sender is taken
+    /// as an unsigned-sender hop was, its app checked when known.
+    fn sender_checked(
+        &self,
+        headers: &hyper::HeaderMap,
+        secret: &str,
+        kind: &str,
+        given: &str,
+        path: &str,
+        on_cluster_port: bool,
+    ) -> Result<Option<String>, &'static str> {
+        let mut values = headers.get_all(SENDER).iter();
+        let Some(first) = values.next() else {
+            return Ok(None);
+        };
+        if values.next().is_some() {
+            return Err("hop names its sender twice");
+        }
+        let primary = given.rsplit(' ').next().unwrap_or_default();
+        let sender = first
+            .to_str()
+            .ok()
+            .and_then(|v| verify_sender(secret, kind, primary, v))
+            .ok_or("hop's sender is not bound to its signature")?;
+        if path == HELLO_PATH {
+            return Ok(Some(sender));
+        }
+        let app = self
+            .peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&sender)
+            .map(|p| p.app.clone());
+        match app {
+            Some(app) if app == self.serves => Ok(Some(sender)),
+            Some(_) => Err("hop's sender is a node of another app"),
+            None if on_cluster_port || self.refuse_plaintext => {
+                self.want_listing();
+                Err("hop's sender is not a live node")
+            }
+            None => Ok(Some(sender)),
         }
     }
 
@@ -1612,6 +1685,7 @@ impl Cluster {
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
+        self.add_sender(headers, &secret, "internal", &mac);
         self.check_tls_target(&base)
             .map_err(|e| format!("node {owner}: {e}"))?;
         let call = self.clients().call.clone();
@@ -2388,6 +2462,8 @@ fn random_hex(n: usize) -> std::io::Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+#[cfg(test)]
+mod sender_tests;
 #[cfg(test)]
 mod tests;
 

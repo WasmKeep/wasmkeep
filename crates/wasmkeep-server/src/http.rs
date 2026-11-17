@@ -482,12 +482,44 @@ pub(crate) struct ClusterPort {
 pub(crate) struct ClusterPeer {
     pin: crate::cluster_tls::pinning::Pin32,
     pins: Arc<PinSet>,
+    /// The node a request on the connection was sent by, when it names one
+    /// (ADR 0038, section 5): its answer, or the socket it relays, is then
+    /// trusted only while that node id itself publishes the pin.
+    sender: Option<Arc<str>>,
 }
 
 impl ClusterPeer {
-    /// Whether the peer's pin is still live.
+    #[cfg(test)]
+    pub(crate) fn for_test(pin: crate::cluster_tls::pinning::Pin32, pins: Arc<PinSet>) -> Self {
+        Self {
+            pin,
+            pins,
+            sender: None,
+        }
+    }
+
+    /// This connection, for a request sent by `sender`.
+    pub(crate) fn sent_by(&self, sender: Option<&str>) -> Self {
+        Self {
+            sender: sender.map(Arc::from),
+            ..self.clone()
+        }
+    }
+
+    /// Whether `node`'s own live heartbeat publishes the pin this
+    /// connection presented (ADR 0038, section 5).
+    pub(crate) fn publishes(&self, node: &str) -> bool {
+        self.pins.publishes(&self.pin, node)
+    }
+
+    /// Whether the peer's pin is still live: for a request that named its
+    /// sender, while that node id's own heartbeat publishes it; otherwise
+    /// while any node id's does.
     pub(crate) fn is_live(&self) -> bool {
-        self.pins.node_of_pin(&self.pin).is_some()
+        match &self.sender {
+            Some(node) => self.pins.publishes(&self.pin, node),
+            None => self.pins.node_of_pin(&self.pin).is_some(),
+        }
     }
 }
 
@@ -695,7 +727,11 @@ async fn serve_cluster_port(
             else {
                 return;
             };
-            let cluster = ClusterPeer { pin, pins };
+            let cluster = ClusterPeer {
+                pin,
+                pins,
+                sender: None,
+            };
             serve_connection(tls, app, Some(cluster), header_read_timeout, stop, peer).await;
         });
     }
@@ -733,6 +769,22 @@ async fn serve_connection<I>(
             if !cluster_serves(req.uri().path()) {
                 return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
             }
+            // A hop that names its sender must come over that node's own
+            // connection (ADR 0038, section 5); its signature, checked
+            // later, binds the name.
+            if !crate::cluster::sender_presented(req.headers(), Some(&cluster)) {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "the hop's sender does not publish this connection's certificate\n",
+                ));
+            }
+            let sender = req
+                .headers()
+                .get(crate::cluster::SENDER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::cluster::sender_named)
+                .map(str::to_owned);
+            let cluster = cluster.sent_by(sender.as_deref());
             req.extensions_mut()
                 .insert(ArrivedOnClusterPort(cluster.clone()));
             let response = app.route(req).await;

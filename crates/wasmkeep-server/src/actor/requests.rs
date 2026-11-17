@@ -136,6 +136,8 @@ impl ActorService {
         // The secret never reaches a guest, nor a hand-off's mark (ADR
         // 0027), which only relayed upgrades carry.
         req.headers_mut().remove(INTERNAL);
+        // Nor the sender's proof (ADR 0038, section 5).
+        req.headers_mut().remove(crate::cluster::SENDER);
         req.headers_mut().remove(crate::cluster::UPGRADE_MARK);
         req.headers_mut().remove(CHAIN);
 
