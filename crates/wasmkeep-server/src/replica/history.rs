@@ -39,6 +39,9 @@ pub struct Export {
     pub timestamp_ms: i64,
     /// Ownership-record hint; absence or unreadability is unknown, not settled.
     pub owner_generation: Option<u64>,
+    /// The ownership record's recorded head (ADR 0035), when it is in
+    /// version 2: a hint like the generation, not proof.
+    pub owner_recorded: Option<wasmkeep_cluster::recorded_head::RecordedHead>,
     /// LTX checksum of the raw replay.
     pub raw_checksum: u64,
     /// Objects read in the successful attempt, including timestamp lookups.
@@ -205,11 +208,12 @@ async fn export_mode(
                 result.attempts = attempt;
                 // A hint only. Read-only credentials may deliberately omit owners/.
                 let owner = StorePath::from(root.bucket_key(Family::Owners, &tail));
-                result.owner_generation = get(store, &owner, None, 16 * 1024)
+                let record = get(store, &owner, None, 16 * 1024)
                     .await
                     .ok()
-                    .and_then(|bytes| wasmkeep_cluster::node_lease::OwnerRecord::decode(&bytes))
-                    .map(|owner| owner.generation);
+                    .and_then(|bytes| wasmkeep_cluster::node_lease::OwnerRecord::decode(&bytes));
+                result.owner_generation = record.as_ref().map(|owner| owner.generation);
+                result.owner_recorded = record.and_then(|owner| owner.recorded);
                 if options.require_owner_match
                     && result.owner_generation != Some(result.listed_head.generation)
                 {
@@ -370,6 +374,7 @@ async fn attempt_export(
         listed_head: head,
         timestamp_ms: stamp,
         owner_generation: None,
+        owner_recorded: None,
         raw_checksum: checksum.value(),
         objects: reader.read_count,
         attempts: 1,

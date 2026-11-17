@@ -217,6 +217,9 @@ fn report(result: &history::Export) {
             "Warning: owner generation unavailable; the newest segment may be an unacknowledged tip, overtaken by later history."
         ),
     }
+    if let Some(line) = recorded_line(result.owner_recorded.as_ref()) {
+        eprintln!("{line}");
+    }
     eprintln!(
         "LTX trailers, checksum chain, final checksum and integrity_check: ok; {} foreign-key violations; {} objects read in successful attempt, {} attempt(s); app tables: {}",
         result.verification.foreign_key_violations,
@@ -609,5 +612,67 @@ mod tests {
         ] {
             assert!(parse_at(invalid).is_err());
         }
+    }
+}
+
+/// What `actor export` says of a version 2 record's recorded head (ADR
+/// 0035): the position a released owner froze, its stamp and whether it
+/// is complete; `None` for a version 1 record or none.
+pub(crate) fn recorded_line(
+    recorded: Option<&wasmkeep_cluster::recorded_head::RecordedHead>,
+) -> Option<String> {
+    use wasmkeep_cluster::recorded_head::{Completeness, Position};
+    let r = recorded?;
+    let head = match r.head {
+        Position::Unknown => "unknown".to_owned(),
+        Position::Empty => "empty (before any history)".to_owned(),
+        Position::Known {
+            generation,
+            txid,
+            checksum,
+        } => format!("generation {generation}, txid {txid}, checksum {checksum:016x}"),
+    };
+    let phase = match r.completeness {
+        Completeness::Complete => "complete",
+        Completeness::CompleteInherited => "complete (inherited)",
+        Completeness::LowerBound => "a lower bound",
+    };
+    Some(format!(
+        "Recorded head (wasmkeep-owner 2): {head}, set at generation {}, {phase}; a hint, \
+         not proof of what this listing holds.",
+        r.set_at
+    ))
+}
+
+#[cfg(test)]
+mod recorded_tests {
+    use super::recorded_line;
+    use wasmkeep_cluster::recorded_head::{Completeness, Position, RecordedHead};
+
+    #[test]
+    fn a_version_2_record_names_its_head() {
+        assert_eq!(recorded_line(None), None);
+        let line = recorded_line(Some(&RecordedHead {
+            head: Position::Known {
+                generation: 4,
+                txid: 9,
+                checksum: 0xab,
+            },
+            set_at: 5,
+            completeness: Completeness::Complete,
+            idle_since_ms: None,
+        }))
+        .unwrap();
+        assert!(
+            line.contains("txid 9")
+                && line.contains("set at generation 5")
+                && line.contains("complete"),
+            "{line}"
+        );
+        assert!(
+            recorded_line(Some(&RecordedHead::UNKNOWN))
+                .unwrap()
+                .contains("unknown")
+        );
     }
 }

@@ -1268,6 +1268,7 @@ impl Copier<'_> {
             attempts: 1,
             bytes: std::fs::metadata(output)?.len(),
             verification,
+            owner_recorded: None,
         }))
     }
 
