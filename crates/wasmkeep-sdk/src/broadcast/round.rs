@@ -61,18 +61,33 @@ impl Round {
                         .fold(p.n, |n, e| n.min(e.base))
                 });
                 let mut push = Push {
+                    recover: false,
                     e: epoch.e,
-                    base: epoch.base,
-                    first: head.saturating_add(1),
+                    base: child.position.map_or(epoch.base, |p| {
+                        epochs
+                            .iter()
+                            .filter(|e| e.e > p.e)
+                            .fold(epoch.base, |b, e| b.min(e.base))
+                    }),
+                    first: head.saturating_add(1).min(9007199254740991),
                     head,
                     messages: vec![],
                 };
                 if let Some(n) = n {
                     for m in rows.iter().filter(|m| m.position.n > n) {
+                        let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
+                            push.recover = true;
+                            push.messages.clear();
+                            break;
+                        };
                         if push.messages.is_empty() {
                             push.first = m.position.n;
                         }
                         push.messages.push(Item {
+                            epoch: Some(Epoch {
+                                e: m.position.e,
+                                base: boundary.base,
+                            }),
                             at: m.at,
                             id: m.id.clone(),
                             body: m.body.clone(),
@@ -83,7 +98,9 @@ impl Round {
                         }
                     }
                 }
-                ("push", push.encode())
+                let body = push.encode();
+                Push::decode(&body)?; // Reject numbers JSON cannot represent exactly.
+                ("push", body)
             };
             indices.push(index);
             requests.push((
@@ -104,16 +121,9 @@ impl Round {
                     child.initialized = true;
                     return Some(true);
                 }
-                let j = crate::json::parse_unique(std::str::from_utf8(&r.body).ok()?)?;
-                let p = Position {
-                    e: super::edge::number(&j, "e").ok()?,
-                    n: super::edge::number(&j, "n").ok()?,
-                };
-                if p.e > epoch.e || p.n > head {
-                    return None;
-                }
+                let (p, more) = acknowledgment(&r.body, epoch.e, head)?;
                 child.position = Some(p);
-                Some(p.e != epoch.e || p.n < head || super::edge::number(&j, "lagging").ok()? > 0)
+                Some(more)
             });
             if let Some(more) = ok {
                 child.failures = 0;
@@ -135,5 +145,32 @@ impl Round {
             crate::alarms::set_alarm(at);
         }
         Ok(())
+    }
+}
+
+fn acknowledgment(body: &[u8], epoch: u64, head: u64) -> Option<(Position, bool)> {
+    let j = crate::json::parse_unique(std::str::from_utf8(body).ok()?)?;
+    let p = Position {
+        e: super::edge::number(&j, "e").ok()?,
+        n: super::edge::number(&j, "n").ok()?,
+    };
+    if p.e > epoch || (p.e == epoch && p.n > head) {
+        return None;
+    }
+    let lagging = super::edge::number(&j, "lagging").ok()?;
+    Some((p, p.e != epoch || p.n < head || lagging > 0))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn old_epoch_ack_above_recovered_head_is_not_a_failed_child() {
+        assert_eq!(
+            acknowledgment(br#"{"e":1,"n":5,"lagging":0}"#, 2, 3),
+            Some((Position { e: 1, n: 5 }, true))
+        );
+        assert!(acknowledgment(br#"{"e":2,"n":5,"lagging":0}"#, 2, 3).is_none());
+        assert!(acknowledgment(br#"{"e":3,"n":0,"lagging":0}"#, 2, 3).is_none());
+        assert!(acknowledgment(br#"{"e":2,"n":3,"lagging":-1}"#, 2, 3).is_none());
     }
 }

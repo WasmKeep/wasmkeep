@@ -4,6 +4,8 @@ use crate::json::{self, Json};
 use std::collections::{BTreeMap, VecDeque};
 #[derive(Debug, Clone)]
 pub struct Item {
+    /// Original R2 identity for retained messages in a newer round.
+    pub epoch: Option<super::Epoch>,
     pub at: u64,
     pub id: Option<String>,
     pub body: String,
@@ -16,12 +18,17 @@ impl Item {
             s.push_str(",\"i\":");
             json::write_str(&mut s, id);
         }
+        if let Some(e) = self.epoch {
+            s.push_str(&format!(",\"e\":{},\"b\":{}", e.e, e.base));
+        }
         s.push('}');
         s
     }
 }
 #[derive(Debug, Clone)]
 pub struct Push {
+    /// The history still has rows whose epoch boundaries have expired.
+    pub recover: bool,
     pub e: u64,
     pub base: u64,
     pub first: u64,
@@ -31,7 +38,7 @@ pub struct Push {
 impl Push {
     pub fn encode(&self) -> String {
         format!(
-            "{{\"e\":{},\"b\":{},\"first\":{},\"head\":{},\"messages\":[{}]}}",
+            "{{\"e\":{},\"b\":{},\"first\":{},\"head\":{},\"messages\":[{}],\"recover\":{}}}",
             self.e,
             self.base,
             self.first,
@@ -40,7 +47,8 @@ impl Push {
                 .iter()
                 .map(Item::json)
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            self.recover
         )
     }
     pub fn decode(s: &str) -> Result<Self, String> {
@@ -52,6 +60,11 @@ impl Push {
             return Err("invalid push size".into());
         }
         let p = Self {
+            recover: match j.get("recover") {
+                None => false,
+                Some(Json::Bool(b)) => *b,
+                _ => return Err("invalid recovery flag".into()),
+            },
             e: number(&j, "e")?,
             base: number(&j, "b")?,
             first: number(&j, "first")?,
@@ -60,6 +73,14 @@ impl Push {
                 .iter()
                 .map(|m| {
                     Ok(Item {
+                        epoch: match (m.get("e"), m.get("b")) {
+                            (None, None) => None,
+                            (Some(_), Some(_)) => Some(super::Epoch {
+                                e: number(m, "e")?,
+                                base: number(m, "b")?,
+                            }),
+                            _ => return Err("invalid item epoch".into()),
+                        },
                         at: number(m, "a")?,
                         body: string(m, "d")?.into(),
                         id: match m.get("i") {
@@ -77,6 +98,15 @@ impl Push {
                 && p.first.saturating_add(p.messages.len() as u64 - 1) > p.head)
         {
             return Err("invalid push position".into());
+        }
+        for (i, m) in p.messages.iter().enumerate() {
+            if m.body.len() > 65536
+                || m.id.as_ref().is_some_and(|s| s.len() > 64)
+                || m.epoch
+                    .is_some_and(|e| e.e > p.e || e.base >= p.first + i as u64)
+            {
+                return Err("invalid push item".into());
+            }
         }
         Ok(p)
     }
@@ -141,6 +171,8 @@ pub struct Edge {
     size: usize,
     cursors: BTreeMap<u64, Cursor>,
     slow: u64,
+    opens: u64,
+    refusals: [u64; 3],
 }
 #[derive(Debug)]
 pub struct Ack {
@@ -148,18 +180,29 @@ pub struct Ack {
     pub sockets: usize,
     pub lagging: usize,
     pub slow: u64,
+    pub opens: u64,
+    pub refusals: [u64; 3],
 }
 impl Ack {
     pub fn encode(&self) -> String {
         format!(
-            "{{\"e\":{},\"n\":{},\"sockets\":{},\"lagging\":{},\"slow\":{}}}",
-            self.position.e, self.position.n, self.sockets, self.lagging, self.slow
+            "{{\"e\":{},\"n\":{},\"sockets\":{},\"lagging\":{},\"slow\":{},\"opens\":{},\"refusals\":{{\"unknown\":{},\"moved\":{},\"full\":{}}}}}",
+            self.position.e,
+            self.position.n,
+            self.sockets,
+            self.lagging,
+            self.slow,
+            self.opens,
+            self.refusals[0],
+            self.refusals[1],
+            self.refusals[2]
         )
     }
 }
 impl Edge {
     pub fn open(&mut self, id: u64, position: Option<Position>, io: &mut impl SocketIo) -> bool {
         if self.cursors.len() >= 500 {
+            self.refuse(2);
             return false;
         }
         let resume = self
@@ -171,6 +214,7 @@ impl Edge {
         } else {
             self.head.map_or(0, |p| p.n)
         };
+        self.opens += 1;
         self.cursors.insert(id, Cursor { n, lagging: false });
         let ready = if self.head.is_none() || (position.is_some() && !resume) {
             "null".into()
@@ -186,6 +230,9 @@ impl Edge {
         );
         self.deliver(id, io);
         true
+    }
+    pub(super) fn refuse(&mut self, reason: usize) {
+        self.refusals[reason] += 1;
     }
     pub fn forget(&mut self, id: u64) {
         self.cursors.remove(&id);
@@ -236,6 +283,12 @@ impl Edge {
                 c.n = c.n.min(p.base);
             }
         }
+        if p.recover {
+            self.buffer.clear();
+            self.size = 0;
+            self.floor = p.head;
+            h.n = p.head;
+        }
         if !p.messages.is_empty() && p.first > h.n.saturating_add(1) {
             self.buffer.clear();
             self.size = 0;
@@ -247,12 +300,20 @@ impl Edge {
             if n <= h.n {
                 continue;
             }
-            let json = item.json();
+            let epoch = item.epoch.unwrap_or(super::Epoch {
+                e: p.e,
+                base: p.base,
+            });
+            let json = Item {
+                epoch: None,
+                ..item.clone()
+            }
+            .json();
             self.size += json.len();
             self.buffer.push_back(Buffered {
                 n,
-                e: p.e,
-                base: p.base,
+                e: epoch.e,
+                base: epoch.base,
                 json,
             });
             h.n = n;
@@ -339,6 +400,8 @@ impl Edge {
             sockets: self.cursors.len(),
             lagging: self.cursors.values().filter(|c| c.lagging).count(),
             slow: std::mem::take(&mut self.slow),
+            opens: std::mem::take(&mut self.opens),
+            refusals: std::mem::take(&mut self.refusals),
         }
     }
 }

@@ -4,6 +4,16 @@ thread_local! { static EDGE: std::cell::RefCell<Edge> = std::cell::RefCell::new(
 /// Internal edge class for one fixed full-range edge. No outbound calls.
 #[derive(Debug)]
 pub struct EdgeActor;
+fn decimal(s: &str) -> Result<u64, String> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid position".into());
+    }
+    let n: u64 = s.parse().map_err(|_| "invalid position")?;
+    if n > 9007199254740991 {
+        return Err("invalid position".into());
+    }
+    Ok(n)
+}
 fn owner() -> Result<Option<String>, String> {
     let rows = storage::query("SELECT config FROM wasmkeep_edge WHERE id=1", &[])
         .map_err(|e| e.to_string())?;
@@ -20,6 +30,7 @@ impl Actor for EdgeActor {
     }
     fn on_websocket_open(id: u64, path: String) -> Result<(), String> {
         if owner()?.is_none() {
+            EDGE.with_borrow_mut(|e| e.refuse(0));
             storage::delete_self();
             return Err("unknown".into());
         }
@@ -28,13 +39,14 @@ impl Actor for EdgeActor {
             || u64::from_str_radix(point, 16).is_err()
             || wire::query_param(&path, "c").is_none()
         {
+            EDGE.with_borrow_mut(|e| e.refuse(1));
             return Err("moved".into());
         }
         let p = match (wire::query_param(&path, "e"), wire::query_param(&path, "n")) {
             (None, None) => None,
             (Some(e), Some(n)) => Some(Position {
-                e: e.parse().map_err(|_| "invalid epoch")?,
-                n: n.parse().map_err(|_| "invalid number")?,
+                e: decimal(e)?,
+                n: decimal(n)?,
             }),
             _ => return Err("invalid position".into()),
         };
@@ -46,7 +58,11 @@ impl Actor for EdgeActor {
                     .filter(|other| *other != id)
                     .collect::<Vec<_>>(),
             );
-            if ids.len() > 500 || !edge.open(id, p, &mut HostSockets) {
+            if ids.len() > 500 {
+                edge.refuse(2);
+                return Err("full".into());
+            }
+            if !edge.open(id, p, &mut HostSockets) {
                 Err("full".into())
             } else {
                 Ok(())
@@ -105,8 +121,15 @@ impl http::Guest for EdgeActor {
             }
             let push = Push::decode(body)?;
             Ok(EDGE.with_borrow_mut(|e| {
-                let ack = e.push(&push, &mut HostSockets);
+                if e.head.is_none() {
+                    e.head = Some(Position {
+                        e: push.e,
+                        n: push.head,
+                    });
+                    e.floor = push.head;
+                }
                 e.adopt(&crate::websockets::connections());
+                let ack = e.push(&push, &mut HostSockets);
                 ack.encode()
             }))
         })();

@@ -1,8 +1,8 @@
 # 0040. Directory, broadcast groups and the reconnecting room
 
-- Status: proposed (2026-11-17). A design, not an available capability:
-  until it is accepted and built there is no directory or broadcast-group
-  API in any SDK.
+- Status: partially implemented (2026-11-17). R1–R3 provide the directory,
+  room core, fixed edges and browser client. R4–R8 remain planned; dynamic
+  scaling, relays and the large-room example are not available yet.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -558,3 +558,45 @@ Each slice lands in Rust and TypeScript with its tests.
   client misses a number, void numbers are only those announced, and
   the results file states delivery latency and reconnect time. It also
   decides section 12's host call.
+
+### R3 implementation notes
+
+R3 supplies Rust `EdgeActor` and `Round`, TypeScript `defineEdge()` and
+`define({ edges })`, and the browser-only `room-client` entry. Fixed edge
+addresses are application configuration, recreated at each wake; each edge
+currently owns the full range. Range changes, join/poke and scaling remain
+R4. Neither edge implementation makes outbound calls or persists delivery
+state. The edge cap is 500.
+
+The internal JSON push has a current epoch header and optional `e`/`b` on
+its message items. Rounds include those fields to preserve R2's original
+message identities when retained history spans epochs. The edge removes
+these item fields from browser frames and emits a separate frame at each
+epoch boundary. The push header's rollback base is the lowest retained
+base since the child's acknowledged epoch; each message frame carries its
+own epoch's base. An old acknowledgement above the current head is valid
+following loss; only a current-epoch acknowledgement above the head is
+invalid. If a retained row's epoch boundary has expired from the 64-epoch
+window, the internal push uses `recover: true` with no messages: the edge
+drops its buffer, advances to the room head and sends `behind` to lagging
+cursors. HTTP history then supplies the authoritative `reset`; the round
+never invents an epoch base.
+
+R2's binary protocol retains its integer range. The JSON browser protocol
+accepts nonnegative safe integers (at most 2^53 - 1); rounds reject values
+outside that range rather than round them. A TypeScript front can return
+`JSON.stringify(broadcast.historyJSON(history))`, importing `broadcast`
+from `@wasmkeep/sdk/front`, after authorizing and calling R2 history.
+The helper converts bigint positions, timestamps and epoch boundaries and
+rejects unrepresentable numbers. JSON escaping can expand the R2 binary
+history response; a single text that cannot fit the 64 KiB live frame goes
+through `behind` and HTTP history instead.
+
+R3 verification includes shared Rust/TypeScript push vectors, epoch and
+cursor tests, handler validation, browser transport with an injected clock,
+HTTP retry/cancellation, and a three-client real-node test. The latter uses
+paced traffic and a bounded ping sequence to fill both byte and frame
+permits: byte backpressure alone can leave room for `behind`. It verifies
+4802, reconnect, paged HTTP catch-up (including window reset), and resumed
+live delivery. The host close-slot fix is provided by main (#180); R3
+changes no WIT or server implementation.

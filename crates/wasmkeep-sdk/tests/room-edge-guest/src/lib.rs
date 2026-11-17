@@ -84,6 +84,36 @@ impl http::Guest for TestRoom {
                 let r = storage::flush().map_err(|e| e.to_string());
                 r.map(|_| "ok".into())
             }
+            _ if path.starts_with("/r3-history?") => {
+                let raw = path.strip_prefix("/r3-history?after=").unwrap();
+                let (e, n) = raw.split_once('.').unwrap();
+                client
+                    .history(
+                        Some(Position {
+                            e: e.parse().unwrap(),
+                            n: n.parse().unwrap(),
+                        }),
+                        100,
+                        None,
+                    )
+                    .map(|h| {
+                        format!(
+                            "{{\"e\":{},\"head\":{},\"reset\":{},\"more\":{},\"numbers\":[{}]}}",
+                            h.head.e,
+                            h.head.n,
+                            h.reset.is_some(),
+                            h.more,
+                            h.messages
+                                .iter()
+                                .map(|m| {
+                                    assert_eq!(m.body, "x".repeat(32700));
+                                    m.position.n.to_string()
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+            }
             _ if path.starts_with("/reconnect?") => {
                 let raw = path.strip_prefix("/reconnect?after=").unwrap();
                 let (e, n) = raw.split_once('.').unwrap();

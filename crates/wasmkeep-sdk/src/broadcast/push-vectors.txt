@@ -1,0 +1,11 @@
+# Shared Rust/TypeScript internal push parsing: accept flag followed by JSON.
+1 {"e":1,"b":0,"first":1,"head":0,"messages":[]}
+1 {"e":2,"b":1,"first":1,"head":2,"messages":[{"a":0,"d":"old","e":1,"b":0},{"a":1,"i":"id","d":"new","e":2,"b":1}]}
+0 {"e":9007199254740992,"b":0,"first":1,"head":0,"messages":[]}
+0 {"e":1,"b":0,"first":0,"head":0,"messages":[]}
+0 {"e":1,"b":2,"first":1,"head":1,"messages":[]}
+0 {"e":1,"b":0,"first":1,"head":0,"messages":[{"a":0,"d":"x"}]}
+0 {"e":1,"b":0,"first":1,"head":1,"messages":[{"a":0,"d":42}]}
+0 {"e":1,"b":0,"first":1,"head":1,"messages":[{"a":0,"d":"x","e":2,"b":0}]}
+0 {"e":1,"b":0,"first":1,"head":1,"messages":[{"a":0,"d":"x","e":1}]}
+0 {"e":1,"b":0,"first":1,"head":1,"messages":[{"a":0,"d":"x","e":1,"b":1}]}

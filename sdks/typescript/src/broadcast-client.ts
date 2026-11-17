@@ -76,3 +76,5 @@ export class Client {
         return { head, lost, reset, more, messages };
     }
 }
+
+export { historyJSON } from "./room-history";

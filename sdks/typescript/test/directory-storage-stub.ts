@@ -45,3 +45,4 @@ export function query(sql: string, params: Value[]): Rows {
 }
 export function deleteSelfDurable(): void { deleted = true; db.exec("DELETE FROM wasmkeep_directory_entries; DELETE FROM wasmkeep_directory_map"); }
 export function flush(): void {}
+export function deleteSelf(): void { deleted = true; }
