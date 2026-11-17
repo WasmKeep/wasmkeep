@@ -284,9 +284,10 @@ impl LocalHeads {
     /// names another holder (not this node's process `node`/`instance`) at
     /// a strictly higher generation than the entry's, or names nobody at a
     /// strictly higher generation that this process never tried. A record
-    /// at the same or a lower generation, an absent one and (by the
-    /// caller never calling this) an unreadable one or a failed read prove
-    /// nothing. A record naming this process at a higher generation is its
+    /// at the same or a lower generation and (by the caller never calling
+    /// this) an unreadable one or a failed read prove nothing. An absent
+    /// record drops the entry: only a delete or a whole-app replacement
+    /// removes a record, and either removes the history it names. A record naming this process at a higher generation is its
     /// own unresolved acquisition: it inherited the entry, and keeps it.
     pub fn prepare(
         &mut self,
@@ -296,6 +297,13 @@ impl LocalHeads {
         node: &str,
         instance: &str,
     ) -> Option<Requirement> {
+        // An absent record (review S2): the app was deleted and recreated,
+        // or replaced by a whole-app restore, which removes every record;
+        // the history the entry names is gone.
+        if record.is_none() {
+            self.by_key.remove(key);
+            return None;
+        }
         if let (Some(entry), Some(record)) = (self.by_key.get(key), record)
             && record.generation > entry.generation
         {
@@ -454,10 +462,20 @@ mod tests {
         // Released already, at the same generation: still carried.
         let carried = heads.prepare("owners/x", Some(&record(None, 5)), 6, "a", "i1");
         assert_eq!(carried.map(|r| r.head), Some(at(5, 12)));
-        // Absent record: no proof of anything.
-        assert!(heads.prepare("owners/x", None, 6, "a", "i1").is_some());
         // Transferred to the hold of generation 6: the entry is its.
         heads.transferred("owners/x", 6);
+        assert!(heads.is_empty());
+    }
+
+    /// Review S2: an absent record (the app deleted and recreated, or
+    /// replaced by a whole-app restore, which removes every record) drops
+    /// the entry: its history is gone, and a floor kept from it would
+    /// refuse the actor forever.
+    #[test]
+    fn an_absent_record_drops_local_evidence() {
+        let mut heads = LocalHeads::default();
+        heads.register(&hold(5, Some(at(5, 12)), None));
+        assert!(heads.prepare("owners/x", None, 1, "a", "i1").is_none());
         assert!(heads.is_empty());
     }
 
