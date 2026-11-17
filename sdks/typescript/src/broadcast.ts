@@ -129,3 +129,4 @@ export function define(options: {
 }
 export { defineEdge } from "./broadcast-edge";
 export type { ScaleOptions } from "./broadcast-scaling";
+export { defineRelay } from './broadcast-relay';

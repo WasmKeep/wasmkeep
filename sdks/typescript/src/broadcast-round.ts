@@ -1,4 +1,5 @@
-import { Suspect } from "./room-scale";
+import { packRelay } from "./room-relay";
+import { Suspect, type Relay } from "./room-scale";
 import * as calls from "wasmkeep:actor/calls@0.2.0";
 import * as actors from "wasmkeep:actor/actors@0.2.0";
 import * as alarms from "wasmkeep:actor/alarms@0.2.0";
@@ -19,6 +20,8 @@ interface Child {
 }
 export class Round {
     private children: Child[];
+    private relays: Relay[] = [];
+    private suspects = new Map<string, Suspect>();
     constructor(addresses: string[]) {
         if (addresses.length > 16)
             throw Error("at most 16 fixed edges");
@@ -26,7 +29,11 @@ export class Round {
     }
     sync(children: {
         name: string;
-    }[]) {
+    }[], relays: Relay[] = []) {
+        this.relays = relays;
+        for (const name of this.suspects.keys())
+            if (!relays.some(r => r.name === name))
+                this.suspects.delete(name);
         this.children = this.children.filter(c => children.some(n => n.name === c.address));
         for (const c of children)
             if (!this.children.some(n => n.address === c.name))
@@ -39,7 +46,7 @@ export class Round {
         if (!core.beforePush(BigInt(now)))
             return;
         const epoch = core.wake(), rows = core.messages(), epochs = core.epochs(), head = rows.at(-1)?.position.n ?? epoch.base;
-        const due = this.children.filter(c => c.suspect.due <= now), enc = new TextEncoder();
+        const due = this.children.filter(c => c.suspect.due <= now && !this.relays.some(r => r.edges.includes(c.address) && (this.suspects.get(r.name)?.due ?? 0) > now)), enc = new TextEncoder();
         const requests: [
             string,
             actors.Request
@@ -77,8 +84,36 @@ export class Round {
             return [c.address, { method: "POST", path: `/wasmkeep-edge/v1/${op}`, headers: [], body: enc.encode(body) }];
         });
         let next = Infinity;
-        const results = calls.callMany(requests);
+        const skipped = new Set<number>();
+        let results: ReturnType<typeof calls.callMany>;
+        if (!this.relays.length)
+            results = calls.callMany(requests);
+        else {
+            results = requests.map(() => ({ tag: 'err', val: { tag: 'timeout' } }));
+            const groups = this.relays.map(r => ({ relay: r, indices: due.map((c, i) => r.edges.includes(c.address) ? i : -1).filter(i => i >= 0) })).filter(g => g.indices.length);
+            const replies = calls.callMany(groups.map(g => [g.relay.name, { method: 'POST', path: '/wasmkeep-relay/v1/push', headers: [], body: enc.encode(JSON.stringify(packRelay(g.indices.map(i => ({ edge: due[i].address, push: JSON.parse(new TextDecoder().decode(requests[i][1].body)) }))))) }]));
+            groups.forEach((g, i) => {
+                const suspect = this.suspects.get(g.relay.name) ?? new Suspect();
+                this.suspects.set(g.relay.name, suspect);
+                try {
+                    const reply = replies[i];
+                    if (reply.tag !== 'ok' || reply.val.status !== 200)
+                        throw Error('relay failed');
+                    const answers = JSON.parse(new TextDecoder().decode(reply.val.body));
+                    if (!Array.isArray(answers) || answers.length !== g.indices.length)
+                        throw Error('invalid relay reply');
+                    suspect.success();
+                    g.indices.forEach((index, j) => { results[index] = { tag: 'ok', val: { status: answers[j] === null ? 503 : 200, headers: [], body: enc.encode(JSON.stringify(answers[j])) } }; });
+                }
+                catch {
+                    suspect.fail(now);
+                    g.indices.forEach(index => skipped.add(index));
+                }
+            });
+        }
         due.forEach((c, i) => {
+            if (skipped.has(i))
+                return; // Relay failure belongs to the relay, not its edges.
             try {
                 const r = results[i];
                 if (r.tag !== "ok" || r.val.status !== 200)
@@ -103,6 +138,9 @@ export class Round {
                 c.suspect.fail(now);
             }
         });
+        for (const s of this.suspects.values())
+            if (s.due > now)
+                next = Math.min(next, s.due);
         for (const c of this.children)
             if (c.suspect.due > now)
                 next = Math.min(next, c.suspect.due);

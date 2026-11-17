@@ -4,6 +4,8 @@ use super::*;
 #[derive(Debug, Default)]
 pub struct Round {
     children: Vec<Child>,
+    relays: Vec<Relay>,
+    relay_suspects: std::collections::BTreeMap<String, Suspect>,
 }
 #[derive(Debug)]
 struct Child {
@@ -40,6 +42,12 @@ impl Round {
             }
         }
     }
+    pub fn sync_relays(&mut self, children: &[ScaleChild], relays: &[Relay]) {
+        self.sync(children);
+        self.relays = relays.to_vec();
+        self.relay_suspects
+            .retain(|name, _| relays.iter().any(|r| &r.name == name));
+    }
     pub fn count(&self, name: &str) -> Option<u64> {
         self.children
             .iter()
@@ -52,6 +60,8 @@ impl Round {
             return Err("at most 16 fixed edges".into());
         }
         Ok(Self {
+            relays: vec![],
+            relay_suspects: Default::default(),
             children: addresses
                 .iter()
                 .map(|address| Child {
@@ -78,7 +88,15 @@ impl Round {
         let mut indices = vec![];
         let mut requests = vec![];
         for (index, child) in self.children.iter().enumerate() {
-            if child.suspect.due > now {
+            if child.suspect.due > now
+                || self.relays.iter().any(|r| {
+                    r.edges.contains(&child.address)
+                        && self
+                            .relay_suspects
+                            .get(&r.name)
+                            .is_some_and(|s| s.due > now)
+                })
+            {
                 continue;
             }
             let (path, body) = if !child.initialized {
@@ -150,9 +168,70 @@ impl Round {
             ));
         }
         let mut next = None;
-        for (index, result) in indices.into_iter().zip(crate::calls::call_many(&requests)) {
+        let mut skip = std::collections::BTreeSet::new();
+        let results = if self.relays.is_empty() {
+            crate::calls::call_many(&requests)
+                .into_iter()
+                .map(Result::ok)
+                .collect::<Vec<_>>()
+        } else {
+            let groups: Vec<_> = self
+                .relays
+                .iter()
+                .map(|r| {
+                    (
+                        r,
+                        requests
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (n, _))| r.edges.contains(n))
+                            .map(|(i, _)| i)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .filter(|(_, g)| !g.is_empty())
+                .collect();
+            let mut relay_requests = vec![];
+            for (r, g) in &groups {
+                let entries = g.iter().map(|i| requests[*i].clone()).collect::<Vec<_>>();
+                relay_requests.push((
+                    r.name.clone(),
+                    crate::actors::Request {
+                        method: "POST".into(),
+                        path: "/wasmkeep-relay/v1/push".into(),
+                        headers: vec![],
+                        body: super::relay::pack(&entries)?.into_bytes(),
+                    },
+                ));
+            }
+            let mut results = vec![None; requests.len()];
+            for ((r, g), reply) in groups
+                .into_iter()
+                .zip(crate::calls::call_many(&relay_requests))
+            {
+                let suspect = self.relay_suspects.entry(r.name.clone()).or_default();
+                if let Some(answers) = reply
+                    .ok()
+                    .filter(|r| r.status == 200)
+                    .and_then(|r| super::relay::answers(&r.body, g.len()))
+                {
+                    *suspect = Suspect::default();
+                    for (i, a) in g.into_iter().zip(answers) {
+                        results[i] = a;
+                    }
+                } else {
+                    suspect.fail(now);
+                    skip.extend(g);
+                }
+            }
+            results
+        };
+        for (slot, (index, result)) in indices.into_iter().zip(results).enumerate() {
+            if skip.contains(&slot) {
+                continue;
+            }
             let child = &mut self.children[index];
-            let ok = result.ok().filter(|r| r.status == 200).and_then(|r| {
+            let ok = result.filter(|r| r.status == 200).and_then(|r| {
                 if !child.initialized {
                     child.initialized = true;
                     return Some(true);
@@ -175,6 +254,11 @@ impl Round {
         for c in &self.children {
             if c.suspect.due > now {
                 next = Some(next.map_or(c.suspect.due, |n: u64| n.min(c.suspect.due)));
+            }
+        }
+        for s in self.relay_suspects.values() {
+            if s.due > now {
+                next = Some(next.map_or(s.due, |n| n.min(s.due)));
             }
         }
         if let Some(at) = next {

@@ -17,6 +17,7 @@ fn decimal(s: &str) -> Result<u64, String> {
 #[derive(Debug)]
 struct Config {
     room: String,
+    relay_prefix: Option<String>,
     lo: u64,
     hi: Option<u64>,
     drain: bool,
@@ -64,6 +65,10 @@ fn config(body: &str) -> Result<Config, String> {
         None
     };
     Ok(Config {
+        relay_prefix: j
+            .get("relayPrefix")
+            .map(|_| super::edge::string(&j, "relayPrefix").map(String::from))
+            .transpose()?,
         room: super::edge::string(&j, "room")?.into(),
         lo,
         hi,
@@ -209,7 +214,14 @@ impl http::Guest for EdgeActor {
                     crate::websockets::connections().len()
                 ));
             }
-            if old.as_ref().map(|c| c.room.as_str()) != Some(caller.as_str()) {
+            if !old.as_ref().is_some_and(|c| {
+                c.room == caller
+                    || c.relay_prefix.as_ref().is_some_and(|p| {
+                        caller
+                            .strip_prefix(p)
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    })
+            }) {
                 return Err("forbidden".into());
             }
             if path != "/wasmkeep-edge/v1/push" {

@@ -11,6 +11,8 @@ export interface ScaleOptions {
     directory: string;
     edgeClass: string;
     capacity?: number;
+    relayClass?: string;
+    hysteresisMs?: number;
 }
 export class ScaleHost {
     private scaling: Scaling;
@@ -19,7 +21,7 @@ export class ScaleHost {
     constructor(private options: ScaleOptions) {
         const a = actors.selfAddress();
         this.room = `${a.tenant}/${a.class}/${a.name}`;
-        this.scaling = new Scaling(this, `${options.edgeClass}/${a.name}`, options.capacity ?? 500);
+        this.scaling = new Scaling(this, `${options.edgeClass}/${a.name}`, options.capacity ?? 500, `${options.relayClass ?? "relay"}/${a.name}`, options.hysteresisMs ?? 60000);
     }
     init() {
         storage.exec('CREATE TABLE IF NOT EXISTS wasmkeep_room_scale(id INTEGER PRIMARY KEY CHECK(id=1),data TEXT NOT NULL)', []);
@@ -49,6 +51,12 @@ export class ScaleHost {
         }
     }
     execute(c: Command) {
+        if (c.kind === 'relay-init' || c.kind === 'relay-end') {
+            const r = actors.call(c.name, { method: 'POST', path: `/wasmkeep-relay/v1/${c.kind === 'relay-init' ? 'init' : 'end'}`, headers: [], body: new Uint8Array() });
+            if (r.status !== 200)
+                throw Error(`scale ${c.kind} answered ${r.status}`);
+            return;
+        }
         const dir = new Directory(this.options.directory);
         if (c.kind === 'create') {
             dir.create(c.child.name);
@@ -63,7 +71,7 @@ export class ScaleHost {
             throw Error('invalid scale command');
         const child = c.child;
         const hex = (n: bigint) => n.toString(16).padStart(16, '0');
-        const body = c.kind === 'end' ? (c.force ? 'force' : '') : JSON.stringify({ room: this.room, lo: hex(child.lo), hi: child.hi === undefined ? undefined : hex(child.hi), state: c.kind === 'drain' ? 'draining' : 'active', cap: this.options.capacity ?? 500, ...this.head });
+        const body = c.kind === 'end' ? (c.force ? 'force' : '') : JSON.stringify({ room: this.room, relayPrefix: `${this.room.split("/")[0]}/${this.options.relayClass ?? "relay"}/${this.room.split("/").slice(2).join("/")}.r`, lo: hex(child.lo), hi: child.hi === undefined ? undefined : hex(child.hi), state: c.kind === 'drain' ? 'draining' : 'active', cap: this.options.capacity ?? 500, ...this.head });
         const r = actors.call(child.name, { method: 'POST', path: `/wasmkeep-edge/v1/${c.kind}`, headers: [], body: new TextEncoder().encode(body) });
         if (r.status !== 200)
             throw Error(`scale ${c.kind} answered ${r.status}`);
@@ -87,7 +95,7 @@ export class ScaleHost {
             this.finish(state, now);
             operations++;
         }
-        round.sync(state.children);
+        round.sync(state.children, state.relays);
         round.run(core, now);
         for (const c of state.children)
             c.sockets = round.count(c.name);
@@ -95,7 +103,7 @@ export class ScaleHost {
             this.finish(state, now);
             operations++;
         }
-        while (operations < 4 && decide(state.children, this.options.capacity ?? 500, now, state.split, state.merge)) {
+        while (operations < 4 && decide(state.children, this.options.capacity ?? 500, now, state.split, state.merge, this.options.hysteresisMs ?? 60000)) {
             this.finish(state, now);
             operations++;
         }

@@ -1,4 +1,4 @@
-//! Durable direct-edge scaling. All external effects are replayable.
+//! Durable edge and relay scaling. All external effects are replayable.
 use super::*;
 use crate::directory::{Change, Keep};
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +16,7 @@ pub enum ScaleKind {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScaleOp {
+    pub relays: Vec<Relay>,
     pub id: String,
     pub kind: ScaleKind,
     pub step: u64,
@@ -26,6 +27,8 @@ pub struct ScaleOp {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScaleState {
+    pub relays: Vec<Relay>,
+    pub refused: u64,
     pub children: Vec<ScaleChild>,
     pub next: u64,
     pub version: u64,
@@ -35,6 +38,8 @@ pub struct ScaleState {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScaleCommand {
+    RelayInit(String),
+    RelayEnd(String),
     Init(ScaleChild),
     Range(ScaleChild),
     Drain(ScaleChild),
@@ -47,6 +52,12 @@ pub trait ScaleIo {
     fn save(&mut self, state: &ScaleState) -> Result<(), String>;
     fn execute(&mut self, command: ScaleCommand) -> Result<(), String>;
 }
+/// One layer only; assignments survive wakes and operation replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relay {
+    pub name: String,
+    pub edges: Vec<String>,
+}
 pub fn scale_decision(
     c: &[ScaleChild],
     cap: u64,
@@ -54,7 +65,17 @@ pub fn scale_decision(
     split: Option<u64>,
     merge: Option<u64>,
 ) -> Option<(ScaleKind, usize, usize)> {
-    if merge.is_none_or(|t| now.saturating_sub(t) >= 60000) && c.len() < 16 {
+    decision(c, cap, now, split, merge, 60000)
+}
+fn decision(
+    c: &[ScaleChild],
+    cap: u64,
+    now: u64,
+    split: Option<u64>,
+    merge: Option<u64>,
+    hysteresis: u64,
+) -> Option<(ScaleKind, usize, usize)> {
+    if merge.is_none_or(|t| now.saturating_sub(t) >= hysteresis) {
         for (i, a) in c.iter().enumerate() {
             if a.sockets.is_some_and(|n| n * 100 >= cap * 80)
                 && a.hi.map_or(1u128 << 64, u128::from) - u128::from(a.lo) > 1
@@ -63,7 +84,7 @@ pub fn scale_decision(
             }
         }
     }
-    if split.is_some_and(|t| now.saturating_sub(t) < 60000) {
+    if split.is_some_and(|t| now.saturating_sub(t) < hysteresis) {
         return None;
     }
     for (i, a) in c.iter().enumerate() {
@@ -88,17 +109,31 @@ pub struct Scaling<B: ScaleIo = ScaleHost> {
     pub io: B,
     prefix: String,
     capacity: u64,
+    hysteresis: u64,
+    relay_prefix: String,
 }
 impl<B: ScaleIo> Scaling<B> {
     pub fn new(io: B, prefix: impl Into<String>, capacity: u64) -> Result<Self, String> {
         if capacity == 0 || capacity > 500 {
             return Err("invalid edge capacity".into());
         }
+        let prefix = prefix.into();
+        let relay_prefix = format!(
+            "relay/{}",
+            prefix.split_once('/').map_or(prefix.as_str(), |(_, n)| n)
+        );
         Ok(Self {
             io,
-            prefix: prefix.into(),
+            prefix,
             capacity,
+            hysteresis: 60000,
+            relay_prefix,
         })
+    }
+    /// Override the one-minute default for deterministic, paced tests.
+    pub fn with_hysteresis(mut self, millis: u64) -> Self {
+        self.hysteresis = millis;
+        self
     }
     pub fn state(&self) -> Result<ScaleState, String> {
         self.io.load()
@@ -107,7 +142,19 @@ impl<B: ScaleIo> Scaling<B> {
         if s.op.is_some() {
             return Ok(true);
         }
-        let d = scale_decision(&s.children, self.capacity, now, s.split, s.merge);
+        let d = decision(
+            &s.children,
+            self.capacity,
+            now,
+            s.split,
+            s.merge,
+            self.hysteresis,
+        );
+        if d.is_some_and(|d| d.0 == ScaleKind::Split) && s.children.len() >= 256 {
+            s.refused = s.refused.saturating_add(1);
+            self.io.save(s)?;
+            return Err("room edge ceiling: 256".into());
+        }
         if !s.children.is_empty() && d.is_none() {
             return Ok(false);
         }
@@ -146,7 +193,58 @@ impl<B: ScaleIo> Scaling<B> {
             None => a.clone(),
         };
         b.sockets = None;
+        let names: Vec<String> = match d {
+            Some((ScaleKind::Split, _, _)) => s
+                .children
+                .iter()
+                .map(|c| c.name.clone())
+                .chain(std::iter::once(b.name.clone()))
+                .collect(),
+            Some((ScaleKind::Merge, _, _)) => s
+                .children
+                .iter()
+                .filter(|c| c.name != a.name)
+                .map(|c| c.name.clone())
+                .collect(),
+            _ => vec![a.name.clone()],
+        };
+        let mut relays = s.relays.clone();
+        if names.len() <= 12 {
+            relays.clear();
+        } else if names.len() > 16 || !relays.is_empty() {
+            for r in &mut relays {
+                r.edges.retain(|n| names.contains(n));
+            }
+            relays.retain(|r| !r.edges.is_empty());
+            for name in names {
+                if relays.iter().any(|r| r.edges.contains(&name)) {
+                    continue;
+                }
+                let index = relays
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.edges.len() < 16)
+                    .min_by_key(|(_, r)| r.edges.len())
+                    .map(|(i, _)| i);
+                let index = if let Some(i) = index {
+                    i
+                } else {
+                    let name = format!("{}.r{}", self.relay_prefix, s.next);
+                    s.next = s
+                        .next
+                        .checked_add(1)
+                        .ok_or("scale child counter exhausted")?;
+                    relays.push(Relay {
+                        name,
+                        edges: vec![],
+                    });
+                    relays.len() - 1
+                };
+                relays[index].edges.push(name);
+            }
+        }
         s.op = Some(ScaleOp {
+            relays,
             id,
             kind: d.map_or(ScaleKind::Boot, |d| d.0),
             step: 0,
@@ -171,7 +269,19 @@ impl<B: ScaleIo> Scaling<B> {
                 s.op = None;
             }
             (ScaleKind::Split, 0) => {
+                for r in &o.relays {
+                    if !s.relays.iter().any(|old| old.name == r.name) {
+                        self.io.execute(ScaleCommand::RelayInit(r.name.clone()))?;
+                    }
+                }
+                // Upgrade existing R4 edge authorization before activating relays.
+                if s.relays.is_empty() && !o.relays.is_empty() {
+                    for c in &s.children {
+                        self.io.execute(ScaleCommand::Range(c.clone()))?;
+                    }
+                }
                 self.io.execute(ScaleCommand::Init(o.b.clone()))?;
+                s.relays = o.relays.clone();
                 if !s.children.iter().any(|c| c.name == o.b.name) {
                     s.children.push(o.b.clone());
                 }
@@ -233,6 +343,12 @@ impl<B: ScaleIo> Scaling<B> {
                     o.a.clone(),
                     now.saturating_sub(o.started) >= 30000,
                 ))?;
+                for r in &s.relays {
+                    if !o.relays.iter().any(|next| next.name == r.name) {
+                        self.io.execute(ScaleCommand::RelayEnd(r.name.clone()))?;
+                    }
+                }
+                s.relays = o.relays.clone();
                 s.children.retain(|c| c.name != o.a.name);
                 s.merge = Some(now);
                 s.op = None;
@@ -252,6 +368,113 @@ impl<B: ScaleIo> Scaling<B> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn r5_relay_checkpoints_and_ceiling() {
+        for grow in [true, false] {
+            for cut in 0..if grow { 3 } else { 4 } {
+                let count = if grow { 16 } else { 13 };
+                let children: Vec<_> = (0..count)
+                    .map(|i| ScaleChild {
+                        name: format!("edge/{i}"),
+                        lo: i << 59,
+                        hi: if i == count - 1 {
+                            None
+                        } else {
+                            Some((i + 1) << 59)
+                        },
+                        sockets: Some(if grow { 8 } else { 1 }),
+                    })
+                    .collect();
+                let relays = if grow {
+                    vec![]
+                } else {
+                    vec![Relay {
+                        name: "relay/r.r90".into(),
+                        edges: children.iter().map(|c| c.name.clone()).collect(),
+                    }]
+                };
+                let saved = ScaleState {
+                    children,
+                    relays,
+                    next: 100,
+                    version: 1,
+                    ..Default::default()
+                };
+                let mut scale = Scaling::new(
+                    Fake {
+                        saved,
+                        ..Default::default()
+                    },
+                    "edge/r",
+                    10,
+                )
+                .unwrap();
+                let mut s = scale.io.saved.clone();
+                scale.begin(&mut s, 60000).unwrap();
+                for _ in 0..cut {
+                    scale.step(&mut s, 60000).unwrap();
+                }
+                scale.io.fail = true;
+                assert!(scale.step(&mut s, 60000).is_err());
+                let mut scale = Scaling::new(scale.io, "edge/r", 10).unwrap();
+                let mut s = scale.state().unwrap();
+                while s.op.is_some() {
+                    scale.step(&mut s, 60000).unwrap();
+                }
+                assert_eq!(s.children.len(), if grow { 17 } else { 12 });
+                assert_eq!(s.relays.len(), if grow { 2 } else { 0 });
+                assert!(s.relays.iter().all(|r| r.edges.len() <= 16));
+                assert_eq!(
+                    s.relays.iter().map(|r| r.edges.len()).sum::<usize>(),
+                    if grow { 17 } else { 0 }
+                );
+                let effects = &scale.io.effects;
+                assert!(effects.iter().any(|c| if grow {
+                    matches!(c, ScaleCommand::RelayInit(_))
+                } else {
+                    matches!(c, ScaleCommand::RelayEnd(_))
+                }));
+            }
+        }
+        let mut s = ScaleState {
+            children: (0..256)
+                .map(|i| ScaleChild {
+                    name: format!("edge/{i}"),
+                    lo: i << 56,
+                    hi: if i == 255 { None } else { Some((i + 1) << 56) },
+                    sockets: Some(8),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut scale = Scaling::new(Fake::default(), "edge/r", 10).unwrap();
+        assert_eq!(
+            scale.begin(&mut s, 60000),
+            Err("room edge ceiling: 256".into())
+        );
+        assert_eq!(s.refused, 1);
+        assert!(scale.io.effects.is_empty());
+        assert!(s.op.is_none());
+        assert_eq!(
+            decision(&s.children[..1], 10, 10, None, Some(0), 10),
+            Some((ScaleKind::Split, 0, 0))
+        );
+    }
+    #[test]
+    fn r5_grows_past_sixteen_direct_edges() {
+        let c: Vec<_> = (0..16)
+            .map(|i| ScaleChild {
+                name: format!("edge/{i}"),
+                lo: i << 60,
+                hi: if i == 15 { None } else { Some((i + 1) << 60) },
+                sockets: Some(8),
+            })
+            .collect();
+        assert_eq!(
+            scale_decision(&c, 10, 60000, None, None),
+            Some((ScaleKind::Split, 0, 0))
+        );
+    }
     #[test]
     fn r4_hysteresis_and_pair_thresholds() {
         let mut c = vec![
@@ -435,6 +658,8 @@ fn encode_state(s: &ScaleState) -> Vec<u8> {
     for c in &s.children {
         put_child(&mut w, c);
     }
+    put_relays(&mut w, &s.relays);
+    w.u64(s.refused);
     w.finish()
 }
 fn decode_state(b: &[u8]) -> Result<ScaleState, String> {
@@ -448,14 +673,18 @@ fn decode_state(b: &[u8]) -> Result<ScaleState, String> {
     let merge = num(&mut r)?;
     let merge = (has != 0).then_some(merge);
     let n = num(&mut r)?;
-    if n > 16 {
+    if n > 256 {
         return Err("invalid scale children".into());
     }
     let mut children = vec![];
     for _ in 0..n {
         children.push(get_child(&mut r)?);
     }
+    let relays = get_relays(&mut r)?;
+    let refused = r.u64().unwrap_or(0);
     Ok(ScaleState {
+        relays,
+        refused,
         children,
         next,
         version,
@@ -477,6 +706,7 @@ fn encode_op(o: &ScaleOp) -> Vec<u8> {
         .u64(o.started);
     put_child(&mut w, &o.a);
     put_child(&mut w, &o.b);
+    put_relays(&mut w, &o.relays);
     w.finish()
 }
 fn decode_op(b: &[u8]) -> Result<ScaleOp, String> {
@@ -496,7 +726,37 @@ fn decode_op(b: &[u8]) -> Result<ScaleOp, String> {
         started: num(&mut r)?,
         a: get_child(&mut r)?,
         b: get_child(&mut r)?,
+        relays: get_relays(&mut r)?,
     })
+}
+fn put_relays(w: &mut Writer, rs: &[Relay]) {
+    w.u64(rs.len() as u64);
+    for r in rs {
+        w.bytes(r.name.as_bytes()).u64(r.edges.len() as u64);
+        for n in &r.edges {
+            w.bytes(n.as_bytes());
+        }
+    }
+}
+fn get_relays(r: &mut Reader<'_>) -> Result<Vec<Relay>, String> {
+    let n = r.u64().unwrap_or(0);
+    if n > 16 {
+        return Err("invalid relay count".into());
+    }
+    let mut rs = vec![];
+    for _ in 0..n {
+        let name = txt(r)?;
+        let count = num(r)?;
+        if count > 16 {
+            return Err("invalid relay fanout".into());
+        }
+        let mut edges = vec![];
+        for _ in 0..count {
+            edges.push(txt(r)?);
+        }
+        rs.push(Relay { name, edges });
+    }
+    Ok(rs)
 }
 impl ScaleHost {
     pub fn init(&self) -> Result<(), String> {
@@ -507,6 +767,12 @@ impl ScaleHost {
     fn config(&self, c: &ScaleChild, drain: bool) -> String {
         let mut b = "{\"room\":".to_owned();
         crate::json::write_str(&mut b, &self.room);
+        b.push_str(",\"relayPrefix\":");
+        let mut parts = self.room.splitn(3, '/');
+        let tenant = parts.next().unwrap_or_default();
+        let _ = parts.next();
+        let name = parts.next().unwrap_or_default();
+        crate::json::write_str(&mut b, &format!("{tenant}/relay/{name}.r"));
         b.push_str(&format!(
             ",\"lo\":\"{:016x}\",\"state\":\"{}\",\"cap\":{},\"e\":{},\"n\":{}",
             c.lo,
@@ -569,7 +835,29 @@ impl ScaleIo for ScaleHost {
         result.map_err(|e| e.to_string())
     }
     fn execute(&mut self, c: ScaleCommand) -> Result<(), String> {
+        if let ScaleCommand::RelayInit(name) | ScaleCommand::RelayEnd(name) = &c {
+            let op = if matches!(&c, ScaleCommand::RelayInit(_)) {
+                "init"
+            } else {
+                "end"
+            };
+            let reply = crate::wire::call(
+                name,
+                "POST",
+                format!("/wasmkeep-relay/v1/{op}"),
+                vec![],
+                vec![],
+            )?;
+            return if reply.status == 200 {
+                Ok(())
+            } else {
+                Err(format!("relay {op} answered {}", reply.status))
+            };
+        }
         let (op, child, drain, force) = match c {
+            ScaleCommand::RelayInit(name) | ScaleCommand::RelayEnd(name) => {
+                return Err(format!("invalid relay command: {name}"));
+            }
             ScaleCommand::Create(c) => {
                 crate::directory::Client::new(&self.directory)
                     .create(&c.name, &[])
@@ -625,7 +913,7 @@ impl Scaling<ScaleHost> {
             self.finish(&mut s, now)?;
             operations += 1;
         }
-        round.sync(&s.children);
+        round.sync_relays(&s.children, &s.relays);
         round.run(core, now)?;
         for c in &mut s.children {
             c.sockets = round.count(&c.name);
@@ -635,7 +923,15 @@ impl Scaling<ScaleHost> {
             operations += 1;
         }
         while operations < 4
-            && scale_decision(&s.children, self.capacity, now, s.split, s.merge).is_some()
+            && decision(
+                &s.children,
+                self.capacity,
+                now,
+                s.split,
+                s.merge,
+                self.hysteresis,
+            )
+            .is_some()
         {
             self.finish(&mut s, now)?;
             operations += 1;

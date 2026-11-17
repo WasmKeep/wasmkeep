@@ -5,6 +5,7 @@ import { Edge, type Push } from "./room-edge";
 import type { ActorDefinition } from "./index";
 interface Config {
     room: string;
+    relayPrefix?: string;
     lo: string;
     hi?: string;
     state: "active" | "draining";
@@ -67,7 +68,7 @@ export function defineEdge(): ActorDefinition {
             }
             if (req.path !== "/wasmkeep-edge/v1/push")
                 return { status: 404 };
-            if (config?.room !== caller)
+            if (config?.room !== caller && !(config?.relayPrefix && caller.startsWith(config.relayPrefix) && /^[0-9]+$/.test(caller.slice(config.relayPrefix.length))))
                 return { status: 403 };
             let p: Push;
             try {

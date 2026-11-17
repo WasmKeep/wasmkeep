@@ -1,8 +1,8 @@
 # 0040. Directory, broadcast groups and the reconnecting room
 
-- Status: partially implemented (2026-11-17). R1–R4 provide the directory,
-  room core, edges, browser client and direct-edge scaling. R5–R8 remain
-  planned; relays and the large-room example are not available yet.
+- Status: partially implemented (2026-11-17). R1–R5 provide the directory,
+  room core, edges, browser client, scaling and one relay layer. R6–R8
+  remain planned; the large-room example is not available yet.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -71,12 +71,10 @@ clients ──upgrade──▶ front ──call-many──▶ directory (lookup)
 ### 1. Calls go one way
 
 Room to directory, room to relays, relays to edges, room to edges. The
-front calls the directory and the room. **An edge and a relay call
-nobody; the directory calls nobody.** Everything an edge has to tell the
+front calls the directory and the room. **An edge and the directory call nobody; a relay calls only its edges.** Everything an edge has to tell the
 room travels in its answer to a push. Everything a client has to ask the
 room (a publish, a gap) goes over HTTP through the front. This rule is
-what keeps a batch from meeting itself (Context); the SDK's edge and
-relay code has no call to make, and the docs tell an app not to add one.
+what keeps a batch from meeting itself (Context); the SDK's edge has no call to make and its relay calls only downward, and the docs tell an app not to add one.
 
 Consequence: in this version a client does not publish on its socket.
 It sends an HTTP request to the front, which calls the room.
@@ -638,3 +636,30 @@ repeated steps, suspect backoff, and 4801/resume behavior. The real-node
 fixture uses four clients and capacity five, directory-based hand-offs,
 HTTP recovery during a split, the real one-minute hysteresis interval,
 and a drain that reconnects a remaining client after merging.
+
+
+### R5 implementation notes
+
+Rust exports `RelayActor`; TypeScript exports `broadcast.defineRelay()`.
+Deploy that class internally as `relay` (TypeScript also accepts
+`scaling.relayClass`). The durable scale operation includes the next relay
+assignments. At the 17th edge it initializes relays and refreshes existing
+R4 edge configurations before activating the layer. Each edge accepts pushes
+from the room and that room's relay name prefix; only the room can change
+its range or end it. At 12 edges the operation ends the relays and returns
+to direct pushes. Empty relays are ended even above that threshold.
+
+A relay request shares one bounded history slice among up to 16 edge
+headers. Children with later positions receive their portion; remaining
+history follows in subsequent rounds. A relay failure backs off the relay
+without marking every edge failed; a returned edge failure backs off only
+that edge. Neither makes an upward call. The room retries the original
+assignments after backoff, as section 9 specifies.
+
+The 256-edge ceiling returns `room edge ceiling: 256` and durably increments
+`ScaleState.refused`, without allocating a child or starting an operation.
+The default split/merge hysteresis remains 60,000 ms. Tests can override it
+with Rust `Scaling::with_hysteresis(ms)` or TypeScript
+`scaling.hysteresisMs`. The real-node fixture uses one second, 34 paced
+clients and capacity two, proves contiguous delivery with HTTP gap recovery
+across splits, then removes clients until relays retire at 12 edges.

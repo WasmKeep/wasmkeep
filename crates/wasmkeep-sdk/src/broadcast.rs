@@ -1,4 +1,4 @@
-//! Reconnecting room (ADR 0040 R2–R4). Deploy the room internally; fronts
+//! Reconnecting room (ADR 0040 R2–R5). Deploy the room internally; fronts
 //! use [`Client`] for publishes and gap fetches. No edge-to-room calls.
 //! Keep one [`Core`] per component instance, never per request. The first
 //! operation after a cold start seals an epoch durably, including a history
@@ -62,6 +62,11 @@ pub use round::Round;
 mod scaling;
 #[cfg(feature = "actor")]
 pub use scaling::{
-    ScaleChild, ScaleCommand, ScaleHost, ScaleIo, ScaleKind, ScaleOp, ScaleState, Scaling,
+    Relay, ScaleChild, ScaleCommand, ScaleHost, ScaleIo, ScaleKind, ScaleOp, ScaleState, Scaling,
     scale_decision,
 };
+
+#[cfg(feature = "actor")]
+mod relay;
+#[cfg(feature = "actor")]
+pub use relay::RelayActor;

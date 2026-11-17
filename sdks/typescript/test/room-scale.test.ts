@@ -142,10 +142,58 @@ test('a blocked scale operation never prevents rounds to either side of its map 
     const core = new Core(db, alarms);
     core.init();
     let pushes = 0;
-    install((address, r) => { if (address.startsWith('directory/'))
-        throw Error('directory unavailable'); assert(r.path.endsWith('/push')); pushes++; return { status: 200, headers: [], body: new TextEncoder().encode('{"e":1,"n":0,"sockets":0,"lagging":0}') }; });
+    install((address, r) => {
+        if (address.startsWith('directory/'))
+            throw Error('directory unavailable');
+        assert(r.path.endsWith('/push'));
+        pushes++;
+        return { status: 200, headers: [], body: new TextEncoder().encode('{"e":1,"n":0,"sockets":0,"lagging":0}') };
+    });
     assert.throws(() => host.run(new Round([]), core, 10), /unavailable/);
     assert.equal(pushes, 2);
     assert.equal(host.load()!.op!.step, 1);
     db.close();
+});
+test('R5 grows past sixteen direct edges', () => {
+    const edges = Array.from({ length: 16 }, (_, i) => child(BigInt(i) * (1n << 60n), i === 15 ? undefined : BigInt(i + 1) * (1n << 60n), 8));
+    assert.equal(decide(edges, 10, 60000)?.kind, 'split');
+});
+test('R5 topology creation/retirement survives every lost durable checkpoint; 256 refuses', () => {
+    for (const mode of ['grow', 'shrink'] as const)
+        for (let cut = 0; cut < (mode === 'grow' ? 3 : 4); cut++) {
+            const children = Array.from({ length: mode === 'grow' ? 16 : 13 }, (_, i) => child(BigInt(i) * (1n << 59n), i === (mode === 'grow' ? 15 : 12) ? undefined : BigInt(i + 1) * (1n << 59n), mode === 'grow' ? 8 : 1));
+            let saved: ScaleState = { children, next: 100, version: 1n, relays: mode === 'grow' ? [] : [{ name: 'relay/r.r90', edges: children.map(c => c.name) }] };
+            const active = new Set((saved.relays ?? []).map(r => r.name));
+            let fail = false;
+            const io = { load: () => structuredClone(saved), save: (s: ScaleState) => { if (fail) {
+                    fail = false;
+                    throw Error('crash');
+                } saved = structuredClone(s); }, execute: (c: Command) => { if (c.kind === 'relay-init')
+                    active.add(c.name); if (c.kind === 'relay-end')
+                    active.delete(c.name); } };
+            let scale = new Scaling(io, 'edge/r', 10, 'relay/r');
+            let s = scale.state();
+            scale.begin(s, 60000);
+            for (let i = 0; i < cut; i++)
+                scale.step(s, 60000);
+            fail = true;
+            assert.throws(() => scale.step(s, 60000), /crash/);
+            scale = new Scaling(io, 'edge/r', 10, 'relay/r');
+            s = scale.state();
+            while (s.op)
+                scale.step(s, 60000);
+            assert.equal(s.children.length, mode === 'grow' ? 17 : 12);
+            assert.equal(s.relays?.length, mode === 'grow' ? 2 : 0);
+            assert.deepEqual([...active].sort(), (s.relays ?? []).map(r => r.name).sort());
+            assert((s.relays ?? []).every(r => r.edges.length <= 16));
+            if (mode === 'grow')
+                assert.equal(new Set(s.relays!.flatMap(r => r.edges)).size, 17);
+        }
+    const children = Array.from({ length: 256 }, (_, i) => child(BigInt(i) * (1n << 56n), i === 255 ? undefined : BigInt(i + 1) * (1n << 56n), 8));
+    const s: ScaleState = { children, next: 300, version: 1n };
+    const scale = new Scaling({ load: () => s, save: () => { }, execute: () => assert(false, 'no effect at ceiling') }, 'edge/r', 10);
+    assert.throws(() => scale.begin(s, 60000), /ceiling: 256/);
+    assert.equal(s.refused, 1);
+    assert.equal(s.op, undefined);
+    assert.equal(decide(children.slice(0, 1), 10, 10, undefined, 0, 10)?.kind, 'split');
 });
