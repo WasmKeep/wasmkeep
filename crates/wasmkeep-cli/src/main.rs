@@ -13,6 +13,7 @@ mod dev_project;
 mod diagnose;
 mod migrate_cmd;
 mod new_cmd;
+mod node_file;
 mod project;
 mod secrets_cmd;
 mod status;
@@ -557,6 +558,19 @@ struct ServeArgs {
     /// --actor.
     #[arg(long, value_parser = parse_app, requires = "bucket", conflicts_with = "actors")]
     app: Option<(String, String)>,
+
+    /// Serve the apps a node file lists (`wasmkeep-node.toml`, ADR 0038):
+    /// the listeners, the node id and every per-app setting come from the
+    /// file, so their flags are refused beside it. Relative paths in it are
+    /// read from its directory. Needs --bucket; one `[[app]]` for now.
+    #[arg(long, value_name = "FILE", requires = "bucket", conflicts_with_all = [
+        "app", "actors", "component", "node_id", "advertise", "listen", "cluster_listen",
+        "cluster_advertise", "metrics_listen", "max_sockets_per_node", "max_sockets_per_app",
+        "data_dir", "secrets_keys", "no_secrets", "env", "front_env", "access",
+        "allow_outbound", "allow_outbound_port", "outbound_ca", "max_front_requests",
+        "front_cpu_budget_ms",
+    ])]
+    node_file: Option<PathBuf>,
 
     /// URL the other nodes reach this one at, e.g. http://10.0.0.11:8080.
     #[arg(long, requires = "node_id")]
@@ -1360,8 +1374,20 @@ fn dev(args: DevArgs) -> anyhow::Result<()> {
     }
 }
 
-fn serve(args: ServeArgs) -> anyhow::Result<()> {
+fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
     huge_pages(args.transparent_huge_pages);
+    // A node file (ADR 0038) says what its flags would: read and checked
+    // before anything else, then served as those flags are. `--app` is a
+    // one-entry file with the same meaning, never written to disk.
+    let node_file = match args.node_file.take() {
+        Some(path) => {
+            let file = node_file::read(&path)?;
+            file.apply_to(&mut args)?;
+            tracing::info!(file = %path.display(), "node file read");
+            Some(file)
+        }
+        None => node_file::NodeFile::from_serve(&args),
+    };
     // With --app the front comes from the deploy only (ADR 0023), whatever
     // is deployed: refused before anything is read or compiled.
     if let (Some((tenant, name)), Some(path)) = (&args.app, &args.component) {
@@ -1420,6 +1446,10 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Every resident actor holds three open files: size the caps to the
     // descriptors this process may open (raising the soft limit first).
     let wanted_resident = wasmkeep_server::fds::resident_limit(pool, front_requests);
+    if let Some(file) = &node_file {
+        file.check_resident_floors(wanted_resident)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     let requested_sockets = args.max_sockets_per_node.unwrap_or(50_000);
     let requested = wasmkeep_server::fds::Budget {
         public_connections: args.max_connections,
