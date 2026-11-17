@@ -116,9 +116,19 @@ impl Actor for TestActor {
     }
 
     /// Accepts every WebSocket and echoes text.
-    fn on_websocket_open(_conn: u64, path: String) -> Result<(), String> {
+    fn on_websocket_open(conn: u64, path: String) -> Result<(), String> {
         if path.contains("refuse") {
             return Err("go away".into());
+        }
+        if path == "/slow-close" {
+            // The writer starts after this hook: fill all 256 frame permits
+            // deterministically, without relying on OS TCP buffer sizes.
+            let msg = wasmkeep_sdk::Message::Text("data".into());
+            for _ in 0..256 {
+                wasmkeep_sdk::websockets::send(conn, &msg).unwrap();
+            }
+            assert!(wasmkeep_sdk::websockets::send(conn, &msg).is_err());
+            wasmkeep_sdk::websockets::close(conn, 4802, "slow");
         }
         let _ = storage::exec("INSERT INTO opened (path) VALUES (?1)", &params![path]);
         Ok(())
