@@ -12,7 +12,7 @@ version: use the image of the version your nodes run. The examples below
 set it once:
 
 ```bash
-v=0.4.2   # the version your nodes run, 0.4.2 or later
+v=0.5.0   # the version your nodes run, 0.4.2 or later
 ```
 
 ## What is in it
@@ -103,7 +103,7 @@ in single quotes, keeps the double quotes as they are):
 ```toml
 [classes.counter]
 component = "counter/target/wasm32-wasip2/release/counter.wasm"
-build = 'podman run --rm -v "$PWD:/src" -w /src/counter ghcr.io/wasmkeep/toolchain:0.4.2 cargo build --release --target wasm32-wasip2'
+build = 'podman run --rm -v "$PWD:/src" -w /src/counter ghcr.io/wasmkeep/toolchain:0.5.0 cargo build --release --target wasm32-wasip2'
 watch = ["counter/src", "counter/Cargo.toml"]
 ```
 

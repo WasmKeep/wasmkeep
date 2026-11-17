@@ -1016,20 +1016,22 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 ```text
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS
-a     yes   979ms  serving  12      3        840     310        0.4.0    acme/shop  http://a:8080  https://a:7443   pinned
-b     yes   2.2s   serving  4       0        95      288        0.4.0    acme/shop  http://b:8080  -                plain
-c     no    14m    -        -       -        -       -          0.4.0    acme/shop  http://c:8080  https://c:7443   pinned
+NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS     WORDS
+a     yes   979ms  serving  12      3        840     310        0.5.0    acme/shop  http://a:8080  https://a:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
+b     yes   2.2s   serving  4       0        95      288        0.5.0    acme/shop  http://b:8080  -                plain   take front handoff ends flush rate_limits restore actor-restore recorded-head
+c     no    14m    -        -       -        -       -          0.5.0    acme/shop  http://c:8080  https://c:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
 
-APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT
-acme/shop  9cf4de9152d8dd29  1    16      yes
+APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT  FORMAT
+acme/shop  9cf4de9152d8dd29  1    16      yes    3
 
-2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.4.0
+2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.5.0
 warning: mixed plain and TLS nodes: b still plain while a use the cluster listener; give every node a cluster listener, then drop --cluster-plaintext accept (ADR 0011)
 ```
 
 - **Nodes** come from their heartbeats (`nodes/<id>`): the WasmKeep version
-  each runs, the app it serves, its advertised and cluster addresses, and
+  each runs, the capability words it announces (`WORDS`, `words` in
+  `--json`: `flush`, `rate_limits`, `restore`, `actor-restore`,
+  `recorded-head` and the older ones), the app it serves, its advertised and cluster addresses, and
   whether it publishes a TLS pin. **State** is whether it takes actors:
   `serving`, or, while it is drained ([ADR 0014](adr/0014-draining-a-node-and-moving-an-actor.md)),
   `draining`, `drained` (no actors or WebSockets left) or `stuck` (actors
@@ -1445,7 +1447,7 @@ the 0.4.0 layout change: `cluster migrate --rollback` works only until
 the first node starts after the migration, and never after
 `--remove-old --apply` ([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
 a git checkout report the release they follow and their commit
-(`0.4.2+4f1c2a9e7b3d`), a release's tag the release alone, so the version
+(`0.5.0+4f1c2a9e7b3d`), a release's tag the release alone, so the version
 column tells two builds of `main` apart. A build without git (a source
 tarball, a container image built locally) reports the release alone:
 step 3 is what proves no old node is left.
@@ -1497,7 +1499,7 @@ Rolling upgrades of WasmKeep across mixed versions are planned
 
 ### Rolling upgrades and new storage functions
 
-From the release after 0.4.2, every node announces the heartbeat word
+From 0.5.0, every node announces the heartbeat word
 `flush`: it has `storage.flush`
 ([ADR 0034](adr/0034-batched-plain-writes.md)), which a node of 0.4.2
 or before cannot link. Before it writes anything, `wasmkeep deploy`

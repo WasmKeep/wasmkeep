@@ -1,6 +1,6 @@
 # 0037. Socket session admission
 
-- Status: proposed
+- Status: accepted, as built (0.5.0)
 - Date: 2026-11-16
 
 ## Context

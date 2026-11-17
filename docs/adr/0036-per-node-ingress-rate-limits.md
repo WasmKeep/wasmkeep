@@ -1,6 +1,6 @@
 # 0036. Per-node ingress rate limits
 
-- Status: proposed
+- Status: accepted, as built (0.5.0)
 - Date: 2026-11-16
 - Release: 0.5.0
 

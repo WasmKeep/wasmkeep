@@ -41,16 +41,16 @@ different target, and does not make a language usable here.
 ### Getting an SDK
 
 Each SDK has the version of the server it is released with
-([versions](#versions)); here for `0.4.2`.
+([versions](#versions)); here for `0.5.0`.
 
 | Language | Get it | Build an actor |
 | --- | --- | --- |
 | Rust | `cargo add wasmkeep-sdk` (crates.io) | `cargo build --release --target wasm32-wasip2` ([tutorial](tutorials/first-actor.md)) |
 | TypeScript / JavaScript | `npm install @wasmkeep/sdk` (npm) | `npx wasmkeep-ts build src/index.ts -o actor.wasm` ([README](../sdks/typescript/README.md)) |
 | Python | `pip install wasmkeep` (PyPI) | `python -m wasmkeep build app -o actor.wasm` ([README](../sdks/python/README.md)) |
-| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.4.2` (a module of this repository) | `tinygo build -target=wasip2`, with the WIT the module ships ([README](../sdks/go/README.md#install)) |
-| C / C++ | `wasmkeep-c-sdk-0.4.2.tar.gz`, a file of the [release](https://github.com/WasmKeep/wasmkeep/releases) | The build command in the archive's README ([C SDK](../sdks/c/README.md)) |
-| Zig | `wasmkeep-zig-sdk-0.4.2.tar.gz`, a file of the release | The build command in the archive's README ([Zig SDK](../sdks/zig/README.md)) |
+| Go (TinyGo) | `go get github.com/wasmkeep/wasmkeep/sdks/go@v0.5.0` (a module of this repository) | `tinygo build -target=wasip2`, with the WIT the module ships ([README](../sdks/go/README.md#install)) |
+| C / C++ | `wasmkeep-c-sdk-0.5.0.tar.gz`, a file of the [release](https://github.com/WasmKeep/wasmkeep/releases) | The build command in the archive's README ([C SDK](../sdks/c/README.md)) |
+| Zig | `wasmkeep-zig-sdk-0.5.0.tar.gz`, a file of the release | The build command in the archive's README ([Zig SDK](../sdks/zig/README.md)) |
 | D, MoonBit, C#, standard Go | The repository's source at the release's tag | Each example's `build.sh` |
 
 **Fronts** (an app's stateless `wasi:http` component, the
@@ -243,7 +243,7 @@ needs only TinyGo): an `Actor` of optional hooks, `Exec`, `Query` and
 provides them inert (no directories).
 
 An app adds the module with `go get
-github.com/wasmkeep/wasmkeep/sdks/go@v0.4.2`: the module carries the
+github.com/wasmkeep/wasmkeep/sdks/go@v0.5.0`: the module carries the
 server's version number. The `wasmkeep` package starts at `v0.2.0`
 (`v0.1.0` has only the clients); see the SDK's
 [Install](../sdks/go/README.md#install).
@@ -397,6 +397,7 @@ tested.
 
 | SDK | Server | WIT package |
 | --- | --- | --- |
+| 0.5.0 | 0.5.0 | `wasmkeep:actor@0.2.0` |
 | 0.4.2 | 0.4.2 | `wasmkeep:actor@0.2.0` |
 | 0.4.1 | 0.4.1 | `wasmkeep:actor@0.2.0` |
 | 0.4.0 | 0.4.0 | `wasmkeep:actor@0.2.0` |
@@ -414,7 +415,7 @@ interface between a component and the host
 what it already has changes. An addition keeps it: `0.4.0` added the
 worlds `front` and `front-core` and the interface `calls` under
 `wasmkeep:actor@0.2.0`, `0.4.2` the function
-`storage.delete-self-durable`, and the next release the function
+`storage.delete-self-durable`, and `0.5.0` the function
 `storage.flush`; a component built before links as it did
 ([ADR 0023](adr/0023-the-front.md),
 [ADR 0025](adr/0025-calling-several-actors-at-once.md),
@@ -423,10 +424,10 @@ worlds `front` and `front-core` and the interface `calls` under
 addition needs a host that has it: TypeScript and Python components
 import the whole `storage` interface, so those built with the `0.4.2`
 SDK need a `0.4.2` node even when they never call the new function, and
-those built with the next SDK a node of that release. Rust, Go, C and Zig
+those built with the `0.5.0` SDK a `0.5.0` node. Rust, Go, C and Zig
 components import only what they call.
 
-From the next release on, `wasmkeep deploy` checks this before it
+From `0.5.0` on, `wasmkeep deploy` checks this before it
 writes anything: it reads each component of the version, and refuses one
 that imports `storage.flush` while a live node of the app does not
 announce the capability word `flush`, or one that imports

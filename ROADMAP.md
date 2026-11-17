@@ -6,99 +6,53 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0`, `0.4.1` and `0.4.2`, are pre-releases for trying it,
+`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2` and `0.5.0`, are pre-releases for trying it,
 side projects and staging.
 
 ## Now
 
-`0.5.0`: **several apps, with recoverable state.** Finish the write
-path, give operators access to their data, then put trusted apps on
-the same nodes. Dates are not promised; this is the build order.
-Sizes are relative: S is a small change, M several related changes,
-and L several implementation and verification slices.
+`0.5.1`: **small gaps left by 0.5.0.** Activation deadlines, lossless
+headers, and stable IDs with resumable status.
 
-1. **Batched plain writes** (L), opt-in per class
-   ([ADR 0034](docs/adr/0034-batched-plain-writes.md)).
-   S0, the strict golden trace, S1, snapshot and reset guards, and
-   S2, `Held` and `Barrier`, are merged. Then come
-   the mailbox's pre-drop hook, deploy checks and manifest format 5,
-   the `flush` capability and strict `storage.flush`, the simulation
-   model, WAL boundaries, the uploader and wiring, alarms,
-   snapshots and deletes, clean stop, and strict-versus-batched
-   soaks. Strict stays the default. A plain response is not a
-   durable acknowledgement; explicit durable operations still wait
-   for the bucket while the hold is valid.
-2. **Data access** (L)
-   ([ADR 0033](docs/adr/0033-data-access-export-and-online-backup.md), proposed):
-   export an actor as SQLite, query it read-only, back up while the
-   cluster runs, then restore one actor to a retained point in time.
-   Tools report the position they read, verify the history and
-   distinguish a complete backup from an interrupted one. Whole-app
-   point-in-time restore comes later.
-3. **A big-room baseline and socket limits** (M): measure one room
-   before changing its topology. Make the current caps of 1,000
-   sockets per actor and 50,000 per node configurable, and count
-   sockets in the file-descriptor budget alongside internal
-   connections and files.
-4. **Several apps per process** (L): one supervisor owns the node's
+## Next
+
+`0.6.0`: **several apps, files, analytics and larger rooms.** Put
+trusted apps on the same nodes, then build on that multi-app runtime, in
+this order.
+
+1. **Several apps per process** (L): one supervisor owns the node's
    three ports and routes by app, with an operator-managed hostname
    table. Add per-app limits, accounting and suspension. This is for
    one owner's apps and trusted tenants, not hostile-tenant isolation
    ([security](docs/security.md)). The website moves onto the fleet
-   after this is demonstrated.
-5. **Rate limits** (M): declarative per-node limits in
-   `wasmkeep.toml`, with visible refusals and a worked rate-limiter
-   pattern. Flood and DDoS protection stay at the CDN.
-6. **A shorter path from code to a running app** (M): typed
-   TypeScript actor clients, structured errors, one framework
-   quickstart, and task-shaped inspection and recovery guides.
-   Write "What saved means" and "Designing for hot actors" alongside
-   the implementation.
-
-Correctness fixes are part of this work, especially
-bucket consistency checks, incomplete request bodies, execution
-deadlines and host-memory bounds. Each affected change carries a
-focused regression test.
-
-Before release: publish strict and batched soak results, latency and
-bucket-request measurements, a verified backup and single-actor
-restore, and the big-room baseline. Demonstrate app separation,
-three-port routing and bounded overload.
-
-CI stays small on each merge. The full suite runs nightly and before
-a release; real-bucket soaks and benchmarks qualify the release
-candidate. Release notes state whether upgrading rolls one node at a
-time or requires a coordinated restart.
-
-## Next
-
-`0.6.0`: **files, analytics and larger rooms.** Build on the same
-multi-app runtime, in this order.
-
-1. **Files and static assets** (L)
+   after this is demonstrated, as the first deploy of its kind.
+2. **A framework quickstart** (M): one framework example with
+   reconnect and recovery, and task-shaped inspection and recovery
+   guides. Moved from 0.5.0.
+3. **Files and static assets** (L)
    ([ADR 0030](docs/adr/0030-files-and-static-assets.md)): app-scoped
    files, direct browser uploads and downloads, and static assets
    shipped with `wasmkeep deploy`. Paths without a file pass to the
    front, a single-page app's `index.html`, or a 404 page. Routing
    and redirects stay in front code. File deletion, backup and
    restoration are part of the feature.
-2. **A change feed** (L): resumable changes to actors' databases,
+4. **A change feed** (L): resumable changes to actors' databases,
    ordered within each actor, with explicit schema, retention,
    deletion and restore behavior. Start with Parquet output and a
    DuckDB guide. PostgreSQL is the next sink, or the first if a
    concrete user needs it; all sinks are not a release requirement.
-3. **One directory for the scaling patterns** (L): start with
+5. **One directory for the scaling patterns** (L): start with
    broadcast groups and fan-out trees whose layers grow and shrink
    within configured limits. Measure them against the big-room
    baseline, including slow clients, reconnects and failed nodes.
    Aggregation trees and sharding with resharding will reuse this
    directory, rather than each inventing another one.
-4. **Rebalancing, first at wake-up** (M): place an actor on a node
+6. **Rebalancing, first at wake-up** (M): place an actor on a node
    with room, accounting for app limits and sockets. Nodes that join
    or return fill as actors sleep and wake. Running actors stay
    where they are unless an operator moves them or drains a node
    ([how](docs/cluster.md)).
-5. **Inspection and application clients** (M): an authenticated,
+7. **Inspection and application clients** (M): an authenticated,
    read-only inspector, typed Rust clients alongside TypeScript,
    and a complete framework example with reconnect and recovery.
    Extend "Designing for hot actors" with the measured scaling
@@ -108,7 +62,8 @@ An actor still runs on one node at a time. A hot application's work
 is split among actors by an explicit pattern, not by making one
 actor execute on several nodes.
 
-Before release: demonstrate file lifecycle and restoration, feed
+Before release: demonstrate app separation, three-port routing and
+bounded overload, file lifecycle and restoration, feed
 resume and gap detection, a measured large logical room, and useful
 wake-up placement. Publish throughput, latency, memory, file
 descriptors and failure behavior with the workload and limits.
@@ -344,6 +299,28 @@ Started alongside M3; what is left of it is under [Now](#now) and
   release carries the counter prebuilt in each of those languages.
 - In `0.4.2`, an idle node lists the bucket about 13 times less
   ([what an idle cluster asks of the bucket](docs/cluster.md#what-an-idle-cluster-asks-of-the-bucket)).
+
+- In `0.5.0`, batched plain writes, opt-in per class
+  ([ADR 0034](docs/adr/0034-batched-plain-writes.md)), with
+  `storage.flush`, manifest format 5 and strict-versus-batched soaks
+  ([measured](docs/benchmarks.md#two-hours-strict-and-batched)).
+- In `0.5.0`, data access
+  ([ADR 0033](docs/adr/0033-data-access-export-and-online-backup.md),
+  [guide](docs/actor-data-access.md)): actor export and read-only SQL,
+  online backup, backup prune, whole-app and single-actor restore, and a
+  backup and restore drill.
+- In `0.5.0`, a big-room baseline
+  ([measured](docs/benchmarks.md#one-big-room)), configurable socket
+  caps and a file-descriptor budget that counts sockets
+  ([ADR 0037](docs/adr/0037-socket-session-admission.md)).
+- In `0.5.0`, declarative per-node rate limits in `wasmkeep.toml`
+  (manifest format 6,
+  [ADR 0036](docs/adr/0036-per-node-ingress-rate-limits.md)).
+- In `0.5.0`, a recorded head on hand-over, off by default and one way
+  per app ([ADR 0035](docs/adr/0035-a-recorded-head-on-hand-over.md),
+  [upgrading](docs/deploy/upgrading-to-0.5.md)).
+- In `0.5.0`, typed TypeScript actor clients and structured errors
+  ([guide](docs/typed-clients.md)).
 
 ## Stretch goal: the benchmark showdown
 
