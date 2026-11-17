@@ -65,35 +65,44 @@ pub(crate) fn run(args: &AppFormatArgs) -> anyhow::Result<()> {
     let late = u64::try_from(wasmkeep_server::apps::LATE_WRITES.as_millis()).unwrap_or(u64::MAX);
     enable_check(&nodes, &format!("{tenant}/{app}"), now, horizon, late)
         .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))?;
-    let put = rt.block_on(store.put_opts(
-        &object_store::path::Path::from(key.as_str()),
-        app_format::ENABLED_BODY.to_vec().into(),
-        object_store::PutOptions {
-            mode: object_store::PutMode::Create,
-            ..object_store::PutOptions::default()
-        },
-    ));
-    match put {
-        Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
-        Err(e) => return Err(e.into()),
-    }
-    let now_body = rt.block_on(async {
-        store
-            .get(&object_store::path::Path::from(key.as_str()))
-            .await?
-            .bytes()
-            .await
-    })?;
-    anyhow::ensure!(
-        app_format::decode(Some(&now_body)) == Ok(AppFormat::RecordedHead),
-        "{tenant}/{app}: another writer put something else at {key}"
-    );
+    rt.block_on(write_enabled(&store, &key))
+        .map_err(|e| anyhow::anyhow!("{tenant}/{app}: {e}"))?;
     println!(
         "{tenant}/{app}: the recorded-head format is enabled, for good. Start only nodes of \
          this version or later; a server outside the bucket's registrations must be upgraded \
          too before it starts."
     );
     Ok(())
+}
+
+/// Writes the enabled setting at `key`, create-only; `Ok(false)` if it was
+/// already enabled. Anything else there is an error, never overwritten.
+pub(crate) async fn write_enabled(
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    key: &str,
+) -> anyhow::Result<bool> {
+    let path = object_store::path::Path::from(key);
+    let put = store
+        .put_opts(
+            &path,
+            app_format::ENABLED_BODY.to_vec().into(),
+            object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..object_store::PutOptions::default()
+            },
+        )
+        .await;
+    let created = match put {
+        Ok(_) => true,
+        Err(object_store::Error::AlreadyExists { .. }) => false,
+        Err(e) => return Err(e.into()),
+    };
+    let body = store.get(&path).await?.bytes().await?;
+    anyhow::ensure!(
+        app_format::decode(Some(&body)) == Ok(AppFormat::RecordedHead),
+        "something else is at {key}; nothing overwritten"
+    );
+    Ok(created)
 }
 
 /// Whether the app may switch to the recorded-head format now (ADR 0035,
@@ -217,6 +226,37 @@ mod tests {
         let mut other = node("x", false, now, false);
         other.app = "t/other".into();
         assert_eq!(enable_check(&[other], "t/a", now, horizon, late), Ok(()));
+    }
+
+    /// The write is create-only: enabled once, then already enabled; an
+    /// unreadable setting is never overwritten.
+    #[test]
+    fn the_setting_is_written_once_and_never_over_something_else() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let key = "formats/t/a/recorded-head";
+        assert!(rt.block_on(write_enabled(&store, key)).unwrap());
+        assert!(!rt.block_on(write_enabled(&store, key)).unwrap());
+        let other = "formats/t/b/recorded-head";
+        rt.block_on(store.put(
+            &object_store::path::Path::from(other),
+            b"junk".to_vec().into(),
+        ))
+        .unwrap();
+        assert!(rt.block_on(write_enabled(&store, other)).is_err());
+        let body = rt
+            .block_on(async {
+                store
+                    .get(&object_store::path::Path::from(other))
+                    .await?
+                    .bytes()
+                    .await
+            })
+            .unwrap();
+        assert_eq!(&body[..], b"junk");
     }
 
     #[test]

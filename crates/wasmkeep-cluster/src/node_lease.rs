@@ -816,6 +816,18 @@ fn holder_token(t: &str) -> bool {
     !t.is_empty() && !t.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// The bytes of a record about to be written, only if they decode back
+/// to it: a version 2 record whose fields are not a valid combination
+/// would refuse the actor everywhere. Refused before anything is sent.
+fn checked(record: &OwnerRecord) -> Result<Vec<u8>, AcquireError> {
+    let body = record.encode();
+    if OwnerRecord::decode(&body).as_ref() == Some(record) {
+        Ok(body)
+    } else {
+        Err(AcquireError::Corrupt)
+    }
+}
+
 /// What an ownership key holds: a record of either version, or the
 /// migration tombstone ([`crate::migrate::TOMBSTONE_HEADER`]), which is
 /// dispatched first and is never an unknown ownership version.
@@ -1115,7 +1127,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                     return Err(AcquireError::LeaseInvalid);
                 }
                 attempted = self.mine(first, self.acquiring(inherited, None));
-                let written = self.bucket.create(key, attempted.encode()).await;
+                let written = self.bucket.create(key, checked(&attempted)?).await;
                 (first, None, written)
             }
             Some((body, version)) => {
@@ -1150,7 +1162,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                     return Err(AcquireError::LeaseInvalid);
                 }
                 attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
-                let written = self.bucket.replace(key, attempted.encode(), &version).await;
+                let written = self
+                    .bucket
+                    .replace(key, checked(&attempted)?, &version)
+                    .await;
                 (generation, Some((version, record)), written)
             }
         };
@@ -1227,7 +1242,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             return Err(AcquireError::LeaseInvalid);
         }
         let attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
-        let written = self.bucket.replace(key, attempted.encode(), &version).await;
+        let written = self
+            .bucket
+            .replace(key, checked(&attempted)?, &version)
+            .await;
         let version = match written {
             Ok(version) => version,
             Err(_) => {
@@ -1350,6 +1368,11 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             }),
         }
         .encode();
+        // Never a record no reader could decode (a permanent refusal of
+        // the actor): kept pending, nothing written.
+        if OwnerRecord::decode(&body).is_none() {
+            return Released::Pending;
+        }
         match self.bucket.replace(&hold.key, body, &hold.version).await {
             Ok(_) => Released::Released,
             Err(BucketError::Unavailable(_)) => Released::Pending,
@@ -2367,6 +2390,40 @@ mod tests {
         assert_eq!(
             run(a.acquire("owners/x", || true, async || Ok(1))),
             Err(AcquireError::Corrupt)
+        );
+    }
+
+    /// A version 2 record whose fields would not decode (a stamp above its
+    /// generation, here) is never written: refused, nothing sent.
+    #[test]
+    fn an_invalid_version_2_record_is_never_written() {
+        use crate::lease::tests::{At, Mem, run};
+        use crate::local_heads::Requirement;
+        use crate::recorded_head::{Completeness, Position};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        a.set_recorded_head(true);
+        let bad = Requirement {
+            head: Position::Known {
+                generation: 9,
+                txid: 3,
+                checksum: 1,
+            },
+            set_at: 99,
+            completeness: Completeness::Complete,
+        };
+        let got = run(a.acquire_prepared(
+            "owners/x",
+            || true,
+            async || Ok(1),
+            |_, _| Ok(Some((bad, 1))),
+        ));
+        assert_eq!(got, Err(AcquireError::Corrupt));
+        assert!(
+            run((&mem).get("owners/x")).unwrap().is_none(),
+            "nothing written"
         );
     }
 }

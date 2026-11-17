@@ -4048,3 +4048,142 @@ async fn an_enabled_app_refuses_service_beside_an_incapable_peer() {
     a.validity.bump_epoch();
     LeaseHold::acquire(&a, &x).await.unwrap();
 }
+
+/// ADR 0035, section 3, simulation case 5 on the real code: liveness after
+/// collection on a strongly consistent bucket. A releases H (stamped g1);
+/// B inherits it, verifies, writes, snapshots at P and collects every
+/// object below P, H's included, then crashes (its record held, a lower
+/// bound H stamped g1). A fresh node must activate from P: P's generation
+/// is above the stamp, so it proves H though H's object is gone.
+#[tokio::test]
+async fn a_floor_collected_away_is_proven_by_a_later_generation() {
+    use crate::replica::{Replica, SnapshotKind};
+    use futures_util::StreamExt as _;
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::node_lease::OwnerRecord;
+    use wasmkeep_cluster::recorded_head::Completeness;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let mut db = storage.open("c", "x").unwrap();
+    // g1: H.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let g1 = hold.generation().unwrap();
+    let mut replica = Replica::restore(&a, &x, hold.view(), g1, storage.db_path("c", "x"), 1 << 30)
+        .await
+        .unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // g2: B writes on, snapshots at P, collects below it.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let g2 = hold.generation().unwrap();
+    let floor = hold.view().inherited().unwrap();
+    assert_eq!(floor.set_at, g1);
+    let mut replica = Replica::restore(&a, &x, hold.view(), g2, storage.db_path("c", "x"), 1 << 30)
+        .await
+        .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.start_capture().unwrap();
+    for v in 2..5 {
+        db.exec(&format!("INSERT INTO t VALUES ({v})"), &[])
+            .unwrap();
+        replica
+            .ship(&db.take_changes().unwrap().unwrap())
+            .await
+            .unwrap();
+    }
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::Periodic)
+        .await
+        .unwrap();
+    let p = replica.head();
+    let history = StorePath::from(format!("{}/", a.history_key(&x)));
+    let listed: Vec<_> = store.list(Some(&history)).collect().await;
+    let snapshot_p = format!("{:016x}-{:016x}.ltx", p.txid, p.generation);
+    for meta in listed.into_iter().map(Result::unwrap) {
+        if !meta.location.as_ref().ends_with(&snapshot_p) {
+            store.delete(&meta.location).await.unwrap();
+        }
+    }
+    drop((db, replica));
+    // B crashes: its record stays held, a lower bound H stamped g1, and its
+    // node is gone (this test forgets the hold and frees the record as a
+    // fence would).
+    std::mem::forget(hold);
+    let crashed = OwnerRecord {
+        holder: Some(("gone".into(), "dead".into())),
+        generation: g2,
+        recorded: Some(wasmkeep_cluster::local_heads::Requirement::stored(
+            Some(floor),
+            true,
+            None,
+        )),
+    };
+    assert_eq!(
+        crashed.recorded.unwrap().completeness,
+        Completeness::LowerBound
+    );
+    store
+        .put(&StorePath::from(key.clone()), crashed.encode().into())
+        .await
+        .unwrap();
+    let fenced = wasmkeep_cluster::node_lease::NodeLeaseObject {
+        state: wasmkeep_cluster::node_lease::NodeState::Fenced,
+        instance: Some("dead".into()),
+        written_at_ms: 0,
+    };
+    store
+        .put(&StorePath::from("nodes/gone"), fenced.encode().into())
+        .await
+        .unwrap();
+    // A fresh node, no local evidence: it activates from P.
+    let c = fast_node("c", &store);
+    c.identity().await.unwrap();
+    wait_lease_valid(&c).await;
+    let hold = LeaseHold::acquire(&c, &x).await.unwrap();
+    let carried = hold.view().inherited().unwrap();
+    assert_eq!((carried.head, carried.set_at), (floor.head, floor.set_at));
+    assert_eq!(carried.completeness, Completeness::LowerBound);
+    let other = tempfile::tempdir().unwrap();
+    let restored = Replica::restore(
+        &c,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(other.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.head(), p);
+}

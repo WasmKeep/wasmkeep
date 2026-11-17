@@ -698,11 +698,20 @@ impl LeaseHold {
             Err(AcquireError::LocalHold) => Err(OwnershipError::Unavailable(
                 "this node is still ending its previous hold of the actor; retry".into(),
             )),
-            Err(AcquireError::FormatMismatch) => Err(OwnershipError::Broken(
-                "the ownership record is in the recorded-head format (wasmkeep-owner 2), \
-                 which this app has not enabled on this node: a setting mismatch"
-                    .into(),
-            )),
+            Err(AcquireError::FormatMismatch) => {
+                // The setting may have been enabled since it was read:
+                // read again before the next acquisition.
+                *cluster
+                    .pending
+                    .format
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                Err(OwnershipError::Unavailable(
+                    "the ownership record is in the recorded-head format (wasmkeep-owner 2), \
+                     which this node had not seen the app enable: reading the setting again"
+                        .into(),
+                ))
+            }
             Err(AcquireError::Unavailable) => Err(OwnershipError::Unavailable(
                 "the bucket did not answer".into(),
             )),
