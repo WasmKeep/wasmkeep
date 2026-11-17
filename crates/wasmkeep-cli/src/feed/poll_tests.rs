@@ -1232,3 +1232,26 @@ async fn f7_compaction_adopts_visible_f3_batch_before_poll_retry() {
     poll(&args, &store, "").await.unwrap();
     assert_eq!(files(out.path()), after);
 }
+
+/// The views name files by absolute path. A poll resolves the output
+/// directory; publishing again through a link to it (macOS's /var is a
+/// link to /private/var) must write the same text.
+#[cfg(unix)]
+#[tokio::test]
+async fn views_name_the_same_paths_through_a_link_to_the_output() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let out = link.join("out");
+    let state = link.join("state");
+    let store = fixture().await;
+    poll(&args(&out, &state), &store, "").await.unwrap();
+    let polled = std::fs::read_to_string(out.join("views.duckdb.sql")).unwrap();
+    views::publish(&out).unwrap();
+    assert_eq!(
+        polled,
+        std::fs::read_to_string(out.join("views.duckdb.sql")).unwrap()
+    );
+}

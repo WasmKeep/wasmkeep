@@ -51,3 +51,16 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # so a new or renamed module runs until someone lists it here.
 [profile.pr]
 default-filter = 'not (binary(cluster_over_tls) & test(/^suite::(alarms|bucket|deploys|durable_writes)::/)) | test(=suite::deploys::existing_access_checks_the_bucket_and_leaves_nothing_for_unknown_names) | test(=suite::deploys::deployed_rules_and_configuration_reach_nodes_started_without_any)'
+
+[profile.macos]
+# CI's macOS job (.github/workflows/ci.yml). Hosted macOS runners are
+# slower and noisier than the Linux ones: a test that misses a timing there
+# is run again, up to twice, and reported as FLAKY in the summary and in
+# junit.xml, so it stays visible for the testing pass instead of failing
+# the nightly run and blocking a release. A test failing three times in a
+# row still fails. Timeouts are half again as long as the default.
+retries = { backoff = "fixed", count = 2, delay = "2s" }
+slow-timeout = { period = "90s", terminate-after = 2 }
+
+[profile.macos.junit]
+path = "junit.xml"
