@@ -9,10 +9,10 @@ is checked at run time, not only at compile time.
 
 This is additive. `actors.call`, `actors.callMany` and the `kv`, `queue`,
 `db` and `workflow` clients are unchanged, and nothing here needs a newer
-host: it is built on the calls an actor already makes. The Rust SDK does not
-generate typed clients; it can write and read the error envelope below, so a
-Rust actor and a TypeScript caller (or the reverse) understand each other's
-failures.
+host: it is built on the calls an actor already makes. The Rust SDK has the
+same clients behind its `client` feature ([below](#typed-clients-in-rust)),
+and both write and read the error envelope below, so a Rust actor and a
+TypeScript caller (or the reverse) understand each other's failures.
 
 ## Defining a contract
 
@@ -110,6 +110,82 @@ A front can call a contract the same way; from a front the call is an
 inside call, as with `actors.call`. A portable client for a browser would be
 a separate thing pointed at a public URL: nothing here gives a browser the
 privileges of an inside caller.
+
+## Typed clients in Rust
+
+Enable the `client` feature of `wasmkeep-sdk` (it adds no dependency and does
+not need the `actor` feature, so a front can use it). `contract!` is a plain
+`macro_rules!` macro: it declares each operation (method, path, input, answer
+and the errors it may return) and writes a module with one function per
+operation, returning its `Operation`, and a `Client` with one method per
+operation.
+
+```rust
+use wasmkeep_sdk::client::{Failure, Nullable, with_query};
+use wasmkeep_sdk::{contract, record};
+
+record! {
+    pub struct AddItem { pub sku: String, pub qty: i64 }
+}
+record! {
+    pub struct Count { pub count: i64, pub note: Option<Nullable<String>> }
+}
+record! {
+    pub struct OutOfStock { pub left: i64 }
+}
+
+contract! {
+    pub mod cart {
+        fn add_item(AddItem) -> Count
+            = POST |i: &AddItem| with_query("/", &[("sku", &i.sku)]),
+            errors AddItemError {
+                OutOfStock("cart.out_of_stock"): OutOfStock,
+                Closed("cart.closed"),
+            };
+        fn get() -> Count = GET "/";
+    }
+}
+
+let alice = cart::Client::new("cart/alice");
+match alice.add_item(&AddItem { sku: "A1".into(), qty: 2 }) {
+    Ok(reply) => println!("{}", reply.value.count),
+    Err(Failure::Declared { error: cart::AddItemError::OutOfStock(o), .. }) => println!("{} left", o.left),
+    Err(other) => println!("{}", other.kind()),
+}
+```
+
+It follows the TypeScript client:
+
+- Same request rules: `POST`, `PUT` and `PATCH` send the input as a JSON
+  body (written as `JSON.stringify` would, in declaration order), `GET`,
+  `HEAD` and `DELETE` send none; the unit type is no input and no body.
+  `url_path!` and `with_query` percent-encode every value as one segment, and
+  the same paths are refused (`.` and `..` segments, spaces, `#`, `\`).
+- Same answer rules: the same nine failure kinds (`Failure::kind()` returns
+  the TypeScript names), the same limits (a 1 MiB success body, 16 calls per
+  batch, an unsent `invalid-request` entry), the same classification of an
+  error envelope (it uses `problem::classify`, and the shared test vectors run
+  through the client), and no retries.
+- `record!` declares a struct that is read and written as a JSON object: the
+  declared keys only, extra keys dropped. `Option<T>` is `codec.optional`
+  (key may be absent, `null` refused); `Nullable<T>` is `codec.nullable` (key
+  present, may be `null`); `()` is `codec.none()`. Integers are safe integers
+  (at most 2^53 - 1), as `codec.integer()`.
+
+Where it differs:
+
+- A batch is built with `client.batch()`, `add` (which returns a typed handle)
+  and `send`, then `take(handle)` for each result; there is no tuple-typed
+  array. Results come back in order and each entry fails on its own.
+- Types come from Rust types, not codecs; there is no `body` function and no
+  `union`. The error enum of an operation is closed (each variant names its
+  code); any other code is `Failure::Problem`.
+- A path closure must annotate its parameter (`|i: &AddItem| ...`).
+- Answers are read with the SDK's own JSON reader: objects of at most 64
+  members and nesting of at most 16, numbers as `f64`.
+- `CallError::kind` is text as in TypeScript; `known()` returns the Rust enum.
+- Calls are as synchronous as `actors::call`. The transport is a trait for
+  tests: `Client::with_transport(transport, address)`.
 
 ## Batching
 
@@ -262,5 +338,5 @@ runtime checks are what protect a rolling deploy.
 
 - A success body is decoded up to 1 MiB by default (`maxResponseBytes` on an
   operation changes it); the host's own limits on bodies still apply.
-- There is no typed Rust client yet; Rust writes and reads the envelope and
-  calls actors with `actors::call` as before.
+- Neither SDK has a client for calls from outside the app (a browser, another
+  service): a typed client is a call from an actor or a front.

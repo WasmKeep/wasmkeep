@@ -9,6 +9,15 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Typed Rust clients:** the `client` feature of `wasmkeep-sdk` adds
+  `contract!` (a plain `macro_rules!` macro) and `record!`: declare an actor
+  class's operations with typed inputs, answers and declared errors, and get a
+  client whose methods return values and the same nine-kind failure as the
+  TypeScript clients, with `batch` over `call_many`. Requests, limits and the
+  error envelope match TypeScript (the shared problem vectors run through the
+  client). No dependency, no WIT or server change. See [typed
+  clients](docs/typed-clients.md#typed-clients-in-rust).
+
 - **Static assets (ADR 0030, section 9):** deploy project directories with
   app-scoped indexes, hostname isolation, verified per-app caches, browser
   cache rules, compressed variants and ranges. Deploy/collection markers

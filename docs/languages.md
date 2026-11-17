@@ -74,9 +74,10 @@ component imports it or not.
 
 **Typed actor clients and structured errors**: TypeScript
 (`@wasmkeep/sdk/contracts`, `actorClient()`) describes an actor's operations
-once and checks every input and answer at run time; Rust and TypeScript share
-an opt-in error envelope for HTTP failures (`wasmkeep_sdk::problem`). Typed
-Rust clients are not generated yet. See
+once and checks every input and answer at run time; Rust has the same
+clients through the `contract!` macro (`client` feature of `wasmkeep-sdk`),
+and both share an opt-in error envelope for HTTP failures
+(`wasmkeep_sdk::problem`). See
 [typed clients](typed-clients.md).
 
 The release's files are signed:

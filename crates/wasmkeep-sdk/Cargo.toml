@@ -33,6 +33,10 @@ wasip2 = "2.0.1"
 # import nothing from the actor world beyond `actors` and `env`.
 default = ["actor"]
 actor = []
+# Typed clients for calls between actors (`client::Client`, `contract!`):
+# the Rust side of the TypeScript SDK's typed clients. No dependency, and
+# independent of `actor`: a front can use it too.
+client = []
 
 # The crate is a guest library: document it for the target actors build for.
 [package.metadata.docs.rs]
@@ -44,3 +48,7 @@ workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
+# Turns `client` on for this crate's own tests and for workspace clippy and
+# nextest (scripts/check.sh), which build default features only. Dropped from
+# the published package: a dev-dependency has no version.
+wasmkeep-sdk = { path = ".", features = ["client"] }

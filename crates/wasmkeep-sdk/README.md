@@ -77,6 +77,8 @@ goes from an empty directory to an actor whose state survives a restart.
   (`Problem`, `problem::response`, `problem::classify`), the same bytes the
   TypeScript SDK's typed clients write and read
   (`docs/typed-clients.md` in the repository).
+- `client` (feature `client`): typed clients for calls to other actors,
+  `contract!` and `record!`; see below.
   It works in a front too.
 - `kv`, `queue`, `workflow`: a key-value store, queues and durable workflows,
   each built from actors
@@ -89,6 +91,39 @@ goes from an empty directory to an actor whose state survives a restart.
 
 The [API reference](https://github.com/WasmKeep/wasmkeep/blob/v0.5.1/docs/reference/api.md)
 lists every host function with its name in each SDK.
+
+## Typed clients
+
+The `client` feature (no dependency) is the Rust side of the TypeScript
+SDK's typed clients: declare an actor class's operations once with
+`contract!`, and call them with typed inputs and answers. Every input and
+answer is checked, and a call returns a value or a `Failure` of nine kinds
+(`transport`, `declared`, `problem`, `invalid-details`,
+`unsupported-envelope`, `malformed-envelope`, `http`, `invalid-response`,
+`invalid-request`), never a panic.
+
+```rust
+use wasmkeep_sdk::client::with_query;
+use wasmkeep_sdk::{contract, record};
+
+record! { pub struct AddItem { pub sku: String, pub qty: i64 } }
+record! { pub struct Count { pub count: i64 } }
+record! { pub struct OutOfStock { pub left: i64 } }
+
+contract! {
+    pub mod cart {
+        fn add_item(AddItem) -> Count
+            = POST |i: &AddItem| with_query("/", &[("sku", &i.sku)]),
+            errors AddItemError { OutOfStock("cart.out_of_stock"): OutOfStock };
+    }
+}
+
+let reply = cart::Client::new("cart/alice").add_item(&AddItem { sku: "A1".into(), qty: 2 });
+```
+
+`client.batch()` sends several operations at once over `call_many`. See
+`docs/typed-clients.md` in the repository for the rules and how Rust differs
+from TypeScript.
 
 ## Several outbound requests at once
 
