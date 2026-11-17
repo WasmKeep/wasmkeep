@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WasmKeep reconnecting room</title>
+<style>body{font:1rem system-ui;max-width:52rem;margin:3rem auto;padding:0 1rem;color:#152638;background:#f6f8fa}button,input{font:inherit;padding:.5rem}form{display:flex;gap:.5rem;margin:1rem 0;flex-wrap:wrap}#messages{height:20rem;overflow:auto;background:white;padding:1rem 2rem;border:1px solid #ccd4dc}#text{flex:1}output{display:block;white-space:pre-wrap}li{overflow-wrap:anywhere}</style>
+<h1>Reconnecting room</h1>
+<p>Choose a name to join the public lobby. Names are labels, not accounts.</p>
+<form id="signin"><label>Name <input id="name" required pattern="[a-zA-Z0-9_-]{1,24}" maxlength="24" autocomplete="nickname"></label><button>Join</button></form>
+<p>Connection: <strong id="state" role="status">closed</strong> <button id="drop" disabled>Drop connection</button></p>
+<output id="counters" aria-label="Delivery counters"></output>
+<ol id="messages" aria-label="Messages"></ol>
+<form id="send"><label for="text">Message</label><input id="text" required maxlength="2000" disabled><button id="submit" disabled>Send</button></form>
+<p id="error" role="alert"></p><output id="stats" aria-label="Room topology"></output>
+<script type="module" src="/client.js"></script>
+</html>

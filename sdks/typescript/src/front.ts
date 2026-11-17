@@ -83,3 +83,6 @@ export function frontExportsFor(definition: FrontDefinition) {
     },
   };
 }
+
+/** HTTP publish and history helpers for internal rooms. */
+export * as broadcast from "./broadcast-client";

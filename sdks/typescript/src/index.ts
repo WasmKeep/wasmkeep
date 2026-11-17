@@ -38,6 +38,8 @@ import type { ActorRequest, ActorResponse } from "./request";
 /** A database kept by one actor (`db.define({ migrations })`,
  * `new db.Client("db/main")`); see ./db.ts. */
 export * as db from "./db";
+export * as directory from "./directory";
+export * as broadcast from "./broadcast";
 /** Key-value storage over shard actors (`new kv.Client("kv", 8)`); see ./kv.ts. */
 export * as kv from "./kv";
 /** Queues over queue actors (`new queue.Client("queue/jobs")`,
@@ -207,7 +209,9 @@ export { actorClient, actorTransport } from "./transport";
 /** A WebSocket connection id. */
 export type ConnId = bigint;
 
+import { trySend } from "./sockets";
 export const sockets = {
+  trySend,
   /** Sends a text or binary message. Returns false if the connection is
    * gone or its buffer is full. */
   send(conn: ConnId, data: string | Uint8Array): boolean {

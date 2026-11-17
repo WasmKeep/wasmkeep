@@ -12,3 +12,18 @@ declare module "node:assert/strict" {
   };
   export default assert;
 }
+
+declare module "node:fs" { export function readFileSync(path:string,encoding:"utf8"):string; }
+declare module "node:sqlite" {
+ export class DatabaseSync {
+  constructor(path:string);
+  exec(sql:string):void;
+  close():void;
+  prepare(sql:string):{run(...params:unknown[]):{changes:number|bigint};all(...params:unknown[]):Record<string,unknown>[];setReadBigInts(enabled:boolean):void;columns():{name:string}[]};
+ }
+}
+declare module "node:fs" {
+ export function mkdtempSync(prefix:string):string;
+ export function rmSync(path:string,options:{recursive:boolean;force:boolean}):void;
+}
+declare module "node:os" {export function tmpdir():string;}

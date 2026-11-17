@@ -5,6 +5,8 @@
 //! change with the SDK (both ends are built from the same SDK version when a
 //! class is deployed with its callers; see ADR 0015).
 
+#![cfg_attr(not(feature = "actor"), allow(dead_code))]
+
 use crate::actors;
 
 /// Appends to a buffer.

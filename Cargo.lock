@@ -3581,6 +3581,7 @@ dependencies = [
 name = "wasmkeep-sdk"
 version = "0.5.1"
 dependencies = [
+ "rusqlite",
  "wasip2 2.0.1+wasi-0.2.12",
  "wit-bindgen 0.63.0",
 ]

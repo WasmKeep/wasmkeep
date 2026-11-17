@@ -30,3 +30,4 @@ export function install(host: Host): void {
 export function call(address: string, request: Request): Response {
   return state.host(address, request);
 }
+export function selfAddress() { return {tenant:"tenant",class:"room",name:"r"}; }

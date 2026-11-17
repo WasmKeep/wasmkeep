@@ -41,3 +41,6 @@ targets = ["wasm32-wasip2"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

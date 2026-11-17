@@ -91,6 +91,7 @@ mod project_file;
 #[path = "recorded_head.rs"]
 mod recorded_head;
 mod restore;
+mod room;
 #[path = "routing.rs"]
 mod routing;
 #[path = "signed_calls.rs"]

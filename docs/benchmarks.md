@@ -1276,6 +1276,76 @@ hundred messages. The node serves every cell, in rooms named by
 `ROOM_RUN`; `merge` counts only the node's samples from each cell's
 ramp-up to its last receipt.
 
+## Reconnecting-room harness
+
+[`bench/room-group.mjs`](../bench/room-group.mjs) drives the SDK's actual
+`RoomClient` against a deployed [ts-big-room](../examples/ts-big-room/README.md)
+front. It is separate from the historical single-actor `bench/room.sh` matrix.
+It starts no cluster and performs no deployment or failure injection. Run
+fleet measurements on a load host, with a dedicated lobby and its real bucket:
+
+```bash
+(cd sdks/typescript && npm ci)
+node bench/room-group.mjs --url https://room.example.net \
+  --clients 10000 --duration 120 --rate 20 --publishers 2 \
+  --metrics-url https://node-a.example.net/metrics \
+  --metrics-url https://node-b.example.net/metrics \
+  --out room-group-r1.json
+```
+
+`--rate` is aggregate offered messages per second, shared by paced publishers;
+there are no catch-up bursts after slow requests. Unknown publish outcomes
+retry the same id (at most three attempts). Clients ramp at at most 500/s,
+then wait up to 30 seconds for admission before the timed publishing phase.
+`--reconnect-every 5` drops one socket every five seconds to exercise rejoin.
+Natural close codes and SDK backoff/recovery are always observed. Custom SDK
+fronts must expose the example's join/publish/history/stats JSON contract.
+This driver does not implement R8's grow/shrink schedule or stalled readers.
+
+The JSON includes the harness Git revision (dirty when applicable), Node
+version, settings, admitted clients, delivery/repeat/void/reset counters,
+reconnect attempts and times, 4801/4802 counts, publish failures and retries,
+and one-second topology samples (sampling can slip while endpoints time out).
+`gaps_recovered` counts nonempty history pages requested with an `after`
+position, not distinct outages; `recovered_messages` counts items applied
+from those pages. Reconnect latency runs from disconnect detection to the
+next ready frame, not to completion of history recovery. Delivery latency
+runs from the originating publisher's monotonic timestamp to each recipient,
+including HTTP replay; it needs no synchronized server clock. Percentiles
+are bounded-memory logarithmic histogram upper bounds within 1% or 1 ms;
+all deliveries count, but only this process's tagged messages enter latency.
+Separate load processes must keep their own artifacts; do not average their
+percentiles. A successful run is not proof that every client saw every number.
+
+Samples report persisted edge/relay counts and, if exposed at each optional
+Prometheus URL, `process_cpu_seconds_total` and
+`process_resident_memory_bytes`. CPU is cumulative seconds; derive utilization
+from consecutive samples. Missing metrics are `null`, never zero. URLs,
+credentials, response bodies and local filenames are not included in results.
+Add reviewed deployment revision, hardware, bucket, storage and confirm-mode
+metadata before comparing runs; the driver cannot infer those remotely.
+
+For a bounded local correctness smoke, install the SDK dependencies and use
+prebuilt CLI and ts-big-room components, then run:
+
+```bash
+python3 -I scripts/check-room-bench.py
+```
+
+The script starts a temporary loopback node without a bucket, runs 24 clients
+for eight publishing seconds at four messages/s with forced reconnects,
+drops one received frame to exercise HTTP gap recovery, checks the
+delivery/reconnect/recovery/topology output, and removes its data and results.
+Its total timeout is under 30 seconds. `WASMKEEP_BIN` selects a prebuilt CLI.
+Direct `--smoke` runs require a loopback URL, at most 32 clients, 15 publishing
+seconds, five messages/s and two publishers. Neither smoke is fleet evidence.
+
+Output goes only to the explicitly supplied `--out`, written through a
+partial file on completion. Keep raw runs in scratch storage. Publish only
+reviewed, redacted evidence under `bench/results/`, named
+`<date>-<commit>-room-group-<label>.json`, following the publication-path rules
+below. R7 commits no measurements; R8 owns real-bucket capacity claims.
+
 ## Reproduce
 
 Both entry points require Bash. Full comparisons and `bench/run.sh` require

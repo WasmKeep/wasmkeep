@@ -9,7 +9,7 @@ import unittest
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 PACKAGE = 'sdks/typescript/package.json'
 LOCK = 'sdks/typescript/package-lock.json'
-EXAMPLES = ('ts-counter', 'ts-chat-room', 'ts-jobs', 'ts-workflows', 'ts-db')
+EXAMPLES = ('ts-counter', 'ts-chat-room', 'ts-big-room', 'ts-jobs', 'ts-workflows', 'ts-db')
 
 
 class Versions(unittest.TestCase):

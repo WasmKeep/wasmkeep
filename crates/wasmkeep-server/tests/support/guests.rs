@@ -15,6 +15,8 @@ pub(crate) fn build_guest(dir: &str, name: &str) -> Vec<u8> {
         .current_dir(&root)
         .args([
             "build",
+            "-j",
+            "4",
             "--release",
             "--locked",
             "--target",

@@ -413,3 +413,46 @@ override in your root `package.json`:
   }
 }
 ```
+
+## Directory (ADR 0040, R1)
+
+Export `directory.define()` from an app-owned internal class, or delegate
+its hooks to `directory.init` and `directory.handle`. Each actor holds one
+map. `new directory.Client("class/name")` provides `create`, `lookup`,
+`entries`, `change` (a `kind: "split"` or `kind: "merge"` request), and
+`delete`. `directory.point(key)` accepts bytes or a UTF-8 string.
+
+Points, bounds and versions are `bigint`; an absent `entry.hi` means 2^64.
+`lookup` returns `{ entry, version }`, where `version` is the map version
+and `entry.version` is its last change. The creator owns mutations; any
+inside caller may read. `DirectoryError` carries the status and, on a
+409, the current version. Maps hold at most 4,096 ranges and metadata is
+at most 1 KiB per range. Targets and nonempty operation ids are capped at
+1 KiB of UTF-8 each. Changes are durable transactions. Retry an unknown
+outcome with the same op id **before submitting another change**: only
+the latest operation's result is retained. The Rust SDK speaks the same
+binary protocol and uses the same point hash.
+
+This implements R1 of the proposed ADR only; broadcast groups and rooms
+are not provided by this module.
+
+### Room core (ADR 0040, R2)
+
+`broadcast.define({ confirm: false })` defines an internal room actor.
+A stateless front imports `broadcast` from `@wasmkeep/sdk/front` and uses
+`new broadcast.Client("room/name")`. It authorizes HTTP publishes and
+`GET /history?after=e.n` requests before calling `publish` or `history`.
+Positions and timestamps are `bigint`; preserve their precision when mapping
+them to the application's HTTP representation. History returns `lost`,
+`reset`, `more`, the head and individually positioned messages; continue a
+page from its last message's position. The internal binary protocol matches
+Rust.
+
+Use a batched class. One durable epoch boundary is recorded at the first
+operation after each cold start, including history, so reconnects learn
+losses before the next publish. Plain publishes schedule a 20 ms alarm and
+retain 2,000 messages or 8 MiB of UTF-8 bodies. History replies, including
+framing, stay within 256 KiB. With `confirm: true`, the alarm's confirmation
+barrier flushes before permitting a round; an upload still pending retries
+50 ms later. There are no delivery children in R2. R3–R5 add edge delivery,
+join/poke, scaling and relays.
