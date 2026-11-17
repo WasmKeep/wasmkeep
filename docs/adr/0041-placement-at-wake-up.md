@@ -1,0 +1,471 @@
+# 0041. Placement at wake-up
+
+- Status: proposed (2026-11-17). Nothing is built.
+- Date: 2026-11-17
+- Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, item 6
+- Follows: [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) (a
+  draining node sends an event to a chosen peer, which claims),
+  [ADR 0017](0017-moving-one-actor.md) (the take call),
+  [ADR 0020](0020-one-lease-per-node.md) (ownership records under a node
+  lease), [ADR 0024](0024-socket-home.md) (parked holds),
+  [ADR 0035](0035-a-recorded-head-on-hand-over.md) (the recorded head),
+  [ADR 0036](0036-per-node-ingress-rate-limits.md) and
+  [ADR 0037](0037-socket-session-admission.md) (admission), and
+  [ADR 0038](0038-several-apps-per-process.md) (the sender and the proof
+  on every hop, budgets shared between apps, the load line per app).
+- Amends, once accepted: nothing in ADR 0020 or ADR 0035. The heartbeat's
+  load line gains two fields and stops being display only.
+
+## Context
+
+An actor that nobody holds starts on the node that receives its next
+event. A load balancer that hashes the actor's path spreads requests
+well, but three kinds of wake-up ignore it: a call from another actor
+wakes the callee on the caller's node, a call from the front wakes it
+where the front request landed, and a balancer that does not hash sends
+the first request anywhere. One node can then hold most of the residents
+while another has room, and a node that joins or comes back gets only
+what the balancer sends it.
+
+Nothing reads node load today. Each node publishes it on payload line 10
+of its node lease (`load actors=... sockets=...`), for `wasmkeep cluster
+status` only.
+
+This record decides the first automatic use of it, and the smallest one:
+**where an actor that nobody holds starts**. A running actor never moves
+because of it.
+
+## Decision
+
+A node that is about to wake an actor nobody holds keeps it, unless the
+node is clearly fuller than another node of the app. Then it sends the
+event there, once, with a signed mark, and that node acquires the actor
+as it would for any request. The rest of this section says exactly when,
+where and how.
+
+### 1. What is placed, and what never is
+
+The decision is taken in routing (`actor/routing.rs`), where a cold
+address is routed before it takes a local actor slot. Today that step
+answers "another node holds it" or "try here" (`remote_owner`). It gains
+a third answer, "nobody holds it", from the same single read of the
+ownership record: the record is absent, or it names nobody (a released
+record). Only that answer can lead to a placement. No read is added.
+
+An event is **placeable** when all of these hold:
+
+- it is a request from outside whose body is absent or declared
+  (`content-length`) at 64 KiB or less, or an `actors.call` from an actor
+  or from the front (one entry of a `call-many` counts as one call);
+- it did not arrive from another node: it has no forwarded mark and did
+  not arrive on the cluster port;
+- the node has no mailbox for the actor, no parked hold for it
+  (ADR 0024), and no move request names it (ADR 0017);
+- the node is not draining (the drain's own rule decides then, ADR 0014),
+  its node lease is valid, and it can open the app's secrets;
+- the record read answered "nobody holds it". A read that failed or
+  timed out means "try here", as today.
+
+Never placed:
+
+- **A WebSocket upgrade**, from a client or handed over by the front. A
+  socket relayed to another node holds a session on both nodes for its
+  whole life (ADR 0037), so placing it would add socket load to save
+  resident load. With a hashing balancer, every socket of a room would be
+  relayed.
+- **An alarm.** The sweep already gives each live node its own share of
+  the overdue alarms (`plan_sweep`), and the node that delivers one must clear its index entry
+  (ADR 0009). That path stays as it is.
+- **A request with a larger or chunked body.** It is streamed, so it
+  could not run here after a refusal (section 6).
+- **A take call, an alarm hand-off, a drain's hand-over**, and every
+  operator pass (deletes, restores, expiry).
+- **A record that names a node**, whatever its state: live, lapsed,
+  fenced, or this node's own ended or parked hold. Takeovers after a
+  failure and wakes of parked holds are unchanged.
+
+### 2. The load measure
+
+Each node id publishes two more fields on its load line, for its own app:
+
+```
+load actors=<n> sockets=<n> events_per_min=<n|-> front_per_min=<n|-> actor_room=<n> socket_room=<n>
+```
+
+- `actor_room`: how many more residents this app could have on this node
+  now. With `cap` the app's `max-resident` (the process limit if unset),
+  `floor` its `min-resident`, and the process's residents counted over
+  all apps:
+  `min(cap - actors, max(floor - actors, limit - process_residents))`,
+  each difference stopping at 0. The `max` is ADR 0038's floor rule: an
+  app below its floor can always evict another app's idle resident, so a
+  full process is not full for it.
+- `socket_room`: `min(app ceiling - app sockets, node ceiling - process
+  sockets)`, stopping at 0, with ADR 0037's effective ceilings.
+
+A node's **resident fill**, in thousandths, is
+`actors * 1000 / (actors + actor_room)`, and its **socket fill** is
+`sockets * 1000 / (sockets + socket_room)`, in integer arithmetic,
+rounded down; a zero denominator is 1000 (no room at all).
+
+The rule compares resident fills, because what a placement moves is one
+resident. The socket fill only rules a candidate out (section 4): a node
+short of socket sessions is a poor home for an actor that may open
+sockets, but a sender full of sockets gains nothing by sending a
+resident away.
+
+So load counts **per app, bounded by the process**. Per app alone, a
+process filled by another app would look empty. Per process alone, one
+busy app would push a quiet app's actors away from a node where that
+quiet app is within its floor.
+
+Rates (`events_per_min`, `front_per_min`) are not used: they lag by a
+minute. Readers of older versions skip the new fields, as the line's
+parser already skips unknown keys.
+
+A node reads **its own** fill from memory at the moment of the decision,
+never from its heartbeat.
+
+### 3. Freshness
+
+A node's view (`cluster/view.rs`) keeps, for each peer, its last load,
+the moment the view first saw that heartbeat on this node's **monotonic**
+clock, and a credit (section 5). The heartbeat's own time is not used:
+clocks differ.
+
+A peer's load is **fresh** for three heartbeat periods after it was first
+seen (9 s with the default 3 s period). A stale load makes the peer no
+candidate. If the bucket stops answering, the view is kept but nothing
+new is seen, so every load goes stale within three periods and every
+node keeps what it wakes. **Stale means keep it.**
+
+### 4. Candidates
+
+The candidate set for an actor is the peers that:
+
+- serve the same app, are live, report `serving` on heartbeat line 9, are
+  not asked to drain and are not suspected (ADR 0014's eligible peers);
+- can be reached the way node calls reach them;
+- announce the capability word `place` (section 9);
+- have a fresh load with both room fields, and a socket fill below 800;
+- are not in this node's placement backoff (section 6).
+
+The node itself is never in the set. The two candidates are the two
+highest rendezvous weights for the actor's encoded address over that set
+(`rendezvous`, the hash ADR 0014 uses). With one peer there is one
+candidate; with none, the node keeps the actor.
+
+Choice: rendezvous, not a random pair. Two nodes that wake the same actor
+at the same moment pick the same target, so they do not race each other
+for the record, and a test can say in advance where an actor goes.
+
+### 5. The rule
+
+With `s` this node's resident fill, and for a candidate `p` its published `actors`
+and `actor_room`, its credit `k` (placements this node sent it since that
+heartbeat was first seen) and `N` the number of nodes of the app that
+announce `place`, this node included:
+
+1. **Floor.** If `s < 200`, keep it. A node under a fifth of its capacity
+   never sends an actor away, so an idle cluster forwards nothing.
+2. **The lighter candidate.** For each candidate, the estimated fill is
+   `(actors + k) * 1000 / (actors + actor_room)`. Take the lower one; on
+   a tie, the higher rendezvous weight.
+3. **The 25% rule.** Keep it unless `s * 4 > c * 5`, with `c` that
+   estimated fill: this node must be more than 25% above the candidate.
+4. **The budget.** Let `t = s * 4 * (actors + actor_room) / 5000`, the
+   resident count at which `p` would stand at 80% of this node's fill.
+   This node may send `p` at most `max(1, (t - actors) / (N - 1))`
+   actors per heartbeat of `p` it sees, `t - actors` stopping at 0. If
+   `k` has reached it, keep it.
+
+Otherwise the event is placed on `p` and `k` grows by one. A new
+heartbeat from `p` sets `k` back to 0.
+
+The budget is what makes a stale number safe. Up to `N - 1` nodes read
+the same heartbeat of a light node; each closes at most its share of its
+own gap, so together they bring it to at most 80% of the fullest sender's
+fill, plus one actor each when gaps are tiny. The receiver therefore
+never ends up above the senders, and has no reason to send anything back.
+
+The three numbers (floor 200, the 5/4 ratio, three periods) are
+constants in 0.6.0, not settings.
+
+### 6. The hop, and what happens when it is not taken
+
+A placed event travels as the drain's hand-over does: one forward to the
+chosen node, which acquires. It is **not** the take call (section 7).
+
+Before sending, a placed request's body is read into memory (64 KiB at
+most); a call's already is. The hop carries the forwarded mark, the app,
+the sender and its proof (ADR 0038, section 5), and the placed mark
+(section 8). The sender then acts on the answer:
+
+| What comes back | What the sender does |
+| --- | --- |
+| Any answer without the refusal mark | Returns it. If it carries `x-wasmkeep-node` naming the chosen node (the actor ran there), remembers that node as the actor's owner (the owner hint), so the next requests skip the record read. An access answer (`403`, `404`) sets no hint. |
+| `503` with `x-wasmkeep-placed: refused` | The event did not run there. Runs it here, with placement off for this event. Backs the node off. |
+| The hop was never read (no address, the target not trusted, a refused handshake, a request given back unsent: `never_read_by_peer`) | The same: runs it here, backs the node off. |
+| Anything else (the connection failed after the write, no answer in time) | Answers as a failed forward does today: `503` with `Retry-After` for a request, `failed` for a call. The event may have run, so it is not run again. Backs the node off. |
+
+"Runs it here" is the ordinary path: this node reads the record again
+and acquires, or forwards to an owner that appeared meanwhile.
+
+**Backoff** is placement's own table: the node is no candidate for one
+heartbeat horizon (10 s by default). It is not ADR 0014's suspect list,
+which also decides drains and who collects expiries; a full node is not a
+suspect.
+
+**The receiver** treats the hop as a forwarded request, so it never
+forwards it and never places it. It answers `503` with
+`x-wasmkeep-placed: refused` whenever it answers without handing the
+event to the guest for one of these reasons: it is draining, cannot open
+the secrets, is moving the actor away, has no resident capacity, the hop's
+proof or sender did not check (ADR 0038 refuses such a hop; the mark
+tells the sender it did not run), or it found another holder. An access answer (`403`,
+`404`) is the client's answer and carries no mark: it would be the same
+here. The host sets the response mark; it is removed from a guest's
+response.
+
+**Never a loop.** An event is placed at most once. The receiver cannot
+send it on. After a refusal the sender uses the ordinary path, which
+forwards at most once to a real owner.
+
+### 7. Why not the take call
+
+The move's take call (`x-wasmkeep-take`, ADR 0017) could ask the chosen
+node to acquire first, and the request would then follow as an ordinary
+forward. It would make every refusal clean. It is not used, because:
+
+- a take answers "no such actor" for an actor that does not exist yet,
+  and whether a request may create one is the request's own admission
+  (ADR 0010), judged by the node that will hold it;
+- it costs a second round trip on every placement, and wakes an actor
+  for a request that may never arrive;
+- the forward that acquires on arrival is already the drain's path.
+
+The buffered body and the refusal mark give the same clean refusals for
+everything placeable.
+
+### 8. The placed mark
+
+`x-wasmkeep-placed: 1` on the hop. It is added to the headers the hop's
+signature covers (`signature`'s list, as `x-wasmkeep-take` was), in the
+forward's proof (`x-wasmkeep-admitted`) and in a call's signature
+(`x-wasmkeep-internal`). The signature already binds the destination
+node, the method, the actor's path, the app, a timestamp and, through
+`x-wasmkeep-sender`, the sending node id; a call's also binds the body
+and is accepted once. A hop with the signed mark is sent only to nodes
+announcing `place`, since an older node would compute another signature.
+
+A node that cannot sign the hop keeps the actor: the cluster secret is
+not loaded, or the request has no peer address to prove.
+
+What the mark grants: **nothing**. Any node acquires an actor nobody
+holds when a client's request for it arrives. The mark only takes a
+right away, the receiver's right to place. So:
+
+- a replay of a placed forward does what the same client request sent
+  to that node's public port does, and needs no replay store of its
+  own. The existing ones still apply: a call's signature and a charged
+  rate-limit proof are accepted once;
+- a mark a client forged reaches a node only where a client's forwarded
+  mark does today: the public port of a single-app process that still
+  accepts plaintext hops. There the request is handled as that
+  forwarded request is today; the mark adds only "do not place", which
+  is today's behaviour, and it is not counted as a placement received.
+  On the public port of a process with several apps the mark is
+  stripped with every other `x-wasmkeep-*` header;
+- a hop whose proof is required and does not check is refused as
+  ADR 0038 refuses it, with the refusal mark (section 6).
+
+### 9. The `place` capability word, and the switch
+
+A node announces `place` on heartbeat line 11 when it publishes the room
+fields, reads the mark and has placement on. A node without the word is
+never a candidate and is not counted in `N`. A node places only when it
+announces the word itself.
+
+During a mixed-version upgrade, older nodes keep everything they wake
+and receive nothing placed; newer nodes place among themselves. Nothing
+refuses to start.
+
+Placement is on by default. `serve --no-placement`, or `placement =
+false` under `[process]` in the node file, turns it off for a process:
+its node ids neither place nor announce the word. It applies to every
+app of the process.
+
+### 10. Leases, drains, moves, failover
+
+- **Leases.** Unchanged. The receiver acquires through the ordinary
+  path: the record's conditional write under its node lease (ADR 0020)
+  and the recorded-head gate (ADR 0035). Placement never writes a
+  record and never asks a holder to release. If two nodes place or
+  acquire the same actor at once, one write wins and the other node
+  finds a holder.
+- **Drains.** A draining node does not place; its drain sends events to
+  its chosen peer. A node asked to drain, or not `serving`, is no
+  candidate. A node that starts draining after it was chosen refuses,
+  and the sender runs the event.
+- **Moves.** An actor named by a move request is not placed, on any
+  node. A moved actor is not pinned: once it hibernates, its next wake
+  is placed like any other.
+- **Failover.** A record naming a dead node is taken over by the node
+  the request reaches, after the usual wait. Requests kept during that
+  wait are not placed.
+- **A load balancer with a consistent hash.** Placement sends an actor
+  away from the node the balancer picked, so every request for it then
+  costs one forward while it is resident. The owner hint removes the
+  record read, not the hop. That price is why the floor and the 25%
+  band exist, and why upgrades are not placed. With an even hash, nodes
+  stay within the band and nothing is placed.
+- **Rate limits and budgets.** A request is charged once, at the node it
+  reached (ADR 0036); a refused placement does not charge it again. A
+  buffered body counts in no new budget: it is bounded by 64 KiB for the
+  time of one hop.
+
+### 11. Metrics
+
+All with `tenant` and `app`:
+
+- `wasmkeep_placements_total{kind,outcome}`: decisions that sent an
+  event. `kind`: `request`, `call`. `outcome`: `placed`, `refused`,
+  `unsent`, `failed` (the four rows of section 6).
+- `wasmkeep_placements_received_total{outcome}`: `acquired`, `refused`.
+- `wasmkeep_placement_kept_total{reason}`: placeable wake-ups kept here:
+  `floor`, `band`, `budget`, `no_candidate`, `unsigned`.
+- `wasmkeep_placement_fill{kind}`: this node id's fill, in thousandths
+  (`kind`: `residents`, `sockets`).
+
+The hop also counts in `wasmkeep_forwards_total`. `wasmkeep cluster
+status` shows each node's fill and room.
+
+## How a joining node fills
+
+A new node publishes a resident fill of 0. Each other node above the floor sends it its
+share of wake-ups, among the actors for which the new node is one of the
+two candidates, until the new node's next heartbeat shows where it
+stands. That repeats each period until the new node is within 25% of the
+senders. Actors already resident elsewhere stay; they reach the new node
+only after they hibernate and wake.
+
+Placement narrows a gap to the band. It does not equalise.
+
+The simulation (`sim/tests/madsim_placement.rs`) runs the real decision
+function over simulated nodes, heartbeats that are late, lost or read at
+different times, and actors that wake and hibernate. It has a node that
+joins three loaded ones, and one that returns after its actors were
+taken over. For every seed:
+
+1. **One hop.** No event is placed twice, and no placed event is
+   forwarded again.
+2. **One holder.** The node-lease simulation's ownership invariant
+   holds with placement on.
+3. **Nothing resident moves.** An actor changes node only across a
+   hibernation, a refusal before it ran, or a node's failure.
+4. **Direction.** Every placement leaves a node whose resident fill was
+   at least 200 and goes to a node whose last fill seen by the sender was below
+   80% of it.
+5. **No overshoot.** When a placed event arrives, the receiver's
+   residents are at most the count that puts it at 80% of the fullest
+   sender's fill at sending time, plus `N - 2` actors, plus the wake-ups
+   that reached it directly.
+6. **No flapping.** With steady arrivals, no two nodes place in both
+   directions within three heartbeat periods of each other.
+7. **It fills, then it is quiet.** With steady arrivals, and the other
+   nodes above the floor, the joining node's fill reaches 80% of the
+   lightest of them within two idle timeouts plus ten heartbeat periods,
+   and from then on no placement happens while every pair stays within
+   the band.
+8. **An idle cluster is silent.** With every node under the floor, no
+   event is placed.
+
+Removing the budget must fail property 5, removing the floor property 8,
+and using the heartbeat's clock under skew property 4.
+
+## Consequences
+
+- A node that joins or returns fills from the others' wake-ups without
+  an operator.
+- A placed actor costs a forward per request until it hibernates.
+- A request with a body above 64 KiB, an upgrade or an alarm always
+  wakes its actor where it lands.
+- One more thing can go wrong at wake-up: a chosen node that dies
+  between its heartbeat and the hop. A request then gets one `503`
+  unless the hop was never read, and the node is backed off.
+- The load line is now read by nodes. A node that published wrong room
+  figures would attract or repel wake-ups, never break ownership.
+
+## Alternatives
+
+- **The take call first.** Section 7.
+- **A random pair, or the least loaded node of all.** A random pair
+  splits two concurrent wakes of one actor; the least loaded node makes
+  every sender pick the same target, the herd the budget exists to
+  bound.
+- **No mark, the forwarded mark alone.** It would work for routing. The
+  mark lets the receiver refuse without running, lets it count what it
+  received, and keeps "placed" out of what a plain forward means.
+- **Moving running actors.** On the roadmap, only if this is not enough.
+
+## Tests (to build)
+
+- Load: room arithmetic with a cap, a floor and a full process; the line
+  written and read; a frozen older reader skipping the fields.
+- Decision: the floor, the band at its integer edges, the budget, a
+  stale load, one candidate, none, the same pair chosen on every node.
+- Routing: each "never placed" case of section 1; each row of section
+  6's table; the owner hint after a placement; the backoff; a call's
+  chain and re-entrancy kept across a placed call.
+- Signing: the mark inside both signatures, a stripped or added mark
+  refused, a guest unable to set either header, a node without `place`
+  never chosen, a process with placement off never chosen.
+- Cluster: three nodes, one fuller; a fourth joins and fills; two apps
+  in one process, one full, the other placed by its own room.
+- The simulation above.
+
+## Docs to change when accepted
+
+`failover-and-scaling.md` ("What does not happen today"), `cluster.md`,
+`monitoring.md`, `deploy/front-door.md`, `reference/node-file.md`,
+`ROADMAP.md`.
+
+## Open questions
+
+- The floor (200) and the band (25%) are first values. The simulation
+  and the release's benchmark pass may change them before this record
+  is accepted.
+- On by default: confirmed only if the benchmark shows no loss with a
+  hashing balancer.
+- The time bound in the simulation's property 7 is a first guess; the
+  simulation fixes it.
+- Whether a refused or unsent placement should also be offered to the
+  second candidate. Not in 0.6.0: one attempt, then here.
+
+## Plan
+
+Each slice is one change and says what it proves.
+
+- **P1. Load and view.** The room fields, written and read
+  (`wasmkeep-cluster`'s `membership.rs`: `Load`, `NodeInfo`; the
+  server's `actor/load.rs`); the view keeps each peer's load,
+  first-seen time and credit (`Peer` in `cluster.rs`,
+  `cluster/view.rs`); `place` parsed, not announced; `cluster status`
+  shows fill. Proves the arithmetic and that older readers are
+  unaffected.
+- **P2. The decision.** A pure function in `cluster/view.rs`:
+  candidates, the rule, the budget, freshness. Proves section 5 by unit
+  tests.
+- **P3. The simulation.** `sim/tests/madsim_placement.rs`, before any
+  wiring, so the constants can still change. Proves the eight
+  properties.
+- **P4. The hop.** The three-way route (`Owners::other_owner` in
+  `node_lease.rs`, `remote_owner` and `call` in `actor/routing.rs`,
+  `dispatch` in `actor/requests.rs`), the mark in both signatures
+  (`cluster/signing.rs`, `cluster/forwarding.rs`, `cluster.rs`), the
+  buffered body, the refusal mark, the fallback, the hint, the backoff,
+  the switch, the word announced, the metrics. Proves the routing,
+  signing and cluster tests. One adversarial review follows it: it
+  touches the path to ownership.
+- **P5. Docs and status.** The pages above; this record becomes
+  "accepted, as built".
