@@ -1374,6 +1374,16 @@ lease `released` and its remaining actors take the crash path (their
 last recorded floor still holds). `cluster diagnose` checks the bucket's
 semantics, not this setting.
 
+## Several apps in one process
+
+From 0.6.0 one process can serve several apps behind one public, one
+cluster and one metrics port: the [node file](reference/node-file.md)
+lists them. Each app keeps its own node id, lease, state and restarts; the
+process shares its listeners, its certificate (named for `[process] id`),
+its engine and its budgets. `wasmkeep cluster status` groups node ids by
+process, and `wasmkeep cluster drain --process ID` drains them all. See
+[upgrading to 0.6.0](deploy/upgrading-to-0.6.md) for the rollout.
+
 ## Upgrading WasmKeep
 
 Upgrading the `wasmkeep` binary itself (not your application: that is

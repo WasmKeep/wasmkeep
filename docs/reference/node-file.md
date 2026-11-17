@@ -1,0 +1,145 @@
+# The node file
+
+`wasmkeep-node.toml` describes a node process: which apps it serves and
+how ([ADR 0038](../adr/0038-several-apps-per-process.md)). It is the
+operator's file, separate from an app's [project file](../project-file.md):
+the project file says what an app is, the node file says which apps this
+process runs and on which ports.
+
+```sh
+wasmkeep serve --bucket s3://my-bucket/prod --node-file /etc/wasmkeep/wasmkeep-node.toml
+```
+
+`--node-file` replaces the flags it describes (`--app`, `--node-id`,
+`--advertise`, `--listen`, the cluster and metrics listeners, the data
+directory, the per-app settings below): giving one of them beside it is an
+error. Process flags it does not describe (`--bucket`, `--max-instances`,
+`--cache-dir`, `--idle-timeout-secs`, `--cluster-plaintext`, ...) stay on
+the command line. The file is read once, at start; to add, remove or change
+an app, edit it and restart the process.
+
+`serve --app TENANT/APP` and its flags keep working unchanged: they are a
+one-entry node file with the same meaning.
+
+## Example
+
+```toml
+[process]
+id = "edge-1"                       # the process identity, [a-z0-9-]
+data-dir = ".wasmkeep/data"
+
+[listen]
+public = "0.0.0.0:8080"
+public-advertise = "http://10.0.0.11:8080"
+cluster = "0.0.0.0:7443"
+cluster-advertise = "https://10.0.0.11:7443"
+metrics = "127.0.0.1:9100"
+
+[limits]
+max-sockets-per-node = 50000
+
+[[app]]
+name = "acme/shop"
+node-id = "shop-1"
+hostnames = ["shop.example.com"]
+secrets-key = ["keys/shop.key"]
+max-sockets = 20000
+min-resident = 200
+max-resident = 800
+max-front-requests = 32
+front-cpu-budget-ms = 50
+allow-outbound = ["10.0.0.0/8"]
+allow-outbound-port = [587]
+outbound-ca = ["ca/internal.pem"]
+front-env = ["env/shop-front.env"]
+
+[app.env]
+cart = ["env/cart.env"]             # CLASS = files, later files win
+
+[app.access]
+cart = "existing"
+
+[[app]]
+name = "acme/blog"
+node-id = "blog-1"
+hostnames = ["blog.example.com", "www.blog.example.com"]
+data-dir = "data/blog"              # optional: another data directory
+no-secrets = true
+```
+
+Relative paths are read from the file's directory.
+
+## Fields
+
+`[process]`
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The process's name: its cluster certificate is named for it, and each of its node ids publishes `process=<id>` in its heartbeat. |
+| `data-dir` | Every app's data directory unless its entry names its own (default `.wasmkeep/data`, as `--data-dir`). |
+
+`[listen]`: `public`, `public-advertise`, `cluster`, `cluster-advertise`
+and `metrics`, as `--listen`, `--advertise`, `--cluster-listen`,
+`--cluster-advertise` and `--metrics-listen`. `cluster` and
+`cluster-advertise` go together.
+
+`[limits]`: `max-sockets-per-node`, as `--max-sockets-per-node`.
+
+`[[app]]`, one per app:
+
+| Field | As the flag |
+| --- | --- |
+| `name` | `--app TENANT/APP` |
+| `node-id` | `--node-id`: the app's logical node id, kept as it is today |
+| `hostnames` | (none): the hosts that reach this app on the public port |
+| `secrets-key`, `no-secrets` | `--secrets-key` (one or two files), `--no-secrets` |
+| `env` (table by class), `front-env` | `--env CLASS=FILE`, `--front-env` |
+| `access` (table by class) | `--access CLASS=MODE`, until access rules are deployed |
+| `allow-outbound`, `allow-outbound-port`, `outbound-ca` | the egress flags |
+| `no-alarms` | `--no-alarms` |
+| `max-front-requests`, `front-cpu-budget-ms` | the front limits |
+| `max-sockets` | `--max-sockets-per-app` |
+| `min-resident`, `max-resident` | (none): the app's floor and cap in the process's resident pool |
+| `data-dir` | `--data-dir`, for this app alone |
+
+## Several apps in one process
+
+A file with more than one `[[app]]`, or with `hostnames`, is served as
+several apps behind the process's three ports:
+
+- **The public port routes by hostname only.** Exactly one `Host` is
+  required (400 otherwise, and when an absolute-form target names another
+  authority); an unknown host answers **421**, and so does a second host on
+  one connection; `Forwarded` and `X-Forwarded-Host` are ignored. Every
+  `x-wasmkeep-*` request header is removed: on this port every request is a
+  client's. `/_wasmkeep/health` is the process's; an app's readiness is
+  asked with one of its hostnames.
+- **The cluster port routes by the app a hop names,** which that app's
+  runtime checks against the hop's signature, its destination and its
+  sender. A hop without a node's proof answers 503.
+- **Each app keeps its node id, its lease, its state and its restarts.** A
+  verdict on one app's node id (another process writing it, a fence, a
+  release) stops that app's runtime alone; its hostnames answer 503 with
+  `Retry-After`, and it starts again in place, through the start check, 1 s
+  later, doubling to 60 s while it keeps failing. A deleted app's hostnames
+  answer 503 without `Retry-After`.
+- **Budgets are shared by a floor rule.** Residents (a pool sized from
+  `--max-instances`), public connections, front instance reservations,
+  batched uploads and restore reads: each app has an equal part, half of
+  it a floor never lent; an app may use any capacity outside the other
+  apps' unused floors, but takes nothing above its part while an app below
+  its own waits. `min-resident` sets an app's resident floor.
+
+Start refuses, before binding a listener or writing a heartbeat: an
+unknown field; a duplicate app, node id or hostname; an invalid name or
+hostname; an app ceiling above the node's; resident floors above the
+process's limit; two apps whose local roots overlap; two apps of one tenant
+over a data directory still in the layout from before 0.4.0; a second app
+without a cluster listener; several apps with `--cluster-plaintext
+accept`; and, with several apps, any live node of the cluster that does
+not announce `multi-app` (an older version). Errors name the file, line
+and field.
+
+Several apps share one process, one engine and one address space: the
+shares protect apps from a noisy neighbour, they do not isolate them from
+a hostile one. See the [security model](../security.md#several-apps-in-one-process).

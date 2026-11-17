@@ -218,6 +218,28 @@ no event runs new code under an old rule or the reverse. `--access` is
 refused with `--app` once rules are deployed. A rollback that reopens a
 class needs `--allow-reopen`.
 
+## Several apps in one process
+
+A process serving several apps ([the node file](reference/node-file.md))
+shares one cluster certificate between its apps' node ids, each of which
+publishes its pin. Trust is per node id, not per certificate:
+
+- every hop a node signs names its sender, bound to the hop's signature
+  under the cluster secret; on the cluster port the sender's own live
+  heartbeat must publish the pin the connection presented, and its answer
+  or relayed socket stays trusted only while it does. A healthy app's
+  heartbeat never keeps a lapsed sibling's hops or relays trusted;
+- a process of several apps requires the sender on every hop and a signed
+  proof on every forward, and refuses a refused hop with 503: it never
+  runs as a client's request;
+- the public port of such a process removes every `x-wasmkeep-*` header,
+  and routes by hostname only;
+- `--cluster-plaintext accept` is refused with several apps.
+
+The apps share the process's crashes, engine and memory: per-app floors
+and ceilings protect against a noisy neighbour, not a hostile one. Put
+apps of different trust in different processes.
+
 ## Known gaps
 
 - Hostile multi-tenancy: every actor of a node shares one process (see the note above).

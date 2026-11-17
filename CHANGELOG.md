@@ -9,6 +9,21 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Several apps per process (ADR 0038):** `wasmkeep serve --node-file
+  wasmkeep-node.toml` serves several apps behind one public, one cluster
+  and one metrics port. The public port routes by hostname (421 for an
+  unknown host, every `x-wasmkeep-*` header removed); each app keeps its
+  node id, lease, state and restarts, and a verdict on one app's node id
+  restarts that app alone, in place. Residents, connections, front
+  reservations, uploads and restore reads are shared between apps with a
+  floor per app. Every node now names its sender in each hop it signs and
+  announces `multi-app` (and `process=<id>`) in its heartbeat; a process
+  of several apps refuses to start while a live node lacks it. `cluster
+  status` groups node ids by process, `cluster drain --process ID` drains
+  them all. `serve --app` is unchanged. See [the node
+  file](docs/reference/node-file.md) and [upgrading to
+  0.6.0](docs/deploy/upgrading-to-0.6.md).
+
 ## 0.5.1
 
 **Fixes and safer operations on 0.5.0.** Activations run under the same

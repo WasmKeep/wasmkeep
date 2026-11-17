@@ -460,3 +460,33 @@ async fn a_refused_signed_hop_is_named_for_its_503() {
     );
     assert_eq!(b.hop_refused(&m, PATH, &bad, false), None);
 }
+
+/// ADR 0038, section 5: a hop signed for one app's node id, replayed to
+/// another app's node of the same process, is refused: the destination is
+/// signed.
+#[tokio::test]
+async fn a_hop_replayed_to_another_apps_node_is_refused() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(SECRET_KEY),
+            SECRET.as_bytes().to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let process = NodeProcess::new();
+    let make = |id: &str, app: &str| {
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), Arc::clone(&store));
+        config.heartbeat = Duration::from_secs(3_600);
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    let (shop, blog) = (make("shop-1", "shop"), make("blog-1", "blog"));
+    shop.load_secret().await;
+    blog.load_secret().await;
+    let m = hyper::Method::POST;
+    let hop = call("shop-1", PATH, None);
+    assert!(blog.is_internal(&m, PATH, &hop, true).is_none());
+    assert!(blog.hop_refused(&m, PATH, &hop, true).is_some());
+}

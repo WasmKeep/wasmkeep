@@ -230,7 +230,13 @@ struct MoveArgs {
 #[derive(Debug, Args)]
 struct DrainArgs {
     /// The node's id.
-    node: String,
+    #[arg(required_unless_present = "process", conflicts_with = "process")]
+    node: Option<String>,
+
+    /// Every node id this process runs (ADR 0038: the `process=` its
+    /// heartbeats name), instead of one node.
+    #[arg(long, value_name = "ID")]
+    process: Option<String>,
 
     /// Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from
     /// the AWS_* environment variables).
@@ -2359,20 +2365,85 @@ async fn live_node(
         .find(|n| n.id == id && membership::is_live(n, now, horizon_ms)))
 }
 
+/// The live node ids among `nodes` whose heartbeats name `process`, sorted.
+pub(crate) fn process_node_ids(
+    nodes: &[wasmkeep_cluster::membership::NodeInfo],
+    process: &str,
+    now_ms: u64,
+    horizon_ms: u64,
+) -> Vec<String> {
+    let mut ids: Vec<String> = nodes
+        .iter()
+        .filter(|n| {
+            n.process.as_deref() == Some(process)
+                && wasmkeep_cluster::membership::is_live(n, now_ms, horizon_ms)
+        })
+        .map(|n| n.id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// Writes or deletes `control/drain/<node>` (ADR 0014). Without `--force`,
 /// a drain needs a live node with the id (a request for an id no node uses
 /// stays in `control/` until an undrain with the same id), and an undrain a
 /// live node or a request to withdraw.
 fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
-    use wasmkeep_cluster::control::{self, Keys as _};
-    let key = control::drain_key(&args.node)?;
+    // A bad id is refused before the bucket is touched.
+    if let Some(node) = &args.node {
+        wasmkeep_cluster::control::drain_key(node)?;
+    }
     let (store, prefix) = open_bucket(&args.bucket)?;
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    if !args.force && rt.block_on(live_node(&keys, &args.node))?.is_none() {
-        let id = &args.node;
+    let ids = match (&args.node, &args.process) {
+        (Some(node), _) => vec![node.clone()],
+        (None, Some(process)) => {
+            // ADR 0038: every node id the process runs, as its live
+            // heartbeats name it.
+            let horizon_ms = wasmkeep_server::heartbeat_horizon_ms(
+                wasmkeep_server::DEFAULT_HEARTBEAT,
+                &wasmkeep_server::LeaseConfig::default_safe(),
+            );
+            let all = rt
+                .block_on(wasmkeep_cluster::membership::all_heartbeats(&keys))
+                .map_err(|e| anyhow::anyhow!("listing the heartbeats: {e}"))?;
+            let ids = process_node_ids(&all, process, status::now_ms(), horizon_ms);
+            anyhow::ensure!(
+                !ids.is_empty(),
+                "no live node id names the process {process} (see `wasmkeep cluster status`)"
+            );
+            ids
+        }
+        (None, None) => anyhow::bail!("give a node id, or --process ID"),
+    };
+    for id in &ids {
+        drain_node(&rt, &keys, id, drain, args.force)?;
+    }
+    announce_intent(&rt, &keys);
+    for id in &ids {
+        if drain {
+            println!("{}", drain_asked(id));
+        } else {
+            println!("Withdrew the drain request for {id}.");
+        }
+    }
+    Ok(())
+}
+
+/// [`cluster_drain`] for node `id`: the request written or withdrawn.
+fn drain_node(
+    rt: &tokio::runtime::Runtime,
+    keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
+    id: &str,
+    drain: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    use wasmkeep_cluster::control::{self, Keys as _};
+    let key = control::drain_key(id)?;
+    if !force && rt.block_on(live_node(keys, id))?.is_none() {
         if drain {
             anyhow::bail!(
                 "no live node has the id {id} (see `wasmkeep cluster status`): a drain request \
@@ -2381,7 +2452,7 @@ fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
             );
         }
         let requested = rt
-            .block_on(control::read(&keys, None, status::now_ms()))
+            .block_on(control::read(keys, None, status::now_ms()))
             .map_err(|e| anyhow::anyhow!("reading the drain requests: {e}"))?
             .draining
             .contains(id);
@@ -2395,12 +2466,6 @@ fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
         rt.block_on(keys.put_empty(&key))?;
     } else {
         rt.block_on(keys.delete(&key))?;
-    }
-    announce_intent(&rt, &keys);
-    if drain {
-        println!("{}", drain_asked(&args.node));
-    } else {
-        println!("Withdrew the drain request for {}.", args.node);
     }
     Ok(())
 }

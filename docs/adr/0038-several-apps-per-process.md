@@ -1,12 +1,12 @@
 # 0038. Several apps per process
 
-- Status: proposed (2026-11-17); revised the same day after a design
-  review (the sender inside the signed envelope and a pin shared by
+- Status: accepted, as built (2026-11-17). Revised the same day after a
+  design review (the sender inside the signed envelope and a pin shared by
   several node ids, the forward's envelope, node hops and the public
   port, restarting one app in place, residents across apps, per-app
-  settings, a share of every shared budget). A design, not an available
-  capability: until it is accepted and built, a node process serves one
-  app.
+  settings, a share of every shared budget), and after an adversarial
+  review of the build (section 8's floor rule). Built in slices M1 to M6
+  for 0.6.0; see [the node file](../reference/node-file.md).
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, first item
 - Follows: [ADR 0021](0021-the-app-model.md) (the app is the unit; shared

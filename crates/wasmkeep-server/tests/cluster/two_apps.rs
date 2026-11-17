@@ -65,6 +65,16 @@ async fn process_pooled(
     defs: &[Def],
     pool: Option<usize>,
 ) -> Proc {
+    process_inner(store, data, defs, pool, true).await
+}
+
+async fn process_inner(
+    store: &Arc<dyn ObjectStore>,
+    data: &Path,
+    defs: &[Def],
+    pool: Option<usize>,
+    wait: bool,
+) -> Proc {
     let pool = pool.map(wasmkeep_runtime::ResidentPool::new);
     let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let cluster = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -209,11 +219,18 @@ async fn process_pooled(
         services,
         _stop: stop,
     };
-    eventually("every app started", async || {
-        defs.iter().all(|d| proc.service(d.node).is_some())
-    })
-    .await;
+    if wait {
+        eventually("every app started", async || {
+            defs.iter().all(|d| proc.service(d.node).is_some())
+        })
+        .await;
+    }
     proc
+}
+
+/// [`process`], not waiting for every app to start.
+async fn process_pooled_quiet(store: &Arc<dyn ObjectStore>, data: &Path, defs: &[Def]) -> Proc {
+    process_inner(store, data, defs, None, false).await
 }
 
 /// `method path` to `addr` with `Host: host` (none if empty) and `extra`
@@ -705,4 +722,315 @@ async fn one_apps_idle_residents_make_room_for_anothers_wake_up() {
         2,
         "shop kept its floor"
     );
+}
+
+/// The instance token `nodes/<id>` holds now (its line 2's second word).
+async fn token_of(store: &Arc<dyn ObjectStore>, id: &str) -> String {
+    use object_store::ObjectStoreExt as _;
+    let body = store
+        .get(&object_store::path::Path::from(format!("nodes/{id}")))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body).into_owned();
+    text.lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// ADR 0038, section 3: a fence over one app's node id stops that runtime
+/// alone; it comes back in place under a new token, and the sibling app
+/// serves throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_node_id_stops_its_runtime_alone_and_it_restarts_in_place() {
+    use object_store::ObjectStoreExt as _;
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let p = process(&store, d.path(), &SHOP_BLOG).await;
+    let r = to_reachable(p.public, "shop.test", "POST", "/actor/counter/alice").await;
+    assert_eq!(r.status, 200);
+    let old = p.service("shop-1").unwrap();
+    let before = token_of(&store, "shop-1").await;
+    let fence = wasmkeep_cluster::node_lease::NodeLeaseObject {
+        state: wasmkeep_cluster::node_lease::NodeState::Fenced,
+        instance: Some(before.clone()),
+        written_at_ms: now_ms(),
+    };
+    store
+        .put(
+            &object_store::path::Path::from("nodes/shop-1"),
+            fence.encode().into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), old.node_id_lost())
+        .await
+        .expect("the fence was never noticed");
+    let r = to_reachable(p.public, "blog.test", "POST", "/actor/counter/alice").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "blog serves on");
+    eventually("shop restarted in place", async || {
+        to(p.public, "shop.test", "POST", "/actor/counter/alice", "")
+            .await
+            .status
+            == 200
+    })
+    .await;
+    assert_eq!(old.resident(), 0);
+    assert_ne!(token_of(&store, "shop-1").await, before, "a new token");
+}
+
+/// ADR 0038, tests: one app's broken deploy (its version unreadable) keeps
+/// that app's runtime from starting (503 with Retry-After) and leaves the
+/// other app serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_apps_broken_deploy_leaves_the_other_serving() {
+    use futures_util::StreamExt as _;
+    use object_store::ObjectStoreExt as _;
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    for app in ["shop", "blog"] {
+        AppRef::new(Arc::clone(&store), "", "default", app)
+            .deploy(
+                &deploy_runtime(),
+                vec![("t".to_owned(), test_actor_wasm().to_vec())],
+            )
+            .await
+            .unwrap();
+    }
+    // Shop's version objects are gone: its deploy cannot be applied.
+    let versions: Vec<_> = store
+        .list(Some(&object_store::path::Path::from("apps/default/shop")))
+        .collect()
+        .await;
+    let manifests: Vec<_> = versions
+        .into_iter()
+        .map(|v| v.unwrap().location)
+        .filter(|k| k.as_ref().ends_with("/manifest"))
+        .collect();
+    assert!(!manifests.is_empty());
+    for m in manifests {
+        store.delete(&m).await.unwrap();
+    }
+    let d = tempfile::tempdir().unwrap();
+    let defs = [
+        Def {
+            deployed: true,
+            ..def("shop-1", "default", "shop", &["shop.test"])
+        },
+        Def {
+            deployed: true,
+            ..def("blog-1", "default", "blog", &["blog.test"])
+        },
+    ];
+    let public = start_without_waiting(&store, d.path(), &defs).await;
+    eventually("blog serves", async || {
+        to(public.public, "blog.test", "POST", "/actor/t/x/durable", "")
+            .await
+            .status
+            == 200
+    })
+    .await;
+    let r = to(public.public, "shop.test", "POST", "/actor/t/x/durable", "").await;
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert!(r.retry_after.is_some(), "a start is still pending");
+}
+
+/// [`process`], not waiting for every app to start.
+async fn start_without_waiting(store: &Arc<dyn ObjectStore>, data: &Path, defs: &[Def]) -> Proc {
+    process_pooled_quiet(store, data, defs).await
+}
+
+/// ADR 0038, tests: a process started again with one app removed from its
+/// node file: that app's actors fail over to its other node, the other
+/// app's resume on this one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_removed_from_the_file_fails_over_and_the_other_resumes() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let p1 = process(&store, d1.path(), &SHOP_BLOG).await;
+    for host in ["shop.test", "blog.test"] {
+        let r = to_reachable(p1.public, host, "POST", "/actor/counter/alice").await;
+        assert_eq!((r.status, r.body.trim()), (200, "1"), "{host}");
+    }
+    let p2 = process(
+        &store,
+        d2.path(),
+        &[
+            def("shop-2", "acme", "shop", &["shop.test"]),
+            def("blog-2", "acme", "blog", &["blog.test"]),
+        ],
+    )
+    .await;
+    // p1 stops (a clean stop releases its records), and starts again
+    // without blog.
+    let shop1 = p1.service("shop-1").unwrap();
+    drop(p1);
+    eventually("p1 stopped", async || shop1.not_ready().is_some()).await;
+    drop(shop1);
+    let p1 = process(&store, d1.path(), &SHOP_BLOG[..1]).await;
+    let r = to_reachable(p1.public, "shop.test", "POST", "/actor/counter/alice").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    assert_eq!(
+        to(p1.public, "blog.test", "POST", "/actor/counter/alice", "")
+            .await
+            .status,
+        421
+    );
+    let r = to_reachable(p2.public, "blog.test", "POST", "/actor/counter/alice").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+}
+
+/// ADR 0038, rolling upgrade: single-app nodes (an older one among them,
+/// without `multi-app`) first; a process of several apps refuses to start
+/// while the older node is live, starts once it is upgraded, and reports
+/// not ready while an older node joins again; rolled back, the single-app
+/// nodes serve the same actors on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rolling_upgrade_from_single_app_nodes_and_back() {
+    use object_store::ObjectStoreExt as _;
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let single = |id: &'static str, app: &'static str| {
+        let store = Arc::clone(&store);
+        async move {
+            let d = tempfile::tempdir().unwrap();
+            let node = node_configured(
+                id,
+                d.path(),
+                &store,
+                Duration::from_secs(30),
+                &["counter"],
+                counter_wasm(),
+                Duration::from_secs(30),
+                "",
+                |c| {
+                    c.tenant = "acme".into();
+                    c.app = app.into();
+                    if let Some(cluster) = c.cluster.as_mut() {
+                        cluster.app = format!("acme/{app}");
+                    }
+                },
+            )
+            .await;
+            (node, d)
+        }
+    };
+    let (shop_a, _da) = single("shop-a", "shop").await;
+    let (blog_a, _db) = single("blog-a", "blog").await;
+    settle().await;
+    for addr in [shop_a.addr, blog_a.addr] {
+        let r = send_reachable(addr, "POST", "/actor/counter/alice", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, "1"));
+    }
+    // A 0.5.x node of shop, without the word: a second app is refused.
+    let older = |live: bool| {
+        let store = Arc::clone(&store);
+        async move {
+            let state = if live { "live" } else { "released" };
+            let body = format!(
+                "wasmkeep-node 3\n{state} beef\n{}\nold\nhttp://127.0.0.1:1\n0\nacme/shop\n\n\nserving\n\ntake\n",
+                now_ms()
+            );
+            store
+                .put(
+                    &object_store::path::Path::from("nodes/old"),
+                    body.into_bytes().into(),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    older(true).await;
+    let refused = wasmkeep_server::nodes_without_multi_app(Arc::clone(&store), "")
+        .await
+        .unwrap();
+    assert_eq!(refused, ["old"], "the start refusal names it");
+    // It is upgraded (it leaves): the second app is enabled.
+    older(false).await;
+    assert!(
+        wasmkeep_server::nodes_without_multi_app(Arc::clone(&store), "")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let dm = tempfile::tempdir().unwrap();
+    let p = process(
+        &store,
+        dm.path(),
+        &[
+            def("shop-m", "acme", "shop", &["shop.test"]),
+            def("blog-m", "acme", "blog", &["blog.test"]),
+        ],
+    )
+    .await;
+    for host in ["shop.test", "blog.test"] {
+        let r = to_reachable(p.public, host, "POST", "/actor/counter/alice").await;
+        assert_eq!((r.status, r.body.trim()), (200, "2"), "{host}: {}", r.body);
+    }
+    eventually("ready", async || {
+        to(p.public, "shop.test", "GET", "/_wasmkeep/ready", "")
+            .await
+            .status
+            == 200
+    })
+    .await;
+    // An older node joins again: not ready, actors still served.
+    let writer = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            loop {
+                let body = format!(
+                    "wasmkeep-node 3\nlive beef\n{}\nold\nhttp://127.0.0.1:1\n0\nacme/shop\n\n\nserving\n\ntake\n",
+                    now_ms()
+                );
+                let _ = store
+                    .put(
+                        &object_store::path::Path::from("nodes/old"),
+                        body.into_bytes().into(),
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    eventually("not ready in the mix", async || {
+        to(p.public, "blog.test", "GET", "/_wasmkeep/ready", "")
+            .await
+            .status
+            == 503
+    })
+    .await;
+    let r = to_reachable(p.public, "shop.test", "POST", "/actor/counter/alice").await;
+    assert_eq!((r.status, r.body.trim()), (200, "3"));
+    writer.abort();
+    older(false).await;
+    // Rolled back: the process of several apps stops; the single-app
+    // nodes serve the same actors on.
+    drop(p);
+    for addr in [shop_a.addr, blog_a.addr] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = send(addr, "POST", "/actor/counter/alice", "").await;
+            if r.status == 200 {
+                assert!(["3", "4"].contains(&r.body.trim()), "{}", r.body);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{}", r.body);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
