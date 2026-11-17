@@ -206,9 +206,14 @@ The first rule that applies decides:
 5. **Descent is proven**: `state`. Either `P` is on
    `history::ancestry(listing, H)`, or that ancestry holds a position
    of `P`'s generation with a txid at or above `P`'s. The second form
-   is needed because collection removes old segments: a generation has
-   one writer, which uploads one segment per txid in order, so two
-   positions of one generation are on one chain.
+   is needed because collection removes old segments. It is sound
+   because a generation is one hold, a hold has one replica, and a
+   replica writes its positions one after the other, each on the one
+   before: two positions of one generation are on one chain. Every
+   write path was checked against that
+   ([decision 1](#decisions-on-the-open-questions)). A position of
+   generation 0 never satisfies the second form: 0 is not a hold's
+   generation.
 6. **Otherwise**: `rebase`. Reason `fork` when the ancestry holds
    another position at `P`'s txid, or `H`'s txid is below `P`'s; reason
    `unproven` when collection has removed the ancestry before the
@@ -220,7 +225,8 @@ Three cases that have no rule of their own:
   unchanged should not happen: a delete keeps two objects and
   collection keeps the head. The feed lists that actor's prefix once
   more, and if it is still empty emits `deleted`, reason `absent`, with
-  a warning.
+  a warning. An actor already recorded as `deleted` and still not listed
+  is skipped: no listing, nothing emitted.
 - **A database with no app tables and no label** (written by a node
   from before ADR 0033, or an actor that never created a table) is
   emitted as `state` with no rows. The projection is the same as for a
@@ -266,8 +272,16 @@ Each data file holds the table's own columns and, beside them,
 `_wk_tenant`, `_wk_app`, `_wk_name`, `_wk_seq`, `_wk_generation`,
 `_wk_txid` and `_wk_committed_at`: ADR 0033's columns plus `_wk_seq`.
 An app column whose name begins with `_wk_` is written as `_app` plus
-its name (`_app_wk_name`), with a warning. Only ordinary app tables are
-written: no host table, no view, no virtual table.
+its name (`_app_wk_name`), with a warning.
+
+**Only ordinary app tables are written**: no host table, no view, no
+virtual table and no shadow table of a virtual table. The feed asks
+SQLite which is which (`PRAGMA table_list` on the replayed database,
+type `table` only) and does not guess from names. `_wk_tables` lists
+the same tables, so it is not `Verification.tables` as `actor export`
+prints it: that list is every `type='table'` row of the schema, which
+includes virtual tables and their shadows. What this leaves out is in
+[decision 4](#decisions-on-the-open-questions).
 
 **A committed file never changes.** Once `_wk_states/<seq>.parquet`
 exists under its final name, neither it nor the data files of that
@@ -291,7 +305,9 @@ STATE/
   sequence number reserved and the highest committed;
 - `heads`, one row per actor, keyed by class and encoded name: the
   position, the head object's identity, the label, the kind and the
-  sequence number last emitted;
+  sequence number last emitted. A row is never removed: an actor
+  emitted as `deleted` keeps its row, with that kind, so that it is not
+  emitted again at every poll and so that compaction knows it;
 - `columns`, one row per class, table and column: the type last written
   (section 8).
 
@@ -332,7 +348,8 @@ directory records has its rows in committed files, and every head it
 does not record is read again. Losing the state directory is not
 repaired in place: a new state directory with an existing output
 directory is refused, and the remedy is a new output directory, built
-again from the bucket.
+again from the bucket
+([decision 5](#decisions-on-the-open-questions)).
 
 **Guarantees, as ADR 0033 states them**: at least once; ordered per
 actor by `_wk_seq`, never across actors; positions may be skipped; no
@@ -348,20 +365,30 @@ columns.
   case as SQLite compares them; the first spelling seen is kept. An
   actor without a column has NULL there.
 - **A column's type in a file** is that of its values: integer, real,
-  text or blob. A column holding more than one of them in one file is
+  text or blob. A column with no value at all is written with its
+  recorded type, or left out of the file when none is recorded.
+- **Integers and reals together are a real** (Parquet `DOUBLE`), with
+  no warning, when every integer of the column in that file is between
+  -2^53 and 2^53, so that none changes value. This is the ordinary case,
+  not an oddity: the TypeScript SDK binds `2` as an integer and `2.5` as
+  a real, so a price column without a `REAL` affinity holds both.
+- **Any other mix is text**: a column holding more than one type in one
+  file, or integers and reals with an integer outside that range, is
   written as text, rendered as `actor sql` renders CSV, with a warning
-  naming the class, table and column. A column with no value at all is
-  written with its recorded type, or left out of the file when none is
-  recorded.
-- **Across files**, the type last written is recorded in `state.db`.
-  Once a column has been written as text it stays text. A column whose
-  values change type between two polls gets its new type from then on;
-  older files keep theirs, since committed files never change.
+  naming the class, table and column.
+- **Across files**, the type last written is recorded in `state.db`,
+  and a type only widens: integer, then real, then text. Once a column
+  has been written as real, a later file of integers alone is written
+  as real too (or as text, if one is outside the range); once it has
+  been written as text it stays text. Any other change (a blob column
+  that becomes integers) gives the column its new type from then on.
+  Older files keep theirs, since committed files never change.
 - **The views absorb the difference.** After a batch that changed a
   recorded type or added a column, the feed rewrites
   `OUT/views.duckdb.sql`: for each class and table, a view named
   `<class>_<table>` that lists every recorded column, casts a column
-  whose files disagree to text, and keeps the rows whose `_wk_seq` is
+  whose files disagree to `DOUBLE` when they hold integers and reals
+  only and to text otherwise, and keeps the rows whose `_wk_seq` is
   their actor's latest in `_wk_states` and whose kind is not `deleted`;
   and a view `<class>_<table>_history` without that filter. The file is
   plain SQL: the feed depends on no DuckDB code, and another engine can
@@ -425,7 +452,9 @@ warehouse read; no smaller maintained writer exists*.
   features bring. If a feature brings a licence outside the list, the
   feature goes; the list is not widened for the feed.
 - The runtime, storage, cluster and server crates gain nothing. The
-  `wasmkeep` binary, which is also the node, grows by the writer.
+  `wasmkeep` binary, which is also the node, grows by the writer: the
+  feed is always built, behind no cargo feature
+  ([decision 2](#decisions-on-the-open-questions)).
 
 ## Consequences
 
@@ -437,7 +466,15 @@ warehouse read; no smaller maintained writer exists*.
 - A deleted actor's earlier rows stay in older files until compaction.
   The views hide them; the files still hold them. Until F7 the way to
   honour an erasure in the output is to remove both directories and
-  build again.
+  build again. After compaction its rows are gone and its name stays,
+  in one `deleted` row of `_wk_states`
+  ([decision 3](#decisions-on-the-open-questions)). For a deleted actor
+  the bucket's keys hold that name too; for an actor of an earlier
+  incarnation of the app (reason `absent`) the output is then the only
+  place that does, until a new output directory is built.
+- A full-text table that holds its own text (FTS5 without an external
+  content table) is not in the feed: neither the virtual table nor its
+  shadows are written.
 - Lag is at least the poll interval, plus the listing, plus a restore
   per changed actor.
 - One more reader of the bucket, with a request bill the operator
@@ -483,7 +520,10 @@ under `./scripts/check.sh --s3` for the bucket-gated run.
 - **A delete**: the actor's rows leave the view, `_wk_states` holds
   `deleted`; the same actor written again appears as `rebase`, reason
   `delete`, when both happened between two polls, and a database that
-  still carries an old delete label is not reported deleted.
+  still carries an old delete label is not reported deleted. The same
+  in a batched class, with commits pending when the delete is asked:
+  the label's txid must be the reset's. A poll after the delete emits
+  nothing more for that actor.
 - **A restore**: `actor restore` to a past position appears as `rebase`,
   reason `restore`, and the view holds the past rows.
 - **A late tip overtaken**: a listing built with a tip of an earlier
@@ -496,7 +536,12 @@ under `./scripts/check.sh --s3` for the bucket-gated run.
   writes nothing.
 - **A schema change**: a column added by some actors only, a column
   whose values change type within one poll and between two polls, a
-  dropped table, a column named `_wk_name`. The generated views load in
+  dropped table, a column named `_wk_name`; integers and reals in one
+  column (a `DOUBLE`, no warning), then with an integer above 2^53
+  (text, a warning), then a file of integers alone after a real was
+  written (still a `DOUBLE`). An actor with an FTS5 table and an R-tree:
+  neither they nor their shadow tables are written or listed in
+  `_wk_tables`, and its ordinary tables are. The generated views load in
   DuckDB and return the expected rows; this test runs when the DuckDB
   command-line tool is installed and is reported as not run otherwise.
 - **A batched class**: with a segment in flight, the feed shows the
@@ -515,23 +560,208 @@ linked from `docs/SUMMARY.md`; the actor data access guide; the CLI
 reference; `docs/legal.md` and the notices; ADR 0033's sections 7 and 8;
 `ROADMAP.md`.
 
-## Open questions
+## Decisions on the open questions
 
-- Whether rule 5's second form (two positions of one generation are on
-  one chain) holds in every path that writes a segment, including the
-  replacement of a single-actor restore and a reset. If one path breaks
-  it, the rule falls back to the listed ancestry alone and `unproven`
-  becomes more common.
-- Whether the feed should be a cargo feature of the CLI, so that a node
-  binary can be built without the Parquet writer.
-- What compaction keeps of a deleted actor: nothing, or its `deleted`
-  row for a time so that consumers loading files learn of the delete.
-- Whether shadow tables of virtual tables (ordinary tables to SQLite)
-  should be left out by name.
-- Whether a lost state directory should be recoverable from
-  `_wk_states` rather than by building again.
-- Whether integers and reals mixed in one column deserve a numeric type
-  instead of text.
+The six questions this record was proposed with, decided on 2026-11-17
+against the code at `0465468`.
+
+### 1. Same-generation descent holds on every write path
+
+Rule 5's second form stays. What it needs: all the positions one
+generation ever wrote are on one chain. What the code gives:
+
+- **A generation is one hold.** Every acquisition writes the ownership
+  record at generation + 1, a node taking its own actor back included
+  (ADR 0020), and the first record of an actor is seeded above every
+  generation its keys carry. Every give-up (`ActorState::abandon`, a
+  failed or interrupted upload) drops the hold, and `Replica::restore`
+  runs once per hold: a replica never restores twice in one generation.
+- **A replica writes one line.** Each write is at `(its generation,
+  head txid + 1)` with the head as parent, the key is created, never
+  overwritten (`PutMode::Create`: other bytes at the key are a conflict
+  that stops the replica), and the head advances only on an
+  acknowledgement. An upload that fails or is cut leaves `failed` set,
+  and nothing more is written under that generation. So the last
+  position of a generation may be an unacknowledged tip, and nothing
+  of the same generation is beside it.
+
+| Path | What it writes | On the generation's line |
+| --- | --- | --- |
+| Plain and durable writes (`Replica::ship`) | a segment at head + 1 | yes |
+| Batched writes (ADR 0034, the ticket of `replica/batched.rs`) | a segment at head + 1, one in flight at a time; a ticket dropped before its capture uploaded nothing, and its txid is used once | yes |
+| Delete: `delete-self`, the durable one, the operator's (`ship_reset`) | a reset segment at head + 1 | yes; the label decides the kind first (rules 2 and 3) |
+| Single-actor restore (`ship_reset` of the replacement) | a segment at head + 1, by the holder | yes; rule 3 answers `rebase` before descent is asked |
+| First snapshot (empty history) | a snapshot at head + 1, no segment | yes |
+| Periodic snapshot, and the one after a delete or a restore | a snapshot **at the head**, keyed by the head's position, which may be of an earlier generation | no new position: the same database under a second name |
+| Recorded head on hand-over (ADR 0035) | nothing under `actors/`: a field of the ownership record, and a floor a restore must see | not a write path |
+| `cluster migrate` (ADR 0022: offline, once, the layout from before 0.4.0) | copies of history objects under the app's root, bytes and key tails unchanged | no new position |
+| The ownership format setting (`app_format.rs`) | nothing under `actors/` | not a write path |
+
+So "one writer per generation" is true of positions, not of objects: a
+snapshot named after an earlier generation's position can be written by
+a later holder. The feed compares positions, and that snapshot is only
+ever the database at the position it names
+(`Replica::refuse_unless_at_head`).
+
+**Where it does not hold, and what the feed does:**
+
+- **A new incarnation of the app** (`app delete` then a recreation,
+  `backup restore` into an empty root or in place). Generations start
+  again or history keys come back with other bytes, so a position can
+  name two databases. Both write a marker (`recreated`, `restored`),
+  and rule 1 answers before any position is compared: every actor is a
+  `rebase`. Descent is never asked across incarnations.
+- **Generation 0.** `ActorState` builds its replica with
+  `hold.generation().unwrap_or(0)`: a hold lost between the acquire and
+  the restore gives a replica of generation 0. Its lease is already
+  invalid, so nothing it uploads is acknowledged, but an upload's first
+  attempt is sent before the lease is looked at. Whether such an object
+  can land was not shown either way, and two lost holds would share the
+  number. The feed therefore never takes a position of generation 0 as
+  proof (rule 5), and falls back to the listed ancestry, then `fork` or
+  `unproven`.
+- **A delete whose label is behind.** Rule 2 wants the label's txid to
+  be the head's. The label is computed (`head + 1`) before the reset is
+  shipped, under a lock released in between. If a batched segment were
+  acknowledged in that gap, the reset would land one txid later and the
+  actor would be emitted as `rebase`, reason `delete`, with no table:
+  the projection is right (no rows), the kind is not. F4 tests it; if
+  it can happen, rule 2 compares "at or below the head's txid, in the
+  head's generation, and no app table" instead.
+
+**Revisit if** a write path is added that writes under `actors/` without
+holding the actor (a repair tool, a node-written change index), or the
+ownership record stops raising the generation at every acquisition.
+
+### 2. Always built, no cargo feature
+
+The feed is part of every `wasmkeep` binary.
+
+- The CLI has no cargo feature today, and `scripts/check.sh`,
+  `cargo deny`, the licence and notice scripts, `scripts/sbom.sh` and
+  the release workflow all describe one tree. A feature makes two: two
+  SBOMs and notice files, or one that does not match the binary an
+  operator built without it.
+- A released binary that may or may not have `feed` is a support
+  question at every report.
+- What F1 added is small: `parquet` with no optional feature (no Arrow,
+  no codec), seven crates in the lock file, all inside the accepted
+  licences, in a release binary of about 42 MB that Wasmtime dominates.
+
+The size is to be measured once, when the command is exposed: the
+release binary before and after, from release artifacts or one local
+build each, written in `docs/legal.md`.
+
+**Revisit if** that measure is above 2 MB, or a later target (`duckdb`,
+`postgres`) needs a native library or a large tree: that target would
+be a feature, the Parquet writer still would not.
+
+### 3. Compaction keeps a deleted actor's `deleted` row, and no data row
+
+The compacted batch holds **one `_wk_states` row for every actor in
+`heads`**, and data rows for the live ones only. For a deleted actor
+that is its `deleted` row: name, position, kind, reason.
+
+- For reason `delete` it is what building again from the bucket would
+  give: a deleted actor is still listed (its reset and the snapshot at
+  it stay for good, ADR 0028), and a new feed emits it as `deleted`.
+- For reason `absent` (an actor of an earlier incarnation, gone from
+  the bucket) a new build would not know the actor at all. Its row is
+  kept all the same: one rule, and the consumer below needs it most
+  there, since a whole app's actors went at once.
+- A consumer that loads files as they appear (section 5) and was behind
+  when compaction ran still learns of the delete. With the row dropped
+  it would keep the actor's rows for ever, which breaks "at least once".
+- No time to configure, nothing to expire.
+
+What stays is the actor's name. The bucket's keys hold it anyway for
+reason `delete`; for reason `absent` the output alone does, and the way
+to remove it is a new output directory, which an operator who deleted
+an app to erase it should build in any case. F7's proof becomes "no
+*data* row of a deleted actor remains".
+
+**Revisit if** names of deleted actors must leave the output without a
+new build: that needs a retention time for `deleted` rows, and
+consumers that load within it.
+
+### 4. Virtual tables and their shadow tables are left out
+
+Neither is written, and neither is listed in `_wk_tables`.
+
+- **Today's readers do not separate them.** `readonly::verify` lists
+  every `type='table'` row of the schema that is not a host or `sqlite_`
+  table: a virtual table and each of its shadows are in
+  `Verification.tables`, `actor export` keeps them in the file, and
+  `actor sql` can read both. Guests may create FTS3, FTS4, FTS5 and
+  R-tree tables (`ALLOWED_MODULES`), so they exist in real actors.
+- **Shadow tables are an index's private pages**: blobs in a layout
+  SQLite does not promise, often larger than the data, rewritten at
+  every change. As Parquet they cost and answer nothing.
+- **By type, not by name**: `PRAGMA table_list` gives `table`,
+  `virtual` or `shadow` (checked on the bundled SQLite with FTS5 and
+  R-tree). A name pattern would drop an app's ordinary table that
+  happens to be called `notes_data`.
+
+The cost: text held only by a full-text table (FTS5 without an external
+content table) is not in the feed. The usual layout, an ordinary table
+indexed by an external-content FTS table, loses nothing.
+
+**Revisit if** someone needs that text: write the virtual table's own
+rows (`SELECT *` through the module), never its shadows.
+
+### 5. A lost state directory is not recovered from `_wk_states`
+
+The refusal of section 7 stays: a new state directory with an existing
+output directory does not start, and the remedy is a new output
+directory.
+
+- `_wk_states` does not hold what `heads` holds: the head object's
+  identity, the label and the app's incarnation are not in the output,
+  and the recorded column types would have to be read back from every
+  file.
+- Without them no actor can be called unchanged and no descent can be
+  claimed. A recovered feed would read every actor again and emit each
+  as `rebase`, reason `unproven`: the bucket cost of a new build, with
+  an output directory twice the size.
+- The output is disposable by design (section 1).
+
+**Revisit if** F6 shows a build of a large app is too long to repeat.
+The cheap form is then an explicit `--adopt`: a state seeded with the
+next sequence number alone, every actor emitted once as `unproven`.
+
+### 6. Integers and reals in one column are a `DOUBLE`
+
+As section 8 now says: a `DOUBLE` when every integer is within ±2^53,
+text otherwise, and real is kept across files as text is.
+
+- Text was the wrong default for the common case. From TypeScript a
+  whole number is bound as an integer and any other as a real, so any
+  amount, average or coordinate in a column without `REAL` affinity is
+  mixed. As text, `sum()` needs a cast, the column never becomes
+  numeric again, and every poll warns.
+- Nothing is lost in the files: the range check keeps every integer
+  exact, and a column that fails it falls to text, which is lossless.
+- One place rounds: the view casts older integer-only files of a column
+  that later became real, and an integer above 2^53 in such a file is
+  rounded **by the view**, not in the file. `<class>_<table>_history`
+  read file by file keeps the integers.
+
+**Revisit if** an app needs exact 64-bit integers beside reals in one
+column: Parquet `DECIMAL`, decided then.
+
+### What these change in the slices
+
+- **F1 (built, `d75d2a1`)**: its writer turns any mixed column into
+  text. The integer-and-real rule and "real is kept" are a change to
+  `feed/writer.rs` and its tests, to make with F2 or right after it.
+- **F2**: choose the tables with `PRAGMA table_list`, not with
+  `Verification.tables`; `_wk_tables` is that choice. Nothing else.
+- **F3**: unchanged.
+- **F4**: `heads` keeps deleted actors, and one still absent is
+  skipped without a listing; generation 0 proves no descent; the
+  batched delete test of the label's txid.
+- **F5**: the views cast integer and real files to `DOUBLE`.
+- **F7**: one `_wk_states` row per actor in `heads`.
 
 ## Plan
 
@@ -541,26 +771,31 @@ Each slice is one change; each says what it proves.
   features, the type rules of section 8 within one file, the
   write-fsync-rename of a file. Proves that files read back equal what
   was written, and that `cargo deny check`, the licence and notice
-  scripts and the SBOM pass.
+  scripts and the SBOM pass. Built before decision 6: integers and
+  reals as a `DOUBLE` is a follow-up to its writer.
 - **F2. One poll.** The shared actor grouping, `state.db`, unchanged
-  heads skipped, `state` rows, `--classes`, `--max-bytes`, the lock.
-  Proves the projection of a known workload, the request counts of
-  section 9 and the read-only wrapper.
+  heads skipped, `state` rows, `--classes`, `--max-bytes`, the lock,
+  the tables chosen with `PRAGMA table_list` (decision 4). Proves the
+  projection of a known workload, the request counts of section 9 and
+  the read-only wrapper. The binary's size before and after is
+  recorded when the command is exposed (decision 2).
 - **F3. Crash safety.** Sequence numbers, the commit order, recovery at
   start, batches. Proves stop and resume at every step.
-- **F4. Kinds.** The label, descent, incarnations, the absent actor.
-  Proves the delete, restore, late tip, incarnation and batched-class
-  cases. **One adversarial review after F4** covers F2 to F4: the feed
-  writes nothing to a cluster, but its claims about history are claims
-  about replication.
-- **F5. Drift across files and the views.** Recorded types,
-  `views.duckdb.sql`, `--every`, the guide. Proves the schema-change
-  case in DuckDB.
+- **F4. Kinds.** The label, descent (never from generation 0),
+  incarnations, the absent actor, a `heads` row kept for a deleted
+  actor. Proves the delete (in a batched class too), restore, late tip,
+  incarnation and batched-class cases. **One adversarial review after
+  F4** covers F2 to F4: the feed writes nothing to a cluster, but its
+  claims about history are claims about replication.
+- **F5. Drift across files and the views.** Recorded types, the
+  `DOUBLE` cast of integer and real files, `views.duckdb.sql`,
+  `--every`, the guide. Proves the schema-change case in DuckDB.
 - **F6. The listing measured.** A synthetic app of 100,000 actors, a
   poll at rest and with 1 % changed, written to `bench/results/`.
   Decides the "change my mind" condition with a number.
 - **F7. Compaction.** `wasmkeep feed compact`: under the feed's lock,
-  one new batch holding each live actor's latest rows copied from the
-  existing files (no bucket read), then the older files removed. Proves
-  the views return the same rows before and after, and that no row of a
-  deleted actor remains.
+  one new batch holding one `_wk_states` row per actor in `heads` and
+  each live actor's latest rows copied from the existing files (no
+  bucket read), then the older files removed. Proves the views return
+  the same rows before and after, that no data row of a deleted actor
+  remains, and that its `deleted` row does (decision 3).
