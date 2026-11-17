@@ -122,10 +122,57 @@ all listed sizes and ETags match. Moved actors fetch only new source objects,
 and `--cache` keeps content, raw databases and checksum sidecars. When the cached
 head is on the new replay plan, only its new segments are applied after checking
 the cached database checksum. A new snapshot beyond the cached head starts a
-fresh replay. Destination reads therefore exceed ADR 0033's optimized estimates. Existing or concurrent
-prune markers refuse completion conservatively. `backup prune` and single-actor
-restore remain later plan steps. The stopped-cluster copy and drill below
-remain available too.
+fresh replay. Destination reads therefore exceed ADR 0033's optimized estimates.
+Concurrent prune markers refuse completion conservatively; completed markers
+permit later creates. The stopped-cluster copy and drill below remain available.
+
+## Prune an online archive
+
+```bash
+wasmkeep backup prune --from s3://archive/prod --keep-runs 7
+```
+
+This command opens only the archive destination, using the current bucket
+credentials (LIST, GET, PUT and DELETE). It never opens or changes a live bucket.
+The retention rule keeps the newest N complete runs by run ID (UTC start time,
+with the random suffix breaking ties). It also always keeps `latest`, complete
+runs whose `started` object is at most 24 hours old, and runs pinned by
+`before-restore/<nonce>` undo labels or `restoring/<run>` archive pins.
+`--keep-runs 0` is allowed; these protections still apply. Age uses object-store
+modification timestamps against the CLI clock; keep that clock synchronized.
+
+Prune refuses while an incomplete run's `started` object is at most 24 hours
+old. Older incomplete runs are abandoned; create refuses to publish after
+24 hours. Before deleting, prune validates all kept complete manifests and
+builds their combined content references, including deploys, secrets and all
+apps. It removes discarded runs' `complete` and `verified` first, their other
+metadata next, and `started` last. Only unreferenced `data/` objects older than
+24 hours are collected. Shared content survives for every kept run.
+
+Prune writes a permanent `prunes/<nonce>` marker before scanning. After requests
+have drained, `prune-done/<nonce>` closes the marker, including a refused pass.
+Create checks these markers before starting and before publishing; an intervening
+prune makes it refuse completion. Create publication and prune deletion also
+share a conditional `prune-lock`, protecting the `complete` to `latest` gap.
+Never delete prune markers or completion records: they prevent a create spanning
+an entire prune from missing it. Existing older CLIs refuse all such markers;
+use this version for subsequent creates.
+
+An error is safe to retry: prune recomputes references rather than replaying an
+old deletion plan. A killed process or an uncertain lock response can leave
+`prune-lock` held. Stop the old CLI, wait at least 40 seconds for pending
+requests, remove **only** `prune-lock`, then rerun prune. A competing CLI must
+never clear a live lock. Ordinary returned errors attempt to release it.
+
+Whole-app restore and backup-backed actor restore now write an archive pin
+before reading a run or changing the target. This requires archive PUT access.
+Undo backups are pinned before publication, closing the gap before the undo
+label is written. Pins and undo labels have no automatic expiry, including after
+success, abort or failure; this deliberately favors recovery over reclamation.
+Do not remove them while any restore or its `restoring` target fence can still
+refer to the run. Before the first prune after upgrading, finish any restores
+started by an older CLI (which did not write archive pins). A destination-only
+pruner cannot discover fences in arbitrary live buckets.
 
 ## Restore an online archive
 
