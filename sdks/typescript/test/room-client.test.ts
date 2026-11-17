@@ -192,3 +192,14 @@ import * as frontBroadcast from "../src/broadcast-client";
 test("the history adapter is available to a front without browser globals", () => {
     assert.equal(typeof (frontBroadcast as any).historyJSON, "function");
 });
+test('repeat counter includes live items superseded by HTTP catch-up', async () => {
+    const repeats: number[] = [], seen: number[] = [];
+    const r = new Receiver({
+        onMessage: p => { seen.push(p.n); },
+        onRepeat: p => { repeats.push(p.n); },
+        history: async () => ({head:{e:1,n:3},more:false,messages:[1,2,3].map(n=>({position:{e:1,n},at:0,body:String(n)}))}),
+    }, {e:1,n:1});
+    await r.receive({t:'m',e:1,b:0,n:3,m:[{a:0,d:'3'}]});
+    assert.deepEqual(seen,[2,3]);
+    assert.deepEqual(repeats,[1,3]);
+});

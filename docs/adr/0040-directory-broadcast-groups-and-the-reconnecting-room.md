@@ -1,8 +1,8 @@
 # 0040. Directory, broadcast groups and the reconnecting room
 
-- Status: partially implemented (2026-11-17). R1–R5 provide the directory,
-  room core, edges, browser client, scaling and one relay layer. R6–R8
-  remain planned; the large-room example is not available yet.
+- Status: partially implemented (2026-11-17). R1–R6 provide the directory,
+  room core, edges, browser client, scaling, one relay layer, the large-room
+  example and the 300-client cluster proof. R7–R8 remain planned.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -663,3 +663,30 @@ with Rust `Scaling::with_hysteresis(ms)` or TypeScript
 `scaling.hysteresisMs`. The real-node fixture uses one second, 34 paced
 clients and capacity two, proves contiguous delivery with HTTP gap recovery
 across splits, then removes clients until relays retire at 12 edges.
+
+
+### R6 implementation notes
+
+[`examples/ts-big-room`](../../examples/ts-big-room) embeds a plain browser page
+and the SDK client in its front, with SDK room, edge, relay and directory
+classes. Both JS engines run an end-to-end example test in the language suite.
+The page exposes connection state, delivery counters and a manual socket drop.
+Names are public labels, not accounts; the stats route reports the head and
+persisted topology, not the full runtime statistics proposed in section 10.
+`onRepeat` on the browser receiver supplies the discarded-item counter,
+including overlaps with HTTP catch-up. The example also exposed and tests the
+QuickJS `null` representation of an unset WIT alarm: poke accepts both engines'
+representations.
+
+`crates/wasmkeep-server/tests/room_cluster.rs` runs 30 and 300 paced clients on
+three real in-process nodes sharing an in-memory object store. Each node owns
+its own Tokio runtime; killing one stops its tasks and sockets without a drain
+or lease release. Edge names are prewarmed on three nodes (placement remains
+outside this ADR), then the SDK creates their ranges through normal splits.
+The capacity is 15/150 and the fixture's hysteresis is one second. The test
+asserts sockets on all three nodes, 4801 moves, reconnects after node death,
+contiguous numbered delivery, a stalled client closed with 4802, paged HTTP
+catch-up with no reset or loss, and resumed live delivery for every client.
+HTTP recovery is concurrency-bounded and publishes use stable retry ids.
+The 300-client proof is enabled by default; it is paced rather than a benchmark.
+R7/R8 still own benchmark publication and real-bucket scale claims.

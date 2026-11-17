@@ -116,7 +116,7 @@ export function define(options: {
                 if (req.path === PREFIX + 'poke') {
                     if (body.length)
                         throw Error('invalid poke');
-                    if ((lastRound === undefined || Date.now() - lastRound > 1000) && alarms.getAlarm() === undefined)
+                    if ((lastRound === undefined || Date.now() - lastRound > 1000) && alarms.getAlarm() == null)
                         alarms.setAlarm(BigInt(Date.now()));
                     return { status: 200 };
                 }

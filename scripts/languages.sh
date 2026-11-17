@@ -127,6 +127,6 @@ done
 
 echo '-- every language against the same tests'
 WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-server --locked -E "$tests" \
-  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --test db_langs
+  --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --test db_langs --test big_room
 echo '-- the todo front, in Rust and in TypeScript, and the projects wasmkeep new writes'
 WASMKEEP_REQUIRE_LANGS=1 cargo nextest run -p wasmkeep-cli --locked --test todo_front --test new_project

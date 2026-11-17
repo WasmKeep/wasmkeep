@@ -21,6 +21,8 @@ export type Frame = {
 export interface ReceiverOptions {
     history(after?: Position): Promise<History>;
     onMessage?(p: Position, body: string, id?: string, at?: number): void;
+    /** An item discarded because its position was already applied. */
+    onRepeat?(p: Position): void;
     onLost?(first: number, last: number): void;
     onReset?(p: Position): void;
 }
@@ -66,8 +68,10 @@ export class Receiver {
         return next;
     }
     private message(p: Position, body: string, id?: string, at?: number) {
-        if (this.last && (p.e < this.last.e || (p.e === this.last.e && p.n <= this.last.n)))
+        if (this.last && (p.e < this.last.e || (p.e === this.last.e && p.n <= this.last.n))) {
+            this.options.onRepeat?.(p);
             return;
+        }
         this.options.onMessage?.(p, body, id, at);
         this.last = p;
     }
@@ -88,8 +92,10 @@ export class Receiver {
             for (const m of h.messages) {
                 // HTTP history is authoritative; a current-epoch head can precede
                 // retained rows whose original identity belongs to an older epoch.
-                if (this.last && m.position.n <= this.last.n)
+                if (this.last && m.position.n <= this.last.n) {
+                    this.options.onRepeat?.(m.position);
                     continue;
+                }
                 if (this.last && m.position.n !== this.last.n + 1)
                     throw Error("invalid history gap");
                 this.options.onMessage?.(m.position, m.body, m.id, m.at);
@@ -126,6 +132,8 @@ export class Receiver {
                 this.last = { e: f.e, n: this.last.n };
         }
         if (this.last && f.e < this.last.e) {
+            for (let i = 0; i < f.m.length && f.n + i <= this.last.n; i++)
+                this.options.onRepeat?.({ e: f.e, n: f.n + i });
             if (f.n + f.m.length - 1 > this.last.n)
                 await this.recover();
             return;

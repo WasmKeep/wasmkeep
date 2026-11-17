@@ -1,0 +1,11 @@
+{
+  "name": "wasmkeep-example-ts-big-room",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "npm test && node build.mjs",
+    "build:starlingmonkey": "npm test && node build.mjs --engine starlingmonkey"
+  },
+  "dependencies": { "@wasmkeep/sdk": "file:../../sdks/typescript" }
+}

@@ -35,6 +35,7 @@ MANIFESTS = [
     ('sdks/zig/wasmkeep.zig', 'zig', ('version',)),
     ('examples/ts-counter/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-chat-room/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
+    ('examples/ts-big-room/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-jobs/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-workflows/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),
     ('examples/ts-db/package-lock.json', 'json', ('packages', '../../sdks/typescript', 'version')),

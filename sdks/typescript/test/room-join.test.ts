@@ -39,3 +39,20 @@ test('poke schedules an alarm without doing directory, push or scaling calls', (
     assert(alarms.pending !== undefined);
     db.close();
 });
+
+test('QuickJS null: poke schedules an alarm without doing directory, push or scaling calls', () => {
+    db.install(':memory:');
+    alarms.clearAlarm();
+    alarms.useQuickJS(true);
+    let calls = 0;
+    install(() => { calls++; throw Error('poke must not call'); });
+    const room = define({ scaling: { directory: 'directory/bg:r', edgeClass: 'edge', capacity: 5 } });
+    room.init!();
+    const r = room.fetch!({ method: 'POST', path: '/wasmkeep-room/v1/poke', headers: { 'x-wasmkeep-caller': 'tenant/_front/main' }, bytes: () => new Uint8Array(), text: () => '', json: <T>() => ({}) as T });
+    assert(typeof r === 'object' && !(r instanceof Uint8Array));
+    assert.equal(r.status, 200);
+    assert.equal(calls, 0);
+    assert(alarms.pending !== undefined);
+    alarms.useQuickJS(false);
+    db.close();
+});

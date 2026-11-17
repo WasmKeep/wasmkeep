@@ -24,11 +24,21 @@ impl Actor for Guest {
             ScaleHost {
                 directory: format!("directory/bg:{}", a.name),
                 room: format!("{}/{}/{}", a.tenant, a.class, a.name),
-                capacity: if a.name == "relays" { 2 } else { 5 },
+                capacity: match a.name.as_str() {
+                    "relays" => 2,
+                    "big" => 150,
+                    "small" => 15,
+                    _ => 5,
+                },
                 head: Position { e: 0, n: 0 },
             },
             format!("edge/{}", a.name),
-            if a.name == "relays" { 2 } else { 5 },
+            match a.name.as_str() {
+                "relays" => 2,
+                "big" => 150,
+                "small" => 15,
+                _ => 5,
+            },
         )?
         .with_hysteresis(1000);
         ROUND.with_borrow_mut(|r| handler::scaling(&mut scale, r))
