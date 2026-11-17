@@ -1,0 +1,10 @@
+[package]
+name = "client-guest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+wasmkeep-sdk = { path = "../..", features = ["client"] }

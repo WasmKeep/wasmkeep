@@ -13,6 +13,8 @@
 // Without the `actor` feature only the error envelope (`problem`) uses this
 // module, and not all of it.
 #![cfg_attr(not(feature = "actor"), allow(dead_code))]
+// `Json` and its readers are public only through `client::Value`.
+#![cfg_attr(not(feature = "client"), allow(unreachable_pub))]
 
 use std::fmt::Write as _;
 
@@ -25,7 +27,7 @@ pub(crate) const MAX_MEMBERS: usize = 64;
 /// A parsed JSON value. Object members keep their order; a repeated key
 /// keeps its last value (as `JSON.parse`).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Json {
+pub enum Json {
     Null,
     Bool(bool),
     Number(f64),
@@ -36,7 +38,7 @@ pub(crate) enum Json {
 
 impl Json {
     /// The member `key` of an object.
-    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
+    pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
@@ -83,14 +85,14 @@ impl Json {
         }
     }
 
-    pub(crate) fn as_str(&self) -> Option<&str> {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
             Json::String(s) => Some(s),
             _ => None,
         }
     }
 
-    pub(crate) fn as_array(&self) -> Option<&[Json]> {
+    pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Json::Array(items) => Some(items),
             _ => None,

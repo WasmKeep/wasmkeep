@@ -3663,6 +3663,7 @@ version = "0.5.1"
 dependencies = [
  "rusqlite",
  "wasip2 2.0.1+wasi-0.2.12",
+ "wasmkeep-sdk",
  "wit-bindgen 0.63.0",
 ]
 
