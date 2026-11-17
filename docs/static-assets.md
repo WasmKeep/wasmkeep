@@ -22,6 +22,7 @@ immutable = ["assets/"]
 ```
 
 Run `wasmkeep dev` locally, then `wasmkeep deploy --bucket s3://my-bucket`.
+The [React app tutorial](build/react.md) builds one from an empty directory.
 Paths are relative to the [project file](project-file.md). The assets build
 runs before the front and class builds. A site can have assets and no code.
 Removing `[assets]` removes the deployed assets on the next project deploy.

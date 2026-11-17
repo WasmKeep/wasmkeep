@@ -87,6 +87,10 @@ const bundle = await build({
   external: ["wasi:*", "wasmkeep:*"],
   alias: {
     "@wasmkeep/sdk/front": join(sdkRoot, "src", "front.ts"),
+    // The package's other entries (package.json "exports"), which esbuild
+    // would otherwise look for under src/index.ts.
+    "@wasmkeep/sdk/contracts": join(sdkRoot, "src", "pure.ts"),
+    "@wasmkeep/sdk/room-client": join(sdkRoot, "src", "room-client.ts"),
     "@wasmkeep/sdk": join(sdkRoot, "src", "index.ts"),
   },
   logLevel: "warning",

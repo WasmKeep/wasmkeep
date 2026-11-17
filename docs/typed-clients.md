@@ -109,7 +109,8 @@ transport, `new Client(transport)` takes any object with `call` and
 A front can call a contract the same way; from a front the call is an
 inside call, as with `actors.call`. A portable client for a browser would be
 a separate thing pointed at a public URL: nothing here gives a browser the
-privileges of an inside caller.
+privileges of an inside caller. The [React app tutorial](build/react.md)
+shows one, over `fetch`, for an `open` class.
 
 ## Typed clients in Rust
 

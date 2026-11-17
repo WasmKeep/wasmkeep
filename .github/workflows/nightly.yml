@@ -63,6 +63,13 @@ jobs:
       # The S3 store at the version the page names (the test uses uvx
       # instead when the runner has it).
       - run: pip install --quiet "moto[server]==5.2.5"
+      # The React tutorial builds a TypeScript actor and a Vite page, with
+      # the clone's SDK.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: sdks/typescript
       - run: ./scripts/test-tutorials.sh
 
   # The toolchain image built and tested (deploy/toolchain/test.sh) on

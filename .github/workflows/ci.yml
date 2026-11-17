@@ -446,6 +446,7 @@ jobs:
           cache-dependency-path: |
             sdks/typescript/package-lock.json
             examples/ts-*/package-lock.json
+            examples/react-todos/package-lock.json
             crates/wasmkeep-server/tests/guests/ts-fetch/package-lock.json
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
@@ -538,6 +539,7 @@ jobs:
       - name: build every example
         run: |
           for ex in examples/ts-*/; do (cd "$ex" && npm ci && npm run build && npm run build:starlingmonkey); done
+          (cd examples/react-todos && npm ci && npm run build && npm test)
           for ex in examples/c-*/; do "$ex/build.sh"; done
           for ex in examples/zig-*/; do ZIG="python -m ziglang" "$ex/build.sh"; done
           for ex in examples/py-*/; do "$ex/build.sh"; done
