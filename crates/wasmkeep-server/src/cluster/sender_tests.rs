@@ -338,6 +338,7 @@ async fn a_live_node_without_multi_app_makes_several_apps_not_ready() {
         can_end: true,
         can_flush: true,
         can_rate_limits: true,
+        can_assets: false,
         can_restore: true,
         can_actor_restore: true,
         instance: None,

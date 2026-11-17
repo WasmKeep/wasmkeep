@@ -172,6 +172,7 @@ mod tests {
         };
         for i in 0..n {
             let manifest = Manifest {
+                assets: None,
                 previous: (i > 0).then(|| format!("v{}", i - 1)),
                 classes: BTreeMap::from([("counter".into(), format!("{i:02}"))]),
                 front: None,
@@ -328,6 +329,7 @@ mod tests {
         // address the whole app. The walk stops there instead.
         let (store, app) = lineage(8).await;
         let manifest = Manifest {
+            assets: None,
             previous: Some("/".into()),
             classes: BTreeMap::from([("counter".into(), "01".into())]),
             front: None,
