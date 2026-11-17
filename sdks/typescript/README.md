@@ -413,3 +413,25 @@ override in your root `package.json`:
   }
 }
 ```
+
+## Directory (ADR 0040, R1)
+
+Export `directory.define()` from an app-owned internal class, or delegate
+its hooks to `directory.init` and `directory.handle`. Each actor holds one
+map. `new directory.Client("class/name")` provides `create`, `lookup`,
+`entries`, `change` (a `kind: "split"` or `kind: "merge"` request), and
+`delete`. `directory.point(key)` accepts bytes or a UTF-8 string.
+
+Points, bounds and versions are `bigint`; an absent `entry.hi` means 2^64.
+`lookup` returns `{ entry, version }`, where `version` is the map version
+and `entry.version` is its last change. The creator owns mutations; any
+inside caller may read. `DirectoryError` carries the status and, on a
+409, the current version. Maps hold at most 4,096 ranges and metadata is
+at most 1 KiB per range. Targets and nonempty operation ids are capped at
+1 KiB of UTF-8 each. Changes are durable transactions. Retry an unknown
+outcome with the same op id **before submitting another change**: only
+the latest operation's result is retained. The Rust SDK speaks the same
+binary protocol and uses the same point hash.
+
+This implements R1 of the proposed ADR only; broadcast groups and rooms
+are not provided by this module.

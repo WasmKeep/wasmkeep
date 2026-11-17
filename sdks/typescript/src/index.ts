@@ -38,6 +38,7 @@ import type { ActorRequest, ActorResponse } from "./request";
 /** A database kept by one actor (`db.define({ migrations })`,
  * `new db.Client("db/main")`); see ./db.ts. */
 export * as db from "./db";
+export * as directory from "./directory";
 /** Key-value storage over shard actors (`new kv.Client("kv", 8)`); see ./kv.ts. */
 export * as kv from "./kv";
 /** Queues over queue actors (`new queue.Client("queue/jobs")`,

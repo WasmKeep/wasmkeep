@@ -63,6 +63,8 @@ pub mod bindings {
 
 #[cfg(feature = "actor")]
 pub mod db;
+#[cfg(feature = "actor")]
+pub mod directory;
 pub mod front;
 pub mod headers;
 pub mod http;

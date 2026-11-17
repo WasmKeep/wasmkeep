@@ -279,3 +279,23 @@ WIT files are in `wit/`, a copy of the ones the server is built from.
 ## License
 
 Apache-2.0; see `LICENSE` and `NOTICE`. WasmKeep is pre-alpha.
+
+## Directory (ADR 0040, R1)
+
+`directory::Directory` is library code exported by an app's own internal
+class; custom classes can delegate to `directory::handler::{init, handle}`.
+Each actor holds one map. `directory::Client` provides `create`, `lookup`,
+`entries`, `change` (`Change::Split` or `Change::Merge`), and `delete`.
+`directory::point` hashes key bytes with FNV-1a followed by fmix64.
+
+The creator owns mutations; inside callers may read. Bounds are `u64`,
+with `Entry::hi = None` for 2^64. Versions are positive SQLite integers;
+conflicts return the current map version. Maps hold at most 4,096 ranges
+and metadata is at most 1 KiB per range. Targets and nonempty operation ids
+are capped at 1 KiB of UTF-8 each. A change commits once, durably; retry an
+unknown outcome with the same op id **before submitting another change**.
+Only the latest operation's result is retained. A map lookup is one actor
+event and sees either side of a change, never a partial change.
+
+This implements R1 of the proposed ADR only; broadcast groups and rooms
+are not provided by this module.
