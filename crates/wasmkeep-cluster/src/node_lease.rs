@@ -1034,6 +1034,22 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         Ok(())
     }
 
+    /// The requirement an acquisition carries: this process's local
+    /// evidence (with the generation of the hold that froze it), combined
+    /// by lineage with the record's own when the format is enabled
+    /// ([`crate::local_heads::combine`]).
+    fn carried(
+        &self,
+        local: Option<(Requirement, u64)>,
+        record: Option<&OwnerRecord>,
+    ) -> Option<Requirement> {
+        if !self.recorded_head() {
+            return local.map(|(r, _)| r);
+        }
+        let recorded = record.and_then(|r| Requirement::of_record(r).map(|q| (q, r.generation)));
+        crate::local_heads::combine(local, recorded)
+    }
+
     /// The version 2 fields of an acquisition carrying `inherited`, over
     /// `before` (its idle origin carried), if the format is enabled.
     fn acquiring(
@@ -1068,16 +1084,20 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     /// `prepare(record, generation)` runs after the authoritative read and
     /// the eligibility checks (`record`: what the read decoded, `None` for
     /// an absent record) and before the conditional write at
-    /// `generation`. It combines this process's local evidence
-    /// ([`crate::local_heads`]); the requirement it gives is the new
-    /// hold's [`crate::hold_cell::HoldHead::inherited`]. An error refuses
-    /// the acquisition with nothing written.
+    /// `generation`. It gives this process's local evidence
+    /// ([`crate::local_heads`]) with the generation of the hold that froze
+    /// it; combined with the record's (version 2), it is the new hold's
+    /// [`crate::hold_cell::HoldHead::inherited`]. An error refuses the
+    /// acquisition with nothing written.
     pub async fn acquire_prepared(
         &self,
         key: &str,
         lease_valid: impl Fn() -> bool,
         first_generation: impl AsyncFnOnce() -> Result<u64, AcquireError>,
-        prepare: impl FnOnce(Option<&OwnerRecord>, u64) -> Result<Option<Requirement>, AcquireError>,
+        prepare: impl FnOnce(
+            Option<&OwnerRecord>,
+            u64,
+        ) -> Result<Option<(Requirement, u64)>, AcquireError>,
     ) -> Result<Hold, AcquireError> {
         let read = self
             .bucket
@@ -1090,7 +1110,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         let (generation, before, written) = match read {
             None => {
                 let first = first_generation().await?;
-                inherited = prepare(None, first)?;
+                inherited = self.carried(prepare(None, first)?, None);
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
@@ -1125,7 +1145,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                     .generation
                     .checked_add(1)
                     .ok_or(AcquireError::Corrupt)?;
-                inherited = prepare(Some(&record), generation)?;
+                inherited = self.carried(prepare(Some(&record), generation)?, Some(&record));
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
@@ -1180,7 +1200,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         key: &str,
         unchanged: impl Fn(&Version) -> bool,
         lease_valid: impl Fn() -> bool,
-        prepare: impl FnOnce(Option<&OwnerRecord>, u64) -> Result<Option<Requirement>, AcquireError>,
+        prepare: impl FnOnce(
+            Option<&OwnerRecord>,
+            u64,
+        ) -> Result<Option<(Requirement, u64)>, AcquireError>,
     ) -> Result<Hold, AcquireError> {
         let Some((body, version)) = self
             .bucket
@@ -1199,7 +1222,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             .generation
             .checked_add(1)
             .ok_or(AcquireError::Corrupt)?;
-        let inherited = prepare(Some(&record), generation)?;
+        let inherited = self.carried(prepare(Some(&record), generation)?, Some(&record));
         if !lease_valid() {
             return Err(AcquireError::LeaseInvalid);
         }

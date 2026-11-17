@@ -210,7 +210,7 @@ impl Pending {
         attempted: u64,
         node: &str,
         instance: &str,
-    ) -> Result<Option<Requirement>, AcquireError> {
+    ) -> Result<Option<(Requirement, u64)>, AcquireError> {
         let holds = self.holds.lock().unwrap_or_else(|p| p.into_inner());
         if holds
             .get(key)
@@ -219,13 +219,11 @@ impl Pending {
             return Err(AcquireError::LocalHold);
         }
         let mut local = self.local();
-        let carried = local
+        // With the generation of the hold that froze it: `Owners` combines
+        // it with the record's own by lineage.
+        Ok(local
             .prepare(key, record, attempted, node, instance)
-            .zip(local.get(key).map(|e| e.generation));
-        drop(local);
-        // The record's own requirement (version 2), combined by lineage.
-        let recorded = record.and_then(|r| Requirement::of_record(r).map(|q| (q, r.generation)));
-        Ok(wasmkeep_cluster::local_heads::combine(carried, recorded))
+            .zip(local.get(key).map(|e| e.generation)))
     }
 
     /// Whether `key` is cooling down after visibility refusals (ADR 0035,

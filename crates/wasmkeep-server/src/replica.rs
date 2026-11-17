@@ -832,7 +832,17 @@ impl Replica {
         let keys: Vec<String> = sized.iter().map(|(k, _)| k.clone()).collect();
         let sizes: std::collections::HashMap<String, u64> = sized.into_iter().collect();
         let listing = Listing::from_keys(keys.iter().map(String::as_str));
-        let plan = plan_restore(&listing).map_err(|e| ReplicaError::Restore(e.to_string()))?;
+        let plan = plan_restore(&listing).map_err(|e| match e {
+            // ADR 0035, section 3: with a recorded floor to reach, a missing
+            // link is a listing behind its writes, listed again; without
+            // one, as before.
+            wasmkeep_cluster::replication::PlanError::Missing { .. }
+                if floor.is_some_and(|f| matches!(f.head, Position::Known { .. })) =>
+            {
+                ReplicaError::Visibility(e.to_string())
+            }
+            e => ReplicaError::Restore(e.to_string()),
+        })?;
         // ADR 0035, section 3: what the listing alone proves of the floor,
         // before any local file is used or changed.
         let chain: Vec<(SegmentId, Option<u64>)> = plan

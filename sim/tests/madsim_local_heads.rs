@@ -26,6 +26,12 @@
 //!   acquisition sees the live hold (and waits) or the frozen head, never
 //!   neither.
 //!
+//! - **7**, with the recorded-head format enabled: a release whose reply
+//!   is lost, sent again; another node inheriting H from the record
+//!   alone; the first release sent late on its old version; the original
+//!   process re-acquiring: every record carries H, complete, with its
+//!   stamp, and no late release overwrites a newer hold.
+//!
 //! An unverified hold re-freezes what it inherited, stamp unchanged.
 //! Broken variants must each be caught: dropping H on re-acquire,
 //! keeping superseded evidence after a remote takeover, draining the live
@@ -110,6 +116,14 @@ impl Mem {
     async fn pause(&self) {
         let ms = self.seed.lock().unwrap().below(20);
         sleep(Duration::from_millis(ms)).await;
+    }
+
+    fn record(&self) -> Option<OwnerRecord> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(KEY)
+            .and_then(|(b, _)| OwnerRecord::decode(b))
     }
 
     fn put(&self, key: &str, body: Vec<u8>) -> Version {
@@ -215,10 +229,12 @@ impl Node {
                 return Err(AcquireError::LocalHold);
             }
             let mut local = self.local.lock().unwrap();
-            let carried = local.prepare(KEY, record, attempted, "a", "i1");
+            let carried = local
+                .prepare(KEY, record, attempted, "a", "i1")
+                .zip(local.get(KEY).map(|e| e.generation));
             if self.breaks.keep_superseded && carried.is_none() {
                 // Broken: a retired entry is not retired.
-                return Ok(KEPT.with(|k| *k.borrow()));
+                return Ok(KEPT.with(|k| *k.borrow()).map(|r| (r, u64::MAX)));
             }
             Ok(if self.breaks.drop_local {
                 None
@@ -371,6 +387,7 @@ enum Case {
     LostWake,
     Remote,
     Race,
+    V2Release,
 }
 
 #[derive(Debug, Default)]
@@ -398,6 +415,8 @@ fn simulate(seed: u64, breaks: Breaks, case: Case) -> Outcome {
             landed: Mutex::new(false),
             landed_at_prepare: Mutex::new(false),
         });
+        // Case 7 runs with the recorded-head format enabled.
+        node.owners.set_recorded_head(case == Case::V2Release);
         let mut out = Outcome::default();
         // A first hold, verified, that acknowledges up to H.
         let cell = node.acquire().await.unwrap();
@@ -555,6 +574,57 @@ fn simulate(seed: u64, breaks: Breaks, case: Case) -> Outcome {
                 }
                 count(Counter::Retired, carried.is_none());
             }
+            Case::V2Release => {
+                // Case 7. The release lands with its reply lost; its retry
+                // meets its own landed write. The record carries H,
+                // complete, stamped with the hold that froze it.
+                let hold = node.take(&cell).unwrap();
+                mem.faults.lock().unwrap().lose_replace_reply = true;
+                if node.release(&hold).await != Released::Pending {
+                    count(Counter::Refused, true);
+                    return out;
+                }
+                let _ = node.release(&hold).await;
+                let stored = |what: &str, out: &mut Outcome| {
+                    let r = mem.record().unwrap();
+                    let carried = Requirement::of_record(&r);
+                    if carried != Some(want) {
+                        out.violation.get_or_insert(format!(
+                            "{what}: the record carries {carried:?}, want H"
+                        ));
+                    }
+                    r
+                };
+                stored("lost reply", &mut out);
+                // Another node takes the actor: it inherits H from the
+                // record alone, and releases it unverified, stamp kept.
+                let b = Owners::new(mem.clone(), SimClock, "b", "j1", "nodes/", cfg);
+                b.set_recorded_head(true);
+                let theirs = b.acquire(KEY, || true, async || Ok(1)).await.unwrap();
+                if theirs.head.inherited != Some(want) {
+                    fail(&mut out, format!("b inherited {:?}", theirs.head.inherited));
+                }
+                // The first release, sent again late on its old version,
+                // never overwrites the newer hold.
+                let late = node.owners.release(&hold).await;
+                let held = mem.record().unwrap();
+                if held.holder.is_none() || late == Released::Released {
+                    fail(&mut out, "a late release overwrote a newer hold".into());
+                }
+                assert_eq!(b.release(&theirs).await, Released::Released);
+                let after = stored("after b", &mut out);
+                if after.generation != theirs.generation {
+                    fail(&mut out, "the record went back".into());
+                }
+                // This process again: its own entry is retired by b's
+                // release, the record's floor carried instead.
+                let c = node.acquire().await.unwrap();
+                let carried = carried_of(&c);
+                if carried != Some(want) {
+                    fail(&mut out, format!("re-acquired with {carried:?}, want H"));
+                }
+                count(Counter::Carried, carried == Some(want));
+            }
         }
         out
     })
@@ -587,7 +657,8 @@ fn case_of(seed: u64) -> Case {
         Case::LostWake,
         Case::Remote,
         Case::Race,
-    ][usize::try_from(seed % 6).unwrap()]
+        Case::V2Release,
+    ][usize::try_from(seed % 7).unwrap()]
 }
 
 #[test]
