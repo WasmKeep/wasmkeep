@@ -26,6 +26,28 @@ use wasmkeep_storage::wal::WalBoundary;
 /// The node's budget of batched segments in flight (ADR 0034, section 2).
 static NODE_BUDGET: LazyLock<UploadBudget> = LazyLock::new(UploadBudget::node);
 
+/// [`NODE_BUDGET`] divided between the apps a process serves (ADR 0038,
+/// section 8), checked before it.
+pub(crate) static UPLOAD_SHARES: LazyLock<std::sync::Arc<crate::shares::Shares>> =
+    LazyLock::new(|| {
+        std::sync::Arc::new(crate::shares::Shares::new(
+            crate::replica::NODE_UPLOAD_BYTES,
+        ))
+    });
+
+/// Room for a segment of `app` estimated at `estimated` bytes: its app's
+/// share first, then the node's budget, in the order captures asked.
+/// Cancel-safe: a dropped wait takes nothing.
+pub(super) async fn reserve_upload(
+    app: &str,
+    estimated: u64,
+) -> Result<crate::replica::BudgetPermit, crate::replica::ReplicaError> {
+    let share = UPLOAD_SHARES
+        .acquire(app, NODE_BUDGET.charge(estimated))
+        .await;
+    Ok(NODE_BUDGET.reserve(estimated).await?.with_share(share))
+}
+
 /// The bytes of the node's budget of batched segments in flight in use
 /// now: `wasmkeep_upload_budget_bytes_in_use` (ADR 0034, section 16).
 pub(crate) fn upload_budget_in_use() -> usize {
@@ -262,6 +284,7 @@ pub(super) async fn pump(
     // When the oldest commit this capture would take was marked: its age
     // is sampled once the capture is handed off, budget wait included.
     let oldest = replica.oldest_unsent();
+    let app = replica.app();
     drop(replica);
     if NODE_BUDGET.available() < NODE_BUDGET.charge(plan.boundary.estimated_bytes) {
         crate::metrics::inc(
@@ -270,7 +293,7 @@ pub(super) async fn pump(
                 .get(&[("reason", "budget")]),
         );
     }
-    let reserve = NODE_BUDGET.reserve(plan.boundary.estimated_bytes);
+    let reserve = reserve_upload(&app, plan.boundary.estimated_bytes);
     let permit = match deadline {
         Some(at) => tokio::select! {
             biased;
@@ -772,5 +795,56 @@ impl ActorState {
             }
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+
+    /// One app's segments fill its share of the node's upload budget; the
+    /// other app's next segment gets its room at once, and every permit
+    /// comes back.
+    #[tokio::test]
+    async fn a_saturating_apps_uploads_leave_the_others_share() {
+        let (_a, _b) = (UPLOAD_SHARES.join("a/a"), UPLOAD_SHARES.join("b/b"));
+        let one = wasmkeep_storage::wal::DEFAULT_SEGMENT_BYTES;
+        let wait = std::time::Duration::from_millis(50);
+        let mut held = Vec::new();
+        while let Ok(permit) = tokio::time::timeout(wait, reserve_upload("a/a", one)).await {
+            held.push(permit.unwrap());
+        }
+        assert_eq!(
+            held.len() as u64,
+            crate::replica::NODE_UPLOAD_BYTES / 2 / one,
+            "a stops at its share"
+        );
+        let b = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reserve_upload("b/b", one),
+        )
+        .await
+        .expect("b within its share is not kept waiting")
+        .unwrap();
+        drop(held);
+        drop(b);
+        assert_eq!(upload_budget_in_use(), 0);
+        assert_eq!(UPLOAD_SHARES.used("a/a"), 0);
+        assert_eq!(UPLOAD_SHARES.used("b/b"), 0);
+    }
+
+    /// An app alone in the process has the whole budget, as before.
+    #[tokio::test]
+    async fn an_app_alone_has_the_whole_upload_budget() {
+        let _a = UPLOAD_SHARES.join("a/a");
+        let one = wasmkeep_storage::wal::DEFAULT_SEGMENT_BYTES;
+        let mut held = Vec::new();
+        for _ in 0..crate::replica::NODE_UPLOAD_BYTES / one {
+            held.push(reserve_upload("a/a", one).await.unwrap());
+        }
+        assert_eq!(
+            upload_budget_in_use() as u64,
+            crate::replica::NODE_UPLOAD_BYTES
+        );
     }
 }

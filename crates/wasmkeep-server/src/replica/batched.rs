@@ -194,6 +194,7 @@ impl UploadBudget {
             .map_err(|_| ReplicaError::Local("the node's upload budget is closed".into()))?;
         Ok(BudgetPermit {
             _permit: permit,
+            _share: None,
             charged: charge,
             cap: self.cap,
         })
@@ -226,11 +227,20 @@ impl UploadBudget {
 #[derive(Debug)]
 pub(crate) struct BudgetPermit {
     _permit: OwnedSemaphorePermit,
+    /// Its app's share of the budget (ADR 0038, section 8), if it took
+    /// one: given back with the bytes.
+    _share: Option<crate::shares::SharePermit>,
     charged: u64,
     cap: u64,
 }
 
 impl BudgetPermit {
+    /// Holds `share` as long as the bytes.
+    pub(crate) fn with_share(mut self, share: crate::shares::SharePermit) -> Self {
+        self._share = Some(share);
+        self
+    }
+
     /// The bytes it holds.
     pub(crate) fn charged(&self) -> u64 {
         self.charged

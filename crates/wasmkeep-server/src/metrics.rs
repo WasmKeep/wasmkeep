@@ -190,7 +190,15 @@ impl<T> Default for Family<T> {
 impl<T: Default> Family<T> {
     /// The value for these labels, created on first use.
     pub(crate) fn get(&self, labels: &[(&str, &str)]) -> Arc<T> {
-        let key = render_labels(labels);
+        self.get_key(render_labels(labels))
+    }
+
+    /// The value for the labels of `app` ([`app_labels`]) then `labels`.
+    pub(crate) fn get_in(&self, app: &str, labels: &[(&str, &str)]) -> Arc<T> {
+        self.get_key(join_labels(app, &render_labels(labels)))
+    }
+
+    fn get_key(&self, key: String) -> Arc<T> {
         if let Some(v) = self
             .entries
             .read()
@@ -544,6 +552,46 @@ impl Family<AtomicU64> {
         self.each(|_, v| sum = sum.saturating_add(v.load(Ordering::Relaxed)));
         sum
     }
+
+    /// The sum over the label sets of the app `app` names
+    /// ([`app_labels`]).
+    pub(crate) fn total_in(&self, app: &str) -> u64 {
+        let mut sum = 0u64;
+        self.each(|labels, v| {
+            let theirs = labels
+                .strip_prefix(app)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(','));
+            if theirs {
+                sum = sum.saturating_add(v.load(Ordering::Relaxed));
+            }
+        });
+        sum
+    }
+}
+
+/// An app's labels, `tenant="...",app="..."`: what its work is recorded
+/// under (ADR 0038, section 9).
+pub(crate) fn app_labels(tenant: &str, app: &str) -> Arc<str> {
+    Arc::from(render_labels(&[("tenant", tenant), ("app", app)]))
+}
+
+/// One event of `class` in the app `app` names ([`app_labels`]), of
+/// `kind`, ended with `outcome`, after `elapsed`.
+pub(crate) fn record_event(
+    app: &str,
+    class: &str,
+    kind: &str,
+    outcome: &str,
+    elapsed: std::time::Duration,
+) {
+    inc(&METRICS.events.get_in(
+        app,
+        &[("class", class), ("kind", kind), ("outcome", outcome)],
+    ));
+    METRICS
+        .event_seconds
+        .get_in(app, &[("class", class)])
+        .observe(elapsed);
 }
 
 /// `kind` of `wasmkeep_failover_waits_total` ([`crate::cluster::failover_wait`]).
@@ -849,11 +897,11 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "counter",
         "Events run, by tenant, app, class, kind and outcome.",
     );
+    // Recorded with their app (ADR 0038, section 9).
     m.events.each(|labels, v| {
         let _ = writeln!(
             out,
-            "wasmkeep_events_total{{{}}} {}",
-            join_labels(&app, labels),
+            "wasmkeep_events_total{{{labels}}} {}",
             v.load(Ordering::Relaxed)
         );
     });
@@ -864,11 +912,7 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "How long events ran, by tenant, app and class.",
     );
     m.event_seconds.each(|labels, h| {
-        h.render(
-            &mut out,
-            "wasmkeep_event_duration_seconds",
-            &join_labels(&app, labels),
-        );
+        h.render(&mut out, "wasmkeep_event_duration_seconds", labels);
     });
     family(
         &mut out,
@@ -1245,6 +1289,50 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
 mod tests {
     use super::*;
 
+    /// Two apps of one process: each event is counted once, under its own
+    /// app, whatever identity the page is rendered for; the sum over apps
+    /// is the work done, and the process's series appear once.
+    #[test]
+    fn events_are_counted_under_their_own_app() {
+        let (shop, blog) = (app_labels("acme", "shop"), app_labels("acme", "blog"));
+        let ms = Duration::from_millis(3);
+        for _ in 0..2 {
+            record_event(&shop, "c", "request", "ok", ms);
+        }
+        for _ in 0..3 {
+            record_event(&blog, "c", "request", "ok", ms);
+        }
+        assert_eq!(METRICS.events.total_in(&shop), 2);
+        assert_eq!(METRICS.events.total_in(&blog), 3);
+        assert_eq!(METRICS.events.total(), 5);
+        for identity in [
+            Identity {
+                tenant: "acme".into(),
+                app: "shop".into(),
+                node: "n1".into(),
+            },
+            Identity::default(),
+        ] {
+            let page = render_for(Gauges::default(), &identity);
+            for line in [
+                "\nwasmkeep_events_total{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"request\",outcome=\"ok\"} 2\n",
+                "\nwasmkeep_events_total{tenant=\"acme\",app=\"blog\",class=\"c\",kind=\"request\",outcome=\"ok\"} 3\n",
+                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"c\"} 2\n",
+                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"blog\",class=\"c\"} 3\n",
+            ] {
+                assert!(page.contains(line), "no {line} in\n{page}");
+            }
+            let events: u64 = page
+                .lines()
+                .filter(|l| l.starts_with("wasmkeep_events_total{"))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum();
+            assert_eq!(events, 5, "{page}");
+            assert_eq!(page.matches("\nwasmkeep_info{").count(), 1);
+            assert_eq!(page.matches("\nwasmkeep_actors_resident ").count(), 1);
+        }
+    }
+
     #[test]
     fn a_family_total_sums_every_label_set() {
         let f: Family<AtomicU64> = Family::default();
@@ -1342,13 +1430,20 @@ mod tests {
 
     #[test]
     fn series_with_a_class_label_carry_the_tenant_and_app() {
-        inc(&METRICS
-            .events
-            .get(&[("class", "c"), ("kind", "request"), ("outcome", "ok")]));
-        METRICS
-            .event_seconds
-            .get(&[("class", "c")])
-            .observe(Duration::from_millis(3));
+        record_event(
+            &app_labels("acme", "shop"),
+            "c",
+            "request",
+            "ok",
+            Duration::from_millis(3),
+        );
+        record_event(
+            &app_labels("default", "default"),
+            "c",
+            "request",
+            "ok",
+            Duration::from_millis(3),
+        );
         inc(&METRICS
             .bucket_requests
             .get(&[("operation", "get"), ("status", "ok")]));
@@ -1373,13 +1468,18 @@ mod tests {
             page.contains("wasmkeep_events_total{tenant=\"default\",app=\"default\",class=\"c\",kind=\"request\",outcome=\"ok\"} 1\n"),
             "{page}"
         );
-        // Every series with a class has them, and so do the front's
-        // counters and histogram (ADR 0023); the others are as they were,
-        // and gauges of the process stay unlabelled.
+        // Every series with a class has them (its own app's, recorded with
+        // the event: ADR 0038, section 9), and so do the front's counters
+        // and histogram (ADR 0023); the others are as they were, and
+        // gauges of the process stay unlabelled.
         for l in page.lines().filter(|l| !l.starts_with('#')) {
-            if l.contains("class=\"")
-                || (l.starts_with("wasmkeep_front_") && !l.starts_with("wasmkeep_front_slots"))
-            {
+            if l.contains("class=\"") {
+                assert!(
+                    l.contains("{tenant=\"default\",app=\"default\",")
+                        || l.contains("{tenant=\"acme\",app=\"shop\","),
+                    "{l}"
+                );
+            } else if l.starts_with("wasmkeep_front_") && !l.starts_with("wasmkeep_front_slots") {
                 assert!(l.contains("{tenant=\"default\",app=\"default\","), "{l}");
             } else if !l.starts_with("wasmkeep_info{") {
                 assert!(!l.contains("tenant=") && !l.contains("app="), "{l}");

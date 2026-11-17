@@ -196,7 +196,11 @@ impl ActorState {
         .await;
         let trapped = !matches!(run, Ok(Ok(_)));
         // A handler that returned an error failed too (it is retried).
-        live.record_event(self.address.class(), !matches!(run, Ok(Ok(Ok(())))));
+        live.record_event(
+            &self.app_labels,
+            self.address.class(),
+            !matches!(run, Ok(Ok(Ok(())))),
+        );
         match run {
             Ok(Ok(Ok(()))) => {
                 let cleared = with_db(&mut live.store, move |db| {

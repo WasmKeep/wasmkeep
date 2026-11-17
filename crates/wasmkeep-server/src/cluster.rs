@@ -778,6 +778,11 @@ impl Cluster {
         ))
     }
 
+    /// What this node serves, `tenant/app`.
+    pub(crate) fn serves(&self) -> &str {
+        &self.serves
+    }
+
     /// The root of this node's actor state (ADR 0022).
     pub(crate) fn state_root(&self) -> &StateRoot {
         &self.root

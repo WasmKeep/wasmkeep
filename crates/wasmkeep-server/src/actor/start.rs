@@ -88,6 +88,19 @@ impl ActorService {
                 .unwrap_or_default(),
         };
         let factory_cluster = cluster.clone();
+        // Its work is recorded under its app (ADR 0038, section 9).
+        let app_labels = crate::metrics::app_labels(root.tenant(), root.app());
+        let factory_app_labels = Arc::clone(&app_labels);
+        // A cluster node's app takes its share of the process's upload and
+        // restore budgets while it is served (ADR 0038, section 8).
+        let shares = match &cluster {
+            Some(c) => vec![
+                super::uploads::UPLOAD_SHARES.join(c.serves()),
+                crate::replica::RESTORE_SLOT_SHARES.join(c.serves()),
+                crate::replica::RESTORE_BYTE_SHARES.join(c.serves()),
+            ],
+            None => Vec::new(),
+        };
         // A guest statement runs on a blocking thread, which does not stop
         // when its event is cut: stop the statement no later than that.
         let mut storage_config = config.storage.clone();
@@ -176,6 +189,7 @@ impl ActorService {
                 let guest_log = factory_guest_log.clone();
                 let secrets_blocked = Arc::clone(&factory_blocked);
                 let factory_moves = Arc::clone(&factory_moves_outer);
+                let factory_app_labels = Arc::clone(&factory_app_labels);
                 async move {
                     let class = class.ok_or_else(|| -> BoxError {
                         format!("unknown class {}", address.class()).into()
@@ -188,6 +202,7 @@ impl ActorService {
                     }
                     Ok(ActorState {
                         address,
+                        app_labels: Arc::clone(&factory_app_labels),
                         class,
                         runtime,
                         storage,
@@ -219,6 +234,8 @@ impl ActorService {
 
         let service = Self {
             inner: Arc::new(ServiceInner {
+                app_labels,
+                _shares: shares,
                 restoring: Default::default(),
                 tenant: config.tenant,
                 wall: config.wall_per_event,

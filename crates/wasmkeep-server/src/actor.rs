@@ -254,6 +254,11 @@ pub struct ActorService {
 }
 
 struct ServiceInner {
+    /// Its app's metric labels ([`crate::metrics::app_labels`]).
+    app_labels: Arc<str>,
+    /// Its app's shares of the process's budgets (ADR 0038, section 8),
+    /// while it is served.
+    _shares: Vec<crate::shares::Member>,
     restoring: std::sync::Mutex<std::collections::HashMap<ActorAddress, usize>>,
     tenant: String,
     wall: Duration,

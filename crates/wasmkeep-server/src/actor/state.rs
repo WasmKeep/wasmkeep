@@ -70,6 +70,8 @@ pub(super) struct ActorState {
     /// service.
     pub(super) secrets_blocked: Arc<std::sync::atomic::AtomicBool>,
     pub(super) address: ActorAddress,
+    /// Its app's metric labels ([`crate::metrics::app_labels`]).
+    pub(super) app_labels: Arc<str>,
     pub(super) class: Arc<ActorClass>,
     pub(super) runtime: Runtime,
     pub(super) storage: Storage,
@@ -141,20 +143,13 @@ impl Live {
 
     /// Records the running event once: its outcome (`failed` for a trap, a
     /// cut or a guest error) and how long it ran.
-    pub(super) fn record_event(&mut self, class: &str, failed: bool) {
+    /// Counted under its app, `app` ([`crate::metrics::app_labels`]).
+    pub(super) fn record_event(&mut self, app: &str, class: &str, failed: bool) {
         let Some((started, kind)) = self.event.take() else {
             return;
         };
-        let m = &crate::metrics::METRICS;
         let outcome = if failed { "failed" } else { "ok" };
-        crate::metrics::inc(&m.events.get(&[
-            ("class", class),
-            ("kind", kind),
-            ("outcome", outcome),
-        ]));
-        m.event_seconds
-            .get(&[("class", class)])
-            .observe(started.elapsed());
+        crate::metrics::record_event(app, class, kind, outcome, started.elapsed());
     }
 }
 
@@ -1371,7 +1366,11 @@ impl ActorState {
         .await;
         // A guest error leaves the instance usable; a trap or timeout does not.
         let trapped = !matches!(init, Ok(Ok(_)));
-        live.record_event(self.address.class(), !matches!(init, Ok(Ok(Ok(())))));
+        live.record_event(
+            &self.app_labels,
+            self.address.class(),
+            !matches!(init, Ok(Ok(Ok(())))),
+        );
         let outcome = match init {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(msg))) => Err(format!("on-init failed: {msg}")),
@@ -1412,7 +1411,7 @@ impl ActorState {
         sync_alarm: bool,
     ) -> Option<Option<Entry>> {
         let live = self.live.as_mut()?;
-        live.record_event(self.address.class(), trapped);
+        live.record_event(&self.app_labels, self.address.class(), trapped);
         // A wall-clock cut cancels the guest future, not spawn_blocking.
         // Recover its connection before rollback, replication, deletion or
         // another event can open this database again.
