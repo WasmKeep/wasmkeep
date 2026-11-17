@@ -3620,6 +3620,7 @@ dependencies = [
  "wasmkeep-server",
  "wasmkeep-storage",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]

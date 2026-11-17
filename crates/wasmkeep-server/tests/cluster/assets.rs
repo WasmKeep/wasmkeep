@@ -33,7 +33,10 @@ pub(super) fn changes(body: &[u8]) -> Changes {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assets_http_switch_missing_index_repair_and_rollback() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    assets_http_switch_missing_index_repair_and_rollback_on(Arc::new(InMemory::new())).await;
+}
+
+async fn assets_http_switch_missing_index_repair_and_rollback_on(store: Arc<dyn ObjectStore>) {
     let app_ref = AppRef::new(store.clone(), "", "default", "default");
     let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
     let first = app_ref
@@ -439,4 +442,36 @@ mod concurrent {
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_assets() {
+    super::s3::run(
+        "assets",
+        assets_http_switch_missing_index_repair_and_rollback_on,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_asset_collection() {
+    super::s3::run("asset-collection", async |store| {
+        let app = AppRef::new(store.clone(), "", "default", "default");
+        let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
+        app.deploy_changes(&runtime, changes(b"kept"))
+            .await
+            .unwrap();
+        let orphan = format!("apps/default/default/_assets/content/{}", digest(b"orphan"));
+        store
+            .put(&orphan.clone().into(), b"orphan".to_vec().into())
+            .await
+            .unwrap();
+        // S3 Last-Modified is rounded to seconds; the orphan must predate Tc.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(app.collect_assets(Duration::ZERO).await.unwrap(), 1);
+        assert!(store.head(&orphan.into()).await.is_err());
+        let kept = format!("apps/default/default/_assets/content/{}", digest(b"kept"));
+        assert!(store.head(&kept.into()).await.is_ok());
+    })
+    .await;
 }

@@ -3878,6 +3878,7 @@ async fn a_second_run_reads_no_unchanged_file_and_verify_needs_every_file() {
     let counting = Arc::new(CountBlobGets {
         inner: f.source.clone(),
         gets: Default::default(),
+        late_change: None,
     });
     let source: Store = counting.clone();
     create(&f.args(), &source, "", &f.dest, "").await.unwrap();
@@ -4080,6 +4081,7 @@ async fn an_in_place_restore_moves_files_to_a_new_epoch() {
 struct CountBlobGets {
     inner: Store,
     gets: std::sync::atomic::AtomicUsize,
+    late_change: Option<(Store, String, Arc<std::sync::atomic::AtomicBool>)>,
 }
 impl std::fmt::Display for CountBlobGets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4117,6 +4119,30 @@ impl ObjectStore for CountBlobGets {
         &self,
         prefix: Option<&Key>,
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if prefix.is_some_and(|p| p.as_ref().contains("/blobs/"))
+            && let Some((archive, copied, changed)) = self.late_change.clone()
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.cloned();
+            return futures_util::stream::once(async move {
+                // The actor's snapshot is already in the archive. No sleep
+                // or race with a scheduler decides which bytes are backed up.
+                assert!(archive.head(&Key::from(copied)).await.is_ok());
+                put_file(
+                    &inner,
+                    &fresh_epoch(),
+                    &alice_ns("0"),
+                    "value",
+                    b"2",
+                    "text/plain",
+                )
+                .await;
+                changed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, object_store::Error>(inner.list(prefix.as_ref()))
+            })
+            .try_flatten()
+            .boxed();
+        }
         self.inner.list(prefix)
     }
     fn delete_stream(
@@ -4139,4 +4165,207 @@ impl ObjectStore for CountBlobGets {
     ) -> object_store::Result<()> {
         self.inner.copy_opts(a, b, o).await
     }
+}
+
+#[test]
+fn missing_file_manifest_warning_is_specific_to_blob_imports() {
+    assert!(restore::missing_files_warning(true, &json!({})).is_some());
+    assert!(restore::missing_files_warning(false, &json!({})).is_none());
+    assert!(restore::missing_files_warning(true, &json!({"files": []})).is_none());
+}
+
+#[tokio::test]
+async fn file_changed_after_actor_copy_restores_newer_than_its_row() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::new().await;
+    put_file(
+        &f.source,
+        &fresh_epoch(),
+        &alice_ns("0"),
+        "value",
+        b"1",
+        "text/plain",
+    )
+    .await;
+    let objects = history::list_objects(&f.source, "state/acme/shop/actors/counter/alice/")
+        .await
+        .unwrap();
+    let snapshot = f
+        .source
+        .get(&objects.values().next().unwrap().location)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let changed = Arc::new(AtomicBool::new(false));
+    let source: Store = Arc::new(CountBlobGets {
+        inner: f.source.clone(),
+        gets: Default::default(),
+        late_change: Some((
+            f.dest.clone(),
+            format!("data/{}", digest(&snapshot)),
+            changed.clone(),
+        )),
+    });
+    create(&f.args(), &source, "", &f.dest, "").await.unwrap();
+    assert!(changed.load(Ordering::SeqCst));
+    let id = latest(&f.dest, "").await.unwrap().unwrap();
+    verify(&f.dest, "", &id, None).await.unwrap();
+    let run = load(&f.dest, "", &id).await.unwrap();
+    assert!(array(&run.complete, "failed").unwrap().is_empty());
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    restore::execute(
+        &restore_args(&id, false),
+        &f.dest,
+        "",
+        &target,
+        "",
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    let db = f._dir.path().join("restored.db");
+    history::replay(&target, "state/acme/shop/actors/counter/alice/", &db, MAX)
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let row: i64 = conn
+        .query_row("SELECT n FROM counts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(row, 1);
+    let epoch = restored_epoch(&target).await;
+    assert_eq!(
+        file_at(
+            &target,
+            &format!("state/acme/shop/blobs/{epoch}/{}/value", alice_ns("0"))
+        )
+        .await,
+        Some((b"2".to_vec(), Some("text/plain".into())))
+    );
+}
+
+#[tokio::test]
+async fn legacy_backup_with_blob_imports_restores_successfully() {
+    const CHILD: &str = "WASMKEEP_TEST_LEGACY_BLOB_FRONT";
+    if std::env::var_os(CHILD).is_none() {
+        for front in ["false", "true"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::legacy_backup_with_blob_imports_restores_successfully",
+                    "--nocapture",
+                ])
+                .env(CHILD, front)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{}\n{stderr}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.starts_with("warning:"))
+                    .count(),
+                1,
+                "{stderr}"
+            );
+        }
+        return;
+    }
+    let front = std::env::var(CHILD).unwrap() == "true";
+    let f = Fixture::new().await;
+    let wasm = wat::parse_str(
+        r#"(component
+            (import "wasmkeep:actor/blobs@0.2.0" (instance)))"#,
+    )
+    .unwrap();
+    let class = if front { "_front" } else { "counter" };
+    let line = if front {
+        format!("front main {}", digest(&wasm))
+    } else {
+        format!("class counter {}", digest(&wasm))
+    };
+    put(
+        &f.source,
+        "apps/acme/shop/v1/manifest",
+        format!("wasmkeep-manifest 3\n{line}\n").into_bytes(),
+        true,
+    )
+    .await
+    .unwrap();
+    put(
+        &f.source,
+        &format!("apps/acme/shop/v1/{class}.wasm"),
+        wasm,
+        false,
+    )
+    .await
+    .unwrap();
+    let id = f.create().await;
+    let run = load(&f.dest, "", &id).await.unwrap();
+    let mut app = run.apps[0].clone();
+    for field in ["files", "file_count", "blob_epoch"] {
+        app.as_object_mut().unwrap().remove(field);
+    }
+    let mut complete = run.complete.clone();
+    let app_key = complete["apps"][0]["key"].as_str().unwrap().to_owned();
+    complete["apps"][0]["sha256"] = json!(json_put(&f.dest, &app_key, &app, true).await.unwrap());
+    let hash = json_put(&f.dest, &format!("runs/{id}/complete"), &complete, true)
+        .await
+        .unwrap();
+    json_put(
+        &f.dest,
+        &format!("runs/{id}/root"),
+        &json!({"run":id,"sha256":hash}),
+        true,
+    )
+    .await
+    .unwrap();
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    let imported = restore::imports_blobs(
+        &f.dest,
+        "",
+        &app,
+        "apps/acme/shop/",
+        &target,
+        "apps/acme/shop",
+        DeployChoice::Backup,
+    )
+    .await
+    .unwrap();
+    assert!(imported);
+    assert_eq!(
+        restore::missing_files_warning(imported, &app)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    restore::execute(
+        &restore_args(&id, false),
+        &f.dest,
+        "",
+        &target,
+        "",
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert!(
+        restore::imports_blobs(
+            &f.dest,
+            "",
+            &app,
+            "apps/acme/shop/",
+            &target,
+            "apps/acme/shop",
+            DeployChoice::Keep
+        )
+        .await
+        .unwrap()
+    );
 }

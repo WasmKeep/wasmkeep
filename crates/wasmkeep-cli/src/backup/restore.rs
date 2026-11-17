@@ -488,6 +488,12 @@ pub(super) async fn execute(
     // Only deploy payloads and secrets are allowed to become target metadata;
     // in particular, a trailing slash must not normalize into a fence key.
     let source_app = format!("{}/", key(sp, &format!("apps/{name}")));
+    if app.get("files").is_none() {
+        let imports = imports_blobs(archive, ap, app, &source_app, target, &base, choice).await?;
+        if let Some(warning) = missing_files_warning(imports, app) {
+            eprintln!("{warning}");
+        }
+    }
     for object in array(app, "objects")? {
         let tail = text(object, "key")?
             .strip_prefix(&source_app)
@@ -782,6 +788,62 @@ pub(super) async fn execute(
     result?;
     unlock?;
     Ok(())
+}
+
+pub(super) fn missing_files_warning(imports_blobs: bool, app: &Value) -> Option<&'static str> {
+    (imports_blobs && app.get("files").is_none()).then_some(
+        "warning: app version imports blobs but this backup run has no file manifest; files cannot be restored",
+    )
+}
+
+pub(super) async fn imports_blobs(
+    archive: &Store,
+    ap: &str,
+    app: &Value,
+    source_app: &str,
+    target: &Store,
+    base: &str,
+    choice: DeployChoice,
+) -> anyhow::Result<bool> {
+    use wasmkeep_server::apps::{Current, Manifest, StorageImports};
+    let objects: BTreeMap<_, _> = array(app, "objects")?
+        .iter()
+        .map(|o| Ok((text(o, "key")?, o)))
+        .collect::<anyhow::Result<_>>()?;
+    let get = async |tail: &str| -> anyhow::Result<Vec<u8>> {
+        if choice == DeployChoice::Keep {
+            read(target, &key(base, tail), MAX).await
+        } else {
+            blob(
+                archive,
+                ap,
+                objects
+                    .get(key(source_app, tail).as_str())
+                    .context("deploy object missing")?,
+            )
+            .await
+        }
+    };
+    let current = Current::parse(&get("current").await?).context("invalid current")?;
+    let manifest = Manifest::parse(std::str::from_utf8(
+        &get(&format!("{}/manifest", current.version)).await?,
+    )?)
+    .context("invalid manifest")?;
+    let runtime = wasmkeep_runtime::Runtime::new(&wasmkeep_runtime::RuntimeConfig::default())?;
+    for class in manifest
+        .classes
+        .keys()
+        .map(String::as_str)
+        .chain(manifest.front.as_ref().map(|_| "_front"))
+    {
+        let bytes = get(&format!("{}/{class}.wasm", current.version)).await?;
+        let component = wasmtime::component::Component::new(runtime.engine(), &bytes)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if StorageImports::of(&runtime, &component).blobs {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

@@ -139,9 +139,13 @@ impl ObjectStore for Counted {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn feed_one_poll_projection_cost_and_read_only() {
+    feed_one_poll_projection_cost_and_read_only_on(Arc::new(InMemory::new())).await;
+}
+
+async fn feed_one_poll_projection_cost_and_read_only_on(store: Arc<dyn ObjectStore>) {
     use clap::Parser;
     use wasmkeep_cli::feed::{Args, poll};
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
     let dir = tempfile::tempdir().unwrap();
     let node = node_with(
         "feed",
@@ -1320,4 +1324,9 @@ async fn write_after_delete(addr: std::net::SocketAddr, path: &str) -> String {
         assert_eq!(r.status, 200, "{}", r.body);
         return r.body.trim().to_owned();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_feed() {
+    super::s3::run("feed", feed_one_poll_projection_cost_and_read_only_on).await;
 }

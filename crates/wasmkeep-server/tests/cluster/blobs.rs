@@ -191,7 +191,13 @@ const A: &str = "/actor/blob/alice";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_actor_keeps_files_in_the_bucket_with_conditions_and_listings() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    an_actor_keeps_files_in_the_bucket_with_conditions_and_listings_on(Arc::new(InMemory::new()))
+        .await;
+}
+
+async fn an_actor_keeps_files_in_the_bucket_with_conditions_and_listings_on(
+    store: Arc<dyn ObjectStore>,
+) {
     let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a = blob_node("a", d1.path(), &store).await;
     let b = blob_node("b", d2.path(), &store).await;
@@ -849,7 +855,10 @@ async fn put_raw(addr: SocketAddr, path: &str, headers: &str, body: &[u8]) -> Re
 
 #[tokio::test(flavor = "multi_thread")]
 async fn upload_links_create_one_file_of_the_size_and_type_allowed() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    upload_links_create_one_file_of_the_size_and_type_allowed_on(Arc::new(InMemory::new())).await;
+}
+
+async fn upload_links_create_one_file_of_the_size_and_type_allowed_on(store: Arc<dyn ObjectStore>) {
     let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a = blob_node("a", d1.path(), &store).await;
     let b = blob_node("b", d2.path(), &store).await;
@@ -965,7 +974,10 @@ async fn file_keys(store: &Arc<dyn ObjectStore>) -> (Vec<String>, Vec<String>) {
 /// After a delete of `name` (by `how`), the next actor at the address
 /// finds none of the old files, the old ones go, and a link to one fails.
 async fn a_delete_ends_the_files(how: &str) {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    a_delete_ends_the_files_on(how, Arc::new(InMemory::new())).await;
+}
+
+async fn a_delete_ends_the_files_on(how: &str, store: Arc<dyn ObjectStore>) {
     let d = tempfile::tempdir().unwrap();
     let a = blob_node("a", d.path(), &store).await;
     settle().await;
@@ -1670,4 +1682,30 @@ async fn over_the_apps_limit_writes_and_upload_links_are_refused_until_a_count_i
         })
         .await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_blobs() {
+    super::s3::run(
+        "blobs",
+        an_actor_keeps_files_in_the_bucket_with_conditions_and_listings_on,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_blob_links_and_sweep() {
+    super::s3::run("blob-sweep", async |store| {
+        a_delete_ends_the_files_on("delete-self-durable", store).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_blob_upload_links() {
+    super::s3::run(
+        "blob-upload-links",
+        upload_links_create_one_file_of_the_size_and_type_allowed_on,
+    )
+    .await;
 }

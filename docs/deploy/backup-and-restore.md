@@ -166,7 +166,10 @@ restored file has a new `etag` and modified time: an app that stored an
 ETag for a conditional write reads it again.
 
 Back up an app that uses files or assets with a CLI of 0.6.0 or later:
-an older one copies neither and restores neither.
+an older one copies neither and restores neither. When the selected app
+version imports `blobs` but the run has no file manifest, `backup restore`
+prints a warning to stderr and continues. An empty file manifest is valid
+and does not warn.
 
 ## Prune an online archive
 
@@ -653,6 +656,12 @@ the hook manually while that source is running:
 ```sh
 ./scripts/drills/backup-restore.sh --source s3://test/soak-run --acks drill-acks.json
 ```
+
+The drill also deploys the local `blob-actor` fixture and a static asset to
+separate roots under its owned scratch prefix, including in `--source` mode.
+It checks both after whole-app restore, then checks that actor restore keeps
+newer file contents and, after deletion, the current file namespace. This
+fixture never changes the externally supplied soak source.
 
 The acknowledgement file is a nonempty JSON object mapping routes such as
 `/actor/t/s123-0/durable` to positive integer counts. Capture it before the

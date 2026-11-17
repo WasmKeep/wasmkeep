@@ -9,6 +9,8 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- `backup restore` warns when the selected app version imports files but the backup predates file manifests.
+
 - **Actor SQL/export verification:** apply SQLite authorization, schema checks,
   and execution deadlines before verification queries; reject hostile host
   metadata views and run verification off the async executor.

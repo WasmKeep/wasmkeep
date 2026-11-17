@@ -185,7 +185,8 @@ files must outlive a quiet period needs an alarm, or no
 
 **`actor restore` restores rows, not files.** It rewinds one actor's
 database; its files are as they are now. A restore to a point before a
-delete gives the actor its old rows in a new, empty namespace. A row
+delete gives the actor its old rows but keeps the current life's file
+namespace, including any files written since the delete. A row
 may name a file deleted since: check with `head` before trusting a
 restored row. To get the files of a past moment, restore the whole app
 from a backup into a prefix of its own and copy them out

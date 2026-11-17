@@ -3,7 +3,7 @@
 # lease and ownership tests on an S3 API, failover with production timings,
 # two nodes over the cluster listener, `cluster status` and deploy
 # configuration against a bucket, and `cluster diagnose` (the bucket
-# conformance check).
+# conformance check), plus files, static asset deploy/collection and the feed.
 #
 # With WASMKEEP_TEST_S3_BUCKET and the AWS_* variables already set, they run
 # against that bucket (R2, OVHcloud, AWS: see docs/deploy). Otherwise this
@@ -43,9 +43,11 @@ else
   echo "S3 suites against moto $MOTO_VERSION"
 fi
 
-cargo nextest run -p wasmkeep-cluster --test s3 --locked
-cargo nextest run -p wasmkeep-cli --locked --no-capture \
+cargo nextest run --build-jobs 4 --test-threads 4 -p wasmkeep-cluster --test s3 --locked
+cargo nextest run --build-jobs 4 --test-threads 4 -p wasmkeep-cli --locked --no-capture \
   --test failover --test cluster_tls --test cluster_status --test deploy_config --test cluster_diagnose
+
+cargo nextest run --build-jobs 4 --test-threads 4 -p wasmkeep-server --test cluster --locked -E 'test(::s3_)'
 
 # The same drill used by the soak, with a bounded fixture writer here.
 ./scripts/drills/backup-restore.sh
