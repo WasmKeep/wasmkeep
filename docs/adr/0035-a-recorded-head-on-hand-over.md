@@ -890,11 +890,37 @@ Follow-ups from the review of the build:
 - **The exact-floor sidecar proof (proof 3, case 10)** stays unbuilt:
   it would let an actor activate from its own local file while the
   listing is behind, a liveness shortcut. Safety does not depend on it.
-  Nor is the structural route beyond the snapshot stop a safety gap for
-  want of a checksum at the floor: a history key names its writer's
-  generation and transaction, is created once, and only that generation's
-  holder writes it, so a listed key at the floor's identity is the object
-  the floor names.
+  Nor is the structural route beyond the snapshot stop (a listed floor
+  the base snapshot links back to through listed segments) a safety gap
+  for want of a checksum at the floor, under these preconditions:
+  - **Segments are bound to their writer.** A segment key names its
+    generation, transaction and parent generation; only that
+    generation's holder writes it, created once (`If-None-Match`), and
+    its bytes carry the writer's own pre- and post-apply checksums,
+    which every replay checks. A listed segment at the floor's identity
+    is the object the floor names.
+  - **Snapshots are not.** A periodic, after-delete or after-restore
+    snapshot is labelled at the head it holds (`self.head`, an older
+    generation's position), so a later holder may write a snapshot key
+    in an earlier generation. Its content is bound by the checksum its
+    writer verified at that head (one at the same key is the same
+    position, the same database), and the replay of the selected chain
+    starts from it. The route's links are segments only; the floor
+    itself may be a listed segment or snapshot key, each bound to the
+    checksum its writer verified there.
+  - **The store enforces conditional create**, as `cluster diagnose`
+    checks: no key is replaced once written.
+  - **Nothing is restored into the prefix from another lineage.**
+    Whole-app restore removes every ownership record and seeds
+    generations above the restored keys; single-actor restore writes a
+    new reset on the live head.
+
+  Generations never restart for an actor whose record remains: deletes,
+  idle expiry and `delete-self` write a reset at the next transaction and
+  keep the record. Only `app delete` then `--recreate` removes both the
+  record and the history, and generations may start again from 1; no
+  floor survives it (the record is gone, and local evidence is dropped
+  on an absent record).
 
 Earlier questions:
 

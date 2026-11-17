@@ -3685,6 +3685,8 @@ struct LaggingList {
     lag: std::sync::atomic::AtomicBool,
     hidden: Mutex<std::collections::BTreeSet<String>>,
     lists: std::sync::atomic::AtomicU64,
+    /// Each history listing waits this long before it answers (ms).
+    slow_lists_ms: std::sync::atomic::AtomicU64,
 }
 
 impl LaggingList {
@@ -3694,6 +3696,7 @@ impl LaggingList {
             lag: std::sync::atomic::AtomicBool::new(false),
             hidden: Mutex::default(),
             lists: std::sync::atomic::AtomicU64::new(0),
+            slow_lists_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -3756,19 +3759,28 @@ impl ObjectStore for LaggingList {
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
     {
         use futures_util::StreamExt as _;
-        if prefix.is_some_and(|p| p.as_ref().contains("/actors/")) {
+        let history = prefix.is_some_and(|p| p.as_ref().contains("/actors/"));
+        if history {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         let hidden = self.hidden.lock().unwrap().clone();
-        self.inner
-            .list(prefix)
-            .filter(move |m| {
-                let keep = m
-                    .as_ref()
-                    .map_or(true, |m| !hidden.contains(m.location.as_ref()));
-                std::future::ready(keep)
-            })
-            .boxed()
+        let slow = if history {
+            self.slow_lists_ms.load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
+        };
+        let listed = self.inner.list(prefix).filter(move |m| {
+            let keep = m
+                .as_ref()
+                .map_or(true, |m| !hidden.contains(m.location.as_ref()));
+            std::future::ready(keep)
+        });
+        futures_util::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(slow)).await;
+            listed
+        })
+        .flatten()
+        .boxed()
     }
 
     async fn list_with_delimiter(
@@ -4456,4 +4468,118 @@ async fn a_missing_link_past_the_bound_is_a_corruption() {
         "{:?}",
         got.err()
     );
+}
+
+/// Review of S6: a missing link is a corruption only when every listing
+/// the bound allowed showed it missing. Listings slow enough to spend the
+/// deadline first prove nothing: refused as not yet visible (503), and
+/// the next request, once the link is listed, activates.
+#[tokio::test]
+async fn a_missing_link_behind_slow_listings_stays_retryable() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let lagging = LaggingList::new();
+    let store: Arc<dyn ObjectStore> = Arc::clone(&lagging) as Arc<dyn ObjectStore>;
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    // The middle link is not listed yet; the last one is.
+    lagging.lag.store(true, std::sync::atomic::Ordering::SeqCst);
+    db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    lagging
+        .lag
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    db.exec("INSERT INTO t VALUES (3)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // Listings slow enough that the deadline ends the discovery first.
+    lagging
+        .slow_lists_ms
+        .store(4_000, std::sync::atomic::Ordering::SeqCst);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let path = storage_in(other.path()).db_path("c", "x");
+    let got = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path.clone(),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(&got, Err(ReplicaError::Visibility(_))),
+        "{:?}",
+        got.err()
+    );
+    drop(hold);
+    assert!(a.releases_done(Duration::from_secs(5)).await);
+    // The link is listed now: the next request activates.
+    lagging.reveal();
+    lagging
+        .slow_lists_ms
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    a.pending.clear_cooldown(&a.owner_key(&x));
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let restored = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path,
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.verified_head(), h);
 }

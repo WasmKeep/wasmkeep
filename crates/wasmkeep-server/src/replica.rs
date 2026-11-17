@@ -604,9 +604,9 @@ const DISCOVERY: std::time::Duration = std::time::Duration::from_secs(15);
 /// The pauses between the at most ten listings of that discovery (ms).
 const RELIST_MS: [u64; 9] = [100, 200, 400, 800, 1_600, 1_600, 1_600, 1_600, 1_600];
 
-/// What a discovery that ran out of attempts or time reports: a missing
-/// link still missing is a corruption (500), a floor merely not visible
-/// a retryable refusal (503) (ADR 0035, S6).
+/// What a discovery that used all ten listings reports: a link every one
+/// of them showed missing is a corruption (500); otherwise a retryable
+/// refusal (503) (ADR 0035, S6).
 fn gave_up(why: String, missing_link: bool) -> ReplicaError {
     if missing_link {
         ReplicaError::Restore(format!(
@@ -791,6 +791,9 @@ impl Replica {
         let deadline = tokio::time::Instant::now() + DISCOVERY;
         let mut attempt = 0;
         let started = std::time::Instant::now();
+        // Whether every listing so far showed a link missing: only all ten
+        // listings the bound allows, each so, make it a corruption.
+        let mut all_missing = true;
         let restored = loop {
             let tried = Self::restore_within(
                 cluster,
@@ -802,19 +805,27 @@ impl Replica {
                 floor.as_ref(),
             )
             .await;
-            let missing_link = matches!(tried, Err(ReplicaError::MissingLink(_)));
+            all_missing &= matches!(tried, Err(ReplicaError::MissingLink(_)));
             match tried {
                 Err(ReplicaError::Visibility(why) | ReplicaError::MissingLink(why))
                     if attempt < RELIST_MS.len() =>
                 {
+                    // The hold ended: late, whatever the listing showed.
+                    if !lease.is_valid() {
+                        break Err(ReplicaError::Late);
+                    }
                     let pause = jittered(std::time::Duration::from_millis(RELIST_MS[attempt]));
-                    if tokio::time::Instant::now() + pause >= deadline || !lease.is_valid() {
-                        break Err(gave_up(why, missing_link));
+                    // The deadline, spent before the ten listings: nothing
+                    // proven either way, retryable.
+                    if tokio::time::Instant::now() + pause >= deadline {
+                        break Err(ReplicaError::Visibility(why));
                     }
                     attempt += 1;
                     tokio::time::sleep(pause).await;
                 }
-                Err(ReplicaError::MissingLink(why)) => break Err(gave_up(why, true)),
+                // The tenth listing.
+                Err(ReplicaError::MissingLink(why)) => break Err(gave_up(why, all_missing)),
+                Err(ReplicaError::Visibility(why)) => break Err(ReplicaError::Visibility(why)),
                 other => break other,
             }
         };
