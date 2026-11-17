@@ -113,6 +113,7 @@ impl Cluster {
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
+        self.add_sender(headers, &secret, "internal", &mac);
         self.check_tls_target(&base)
             .map_err(|e| format!("node {peer}: {e}"))?;
         // A connection of its own, closed after the answer: a hello's must
@@ -122,7 +123,7 @@ impl Cluster {
         let client: hyper_util::client::legacy::Client<_, http_body_util::Full<bytes::Bytes>> =
             peer_client_builder(PEER_POOL_IDLE)
                 .pool_max_idle_per_host(0)
-                .build(self.connector.clone());
+                .build(self.transport.connector.clone());
         let response = client
             .request(req)
             .await

@@ -117,6 +117,15 @@ pub struct NodeInfo {
     /// (ADR 0035, section 5; capability word `recorded-head`): an app
     /// that enables it may be served only by nodes announcing it.
     pub can_recorded_head: bool,
+    /// It can serve several apps in one process, and sends the sender and
+    /// the forward proof on every hop (ADR 0038, section 10; capability
+    /// word `multi-app`): a process serving several apps refuses to start,
+    /// and reports not ready, while a live node lacks it.
+    pub can_multi_app: bool,
+    /// The process that runs it (heartbeat line 11, `process=<id>`, ADR
+    /// 0038): the node ids of one process share its address and
+    /// certificate. `None` from nodes that predate it or name none.
+    pub process: Option<String>,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which
     /// each notices in its next listing. `None` from nodes that predate it.
@@ -294,7 +303,10 @@ impl NodeInfo {
             out.push('\n');
             // Line 10 is written (empty if need be) when line 11 follows,
             // so line 11 stays line 11.
-            if self.reads_secrets || self.capabilities().next().is_some() || self.instance.is_some()
+            if self.reads_secrets
+                || self.capabilities().next().is_some()
+                || self.instance.is_some()
+                || self.process.is_some()
             {
                 out.push_str(if self.reads_secrets {
                     "secrets\n"
@@ -306,6 +318,9 @@ impl NodeInfo {
             let mut words: Vec<String> = self.capabilities().map(str::to_owned).collect();
             if let Some(instance) = &self.instance {
                 words.push(format!("instance={instance}"));
+            }
+            if let Some(process) = &self.process {
+                words.push(format!("process={process}"));
             }
             if !words.is_empty() {
                 out.push_str(&words.join(" "));
@@ -368,6 +383,10 @@ impl NodeInfo {
     /// invisible to them.
     pub fn payload(&self) -> Vec<u8> {
         let pins: Vec<String> = self.tls_pins.iter().map(hex).collect();
+        let mut words: Vec<String> = self.capabilities().map(str::to_owned).collect();
+        if let Some(process) = &self.process {
+            words.push(format!("process={process}"));
+        }
         let mut out = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             self.id,
@@ -378,7 +397,7 @@ impl NodeInfo {
             pins.join(" "),
             self.drain.unwrap_or_default().as_str(),
             if self.reads_secrets { "secrets" } else { "" },
-            self.capabilities().collect::<Vec<_>>().join(" "),
+            words.join(" "),
         );
         if let Some(load) = &self.load {
             out.push_str(&load.line());
@@ -424,6 +443,8 @@ impl NodeInfo {
             can_restore: words.can_restore,
             can_actor_restore: words.can_actor_restore,
             can_recorded_head: words.can_recorded_head,
+            can_multi_app: words.can_multi_app,
+            process: words.process,
             instance: lease.instance,
             lease: Some(lease.state),
             load,
@@ -447,6 +468,7 @@ impl NodeInfo {
             (self.can_restore, "restore"),
             (self.can_actor_restore, "actor-restore"),
             (self.can_recorded_head, "recorded-head"),
+            (self.can_multi_app, "multi-app"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -480,6 +502,11 @@ impl NodeInfo {
             can_restore: words.contains(&"restore"),
             can_actor_restore: words.contains(&"actor-restore"),
             can_recorded_head: words.contains(&"recorded-head"),
+            can_multi_app: words.contains(&"multi-app"),
+            process: words.iter().find_map(|w| {
+                let id = w.strip_prefix("process=")?;
+                validate_node_id(id).is_ok().then(|| id.to_owned())
+            }),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
                 let ok = !token.is_empty()
@@ -570,6 +597,8 @@ pub struct Membership<D, C> {
     reads_secrets: bool,
     /// Published on line 11: this process's token.
     instance: Option<String>,
+    /// Published on line 11: the process's id (ADR 0038).
+    process: Option<String>,
     /// Published on payload line 10 (format 3); set by the server, or read
     /// from `load_source` as each payload is built (the last read kept).
     load: std::sync::Mutex<Option<Load>>,
@@ -602,6 +631,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             drain: std::sync::Mutex::new(DrainState::Serving),
             reads_secrets: true,
             instance: None,
+            process: None,
             load: std::sync::Mutex::new(None),
             load_source: std::sync::OnceLock::new(),
             ttl_ms,
@@ -622,6 +652,12 @@ impl<D: Directory, C: Clock> Membership<D, C> {
     #[must_use]
     pub fn with_instance(mut self, token: impl Into<String>) -> Self {
         self.instance = Some(token.into());
+        self
+    }
+
+    /// Publishes the process's id (`process=<id>`, ADR 0038) on line 11.
+    pub fn with_process(mut self, id: impl Into<String>) -> Self {
+        self.process = Some(id.into());
         self
     }
 
@@ -731,6 +767,8 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_restore: true,
             can_actor_restore: true,
             can_recorded_head: true,
+            can_multi_app: true,
+            process: self.process.clone(),
             instance: self.instance.clone(),
             lease: None,
             load,
@@ -772,8 +810,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
     /// listing), sorted by id: those whose object is gone are left out.
     /// What [`Membership::heartbeats`] would give for them.
     pub async fn heartbeats_of(&self, ids: &[String]) -> Result<Vec<NodeInfo>, BucketError> {
-        let keys: Vec<String> = ids.iter().map(|id| format!("{NODES_PREFIX}{id}")).collect();
-        Ok(decoded(self.directory.read(&keys).await?))
+        heartbeats_of(&self.directory, ids).await
     }
 
     /// The live ones of `nodes` (see [`Membership::live_nodes`]).
@@ -790,6 +827,17 @@ impl<D: Directory, C: Clock> Membership<D, C> {
 /// nodes too (`wasmkeep cluster status`). Unreadable objects are skipped.
 pub async fn all_heartbeats<D: Directory>(directory: &D) -> Result<Vec<NodeInfo>, BucketError> {
     Ok(decoded(directory.list(NODES_PREFIX).await?))
+}
+
+/// The heartbeats of the nodes `ids` names, read one by one (no listing),
+/// sorted by id: those whose object is gone are left out. What
+/// [`all_heartbeats`] would give for them.
+pub async fn heartbeats_of<D: Directory>(
+    directory: &D,
+    ids: &[String],
+) -> Result<Vec<NodeInfo>, BucketError> {
+    let keys: Vec<String> = ids.iter().map(|id| format!("{NODES_PREFIX}{id}")).collect();
+    Ok(decoded(directory.read(&keys).await?))
 }
 
 /// The heartbeats among `objects` (key, body), sorted by id.
@@ -994,6 +1042,8 @@ mod tests {
             lease: None,
             load: None,
             can_recorded_head: false,
+            can_multi_app: false,
+            process: None,
         };
         mem.0.borrow_mut().insert("nodes/x".into(), forged.encode());
         mem.0
@@ -1035,6 +1085,8 @@ mod tests {
             lease: None,
             load: None,
             can_recorded_head: false,
+            can_multi_app: false,
+            process: None,
         };
         assert_eq!(NodeInfo::decode(&info.encode()), Some(info));
         let old = b"wasmkeep-node 1\na\nx:1\n0.1\n5\n";
@@ -1112,6 +1164,8 @@ mod tests {
             lease: None,
             load: None,
             can_recorded_head: false,
+            can_multi_app: false,
+            process: None,
         }
     }
 
@@ -1490,6 +1544,8 @@ mod tests {
             lease: Some(lease.state),
             load: None,
             can_recorded_head: false,
+            can_multi_app: false,
+            process: None,
         })
     }
 
@@ -1602,9 +1658,37 @@ mod tests {
         let payload = String::from_utf8(a.lease_payload()).unwrap();
         assert_eq!(
             payload.lines().nth(8),
-            Some("take front handoff ends flush rate_limits restore actor-restore recorded-head"),
+            Some(
+                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app"
+            ),
             "{payload}"
         );
+    }
+
+    /// ADR 0038: this binary announces `multi-app` and, when given, its
+    /// process's id; older readers ignore both, and an id that is not one
+    /// is ignored.
+    #[test]
+    fn multi_app_and_the_process_are_announced() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let membership = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0)
+            .unwrap()
+            .with_process("edge-1");
+        let decoded =
+            NodeInfo::decode(&format3(&membership.info(), NodeState::Live, "beef")).unwrap();
+        assert!(decoded.can_multi_app);
+        assert_eq!(decoded.process.as_deref(), Some("edge-1"));
+        let plain = Membership::new(&mem, At(&t), "b", "http://x:1", 3_000, 0).unwrap();
+        let decoded = NodeInfo::decode(&format3(&plain.info(), NodeState::Live, "beef")).unwrap();
+        assert!(decoded.can_multi_app);
+        assert_eq!(decoded.process, None);
+        let words = NodeInfo::words(Some("take process=Bad_Id multi-app"));
+        assert!(words.can_multi_app);
+        assert_eq!(words.process, None);
+        let words = NodeInfo::words(Some("take process=edge-2"));
+        assert!(!words.can_multi_app);
+        assert_eq!(words.process.as_deref(), Some("edge-2"));
     }
 
     /// ADR 0035, section 5: this binary announces `recorded-head`; a live

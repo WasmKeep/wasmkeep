@@ -39,6 +39,19 @@ at the start of `serve`'s exit line, followed there by the details:
 Point load balancers at `/_wasmkeep/ready`, and use `/_wasmkeep/health` for
 "restart it if it stops answering".
 
+### A process serving several apps
+
+Readiness is asked with an app's hostname, and reports that app's
+runtime: 503 while it starts again after a verdict, and while a live node
+without `multi-app` (an older version) runs in the cluster, which the
+metrics page names among the not-ready reasons. `/_wasmkeep/health` is the
+process's. The metrics page has one `wasmkeep_info` per app's node; app
+series (`wasmkeep_events_total`, `wasmkeep_front_requests_total`, ...)
+carry each app's `tenant` and `app`; the process's gauges (residents,
+WebSockets, the socket budget) are summed over its apps; and
+`wasmkeep_budget_share_part` and `wasmkeep_budget_share_in_use` show each
+app's part of the shared budgets.
+
 ## Open files
 
 Every resident actor holds three open files (its database, write-ahead log
@@ -198,6 +211,8 @@ its first request.
 | `wasmkeep_batched_waits_total{reason}` | counter | Times a batched actor's next event waited at the end of the one before (the event-start rule), by `reason`: `age` (a commit waited unsent past `--max-unsent-age`), `bytes` (the next segment was full, an event was over the cap, or the WAL asked for a checkpoint) and `budget` (the node's budget of segments in flight was full). |
 | `wasmkeep_flush_seconds` | histogram | How long a batched `storage.flush` (or `exec-durable`'s flush) took, answered `ok` or not. |
 | `wasmkeep_upload_budget_bytes_in_use` | gauge | Bytes of the node's 256 MiB budget of batched segments in flight in use now. |
+| `wasmkeep_budget_share_part` | gauge | Each app's equal part of a budget the process shares between its apps (`budget`: `uploads` in bytes, `restore_reads`, `restore_megabytes`), by tenant and app; half of it is a floor never lent to another app. |
+| `wasmkeep_budget_share_in_use` | gauge | What each app holds now of a shared budget, by budget, tenant and app. |
 
 Not there yet: `tenant` and `app` on the series without a class (one app
 per process for now: join on `wasmkeep_info`), traps by reason

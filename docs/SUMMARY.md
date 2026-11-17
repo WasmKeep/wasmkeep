@@ -38,11 +38,13 @@
 - [The toolchain image](deploy/toolchain.md)
 - [Upgrade a cluster to 0.4.0](deploy/upgrading-to-0.4.md)
 - [Upgrade a cluster to 0.5.0](deploy/upgrading-to-0.5.md)
+- [Upgrade a cluster to 0.6.0](deploy/upgrading-to-0.6.md)
 - [Monitoring](monitoring.md)
 
 # Reference
 
 - [API reference](reference/api.md)
+- [The node file](reference/node-file.md)
 - [Benchmarks](benchmarks.md)
 - [Security model](security.md)
 - [Licensing and compliance](legal.md)
@@ -93,6 +95,6 @@ are designs, not available capabilities. -->
 - [0035 A recorded head on hand-over](adr/0035-a-recorded-head-on-hand-over.md)
 - [0036 Per-node ingress rate limits (accepted, as built)](adr/0036-per-node-ingress-rate-limits.md)
 - [0037 Socket session admission (accepted, as built)](adr/0037-socket-session-admission.md)
-- [0038 Several apps per process (proposed)](adr/0038-several-apps-per-process.md)
+- [0038 Several apps per process (accepted, as built)](adr/0038-several-apps-per-process.md)
 
 - [Socket admission options](reference/socket-limits.md)

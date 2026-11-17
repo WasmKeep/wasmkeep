@@ -47,6 +47,9 @@ const LAPSED_WAIT: Duration = Duration::from_secs(3);
 /// the heartbeats.
 #[derive(Debug)]
 pub(crate) struct ClusterTls {
+    /// The name its certificate was made for (the process's, ADR 0038).
+    #[cfg_attr(not(test), allow(dead_code))]
+    name: String,
     identity: Identity,
     /// The cluster listener's address as published (`https://host:port`).
     advertise: String,
@@ -95,11 +98,18 @@ impl ClusterTls {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         Ok(Self {
             identity: Identity::generate(node_id, host)?,
+            name: node_id.to_owned(),
             advertise: advertise.trim_end_matches('/').to_owned(),
             pins: Arc::new(PinSet::default()),
             by_address: RwLock::new(HashMap::new()),
             listed: tokio::sync::watch::Sender::new(0),
         })
+    }
+
+    /// The name its certificate was made for.
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     /// The cluster address this node publishes.
@@ -740,6 +750,8 @@ mod tests {
             lease: None,
             load: None,
             can_recorded_head: false,
+            can_multi_app: false,
+            process: None,
         }
     }
 
@@ -1008,6 +1020,39 @@ mod tests {
         assert!(dialled.is_err(), "a connection was made");
     }
 
+    /// One process's certificate published by two node ids (ADR 0038,
+    /// section 5): the pin stays trusted while either is live, but each
+    /// node id publishes it only while its own heartbeat is.
+    #[test]
+    fn a_pin_published_by_two_node_ids_one_lapsing() {
+        let k = Identity::generate("p", "p.test").unwrap();
+        let pins = pinning::PinSet::default();
+        let now = now_ms();
+        pins.replace([
+            ("shop-1", &[k.pin()][..], now + 60_000),
+            ("blog-1", &[k.pin()][..], now.saturating_sub(1)),
+        ]);
+        assert!(
+            pins.node_of_pin(&k.pin()).is_some(),
+            "shop-1 keeps it trusted"
+        );
+        assert!(pins.publishes(&k.pin(), "shop-1"));
+        assert!(!pins.publishes(&k.pin(), "blog-1"), "blog-1 lapsed");
+        assert!(!pins.publishes(&k.pin(), "other"));
+        // The order of the listing does not matter (no last-insert wins).
+        pins.replace([
+            ("blog-1", &[k.pin()][..], now.saturating_sub(1)),
+            ("shop-1", &[k.pin()][..], now + 60_000),
+        ]);
+        assert!(pins.publishes(&k.pin(), "shop-1"));
+        assert!(!pins.publishes(&k.pin(), "blog-1"));
+        pins.replace([
+            ("shop-1", &[k.pin()][..], now + 60_000),
+            ("blog-1", &[k.pin()][..], now.saturating_sub(1)),
+        ]);
+        assert_eq!(pins.node_of_pin(&k.pin()).as_deref(), Some("shop-1"));
+    }
+
     #[tokio::test]
     async fn pins_expire_with_their_heartbeat_even_if_listing_stops() {
         // One listing, then none (the bucket cannot be listed): trust lasts
@@ -1202,8 +1247,13 @@ pub(crate) mod pinning {
     /// bucket), so looking them up need not be constant-time.
     #[derive(Debug, Default)]
     pub(crate) struct PinSet {
-        /// Each live pin's node, and when its heartbeat expires (ms).
-        by_pin: std::sync::RwLock<std::collections::HashMap<Pin32, (String, u64)>>,
+        /// Each live pin's nodes (one process's certificate is published
+        /// by each of its node ids, ADR 0038), each with when its own
+        /// heartbeat expires (ms).
+        #[allow(clippy::type_complexity)]
+        by_pin: std::sync::RwLock<
+            std::collections::HashMap<Pin32, std::collections::BTreeMap<String, u64>>,
+        >,
         /// Woken when a pin was not known (a peer refused, or one refusing
         /// us): the heartbeats are listed again sooner (rate-limited by the
         /// waiter, so strangers cannot make this node hammer the bucket).
@@ -1218,10 +1268,18 @@ pub(crate) mod pinning {
             &self,
             nodes: impl IntoIterator<Item = (&'a str, &'a [Pin32], u64)>,
         ) {
-            let mut by_pin = std::collections::HashMap::new();
+            let mut by_pin: std::collections::HashMap<
+                Pin32,
+                std::collections::BTreeMap<String, u64>,
+            > = std::collections::HashMap::new();
             for (node, pins, until) in nodes {
                 for pin in pins {
-                    by_pin.insert(*pin, (node.to_owned(), until));
+                    let at = by_pin
+                        .entry(*pin)
+                        .or_default()
+                        .entry(node.to_owned())
+                        .or_insert(0);
+                    *at = (*at).max(until);
                 }
             }
             *self.by_pin.write().unwrap_or_else(|p| p.into_inner()) = by_pin;
@@ -1244,6 +1302,17 @@ pub(crate) mod pinning {
             self.node_of_pin(&fingerprint(cert))
         }
 
+        /// Whether `node`'s own heartbeat, live now, publishes `pin`.
+        pub(crate) fn publishes(&self, pin: &Pin32, node: &str) -> bool {
+            let now = super::now_ms();
+            self.by_pin
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(pin)
+                .and_then(|nodes| nodes.get(node))
+                .is_some_and(|until| now <= *until)
+        }
+
         /// Like `node_of`, for a pin already computed (once per
         /// connection, rather than hashing the certificate on every
         /// check).
@@ -1252,8 +1321,9 @@ pub(crate) mod pinning {
             self.by_pin
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
-                .get(pin)
-                .filter(|(_, until)| now <= *until)
+                .get(pin)?
+                .iter()
+                .find(|(_, until)| now <= **until)
                 .map(|(node, _)| node.clone())
         }
     }

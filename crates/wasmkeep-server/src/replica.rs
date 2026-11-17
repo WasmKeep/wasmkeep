@@ -210,13 +210,20 @@ impl ReadTime {
 /// read keeps nothing of a failed try's answer while it is without its
 /// megabytes, which are what bounds the memory of the node's reads.
 struct Turn {
+    /// The app reading (`tenant/app`), for its share of the limits.
+    app: Arc<str>,
     megabytes: u32,
     counted: u64,
     restore: OwnInFlight,
     /// Whether the read has its place, for the restore that waits for
     /// it: waiting for a place is not the restore's time.
     has: tokio::sync::watch::Sender<bool>,
+    /// Its app's shares of the slots and megabytes (taken first, given
+    /// back last), the slot, the megabytes, and its bytes in flight.
+    #[allow(clippy::type_complexity)]
     held: Option<(
+        crate::shares::SharePermit,
+        crate::shares::SharePermit,
         tokio::sync::SemaphorePermit<'static>,
         tokio::sync::SemaphorePermit<'static>,
         InFlightBytes,
@@ -225,13 +232,19 @@ struct Turn {
 
 impl Turn {
     /// The place of a read of `size` listed bytes, not taken yet.
-    fn new(size: u64, restore: OwnInFlight, has: tokio::sync::watch::Sender<bool>) -> Self {
+    fn new(
+        size: u64,
+        restore: OwnInFlight,
+        has: tokio::sync::watch::Sender<bool>,
+        app: Arc<str>,
+    ) -> Self {
         // One read takes at most a read-ahead's worth: a larger object
         // would take the whole budget, and the fair semaphore would hold
         // every other restore behind it. Its bytes are counted as its
         // permits are, or one large object would lift every read's limit
         // past any bound.
         Self {
+            app,
             megabytes: u32::try_from(size.div_ceil(1 << 20))
                 .unwrap_or(u32::MAX)
                 .clamp(1, RESTORE_READ_ONE_MIB),
@@ -245,6 +258,12 @@ impl Turn {
     /// Waits for its place: a slot, then its megabytes.
     async fn take(&mut self) -> Result<(), ReplicaError> {
         self.has.send_replace(false);
+        // Its app's shares first (ADR 0038, section 8): an app that fills
+        // its own never keeps another's read from its slots.
+        let slot_share = RESTORE_SLOT_SHARES.acquire(&self.app, 1).await;
+        let bytes_share = RESTORE_BYTE_SHARES
+            .acquire(&self.app, u64::from(self.megabytes))
+            .await;
         // Never closed: a failed acquire would be a bug.
         let (Ok(slot), Ok(bytes)) = (
             RESTORE_READ_SLOTS.acquire().await,
@@ -256,7 +275,7 @@ impl Turn {
         // other restores' included, as it is while the read lasts (reads
         // that join later count too).
         let counted = InFlightBytes::new(self.counted, &self.restore);
-        self.held = Some((slot, bytes, counted));
+        self.held = Some((slot_share, bytes_share, slot, bytes, counted));
         self.has.send_replace(true);
         Ok(())
     }
@@ -277,6 +296,12 @@ static RESTORE_READ_SLOTS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(RESTORE_READS);
 static RESTORE_READ_BYTES: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(RESTORE_READ_MIB as usize);
+/// [`RESTORE_READ_SLOTS`] and [`RESTORE_READ_BYTES`] divided between the
+/// apps a process serves (ADR 0038, section 8), checked before them.
+pub(crate) static RESTORE_SLOT_SHARES: std::sync::LazyLock<Arc<crate::shares::Shares>> =
+    std::sync::LazyLock::new(|| Arc::new(crate::shares::Shares::new(RESTORE_READS as u64)));
+pub(crate) static RESTORE_BYTE_SHARES: std::sync::LazyLock<Arc<crate::shares::Shares>> =
+    std::sync::LazyLock::new(|| Arc::new(crate::shares::Shares::new(u64::from(RESTORE_READ_MIB))));
 /// Attempts per read before the restore fails (the next event restores
 /// again, from a fresh listing).
 const READ_ATTEMPTS: u32 = 3;
@@ -642,6 +667,9 @@ pub(crate) struct Replica {
     /// there too, and read back by the actor's next `Replica`
     /// ([`SnapshotWaits`]).
     address: ActorAddress,
+    /// Its app, `tenant/app`: for the app's shares of the node's budgets
+    /// (ADR 0038, section 8).
+    app: Arc<str>,
     snapshot_waits: Arc<SnapshotWaits>,
     /// Periodic snapshots that failed since the last snapshot taken.
     snapshot_failures: u32,
@@ -751,6 +779,11 @@ fn set_aside(db_path: &Path) -> std::io::Result<()> {
 }
 
 impl Replica {
+    /// Its app, `tenant/app`.
+    pub(crate) fn app(&self) -> Arc<str> {
+        Arc::clone(&self.app)
+    }
+
     /// Prepares the actor's local database for generation `generation`:
     /// restores the bucket's current chain unless the local file is already
     /// at its head. The database must be closed.
@@ -831,7 +864,7 @@ impl Replica {
         };
         if let (Err(ReplicaError::Visibility(why)), Some(key)) = (&restored, &key) {
             cluster.pending.refused(key);
-            tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), generation, required = ?floor, attempts = attempt + 1, elapsed = ?started.elapsed(), reason = %why, "refused to activate: the recorded head is not visible");
+            tracing::warn!(app = %crate::logging::named(cluster.serves()), actor = %crate::logging::actor(address), generation, required = ?floor, attempts = attempt + 1, elapsed = ?started.elapsed(), reason = %why, "refused to activate: the recorded head is not visible");
         }
         let restored = restored.and_then(|replica| {
             // The verified head goes into the hold cell, under its
@@ -914,6 +947,7 @@ impl Replica {
             head: plan.head(),
             since_snapshot: plan.segments.len() as u64,
             address: address.clone(),
+            app: Arc::from(cluster.serves()),
             snapshot_waits: Arc::clone(&cluster.snapshot_waits),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
@@ -1095,7 +1129,7 @@ impl Replica {
                 let time = Arc::new(ReadTime::new(ahead, Some(Arc::clone(&in_flight))));
                 let (has, has_turn) = tokio::sync::watch::channel(false);
                 let its_time = Arc::clone(&time);
-                let mut turn = Turn::new(size, Arc::clone(&in_flight), has);
+                let mut turn = Turn::new(size, Arc::clone(&in_flight), has, Arc::clone(&self.app));
                 let task = tokio::spawn(async move {
                     turn.take().await?;
                     let read = std::time::Instant::now();
@@ -2437,6 +2471,7 @@ mod tests {
             },
             since_snapshot: 0,
             address: ActorAddress::new("t", "c", "a").unwrap(),
+            app: Arc::from("t/default"),
             snapshot_waits: Arc::default(),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
@@ -3534,7 +3569,7 @@ mod tests {
         assert_eq!(places(), free);
         let own = OwnInFlight::default();
         let (has, has_turn) = tokio::sync::watch::channel(false);
-        let mut turn = Turn::new(size, Arc::clone(&own), has);
+        let mut turn = Turn::new(size, Arc::clone(&own), has, Arc::from("t/default"));
         turn.take().await.unwrap();
         assert_eq!(places(), (RESTORE_READS - 1, 256 - 3, size));
         let read = {
@@ -3963,5 +3998,53 @@ mod tests {
             .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
         assert!(r.ship(&changes(DbChecksum::from_value(7))).await.is_err());
         assert_eq!(r.in_flight, None);
+    }
+
+    /// One app's restore reads fill its share of the node's read slots;
+    /// the other app's read takes its place at once, and every place comes
+    /// back.
+    #[tokio::test]
+    async fn a_saturating_apps_restore_reads_leave_the_others_share() {
+        let _shares = [
+            RESTORE_SLOT_SHARES.join("a/a"),
+            RESTORE_SLOT_SHARES.join("b/b"),
+            RESTORE_BYTE_SHARES.join("a/a"),
+            RESTORE_BYTE_SHARES.join("b/b"),
+        ];
+        let turn = |app: &str| {
+            let (has, _) = tokio::sync::watch::channel(false);
+            Turn::new(1 << 20, OwnInFlight::default(), has, Arc::from(app))
+        };
+        let wait = std::time::Duration::from_millis(50);
+        let mut held = Vec::new();
+        loop {
+            let mut t = turn("a/a");
+            match tokio::time::timeout(wait, t.take()).await {
+                Ok(taken) => {
+                    taken.unwrap();
+                    held.push(t);
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            held.len(),
+            RESTORE_READS * 3 / 4,
+            "a stops at b's floor, half of b's part"
+        );
+        let mut b = turn("b/b");
+        tokio::time::timeout(std::time::Duration::from_secs(5), b.take())
+            .await
+            .expect("b within its share is not kept waiting")
+            .unwrap();
+        drop(held);
+        drop(b);
+        assert_eq!(RESTORE_READ_SLOTS.available_permits(), RESTORE_READS);
+        assert_eq!(
+            RESTORE_READ_BYTES.available_permits(),
+            RESTORE_READ_MIB as usize
+        );
+        assert_eq!(RESTORE_SLOT_SHARES.used("a/a"), 0);
+        assert_eq!(RESTORE_BYTE_SHARES.used("b/b"), 0);
     }
 }

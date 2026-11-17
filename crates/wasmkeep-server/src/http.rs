@@ -97,6 +97,14 @@ impl App {
                 _ => text_response(StatusCode::NOT_FOUND, "not found\n"),
             };
         }
+        // A signed hop that is refused answers 503: it never runs as a
+        // client's request (ADR 0038, section 5).
+        if let Some(actors) = &self.actors
+            && let Some(why) = actors.hop_refused(&req)
+        {
+            tracing::warn!(reason = why, "a signed hop refused");
+            return crate::cluster::unavailable("this hop is refused; retry\n");
+        }
         if (req.extensions().get::<ArrivedOnClusterPort>().is_none()
             || req.headers().contains_key(crate::cluster::FORWARDED))
             && let Some(actors) = &self.actors
@@ -143,6 +151,8 @@ impl App {
         }
     }
 }
+
+pub(crate) mod apps;
 
 /// The path and query a request arrived with, before routing rewrote it to
 /// what the actor sees; forwarding to another node uses it.
@@ -382,6 +392,9 @@ pub struct ServeLimits {
     /// Connections the cluster port holds at once, when it is served
     /// ([`serve_with_cluster_listener`]); more wait in the kernel's backlog.
     pub cluster_connections: usize,
+    /// The process's front reservations, shared between the apps it serves
+    /// (ADR 0038, section 8); by default the first front's.
+    pub front_reservations: Option<usize>,
 }
 
 impl Default for ServeLimits {
@@ -391,6 +404,7 @@ impl Default for ServeLimits {
             header_read_timeout: Duration::from_secs(30),
             front_wall: Duration::from_secs(30),
             cluster_connections: crate::fds::CLUSTER_CONNECTIONS,
+            front_reservations: None,
         }
     }
 }
@@ -482,12 +496,44 @@ pub(crate) struct ClusterPort {
 pub(crate) struct ClusterPeer {
     pin: crate::cluster_tls::pinning::Pin32,
     pins: Arc<PinSet>,
+    /// The node a request on the connection was sent by, when it names one
+    /// (ADR 0038, section 5): its answer, or the socket it relays, is then
+    /// trusted only while that node id itself publishes the pin.
+    sender: Option<Arc<str>>,
 }
 
 impl ClusterPeer {
-    /// Whether the peer's pin is still live.
+    #[cfg(test)]
+    pub(crate) fn for_test(pin: crate::cluster_tls::pinning::Pin32, pins: Arc<PinSet>) -> Self {
+        Self {
+            pin,
+            pins,
+            sender: None,
+        }
+    }
+
+    /// This connection, for a request sent by `sender`.
+    pub(crate) fn sent_by(&self, sender: Option<&str>) -> Self {
+        Self {
+            sender: sender.map(Arc::from),
+            ..self.clone()
+        }
+    }
+
+    /// Whether `node`'s own live heartbeat publishes the pin this
+    /// connection presented (ADR 0038, section 5).
+    pub(crate) fn publishes(&self, node: &str) -> bool {
+        self.pins.publishes(&self.pin, node)
+    }
+
+    /// Whether the peer's pin is still live: for a request that named its
+    /// sender, while that node id's own heartbeat publishes it; otherwise
+    /// while any node id's does.
     pub(crate) fn is_live(&self) -> bool {
-        self.pins.node_of_pin(&self.pin).is_some()
+        match &self.sender {
+            Some(node) => self.pins.publishes(&self.pin, node),
+            None => self.pins.node_of_pin(&self.pin).is_some(),
+        }
     }
 }
 
@@ -525,6 +571,35 @@ pub(crate) async fn serve_with_cluster(
     if let Some(front) = app.front.as_mut() {
         front.wall = limits.front_wall;
     }
+    serve_served(listener, cluster, Served::One(app), shutdown, limits).await
+}
+
+/// What a process's ports serve: one app, as before, or several by
+/// hostname and signed app (ADR 0038).
+#[derive(Clone)]
+pub(crate) enum Served {
+    One(App),
+    Table(Arc<apps::AppTable>),
+}
+
+impl Served {
+    /// The apps running now.
+    fn running(&self) -> Vec<App> {
+        match self {
+            Self::One(app) => vec![app.clone()],
+            Self::Table(t) => t.running(),
+        }
+    }
+}
+
+/// [`serve_with_cluster`] for what `served` names.
+pub(crate) async fn serve_served(
+    listener: TcpListener,
+    cluster: Option<ClusterPort>,
+    app: Served,
+    shutdown: impl Future<Output = ()>,
+    limits: ServeLimits,
+) -> Result<(), Error> {
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
     let mut accept_errors = 0u32;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -587,8 +662,11 @@ pub(crate) async fn serve_with_cluster(
     }
 
     // Not ready from now on, for load balancers still checking.
-    if let Some(actors) = &app.actors {
-        actors.begin_shutdown();
+    let running = app.running();
+    for a in &running {
+        if let Some(actors) = &a.actors {
+            actors.begin_shutdown();
+        }
     }
     drop(listener);
     let _ = stop_tx.send(true);
@@ -613,10 +691,14 @@ pub(crate) async fn serve_with_cluster(
             let _ = cluster_loop.await;
         }
     }
-    // Then stop the actors, releasing their leases.
-    if let Some(actors) = &app.actors {
-        actors.shutdown(SHUTDOWN_GRACE).await;
-    }
+    // Then stop the actors, releasing their leases: every app's at once,
+    // under one deadline (ADR 0038, section 2).
+    futures_util::future::join_all(running.iter().filter_map(|a| {
+        a.actors
+            .as_ref()
+            .map(|actors| actors.shutdown(SHUTDOWN_GRACE))
+    }))
+    .await;
     Ok(())
 }
 
@@ -626,7 +708,7 @@ pub(crate) async fn serve_with_cluster(
 /// `cluster_serves` paths. Returns once its connections have finished.
 async fn serve_cluster_port(
     port: ClusterPort,
-    app: App,
+    app: Served,
     header_read_timeout: Duration,
     max_connections: usize,
     stop: tokio::sync::watch::Receiver<bool>,
@@ -695,7 +777,11 @@ async fn serve_cluster_port(
             else {
                 return;
             };
-            let cluster = ClusterPeer { pin, pins };
+            let cluster = ClusterPeer {
+                pin,
+                pins,
+                sender: None,
+            };
             serve_connection(tls, app, Some(cluster), header_read_timeout, stop, peer).await;
         });
     }
@@ -710,7 +796,7 @@ async fn serve_cluster_port(
 /// marked, the peer's pin checked again on each request).
 async fn serve_connection<I>(
     io: I,
-    app: App,
+    app: Served,
     cluster: Option<ClusterPeer>,
     header_read_timeout: Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
@@ -718,12 +804,19 @@ async fn serve_connection<I>(
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // The app of the connection's first request, on the public port of a
+    // process serving several (ADR 0038, section 6).
+    let first: Arc<apps::ConnectionApp> = Arc::default();
     let service = service_fn(move |mut req: Request<Incoming>| {
-        let (app, cluster) = (app.clone(), cluster.clone());
+        let (app, cluster, first) = (app.clone(), cluster.clone(), Arc::clone(&first));
         async move {
             req.extensions_mut().insert(PeerAddress(peer));
             let Some(cluster) = cluster else {
-                return Ok::<_, std::convert::Infallible>(app.route(req).await);
+                let response = match &app {
+                    Served::One(app) => app.route(req).await,
+                    Served::Table(t) => t.route_public(req, &first).await,
+                };
+                return Ok::<_, std::convert::Infallible>(response);
             };
             if !cluster.is_live() {
                 // Its heartbeat expired or its pin changed since the
@@ -733,9 +826,28 @@ async fn serve_connection<I>(
             if !cluster_serves(req.uri().path()) {
                 return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
             }
+            // A hop that names its sender must come over that node's own
+            // connection (ADR 0038, section 5); its signature, checked
+            // later, binds the name.
+            if !crate::cluster::sender_presented(req.headers(), Some(&cluster)) {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "the hop's sender does not publish this connection's certificate\n",
+                ));
+            }
+            let sender = req
+                .headers()
+                .get(crate::cluster::SENDER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::cluster::sender_named)
+                .map(str::to_owned);
+            let cluster = cluster.sent_by(sender.as_deref());
             req.extensions_mut()
                 .insert(ArrivedOnClusterPort(cluster.clone()));
-            let response = app.route(req).await;
+            let response = match &app {
+                Served::One(app) => app.route(req).await,
+                Served::Table(t) => t.route_cluster(req).await,
+            };
             // Nor is an answer delivered to a peer whose pin lapsed while
             // its request ran, or streamed on after that. The connection
             // stays: its next request is refused, and closes it.
@@ -793,6 +905,50 @@ pub async fn serve_metrics(
     actors: Option<ActorService>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
+    serve_metrics_of(listener, Metered::One(actors), shutdown).await
+}
+
+/// What a metrics page is rendered from.
+#[derive(Clone)]
+pub(crate) enum Metered {
+    One(Option<ActorService>),
+    /// A process serving several apps: its gauges summed over the apps
+    /// running now (ADR 0038, section 9).
+    Table(Arc<apps::AppTable>),
+}
+
+impl Metered {
+    fn page(&self) -> String {
+        match self {
+            Self::One(actors) => actors.as_ref().map_or_else(
+                || crate::metrics::render(crate::metrics::Gauges::default()),
+                |a| crate::metrics::render_for(a.gauges(), a.metrics_identity()),
+            ),
+            Self::Table(table) => {
+                let running: Vec<ActorService> = table
+                    .running()
+                    .into_iter()
+                    .filter_map(|a| a.actors)
+                    .collect();
+                let gauges: Vec<crate::metrics::Gauges> =
+                    running.iter().map(ActorService::gauges).collect();
+                let process = crate::metrics::Gauges::of_process(&gauges);
+                let identities: Vec<crate::metrics::Identity> = running
+                    .iter()
+                    .map(|a| a.metrics_identity().clone())
+                    .collect();
+                crate::metrics::render_for_apps(process, &identities)
+            }
+        }
+    }
+}
+
+/// [`serve_metrics`] for what `metered` names.
+pub(crate) async fn serve_metrics_of(
+    listener: TcpListener,
+    metered: Metered,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), Error> {
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -814,17 +970,14 @@ pub async fn serve_metrics(
             },
             () = &mut shutdown => return Ok(()),
         };
-        let actors = actors.clone();
+        let metered = metered.clone();
         let service = service_fn(move |req: Request<Incoming>| {
-            let actors = actors.clone();
+            let metered = metered.clone();
             async move {
                 let page = req.uri().path() == "/metrics"
                     && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
                 let response = if page {
-                    let body = actors.as_ref().map_or_else(
-                        || crate::metrics::render(crate::metrics::Gauges::default()),
-                        |a| crate::metrics::render_for(a.gauges(), a.metrics_identity()),
-                    );
+                    let body = metered.page();
                     let mut r = text_response(StatusCode::OK, &body);
                     r.headers_mut().insert(
                         hyper::header::CONTENT_TYPE,

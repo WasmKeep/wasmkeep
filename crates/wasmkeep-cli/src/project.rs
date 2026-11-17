@@ -83,13 +83,13 @@ const CLASS: &[&str] = &[
 const DEV: &[&str] = &["port", "data-dir", "env"];
 
 /// A position in the file, for errors: `path:line:column`.
-struct Source<'a> {
-    text: &'a str,
-    path: &'a Path,
+pub(crate) struct Source<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) path: &'a Path,
 }
 
 impl Source<'_> {
-    fn at(&self, span: std::ops::Range<usize>) -> String {
+    pub(crate) fn at(&self, span: std::ops::Range<usize>) -> String {
         let start = span.start.min(self.text.len());
         let before = &self.text[..start];
         let line = before.matches('\n').count() + 1;
@@ -102,7 +102,7 @@ impl Source<'_> {
         format!("{}:{line}:{column}", self.path.display())
     }
 
-    fn err<T>(
+    pub(crate) fn err<T>(
         &self,
         span: std::ops::Range<usize>,
         msg: impl std::fmt::Display,
@@ -111,10 +111,10 @@ impl Source<'_> {
     }
 }
 
-type Table<'i> = DeTable<'i>;
+pub(crate) type Table<'i> = DeTable<'i>;
 
 /// Checks that `table` (`what`, e.g. `[front]`) has only `allowed` keys.
-fn known_keys(
+pub(crate) fn known_keys(
     src: &Source<'_>,
     table: &Table<'_>,
     what: &str,
@@ -135,7 +135,7 @@ fn known_keys(
     Ok(())
 }
 
-fn get<'a, 'i>(
+pub(crate) fn get<'a, 'i>(
     table: &'a Table<'i>,
     key: &str,
 ) -> Option<(
@@ -145,7 +145,7 @@ fn get<'a, 'i>(
     table.get_key_value(key)
 }
 
-fn string(
+pub(crate) fn string(
     src: &Source<'_>,
     table: &Table<'_>,
     key: &str,
@@ -164,7 +164,7 @@ fn string(
     }
 }
 
-fn strings(
+pub(crate) fn strings(
     src: &Source<'_>,
     table: &Table<'_>,
     key: &str,
@@ -200,7 +200,7 @@ fn strings(
     Ok(out)
 }
 
-fn table<'a, 'i>(
+pub(crate) fn table<'a, 'i>(
     src: &Source<'_>,
     parent: &'a Table<'i>,
     key: &str,
@@ -227,7 +227,7 @@ fn resolve(dir: &Path, path: &str) -> PathBuf {
 /// `path` made absolute (against the current directory) with `.` and `..`
 /// resolved lexically: two spellings of one path compare equal without
 /// touching the disk.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     use std::path::Component;
     let path = if path.is_absolute() {
         path.to_path_buf()

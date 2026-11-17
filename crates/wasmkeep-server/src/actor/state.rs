@@ -70,6 +70,10 @@ pub(super) struct ActorState {
     /// service.
     pub(super) secrets_blocked: Arc<std::sync::atomic::AtomicBool>,
     pub(super) address: ActorAddress,
+    /// Its app's metric labels ([`crate::metrics::app_labels`]).
+    pub(super) app_labels: Arc<str>,
+    /// Its app, `tenant/app`, for log lines (ADR 0038, section 9).
+    pub(super) app_name: Arc<str>,
     pub(super) class: Arc<ActorClass>,
     pub(super) runtime: Runtime,
     pub(super) storage: Storage,
@@ -141,20 +145,13 @@ impl Live {
 
     /// Records the running event once: its outcome (`failed` for a trap, a
     /// cut or a guest error) and how long it ran.
-    pub(super) fn record_event(&mut self, class: &str, failed: bool) {
+    /// Counted under its app, `app` ([`crate::metrics::app_labels`]).
+    pub(super) fn record_event(&mut self, app: &str, class: &str, failed: bool) {
         let Some((started, kind)) = self.event.take() else {
             return;
         };
-        let m = &crate::metrics::METRICS;
         let outcome = if failed { "failed" } else { "ok" };
-        crate::metrics::inc(&m.events.get(&[
-            ("class", class),
-            ("kind", kind),
-            ("outcome", outcome),
-        ]));
-        m.event_seconds
-            .get(&[("class", class)])
-            .observe(started.elapsed());
+        crate::metrics::record_event(app, class, kind, outcome, started.elapsed());
     }
 }
 
@@ -193,7 +190,7 @@ impl Drop for ActorState {
         let barrier = hold.barrier_at_drop(self.stepped, unmarked);
         if let Barrier::GaveUp(reason) = barrier {
             if reason == Dropped::Unbarriered {
-                tracing::error!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "a batched hold dropped without a barrier; its pending writes are given up");
+                tracing::error!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "a batched hold dropped without a barrier; its pending writes are given up");
             }
             hold.drop_now_with(reason, u64::from(unmarked != Some(false)));
             return;
@@ -340,7 +337,7 @@ impl ActorState {
                 return;
             }
             Ok(Admitted::Unavailable(why)) => {
-                tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %why, "event refused for now; retry");
+                tracing::info!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %why, "event refused for now; retry");
                 let _ = response_tx.send(Outcome::Refused(why));
                 return;
             }
@@ -367,7 +364,7 @@ impl ActorState {
             // refusal (503 with Retry-After), not the actor's error (review
             // finding D4). Logged above debug: an outage shows in the log.
             Err(OwnershipError::Unavailable(e)) => {
-                tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), why = %e, "event refused for now; retry");
+                tracing::info!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), why = %e, "event refused for now; retry");
                 let _ = response_tx.send(Outcome::Refused(e));
             }
             // A fault a retry will not fix: the actor's error (500).
@@ -582,7 +579,7 @@ impl ActorState {
                         Ok(())
                     }
                     Err(e) => {
-                        tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "restore failed");
+                        tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "restore failed");
                         self.release_hold(); // another node may try
                         // The bucket not answering is temporary; a history
                         // that cannot be restored, or local file trouble,
@@ -630,7 +627,7 @@ impl ActorState {
             return false;
         }
         crate::metrics::inc(&crate::metrics::METRICS.requests_abandoned);
-        tracing::debug!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "a request's sender left before it ran; not run");
+        tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "a request's sender left before it ran; not run");
         true
     }
 
@@ -704,7 +701,7 @@ impl ActorState {
             Err(cut) => Err(format!("event {cut}")),
         };
         if let Err(e) = &result {
-            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "guest trapped; instance discarded");
+            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "guest trapped; instance discarded");
         }
         self.finish_event(result.is_err()).await;
     }
@@ -887,14 +884,14 @@ impl ActorState {
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "periodic snapshot failed");
+                        tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "periodic snapshot failed");
                     }
                 },
                 Ok(Err(wasmkeep_storage::wal::CaptureError::Pending(_))) => {
                     replica.fail("changes appeared during a snapshot");
                 }
                 other => {
-                    tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?other, "periodic snapshot failed")
+                    tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?other, "periodic snapshot failed")
                 }
             }
         }
@@ -1017,7 +1014,7 @@ impl ActorState {
                                 crate::metrics::inc(
                                     &crate::metrics::METRICS.history_collect_failures,
                                 );
-                                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "snapshot after a delete failed; its history is not erased");
+                                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "snapshot after a delete failed; its history is not erased");
                             }
                         }
                         Ok(())
@@ -1068,7 +1065,7 @@ impl ActorState {
             Err(crate::replica::ReplicaError::Refused(_)) => {}
             Err(e) => {
                 crate::metrics::inc(&crate::metrics::METRICS.history_collect_failures);
-                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "snapshot after a delete failed; its history is not erased");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "snapshot after a delete failed; its history is not erased");
             }
         }
         if let Some(cluster) = &self.cluster {
@@ -1117,9 +1114,9 @@ impl ActorState {
         let files_removed = matches!(removed, Ok(Ok(())));
         if !files_removed {
             if self.replica().is_some() {
-                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; the bucket records it empty anyway");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; the bucket records it empty anyway");
             } else {
-                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; its data stays on this node");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "deleting the actor database failed; its data stays on this node");
             }
         }
         let recorded = self
@@ -1144,7 +1141,7 @@ impl ActorState {
     /// Gives the actor up after a replication failure: everything local may
     /// be ahead of the bucket, so it is closed and rebuilt on the next event.
     pub(super) fn abandon(&mut self, reason: &str) {
-        tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), %reason, "replication failed; giving the actor up");
+        tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %reason, "replication failed; giving the actor up");
         // The hold first: a batched hold's capture token goes before the
         // database it guards closes (ADR 0034, section 2).
         self.drop_hold(Dropped::Failure);
@@ -1270,7 +1267,7 @@ impl ActorState {
             host.deleter = Some((self.storage.clone(), self.address.clone()));
             host.egress = crate::egress::EgressHooks::new(Arc::clone(&self.egress));
             host.wasi = self.guest_log.wasi(
-                crate::logging::app(&self.address).to_string(),
+                crate::logging::named(&self.app_name).to_string(),
                 crate::logging::actor(&self.address).to_string(),
             );
             host.env = Arc::clone(&self.class.env);
@@ -1304,7 +1301,7 @@ impl ActorState {
                     // Cancelling instantiation does not stop its blocking SQL
                     // worker. Keep ownership until it can no longer commit.
                     if let Err(e) = store.data_mut().drain_db().await {
-                        tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "activation database worker failed");
+                        tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "activation database worker failed");
                     }
                     // End the capture/hold before the unfinished store closes.
                     // Start functions may have written, so give up rather than
@@ -1371,7 +1368,11 @@ impl ActorState {
         .await;
         // A guest error leaves the instance usable; a trap or timeout does not.
         let trapped = !matches!(init, Ok(Ok(_)));
-        live.record_event(self.address.class(), !matches!(init, Ok(Ok(Ok(())))));
+        live.record_event(
+            &self.app_labels,
+            self.address.class(),
+            !matches!(init, Ok(Ok(Ok(())))),
+        );
         let outcome = match init {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(msg))) => Err(format!("on-init failed: {msg}")),
@@ -1412,12 +1413,12 @@ impl ActorState {
         sync_alarm: bool,
     ) -> Option<Option<Entry>> {
         let live = self.live.as_mut()?;
-        live.record_event(self.address.class(), trapped);
+        live.record_event(&self.app_labels, self.address.class(), trapped);
         // A wall-clock cut cancels the guest future, not spawn_blocking.
         // Recover its connection before rollback, replication, deletion or
         // another event can open this database again.
         if let Err(e) = live.store.data_mut().drain_db().await {
-            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "database worker failed");
+            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "database worker failed");
             self.drop_hold(Dropped::Failure);
             self.live = None;
             self.db = None;
@@ -1445,7 +1446,7 @@ impl ActorState {
                 // A request whose key is still listed may then be carried
                 // out again on the new actor (ADR 0028).
                 other => {
-                    tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?other, "reading the operator delete marker failed; the delete does not carry it");
+                    tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?other, "reading the operator delete marker failed; the delete does not carry it");
                     None
                 }
             }
@@ -1475,7 +1476,7 @@ impl ActorState {
                 Ok(Ok(Some(at))) => self.alarms.set(self.address.clone(), at),
                 Ok(Ok(None)) => self.alarms.clear(self.address.clone()),
                 _ => {
-                    tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "could not read the alarm")
+                    tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "could not read the alarm")
                 }
             }
         }

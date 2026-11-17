@@ -1250,7 +1250,7 @@ impl Cluster {
         let _locked = lock.lock().await;
         let hold = self.pending.take_parked(&key, None)?;
         crate::metrics::parked_released(reason, 1);
-        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), reason, "released a parked record");
+        tracing::debug!(app = %crate::logging::named(&self.serves), actor = %crate::logging::actor(address), reason, "released a parked record");
         Some(self.release_or_park(hold).await)
     }
 
@@ -1286,7 +1286,7 @@ impl Cluster {
         match self.owners.still_names_this(&key, generation).await {
             Ok(false) => {
                 if self.pending.take_parked(&key, Some(generation)).is_some() {
-                    tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), generation, "a parked record no longer names this node; forgotten");
+                    tracing::warn!(app = %crate::logging::named(&self.serves), actor = %crate::logging::actor(address), generation, "a parked record no longer names this node; forgotten");
                 }
                 Recheck::Read
             }

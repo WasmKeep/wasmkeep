@@ -433,6 +433,8 @@ fn a_move_target_that_cannot_take_it_gets_a_warning() {
         lease: None,
         load: None,
         can_recorded_head: false,
+        can_multi_app: false,
+        process: None,
     };
     assert!(move_warnings(&node(true, Some(DrainState::Serving)), "acme/shop").is_empty());
     assert!(move_warnings(&node(true, None), "acme/shop").is_empty());
@@ -1404,4 +1406,64 @@ fn stable_id_app_delete_timeout_finish_recreate_resume() {
             );
         }
     });
+}
+
+/// ADR 0038, M6: `cluster drain --process ID` drains every node id that
+/// process runs.
+#[test]
+fn a_process_is_drained_through_every_node_id_it_runs() {
+    use clap::Parser as _;
+    let parse = |argv: &[&str]| {
+        super::Cli::try_parse_from(argv)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    assert!(
+        parse(&[
+            "wasmkeep",
+            "cluster",
+            "drain",
+            "--process",
+            "edge-1",
+            "--bucket",
+            "s3://b"
+        ])
+        .is_ok()
+    );
+    assert!(parse(&["wasmkeep", "cluster", "drain", "a", "--bucket", "s3://b"]).is_ok());
+    assert!(parse(&["wasmkeep", "cluster", "drain", "--bucket", "s3://b"]).is_err());
+    assert!(
+        parse(&[
+            "wasmkeep",
+            "cluster",
+            "drain",
+            "a",
+            "--process",
+            "edge-1",
+            "--bucket",
+            "s3://b"
+        ])
+        .is_err()
+    );
+    let n = |id: &str, process: Option<&str>, at: u64| {
+        let mut n = wasmkeep_cluster::membership::NodeInfo::decode(
+            format!("wasmkeep-node 2\n{at}\n{id}\nhttp://x\n0\nacme/shop\n").as_bytes(),
+        )
+        .unwrap();
+        n.id = id.to_owned();
+        n.written_at_ms = at;
+        n.process = process.map(str::to_owned);
+        n
+    };
+    let now = 1_000_000;
+    let nodes = [
+        n("shop-1", Some("edge-1"), now),
+        n("blog-1", Some("edge-1"), now),
+        n("shop-2", Some("edge-2"), now),
+        n("old-1", Some("edge-1"), now - 600_000),
+    ];
+    assert_eq!(
+        super::process_node_ids(&nodes, "edge-1", now, 30_000),
+        ["blog-1", "shop-1"]
+    );
 }

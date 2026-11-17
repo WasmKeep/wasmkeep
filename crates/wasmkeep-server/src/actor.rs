@@ -32,8 +32,8 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 use crate::Error;
 use crate::alarm::{self, AlarmHandle, Delivery, now_ms};
 use crate::cluster::{
-    ALARM_HANDOFF, CALLER, CHAIN, Cluster, ClusterConfig, INTERNAL, LeaseHold, OwnershipError,
-    SERVED_BY, decode_address, encode_address,
+    ALARM_HANDOFF, CALLER, CHAIN, Cluster, ClusterConfig, LeaseHold, OwnershipError, SERVED_BY,
+    decode_address, encode_address,
 };
 use crate::http::text_response;
 use crate::replica::{Replica, ReplicaError};
@@ -80,7 +80,7 @@ use self::held::{Barrier, Dropped, Held};
 pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};
 pub use self::uploads::hold_node_upload_budget;
-pub(crate) use self::uploads::upload_budget_in_use;
+pub(crate) use self::uploads::{UPLOAD_SHARES, upload_budget_in_use};
 
 /// `--max-unsent-age`'s default and bounds (ADR 0034, section 3).
 pub(crate) const DEFAULT_UNSENT_AGE: Duration = Duration::from_millis(500);
@@ -144,6 +144,13 @@ pub struct ActorConfig {
     /// setting fires them later. For a node on a restored copy, which must
     /// not run the app's side effects a second time.
     pub no_alarms: bool,
+    /// The process's resident pool when it serves several apps (ADR 0038,
+    /// section 8): this app's residents count against it, and
+    /// `mailbox.max_resident` stays this app's own cap.
+    pub resident_pool: Option<Arc<wasmkeep_runtime::ResidentPool>>,
+    /// This app's floor in `resident_pool` (`min-resident`); by default the
+    /// pool's limit divided by twice its apps.
+    pub min_resident: Option<usize>,
     /// Which addresses actors' outbound HTTP may reach: public ones, plus
     /// the ranges this allows.
     pub egress: crate::egress::EgressPolicy,
@@ -224,6 +231,8 @@ impl ActorConfig {
             alarm_retry_initial: Duration::from_secs(1),
             alarm_retry_max: Duration::from_secs(300),
             no_alarms: false,
+            resident_pool: None,
+            min_resident: None,
             cluster: None,
             egress: crate::egress::EgressPolicy::default(),
             guest_log: crate::guest_log::GuestLog::default(),
@@ -254,6 +263,13 @@ pub struct ActorService {
 }
 
 struct ServiceInner {
+    /// Its app's metric labels ([`crate::metrics::app_labels`]).
+    app_labels: Arc<str>,
+    /// Its app, `tenant/app`, for log lines (ADR 0038, section 9).
+    app_name: Arc<str>,
+    /// Its app's shares of the process's budgets (ADR 0038, section 8),
+    /// while it is served.
+    _shares: Vec<crate::shares::Member>,
     restoring: std::sync::Mutex<std::collections::HashMap<ActorAddress, usize>>,
     tenant: String,
     wall: Duration,
@@ -732,6 +748,36 @@ impl ActorService {
     /// cluster listener (ADR 0011).
     pub(crate) fn cluster_tls(&self) -> Option<Arc<crate::cluster_tls::ClusterTls>> {
         self.inner.cluster.as_ref()?.tls().cloned()
+    }
+
+    /// Why a signed hop in `req` must answer 503 rather than run as a
+    /// client's request (see `Cluster::hop_refused`).
+    pub(crate) fn hop_refused<B>(&self, req: &hyper::Request<B>) -> Option<&'static str> {
+        let cluster = self.inner.cluster.as_ref()?;
+        let on_cluster_port = req
+            .extensions()
+            .get::<crate::http::ArrivedOnClusterPort>()
+            .is_some();
+        let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+        cluster.hop_refused(req.method(), path, req.headers(), on_cluster_port)
+    }
+
+    /// Whether every actor has ended, its resources closed, within `limit`.
+    pub async fn drained(&self, limit: Duration) -> bool {
+        self.inner.mailboxes.drained(limit).await
+    }
+
+    /// After [`Self::shutdown`]: its node id leaves its process, so the
+    /// app's runtime may start again in place (ADR 0038, section 3).
+    pub fn leave_process(&self) {
+        if let Some(c) = &self.inner.cluster {
+            c.leave_process();
+        }
+    }
+
+    /// Its app's metric labels ([`crate::metrics::app_labels`]).
+    pub(crate) fn app_labels(&self) -> Arc<str> {
+        Arc::clone(&self.inner.app_labels)
     }
 
     /// Number of actors currently resident in memory.

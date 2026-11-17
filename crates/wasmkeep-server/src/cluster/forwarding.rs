@@ -235,7 +235,12 @@ impl Cluster {
         req: &mut Request<B>,
     ) -> Result<(), String> {
         // No-policy forwards must never fetch a secret or wait on storage.
+        // With several apps a forward always carries its proof (ADR 0038,
+        // section 5): without the secret it is refused, not sent unsigned.
         let Some(secret) = self.secret.get() else {
+            if self.several_apps() {
+                return Err("the cluster secret is not loaded: cannot sign the forward".into());
+            }
             return Ok(());
         };
         let Some(peer) = req.extensions().get::<crate::http::PeerAddress>() else {
@@ -274,6 +279,8 @@ impl Cluster {
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
+        let cluster_secret = self.secret.get().map(String::as_str).unwrap_or_default();
+        self.add_sender(req.headers_mut(), cluster_secret, "admitted", &mac);
         Ok(())
     }
 
@@ -301,6 +308,18 @@ impl Cluster {
             req.headers(),
         )?;
         if signed.body != identity_headers(req.headers()) {
+            return None;
+        }
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
+        if let Err(why) = self.sender_checked(
+            req.headers(),
+            self.secret.get()?,
+            "admitted",
+            given,
+            path,
+            on_cluster_port,
+        ) {
+            self.note_refused(why);
             return None;
         }
         let encoded = given.split(' ').nth(2)?;

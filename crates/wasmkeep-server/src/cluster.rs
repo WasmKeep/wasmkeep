@@ -37,6 +37,7 @@ mod hello;
 mod identity;
 mod lease_hold;
 mod node_lease_task;
+mod process;
 mod signing;
 mod view;
 pub(crate) use hello::HELLO_PATH;
@@ -49,6 +50,7 @@ pub(crate) use identity::*;
 pub(crate) use lease_hold::*;
 pub(crate) use node_lease_task::lease_attempt;
 use node_lease_task::{lease_every, node_lease_loop};
+pub use process::NodeProcess;
 pub(crate) use signing::*;
 pub use view::older_nodes_advice;
 pub(crate) use view::*;
@@ -94,6 +96,17 @@ pub(crate) const CHAIN: &str = "x-wasmkeep-chain";
 /// node of an older version). Stripped from anything a guest or a client
 /// sends, and never reaches a guest.
 pub(crate) const APP: &str = "x-wasmkeep-app";
+
+/// Readiness while a live node lacks `multi-app` and the process serves
+/// several apps (ADR 0038, section 10).
+pub(crate) const MULTI_APP_MISSING: &str =
+    "a live node of an older version (no multi-app) runs in this cluster";
+
+/// What only nodes send each other on a hop, removed before a guest sees
+/// the request (a call, or a WebSocket's open): the signature, the
+/// sender's proof (ADR 0038), the caller and chain it vouches for, and a
+/// hand-off's upgrade mark.
+pub(crate) const HOP_PROOFS: [&str; 5] = [INTERNAL, SENDER, CALLER, CHAIN, UPGRADE_MARK];
 /// The app name of nodes given classes on the command line (`serve
 /// --actor`, `dev`): with their tenant, `default`, the implicit app
 /// `default/default` (ADR 0022).
@@ -182,6 +195,9 @@ pub struct ClusterConfig {
     /// actor until it has checked for the app's tombstone with its lease
     /// valid, at start and after every lapse (ADR 0028, section 5).
     pub follows_app: bool,
+    /// The process this app runs in (ADR 0038): what it shares with the
+    /// process's other apps. `None`: a process of its own.
+    pub process: Option<Arc<NodeProcess>>,
 }
 
 /// Plain HTTP between nodes, for a node with a cluster listener (ADR 0011).
@@ -243,6 +259,7 @@ impl ClusterConfig {
             failover_wait_max: crate::http::ServeLimits::default().max_connections / 4,
             expiry_every: Duration::from_millis(wasmkeep_cluster::expiry::PASS_EVERY_MS),
             follows_app: false,
+            process: None,
         }
     }
 }
@@ -354,17 +371,14 @@ pub(crate) struct Cluster {
     /// Live nodes by id, with their addresses; refreshed with every
     /// listing of the heartbeats.
     peers: RwLock<HashMap<String, Peer>>,
-    /// This node's TLS identity and its peers' pins, with a cluster
-    /// listener (ADR 0011).
-    tls: Option<Arc<ClusterTls>>,
+    /// The process's TLS identity, trust table, clients to other nodes
+    /// and listing of `nodes/` (ADR 0038, section 2).
+    transport: Arc<process::Transport>,
+    /// Its node id's place in the process (ADR 0038): left when dropped.
+    joined: process::Joined,
     /// When this node's identity first reached the bucket in a heartbeat
     /// (ms; 0: not yet): for readiness.
     published_ms: std::sync::atomic::AtomicU64,
-    /// The clients to other nodes; replaced (with empty connection pools)
-    /// when a peer's cluster address changes hands, so a connection pooled
-    /// to its previous holder is never used again.
-    clients: RwLock<Arc<Clients>>,
-    connector: ClusterConnector,
     /// How long a heartbeat stays live (ms; its ttl plus the clock skew
     /// allowed): pins are trusted no longer than this after their
     /// heartbeat was written.
@@ -489,6 +503,9 @@ pub(crate) struct Cluster {
     /// they expire, likewise.
     ended_deletes: Mutex<Vec<control::DeleteIntent>>,
     ended_restores: Mutex<Vec<control::RestoreIntent>>,
+    /// Live nodes the last listing found without `multi-app`, while the
+    /// process serves several apps (ADR 0038, section 10).
+    multi_app_missing: Mutex<Vec<String>>,
 }
 
 /// One page of the alarm index, as the sweep reads it.
@@ -652,23 +669,21 @@ impl Cluster {
         });
         let membership = membership.with_instance(instance.clone());
         let refuse_plaintext = config.cluster_plaintext == ClusterPlaintext::Refuse;
-        if refuse_plaintext && config.cluster_tls.is_none() {
-            return Err(crate::Error::ClusterTls(
-                "refusing plain HTTP between nodes needs a cluster listener".into(),
-            ));
-        }
-        let tls = match &config.cluster_tls {
-            Some(t) => Some(Arc::new(
-                ClusterTls::generate(&config.node_id, &t.advertise)
-                    .map_err(crate::Error::ClusterTls)?,
-            )),
-            None => None,
+        // The process's transport: made by its first (and only) app.
+        let (transport, joined) = config
+            .process
+            .clone()
+            .unwrap_or_else(NodeProcess::new)
+            .attach(config, bucket.clone())?;
+        // Its heartbeat names the process (ADR 0038, section 2).
+        let membership = match joined.process().name() {
+            Some(name) => membership.with_process(name),
+            None => membership,
         };
-        let membership = match &tls {
+        let membership = match &transport.tls {
             Some(t) => membership.with_cluster_tls(t.advertise(), vec![t.pin()]),
             None => membership,
         };
-        let connector = ClusterConnector::new(tls.clone(), refuse_plaintext);
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
             seen: SeenSignatures::named("calls"),
@@ -687,14 +702,13 @@ impl Cluster {
             pending: Pending::default(),
             membership,
             peers: RwLock::new(HashMap::new()),
-            clients: RwLock::new(Clients::new(&connector)),
-            connector,
             heartbeat_horizon_ms: heartbeat_horizon_ms(config.heartbeat, &config.lease),
             conflict_logged_ms: std::sync::atomic::AtomicU64::new(0),
             refuse_plaintext,
             plain_peers_logged_ms: std::sync::atomic::AtomicU64::new(0),
             invalid_releases: lease_hold::InvalidReleases::default(),
-            tls,
+            transport,
+            joined,
             published_ms: std::sync::atomic::AtomicU64::new(0),
             secret: tokio::sync::OnceCell::new(),
             ttl: Duration::from_millis(config.lease.ttl_ms()),
@@ -752,6 +766,7 @@ impl Cluster {
             deleted_moves: Mutex::new(Vec::new()),
             ended_deletes: Mutex::new(Vec::new()),
             ended_restores: Mutex::new(Vec::new()),
+            multi_app_missing: Mutex::new(Vec::new()),
         });
         if refuse_plaintext {
             tracing::info!(
@@ -784,6 +799,64 @@ impl Cluster {
             Family::Alarms,
             &alarm_index::key_tail(address.class(), address.name(), entry),
         ))
+    }
+
+    /// Leaves the process: a stopped runtime's node id may start again.
+    pub(crate) fn leave_process(&self) {
+        self.joined.leave();
+    }
+
+    /// Whether its process serves several apps (ADR 0038): hops then must
+    /// name their sender, forwards carry their proof, and every live node
+    /// must announce `multi-app`.
+    pub(crate) fn several_apps(&self) -> bool {
+        self.joined.process().several()
+    }
+
+    /// Notes the live nodes that lack the `multi-app` word, for readiness
+    /// (ADR 0038, section 10): checked at every listing while the process
+    /// serves several apps.
+    pub(super) fn note_multi_app(&self, live: &[NodeInfo]) {
+        let missing: Vec<String> = if self.several_apps() {
+            live.iter()
+                .filter(|n| !n.can_multi_app)
+                .map(|n| n.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut last = self
+            .multi_app_missing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !missing.is_empty() && *last != missing {
+            tracing::error!(
+                nodes = %missing.join(", "),
+                "nodes of an older version (no multi-app) are live in this cluster: this \
+                 process serves several apps and reports not ready until they are upgraded"
+            );
+        }
+        *last = missing;
+    }
+
+    /// The live nodes found without `multi-app` at the last listing.
+    pub(crate) fn multi_app_missing(&self) -> Vec<String> {
+        self.multi_app_missing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Why this runtime is not ready for want of `multi-app`, if it is not.
+    #[cfg(test)]
+    pub(crate) fn multi_app_reason(&self) -> Option<String> {
+        let missing = self.multi_app_missing();
+        (!missing.is_empty()).then(|| format!("{MULTI_APP_MISSING}: {}", missing.join(", ")))
+    }
+
+    /// What this node serves, `tenant/app`.
+    pub(crate) fn serves(&self) -> &str {
+        &self.serves
     }
 
     /// The root of this node's actor state (ADR 0022).
@@ -1131,7 +1204,7 @@ impl Cluster {
                 tracing::warn!(owner, error = %e, "forwarding an upgrade refused");
                 return unavailable("the actor's node is not reachable; retry\n");
             }
-            let revocation = self.revocation(&base);
+            let revocation = self.revocation(&base, owner);
             let upgrade = self.clients().upgrade.clone();
             match tokio::time::timeout(FORWARD_TIMEOUT, upgrade.request(out)).await {
                 Ok(Ok(r)) => break (base, revocation, r),
@@ -1165,7 +1238,7 @@ impl Cluster {
             // The owner refused (or it moved again): pass its answer on,
             // checked like any answer from a peer.
             return self
-                .trusted_response(&base, response)
+                .trusted_response(&base, owner, response)
                 .unwrap_or_else(|| unavailable("the actor's node is no longer trusted; retry\n"));
         }
         let headers = response.headers().clone();
@@ -1238,6 +1311,7 @@ impl Cluster {
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
+        self.add_sender(headers, &secret, "internal", &mac);
         Ok(())
     }
 
@@ -1337,13 +1411,131 @@ impl Cluster {
                 self.note_refused("signed call on the public port, treated as from outside (--cluster-plaintext refuse)");
                 None
             }
-            Some(signed) => Some(signed),
+            Some(signed) => {
+                match self.sender_checked(headers, secret, "internal", given, path, on_cluster_port)
+                {
+                    Ok(_) => Some(signed),
+                    Err(why) => {
+                        self.note_refused(why);
+                        None
+                    }
+                }
+            }
             // Junk on the public port is an outside request like any other.
             None if public_port => None,
             None => {
                 self.note_refused("bad, expired or misaddressed signature (clock skew? another cluster's secret? a node of an older version?)");
                 None
             }
+        }
+    }
+
+    /// Whether the connection a signed hop came on (`peer`, on the cluster
+    /// port) is the one its [`SENDER`] names: that node's own live
+    /// heartbeat publishes the pin presented. A hop without a sender (a
+    /// node of an older version) or over plain HTTP passes here.
+    /// Names this node as the sender of a hop it signed (ADR 0038,
+    /// section 5), bound to the hop's own signature `mac`.
+    fn add_sender(&self, headers: &mut hyper::HeaderMap, secret: &str, kind: &str, mac: &str) {
+        if let Ok(v) =
+            hyper::header::HeaderValue::from_str(&sender_value(secret, kind, mac, &self.node_id))
+        {
+            headers.insert(SENDER, v);
+        }
+    }
+
+    /// The sender a signed hop names, checked (ADR 0038, section 5): bound
+    /// to the hop's signature (`given`, its [`INTERNAL`] or [`ADMITTED`]
+    /// value), named once, and a live node of this app. `Ok(None)`: no
+    /// sender (a node of an older version, rolling upgrade stage 1). A
+    /// hello may come from a node not listed yet (it asks for a listing);
+    /// over plain HTTP between nodes (`accept`) an unlisted sender is taken
+    /// as an unsigned-sender hop was, its app checked when known.
+    fn sender_checked(
+        &self,
+        headers: &hyper::HeaderMap,
+        secret: &str,
+        kind: &str,
+        given: &str,
+        path: &str,
+        on_cluster_port: bool,
+    ) -> Result<Option<String>, &'static str> {
+        let mut values = headers.get_all(SENDER).iter();
+        let Some(first) = values.next() else {
+            // Required once several apps share the process (ADR 0038,
+            // section 5): every live node then sends it.
+            if self.several_apps() {
+                return Err("hop names no sender (several apps per process require it)");
+            }
+            return Ok(None);
+        };
+        if values.next().is_some() {
+            return Err("hop names its sender twice");
+        }
+        let primary = given.rsplit(' ').next().unwrap_or_default();
+        let sender = first
+            .to_str()
+            .ok()
+            .and_then(|v| verify_sender(secret, kind, primary, v))
+            .ok_or("hop's sender is not bound to its signature")?;
+        if path == HELLO_PATH {
+            return Ok(Some(sender));
+        }
+        // The process's view of the live nodes, every runtime's listings
+        // merged, as its pins are: a node a sibling runtime listed first is
+        // live here too. This runtime's own peers cover the rest.
+        let app = self.transport.live_app(&sender).or_else(|| {
+            self.peers
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&sender)
+                .map(|p| p.app.clone())
+        });
+        match app {
+            Some(app) if app == self.serves => Ok(Some(sender)),
+            Some(_) => Err("hop's sender is a node of another app"),
+            None if on_cluster_port || self.refuse_plaintext => {
+                self.want_listing();
+                Err("hop's sender is not a live node")
+            }
+            None => Ok(Some(sender)),
+        }
+    }
+
+    /// Why a signed hop must be refused with 503 rather than served as a
+    /// client's request (ADR 0038, section 5): its sender is forged, of
+    /// another app or not live, or, on the cluster port, its signature does
+    /// not hold. `None` for a hop accepted, or for a request that is no
+    /// node's (no signature, or junk on the public port).
+    pub(crate) fn hop_refused(
+        &self,
+        method: &hyper::Method,
+        path: &str,
+        headers: &hyper::HeaderMap,
+        on_cluster_port: bool,
+    ) -> Option<&'static str> {
+        let given = headers.get(INTERNAL)?.to_str().ok()?;
+        if self.refuse_plaintext && !on_cluster_port {
+            // The public port in refuse mode: never a node's call.
+            return None;
+        }
+        let Some(secret) = self.secret.get() else {
+            return on_cluster_port.then_some("cluster secret not loaded yet");
+        };
+        match verify(
+            secret,
+            given,
+            now_ms(),
+            &self.node_id,
+            method,
+            path,
+            headers,
+        ) {
+            Some(_) => self
+                .sender_checked(headers, secret, "internal", given, path, on_cluster_port)
+                .err(),
+            None if on_cluster_port => Some("bad, expired or misaddressed signature"),
+            None => None,
         }
     }
 
@@ -1408,6 +1600,14 @@ impl Cluster {
             Identity::Refused(_) => return Some("the bucket does not enforce conditional writes"),
             Identity::Unique => {}
         }
+        if !self.multi_app_missing().is_empty() {
+            // MULTI_APP_MISSING, spelled out for the list of reasons.
+            debug_assert_eq!(
+                MULTI_APP_MISSING,
+                "a live node of an older version (no multi-app) runs in this cluster"
+            );
+            return Some("a live node of an older version (no multi-app) runs in this cluster");
+        }
         if self.secret.get().is_none() {
             return Some("cluster secret not loaded");
         }
@@ -1418,7 +1618,7 @@ impl Cluster {
         // Peers refuse this node's handshakes until they have listed its
         // pin: give them a heartbeat period (ADR 0011), and half of one more
         // for their listing's own latency.
-        if self.tls.is_some() {
+        if self.transport.tls.is_some() {
             let published = self.published_ms.load(std::sync::atomic::Ordering::Relaxed);
             let period = u64::try_from(self.heartbeat_every.as_millis())
                 .unwrap_or(u64::MAX)
@@ -1615,12 +1815,13 @@ impl Cluster {
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
+        self.add_sender(headers, &secret, "internal", &mac);
         self.check_tls_target(&base)
             .map_err(|e| format!("node {owner}: {e}"))?;
         let call = self.clients().call.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, call.request(req)).await {
             Ok(Ok(response)) => self
-                .trusted_response(&base, response)
+                .trusted_response(&base, owner, response)
                 .ok_or_else(|| CallFailure::Other(format!("node {owner} is no longer trusted"))),
             // Never read by the peer, so sent again once this node's
             // heartbeat is live there: a refused handshake, or a TLS
@@ -2148,7 +2349,7 @@ impl Cluster {
             }
             return None;
         };
-        match (&self.tls, &peer.tls) {
+        match (&self.transport.tls, &peer.tls) {
             (Some(_), Some(tls)) => Some(tls.clone()),
             _ if self.refuse_plaintext => None,
             _ => peer.plain.clone(),
@@ -2158,11 +2359,11 @@ impl Cluster {
     /// This node's TLS identity and its peers' pins, with a cluster
     /// listener.
     pub(crate) fn tls(&self) -> Option<&Arc<ClusterTls>> {
-        self.tls.as_ref()
+        self.transport.tls.as_ref()
     }
 
     fn clients(&self) -> Arc<Clients> {
-        Arc::clone(&self.clients.read().unwrap_or_else(|p| p.into_inner()))
+        self.transport.clients()
     }
 
     /// Before sending to `base` over TLS (perhaps on a pooled connection):
@@ -2177,6 +2378,7 @@ impl Cluster {
             };
         }
         let tls = self
+            .transport
             .tls
             .as_ref()
             .ok_or("TLS between nodes is not configured")?;
@@ -2184,19 +2386,26 @@ impl Cluster {
         tls.expected(&uri).map(|_| ())
     }
 
-    /// For an answer or a connection from `base`: given the pin the peer
+    /// For an answer or a connection from `base`, node `node`: given the pin the peer
     /// presented, whether that pin is still trusted there (checked again
     /// for as long as the answer streams or the connection stays open).
     /// `None` for plain HTTP.
     #[allow(clippy::type_complexity)]
-    fn revocation(
+    pub(crate) fn revocation(
         &self,
         base: &str,
+        node: &str,
     ) -> Option<Box<dyn FnOnce(Option<[u8; 32]>) -> crate::cluster_tls::StillTrusted + Send>> {
-        let tls = Arc::clone(self.tls.as_ref()?);
+        let tls = Arc::clone(self.transport.tls.as_ref()?);
         let uri: hyper::Uri = base.parse().ok().filter(|_| base.starts_with("https://"))?;
+        // Trusted while the pin is published at the address and by the
+        // destination node id itself (ADR 0038, section 5): a sibling app's
+        // heartbeat on the same process never keeps it trusted.
+        let node = node.to_owned();
         Some(Box::new(move |pin| {
-            Arc::new(move || tls.still_trusted(&uri, pin))
+            Arc::new(move || {
+                tls.still_trusted(&uri, pin) && pin.is_some_and(|p| tls.pins().publishes(&p, &node))
+            })
         }))
     }
 
@@ -2207,13 +2416,14 @@ impl Cluster {
     fn trusted_response(
         &self,
         base: &str,
+        node: &str,
         response: Response<Incoming>,
     ) -> Option<Response<HyperOutgoingBody>> {
         let pin = response
             .extensions()
             .get::<crate::cluster_tls::PeerPin>()
             .map(|p| p.0);
-        let still = self.revocation(base).map(|r| r(pin));
+        let still = self.revocation(base, node).map(|r| r(pin));
         if still.as_ref().is_some_and(|s| !s()) {
             return None;
         }
@@ -2283,10 +2493,12 @@ impl Cluster {
         }
         let client = self.clients().request.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
-            Ok(Ok(response)) => self.trusted_response(&base, response).unwrap_or_else(|| {
-                tracing::warn!(owner, "forwarding: the node is no longer trusted");
-                unavailable("the actor's node is no longer trusted; retry\n")
-            }),
+            Ok(Ok(response)) => self
+                .trusted_response(&base, owner, response)
+                .unwrap_or_else(|| {
+                    tracing::warn!(owner, "forwarding: the node is no longer trusted");
+                    unavailable("the actor's node is no longer trusted; retry\n")
+                }),
             // Every failure before an answer, none sent again from here:
             // a connection that could not be opened, a request the client
             // handed back unsent on a new connection, and a request
@@ -2390,6 +2602,8 @@ fn random_hex(n: usize) -> std::io::Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+#[cfg(test)]
+mod sender_tests;
 #[cfg(test)]
 mod tests;
 

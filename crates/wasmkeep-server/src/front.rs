@@ -34,7 +34,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::actor::{BodyBudget, FRONT_CLASS, FRONT_NAME, refuse_batch};
 use crate::http::{CappedBody, text_response};
-use crate::metrics::{METRICS, inc};
+use crate::metrics::METRICS;
 use crate::{ActorService, Error};
 
 /// What the front keeps of its wall for itself: a call gives up while this
@@ -65,6 +65,8 @@ struct FrontHost {
     actors: Option<ActorService>,
     /// The tenant of the front's caller value and `self-address`.
     tenant: String,
+    /// Its app's metric labels ([`crate::metrics::app_labels`]).
+    app: Arc<str>,
     /// The front's values (`env.get`).
     env: Arc<crate::env::Vars>,
     /// When the request's wall runs out.
@@ -134,14 +136,14 @@ impl FrontHost {
 
 /// Counts a call's outcome in `wasmkeep_front_calls_total`. Every other
 /// failure (invalid-address, reentrant, too-large) is `failed`.
-fn count(result: &Result<CallResponse, CallError>) {
+fn count(app: &str, result: &Result<CallResponse, CallError>) {
     let outcome = match result {
         Ok(_) => "ok",
         Err(CallError::Timeout) => "timeout",
         Err(CallError::Failed(m)) if m == BUSY || m == BUSY_NODE => "busy",
         Err(_) => "failed",
     };
-    inc(&METRICS.front_calls.get(&[("outcome", outcome)]));
+    crate::metrics::front_call(app, outcome);
 }
 
 impl actors::Host for FrontHost {
@@ -167,7 +169,7 @@ impl actors::Host for FrontHost {
                 .await
             }
         };
-        count(&result);
+        count(&self.app, &result);
         Ok(result)
     }
 
@@ -193,7 +195,7 @@ impl calls::Host for FrontHost {
             // Refused as a whole, before any call: counted once, however
             // long the list a guest sent.
             if let Some(first) = refused.first() {
-                count(first);
+                count(&self.app, first);
             }
             return Ok(refused);
         }
@@ -211,7 +213,7 @@ impl calls::Host for FrontHost {
                 .map(|_| Err(CallError::InvalidAddress("no such actor class".into())))
                 .collect()
         };
-        results.iter().for_each(count);
+        results.iter().for_each(|r| count(&self.app, r));
         Ok(results)
     }
 }
@@ -293,14 +295,22 @@ impl Drop for Waiting {
 }
 
 /// A slot held while one front instance lives; the gauge counts them.
-struct Slot(#[allow(dead_code, reason = "held for its drop")] tokio::sync::OwnedSemaphorePermit);
+struct Slot(
+    #[allow(dead_code, reason = "held for its drop")] tokio::sync::OwnedSemaphorePermit,
+    /// Its app's place in the process's front reservations (ADR 0038).
+    #[allow(dead_code, reason = "held for its drop")]
+    Option<crate::shares::SharePermit>,
+);
 
 impl Slot {
-    fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+    fn new(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        share: Option<crate::shares::SharePermit>,
+    ) -> Self {
         METRICS
             .front_slots_in_use
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self(permit)
+        Self(permit, share)
     }
 }
 
@@ -500,6 +510,10 @@ pub struct HttpComponent {
     max_requests: usize,
     /// Calls waiting on each actor, for the per-actor bound.
     waits: Arc<Waits>,
+    /// The process's front reservations shared between its apps, and this
+    /// front's app (ADR 0038, section 8): a request beyond the app's share
+    /// is refused as busy, never waited for.
+    pub(crate) share: Option<(Arc<crate::shares::Shares>, Arc<str>)>,
 }
 
 impl std::fmt::Debug for HttpComponent {
@@ -529,6 +543,7 @@ impl HttpComponent {
             slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
             max_requests,
             waits: Arc::default(),
+            share: None,
         })
     }
 
@@ -550,6 +565,16 @@ impl HttpComponent {
             slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
             max_requests,
             waits: Arc::default(),
+            share: None,
+        }
+    }
+
+    /// This front's app's place in the process's front reservations, if it
+    /// shares them: `Err` when the app is past its share.
+    pub(crate) fn take_share(&self) -> Result<Option<crate::shares::SharePermit>, ()> {
+        match &self.share {
+            None => Ok(None),
+            Some((shares, app)) => shares.try_acquire(app, 1).map(Some).ok_or(()),
         }
     }
 
@@ -647,6 +672,7 @@ impl HttpComponent {
             table: ResourceTable::new(),
             egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress)),
             tenant: actors.map_or_else(|| "default".to_owned(), |a| a.tenant().to_owned()),
+            app: front_app(actors),
             actors: actors.cloned(),
             env,
             deadline: tokio::time::Instant::now() + self.wall,
@@ -720,6 +746,8 @@ impl HttpComponent {
         actors: Option<&ActorService>,
     ) -> Response<HyperOutgoingBody> {
         let started = Instant::now();
+        // Counted under the front's app (ADR 0038, section 9).
+        let app = front_app(actors);
         // The version admitted with its policy, even if a deploy has since landed.
         let pinned = req.extensions_mut().remove::<IngressFront>();
         let selected = if actors.is_some_and(|a| Arc::ptr_eq(&self.version, &a.front_slot())) {
@@ -733,15 +761,19 @@ impl HttpComponent {
         // A required value not set, or the app's secrets not open: not
         // instantiated, and nothing said to the client of why (ADR 0023).
         if version.unconfigured() || actors.is_some_and(ActorService::secrets_blocked) {
-            outcome("unconfigured");
+            outcome(&app, "unconfigured");
             return unavailable("this node cannot serve the app now; retry\n");
         }
         // Past its slots, the front is not instantiated.
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
-            outcome("busy");
+            outcome(&app, "busy");
             return busy();
         };
-        let slot = Slot::new(permit);
+        let Ok(share) = self.take_share() else {
+            outcome(&app, "busy");
+            return busy();
+        };
+        let slot = Slot::new(permit, share);
         strip_wasmkeep_headers(req.headers_mut());
         // A WebSocket upgrade: kept aside, for a hand-off (ADR 0027), and
         // marked for the front after the strip, so only the host sets it.
@@ -753,7 +785,8 @@ impl HttpComponent {
             );
         }
         let head = req.method() == hyper::Method::HEAD;
-        let observe = move || METRICS.front_request_seconds.observe(started.elapsed());
+        let took = Arc::clone(&app);
+        let observe = move || crate::metrics::front_request_took(&took, started.elapsed());
         match self.try_handle(req, actors, slot, version).await {
             Ok((mut response, running)) => {
                 // wasmtime-wasi-http lets a guest set any status: never an
@@ -766,7 +799,7 @@ impl HttpComponent {
                     );
                     running.abort.silence();
                     drop(running);
-                    outcome("guest_error");
+                    outcome(&app, "guest_error");
                     observe();
                     return internal_error();
                 }
@@ -780,7 +813,7 @@ impl HttpComponent {
                             running.abort.silence();
                             drop(running);
                             drop(response);
-                            outcome("handoff");
+                            outcome(&app, "handoff");
                             observe();
                             return match actors {
                                 Some(actors) => match upgrade.request(&to.path) {
@@ -796,7 +829,7 @@ impl HttpComponent {
                             tracing::warn!(reason = why, "front answered a broken hand-off");
                             running.abort.silence();
                             drop(running);
-                            outcome("guest_error");
+                            outcome(&app, "guest_error");
                             observe();
                             return internal_error();
                         }
@@ -841,13 +874,13 @@ impl HttpComponent {
                 if e.downcast_ref::<wasmtime::PoolConcurrencyLimitError>()
                     .is_some()
                 {
-                    outcome("busy");
+                    outcome(&app, "busy");
                     observe();
                     tracing::warn!(error = %format!("{e:#}"), "front request: no instance free");
                     return busy();
                 }
                 let reason = reason(&e);
-                outcome(reason);
+                outcome(&app, reason);
                 observe();
                 tracing::warn!(reason, error = %format!("{e:#}"), "front request failed");
                 internal_error()
@@ -882,6 +915,8 @@ impl HttpComponent {
         // client leaving before the end of its answer.
         let counted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let counts = Arc::clone(&counted);
+        let app = front_app(actors);
+        let its_app = Arc::clone(&app);
 
         // The guest may keep streaming the body after it has set the
         // response, so it runs in its own task, which holds the slot for as
@@ -903,10 +938,10 @@ impl HttpComponent {
                 .unwrap_or_else(|_| Err(WallExceeded(wall).into()));
             if was_sent.await.is_ok() && !counts.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 match &result {
-                    Ok(()) => outcome("ok"),
+                    Ok(()) => outcome(&app, "ok"),
                     Err(e) => {
                         let reason = reason(e);
-                        outcome(reason);
+                        outcome(&app, reason);
                         tracing::warn!(
                             reason,
                             error = %format!("{e:#}"),
@@ -921,6 +956,7 @@ impl HttpComponent {
         // frees its slot.
         let abort = AbortOnDrop {
             task: Some(task.abort_handle()),
+            app: its_app,
             counted,
         };
 
@@ -1040,9 +1076,18 @@ impl HandOff {
     }
 }
 
+/// The metric labels of the front's app: its actors' app, or the implicit
+/// app on a node that serves only a front.
+fn front_app(actors: Option<&ActorService>) -> Arc<str> {
+    actors.map_or_else(
+        || crate::metrics::app_labels("default", crate::cluster::IMPLICIT_APP_NAME),
+        ActorService::app_labels,
+    )
+}
+
 /// Counts one front request ([`crate::metrics::Metrics::front_requests`]).
-fn outcome(o: &str) {
-    inc(&METRICS.front_requests.get(&[("outcome", o)]));
+fn outcome(app: &str, o: &str) {
+    crate::metrics::front_request(app, o);
 }
 
 /// Why an instance failed, as an outcome.
@@ -1082,6 +1127,8 @@ struct Running {
 /// counts the request as `client_gone` unless it was counted already.
 struct AbortOnDrop {
     task: Option<tokio::task::AbortHandle>,
+    /// The front's app, for its count.
+    app: Arc<str>,
     /// Set by whoever counts the request first.
     counted: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1105,7 +1152,7 @@ impl Drop for AbortOnDrop {
         if let Some(task) = self.task.take() {
             task.abort();
             if !self.counted.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                outcome("client_gone");
+                outcome(&self.app, "client_gone");
             }
         }
     }
@@ -1218,6 +1265,45 @@ impl hyper::body::Body for Timed {
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    /// ADR 0038, section 8: the fronts of two apps share the process's
+    /// front reservations; one past its share is refused, the other keeps
+    /// its floor.
+    #[test]
+    fn a_front_past_its_apps_share_is_refused() {
+        let runtime = wasmkeep_runtime::Runtime::new(&wasmkeep_runtime::RuntimeConfig {
+            max_instances: 8,
+            ..wasmkeep_runtime::RuntimeConfig::default()
+        })
+        .unwrap();
+        let shares = std::sync::Arc::new(crate::shares::Shares::new(4));
+        let _m = [shares.join("a/a"), shares.join("b/b")];
+        let front = |app: &str| {
+            let mut f = super::HttpComponent {
+                runtime: runtime.clone(),
+                version: std::sync::Arc::default(),
+                egress: std::sync::Arc::default(),
+                guest_log: crate::guest_log::GuestLog::default(),
+                wall: std::time::Duration::from_secs(1),
+                cpu_budget: super::DEFAULT_CPU_BUDGET,
+                slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+                max_requests: 8,
+                waits: std::sync::Arc::default(),
+                share: None,
+            };
+            f.share = Some((std::sync::Arc::clone(&shares), std::sync::Arc::from(app)));
+            f
+        };
+        let (a, b) = (front("a/a"), front("b/b"));
+        let held: Vec<_> = (0..4).filter_map(|_| a.take_share().ok()).collect();
+        assert_eq!(held.len(), 3, "a stops at b's floor");
+        let floor = b.take_share().unwrap();
+        assert!(floor.is_some(), "b gets its floor at once");
+        assert!(b.take_share().is_err(), "the reservations are all taken");
     }
 }
 

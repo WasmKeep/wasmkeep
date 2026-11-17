@@ -13,8 +13,10 @@ mod dev_project;
 mod diagnose;
 mod migrate_cmd;
 mod new_cmd;
+mod node_file;
 mod project;
 mod secrets_cmd;
+mod serve_many;
 mod status;
 mod usage;
 
@@ -228,7 +230,13 @@ struct MoveArgs {
 #[derive(Debug, Args)]
 struct DrainArgs {
     /// The node's id.
-    node: String,
+    #[arg(required_unless_present = "process", conflicts_with = "process")]
+    node: Option<String>,
+
+    /// Every node id this process runs (ADR 0038: the `process=` its
+    /// heartbeats name), instead of one node.
+    #[arg(long, value_name = "ID")]
+    process: Option<String>,
 
     /// Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from
     /// the AWS_* environment variables).
@@ -518,7 +526,7 @@ struct DevArgs {
     access: Vec<(String, String)>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct ServeArgs {
     /// The front: a stateless component (.wasm exporting
     /// wasi:http/incoming-handler) for every path outside /actor/ and
@@ -557,6 +565,19 @@ struct ServeArgs {
     /// --actor.
     #[arg(long, value_parser = parse_app, requires = "bucket", conflicts_with = "actors")]
     app: Option<(String, String)>,
+
+    /// Serve the apps a node file lists (`wasmkeep-node.toml`, ADR 0038):
+    /// the listeners, the node id and every per-app setting come from the
+    /// file, so their flags are refused beside it. Relative paths in it are
+    /// read from its directory. Needs --bucket; one `[[app]]` for now.
+    #[arg(long, value_name = "FILE", requires = "bucket", conflicts_with_all = [
+        "app", "actors", "component", "node_id", "advertise", "listen", "cluster_listen",
+        "cluster_advertise", "metrics_listen", "max_sockets_per_node", "max_sockets_per_app",
+        "data_dir", "secrets_keys", "no_secrets", "env", "front_env", "access",
+        "allow_outbound", "allow_outbound_port", "outbound_ca", "max_front_requests",
+        "front_cpu_budget_ms", "no_alarms",
+    ])]
+    node_file: Option<PathBuf>,
 
     /// URL the other nodes reach this one at, e.g. http://10.0.0.11:8080.
     #[arg(long, requires = "node_id")]
@@ -1360,8 +1381,31 @@ fn dev(args: DevArgs) -> anyhow::Result<()> {
     }
 }
 
-fn serve(args: ServeArgs) -> anyhow::Result<()> {
+fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
     huge_pages(args.transparent_huge_pages);
+    // A node file (ADR 0038) says what its flags would: read and checked
+    // before anything else, then served as those flags are. `--app` is a
+    // one-entry file with the same meaning, never written to disk.
+    let node_file = match args.node_file.take() {
+        Some(path) => {
+            let file = node_file::read(&path)?;
+            file.check_plaintext(args.cluster_plaintext == ClusterPlaintext::Accept)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for w in file.warnings() {
+                tracing::warn!("{w}");
+            }
+            // Several apps, or a hostname table: one runtime per app behind
+            // the process's ports (ADR 0038).
+            if file.several() {
+                tracing::info!(file = %path.display(), apps = file.apps.len(), "node file read");
+                return serve_many::serve_many(&file, &args);
+            }
+            file.apply_to(&mut args)?;
+            tracing::info!(file = %path.display(), "node file read");
+            Some(file)
+        }
+        None => node_file::NodeFile::from_serve(&args),
+    };
     // With --app the front comes from the deploy only (ADR 0023), whatever
     // is deployed: refused before anything is read or compiled.
     if let (Some((tenant, name)), Some(path)) = (&args.app, &args.component) {
@@ -1420,6 +1464,10 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Every resident actor holds three open files: size the caps to the
     // descriptors this process may open (raising the soft limit first).
     let wanted_resident = wasmkeep_server::fds::resident_limit(pool, front_requests);
+    if let Some(file) = &node_file {
+        file.check_resident_floors(wanted_resident)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     let requested_sockets = args.max_sockets_per_node.unwrap_or(50_000);
     let requested = wasmkeep_server::fds::Budget {
         public_connections: args.max_connections,
@@ -1531,6 +1579,12 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         tracing::info!(allowed = %ranges.join(", "), "outbound HTTP may also reach these ranges");
     }
     let mut app = App::default();
+    // The process's listeners, shutdown and transport to other nodes
+    // (ADR 0038): one app.
+    let supervisor = match node_file.as_ref().and_then(|f| f.process.id.as_deref()) {
+        Some(name) => wasmkeep_server::Supervisor::named(name),
+        None => wasmkeep_server::Supervisor::new(),
+    };
     // One for the node: guests share its node-wide line budget.
     let guest_log = wasmkeep_server::GuestLog::new(args.guest_log_rate);
     let front_env = load_front_env(&args.front_env)?;
@@ -1721,6 +1775,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     cluster_advertise.clone(),
                 ));
             }
+            cluster.process = Some(supervisor.process());
             cluster.cluster_plaintext = match args.cluster_plaintext {
                 ClusterPlaintext::Accept => wasmkeep_server::ClusterPlaintext::Accept,
                 ClusterPlaintext::Refuse => wasmkeep_server::ClusterPlaintext::Refuse,
@@ -1827,57 +1882,25 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
         }
         tracing::info!("listening on http://{}", listener.local_addr()?);
-        if let Some(addr) = args.metrics_listen {
-            let metrics = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("binding {addr} for metrics"))?;
-            tracing::info!("metrics on http://{}/metrics", metrics.local_addr()?);
-            if !metrics.local_addr()?.ip().is_loopback() {
-                tracing::warn!("metrics are served on a non-loopback address: keep it private");
+        let metrics = match args.metrics_listen {
+            Some(addr) => {
+                let metrics = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("binding {addr} for metrics"))?;
+                tracing::info!("metrics on http://{}/metrics", metrics.local_addr()?);
+                if !metrics.local_addr()?.ip().is_loopback() {
+                    tracing::warn!("metrics are served on a non-loopback address: keep it private");
+                }
+                Some(metrics)
             }
-            let actors = app.actors.clone();
-            tokio::spawn(async move {
-                let _ = wasmkeep_server::serve_metrics(metrics, actors, stop_signal()).await;
-            });
-        }
+            None => None,
+        };
         let limits = wasmkeep_server::ServeLimits {
             max_connections,
             cluster_connections,
             ..wasmkeep_server::ServeLimits::default()
         };
-        // A second process found running with this node id (both started
-        // at the same moment) stops this one too: it takes no more leases,
-        // and shuts down like a SIGTERM, then exits with the reason.
-        let lost: std::sync::Arc<std::sync::Mutex<Option<String>>> = std::sync::Arc::default();
-        let actors = app.actors.clone();
-        let lost_reason = std::sync::Arc::clone(&lost);
-        let shutdown = async move {
-            let node_id_lost = async {
-                match &actors {
-                    Some(a) => a.node_id_lost().await,
-                    None => std::future::pending().await,
-                }
-            };
-            let app_deleted = async {
-                match &actors {
-                    Some(a) => a.app_deleted().await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                () = app_deleted => {
-                    let why = "the app was deleted (wasmkeep app delete): this node no longer serves it".to_owned();
-                    tracing::error!("shutting down: {why}");
-                    *lost_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
-                }
-                () = stop_signal() => tracing::info!("shutting down"),
-                why = node_id_lost => {
-                    tracing::error!("shutting down: {why}");
-                    *lost_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
-                }
-            }
-        };
-        match args.cluster_listen {
+        let cluster = match args.cluster_listen {
             Some(addr) => {
                 let cluster_listener = tokio::net::TcpListener::bind(addr)
                     .await
@@ -1886,18 +1909,18 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     "cluster listener on https://{} (mutual TLS, other nodes only)",
                     cluster_listener.local_addr()?
                 );
-                wasmkeep_server::serve_with_cluster_listener(
-                    listener,
-                    cluster_listener,
-                    app,
-                    shutdown,
-                    limits,
-                )
-                .await?;
+                Some(cluster_listener)
             }
-            None => wasmkeep_server::serve_with(listener, app, shutdown, limits).await?,
-        }
-        if let Some(why) = lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            None => None,
+        };
+        let listeners = wasmkeep_server::Listeners {
+            public: listener,
+            cluster,
+            metrics,
+        };
+        // The app deleted, or its node id lost (another process found
+        // running with it): the process exits with the reason, non-zero.
+        if let Some(why) = supervisor.serve(listeners, app, stop_signal, limits).await? {
             anyhow::bail!("{why}");
         }
         Ok(())
@@ -2342,20 +2365,85 @@ async fn live_node(
         .find(|n| n.id == id && membership::is_live(n, now, horizon_ms)))
 }
 
+/// The live node ids among `nodes` whose heartbeats name `process`, sorted.
+pub(crate) fn process_node_ids(
+    nodes: &[wasmkeep_cluster::membership::NodeInfo],
+    process: &str,
+    now_ms: u64,
+    horizon_ms: u64,
+) -> Vec<String> {
+    let mut ids: Vec<String> = nodes
+        .iter()
+        .filter(|n| {
+            n.process.as_deref() == Some(process)
+                && wasmkeep_cluster::membership::is_live(n, now_ms, horizon_ms)
+        })
+        .map(|n| n.id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// Writes or deletes `control/drain/<node>` (ADR 0014). Without `--force`,
 /// a drain needs a live node with the id (a request for an id no node uses
 /// stays in `control/` until an undrain with the same id), and an undrain a
 /// live node or a request to withdraw.
 fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
-    use wasmkeep_cluster::control::{self, Keys as _};
-    let key = control::drain_key(&args.node)?;
+    // A bad id is refused before the bucket is touched.
+    if let Some(node) = &args.node {
+        wasmkeep_cluster::control::drain_key(node)?;
+    }
     let (store, prefix) = open_bucket(&args.bucket)?;
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    if !args.force && rt.block_on(live_node(&keys, &args.node))?.is_none() {
-        let id = &args.node;
+    let ids = match (&args.node, &args.process) {
+        (Some(node), _) => vec![node.clone()],
+        (None, Some(process)) => {
+            // ADR 0038: every node id the process runs, as its live
+            // heartbeats name it.
+            let horizon_ms = wasmkeep_server::heartbeat_horizon_ms(
+                wasmkeep_server::DEFAULT_HEARTBEAT,
+                &wasmkeep_server::LeaseConfig::default_safe(),
+            );
+            let all = rt
+                .block_on(wasmkeep_cluster::membership::all_heartbeats(&keys))
+                .map_err(|e| anyhow::anyhow!("listing the heartbeats: {e}"))?;
+            let ids = process_node_ids(&all, process, status::now_ms(), horizon_ms);
+            anyhow::ensure!(
+                !ids.is_empty(),
+                "no live node id names the process {process} (see `wasmkeep cluster status`)"
+            );
+            ids
+        }
+        (None, None) => anyhow::bail!("give a node id, or --process ID"),
+    };
+    for id in &ids {
+        drain_node(&rt, &keys, id, drain, args.force)?;
+    }
+    announce_intent(&rt, &keys);
+    for id in &ids {
+        if drain {
+            println!("{}", drain_asked(id));
+        } else {
+            println!("Withdrew the drain request for {id}.");
+        }
+    }
+    Ok(())
+}
+
+/// [`cluster_drain`] for node `id`: the request written or withdrawn.
+fn drain_node(
+    rt: &tokio::runtime::Runtime,
+    keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
+    id: &str,
+    drain: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    use wasmkeep_cluster::control::{self, Keys as _};
+    let key = control::drain_key(id)?;
+    if !force && rt.block_on(live_node(keys, id))?.is_none() {
         if drain {
             anyhow::bail!(
                 "no live node has the id {id} (see `wasmkeep cluster status`): a drain request \
@@ -2364,7 +2452,7 @@ fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
             );
         }
         let requested = rt
-            .block_on(control::read(&keys, None, status::now_ms()))
+            .block_on(control::read(keys, None, status::now_ms()))
             .map_err(|e| anyhow::anyhow!("reading the drain requests: {e}"))?
             .draining
             .contains(id);
@@ -2378,12 +2466,6 @@ fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()> {
         rt.block_on(keys.put_empty(&key))?;
     } else {
         rt.block_on(keys.delete(&key))?;
-    }
-    announce_intent(&rt, &keys);
-    if drain {
-        println!("{}", drain_asked(&args.node));
-    } else {
-        println!("Withdrew the drain request for {}.", args.node);
     }
     Ok(())
 }

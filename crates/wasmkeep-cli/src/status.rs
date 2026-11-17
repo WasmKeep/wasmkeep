@@ -396,6 +396,37 @@ impl Report {
         out
     }
 
+    /// The live node ids whose heartbeats name process `process`.
+    pub(crate) fn process_nodes(&self, process: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.live && n.info.process.as_deref() == Some(process))
+            .map(|n| n.info.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Each process the live heartbeats name, with its node ids, sorted.
+    fn processes(&self) -> Vec<(String, Vec<String>)> {
+        let mut names: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.live)
+            .filter_map(|n| n.info.process.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .map(|p| {
+                let nodes = self.process_nodes(&p);
+                (p, nodes)
+            })
+            .collect()
+    }
+
     pub(crate) fn to_json(&self) -> Value {
         let (tls, plain) = self.tls_split();
         let nodes: Vec<Value> = self
@@ -429,6 +460,8 @@ impl Report {
                     "sockets": n.load().map(|l| l.sockets),
                     "events_per_min": n.load().and_then(|l| l.events_per_min),
                     "front_per_min": n.load().and_then(|l| l.front_per_min),
+                    // ADR 0038: the process the node id runs in.
+                    "process": n.info.process,
                 })
             })
             .collect();
@@ -456,6 +489,11 @@ impl Report {
             "read_at_ms": self.read_at_ms,
             "horizon_ms": self.horizon_ms,
             "nodes": nodes,
+            "processes": self
+                .processes()
+                .into_iter()
+                .map(|(p, nodes)| json!({"process": p, "nodes": nodes}))
+                .collect::<Vec<_>>(),
             "apps": apps,
             "summary": {
                 "nodes": self.nodes.len(),
@@ -540,6 +578,17 @@ impl Report {
                 ],
                 &rows,
             );
+        }
+        // Node ids of one process (ADR 0038): grouped by the process their
+        // heartbeats name.
+        let processes = self.processes();
+        if !processes.is_empty() {
+            out.push('\n');
+            let rows: Vec<[String; 2]> = processes
+                .into_iter()
+                .map(|(p, nodes)| [p, nodes.join(", ")])
+                .collect();
+            table(&mut out, ["PROCESS", "LIVE NODE IDS"], &rows);
         }
         out.push('\n');
         if self.apps.is_empty() {
@@ -866,6 +915,42 @@ mod tests {
         let why = may_forget(lease.as_bytes(), NOW).unwrap_err();
         assert!(why.contains("never deleted"), "{why}");
         assert!(may_forget(b"junk", NOW).is_err());
+    }
+
+    /// ADR 0038, M6: node ids of one process are grouped by the process
+    /// their heartbeats name (`process=<id>`).
+    #[test]
+    fn node_ids_are_grouped_by_their_process() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        block_on(async {
+            for (id, app, process) in [
+                ("shop-1", "acme/shop", " process=edge-1"),
+                ("blog-1", "acme/blog", " process=edge-1"),
+                ("shop-2", "acme/shop", ""),
+            ] {
+                let body = format!(
+                    "wasmkeep-node 3\nlive beef\n{NOW}\n{id}\nhttp://{id}\n1\n{app}\n\n\nserving\n\ntake multi-app{process}\n"
+                );
+                put(&store, &format!("demo/nodes/{id}"), &body).await;
+            }
+        });
+        let r = report(store);
+        let text = r.to_text();
+        assert!(text.contains("PROCESS"), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("edge-1") && l.contains("blog-1, shop-1")),
+            "{text}"
+        );
+        let j = r.to_json();
+        assert_eq!(j["processes"][0]["process"], "edge-1");
+        assert_eq!(
+            j["processes"][0]["nodes"],
+            serde_json::json!(["blog-1", "shop-1"])
+        );
+        assert_eq!(j["nodes"][0]["process"], "edge-1");
+        assert_eq!(j["nodes"][2]["process"], serde_json::Value::Null);
+        assert_eq!(r.process_nodes("edge-1"), ["blog-1", "shop-1"]);
     }
 
     #[test]

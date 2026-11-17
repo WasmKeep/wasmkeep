@@ -190,7 +190,15 @@ impl<T> Default for Family<T> {
 impl<T: Default> Family<T> {
     /// The value for these labels, created on first use.
     pub(crate) fn get(&self, labels: &[(&str, &str)]) -> Arc<T> {
-        let key = render_labels(labels);
+        self.get_key(render_labels(labels))
+    }
+
+    /// The value for the labels of `app` ([`app_labels`]) then `labels`.
+    pub(crate) fn get_in(&self, app: &str, labels: &[(&str, &str)]) -> Arc<T> {
+        self.get_key(join_labels(app, &render_labels(labels)))
+    }
+
+    fn get_key(&self, key: String) -> Arc<T> {
         if let Some(v) = self
             .entries
             .read()
@@ -406,7 +414,7 @@ pub(crate) struct Metrics {
     pub(crate) front_requests: Family<AtomicU64>,
     /// How long front requests took, to the response's last byte; rendered
     /// with the node's tenant and app.
-    pub(crate) front_request_seconds: Histogram,
+    pub(crate) front_request_seconds: Family<Histogram>,
     /// Front requests running now (a gauge).
     pub(crate) front_slots_in_use: AtomicU64,
     /// `actors.call` from the front, by outcome (`ok`, `busy`, `timeout`,
@@ -544,6 +552,66 @@ impl Family<AtomicU64> {
         self.each(|_, v| sum = sum.saturating_add(v.load(Ordering::Relaxed)));
         sum
     }
+
+    /// The sum over the label sets of the app `app` names
+    /// ([`app_labels`]).
+    pub(crate) fn total_in(&self, app: &str) -> u64 {
+        let mut sum = 0u64;
+        self.each(|labels, v| {
+            let theirs = labels
+                .strip_prefix(app)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(','));
+            if theirs {
+                sum = sum.saturating_add(v.load(Ordering::Relaxed));
+            }
+        });
+        sum
+    }
+}
+
+/// An app's labels, `tenant="...",app="..."`: what its work is recorded
+/// under (ADR 0038, section 9).
+pub(crate) fn app_labels(tenant: &str, app: &str) -> Arc<str> {
+    Arc::from(render_labels(&[("tenant", tenant), ("app", app)]))
+}
+
+/// One front request of the app `app` names ([`app_labels`]), ended
+/// with `outcome` ([`FRONT_REQUEST_OUTCOMES`]).
+pub(crate) fn front_request(app: &str, outcome: &str) {
+    inc(&METRICS.front_requests.get_in(app, &[("outcome", outcome)]));
+}
+
+/// How long a front request of `app` took, to its response's last byte.
+pub(crate) fn front_request_took(app: &str, elapsed: std::time::Duration) {
+    METRICS
+        .front_request_seconds
+        .get_in(app, &[])
+        .observe(elapsed);
+}
+
+/// One `actors.call` from the front of `app`, ended with `outcome`
+/// ([`FRONT_CALL_OUTCOMES`]).
+pub(crate) fn front_call(app: &str, outcome: &str) {
+    inc(&METRICS.front_calls.get_in(app, &[("outcome", outcome)]));
+}
+
+/// One event of `class` in the app `app` names ([`app_labels`]), of
+/// `kind`, ended with `outcome`, after `elapsed`.
+pub(crate) fn record_event(
+    app: &str,
+    class: &str,
+    kind: &str,
+    outcome: &str,
+    elapsed: std::time::Duration,
+) {
+    inc(&METRICS.events.get_in(
+        app,
+        &[("class", class), ("kind", kind), ("outcome", outcome)],
+    ));
+    METRICS
+        .event_seconds
+        .get_in(app, &[("class", class)])
+        .observe(elapsed);
 }
 
 /// `kind` of `wasmkeep_failover_waits_total` ([`crate::cluster::failover_wait`]).
@@ -623,7 +691,7 @@ pub(crate) const FRONT_CALL_OUTCOMES: [&str; 4] = ["ok", "busy", "timeout", "fai
 /// [`crate::ActorService::not_ready`], of the cluster's readiness and the
 /// words of a stopped node. A reason not listed here is still rendered
 /// while it holds; a test keeps the list complete.
-pub(crate) const NOT_READY_REASONS: [&str; 19] = [
+pub(crate) const NOT_READY_REASONS: [&str; 20] = [
     "shutting down",
     "checking that no other process runs with this node id",
     "another process runs with this node id",
@@ -636,6 +704,7 @@ pub(crate) const NOT_READY_REASONS: [&str; 19] = [
     "this node holds no lease",
     "the bucket does not enforce conditional writes",
     "cluster secret not loaded",
+    "a live node of an older version (no multi-app) runs in this cluster",
     "bucket unreachable (node lease not renewed)",
     "cluster identity not published for a heartbeat period yet",
     "disk not checked yet",
@@ -684,8 +753,6 @@ impl Metrics {
         one(&m.parked_releases, "reason", &PARKED_RELEASE_REASONS);
         one(&m.plain_events_dropped, "reason", &PLAIN_DROP_REASONS);
         one(&m.batched_waits, "reason", &BATCHED_WAIT_REASONS);
-        one(&m.front_requests, "outcome", &FRONT_REQUEST_OUTCOMES);
-        one(&m.front_calls, "outcome", &FRONT_CALL_OUTCOMES);
         m
     }
 }
@@ -718,6 +785,24 @@ pub struct Gauges {
     pub not_ready: Option<&'static str>,
 }
 
+impl Gauges {
+    /// The process's gauges from each app runtime's (ADR 0038, section 9):
+    /// residents, WebSockets and classes summed; the socket budget, shared,
+    /// once; the first reason not to be ready.
+    pub(crate) fn of_process(apps: &[Gauges]) -> Gauges {
+        let Some(first) = apps.first() else {
+            return Gauges::default();
+        };
+        Gauges {
+            resident: apps.iter().map(|g| g.resident).sum(),
+            websockets: apps.iter().map(|g| g.websockets).sum(),
+            classes: apps.iter().map(|g| g.classes).sum(),
+            not_ready: apps.iter().find_map(|g| g.not_ready),
+            ..*first
+        }
+    }
+}
+
 /// The metrics page of a process serving no actors ([`render_for`] with
 /// the implicit app `default/default` and no node).
 pub fn render(gauges: Gauges) -> String {
@@ -728,12 +813,26 @@ pub fn render(gauges: Gauges) -> String {
 /// far plus `gauges`, and the runtime's CPU-budget traps. Series with a
 /// class carry its tenant and app; `wasmkeep_info` its version and node.
 pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
-    render_with(&METRICS, gauges, identity)
+    render_with(&METRICS, gauges, std::slice::from_ref(identity))
 }
 
-/// [`render_for`], from `m`.
-fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
-    let app = identity.app_labels();
+/// The page of a process serving several apps (ADR 0038, section 9): one
+/// `wasmkeep_info` per app's node, and each app's front series from the
+/// first scrape.
+pub(crate) fn render_for_apps(gauges: Gauges, identities: &[Identity]) -> String {
+    render_with(&METRICS, gauges, identities)
+}
+
+/// [`render_for`], from `m`, for the nodes `identities` name (at least the
+/// implicit app's).
+fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
+    let implicit = [Identity::default()];
+    let identities = if identities.is_empty() {
+        &implicit[..]
+    } else {
+        identities
+    };
+    let apps: Vec<String> = identities.iter().map(Identity::app_labels).collect();
     let mut out = String::new();
     let head = |out: &mut String, name: &str, kind: &str, help: &str| {
         let _ = writeln!(out, "# HELP {name} {help}");
@@ -760,15 +859,17 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "gauge",
         "Always 1: the running version, and the tenant, app and node id (in a cluster) of the node, for joining with other series.",
     );
-    let mut info = vec![
-        ("version", wasmkeep_cluster::VERSION),
-        ("tenant", identity.tenant.as_str()),
-        ("app", identity.app.as_str()),
-    ];
-    if !identity.node.is_empty() {
-        info.push(("node", identity.node.as_str()));
+    for identity in identities {
+        let mut info = vec![
+            ("version", wasmkeep_cluster::VERSION),
+            ("tenant", identity.tenant.as_str()),
+            ("app", identity.app.as_str()),
+        ];
+        if !identity.node.is_empty() {
+            info.push(("node", identity.node.as_str()));
+        }
+        let _ = writeln!(out, "wasmkeep_info{{{}}} 1", render_labels(&info));
     }
-    let _ = writeln!(out, "wasmkeep_info{{{}}} 1", render_labels(&info));
     gauge(
         &mut out,
         "wasmkeep_actors_resident",
@@ -849,11 +950,11 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "counter",
         "Events run, by tenant, app, class, kind and outcome.",
     );
+    // Recorded with their app (ADR 0038, section 9).
     m.events.each(|labels, v| {
         let _ = writeln!(
             out,
-            "wasmkeep_events_total{{{}}} {}",
-            join_labels(&app, labels),
+            "wasmkeep_events_total{{{labels}}} {}",
             v.load(Ordering::Relaxed)
         );
     });
@@ -864,11 +965,7 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "How long events ran, by tenant, app and class.",
     );
     m.event_seconds.each(|labels, h| {
-        h.render(
-            &mut out,
-            "wasmkeep_event_duration_seconds",
-            &join_labels(&app, labels),
-        );
+        h.render(&mut out, "wasmkeep_event_duration_seconds", labels);
     });
     family(
         &mut out,
@@ -1153,17 +1250,53 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "Bytes of the node's budget of batched segments in flight in use now.",
         crate::actor::upload_budget_in_use(),
     );
-    let app_family = |out: &mut String, name: &str, help: &str, f: &Family<AtomicU64>| {
-        head(out, name, "counter", help);
-        f.each(|labels, v| {
-            let _ = writeln!(
-                out,
-                "{name}{{{}}} {}",
-                join_labels(&app, labels),
-                v.load(Ordering::Relaxed)
-            );
-        });
-    };
+    // Each app's part of the shared budgets and its use (ADR 0038,
+    // section 8): none on a node that joined no cluster.
+    let shares: [(&str, &crate::shares::Shares); 3] = [
+        ("uploads", &crate::actor::UPLOAD_SHARES),
+        ("restore_reads", &crate::replica::RESTORE_SLOT_SHARES),
+        ("restore_megabytes", &crate::replica::RESTORE_BYTE_SHARES),
+    ];
+    for (name, help, part) in [
+        (
+            "wasmkeep_budget_share_part",
+            "Each app's equal part of a shared budget (uploads in bytes, restore reads, restore megabytes); half of it is a floor never lent.",
+            true,
+        ),
+        (
+            "wasmkeep_budget_share_in_use",
+            "What each app holds now of a shared budget.",
+            false,
+        ),
+    ] {
+        head(&mut out, name, "gauge", help);
+        for (budget, s) in shares {
+            s.each(|app, app_part, used| {
+                let (tenant, app) = app.split_once('/').unwrap_or((app, ""));
+                let labels = render_labels(&[("budget", budget), ("tenant", tenant), ("app", app)]);
+                let v = if part { app_part } else { used };
+                let _ = writeln!(out, "{name}{{{labels}}} {v}");
+            });
+        }
+    }
+    // Recorded with their app (ADR 0038, section 9); the page's own app
+    // has every outcome from the first scrape, at 0 until counted.
+    let app_family =
+        |out: &mut String, name: &str, help: &str, f: &Family<AtomicU64>, outcomes: &[&str]| {
+            head(out, name, "counter", help);
+            let mut rows = BTreeMap::new();
+            for o in outcomes {
+                for app in &apps {
+                    rows.insert(join_labels(app, &render_labels(&[("outcome", o)])), 0);
+                }
+            }
+            f.each(|labels, v| {
+                rows.insert(labels.to_owned(), v.load(Ordering::Relaxed));
+            });
+            for (labels, v) in rows {
+                let _ = writeln!(out, "{name}{{{labels}}} {v}");
+            }
+        };
     head(
         &mut out,
         "wasmkeep_rate_limit_requests_total",
@@ -1196,6 +1329,7 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_front_requests_total",
         "Front requests, by tenant, app and outcome.",
         &m.front_requests,
+        &FRONT_REQUEST_OUTCOMES,
     );
     head(
         &mut out,
@@ -1203,10 +1337,11 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "histogram",
         "How long front requests took, to the response's last byte, by tenant and app.",
     );
-    if m.front_request_seconds.count.load(Ordering::Relaxed) > 0 {
-        m.front_request_seconds
-            .render(&mut out, "wasmkeep_front_request_seconds", &app);
-    }
+    m.front_request_seconds.each(|labels, h| {
+        if h.count.load(Ordering::Relaxed) > 0 {
+            h.render(&mut out, "wasmkeep_front_request_seconds", labels);
+        }
+    });
     head(
         &mut out,
         "wasmkeep_front_slots_in_use",
@@ -1223,6 +1358,7 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "wasmkeep_front_calls_total",
         "actors.call from the front, by tenant, app and outcome.",
         &m.front_calls,
+        &FRONT_CALL_OUTCOMES,
     );
     head(
         &mut out,
@@ -1244,6 +1380,173 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each app's part of the process's shared budgets and what it uses,
+    /// once per budget and app.
+    #[test]
+    fn budget_shares_are_on_the_page_by_app() {
+        let _shares = [
+            crate::actor::UPLOAD_SHARES.join("acme/shop"),
+            crate::actor::UPLOAD_SHARES.join("acme/blog"),
+        ];
+        let _held = crate::actor::UPLOAD_SHARES
+            .try_acquire("acme/shop", 1000)
+            .unwrap();
+        let page = render(Gauges::default());
+        let half = crate::replica::NODE_UPLOAD_BYTES / 2;
+        for line in [
+            format!("\nwasmkeep_budget_share_part{{budget=\"uploads\",tenant=\"acme\",app=\"shop\"}} {half}\n"),
+            format!("\nwasmkeep_budget_share_part{{budget=\"uploads\",tenant=\"acme\",app=\"blog\"}} {half}\n"),
+            "\nwasmkeep_budget_share_in_use{budget=\"uploads\",tenant=\"acme\",app=\"shop\"} 1000\n".to_owned(),
+            "\nwasmkeep_budget_share_in_use{budget=\"uploads\",tenant=\"acme\",app=\"blog\"} 0\n".to_owned(),
+        ] {
+            assert!(page.contains(&line), "no {line} in\n{page}");
+        }
+        assert_eq!(
+            page.matches("# TYPE wasmkeep_budget_share_part ").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_process_of_several_apps_has_an_info_line_per_app() {
+        let id = |app: &str, node: &str| Identity {
+            tenant: "acme".into(),
+            app: app.into(),
+            node: node.into(),
+        };
+        let page = render_for_apps(
+            Gauges::default(),
+            &[id("shop", "shop-1"), id("blog", "blog-1")],
+        );
+        let v = wasmkeep_cluster::VERSION;
+        for line in [
+            format!(
+                "\nwasmkeep_info{{version=\"{v}\",tenant=\"acme\",app=\"shop\",node=\"shop-1\"}} 1\n"
+            ),
+            format!(
+                "\nwasmkeep_info{{version=\"{v}\",tenant=\"acme\",app=\"blog\",node=\"blog-1\"}} 1\n"
+            ),
+            "\nwasmkeep_front_requests_total{tenant=\"acme\",app=\"blog\",outcome=\"ok\"} "
+                .to_owned(),
+        ] {
+            assert!(page.contains(&line), "no {line} in\n{page}");
+        }
+        assert_eq!(page.matches("# TYPE wasmkeep_info ").count(), 1);
+    }
+
+    #[test]
+    fn a_process_of_several_apps_sums_their_gauges() {
+        let g = |resident, websockets, not_ready| Gauges {
+            socket_sessions: 7,
+            socket_requested: 100,
+            socket_effective: 90,
+            socket_actor_requested: 10,
+            socket_actor_effective: 10,
+            resident,
+            websockets,
+            classes: 2,
+            not_ready,
+        };
+        let p = Gauges::of_process(&[g(3, 1, None), g(4, 2, Some("disk almost full"))]);
+        assert_eq!((p.resident, p.websockets, p.classes), (7, 3, 4));
+        assert_eq!((p.socket_sessions, p.socket_effective), (7, 90));
+        assert_eq!(p.not_ready, Some("disk almost full"));
+        assert_eq!(Gauges::of_process(&[]).resident, 0);
+    }
+
+    /// Two apps' fronts in one process: each request and call is counted
+    /// under its own app, and the sum is the work done.
+    #[test]
+    fn front_work_is_counted_under_its_own_app() {
+        let (shop, blog) = (app_labels("acme", "shop"), app_labels("acme", "blog"));
+        front_request(&shop, "ok");
+        front_request(&shop, "ok");
+        front_request(&blog, "busy");
+        front_request_took(&shop, Duration::from_millis(2));
+        front_request_took(&blog, Duration::from_millis(2));
+        front_call(&blog, "timeout");
+        assert_eq!(METRICS.front_requests.total_in(&shop), 2);
+        assert_eq!(METRICS.front_requests.total_in(&blog), 1);
+        let page = render_for(Gauges::default(), &Identity::default());
+        for line in [
+            "\nwasmkeep_front_requests_total{tenant=\"acme\",app=\"shop\",outcome=\"ok\"} 2\n",
+            "\nwasmkeep_front_requests_total{tenant=\"acme\",app=\"blog\",outcome=\"busy\"} 1\n",
+            "\nwasmkeep_front_request_seconds_count{tenant=\"acme\",app=\"shop\"} 1\n",
+            "\nwasmkeep_front_request_seconds_count{tenant=\"acme\",app=\"blog\"} 1\n",
+            "\nwasmkeep_front_calls_total{tenant=\"acme\",app=\"blog\",outcome=\"timeout\"} 1\n",
+        ] {
+            assert!(page.contains(line), "no {line} in\n{page}");
+        }
+    }
+
+    /// The front's series are on an app's page at 0 from the first scrape,
+    /// under that app only.
+    #[test]
+    fn an_apps_page_has_its_front_series_at_zero() {
+        let page = render_for(
+            Gauges::default(),
+            &Identity {
+                tenant: "acme".into(),
+                app: "shop".into(),
+                node: String::new(),
+            },
+        );
+        for o in FRONT_REQUEST_OUTCOMES {
+            let line = format!(
+                "\nwasmkeep_front_requests_total{{tenant=\"acme\",app=\"shop\",outcome=\"{o}\"}} 0\n"
+            );
+            assert!(page.contains(&line), "no {line} in\n{page}");
+        }
+        assert!(
+            !page.contains("wasmkeep_front_requests_total{tenant=\"default\""),
+            "{page}"
+        );
+    }
+
+    /// Two apps of one process: each event is counted once, under its own
+    /// app, whatever identity the page is rendered for; the sum over apps
+    /// is the work done, and the process's series appear once.
+    #[test]
+    fn events_are_counted_under_their_own_app() {
+        let (shop, blog) = (app_labels("acme", "shop"), app_labels("acme", "blog"));
+        let ms = Duration::from_millis(3);
+        for _ in 0..2 {
+            record_event(&shop, "c", "request", "ok", ms);
+        }
+        for _ in 0..3 {
+            record_event(&blog, "c", "request", "ok", ms);
+        }
+        assert_eq!(METRICS.events.total_in(&shop), 2);
+        assert_eq!(METRICS.events.total_in(&blog), 3);
+        assert_eq!(METRICS.events.total(), 5);
+        for identity in [
+            Identity {
+                tenant: "acme".into(),
+                app: "shop".into(),
+                node: "n1".into(),
+            },
+            Identity::default(),
+        ] {
+            let page = render_for(Gauges::default(), &identity);
+            for line in [
+                "\nwasmkeep_events_total{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"request\",outcome=\"ok\"} 2\n",
+                "\nwasmkeep_events_total{tenant=\"acme\",app=\"blog\",class=\"c\",kind=\"request\",outcome=\"ok\"} 3\n",
+                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"c\"} 2\n",
+                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"blog\",class=\"c\"} 3\n",
+            ] {
+                assert!(page.contains(line), "no {line} in\n{page}");
+            }
+            let events: u64 = page
+                .lines()
+                .filter(|l| l.starts_with("wasmkeep_events_total{"))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum();
+            assert_eq!(events, 5, "{page}");
+            assert_eq!(page.matches("\nwasmkeep_info{").count(), 1);
+            assert_eq!(page.matches("\nwasmkeep_actors_resident ").count(), 1);
+        }
+    }
 
     #[test]
     fn a_family_total_sums_every_label_set() {
@@ -1342,13 +1645,20 @@ mod tests {
 
     #[test]
     fn series_with_a_class_label_carry_the_tenant_and_app() {
-        inc(&METRICS
-            .events
-            .get(&[("class", "c"), ("kind", "request"), ("outcome", "ok")]));
-        METRICS
-            .event_seconds
-            .get(&[("class", "c")])
-            .observe(Duration::from_millis(3));
+        record_event(
+            &app_labels("acme", "shop"),
+            "c",
+            "request",
+            "ok",
+            Duration::from_millis(3),
+        );
+        record_event(
+            &app_labels("default", "default"),
+            "c",
+            "request",
+            "ok",
+            Duration::from_millis(3),
+        );
         inc(&METRICS
             .bucket_requests
             .get(&[("operation", "get"), ("status", "ok")]));
@@ -1373,13 +1683,18 @@ mod tests {
             page.contains("wasmkeep_events_total{tenant=\"default\",app=\"default\",class=\"c\",kind=\"request\",outcome=\"ok\"} 1\n"),
             "{page}"
         );
-        // Every series with a class has them, and so do the front's
-        // counters and histogram (ADR 0023); the others are as they were,
-        // and gauges of the process stay unlabelled.
+        // Every series with a class has them (its own app's, recorded with
+        // the event: ADR 0038, section 9), and so do the front's counters
+        // and histogram (ADR 0023); the others are as they were, and
+        // gauges of the process stay unlabelled.
         for l in page.lines().filter(|l| !l.starts_with('#')) {
-            if l.contains("class=\"")
-                || (l.starts_with("wasmkeep_front_") && !l.starts_with("wasmkeep_front_slots"))
-            {
+            if l.contains("class=\"") {
+                assert!(
+                    l.contains("{tenant=\"default\",app=\"default\",")
+                        || l.contains("{tenant=\"acme\",app=\"shop\","),
+                    "{l}"
+                );
+            } else if l.starts_with("wasmkeep_front_") && !l.starts_with("wasmkeep_front_slots") {
                 assert!(l.contains("{tenant=\"default\",app=\"default\","), "{l}");
             } else if !l.starts_with("wasmkeep_info{") {
                 assert!(!l.contains("tenant=") && !l.contains("app="), "{l}");
@@ -1453,7 +1768,7 @@ mod tests {
         inc(&m
             .events
             .get(&[("class", "c"), ("kind", "request"), ("outcome", "failed")]));
-        let page = render_with(&m, Gauges::default(), &Identity::default());
+        let page = render_with(&m, Gauges::default(), &[Identity::default()]);
         let mut names = std::collections::BTreeSet::new();
         let mut rest = exprs.as_str();
         while let Some(at) = rest.find("wasmkeep_") {
@@ -1549,7 +1864,11 @@ mod tests {
     /// A page rendered from a fresh, seeded [`Metrics`]: what a node
     /// serves before anything happened.
     fn fresh_page() -> String {
-        render_with(&Metrics::seeded(), Gauges::default(), &Identity::default())
+        render_with(
+            &Metrics::seeded(),
+            Gauges::default(),
+            &[Identity::default()],
+        )
     }
 
     /// Families whose label values are a fixed set have every series on
@@ -1662,7 +1981,7 @@ mod tests {
                 not_ready: Some(why),
                 ..Gauges::default()
             },
-            &Identity::default(),
+            &[Identity::default()],
         ));
         assert_eq!(not_ready.len(), NOT_READY_REASONS.len(), "{not_ready:?}");
         let ones: Vec<_> = not_ready.iter().filter(|(_, v)| v == "1").collect();
@@ -1710,7 +2029,7 @@ mod tests {
         m.segment_bytes.observe(5_000);
         crate::metrics::inc(&m.batched_waits.get(&[("reason", "age")]));
         m.flush_seconds.observe(Duration::from_millis(60));
-        let page = render_with(&m, Gauges::default(), &Identity::default());
+        let page = render_with(&m, Gauges::default(), &[Identity::default()]);
         for want in [
             "wasmkeep_unsent_age_seconds_count 1",
             "wasmkeep_segment_events_bucket{le=\"5\"} 1",

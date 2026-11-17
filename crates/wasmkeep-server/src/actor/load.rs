@@ -68,6 +68,9 @@ pub(super) fn load_source(
     service: std::sync::Weak<ServiceInner>,
 ) -> wasmkeep_cluster::membership::LoadSource {
     let start = tokio::time::Instant::now();
+    // Its own app's events (ADR 0038, section 9): a process serving
+    // several apps publishes each app's rate under its own node id.
+    let app = service.upgrade().map(|inner| Arc::clone(&inner.app_labels));
     let rate = std::sync::Mutex::new(EventRate::default());
     let front_rate = std::sync::Mutex::new(EventRate::default());
     Box::new(move || {
@@ -75,11 +78,19 @@ pub(super) fn load_source(
         let events_per_min = rate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sample(at, crate::metrics::METRICS.events.total());
+            .sample(
+                at,
+                app.as_deref()
+                    .map_or(0, |a| crate::metrics::METRICS.events.total_in(a)),
+            );
         let front_per_min = front_rate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sample(at, crate::metrics::METRICS.front_requests.total());
+            .sample(
+                at,
+                app.as_deref()
+                    .map_or(0, |a| crate::metrics::METRICS.front_requests.total_in(a)),
+            );
         // Gone (the service is stopping): nothing runs here any more.
         let (actors, sockets) = service.upgrade().map_or((0, 0), |inner| {
             (inner.mailboxes.resident(), inner.sockets.len())

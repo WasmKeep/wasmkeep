@@ -29,9 +29,14 @@ mod rate_limit;
 mod replica;
 pub mod secret_store;
 pub mod secrets;
+mod shares;
 mod socket_limits;
+mod supervisor;
 mod websocket;
 pub use socket_limits::{SocketBudget, SocketLimits};
+pub use supervisor::{
+    AppSpec, BuildRuntime, Listeners, Runtime, Supervisor, nodes_without_multi_app,
+};
 
 pub use access::{Access, AccessRules};
 #[doc(hidden)]
@@ -39,7 +44,7 @@ pub use actor::hold_node_upload_budget;
 pub use actor::{ActorConfig, ActorService};
 pub use cluster::{
     ClusterConfig, ClusterPlaintext, ClusterTlsConfig, DEFAULT_HEARTBEAT, IMPLICIT_APP_NAME,
-    failover_wait_default, heartbeat_horizon_ms, older_nodes_advice,
+    NodeProcess, failover_wait_default, heartbeat_horizon_ms, older_nodes_advice,
 };
 pub use egress::{EgressPolicy, IpRange};
 pub use env::ActorEnv;

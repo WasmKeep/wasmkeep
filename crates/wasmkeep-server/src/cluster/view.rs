@@ -78,7 +78,7 @@ pub(super) async fn fence_loop(
 /// The intents: see [`Cluster::refresh_control_if_changed`].
 pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Duration) {
     // Held apart from the cluster, so waiting does not keep it alive.
-    let tls = cluster.upgrade().and_then(|c| c.tls.clone());
+    let tls = cluster.upgrade().and_then(|c| c.transport.tls.clone());
     let Some(asked) = cluster.upgrade().map(|c| Arc::clone(&c.listing_asked)) else {
         return;
     };
@@ -486,7 +486,7 @@ impl Cluster {
 
     async fn list_and_refresh(&self, full: bool) -> bool {
         let read = if full {
-            self.membership.heartbeats().await
+            self.transport.list_nodes().await
         } else {
             let mut known = self
                 .known_nodes
@@ -498,7 +498,7 @@ impl Cluster {
             if !known.contains(&self.node_id) {
                 known.push(self.node_id.clone());
             }
-            self.membership.heartbeats_of(&known).await
+            self.transport.read_nodes(&known).await
         };
         match read {
             Ok(all) => {
@@ -510,6 +510,7 @@ impl Cluster {
                 self.note_old_versions(&all);
                 self.note_future_leases(&all);
                 let nodes = self.membership.live(all.clone());
+                self.note_multi_app(&nodes);
                 let mixed = older_nodes(&self.node_id, &nodes);
                 let now = now_ms();
                 let period = u64::try_from(self.heartbeat_every.as_millis()).unwrap_or(u64::MAX);
@@ -521,14 +522,10 @@ impl Cluster {
                         .store(now, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!(serves = %self.serves, "{}", older_nodes_advice(&mixed));
                 }
-                if let Some(tls) = &self.tls
-                    && tls.refresh(&nodes, self.heartbeat_horizon_ms)
-                {
-                    // An address changed hands (or its node left): drop every
-                    // pooled connection, so none to a previous holder is used.
-                    *self.clients.write().unwrap_or_else(|p| p.into_inner()) =
-                        Clients::new(&self.connector);
-                }
+                // The process's trust table; when an address changed hands
+                // (or its node left), every pooled connection is dropped.
+                self.transport
+                    .refresh_trust(&nodes, self.heartbeat_horizon_ms);
                 if self.refuse_plaintext {
                     self.note_plain_peers(&nodes, now);
                 }

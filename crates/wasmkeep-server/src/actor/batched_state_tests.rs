@@ -56,6 +56,8 @@ fn state(
         writes: crate::apps::Writes::Batched,
     });
     ActorState {
+        app_labels: crate::metrics::app_labels("t", "default"),
+        app_name: Arc::from("t/default"),
         moves: Arc::default(),
         secrets_blocked: Arc::default(),
         address,

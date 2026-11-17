@@ -65,38 +65,76 @@ impl Residency {
     /// Reserves from the mailbox's existing task counter, before a factory
     /// may run. A zero limit refuses all new actors; no arithmetic overflows
     /// when the configured limit is `usize::MAX`.
+    #[cfg(test)]
     pub(crate) fn try_acquire(
         count: &Arc<AtomicUsize>,
         limit: usize,
         released: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Option<Self> {
-        let mut current = count.load(Ordering::SeqCst);
-        loop {
-            if current >= limit {
-                return None;
-            }
-            match count.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
+        Self::try_acquire_in(count, limit, None, released)
+    }
+
+    /// [`Self::try_acquire`], and a slot of a shared `pool` (its counter,
+    /// its limit, and what to run when the slot comes back) first: both or
+    /// neither are taken, and both come back together.
+    pub(crate) fn try_acquire_in(
+        count: &Arc<AtomicUsize>,
+        limit: usize,
+        pool: Option<PoolSlot<'_>>,
+        released: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Option<Self> {
+        // Its own slot first: at its own cap the pool is never touched.
+        // A slot taken and given back at once (the other limit was full)
+        // wakes nobody: no waiter could use it, and the caller would wake
+        // itself into a loop.
+        if !take(count, limit) {
+            return None;
         }
+        let pooled = match pool {
+            Some((used, pool_limit, back)) => {
+                if !take(used, pool_limit) {
+                    count.fetch_sub(1, Ordering::SeqCst);
+                    return None;
+                }
+                Some((Arc::clone(used), back))
+            }
+            None => None,
+        };
         Some(Self {
             reservation: Arc::new(Reservation {
                 count: Arc::clone(count),
                 released,
+                pool: pooled,
             }),
         })
+    }
+}
+
+/// A shared pool's counter, its limit, and what to run when a slot comes
+/// back.
+pub(crate) type PoolSlot<'a> = (&'a Arc<AtomicUsize>, usize, Arc<dyn Fn() + Send + Sync>);
+
+/// One more of `count`, if under `limit`.
+fn take(count: &AtomicUsize, limit: usize) -> bool {
+    let mut current = count.load(Ordering::SeqCst);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match count.compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
     }
 }
 
 struct Reservation {
     count: Arc<AtomicUsize>,
     released: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// A shared pool's slot, and what to run when it comes back.
+    #[allow(clippy::type_complexity)]
+    pool: Option<(Arc<AtomicUsize>, Arc<dyn Fn() + Send + Sync>)>,
 }
 
 impl std::fmt::Debug for Reservation {
@@ -110,6 +148,10 @@ impl std::fmt::Debug for Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
+        if let Some((used, back)) = &self.pool {
+            used.fetch_sub(1, Ordering::SeqCst);
+            back();
+        }
         if let Some(released) = &self.released {
             released();
         }

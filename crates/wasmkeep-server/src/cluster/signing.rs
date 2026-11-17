@@ -260,6 +260,79 @@ pub(super) fn signature(
     hex
 }
 
+/// Names the node that sent a signed hop (ADR 0038, section 5): `NODE
+/// MAC`, the MAC binding the node id to the hop's own signature (the last
+/// field of its [`INTERNAL`] or [`ADMITTED`] value) under the cluster
+/// secret. A header of its own rather than a line of the signature: a node
+/// of an older version ignores it and still verifies the hop, and a node
+/// of this version verifies both.
+pub(crate) const SENDER: &str = "x-wasmkeep-sender";
+
+/// The [`SENDER`] value for `sender`, of a hop of `kind` (`internal` or
+/// `admitted`) whose own signature ends with `primary` (hex).
+pub(crate) fn sender_value(secret: &str, kind: &str, primary: &str, sender: &str) -> String {
+    format!("{sender} {}", sender_mac(secret, kind, primary, sender))
+}
+
+fn sender_mac(secret: &str, kind: &str, primary: &str, sender: &str) -> String {
+    use std::fmt::Write as _;
+    let msg = format!("wasmkeep-sender v1\n{kind}\n{primary}\n{sender}\n");
+    let mut hex = String::with_capacity(64);
+    for b in hmac_sha256(secret.as_bytes(), msg.as_bytes()) {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// The node id a [`SENDER`] value names, unauthenticated: for matching it
+/// against a connection's pin before the hop's signature is checked.
+pub(crate) fn sender_named(value: &str) -> Option<&str> {
+    let (node, _) = value.split_once(' ')?;
+    wasmkeep_cluster::membership::validate_node_id(node)
+        .is_ok()
+        .then_some(node)
+}
+
+/// The node a [`SENDER`] value names, if it binds that node to the hop
+/// whose own signature ends with `primary`.
+pub(crate) fn verify_sender(
+    secret: &str,
+    kind: &str,
+    primary: &str,
+    value: &str,
+) -> Option<String> {
+    let node = sender_named(value)?;
+    let (_, mac) = value.split_once(' ')?;
+    let expected = sender_mac(secret, kind, primary, node);
+    constant_time_eq(mac.as_bytes(), expected.as_bytes()).then(|| node.to_owned())
+}
+
+/// Whether the connection a hop came on (`peer`, on the cluster port) is
+/// the one its [`SENDER`] names (ADR 0038, section 5): that node's own
+/// live heartbeat publishes the pin presented. A hop without a sender (a
+/// node of an older version) or over plain HTTP (`None`) passes here; a
+/// sender named twice does not.
+pub(crate) fn sender_presented(
+    headers: &hyper::HeaderMap,
+    peer: Option<&crate::http::ClusterPeer>,
+) -> bool {
+    let Some(peer) = peer else {
+        return true;
+    };
+    let mut values = headers.get_all(SENDER).iter();
+    let Some(first) = values.next() else {
+        return true;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    first
+        .to_str()
+        .ok()
+        .and_then(sender_named)
+        .is_some_and(|node| peer.publishes(node))
+}
+
 /// HMAC-SHA256 (RFC 2104) over `sha2`.
 pub(super) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
