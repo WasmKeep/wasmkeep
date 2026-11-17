@@ -9,6 +9,15 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Actor SQL/export verification:** apply SQLite authorization, schema checks,
+  and execution deadlines before verification queries; reject hostile host
+  metadata views and run verification off the async executor.
+
+- **Local inspector:** `wasmkeep inspect --app TENANT/APP` serves an embedded,
+  authenticated loopback page for bucket status, class and actor listings,
+  retained history and constrained read-only SQL. No node endpoint or bucket
+  writes. See the [inspector guide](docs/inspector.md).
+
 - **A React quickstart:** `examples/react-todos` is a TypeScript actor
   and a React + Vite page over one typed contract, with Vite proxying to
   `wasmkeep dev` and the built page deployed as static assets

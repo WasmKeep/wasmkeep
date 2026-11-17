@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>WasmKeep inspector</title>
+<style>
+:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{max-width:1100px;margin:2rem auto;padding:0 1rem}h1,h2{line-height:1.2}section{border:1px solid #8888;border-radius:.5rem;padding:1rem;margin:1rem 0}label{display:block;font-weight:600;margin-top:.6rem}button,select,textarea,input{font:inherit;padding:.5rem;max-width:100%}button{cursor:pointer;margin:.4rem .4rem .4rem 0}button:disabled{cursor:default}textarea{box-sizing:border-box;width:100%;min-height:7rem}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:28rem;overflow:auto} :focus-visible{outline:3px solid #3688ec;outline-offset:3px}#message{min-height:1.5rem}svg{width:1.2rem;height:1.2rem;vertical-align:middle}table{border-collapse:collapse}th,td{border:1px solid #8888;text-align:left;padding:.4rem;white-space:pre-wrap;overflow-wrap:anywhere}.scroll{overflow:auto;max-height:35rem}.note{max-width:85ch}
+</style>
+<body><main><h1>WasmKeep inspector</h1><p class="note">Read-only bucket view. No node is contacted or actor awakened. Reads can include unacknowledged uploads; owner hints are not proof of a settled head. Listings can change between pages.</p>
+<p id="message" role="status" aria-live="polite"></p>
+<section aria-labelledby="cluster-title"><h2 id="cluster-title">Cluster status</h2><button id="refresh"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2 7M20 4v7h-7" fill="none" stroke="currentColor" stroke-width="2"/></svg> Refresh status</button><pre id="status" tabindex="0" aria-label="Nodes, processes and apps"></pre></section>
+<section aria-labelledby="actors-title"><h2 id="actors-title">Classes and actors</h2><label for="classes">Class</label><select id="classes"><option value="">Select a class</option></select><button id="classes-next" disabled>More classes</button><label for="actors">Actor (encoded bucket name)</label><select id="actors"><option value="">Select an actor</option></select><button id="actors-next" disabled>More actors</button><button id="history">Read actor history</button><pre id="details" tabindex="0" aria-label="Actor head, history and recent segments"></pre></section>
+<section aria-labelledby="sql-title"><h2 id="sql-title">Read-only SQL</h2><p>One statement against a verified private copy of the selected actor. Writes, host tables, schema tables and PRAGMAs are refused. Limits: 5 seconds or 10 million VM instructions; 10,000 rows; 16 MiB of results; 1 MiB per value. Replay limit: 2 GiB. Integers are displayed as decimal strings to preserve precision.</p><label for="sql">SQL statement</label><textarea id="sql" spellcheck="false">SELECT 1</textarea><button id="query">Run read-only query</button><pre id="query-head" tabindex="0" aria-label="Query head"></pre><div class="scroll" tabindex="0" aria-label="Query results"><table id="results"></table></div></section></main>
+<script>
+'use strict';
+let bootstrap=new URL(location.href).searchParams.get('token');
+history.replaceState(null,'','/');
+let bearer=null;
+async function authenticate(){const res=await fetch('/bootstrap',{method:'POST',credentials:'omit',headers:{Authorization:'Bearer '+bootstrap},cache:'no-store'});bootstrap=null;if(!res.ok)throw new Error(await res.text());bearer=(await res.json()).bearer}
+const el=id=>document.getElementById(id);
+let classNext=null,actorNext=null,busy=false;
+async function api(input){const res=await fetch('/api',{method:'POST',credentials:'omit',headers:{'Content-Type':'application/json',Authorization:'Bearer '+bearer},body:JSON.stringify(input),cache:'no-store'});if(!res.ok)throw new Error(await res.text());return res.json()}
+async function task(fn){if(busy)return;busy=true;el('message').textContent='Reading from the bucket…';try{await fn();el('message').textContent='Read completed.'}catch(e){el('message').textContent=e.message}finally{busy=false}}
+function options(id,names,reset){const select=el(id);if(reset)select.replaceChildren(new Option(id==='classes'?'Select a class':'Select an actor',''));for(const name of names)select.add(new Option(name,name))}
+async function classes(more=false){const p=await api({op:'classes',after:more?classNext:null});options('classes',p.items,!more);classNext=p.next;el('classes-next').disabled=!p.next}
+async function actors(more=false){if(!el('classes').value)return;const p=await api({op:'actors',class:el('classes').value,after:more?actorNext:null});options('actors',p.items,!more);actorNext=p.next;el('actors-next').disabled=!p.next}
+function selected(){const cls=el('classes').value,actor=el('actors').value;if(!cls||!actor)throw new Error('Select a class and an actor first.');return {class:cls,actor}}
+async function status(){el('status').textContent=JSON.stringify(await api({op:'status'}),null,2)}
+el('refresh').onclick=()=>task(status);
+el('classes-next').onclick=()=>task(()=>classes(true));
+el('actors-next').onclick=()=>task(()=>actors(true));
+el('classes').onchange=()=>task(async()=>{options('actors',[],true);el('details').textContent='';el('results').replaceChildren();await actors()});
+el('history').onclick=()=>task(async()=>{el('details').textContent=JSON.stringify(await api({op:'history',...selected()}),null,2)});
+el('query').onclick=()=>task(async()=>{el('results').replaceChildren();el('query-head').textContent='';const result=await api({op:'sql',...selected(),sql:el('sql').value});el('query-head').textContent=JSON.stringify(result.head,null,2);const head=document.createElement('thead'),hr=document.createElement('tr');for(const col of result.columns){const th=document.createElement('th');th.scope='col';th.textContent=col;hr.append(th)}head.append(hr);const body=document.createElement('tbody');for(const row of result.rows){const tr=document.createElement('tr');for(const value of row){const td=document.createElement('td');td.textContent=value===null?'NULL':typeof value==='object'?JSON.stringify(value):String(value);tr.append(td)}body.append(tr)}el('results').append(head,body)});
+task(async()=>{await authenticate();await status();await classes()});
+</script></body></html>

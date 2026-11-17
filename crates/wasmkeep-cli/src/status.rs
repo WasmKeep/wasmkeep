@@ -5,11 +5,14 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use object_store::ObjectStore;
+#[cfg(test)]
+use object_store::ObjectStoreExt;
 use object_store::path::Path as StorePath;
-use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::{Value, json};
 use wasmkeep_cluster::membership::{self, DrainState, Load, NodeInfo};
 use wasmkeep_cluster::node_lease::NodeState;
+#[cfg(test)]
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
 use wasmkeep_server::apps::Current;
 
@@ -125,10 +128,58 @@ pub(crate) async fn read(
     now_ms: u64,
     horizon_ms: u64,
 ) -> anyhow::Result<Report> {
-    let heartbeats = ObjectStoreBucket::new(Arc::clone(&store), prefix);
-    let nodes = membership::all_heartbeats(&heartbeats)
-        .await
-        .map_err(|e| anyhow::anyhow!("listing the heartbeats in {bucket}: {e}"))?
+    read_with_limit(store, prefix, bucket, now_ms, horizon_ms, None).await
+}
+
+/// Inspector-only status read with bounded listings.
+pub(crate) async fn read_bounded(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    bucket: &str,
+    now_ms: u64,
+    horizon_ms: u64,
+    max: usize,
+) -> anyhow::Result<Report> {
+    read_with_limit(store, prefix, bucket, now_ms, horizon_ms, Some(max)).await
+}
+
+async fn list_objects(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    max: Option<usize>,
+) -> Result<
+    std::collections::BTreeMap<String, object_store::ObjectMeta>,
+    wasmkeep_server::history::Error,
+> {
+    match max {
+        Some(max) => wasmkeep_server::history::list_objects_bounded(store, prefix, max).await,
+        None => wasmkeep_server::history::list_objects(store, prefix).await,
+    }
+}
+
+async fn read_with_limit(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    bucket: &str,
+    now_ms: u64,
+    horizon_ms: u64,
+    max: Option<usize>,
+) -> anyhow::Result<Report> {
+    let node_prefix = format!("{}/nodes", prefix.trim_end_matches('/'))
+        .trim_start_matches('/')
+        .to_owned();
+    let mut heartbeats = Vec::new();
+    for (key, _) in list_objects(&store, &node_prefix, max).await? {
+        let body = metadata(&store, &StorePath::from(format!("{node_prefix}/{key}"))).await?;
+        if let Some(info) = NodeInfo::decode(&body)
+            && key == info.id
+            && wasmkeep_cluster::membership::validate_node_id(&info.id).is_ok()
+        {
+            heartbeats.push(info);
+        }
+    }
+    heartbeats.sort_by(|a, b| a.id.cmp(&b.id));
+    let nodes = heartbeats
         .into_iter()
         .map(|info| Node {
             age_ms: now_ms.saturating_sub(info.written_at_ms),
@@ -142,72 +193,53 @@ pub(crate) async fn read(
         read_at_ms: now_ms,
         horizon_ms,
         nodes,
-        apps: read_apps(&store, prefix, bucket).await?,
+        apps: read_apps(&store, prefix, bucket, max).await?,
     })
 }
 
-/// `apps/<tenant>/<app>/current` for every app, listing one level at a time
-/// (never the uploaded components), and its version's manifest.
+/// `apps/<tenant>/<app>/current` and its manifest, discovered with an optionally bounded
+/// streaming listing. Component bodies are never downloaded.
 async fn read_apps(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
-    bucket: &str,
+    _bucket: &str,
+    max: Option<usize>,
 ) -> anyhow::Result<Vec<App>> {
     let root = if prefix.is_empty() {
         StorePath::from("apps")
     } else {
         StorePath::from(format!("{prefix}/apps"))
     };
-    let listing_failed =
-        |e: object_store::Error| anyhow::anyhow!("listing the apps in {bucket}: {e}");
     let mut apps = Vec::new();
-    let tenants = store
-        .list_with_delimiter(Some(&root))
-        .await
-        .map_err(listing_failed)?;
-    for tenant in tenants.common_prefixes {
-        let names = store
-            .list_with_delimiter(Some(&tenant))
-            .await
-            .map_err(listing_failed)?;
-        for app in names.common_prefixes {
-            let (tenant_name, app_name) = (
-                tenant.filename().unwrap_or_default(),
-                app.filename().unwrap_or_default(),
-            );
-            let name = format!("{tenant_name}/{app_name}");
-            let current = match store.get(&app.clone().join("current")).await {
-                Ok(r) => match r.bytes().await {
-                    Ok(body) => Current::parse(&body)
-                        .map(Some)
-                        .ok_or_else(|| "unreadable current".to_owned()),
-                    Err(e) => Err(e.to_string()),
-                },
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e.to_string()),
-            };
-            let manifest = match &current {
-                Ok(Some(c)) => wasmkeep_server::apps::AppRef::new(
-                    Arc::clone(store),
-                    prefix,
-                    tenant_name,
-                    app_name,
-                )
-                .manifest(&c.version)
-                .await
-                .ok(),
-                _ => None,
-            };
-            let front = manifest.as_ref().map(|m| m.front.is_some());
-            let manifest_format = manifest.as_ref().map(|m| m.format_number());
-            apps.push(App {
-                name,
-                current,
-                front,
-                manifest_format,
-            });
-        }
+    let objects = list_objects(store, root.as_ref(), max).await?;
+    let names: std::collections::BTreeSet<_> = objects
+        .keys()
+        .filter_map(|key| {
+            let mut parts = key.split('/');
+            Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+        })
+        .collect();
+    for (tenant_name, app_name) in names {
+        let app = root
+            .clone()
+            .join(tenant_name.as_str())
+            .join(app_name.as_str());
+        let name = format!("{tenant_name}/{app_name}");
+        let current = current(store, &app).await.map_err(|e| e.to_string());
+        let manifest = match &current {
+            Ok(Some(c)) => manifest(store, &app, &c.version).await.ok(),
+            _ => None,
+        };
+        let front = manifest.as_ref().map(|m| m.front.is_some());
+        let manifest_format = manifest.as_ref().map(|m| m.format_number());
+        apps.push(App {
+            name,
+            current,
+            front,
+            manifest_format,
+        });
     }
+
     apps.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(apps)
 }
@@ -738,6 +770,7 @@ mod tests {
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(f)
@@ -1385,4 +1418,169 @@ mod tests {
         assert_eq!(age(3 * 3_600_000), "3h");
         assert_eq!(age(5 * 86_400_000), "5d");
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn oversized_current_is_reported() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from("apps/t/a/current"),
+            bytes::Bytes::from(vec![b'x'; (4 << 20) + 1]).into(),
+        )
+        .await
+        .unwrap();
+    let apps = read_apps(&store, "", "memory", None).await.unwrap();
+    assert!(apps[0].current.as_ref().unwrap_err().contains("cap"));
+}
+
+/// Bound headers and streamed bodies, including stores that understate length.
+pub(crate) async fn metadata(
+    store: &Arc<dyn ObjectStore>,
+    key: &StorePath,
+) -> anyhow::Result<bytes::Bytes> {
+    Ok(wasmkeep_server::history::get(store, key, None, 4 << 20).await?)
+}
+pub(crate) async fn current(
+    store: &Arc<dyn ObjectStore>,
+    app: &StorePath,
+) -> anyhow::Result<Option<Current>> {
+    match wasmkeep_server::history::get(store, &app.clone().join("current"), None, 4 << 20).await {
+        Ok(body) => Current::parse(&body)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("unreadable current")),
+        Err(wasmkeep_server::history::Error::Missing(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+pub(crate) async fn manifest(
+    store: &Arc<dyn ObjectStore>,
+    app: &StorePath,
+    version: &str,
+) -> anyhow::Result<wasmkeep_server::apps::Manifest> {
+    let body = metadata(store, &app.clone().join(version).join("manifest")).await?;
+    wasmkeep_server::apps::Manifest::parse(std::str::from_utf8(&body)?)
+        .ok_or_else(|| anyhow::anyhow!("unreadable manifest"))
+}
+
+#[cfg(test)]
+mod hostile_metadata {
+    use super::*;
+    #[derive(Debug)]
+    struct HugeMetadata {
+        inner: Arc<dyn ObjectStore>,
+    }
+    impl std::fmt::Display for HugeMetadata {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("huge metadata")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for HugeMetadata {
+        async fn put_opts(
+            &self,
+            _: &StorePath,
+            _: object_store::PutPayload,
+            _: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            panic!("source PUT")
+        }
+        async fn put_multipart_opts(
+            &self,
+            _: &StorePath,
+            _: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            panic!("source multipart")
+        }
+        async fn get_opts(
+            &self,
+            path: &StorePath,
+            opts: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let mut result = self.inner.get_opts(path, opts).await?;
+            result.meta.size = 8 << 30;
+            result.payload =
+                object_store::GetResultPayload::Stream(Box::pin(futures_util::stream::poll_fn(
+                    |_| panic!("oversized metadata body must never be polled"),
+                )));
+            Ok(result)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&StorePath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        fn delete_stream(
+            &self,
+            _: futures_util::stream::BoxStream<'static, object_store::Result<StorePath>>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<StorePath>> {
+            panic!("source DELETE")
+        }
+        async fn list_with_delimiter(
+            &self,
+            _: Option<&StorePath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            panic!("unexpected delimiter list")
+        }
+        async fn copy_opts(
+            &self,
+            _: &StorePath,
+            _: &StorePath,
+            _: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            panic!("source COPY")
+        }
+    }
+
+    #[tokio::test]
+    async fn huge_current_headers_are_refused_without_polling_body() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        inner
+            .put(
+                &StorePath::from("apps/t/a/current"),
+                bytes::Bytes::new().into(),
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(HugeMetadata { inner });
+        let apps = read_apps(&store, "", "memory", None).await.unwrap();
+        assert!(apps[0].current.as_ref().unwrap_err().contains("byte cap"));
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn large_app_listing_is_unbounded_except_for_inspector() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    for i in 0..10_001 {
+        store
+            .put(
+                &StorePath::from(format!("apps/t/a/v/{i}")),
+                bytes::Bytes::new().into(),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        read(store.clone(), "", "memory", 0, 0)
+            .await
+            .unwrap()
+            .apps
+            .len(),
+        1
+    );
+    let error = match read_bounded(store, "", "memory", 0, 0, 10_000).await {
+        Err(error) => error,
+        Ok(_) => panic!("inspector bound"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("listing exceeds 10000 object limit")
+    );
 }
