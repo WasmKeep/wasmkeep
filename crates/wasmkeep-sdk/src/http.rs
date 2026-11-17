@@ -46,6 +46,36 @@ pub fn respond_with(out: ResponseOutparam, response: &crate::actors::Response) {
     let _ = OutgoingBody::finish(outgoing, None);
 }
 
+/// Sends a complete response with the given headers, every pair as given
+/// and in order (repeats of a name, `Set-Cookie` among them, stay separate
+/// headers), and `content-type: text/plain; charset=utf-8` unless one is
+/// set. Headers the host would not accept are left out.
+pub fn respond_headers(
+    out: ResponseOutparam,
+    status: u16,
+    headers: &crate::headers::Headers,
+    body: &[u8],
+) {
+    let mut headers = headers.clone();
+    if !headers.contains("content-type") {
+        headers.set("content-type", "text/plain; charset=utf-8");
+    }
+    respond_with(
+        out,
+        &crate::actors::Response {
+            status,
+            headers: headers.into_pairs(),
+            body: body.to_vec(),
+        },
+    );
+}
+
+/// The headers of an incoming request in the order received, repeats
+/// included (a value that is not UTF-8 has its bad bytes replaced).
+pub fn request_headers(request: &IncomingRequest) -> crate::headers::Headers {
+    crate::headers::Headers::from_byte_pairs(request.headers().entries())
+}
+
 /// Reads the whole request body, up to `limit` bytes. `None` if the body
 /// was already consumed, could not be read, or is longer than `limit`.
 pub fn read_body(request: &IncomingRequest, limit: usize) -> Option<Vec<u8>> {
@@ -81,6 +111,9 @@ pub fn method_name(method: &Method) -> String {
 pub struct Fetched {
     /// The HTTP status.
     pub status: u16,
+    /// Every response header in the order received, repeats included (each
+    /// `Set-Cookie` is its own entry).
+    pub headers: crate::headers::Headers,
     /// The whole body, or its first `limit` bytes when it is longer (see
     /// [`fetch`]).
     pub body: Vec<u8>,
@@ -300,6 +333,7 @@ enum State {
         stream: wasip2::io::streams::InputStream,
         incoming: wasip2::http::types::IncomingBody,
         status: u16,
+        headers: crate::headers::Headers,
         body: Vec<u8>,
         response: wasip2::http::types::IncomingResponse,
         future: wasip2::http::types::FutureIncomingResponse,
@@ -308,6 +342,7 @@ enum State {
     Trailers {
         trailers: wasip2::http::types::FutureTrailers,
         status: u16,
+        headers: crate::headers::Headers,
         body: Vec<u8>,
         // Held only to drop after the trailers.
         #[allow(dead_code)]
@@ -503,6 +538,10 @@ fn advance(state: &mut State, url: &str, limit: usize) {
                     Ok(Ok(response)) => response,
                 };
                 let status = response.status();
+                let headers = {
+                    let fields = response.headers();
+                    crate::headers::Headers::from_byte_pairs(fields.entries())
+                };
                 let Ok(incoming) = response.consume() else {
                     drop(response);
                     *state = State::Done(Err(format!("{url}: response body already taken")));
@@ -525,6 +564,7 @@ fn advance(state: &mut State, url: &str, limit: usize) {
                     stream,
                     incoming,
                     status,
+                    headers,
                     body: Vec::new(),
                     response,
                     future,
@@ -550,12 +590,18 @@ fn advance(state: &mut State, url: &str, limit: usize) {
                         }
                     }
                 }
-                if let State::Body { status, body, .. } = state
+                if let State::Body {
+                    status,
+                    headers,
+                    body,
+                    ..
+                } = state
                     && !ended
                 {
                     // At the limit: the rest is dropped unread.
                     let fetched = Fetched {
                         status: *status,
+                        headers: std::mem::take(headers),
                         body: std::mem::take(body),
                     };
                     *state = State::Done(Ok(fetched));
@@ -566,6 +612,7 @@ fn advance(state: &mut State, url: &str, limit: usize) {
                         stream,
                         incoming,
                         status,
+                        headers,
                         body,
                         response,
                         future,
@@ -577,6 +624,7 @@ fn advance(state: &mut State, url: &str, limit: usize) {
                     *state = State::Trailers {
                         trailers: IncomingBody::finish(incoming),
                         status,
+                        headers,
                         body,
                         response,
                         future,
@@ -586,6 +634,7 @@ fn advance(state: &mut State, url: &str, limit: usize) {
             State::Trailers {
                 trailers,
                 status,
+                headers,
                 body,
                 ..
             } => {
@@ -593,6 +642,7 @@ fn advance(state: &mut State, url: &str, limit: usize) {
                 let result = match &got {
                     Ok(Ok(_)) => Ok(Fetched {
                         status: *status,
+                        headers: std::mem::take(headers),
                         body: std::mem::take(body),
                     }),
                     Ok(Err(code)) => Err(format!("{url}: incomplete body: {code:?}")),

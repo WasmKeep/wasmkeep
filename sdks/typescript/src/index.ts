@@ -187,12 +187,14 @@ export {
   caller,
   host,
   json,
+  HeaderList,
   parseCaller,
   scheme,
   unavailable,
   type ActorRequest,
   type ActorResponse,
   type Caller,
+  type HeadersInit,
 } from "./request";
 
 /** Typed operation contracts, codecs, the structured error envelope and

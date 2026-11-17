@@ -98,6 +98,15 @@ bytes, having read at most `limit + 1` of it: check a size this way, as a
 chunked body has no `Content-Length` to check first
 (`const body = req.bytes(1000); if (body === undefined) return { status: 413 };`).
 
+Headers are ordered pairs and names compare without case. `req.fields`,
+`actors.call(...).fields` and `http.fetch(...).fields` are a `HeaderList`:
+`get(name)` is the first value, `getAll(name)` every value in order,
+`append`, `set` (replaces all) and `delete`. A response may add
+`headerList: [["set-cookie", "a=1"], ["set-cookie", "b=2"]]` (or give a
+list value in `headers`, for `actors.call` and `http.fetch`); `Set-Cookie`
+is never joined with a comma. The older `headers` records still hold one
+value per name.
+
 ## Typed actor clients
 
 Describe an operation once, in a file both sides import, and call it with

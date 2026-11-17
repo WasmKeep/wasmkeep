@@ -123,6 +123,7 @@ plain values.
 | `actors.call("class/name", method=, path=, headers=, body=)` | Calls another actor; returns a `CallResponse` (`status`, `headers`, `body`, `text()`, `json()`) |
 | `sockets.send(conn, data)`, `broadcast(data, except_conn=)`, `close(conn, code, reason)`, `connections()` | The actor's WebSockets (str is text, bytes binary) |
 | `Response(body, status, headers)`, `json(value, status)` | Full responses; a handler may also return str, bytes, a dict or a list |
+| `Headers`, `req.fields`, `CallResponse.fields` | Ordered header pairs, names compared without case: `get(name)` is the first value, `get_all(name)` every value in order, `append`, `set` (replaces all), `delete`. `req.header_list` and `CallResponse.header_list` are the raw pairs; a `Response` may take `header_list=[("set-cookie", "a=1"), ("set-cookie", "b=2")]`, and `actors.call` takes `headers=` as a dict (list values repeat), pairs or `Headers`. `Set-Cookie` is never joined |
 
 SQL values are `None`, `int`, `float`, `str` and `bytes` (`bool` binds as 0
 or 1). Failures raise `SqlError` (with `.kind`: syntax, constraint, bind, ...)

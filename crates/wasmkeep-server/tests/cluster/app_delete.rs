@@ -95,6 +95,7 @@ async fn app_node(
 
 fn ask() -> DeleteApp {
     DeleteApp {
+        resume: None,
         wait: Duration::from_secs(30),
         force: false,
         who: "test".into(),

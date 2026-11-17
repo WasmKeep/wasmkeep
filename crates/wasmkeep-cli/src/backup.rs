@@ -97,6 +97,9 @@ enum DeployChoice {
 
 #[derive(Debug, Args)]
 pub struct Restore {
+    /// Resume this operation ID without submitting another request.
+    #[arg(long, conflicts_with = "abort")]
+    resume: Option<String>,
     #[arg(long)]
     from: String,
     #[arg(long)]

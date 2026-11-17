@@ -116,6 +116,9 @@ struct AppFormatArgs {
 
 #[derive(Debug, Args)]
 struct AppDeleteArgs {
+    /// Resume this operation ID without submitting another request.
+    #[arg(long)]
+    resume: Option<String>,
     /// The app, TENANT/APP.
     #[arg(long, value_parser = parse_app)]
     app: (String, String),
@@ -164,6 +167,9 @@ enum ActorCommand {
 
 #[derive(Debug, Args)]
 struct DeleteArgs {
+    /// Resume this operation ID without submitting another request.
+    #[arg(long)]
+    resume: Option<String>,
     /// The actor: CLASS/NAME with `--app`, or `default/CLASS/NAME` for
     /// the implicit app `default/default` (the name may contain `/`).
     actor: String,
@@ -2604,10 +2610,13 @@ fn actor_delete_on(
         eprintln!("warning: {warning}");
     }
     let root = wasmkeep_cluster::state_root::StateRoot::new("", tenant.as_str(), app.as_str());
-    let key = control::checked_delete_key(&root, &class, &name, &control::new_request_id())?;
+    let id = args.resume.clone().unwrap_or_else(control::new_request_id);
+    let key = control::checked_delete_key(&root, &class, &name, &id)?;
     let (store, prefix) = open()?;
     check_layout(&args.bucket, &store, &prefix, &tenant)?;
-    refuse_deleted(&store, &prefix, &tenant, &app)?;
+    if args.resume.is_none() {
+        refuse_deleted(&store, &prefix, &tenant, &app)?;
+    }
     let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
     let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -2615,25 +2624,29 @@ fn actor_delete_on(
         .build()?;
     let actor = format!("{class}/{name} of {tenant}/{app}");
     let history = wasmkeep_server::history_folder(&root, &class, &name);
-    anyhow::ensure!(
-        !rt.block_on(keys.list_keys(&history))?.is_empty(),
-        "no such actor: {actor} has nothing in the bucket (nothing was written)"
-    );
     // Listed by its folder: a listing of a key itself shows only what is
     // under it.
     let folder = format!("{}/", key.rsplit_once('/').map_or("", |(f, _)| f));
     let listed = |keys: &wasmkeep_cluster::object_store::ObjectStoreBucket| {
         rt.block_on(keys.list_keys(&folder))
     };
-    rt.block_on(keys.put_empty(&key))?;
-    // Deleted meanwhile (ADR 0028): the request is taken back.
-    if let Err(e) = refuse_deleted(&app_store, &app_prefix, &tenant, &app) {
-        let _ = rt.block_on(keys.delete(&key));
-        return Err(e);
+    if args.resume.is_none() {
+        anyhow::ensure!(
+            !rt.block_on(keys.list_keys(&history))?.is_empty(),
+            "no such actor: {actor} has nothing in the bucket (nothing was written)"
+        );
+        rt.block_on(keys.put_empty(&key))?;
+
+        // Deleted meanwhile (ADR 0028): the request is taken back.
+        if let Err(e) = refuse_deleted(&app_store, &app_prefix, &tenant, &app) {
+            let _ = rt.block_on(keys.delete(&key));
+            return Err(e);
+        }
+        // Nodes list the requests when `control/changed` changes (ADR 0014,
+        // amendment of 2026-11-14).
+        announce_intent(&rt, &keys);
     }
-    // Nodes list the requests when `control/changed` changes (ADR 0014,
-    // amendment of 2026-11-14).
-    announce_intent(&rt, &keys);
+    println!("Operation ID: {id}");
     let written = listed(&keys)?
         .into_iter()
         .find(|(k, _)| *k == key)
@@ -2647,11 +2660,12 @@ fn actor_delete_on(
             )
         },
     );
-    if args.no_wait {
+    if args.no_wait && args.resume.is_none() {
         println!("Asked the cluster to delete {actor} (the request expires at {until}).");
         return Ok(());
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.wait);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(if args.no_wait { 0 } else { args.wait });
     loop {
         // The node that carried the request out writes its outcome beside
         // it before deleting it: the key going away alone (it expires)
@@ -2659,14 +2673,16 @@ fn actor_delete_on(
         let now = listed(&keys)?;
         let outcome = now
             .iter()
-            .find_map(|(k, _)| control::DeleteOutcome::of(k, &key).map(|o| (k.clone(), o)));
-        if let Some((outcome_key, outcome)) = outcome {
-            let _ = rt.block_on(keys.delete(&outcome_key));
+            .find_map(|(k, _)| control::DeleteOutcome::of(k, &key));
+        if let Some(outcome) = outcome {
             match outcome {
                 control::DeleteOutcome::Done => {
                     println!("Deleted {actor}: the delete is recorded in the bucket.");
                     return Ok(());
                 }
+                control::DeleteOutcome::Superseded => anyhow::bail!(
+                    "delete {id} superseded: target incarnation changed; nothing deleted"
+                ),
                 control::DeleteOutcome::Absent => anyhow::bail!(
                     "no such actor: the node found nothing for {actor}; nothing was deleted"
                 ),
@@ -2681,7 +2697,7 @@ fn actor_delete_on(
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "requested; {actor} is not deleted yet after {} s. The cluster keeps trying \
-                 until {until}; running this again writes a new request and waits for it (a \
+                 until {until}; resume with --resume {id} (a \
                  node of the app must serve class {class} and be able to hold the actor)",
                 args.wait
             );

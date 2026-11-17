@@ -310,3 +310,37 @@ async fn a_batch_reaches_callees_on_two_nodes_at_once() {
         r.body
     );
 }
+
+/// Two `Set-Cookie` headers of an actor's answer reach the client as two
+/// headers, in order and with the comma of an `Expires` intact, through the
+/// front passing the answer on (the actor and the front are built from the
+/// SDK).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_cookies_survive_actor_to_front_to_client() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let da = tempfile::tempdir().unwrap();
+    let a = front_node("a", da.path(), &store, true).await;
+    settle().await;
+    let r = front_get(
+        a.addr,
+        &format!("{}&copy", front_call("c", "GET", "/cookies")),
+    )
+    .await;
+    assert_eq!((r.status, r.body.trim()), (200, "cookies"), "{}", r.body);
+    let cookies: Vec<String> = r
+        .head
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("set-cookie")
+                .then(|| v.trim().to_owned())
+        })
+        .collect();
+    assert_eq!(
+        cookies,
+        ["a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT", "b=2"],
+        "{}",
+        r.head
+    );
+    assert_eq!(r.header("x-one").as_deref(), Some("1"), "{}", r.head);
+}

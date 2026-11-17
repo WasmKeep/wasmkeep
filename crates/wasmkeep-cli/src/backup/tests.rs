@@ -1450,6 +1450,7 @@ async fn fix4_range_verification_follows_generation_branches() {
 
 fn restore_args(id: &str, in_place: bool) -> Restore {
     Restore {
+        resume: None,
         from: "s3://destination".into(),
         run: Some(id.into()),
         app: ("acme".into(), "shop".into()),
@@ -2204,6 +2205,7 @@ async fn review5_delete_and_recreate_refuse_restore() {
     let app = wasmkeep_server::apps::AppRef::new(f.source.clone(), "", "acme", "shop");
     assert!(app.recreate(std::time::Duration::ZERO).await.is_err());
     let args = wasmkeep_server::apps::DeleteApp {
+        resume: None,
         wait: std::time::Duration::ZERO,
         force: true,
         who: "test".into(),
@@ -3497,4 +3499,125 @@ async fn prune_waits_for_delayed_delete_before_finalizing() {
     prune::markers(&f.dest, "").await.unwrap();
     assert!(load(&f.dest, "", &old).await.is_err());
     verify(&f.dest, "", &latest, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn stable_id_backup_restore_timeout_finish_recreate_resume() {
+    let f = Fixture::new().await;
+    let run = f.create().await;
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    let mut args = restore_args(&run, false);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            restore::execute(
+                &args,
+                &f.dest,
+                "",
+                &target,
+                "",
+                std::time::Duration::from_secs(10)
+            )
+        )
+        .await
+        .is_err()
+    );
+    let journal: Value = serde_json::from_slice(
+        &read(&target, "apps/acme/shop/restoring", META_MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let id = text(&journal, "nonce").unwrap().to_owned();
+    args.resume = Some("deadbeefdeadbeef".into());
+    assert!(
+        restore::execute(&args, &f.dest, "", &target, "", std::time::Duration::ZERO)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &read(&target, "apps/acme/shop/restoring", META_MAX)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        journal
+    );
+    args.resume = Some(id.clone());
+    // Simulate operator recovery of the stopped CLI's exclusive lock.
+    put(
+        &target,
+        "apps/acme/shop/restore-lock",
+        b"unlocked recovery".to_vec(),
+        true,
+    )
+    .await
+    .unwrap();
+    restore::execute(&args, &f.dest, "", &target, "", std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    for (_, meta) in list_bounded(&target, "state/acme/shop/").await.unwrap() {
+        target.delete(&meta.location).await.unwrap();
+    }
+    put(
+        &target,
+        "state/acme/shop/new-incarnation",
+        b"keep".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    args.resume = Some(id);
+    for _ in 0..2 {
+        restore::execute(&args, &f.dest, "", &target, "", std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&target, "state/acme/shop/new-incarnation", MAX)
+                .await
+                .unwrap(),
+            b"keep"
+        );
+        assert!(
+            optional(&target, "apps/acme/shop/restoring")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    put(
+        &target,
+        "apps/acme/shop/restored",
+        b"different nonce".to_vec(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        restore::execute(&args, &f.dest, "", &target, "", std::time::Duration::ZERO)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        read(&target, "state/acme/shop/new-incarnation", MAX)
+            .await
+            .unwrap(),
+        b"keep"
+    );
+}
+
+#[tokio::test]
+async fn backup_restore_unknown_resume_files_nothing() {
+    let f = Fixture::new().await;
+    let run = f.create().await;
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    let mut args = restore_args(&run, false);
+    args.resume = Some("0123456789abcdef".into());
+    assert!(
+        restore::execute(&args, &f.dest, "", &target, "", std::time::Duration::ZERO)
+            .await
+            .is_err()
+    );
+    assert!(list_bounded(&target, "").await.unwrap().is_empty());
 }

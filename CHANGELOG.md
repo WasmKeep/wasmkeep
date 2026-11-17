@@ -7,6 +7,44 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
+## Unreleased
+
+- Actor delete, app delete, actor restore and backup restore print operation IDs
+  before waiting and accept `--resume ID`, which never files a new request.
+  Actor outcomes are read without consuming them and last for the request TTL;
+  after expiry the ID is unknown and nothing is filed. App delete matches the
+  tombstone ID; backup restore matches the journal nonce or completed `restored`
+  marker. Pending actor deletes superseded by a later restore or a delete at
+  or after their bucket time leave the replacement intact. A 0.5.0 CLI reports
+  a superseded delete as dropped (fails closed); a 0.5.0 node neither recognises
+  nor expires `.superseded`. Bindings, capability negotiation and durable
+  receipts move to 0.6.0. See [operation recovery](docs/operations.md).
+
+- **Activation deadlines (0.5.1):** an actor's activation (instantiating
+  its component and running its start function) runs under the same wall,
+  lease and replication guard as an event; cut, it waits for its pending
+  database work, gives up its hold and answers 503 with `Retry-After`. A
+  front's validation runs under the front's wall budget. No new setting.
+
+- **Lossless HTTP headers in the guest SDKs (0.5.1):** the TypeScript,
+  Python and Rust SDKs keep headers as ordered (name, value) pairs, compare
+  names without case, and never join `Set-Cookie`. `get(name)` is the first
+  value, `getAll(name)` (`get_all`) every value in order, `append` adds and
+  `set` replaces all: `HeaderList` (TypeScript: `req.fields`,
+  `actors.call(...).fields`, `http.fetch(...).fields`), `Headers` (Python:
+  `req.fields`, `CallResponse.fields`, `req.header_list`) and
+  `wasmkeep_sdk::headers::Headers` (Rust). A response sets repeats with
+  `headerList` (TypeScript) or `header_list=` (Python); `actors.call` and
+  `http.fetch` accept a list value in a record, pairs or the new type;
+  `respond_headers` and `request_headers` are new in Rust. No WIT change.
+  Behaviour that changes: TypeScript's `http.fetch(...).headers` no longer
+  joins `Set-Cookie` values with `, ` (it holds the first; read all through
+  `fields`); a TypeScript response whose headers repeat `Content-Type` in
+  another case no longer gets a second default one; a TypeScript lookup in a
+  request without a header list is now case-insensitive. In Rust, `Fetched`
+  gains a public `headers` field (a struct literal of it needs the field).
+  The older `headers` dicts and records still hold one value per name.
+
 ## 0.5.0
 
 **Batched writes, data access and per-node limits.** A class can batch

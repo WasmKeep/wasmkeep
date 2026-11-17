@@ -9,6 +9,8 @@ import { CallError } from "./errors";
 
 export { CallError } from "./errors";
 
+import { HeaderList, pairsOf, type HeadersInit } from "./headers";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -16,14 +18,22 @@ const decoder = new TextDecoder();
 export interface CallRequest {
   method?: string;
   path?: string;
-  headers?: Record<string, string>;
+  /** A record (a list value sends one header per value), pairs in order, or a
+   * {@link HeaderList}; repeats and order are sent as given. */
+  headers?: HeadersInit;
   body?: string | Uint8Array;
 }
 
 /** Another actor's answer. */
 export interface CallResponse {
   status: number;
+  /** By name, lower case or as sent; of a repeated header, the last value.
+   * Use `fields` to read them all. */
   headers: Record<string, string>;
+  /** Every header in the order received, repeats included. */
+  headerList: [string, string][];
+  /** The same, with `get`, `getAll` (every `Set-Cookie`) and a lookup without case. */
+  fields: HeaderList;
   body: Uint8Array;
   text(): string;
 }
@@ -94,7 +104,7 @@ function lower(request: CallRequest): wkActors.Request {
   return {
     method: request.method ?? "GET",
     path: request.path ?? "/",
-    headers: Object.entries(request.headers ?? {}),
+    headers: pairsOf(request.headers),
     body,
   };
 }
@@ -103,6 +113,8 @@ function lift(r: wkActors.Response): CallResponse {
   return {
     status: r.status,
     headers: Object.fromEntries(r.headers),
+    headerList: r.headers.map(([n, v]) => [n, v]),
+    fields: new HeaderList(r.headers),
     body: r.body,
     text: () => decoder.decode(r.body),
   };

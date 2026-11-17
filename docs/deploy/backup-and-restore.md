@@ -631,3 +631,7 @@ once when it starts. They exclude the backup CLI, source nodes, fixture
 validation downloads and cleanup. They are **not** total billed S3 requests
 or a measurement of the entire backup cost. Fleet timing and full request
 cost still require a real-bucket run.
+
+Whole-app restores print their journal's operation ID before waiting. Use
+`--resume ID` with the same restore options to recover its status or continue
+its journal; see [operation recovery](../operations.md).

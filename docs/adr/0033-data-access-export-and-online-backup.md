@@ -1366,3 +1366,17 @@ One PR each, with tests that fail before it:
    alarm isolation still requires an operator firewall.
 10. The change feed, after its open questions are answered in a record
     of its own.
+
+## Restore operation recovery
+
+Actor restore uses its request ID; whole-app restore uses the journal nonce.
+Both print the ID before waiting and accept `--resume`. A resume never files
+a new request. Actor outcomes remain at the existing adjacent keys without
+being consumed and expire after the request TTL; after expiry the ID is
+unknown and nothing is filed.
+
+Whole-app restore matches an active journal's nonce and follows its existing
+exclusive-lock recovery rules. With no journal, it answers done only if
+`apps/<tenant>/<app>/restored` holds that nonce. There are no durable completion
+receipts in this release; those move to 0.6.0.
+See [operation recovery](../operations.md).

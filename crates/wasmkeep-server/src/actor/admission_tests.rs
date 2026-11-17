@@ -698,3 +698,261 @@ async fn batched_capture_is_enabled_after_a_cancelled_database_step() {
         .unwrap();
     assert_eq!(enabled, (Ok(()), true));
 }
+
+async fn activation_deadline(lease_lapse: bool) {
+    use super::*;
+    use wasmkeep_runtime::{Runtime, RuntimeConfig};
+    let data = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
+    let wasm = wat::parse_str(include_str!("../../tests/support/activation.wat")).unwrap();
+    let component = runtime.compile(&wasm).unwrap();
+    let pre = actor_linker(&runtime)
+        .unwrap()
+        .instantiate_pre(&component)
+        .unwrap();
+    let mut config = ActorConfig::new(data.path());
+    config.mailbox.max_resident = 1;
+    config.mailbox.idle_timeout = Duration::from_secs(600);
+    config.wall_per_event = if lease_lapse {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_millis(50)
+    };
+    let service = ActorService::new(runtime, config, vec![]).unwrap();
+    // The start runs before export lookup; no lifecycle exports are needed.
+    service.inner.classes.write().unwrap().insert(
+        "test".into(),
+        Arc::new(ActorClass {
+            pre,
+            version: "timer".into(),
+            seq: 0,
+            rules: Arc::default(),
+            env: Arc::default(),
+            requires: Arc::default(),
+            warned: Arc::default(),
+            writes: crate::apps::Writes::Strict,
+        }),
+    );
+    let address = ActorAddress::new("default", "test", "timer").unwrap();
+    let cluster = if lease_lapse {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let mut config =
+            crate::cluster::ClusterConfig::new("activation", "http://activation", store);
+        config.heartbeat = Duration::from_millis(20);
+        config.lease = wasmkeep_cluster::lease::LeaseConfig::new(1_000, 200, 200, 100).unwrap();
+        let cluster =
+            Cluster::new(&config, &crate::StateRoot::new("", "default", "default")).unwrap();
+        cluster.identity().await.unwrap();
+        Some(cluster)
+    } else {
+        None
+    };
+    let hold = match &cluster {
+        Some(cluster) => Some(Held::new(
+            LeaseHold::acquire(cluster, &address).await.unwrap(),
+            crate::apps::Writes::Strict,
+        )),
+        None => None,
+    };
+    let (tx, rx) = oneshot::channel();
+    let (entered, ready) = oneshot::channel();
+    let job = service.inner.mailboxes.submit(&address, move |state| {
+        Box::pin(async move {
+            state.held = hold;
+            // With the database already open, activation first yields inside
+            // the guest's timer, so the lease ends during instantiation.
+            state.db = Some(
+                state.residency.retain(
+                    state
+                        .storage
+                        .open(state.address.class(), state.address.name())
+                        .unwrap(),
+                ),
+            );
+            entered.send(()).unwrap();
+            state
+                .request(
+                    hyper::Request::new(http_body_util::Empty::<bytes::Bytes>::new()),
+                    tx,
+                    Arc::from(Vec::new()),
+                )
+                .await;
+            assert!(state.live.is_none());
+            assert!(state.db.is_none());
+            assert!(state.held.is_none());
+        })
+    });
+    within(ready).await.unwrap();
+    if let Some(cluster) = &cluster {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(cluster.stop_node_lease(Duration::from_secs(1)).await);
+    }
+    let outcome = within(rx).await.unwrap();
+    match outcome {
+        Outcome::Refused(why) => {
+            assert!(why.contains("activation"), "{why}");
+            assert!(
+                why.contains(if lease_lapse { "lease" } else { "wall-clock" }),
+                "{why}"
+            );
+        }
+        _ => panic!("activation must return a retryable refusal"),
+    }
+    within(job).await.unwrap();
+    within(async {
+        while service.inner.mailboxes.contains(&address) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(service.inner.mailboxes.resident(), 0);
+    let next = ActorAddress::new("default", "test", "next").unwrap();
+    within(
+        service
+            .inner
+            .mailboxes
+            .submit(&next, |_| Box::pin(async {})),
+    )
+    .await
+    .unwrap();
+    if let Some(cluster) = cluster {
+        assert!(cluster.releases_done(Duration::from_secs(2)).await);
+        assert!(!cluster.holds_here(&address));
+    }
+}
+
+#[tokio::test]
+async fn activation_deadline_frees_mailbox_and_slot() {
+    activation_deadline(false).await;
+}
+
+#[tokio::test]
+async fn activation_deadline_lease_lapse_frees_mailbox_and_slot() {
+    activation_deadline(true).await;
+}
+
+/// A start function's blocking SQL worker can outlive its wall deadline.
+/// Keep ownership until that worker can no longer commit on the old node.
+#[tokio::test]
+async fn activation_deadline_drains_write_before_releasing_hold() {
+    use super::*;
+    use wasmkeep_runtime::{Runtime, RuntimeConfig};
+    let data = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
+    let component = runtime
+        .compile(
+            &wat::parse_str(
+                r#"
+        (component
+          (import "write" (func $write))
+          (core func $write (canon lower (func $write)))
+          (core module $m
+            (import "" "write" (func $write))
+            (func $start call $write)
+            (start $start))
+          (core instance (instantiate $m
+            (with "" (instance (export "write" (func $write)))))))
+    "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let (entered, ready) = oneshot::channel();
+    let (release, released) = mpsc::channel();
+    let gate = std::sync::Mutex::new(Some((entered, released)));
+    let mut linker = actor_linker(&runtime).unwrap();
+    linker
+        .root()
+        .func_wrap_async("write", move |mut store, (): ()| {
+            let (entered, released) = gate.lock().unwrap().take().unwrap();
+            Box::new(async move {
+                // Reach the database near the wall, then hold an INSERT's
+                // transaction open without burning CPU or depending on SQL speed.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                store
+                    .data_mut()
+                    .with_db(move |db| {
+                        db.exec("CREATE TABLE writes(v)", &[]).unwrap();
+                        db.exec("BEGIN IMMEDIATE", &[]).unwrap();
+                        db.exec("INSERT INTO writes VALUES (1)", &[]).unwrap();
+                        entered.send(()).unwrap();
+                        let _ = released.recv();
+                        db.exec("COMMIT", &[]).unwrap();
+                    })
+                    .await?;
+                Ok(())
+            })
+        })
+        .unwrap();
+    let pre = linker.instantiate_pre(&component).unwrap();
+    let mut config = ActorConfig::new(data.path());
+    config.mailbox.max_resident = 1;
+    config.wall_per_event = Duration::from_millis(200);
+    let service = ActorService::new(runtime, config, vec![]).unwrap();
+    service.inner.classes.write().unwrap().insert(
+        "test".into(),
+        Arc::new(ActorClass {
+            pre,
+            version: "write".into(),
+            seq: 0,
+            rules: Arc::default(),
+            env: Arc::default(),
+            requires: Arc::default(),
+            warned: Arc::default(),
+            writes: crate::apps::Writes::Strict,
+        }),
+    );
+    let address = ActorAddress::new("default", "test", "write").unwrap();
+    let config = crate::cluster::ClusterConfig::new(
+        "activation-write",
+        "http://activation-write",
+        Arc::new(object_store::memory::InMemory::new()),
+    );
+    let cluster = Cluster::new(&config, &crate::StateRoot::new("", "default", "default")).unwrap();
+    cluster.identity().await.unwrap();
+    let hold = Held::new(
+        LeaseHold::acquire(&cluster, &address).await.unwrap(),
+        crate::apps::Writes::Strict,
+    );
+    let job = service.inner.mailboxes.submit(&address, move |state| {
+        Box::pin(async move {
+            state.held = Some(hold);
+            let error = state.ensure_ready().await.unwrap_err();
+            assert!(
+                error.contains("activation") && error.contains("wall-clock"),
+                "{error}"
+            );
+            assert!(state.held.is_none());
+            state.storage.clone()
+        })
+    });
+    within(ready).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        cluster.holds_here(&address),
+        "ownership released while the INSERT worker can still commit"
+    );
+    release.send(()).unwrap();
+    let storage = within(job).await.unwrap();
+    assert!(cluster.releases_done(Duration::from_secs(2)).await);
+    assert!(!cluster.holds_here(&address));
+    within(async {
+        while service.inner.mailboxes.contains(&address) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(service.inner.mailboxes.resident(), 0);
+    assert!(!storage.is_open(&storage.db_path("test", "write")));
+    within(service.inner.mailboxes.submit(&address, |state| {
+        Box::pin(async move {
+            let mut db = state.storage.open("test", "write").unwrap();
+            assert_eq!(
+                db.query("SELECT v FROM writes", &[]).unwrap().values.len(),
+                1
+            );
+        })
+    }))
+    .await
+    .unwrap();
+}

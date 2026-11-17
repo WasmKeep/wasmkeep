@@ -28,6 +28,8 @@ that must survive in `storage`, not on `self`.
 import json as _json
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from .headers import Headers, HeadersInit, last_values, pairs_of, response_pairs
+
 # componentize-py generates these two modules into the component: they exist
 # there and nowhere else. Under plain CPython (`python -m wasmkeep build`, an
 # editor, a test runner) the package still imports, and whatever needs the
@@ -84,6 +86,7 @@ __all__ = [
     "ActorAddress",
     "CallError",
     "CallResponse",
+    "Headers",
     "Request",
     "Response",
     "SqlError",
@@ -215,9 +218,14 @@ class CallError(Exception):
 class CallResponse:
     """Another actor's answer."""
 
-    def __init__(self, status: int, headers: Dict[str, str], body: bytes):
+    def __init__(self, status: int, headers: Dict[str, str], body: bytes, header_list: Optional[List[Tuple[str, str]]] = None):
         self.status = status
+        # By name as sent; of a repeated header, the last value.
         self.headers = headers
+        # Every header in the order received, repeats included.
+        self.header_list: List[Tuple[str, str]] = list(header_list) if header_list is not None else list(headers.items())
+        # The same, with `get`, `get_all` (every Set-Cookie), without case.
+        self.fields = Headers(self.header_list)
         self.body = body
 
     def text(self) -> str:
@@ -259,21 +267,23 @@ class _Actors:
         address: str,
         method: str = "GET",
         path: str = "/",
-        headers: Optional[Dict[str, str]] = None,
+        headers: Optional[HeadersInit] = None,
         body: Union[str, bytes] = b"",
     ) -> CallResponse:
         """Calls actor `class/name` (same tenant) and waits for its
-        response. Other events to this actor wait meanwhile."""
+        response. Other events to this actor wait meanwhile. `headers` is a
+        dict (a list value sends one header per value), a list of pairs or a
+        `Headers`; repeats and order are sent as given."""
         if isinstance(body, str):
             body = body.encode()
-        request = _actors.Request(method, path, list((headers or {}).items()), body)
+        request = _actors.Request(method, path, pairs_of(headers), body)
         try:
             r = _actors.call(address, request)
         except Err as e:
             kind = _kebab(type(e.value).__name__)
             detail = getattr(e.value, "value", None) or ""
             raise CallError(kind, detail or kind, detail) from None
-        return CallResponse(r.status, dict(r.headers), bytes(r.body))
+        return CallResponse(r.status, last_values(r.headers), bytes(r.body), list(r.headers))
 
 
 actors = _Actors()
@@ -339,9 +349,14 @@ class Request:
             method.value if isinstance(method, Method_Other) else type(method).__name__.split("_", 1)[1].upper()
         )
         self.path: str = incoming.path_with_query() or "/"
-        self.headers: Dict[str, str] = {
-            k: v.decode(errors="replace") for k, v in incoming.headers().entries()
-        }
+        # Every header in the order received, repeats included.
+        self.header_list: List[Tuple[str, str]] = [
+            (k, v.decode(errors="replace")) for k, v in incoming.headers().entries()
+        ]
+        # By name; of a repeated header, the last value.
+        self.headers: Dict[str, str] = last_values(self.header_list)
+        # The same list, with `get`, `get_all` (every Set-Cookie), without case.
+        self.fields = Headers(self.header_list)
 
     def bytes(self) -> bytes:
         """The body, read on first use."""
@@ -364,11 +379,16 @@ class Response:
         self,
         body: Union[str, bytes] = b"",
         status: int = 200,
-        headers: Optional[Dict[str, str]] = None,
+        headers: Optional[HeadersInit] = None,
+        header_list: Optional[HeadersInit] = None,
     ):
         self.body = body
         self.status = status
+        # A dict (a list value is one header per value), pairs or `Headers`.
         self.headers = headers or {}
+        # More headers, sent after `headers`, repeats and order kept:
+        # `header_list=[("set-cookie", "a=1"), ("set-cookie", "b=2")]`.
+        self.header_list = header_list
 
 
 def json(value: Any, status: int = 200) -> Response:
@@ -391,6 +411,10 @@ def _read_all(incoming) -> bytes:
     return b"".join(chunks)
 
 
+def _response_fields(r: Response) -> List[Tuple[str, bytes]]:
+    return [(k, v.encode()) for k, v in response_pairs(r.headers, getattr(r, "header_list", None))]
+
+
 def _respond(out, response: Any) -> None:
     if isinstance(response, Response):
         r = response
@@ -401,9 +425,7 @@ def _respond(out, response: Any) -> None:
     else:
         r = Response(response)
     body = r.body.encode() if isinstance(r.body, str) else bytes(r.body)
-    headers = {"content-type": "text/plain; charset=utf-8"}
-    headers.update({k.lower(): v for k, v in r.headers.items()})
-    outgoing = OutgoingResponse(Fields.from_list([(k, v.encode()) for k, v in headers.items()]))
+    outgoing = OutgoingResponse(Fields.from_list(_response_fields(r)))
     outgoing.set_status_code(r.status)
     out_body = outgoing.body()
     ResponseOutparam.set(out, Ok(outgoing))
