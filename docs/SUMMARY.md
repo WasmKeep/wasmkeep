@@ -20,6 +20,7 @@
 - [Designing for hot actors](designing-for-hot-actors.md)
 - [Running a cluster](cluster.md)
 - [Exporting and querying an actor](actor-data-access.md)
+- [Querying the change feed with DuckDB](change-feed.md)
 - [The project file](project-file.md)
 - [When a node dies, and how it scales](failover-and-scaling.md)
 - [Key-value and queues](kv-and-queues.md)

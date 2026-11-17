@@ -698,3 +698,170 @@ async fn review_visible_types_survive_bucket_change() {
         Field::Double(2.0)
     );
 }
+
+#[tokio::test]
+async fn f5_schema_drift_views() {
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = fixture().await;
+    let args = args(out.path(), state.path());
+    assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+    let sql = std::fs::read_to_string(out.path().join("views.duckdb.sql")).unwrap();
+    assert!(sql.contains("CREATE OR REPLACE VIEW \"c_items_history\""));
+    replace_fixture_actor(&store, "CREATE TABLE items(Value, added, _wk_name); INSERT INTO items VALUES(2.5, 'new', 'app-name')", 1).await;
+    assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+    let sql = std::fs::read_to_string(out.path().join("views.duckdb.sql")).unwrap();
+    assert!(sql.contains("AS DOUBLE) AS \"value\""));
+    assert!(sql.contains("CAST(NULL AS VARCHAR) AS \"added\""));
+    assert!(sql.contains("\"_app_wk_name\""));
+    assert!(sql.contains("_wk_kind <> 'deleted'"));
+    assert!(sql.contains("max(_wk_seq)"));
+    let duckdb = std::process::Command::new("duckdb")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !duckdb {
+        eprintln!("DuckDB execution NOT RUN: offline duckdb binary unavailable; SQL shape checked");
+    }
+    fn query(sql: &str, query: &str) -> String {
+        use std::io::Write;
+        let mut child = std::process::Command::new("duckdb")
+            .args(["-csv", "-noheader", ":memory:"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{sql}\n{query}").as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    }
+    if duckdb {
+        assert_eq!(
+            query(
+                &sql,
+                "SELECT _wk_name, value, added, _app_wk_name FROM c_items ORDER BY _wk_name;"
+            ),
+            "a,2.5,new,app-name\nb,3.0,,\n"
+        );
+        assert_eq!(query(&sql, "SELECT count(*) FROM c_items_history;"), "3\n");
+    }
+    replace_fixture_actor(
+        &store,
+        "CREATE TABLE items(value); INSERT INTO items VALUES('text')",
+        1,
+    )
+    .await;
+    poll(&args, &store, "").await.unwrap();
+    let sql = std::fs::read_to_string(out.path().join("views.duckdb.sql")).unwrap();
+    assert!(sql.contains("AS VARCHAR) AS \"value\""));
+    if duckdb {
+        assert_eq!(
+            query(&sql, "SELECT value FROM c_items WHERE _wk_name='a';"),
+            "text\n"
+        );
+    }
+    replace_fixture_actor(&store, "CREATE TABLE other(value)", 1).await;
+    poll(&args, &store, "").await.unwrap();
+    let sql = std::fs::read_to_string(out.path().join("views.duckdb.sql")).unwrap();
+    assert!(sql.contains("CREATE OR REPLACE VIEW \"c_items\""));
+    if duckdb {
+        assert_eq!(query(&sql, "SELECT _wk_name FROM c_items;"), "b\n");
+    }
+    let objects = history::list_objects(&store, "state/t/a/actors/c/b/")
+        .await
+        .unwrap();
+    for key in objects.keys() {
+        store
+            .delete(&Key::from(format!("state/t/a/actors/c/b/{key}")))
+            .await
+            .unwrap();
+    }
+    assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+    let sql = std::fs::read_to_string(out.path().join("views.duckdb.sql")).unwrap();
+    if duckdb {
+        assert_eq!(query(&sql, "SELECT count(*) FROM c_items;"), "0\n");
+        assert_eq!(query(&sql, "SELECT count(*) FROM c_items_history;"), "4\n");
+    }
+}
+
+#[tokio::test]
+async fn f5_views_quote_identifiers_cast_blobs_and_ignore_orphans() {
+    let root = tempfile::Builder::new()
+        .prefix("feed'quote")
+        .tempdir()
+        .unwrap();
+    let out = root.path().join("out");
+    let state = root.path().join("state");
+    let store = fixture().await;
+    let args = args(&out, &state);
+    replace_fixture_actor(&store, "CREATE TABLE \"odd\"\"table\"(\"a\"\"b\", _WK_name); INSERT INTO \"odd\"\"table\" VALUES(X'00ff', 'app')", 1).await;
+    poll(&args, &store, "").await.unwrap();
+    let first = std::fs::read_to_string(out.join("views.duckdb.sql")).unwrap();
+    assert!(first.contains("\"c_odd\"\"table_history\""));
+    assert!(first.contains("AS BLOB) AS \"a\"\"b\""));
+    assert!(first.contains("feed''quote"));
+    replace_fixture_actor(
+        &store,
+        "CREATE TABLE \"odd\"\"table\"(\"A\"\"B\"); INSERT INTO \"odd\"\"table\" VALUES(7)",
+        1,
+    )
+    .await;
+    poll(&args, &store, "").await.unwrap();
+    let sql = std::fs::read_to_string(out.join("views.duckdb.sql")).unwrap();
+    assert!(sql.contains("lower(hex(d.\"a\"\"b\"))"));
+    assert!(sql.contains("CAST(d.\"A\"\"B\" AS VARCHAR) AS \"a\"\"b\""));
+    assert!(sql.contains("CAST(NULL AS VARCHAR) AS \"_app_WK_name\""));
+    let dir = out.join("tables/c").join(encode_segment("odd\"table"));
+    let file = files(&dir).into_keys().next().unwrap();
+    std::fs::copy(file, dir.join("00000000000000000999.parquet")).unwrap();
+    views::publish(&out).unwrap();
+    assert_eq!(
+        sql,
+        std::fs::read_to_string(out.join("views.duckdb.sql")).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn f5_empty_feed_has_loadable_script() {
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    assert_eq!(
+        poll(&args(out.path(), state.path()), &store, "")
+            .await
+            .unwrap(),
+        0
+    );
+    let sql = std::fs::read_to_string(out.path().join("views.duckdb.sql")).unwrap();
+    assert!(sql.contains("BEGIN TRANSACTION;"));
+    assert!(!sql.contains("read_parquet"));
+}
+
+#[tokio::test]
+async fn f5_recovers_interrupted_view_publication() {
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = fixture().await;
+    let args = args(out.path(), state.path());
+    poll(&args, &store, "").await.unwrap();
+    let expected = std::fs::read(out.path().join("views.duckdb.sql")).unwrap();
+    std::fs::remove_file(out.path().join("views.duckdb.sql")).unwrap();
+    std::fs::write(out.path().join("views.duckdb.sql.partial"), b"interrupted").unwrap();
+    poll(&args, &store, "").await.unwrap();
+    assert!(!out.path().join("views.duckdb.sql.partial").exists());
+    assert_eq!(
+        expected,
+        std::fs::read(out.path().join("views.duckdb.sql")).unwrap()
+    );
+}

@@ -1,5 +1,6 @@
 //! ADR 0039: one read-only poll with durable, resumable batches.
 //! Kinds describe replacement labels, incarnations and retained ancestry.
+mod views;
 pub mod writer;
 
 use anyhow::{Context, ensure};
@@ -191,6 +192,7 @@ async fn poll_inner(
     if let Some((_, _, committed, _)) = &recorded {
         recover(&out, *committed)?;
         recover_visible(&mut db, &out, *committed)?;
+        views::publish(&out)?;
     }
     let scratch = state.join("scratch");
     if scratch.exists() {
@@ -350,6 +352,9 @@ async fn poll_inner(
     if !failed {
         db.execute("UPDATE feed SET incarnation=?1 WHERE id=1", [&incarnation])?;
     }
+    if !out.join("views.duckdb.sql").exists() {
+        views::publish(&out)?;
+    }
     Ok(if failed { 2 } else { 0 })
 }
 
@@ -439,6 +444,7 @@ fn commit_batch(
     tx.execute("UPDATE feed SET seq=?1,pending=0 WHERE id=1", [seq])?;
     tx.commit()?;
     checkpoint("advanced")?;
+    views::publish(out)?;
     Ok(())
 }
 
@@ -524,10 +530,12 @@ fn recover(out: &std::path::Path, committed: u64) -> anyhow::Result<()> {
         }
         Ok(())
     }
-    let partial = out.join("_wk_feed.json.partial");
-    if partial.exists() {
-        std::fs::remove_file(partial)?;
-        std::fs::File::open(out)?.sync_all()?;
+    for name in ["_wk_feed.json.partial", "views.duckdb.sql.partial"] {
+        let partial = out.join(name);
+        if partial.exists() {
+            std::fs::remove_file(partial)?;
+            std::fs::File::open(out)?.sync_all()?;
+        }
     }
     sweep(&out.join("tables"), out, committed)?;
     sweep(&out.join("_wk_states"), out, committed)
