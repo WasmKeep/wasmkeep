@@ -964,6 +964,9 @@ impl Cluster {
                 };
                 let format = app_format::decode(body.as_deref())
                     .map_err(|e| OwnershipError::Broken(e.to_string()))?;
+                if format == AppFormat::RecordedHead {
+                    self.recorded_head_peers().await?;
+                }
                 *self
                     .pending
                     .format
@@ -977,6 +980,39 @@ impl Cluster {
         self.owners
             .set_recorded_head(format == AppFormat::RecordedHead);
         Ok(())
+    }
+
+    /// An app that enabled the recorded-head format is served only while
+    /// every live node of it announces `recorded-head` (ADR 0035, section
+    /// 5): one that does not (an older binary started by mistake) would
+    /// neither write version 2 nor prove the floor. Refused until it stops:
+    /// the operator's to fix, never bypassed.
+    async fn recorded_head_peers(&self) -> Result<(), OwnershipError> {
+        let nodes = tokio::time::timeout(
+            self.lease_attempt,
+            wasmkeep_cluster::membership::all_heartbeats(&self.control_keys),
+        )
+        .await;
+        let Ok(Ok(nodes)) = nodes else {
+            return Err(OwnershipError::Unavailable(
+                "listing the app's nodes for their capabilities: no answer".into(),
+            ));
+        };
+        let served = format!("{}/{}", self.root.tenant(), self.root.app());
+        let old = wasmkeep_cluster::membership::without_recorded_head(
+            &nodes,
+            &served,
+            now_ms(),
+            self.heartbeat_horizon_ms,
+        );
+        if old.is_empty() {
+            return Ok(());
+        }
+        Err(OwnershipError::Refused(format!(
+            "the app enabled the recorded-head ownership format, but live nodes of it do not \
+             support it ({}): stop or upgrade them",
+            old.join(", ")
+        )))
     }
 
     /// The ownership record of an actor (ADR 0020). The name is encoded

@@ -89,7 +89,9 @@ enum AppCommand {
     Delete(AppDeleteArgs),
     /// Show the app's ownership-format setting (ADR 0035): version 1
     /// records, the recorded-head format enabled, or an unreadable
-    /// setting. Read only.
+    /// setting; with --enable, switch the app to the recorded-head format,
+    /// one way, once every registered node of it announces
+    /// `recorded-head` and none runs it.
     Format(AppFormatArgs),
 }
 
@@ -103,6 +105,13 @@ struct AppFormatArgs {
     /// the AWS_* environment variables).
     #[arg(long)]
     bucket: String,
+
+    /// Enable the recorded-head format (cannot be undone): refused while
+    /// a registered node of the app does not announce `recorded-head`,
+    /// while one runs the app, and within the late-write window after
+    /// the last stopped.
+    #[arg(long)]
+    enable: bool,
 }
 
 #[derive(Debug, Args)]

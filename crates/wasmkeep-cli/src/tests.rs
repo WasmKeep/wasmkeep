@@ -432,6 +432,7 @@ fn a_move_target_that_cannot_take_it_gets_a_warning() {
         instance: None,
         lease: None,
         load: None,
+        can_recorded_head: false,
     };
     assert!(move_warnings(&node(true, Some(DrainState::Serving)), "acme/shop").is_empty());
     assert!(move_warnings(&node(true, None), "acme/shop").is_empty());

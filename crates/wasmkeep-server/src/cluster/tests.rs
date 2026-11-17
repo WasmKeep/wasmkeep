@@ -94,6 +94,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         instance: None,
         lease: None,
         load: None,
+        can_recorded_head: false,
     };
     let nodes = [
         n("me", "acme/shop"),
@@ -2735,6 +2736,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         instance: Some("iz".into()),
         lease: Some(wasmkeep_cluster::node_lease::NodeState::Live),
         load: None,
+        can_recorded_head: false,
     };
     a.note_future_leases(&[lease(now_ms())]);
     assert!(!logged(), "a lease within the skew reported");
@@ -2853,6 +2855,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         instance: Some("0011223344556677".to_owned()),
         lease: Some(state),
         load: None,
+        can_recorded_head: false,
     }
 }
 
@@ -3904,4 +3907,144 @@ async fn a_lagging_listing_cannot_hide_a_recorded_head() {
     .await
     .unwrap();
     assert_eq!(restored.verified_head(), h);
+}
+
+/// ADR 0035, section 6 (simulation case 13 on the real code): a
+/// replacement (`actor restore` writes past content as a reset at the
+/// live head's txid + 1, as does `delete-self`) is what the release
+/// records, never the historical source position; a listing that hides
+/// the replacement refuses activation rather than serve the older state.
+#[tokio::test]
+async fn a_replacement_is_the_recorded_head() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::recorded_head::Position;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let lagging = LaggingList::new();
+    let store: Arc<dyn ObjectStore> = Arc::clone(&lagging) as Arc<dyn ObjectStore>;
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let source = replica.verified_head();
+    db.exec("INSERT INTO t VALUES (2)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    // The replacement, hidden from listings: past content as a new write.
+    lagging.lag.store(true, std::sync::atomic::Ordering::SeqCst);
+    db.exec("DELETE FROM t WHERE v = 2", &[]).unwrap();
+    let _ = db.take_changes().unwrap();
+    replica.ship_reset(db.snapshot().unwrap()).await.unwrap();
+    let replaced = replica.verified_head();
+    assert!(
+        matches!((source, replaced), (Position::Known { txid: s, .. }, Position::Known { txid: r, .. }) if r == s + 2),
+        "{source:?} then {replaced:?}"
+    );
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    assert_eq!(
+        owner_record(&store, &key).await.recorded.map(|r| r.head),
+        Some(replaced)
+    );
+    // A listing without the replacement shows the pre-replacement head:
+    // refused, not activated.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let refused = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(other.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ReplicaError::Visibility(_))),
+        "{:?}",
+        refused.err()
+    );
+}
+
+/// ADR 0035, section 5 (part of simulation case 11 on the real code): an
+/// app that enabled the recorded-head format is not served while a live
+/// node of it does not announce `recorded-head` (an older binary started
+/// by mistake); served again once that node is gone. Nothing is written
+/// meanwhile.
+#[tokio::test]
+async fn an_enabled_app_refuses_service_beside_an_incapable_peer() {
+    use wasmkeep_cluster::app_format;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let old = StorePath::from("nodes/old");
+    let body = format!(
+        "wasmkeep-node 3\nlive beef\n{}\nold\nhttp://old\n0.4.2\nt/default\n\n\nserving\n\ntake front\n",
+        now_ms()
+    );
+    store.put(&old, body.into_bytes().into()).await.unwrap();
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    a.validity.bump_epoch();
+    let got = LeaseHold::acquire(&a, &x).await;
+    assert!(
+        matches!(&got, Err(OwnershipError::Refused(why)) if why.contains("old")),
+        "{:?}",
+        got.as_ref().map(|_| ())
+    );
+    assert!(matches!(
+        store.head(&StorePath::from(a.owner_key(&x))).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    store.delete(&old).await.unwrap();
+    a.validity.bump_epoch();
+    LeaseHold::acquire(&a, &x).await.unwrap();
 }

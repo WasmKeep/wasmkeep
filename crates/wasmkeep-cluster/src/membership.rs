@@ -113,6 +113,10 @@ pub struct NodeInfo {
     pub can_restore: bool,
     /// Supports live actor restores and delete supersession markers.
     pub can_actor_restore: bool,
+    /// Reads, preserves and enforces the recorded-head ownership format
+    /// (ADR 0035, section 5; capability word `recorded-head`): an app
+    /// that enables it may be served only by nodes announcing it.
+    pub can_recorded_head: bool,
     /// A token random per process (heartbeat line 11, `instance=<hex>`):
     /// two processes writing this id's heartbeat show two tokens, which
     /// each notices in its next listing. `None` from nodes that predate it.
@@ -419,6 +423,7 @@ impl NodeInfo {
             can_rate_limits: words.can_rate_limits,
             can_restore: words.can_restore,
             can_actor_restore: words.can_actor_restore,
+            can_recorded_head: words.can_recorded_head,
             instance: lease.instance,
             lease: Some(lease.state),
             load,
@@ -440,6 +445,7 @@ impl NodeInfo {
             (self.can_rate_limits, "rate_limits"),
             (self.can_restore, "restore"),
             (self.can_actor_restore, "actor-restore"),
+            (self.can_recorded_head, "recorded-head"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -472,6 +478,7 @@ impl NodeInfo {
             can_rate_limits: words.contains(&"rate_limits"),
             can_restore: words.contains(&"restore"),
             can_actor_restore: words.contains(&"actor-restore"),
+            can_recorded_head: words.contains(&"recorded-head"),
             instance: words.iter().find_map(|w| {
                 let token = w.strip_prefix("instance=")?;
                 let ok = !token.is_empty()
@@ -722,6 +729,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_rate_limits: true,
             can_restore: true,
             can_actor_restore: true,
+            can_recorded_head: true,
             instance: self.instance.clone(),
             lease: None,
             load,
@@ -807,6 +815,22 @@ fn decoded(objects: Vec<(String, Vec<u8>)>) -> Vec<NodeInfo> {
 pub fn is_live(node: &NodeInfo, now_ms: u64, horizon_ms: u64) -> bool {
     !matches!(node.lease, Some(NodeState::Released | NodeState::Fenced))
         && now_ms.saturating_sub(node.written_at_ms) <= horizon_ms
+}
+
+/// The live nodes serving `served` (`tenant/app`) that do not announce
+/// `recorded-head` (ADR 0035, section 5): an app that enabled the format
+/// refuses service while any is found.
+pub fn without_recorded_head<'a>(
+    nodes: &'a [NodeInfo],
+    served: &str,
+    now_ms: u64,
+    horizon_ms: u64,
+) -> Vec<&'a str> {
+    nodes
+        .iter()
+        .filter(|n| n.app == served && !n.can_recorded_head && is_live(n, now_ms, horizon_ms))
+        .map(|n| n.id.as_str())
+        .collect()
 }
 
 /// Hex of a pin, as heartbeats publish it.
@@ -958,6 +982,7 @@ mod tests {
             instance: None,
             lease: None,
             load: None,
+            can_recorded_head: false,
         };
         mem.0.borrow_mut().insert("nodes/x".into(), forged.encode());
         mem.0
@@ -998,6 +1023,7 @@ mod tests {
             instance: None,
             lease: None,
             load: None,
+            can_recorded_head: false,
         };
         assert_eq!(NodeInfo::decode(&info.encode()), Some(info));
         let old = b"wasmkeep-node 1\na\nx:1\n0.1\n5\n";
@@ -1074,6 +1100,7 @@ mod tests {
             instance: None,
             lease: None,
             load: None,
+            can_recorded_head: false,
         }
     }
 
@@ -1451,6 +1478,7 @@ mod tests {
             instance: lease.instance,
             lease: Some(lease.state),
             load: None,
+            can_recorded_head: false,
         })
     }
 
@@ -1563,9 +1591,40 @@ mod tests {
         let payload = String::from_utf8(a.lease_payload()).unwrap();
         assert_eq!(
             payload.lines().nth(8),
-            Some("take front handoff ends flush rate_limits restore actor-restore"),
+            Some("take front handoff ends flush rate_limits restore actor-restore recorded-head"),
             "{payload}"
         );
+    }
+
+    /// ADR 0035, section 5: this binary announces `recorded-head`; a live
+    /// node of the app without it is found, a stopped one or another
+    /// app's is not; an older reader ignores the word.
+    #[test]
+    fn recorded_head_capability_is_announced_and_checked() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let membership = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
+        let mut node = membership.info();
+        let decoded = NodeInfo::decode(&format3(&node, NodeState::Live, "beef")).unwrap();
+        assert!(decoded.can_recorded_head);
+        node.app = "acme/shop".into();
+        node.written_at_ms = 10_000;
+        let mut old = node.clone();
+        old.id = "old".into();
+        old.can_recorded_head = false;
+        let mut stopped = old.clone();
+        stopped.id = "stopped".into();
+        stopped.lease = Some(NodeState::Released);
+        let mut other = old.clone();
+        other.id = "other".into();
+        other.app = "acme/blog".into();
+        let nodes = [node, old, stopped, other];
+        assert_eq!(
+            without_recorded_head(&nodes, "acme/shop", 10_500, 15_000),
+            vec!["old"]
+        );
+        // Stale: no longer live.
+        assert!(without_recorded_head(&nodes, "acme/shop", 99_000, 15_000).is_empty());
     }
 
     #[test]

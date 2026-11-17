@@ -739,6 +739,7 @@ mod tests {
             instance: None,
             lease: None,
             load: None,
+            can_recorded_head: false,
         }
     }
 
