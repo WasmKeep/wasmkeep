@@ -98,6 +98,6 @@ are designs, not available capabilities. -->
 - [0037 Socket session admission (accepted, as built)](adr/0037-socket-session-admission.md)
 - [0038 Several apps per process (accepted, as built)](adr/0038-several-apps-per-process.md)
 - [0039 The change feed (accepted, as built)](adr/0039-the-change-feed.md)
-- [0040 Directory, broadcast groups and the reconnecting room (proposed)](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)
+- [0040 Directory, broadcast groups and the reconnecting room (accepted, as built)](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)
 
 - [Socket admission options](reference/socket-limits.md)

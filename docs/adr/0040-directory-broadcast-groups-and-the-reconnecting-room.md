@@ -1,9 +1,10 @@
 # 0040. Directory, broadcast groups and the reconnecting room
 
-- Status: partially implemented (2026-11-17). R1–R6 provide the directory,
+- Status: accepted, as built (2026-11-17), slices R1 to R7: the directory,
   room core, edges, browser client, scaling, one relay layer, the large-room
-  example and the 300-client cluster proof. R7 adds the remote benchmark
-  harness and hot-actors guide. R8 remains planned.
+  example, the 300-client cluster proof and the remote benchmark harness.
+  R8, the 10,000-client benchmark, is still to run and decides the optional
+  host "send to all my sockets" call.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"

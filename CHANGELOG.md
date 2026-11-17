@@ -9,6 +9,18 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Big rooms (ADR 0040):** the Rust and TypeScript SDKs gain a
+  directory (key ranges to actors, split and merge as durable
+  transactions) and a broadcast group: a room actor that numbers messages
+  as (epoch, number) and keeps a history window, edge actors of at most
+  500 sockets that it feeds by call-many, and a relay layer past 16 edges
+  (up to 256). Edges split at 80% full and drain below 30%. Delivery is at
+  least once and ordered; the browser client drops repeats, recovers gaps
+  over HTTP and reconnects from its last position. Numbers lost with
+  batched writes are announced void; `confirm` flushes before each round.
+  Example: `examples/ts-big-room`. See the [designing for hot actors](docs/designing-for-hot-actors.md)
+  page.
+
 - **The change feed (ADR 0039):** `wasmkeep feed --to parquet --out DIR
   --state DIR` reads an app's actors from the bucket, read-only, and
   writes one append-only Parquet file per class and table for the actors
