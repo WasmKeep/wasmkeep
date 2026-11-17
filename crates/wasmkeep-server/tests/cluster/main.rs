@@ -97,6 +97,8 @@ mod routing;
 mod signed_calls;
 #[path = "snapshots.rs"]
 mod snapshots;
+#[path = "supervisor.rs"]
+mod supervisor;
 #[path = "websockets.rs"]
 mod websockets;
 #[path = "writes_deploys.rs"]

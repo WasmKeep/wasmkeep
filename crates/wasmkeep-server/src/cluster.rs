@@ -37,6 +37,7 @@ mod hello;
 mod identity;
 mod lease_hold;
 mod node_lease_task;
+mod process;
 mod signing;
 mod view;
 pub(crate) use hello::HELLO_PATH;
@@ -49,6 +50,7 @@ pub(crate) use identity::*;
 pub(crate) use lease_hold::*;
 pub(crate) use node_lease_task::lease_attempt;
 use node_lease_task::{lease_every, node_lease_loop};
+pub use process::NodeProcess;
 pub(crate) use signing::*;
 pub use view::older_nodes_advice;
 pub(crate) use view::*;
@@ -182,6 +184,9 @@ pub struct ClusterConfig {
     /// actor until it has checked for the app's tombstone with its lease
     /// valid, at start and after every lapse (ADR 0028, section 5).
     pub follows_app: bool,
+    /// The process this app runs in (ADR 0038): what it shares with the
+    /// process's other apps. `None`: a process of its own.
+    pub process: Option<Arc<NodeProcess>>,
 }
 
 /// Plain HTTP between nodes, for a node with a cluster listener (ADR 0011).
@@ -243,6 +248,7 @@ impl ClusterConfig {
             failover_wait_max: crate::http::ServeLimits::default().max_connections / 4,
             expiry_every: Duration::from_millis(wasmkeep_cluster::expiry::PASS_EVERY_MS),
             follows_app: false,
+            process: None,
         }
     }
 }
@@ -354,17 +360,12 @@ pub(crate) struct Cluster {
     /// Live nodes by id, with their addresses; refreshed with every
     /// listing of the heartbeats.
     peers: RwLock<HashMap<String, Peer>>,
-    /// This node's TLS identity and its peers' pins, with a cluster
-    /// listener (ADR 0011).
-    tls: Option<Arc<ClusterTls>>,
+    /// The process's TLS identity, trust table, clients to other nodes
+    /// and listing of `nodes/` (ADR 0038, section 2).
+    transport: Arc<process::Transport>,
     /// When this node's identity first reached the bucket in a heartbeat
     /// (ms; 0: not yet): for readiness.
     published_ms: std::sync::atomic::AtomicU64,
-    /// The clients to other nodes; replaced (with empty connection pools)
-    /// when a peer's cluster address changes hands, so a connection pooled
-    /// to its previous holder is never used again.
-    clients: RwLock<Arc<Clients>>,
-    connector: ClusterConnector,
     /// How long a heartbeat stays live (ms; its ttl plus the clock skew
     /// allowed): pins are trusted no longer than this after their
     /// heartbeat was written.
@@ -652,23 +653,16 @@ impl Cluster {
         });
         let membership = membership.with_instance(instance.clone());
         let refuse_plaintext = config.cluster_plaintext == ClusterPlaintext::Refuse;
-        if refuse_plaintext && config.cluster_tls.is_none() {
-            return Err(crate::Error::ClusterTls(
-                "refusing plain HTTP between nodes needs a cluster listener".into(),
-            ));
-        }
-        let tls = match &config.cluster_tls {
-            Some(t) => Some(Arc::new(
-                ClusterTls::generate(&config.node_id, &t.advertise)
-                    .map_err(crate::Error::ClusterTls)?,
-            )),
-            None => None,
-        };
-        let membership = match &tls {
+        // The process's transport: made by its first (and only) app.
+        let transport = config
+            .process
+            .clone()
+            .unwrap_or_else(NodeProcess::new)
+            .attach(config, bucket.clone())?;
+        let membership = match &transport.tls {
             Some(t) => membership.with_cluster_tls(t.advertise(), vec![t.pin()]),
             None => membership,
         };
-        let connector = ClusterConnector::new(tls.clone(), refuse_plaintext);
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
             seen: SeenSignatures::named("calls"),
@@ -687,14 +681,12 @@ impl Cluster {
             pending: Pending::default(),
             membership,
             peers: RwLock::new(HashMap::new()),
-            clients: RwLock::new(Clients::new(&connector)),
-            connector,
             heartbeat_horizon_ms: heartbeat_horizon_ms(config.heartbeat, &config.lease),
             conflict_logged_ms: std::sync::atomic::AtomicU64::new(0),
             refuse_plaintext,
             plain_peers_logged_ms: std::sync::atomic::AtomicU64::new(0),
             invalid_releases: lease_hold::InvalidReleases::default(),
-            tls,
+            transport,
             published_ms: std::sync::atomic::AtomicU64::new(0),
             secret: tokio::sync::OnceCell::new(),
             ttl: Duration::from_millis(config.lease.ttl_ms()),
@@ -1418,7 +1410,7 @@ impl Cluster {
         // Peers refuse this node's handshakes until they have listed its
         // pin: give them a heartbeat period (ADR 0011), and half of one more
         // for their listing's own latency.
-        if self.tls.is_some() {
+        if self.transport.tls.is_some() {
             let published = self.published_ms.load(std::sync::atomic::Ordering::Relaxed);
             let period = u64::try_from(self.heartbeat_every.as_millis())
                 .unwrap_or(u64::MAX)
@@ -2148,7 +2140,7 @@ impl Cluster {
             }
             return None;
         };
-        match (&self.tls, &peer.tls) {
+        match (&self.transport.tls, &peer.tls) {
             (Some(_), Some(tls)) => Some(tls.clone()),
             _ if self.refuse_plaintext => None,
             _ => peer.plain.clone(),
@@ -2158,11 +2150,11 @@ impl Cluster {
     /// This node's TLS identity and its peers' pins, with a cluster
     /// listener.
     pub(crate) fn tls(&self) -> Option<&Arc<ClusterTls>> {
-        self.tls.as_ref()
+        self.transport.tls.as_ref()
     }
 
     fn clients(&self) -> Arc<Clients> {
-        Arc::clone(&self.clients.read().unwrap_or_else(|p| p.into_inner()))
+        self.transport.clients()
     }
 
     /// Before sending to `base` over TLS (perhaps on a pooled connection):
@@ -2177,6 +2169,7 @@ impl Cluster {
             };
         }
         let tls = self
+            .transport
             .tls
             .as_ref()
             .ok_or("TLS between nodes is not configured")?;
@@ -2193,7 +2186,7 @@ impl Cluster {
         &self,
         base: &str,
     ) -> Option<Box<dyn FnOnce(Option<[u8; 32]>) -> crate::cluster_tls::StillTrusted + Send>> {
-        let tls = Arc::clone(self.tls.as_ref()?);
+        let tls = Arc::clone(self.transport.tls.as_ref()?);
         let uri: hyper::Uri = base.parse().ok().filter(|_| base.starts_with("https://"))?;
         Some(Box::new(move |pin| {
             Arc::new(move || tls.still_trusted(&uri, pin))

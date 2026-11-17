@@ -122,7 +122,7 @@ impl Cluster {
         let client: hyper_util::client::legacy::Client<_, http_body_util::Full<bytes::Bytes>> =
             peer_client_builder(PEER_POOL_IDLE)
                 .pool_max_idle_per_host(0)
-                .build(self.connector.clone());
+                .build(self.transport.connector.clone());
         let response = client
             .request(req)
             .await

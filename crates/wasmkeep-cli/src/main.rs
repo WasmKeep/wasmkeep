@@ -1561,6 +1561,9 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
         tracing::info!(allowed = %ranges.join(", "), "outbound HTTP may also reach these ranges");
     }
     let mut app = App::default();
+    // The process's listeners, shutdown and transport to other nodes
+    // (ADR 0038): one app.
+    let supervisor = wasmkeep_server::Supervisor::new();
     // One for the node: guests share its node-wide line budget.
     let guest_log = wasmkeep_server::GuestLog::new(args.guest_log_rate);
     let front_env = load_front_env(&args.front_env)?;
@@ -1751,6 +1754,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
                     cluster_advertise.clone(),
                 ));
             }
+            cluster.process = Some(supervisor.process());
             cluster.cluster_plaintext = match args.cluster_plaintext {
                 ClusterPlaintext::Accept => wasmkeep_server::ClusterPlaintext::Accept,
                 ClusterPlaintext::Refuse => wasmkeep_server::ClusterPlaintext::Refuse,
@@ -1857,57 +1861,25 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             }
         }
         tracing::info!("listening on http://{}", listener.local_addr()?);
-        if let Some(addr) = args.metrics_listen {
-            let metrics = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("binding {addr} for metrics"))?;
-            tracing::info!("metrics on http://{}/metrics", metrics.local_addr()?);
-            if !metrics.local_addr()?.ip().is_loopback() {
-                tracing::warn!("metrics are served on a non-loopback address: keep it private");
+        let metrics = match args.metrics_listen {
+            Some(addr) => {
+                let metrics = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("binding {addr} for metrics"))?;
+                tracing::info!("metrics on http://{}/metrics", metrics.local_addr()?);
+                if !metrics.local_addr()?.ip().is_loopback() {
+                    tracing::warn!("metrics are served on a non-loopback address: keep it private");
+                }
+                Some(metrics)
             }
-            let actors = app.actors.clone();
-            tokio::spawn(async move {
-                let _ = wasmkeep_server::serve_metrics(metrics, actors, stop_signal()).await;
-            });
-        }
+            None => None,
+        };
         let limits = wasmkeep_server::ServeLimits {
             max_connections,
             cluster_connections,
             ..wasmkeep_server::ServeLimits::default()
         };
-        // A second process found running with this node id (both started
-        // at the same moment) stops this one too: it takes no more leases,
-        // and shuts down like a SIGTERM, then exits with the reason.
-        let lost: std::sync::Arc<std::sync::Mutex<Option<String>>> = std::sync::Arc::default();
-        let actors = app.actors.clone();
-        let lost_reason = std::sync::Arc::clone(&lost);
-        let shutdown = async move {
-            let node_id_lost = async {
-                match &actors {
-                    Some(a) => a.node_id_lost().await,
-                    None => std::future::pending().await,
-                }
-            };
-            let app_deleted = async {
-                match &actors {
-                    Some(a) => a.app_deleted().await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                () = app_deleted => {
-                    let why = "the app was deleted (wasmkeep app delete): this node no longer serves it".to_owned();
-                    tracing::error!("shutting down: {why}");
-                    *lost_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
-                }
-                () = stop_signal() => tracing::info!("shutting down"),
-                why = node_id_lost => {
-                    tracing::error!("shutting down: {why}");
-                    *lost_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
-                }
-            }
-        };
-        match args.cluster_listen {
+        let cluster = match args.cluster_listen {
             Some(addr) => {
                 let cluster_listener = tokio::net::TcpListener::bind(addr)
                     .await
@@ -1916,18 +1888,18 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
                     "cluster listener on https://{} (mutual TLS, other nodes only)",
                     cluster_listener.local_addr()?
                 );
-                wasmkeep_server::serve_with_cluster_listener(
-                    listener,
-                    cluster_listener,
-                    app,
-                    shutdown,
-                    limits,
-                )
-                .await?;
+                Some(cluster_listener)
             }
-            None => wasmkeep_server::serve_with(listener, app, shutdown, limits).await?,
-        }
-        if let Some(why) = lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            None => None,
+        };
+        let listeners = wasmkeep_server::Listeners {
+            public: listener,
+            cluster,
+            metrics,
+        };
+        // The app deleted, or its node id lost (another process found
+        // running with it): the process exits with the reason, non-zero.
+        if let Some(why) = supervisor.serve(listeners, app, stop_signal, limits).await? {
             anyhow::bail!("{why}");
         }
         Ok(())

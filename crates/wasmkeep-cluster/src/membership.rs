@@ -772,8 +772,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
     /// listing), sorted by id: those whose object is gone are left out.
     /// What [`Membership::heartbeats`] would give for them.
     pub async fn heartbeats_of(&self, ids: &[String]) -> Result<Vec<NodeInfo>, BucketError> {
-        let keys: Vec<String> = ids.iter().map(|id| format!("{NODES_PREFIX}{id}")).collect();
-        Ok(decoded(self.directory.read(&keys).await?))
+        heartbeats_of(&self.directory, ids).await
     }
 
     /// The live ones of `nodes` (see [`Membership::live_nodes`]).
@@ -790,6 +789,17 @@ impl<D: Directory, C: Clock> Membership<D, C> {
 /// nodes too (`wasmkeep cluster status`). Unreadable objects are skipped.
 pub async fn all_heartbeats<D: Directory>(directory: &D) -> Result<Vec<NodeInfo>, BucketError> {
     Ok(decoded(directory.list(NODES_PREFIX).await?))
+}
+
+/// The heartbeats of the nodes `ids` names, read one by one (no listing),
+/// sorted by id: those whose object is gone are left out. What
+/// [`all_heartbeats`] would give for them.
+pub async fn heartbeats_of<D: Directory>(
+    directory: &D,
+    ids: &[String],
+) -> Result<Vec<NodeInfo>, BucketError> {
+    let keys: Vec<String> = ids.iter().map(|id| format!("{NODES_PREFIX}{id}")).collect();
+    Ok(decoded(directory.read(&keys).await?))
 }
 
 /// The heartbeats among `objects` (key, body), sorted by id.
