@@ -71,6 +71,7 @@ try {
           b.onResolve({ filter: /^wasmkeep:actor\/calls@/ }, () => ({ path: callsStub }));
           b.onResolve({ filter: /^wasmkeep:actor\/env@/ }, () => ({ path: envStub }));
           b.onResolve({ filter: /^wasmkeep:actor\/alarms@/ }, () => ({ path: join(root, "test", "room-alarms-stub.ts") }));
+          b.onResolve({ filter: /^wasmkeep:actor\/websockets@/ }, () => ({ path: join(root, "test", "sockets-stub.ts") }));
           b.onResolve({ filter: /^wasmkeep:actor\/storage@/ }, () => ({ path: join(root, "test", "directory-storage-stub.ts") }));
           b.onResolve({ filter: /^(wasmkeep|wasi):/ }, (a) => ({
             errors: [{ text: `${a.path} is not available under node: test a module that does not import it` }],

@@ -61,10 +61,10 @@ export class Core {
         this.db.exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_history (n INTEGER PRIMARY KEY,e INTEGER NOT NULL,at INTEGER NOT NULL,id TEXT UNIQUE,body TEXT NOT NULL)", []);
         this.db.exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_epochs (e INTEGER PRIMARY KEY,base INTEGER NOT NULL)", []);
     }
-    private messages(): Message[] {
+    messages(): Message[] {
         return this.db.query("SELECT n,e,at,id,body FROM wasmkeep_room_history ORDER BY n", []).values.map(r => ({ position: { n: num(r[0]), e: num(r[1]) }, at: num(r[2]), id: r[3].tag === "null" ? undefined : str(r[3]), body: str(r[4]) }));
     }
-    private epochs(): Epoch[] {
+    epochs(): Epoch[] {
         return this.db.query("SELECT e,base FROM wasmkeep_room_epochs ORDER BY e", []).values.map(r => ({ e: num(r[0]), base: num(r[1]) }));
     }
     private transaction<T>(durable: boolean, f: () => T): T {
@@ -86,7 +86,7 @@ export class Core {
             throw e;
         }
     }
-    private wake(): Epoch {
+    wake(): Epoch {
         if (this.epoch)
             return this.epoch;
         const e = (this.epochs().at(-1)?.e ?? 0n) + 1n, base = this.messages().at(-1)?.position.n ?? 0n;

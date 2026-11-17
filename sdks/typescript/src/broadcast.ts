@@ -1,5 +1,6 @@
 /** Reconnecting room core. Export define() as an internal class. Fronts
  * authorize HTTP publish/history requests then use Client. Edges never call it. */
+import { Round } from "./broadcast-round";
 import * as storage from "wasmkeep:actor/storage@0.2.0";
 import * as alarms from "wasmkeep:actor/alarms@0.2.0";
 import { Core, errorMessage, type Position, type Publish, type History, type Message } from "./broadcast-core";
@@ -82,12 +83,14 @@ function serve(core: Core, op: string, body: Uint8Array): Uint8Array {
 }
 export function define(options: {
     confirm?: boolean;
+    edges?: string[];
 } = {}): ActorDefinition {
     const core = new Core(storage, alarms, options.confirm);
+    const round = new Round(options.edges ?? []);
     return { init() {
             core.init();
         }, alarm() {
-            core.beforePush(BigInt(Date.now()));
+            round.run(core, Date.now());
         }, fetch(req: ActorRequest): ActorResponse {
             if (!header(req.headers, "x-wasmkeep-caller"))
                 return { status: 403, body: "inside callers only" };
@@ -106,3 +109,4 @@ export function define(options: {
             }
         } };
 }
+export { defineEdge } from "./broadcast-edge";

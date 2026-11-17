@@ -209,7 +209,9 @@ export { actorClient, actorTransport } from "./transport";
 /** A WebSocket connection id. */
 export type ConnId = bigint;
 
+import { trySend } from "./sockets";
 export const sockets = {
+  trySend,
   /** Sends a text or binary message. Returns false if the connection is
    * gone or its buffer is full. */
   send(conn: ConnId, data: string | Uint8Array): boolean {

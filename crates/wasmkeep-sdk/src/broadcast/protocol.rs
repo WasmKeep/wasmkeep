@@ -227,6 +227,10 @@ mod actor {
         pub fn before_push() -> Result<bool, String> {
             CORE.with_borrow_mut(|c| c.before_push(crate::now_ms()))
         }
+        /// Run a fixed-edge round from the room's alarm.
+        pub fn round(round: &mut Round) -> Result<(), String> {
+            CORE.with_borrow_mut(|c| round.run(c, crate::now_ms()))
+        }
         pub fn handle(req: crate::http::IncomingRequest, out: crate::http::ResponseOutparam) {
             if wire::caller(&req).is_none() {
                 crate::http::respond(out, 403, "text/plain", b"inside callers only");

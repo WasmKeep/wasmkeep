@@ -43,3 +43,18 @@ mod protocol;
 pub use protocol::Client;
 #[cfg(feature = "actor")]
 pub use protocol::{Room, handler};
+#[cfg(feature = "actor")]
+mod edge;
+#[cfg(all(test, feature = "actor"))]
+#[path = "broadcast/edge_tests.rs"]
+mod edge_tests;
+#[cfg(feature = "actor")]
+pub use edge::{Ack, Edge, HostSockets, Item, Push, SendResult, SocketIo};
+#[cfg(feature = "actor")]
+mod edge_actor;
+#[cfg(feature = "actor")]
+pub use edge_actor::EdgeActor;
+#[cfg(feature = "actor")]
+mod round;
+#[cfg(feature = "actor")]
+pub use round::Round;

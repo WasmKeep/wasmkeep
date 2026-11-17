@@ -55,7 +55,7 @@ impl<S: Store> Core<S> {
         self.db.exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_history (n INTEGER PRIMARY KEY,e INTEGER NOT NULL,at INTEGER NOT NULL,id TEXT UNIQUE,body TEXT NOT NULL)", &[], false)?;
         self.db.exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_epochs (e INTEGER PRIMARY KEY,base INTEGER NOT NULL)", &[], false)
     }
-    fn messages(&self) -> Result<Vec<Message>, String> {
+    pub(super) fn messages(&self) -> Result<Vec<Message>, String> {
         self.db
             .query("SELECT n,e,at,id,body FROM wasmkeep_room_history ORDER BY n")?
             .into_iter()
@@ -72,7 +72,7 @@ impl<S: Store> Core<S> {
             })
             .collect()
     }
-    fn epochs(&self) -> Result<Vec<Epoch>, String> {
+    pub(super) fn epochs(&self) -> Result<Vec<Epoch>, String> {
         self.db
             .query("SELECT e,base FROM wasmkeep_room_epochs ORDER BY e")?
             .iter()
@@ -84,7 +84,7 @@ impl<S: Store> Core<S> {
             })
             .collect()
     }
-    fn wake(&mut self) -> Result<Epoch, String> {
+    pub(super) fn wake(&mut self) -> Result<Epoch, String> {
         if let Some(e) = self.epoch {
             return Ok(e);
         }
