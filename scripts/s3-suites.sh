@@ -46,3 +46,6 @@ fi
 cargo nextest run -p wasmkeep-cluster --test s3 --locked
 cargo nextest run -p wasmkeep-cli --locked --no-capture \
   --test failover --test cluster_tls --test cluster_status --test deploy_config --test cluster_diagnose
+
+# The same drill used by the soak, with a bounded fixture writer here.
+./scripts/drills/backup-restore.sh

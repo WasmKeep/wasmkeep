@@ -11,12 +11,17 @@
 # built with the `batched-writes` feature and the nodes start with
 # `--writes t=batched`; strict (the default) runs it as before. The mode is
 # part of the results file's name and of each row's bench name.
+# SOAK_RESTORE_DRILL=1 takes one online backup while writers/kills continue,
+# restores the restore-drill/fixture app to a new root and compares the frozen
+# durable acknowledgements. Remote mode also needs WASMKEEP_SOAK_BUCKET.
+# The drill needs aws CLI and writes its own CSV under bench/results.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${WASMKEEP_TEST_S3_BUCKET:?name the bucket (and AWS_* for its endpoint and keys)}"
 : "${SOAK_LABEL:?label the store, for example SOAK_LABEL=r2}"
 export WASMKEEP_SOAK_SECS=${WASMKEEP_SOAK_SECS:-1800}
 export WASMKEEP_SOAK_KILL_EVERY=${WASMKEEP_SOAK_KILL_EVERY:-180}
+export SOAK_RESTORE_DRILL=${SOAK_RESTORE_DRILL:-0}
 writes=${SOAK_WRITES:-strict}
 case "$writes" in
   strict) features=() ;;

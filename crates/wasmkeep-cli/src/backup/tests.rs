@@ -320,7 +320,11 @@ impl ObjectStore for ReadOnly {
         &self,
         prefix: Option<&Key>,
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        // Like the S3 paginated stream, this must not be polled after EOF.
+        futures_util::stream::unfold(self.inner.list(prefix), |mut stream| async {
+            stream.next().await.map(|meta| (meta, stream))
+        })
+        .boxed()
     }
     fn delete_stream(
         &self,
@@ -3315,4 +3319,23 @@ async fn prune_exact_age_boundary_preserves_then_collects() {
     assert!(optional(&f.dest, "data/orphan").await.unwrap().is_some());
     prune::execute(&f.dest, "", 0, boundary + 1).await.unwrap();
     assert!(optional(&f.dest, "data/orphan").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn actor_groups_does_not_repoll_an_exhausted_s3_listing() {
+    let fixture = Fixture::new().await;
+    let source: Store = Arc::new(ReadOnly {
+        inner: fixture.source,
+        gets: Default::default(),
+        collect: Default::default(),
+        collect_after: 0,
+        fail_collect: false,
+    });
+    let groups: Vec<_> = actor_groups(&source, "state/acme/shop/actors/")
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].0, "state/acme/shop/actors/counter/alice/");
+    assert_eq!(groups[0].1.len(), 1);
 }

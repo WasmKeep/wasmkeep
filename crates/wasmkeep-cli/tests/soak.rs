@@ -283,9 +283,17 @@ fn start(
         .append(true)
         .open(dir.join(format!("{id}.log")))
         .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
-        .args(["serve", "--actor"])
-        .arg(format!("t={}", wasm.display()))
+    let drill_enabled = std::env::var("SOAK_RESTORE_DRILL").as_deref() == Ok("1");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wasmkeep"));
+    command.arg("serve");
+    if drill_enabled {
+        command.args(["--app", "restore-drill/fixture", "--no-secrets"]);
+    } else {
+        command.args(["--actor", &format!("t={}", wasm.display())]);
+        // Rooted fixtures carry this mode in their deploy instead.
+        command.args(soak_writes());
+    }
+    command
         .arg("--data-dir")
         .arg(dir.join(id))
         .args(["--listen", &addr.to_string(), "--node-id", id])
@@ -294,9 +302,6 @@ fn start(
         // measured here.
         .args(["--cluster-plaintext", "accept"])
         .args(["--metrics-listen", &metrics.to_string()])
-        // `WASMKEEP_SOAK_WRITES=batched`: the class's plain writes batched
-        // (ADR 0034), in a binary built with `batched-writes`.
-        .args(soak_writes())
         .env("RUST_LOG", "wasmkeep_server=info")
         .stdout(log.try_clone().unwrap())
         .stderr(log)
@@ -497,6 +502,7 @@ fn three_nodes_against_a_real_bucket() {
         PathBuf::from,
     );
     std::fs::create_dir_all(&dir).unwrap();
+    let drill_enabled = std::env::var("SOAK_RESTORE_DRILL").as_deref() == Ok("1");
     let (addrs, mut nodes) = if let Some(addrs) = node_list("WASMKEEP_SOAK_NODES") {
         // Nodes already running elsewhere, one per machine.
         let var = |name: &str| {
@@ -533,6 +539,29 @@ fn three_nodes_against_a_real_bucket() {
             metrics: NODES.iter().map(|_| free_port()).collect(),
             children: NODES.iter().map(|_| None).collect(),
         };
+        if drill_enabled {
+            // Online backup requires a deploy. Only this newly owned fixture
+            // root is changed; a remote fleet must already have its deploy.
+            if let Nodes::Local { wasm, bucket, .. } = &nodes {
+                assert!(
+                    Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+                        .args([
+                            "deploy",
+                            "--app",
+                            "restore-drill/fixture",
+                            "--no-project",
+                            "--bucket",
+                            bucket,
+                            "--actor",
+                            &format!("t={}", wasm.display())
+                        ])
+                        .args(soak_writes())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        }
         for (i, addr) in addrs.iter().enumerate() {
             nodes.start(i, *addr);
         }
@@ -616,6 +645,53 @@ fn three_nodes_against_a_real_bucket() {
             })
         })
         .collect();
+    // One drill alongside the writers and kill loop. Freeze acknowledged
+    // floors before backup starts; later acknowledgements are not its contract.
+    let drill = drill_enabled.then(|| {
+        let source = match &nodes {
+            Nodes::Local { bucket, .. } => bucket.clone(),
+            Nodes::Remote { .. } => std::env::var("WASMKEEP_SOAK_BUCKET")
+                .expect("remote restore drill needs WASMKEEP_SOAK_BUCKET (full S3 root)"),
+        };
+        let wasm = match &nodes {
+            Nodes::Local { wasm, .. } => wasm.clone(),
+            Nodes::Remote { .. } => test_actor_wasm(),
+        };
+        let shared = Arc::clone(&shared);
+        let snapshot = dir.join("drill-acks.json");
+        std::thread::spawn(move || {
+            std::thread::sleep(kill_every.min(total / 2));
+            let mut floors: HashMap<String, u64> = HashMap::new();
+            {
+                let shared = shared.lock().unwrap();
+                for write in &shared.writes {
+                    if let Some((value, _)) = write.acked.as_ref() {
+                        let floor = floors
+                            .entry(actor_path(write.actor, "/durable"))
+                            .or_default();
+                        *floor = (*floor).max(*value);
+                    }
+                }
+            }
+            assert!(
+                !floors.is_empty(),
+                "restore drill has no acknowledged writes"
+            );
+            std::fs::write(&snapshot, serde_json::to_vec(&floors).unwrap()).unwrap();
+            Command::new("bash")
+                .arg(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../scripts/drills/backup-restore.sh"),
+                )
+                .args(["--source", &source, "--acks"])
+                .arg(snapshot)
+                .env("DRILL_SKIP_BUILD", "1")
+                .env("DRILL_BIN", env!("CARGO_BIN_EXE_wasmkeep"))
+                .env("DRILL_WASM", wasm)
+                .status()
+                .unwrap()
+        })
+    });
     let reads = Arc::new(Mutex::new(Reads::default()));
 
     // Kills: round robin, one every `kill_every`, the first after one
@@ -845,6 +921,7 @@ fn three_nodes_against_a_real_bucket() {
         victim = (victim + 1) % NODES.len();
     }
     std::thread::sleep(total.saturating_sub(began.elapsed()));
+    let drill_status = drill.map(|drill| drill.join().unwrap());
     stop.store(true, Ordering::Relaxed);
     for w in writers.into_iter().chain(plain_writers) {
         w.join().unwrap();
@@ -984,6 +1061,9 @@ fn three_nodes_against_a_real_bucket() {
     metric("soak/lost_writes", u128::from(lost), "count");
     metric("soak/duplicate_values", u128::from(duplicates), "count");
 
+    if let Some(status) = drill_status {
+        assert!(status.success(), "restore drill failed: {status}");
+    }
     assert_eq!(lost, 0, "acknowledged durable writes were lost");
     assert!(rs.stale.is_empty(), "a takeover read lost a durable write");
     assert_eq!(duplicates, 0, "a value was handed out twice");
