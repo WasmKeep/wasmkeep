@@ -109,6 +109,8 @@ pub struct NodeInfo {
     pub can_flush: bool,
     /// Reads manifest format 6 and enforces ingress admission.
     pub can_rate_limits: bool,
+    /// Reads format 7 and serves static assets. Announced only from A4.
+    pub can_assets: bool,
     /// Honours whole-app restore fences (capability word `restore`).
     pub can_restore: bool,
     /// Supports live actor restores and delete supersession markers.
@@ -440,6 +442,7 @@ impl NodeInfo {
             can_end: words.can_end,
             can_flush: words.can_flush,
             can_rate_limits: words.can_rate_limits,
+            can_assets: words.can_assets,
             can_restore: words.can_restore,
             can_actor_restore: words.can_actor_restore,
             can_recorded_head: words.can_recorded_head,
@@ -469,6 +472,7 @@ impl NodeInfo {
             (self.can_actor_restore, "actor-restore"),
             (self.can_recorded_head, "recorded-head"),
             (self.can_multi_app, "multi-app"),
+            (self.can_assets, "assets"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -499,6 +503,7 @@ impl NodeInfo {
             can_end: words.contains(&"ends"),
             can_flush: words.contains(&"flush"),
             can_rate_limits: words.contains(&"rate_limits"),
+            can_assets: words.contains(&"assets"),
             can_restore: words.contains(&"restore"),
             can_actor_restore: words.contains(&"actor-restore"),
             can_recorded_head: words.contains(&"recorded-head"),
@@ -764,6 +769,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_end: true,
             can_flush: true,
             can_rate_limits: true,
+            can_assets: true,
             can_restore: true,
             can_actor_restore: true,
             can_recorded_head: true,
@@ -1036,6 +1042,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_rate_limits: false,
+            can_assets: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1079,6 +1086,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_rate_limits: false,
+            can_assets: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1158,6 +1166,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_rate_limits: false,
+            can_assets: false,
             can_restore: false,
             can_actor_restore: false,
             instance: None,
@@ -1538,6 +1547,7 @@ mod tests {
             can_end: false,
             can_flush: false,
             can_rate_limits: false,
+            can_assets: false,
             can_restore: false,
             can_actor_restore: false,
             instance: lease.instance,
@@ -1659,7 +1669,7 @@ mod tests {
         assert_eq!(
             payload.lines().nth(8),
             Some(
-                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app"
+                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets"
             ),
             "{payload}"
         );
@@ -1745,9 +1755,23 @@ mod tests {
     }
 
     #[test]
+    fn assets_capability_is_announced_and_round_trips() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        let membership = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0).unwrap();
+        let node = membership.info();
+        assert!(node.can_assets);
+        assert!(node.capabilities().any(|w| w == "assets"));
+        for bytes in [node.encode(), format3(&node, NodeState::Live, "beef")] {
+            assert!(NodeInfo::decode(&bytes).unwrap().can_assets);
+        }
+    }
+
+    #[test]
     fn rate_limits_capability_round_trips_and_defaults_to_absent() {
         let node = NodeInfo {
             can_rate_limits: true,
+            can_assets: false,
             ..loaded_node()
         };
         assert!(NodeInfo::decode(&node.encode()).unwrap().can_rate_limits);
@@ -1797,6 +1821,7 @@ mod tests {
             can_end: true,
             can_flush: true,
             can_rate_limits: false,
+            can_assets: false,
             can_restore: true,
             can_actor_restore: false,
             ..loaded_node()
@@ -1821,6 +1846,7 @@ mod tests {
         let before = NodeInfo {
             can_flush: false,
             can_rate_limits: false,
+            can_assets: false,
             can_restore: false,
             can_actor_restore: false,
             ..node

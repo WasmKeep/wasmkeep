@@ -330,7 +330,7 @@ async fn ingress_limits_fail_closed_when_a_new_manifest_cannot_be_read() {
     store
         .put(
             &"apps/default/shop/unknown/manifest".into(),
-            "wasmkeep-manifest 7\n".as_bytes().to_vec().into(),
+            "wasmkeep-manifest 8\n".as_bytes().to_vec().into(),
         )
         .await
         .unwrap();

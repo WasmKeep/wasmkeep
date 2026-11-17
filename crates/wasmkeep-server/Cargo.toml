@@ -52,7 +52,8 @@ tracing-subscriber.workspace = true
 tokio-tungstenite = { workspace = true, features = ["connect"] }
 futures-util.workspace = true
 wasmkeep-storage = { workspace = true, features = ["fault-injection"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "io-util"] }
+# Deterministic asset marker renewal and cancellation tests, without wall-clock waits.
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "test-util"] }
 wat.workspace = true
 criterion.workspace = true
 tempfile.workspace = true

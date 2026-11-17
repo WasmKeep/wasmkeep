@@ -140,6 +140,27 @@ impl ActorService {
         front: Option<&crate::front::DeployedFront>,
         limits: &crate::apps::limits::Policies,
     ) -> Result<(), (String, Error)> {
+        self.apply_deployed_assets(
+            None, seq, classes, rules, config, requires, batched, front, limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all parts of a version publish together"
+    )]
+    pub(crate) fn apply_deployed_assets(
+        &self,
+        assets: Option<crate::assets::Deployed>,
+        seq: u64,
+        classes: &[(String, Component, Vec<u8>)],
+        rules: &crate::access::AccessRules,
+        config: &std::collections::BTreeMap<String, crate::env::Vars>,
+        requires: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        batched: &std::collections::BTreeSet<String>,
+        front: Option<&crate::front::DeployedFront>,
+        limits: &crate::apps::limits::Policies,
+    ) -> Result<(), (String, Error)> {
         crate::apps::limits::validate(limits)
             .map_err(|e| (FRONT_CLASS.to_owned(), Error::NotAFront(e)))?;
         // Linking is slow: done before taking the lock, the front's too.
@@ -203,6 +224,13 @@ impl ActorService {
                 }),
             );
         }
+        let assets = Arc::new(
+            read_lock(&self.inner.assets)
+                .switched(assets)
+                .map_err(|e| ("_assets".into(), Error::NotAFront(e.to_string())))?,
+        );
+        *self.inner.assets.write().unwrap_or_else(|p| p.into_inner()) = assets.clone();
+        assets.prefetch();
         *map = built;
         self.inner
             .rate_limiter
@@ -227,6 +255,21 @@ impl ActorService {
             .deploy_seq
             .store(seq, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    pub(crate) fn asset_snapshot<B>(
+        &self,
+        req: &mut hyper::Request<B>,
+    ) -> Arc<crate::assets::State> {
+        if let Some(assets) = req.extensions().get::<Arc<crate::assets::State>>() {
+            return assets.clone();
+        }
+        let _classes = read_lock(&self.inner.classes);
+        // Capture front and assets together even when the app has no ingress policies.
+        req.extensions_mut().insert(crate::front::IngressFront(
+            read_lock(&self.inner.front).clone(),
+        ));
+        read_lock(&self.inner.assets).clone()
     }
 
     /// Swaps in the app's secrets (ADR 0016): every class's values are
@@ -291,12 +334,20 @@ impl ActorService {
         req: &mut hyper::Request<B>,
     ) -> Option<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>> {
         {
+            let _classes = read_lock(&self.inner.classes);
             let limits = read_lock(&self.inner.limits);
             let pending = self
                 .inner
                 .rate_limits_pending
                 .load(std::sync::atomic::Ordering::Acquire);
             if limits.is_empty() && !pending {
+                if !req.uri().path().starts_with("/actor/") {
+                    req.extensions_mut().insert(crate::front::IngressFront(
+                        read_lock(&self.inner.front).clone(),
+                    ));
+                    req.extensions_mut()
+                        .insert(read_lock(&self.inner.assets).clone());
+                }
                 return None;
             }
             if self
@@ -474,6 +525,8 @@ impl ActorService {
         req.extensions_mut().insert(crate::front::IngressFront(
             read_lock(&self.inner.front).clone(),
         ));
+        req.extensions_mut()
+            .insert(read_lock(&self.inner.assets).clone());
         None
     }
 
@@ -628,6 +681,63 @@ impl ActorService {
 #[cfg(test)]
 mod rate_review_tests {
     use super::*;
+    #[tokio::test]
+    async fn assets_snapshot_precedes_a_policy_free_version_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ActorService::new(
+            Runtime::new(&Default::default()).unwrap(),
+            ActorConfig::new(dir.path()),
+            vec![],
+        )
+        .unwrap();
+        let mut req = hyper::Request::get("/missing").body(()).unwrap();
+        assert!(service.prepare_ingress(&mut req).is_none());
+        let captured = req
+            .extensions()
+            .get::<Arc<crate::assets::State>>()
+            .unwrap()
+            .clone();
+        let index = crate::assets::Index {
+            not_found: "404".into(),
+            ..Default::default()
+        };
+        let assets = crate::assets::Deployed {
+            index: Arc::new(index),
+            previous: None,
+            app: crate::apps::AppRef::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                "",
+                "default",
+                "default",
+            ),
+        };
+        service
+            .apply_deployed_assets(
+                Some(assets),
+                1,
+                &[],
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&captured, &service.asset_snapshot(&mut req)));
+        assert!(captured.answer(&req).await.is_none());
+        let mut next = hyper::Request::get("/missing").body(()).unwrap();
+        assert_eq!(
+            service
+                .asset_snapshot(&mut next)
+                .answer(&next)
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
+
     #[tokio::test]
     async fn review_no_policy_skips_admission_and_front_snapshot() {
         let dir = tempfile::tempdir().unwrap();

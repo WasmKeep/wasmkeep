@@ -32,6 +32,9 @@ use wasmkeep_runtime::Runtime;
 
 use crate::ActorService;
 
+mod assets_deploy;
+#[cfg(test)]
+mod assets_tests;
 mod collect;
 mod delete;
 use crate::access::AccessRules;
@@ -44,6 +47,11 @@ pub use delete::{DeleteApp, LATE_WRITES, delete_app};
 /// Why a deploy, rollback or update failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
+    /// A live node cannot read or serve static assets.
+    #[error(
+        "live nodes of {app} cannot read a version with assets (manifest format 7) ({nodes}): upgrade them first"
+    )]
+    NodesWithoutAssets { app: String, nodes: String },
     /// A component does not implement the actor world (nothing was uploaded).
     #[error("class {0:?} is not a valid actor: {1}")]
     Invalid(String, String),
@@ -297,7 +305,27 @@ impl AppRef {
     /// needs `flush` (ADR 0034), and every format inherits the checks of
     /// those below it (4 needs `ends`, 3 needs `front`).
     async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
-        if !manifest.limits.is_empty() {
+        if manifest.assets.is_some() {
+            let nodes = live_nodes(
+                Arc::clone(&self.store),
+                &self.prefix,
+                &self.tenant,
+                &self.app,
+            )
+            .await?;
+            let lacking: Vec<_> = nodes
+                .iter()
+                .filter(|n| !n.can_assets)
+                .map(|n| n.id.as_str())
+                .collect();
+            if !lacking.is_empty() {
+                return Err(DeployError::NodesWithoutAssets {
+                    app: self.name(),
+                    nodes: lacking.join(", "),
+                });
+            }
+        }
+        if manifest.format_number() >= 6 {
             let nodes = live_nodes(
                 Arc::clone(&self.store),
                 &self.prefix,
@@ -815,6 +843,28 @@ impl AppRef {
         version: &str,
         manifest: &Manifest,
     ) -> Result<Version, DeployError> {
+        let assets = match &manifest.assets {
+            Some(hash) => {
+                let index = self.node_assets_index(hash).await?;
+                let previous = if let Some(previous) = &manifest.previous {
+                    match self.manifest(previous).await {
+                        Ok(m) => match m.assets {
+                            Some(hash) => self.node_assets_index(&hash).await.ok(),
+                            None => None,
+                        },
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                Some(crate::assets::Deployed {
+                    index,
+                    previous,
+                    app: self.clone(),
+                })
+            }
+            None => None,
+        };
         let mut classes = Vec::new();
         for (class, digest) in &manifest.classes {
             let key = format!("{version}/{class}.wasm");
@@ -848,6 +898,7 @@ impl AppRef {
             None => None,
         };
         Ok(Version {
+            assets,
             classes,
             access,
             config,
@@ -857,6 +908,51 @@ impl AppRef {
             limits: manifest.limits.clone(),
             front,
         })
+    }
+
+    async fn node_assets_index(
+        &self,
+        hash: &str,
+    ) -> Result<Arc<crate::assets::Index>, DeployError> {
+        use object_store::ObjectStoreExt;
+        let key = format!("_assets/index/{hash}");
+        let object = self
+            .store
+            .get(&self.path(&key))
+            .await
+            .map_err(|e| match e {
+                object_store::Error::NotFound { .. } => {
+                    DeployError::Corrupt(format!("{key} (missing)"))
+                }
+                e => bucket(e),
+            })?;
+        if object.meta.size > crate::assets::MAX_INDEX as u64 {
+            return Err(DeployError::Corrupt(format!("{key} (size)")));
+        }
+        use futures_util::TryStreamExt;
+        let mut bytes = Vec::new();
+        let mut stream = object.into_stream();
+        while let Some(chunk) = stream.try_next().await.map_err(bucket)? {
+            if bytes.len().saturating_add(chunk.len()) > crate::assets::MAX_INDEX {
+                return Err(DeployError::Corrupt(format!("{key} (size)")));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if crate::assets::digest(&bytes) != hash {
+            return Err(DeployError::Corrupt(format!("{key} (digest)")));
+        }
+        crate::assets::Index::parse(&bytes)
+            .map(Arc::new)
+            .map_err(|_| DeployError::Corrupt(key))
+    }
+
+    pub(crate) async fn asset_content(
+        &self,
+        hash: &str,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.store
+            .get(&self.path(&format!("_assets/content/{hash}")))
+            .await
     }
 
     /// A version's access rules and configuration (digests checked),
@@ -1017,6 +1113,54 @@ impl AppRef {
             None => None,
         };
 
+        let assets = match &changes.assets {
+            crate::assets::Change::Keep => base.as_ref().and_then(|(_, m, _)| m.assets.clone()),
+            crate::assets::Change::Remove => None,
+            crate::assets::Change::Set(bundle) => {
+                bundle.index.validate().map_err(DeployError::Refused)?;
+                for file in bundle.index.files.values() {
+                    for c in file.contents() {
+                        let bytes = bundle.contents.get(&c.digest).ok_or_else(|| {
+                            DeployError::Refused(format!("missing local asset {}", c.digest))
+                        })?;
+                        if bytes.len() as u64 != c.size || crate::assets::digest(bytes) != c.digest
+                        {
+                            return Err(DeployError::Refused(format!(
+                                "invalid local asset {}",
+                                c.digest
+                            )));
+                        }
+                    }
+                }
+                let hash = crate::assets::digest(&bundle.index.bytes());
+                // An unchanged index can repair itself even when its stored copy
+                // is lost. Compare immutable names when the old index survives.
+                if let Some(old_hash) = base.as_ref().and_then(|(_, m, _)| m.assets.as_ref())
+                    && old_hash != &hash
+                    && !bundle.index.immutable.is_empty()
+                {
+                    let old = self.read_assets_index_if_present(old_hash).await?;
+                    if old.is_none() {
+                        eprintln!(
+                            "warning: old assets index {old_hash} is missing; immutable names cannot be compared; deploying supplied --assets"
+                        );
+                    }
+                    for (name, file) in &bundle.index.files {
+                        if bundle.index.immutable.iter().any(|p| name.starts_with(p))
+                            && old
+                                .as_ref()
+                                .and_then(|old| old.files.get(name))
+                                .is_some_and(|f| f.identity.digest != file.identity.digest)
+                        {
+                            return Err(DeployError::Refused(format!(
+                                "immutable asset {name:?} changed contents"
+                            )));
+                        }
+                    }
+                }
+                Some(hash)
+            }
+        };
         // The front, and what to write for it: given, kept (copied inside
         // the bucket, as classes are), or removed.
         let mut uploads = Vec::new();
@@ -1078,7 +1222,7 @@ impl AppRef {
                     manifest.classes.clone()
                 }
                 // A first deploy may give a front alone (ADR 0023).
-                None if has_front => BTreeMap::new(),
+                None if has_front || assets.is_some() => BTreeMap::new(),
                 None => {
                     return Err(DeployError::Nothing(
                         "nothing is deployed yet: give the classes (--actor) or a front (--front)",
@@ -1088,6 +1232,7 @@ impl AppRef {
         };
         if table.is_empty()
             && !has_front
+            && assets.is_none()
             && base.as_ref().is_some_and(|(_, m, _)| m.front.is_some())
         {
             return Err(DeployError::Nothing(
@@ -1236,6 +1381,7 @@ impl AppRef {
             }
         }
         let mut manifest = Manifest {
+            assets,
             previous: None,
             classes: table,
             front,
@@ -1296,90 +1442,122 @@ impl AppRef {
         }
 
         let diff = Diff::between(base.as_ref().map(|(_, m, s)| (m, s)), (&manifest, &set));
-        if let Some((current, base_manifest, _)) = &base {
-            // A no-op when nothing but the lineage would differ.
-            if base_manifest.identity() == manifest.identity() {
+        let unchanged = base
+            .as_ref()
+            .is_some_and(|(_, m, _)| m.identity() == manifest.identity());
+        if let Some((current, _, _)) = &base {
+            manifest.previous = Some(current.version.clone());
+        }
+        if !unchanged {
+            self.check_readers(&manifest).await?;
+            self.check_imports(Some(runtime), &imports, &kept).await?;
+        }
+        if !unchanged && !plan(&diff) {
+            return Err(DeployError::Stopped);
+        }
+        let supplied = match &changes.assets {
+            crate::assets::Change::Set(b) => Some(b),
+            _ => None,
+        };
+        let has_assets = manifest.assets.is_some();
+        let publish = |marker: Option<assets_deploy::Marker>| async move {
+            let repaired = if let (Some(hash), Some(marker)) = (&manifest.assets, &marker) {
+                self.prepare_assets(hash, supplied, changes.assets_verify, marker)
+                    .await?
+            } else {
+                0
+            };
+            if unchanged {
+                let current = base
+                    .as_ref()
+                    .map(|(c, _, _)| c.clone())
+                    .ok_or(DeployError::Nothing("no current version"))?;
                 return Ok(Deployed {
-                    current: current.clone(),
                     previous: Some(current.version.clone()),
+                    current,
                     unchanged: true,
                     diff,
                     newly_marked: false,
+                    repaired,
                 });
             }
-            manifest.previous = Some(current.version.clone());
-        }
-        // A node that cannot read format 3 would stay not ready on it: no
-        // such node may be live (ADR 0023). Checked before any write, as
-        // is a component no live node could link (ADR 0034, section 15).
-        self.check_readers(&manifest).await?;
-        self.check_imports(Some(runtime), &imports, &kept).await?;
-        if !plan(&diff) {
-            return Err(DeployError::Stopped);
-        }
-        let version = manifest.version_id();
-        // News only for an app deployed before rules came with deploys (a
-        // `current` without the marker): a new app has had them from its
-        // first deploy.
-        let from_before = read.as_ref().is_some_and(|(c, _)| !c.marked);
-        // Every deploy of this version writes token 3 (ADR 0022), which
-        // marks the app (ADR 0013): its nodes take their rules from
-        // deploys, and refuse `--access`.
-        let marked = true;
-        for (key, bytes) in uploads {
-            self.put_once(&format!("{version}/{key}"), bytes).await?;
-        }
-        // Server-side copies: unconditional, but the destination key is
-        // content-addressed, so an overwrite writes the same bytes. Nodes
-        // check every digest when they load the version.
-        for (from, key) in copies {
-            self.store
-                .copy(
-                    &self.path(&format!("{from}/{key}")),
-                    &self.path(&format!("{version}/{key}")),
-                )
-                .await
-                .map_err(bucket)?;
-        }
-        let text = manifest.format();
-        self.put_once(&format!("{version}/manifest"), text.clone().into_bytes())
-            .await?;
-        // A directory of this id may be half deleted by garbage collection
-        // (ADR 0012) while this wrote it: never point `current` at one
-        // whose manifest is not there, as written.
-        match self.get(&format!("{version}/manifest")).await? {
-            Some((bytes, _)) if bytes == text.as_bytes() => {}
-            _ => {
-                return Err(DeployError::Bucket(format!(
-                    "{version}/manifest changed while deploying; retry"
+            let version = manifest.version_id();
+            // News only for an app deployed before rules came with deploys (a
+            // `current` without the marker): a new app has had them from its
+            // first deploy.
+            let from_before = read.as_ref().is_some_and(|(c, _)| !c.marked);
+            // Every deploy of this version writes token 3 (ADR 0022), which
+            // marks the app (ADR 0013): its nodes take their rules from
+            // deploys, and refuse `--access`.
+            let marked = true;
+            for (key, bytes) in uploads {
+                self.put_once(&format!("{version}/{key}"), bytes).await?;
+            }
+            // Server-side copies: unconditional, but the destination key is
+            // content-addressed, so an overwrite writes the same bytes. Nodes
+            // check every digest when they load the version.
+            for (from, key) in copies {
+                self.store
+                    .copy(
+                        &self.path(&format!("{from}/{key}")),
+                        &self.path(&format!("{version}/{key}")),
+                    )
+                    .await
+                    .map_err(bucket)?;
+            }
+            if let Some(marker) = &marker {
+                marker.check()?;
+            }
+            let text = manifest.format();
+            self.put_once(&format!("{version}/manifest"), text.clone().into_bytes())
+                .await?;
+            // A directory of this id may be half deleted by garbage collection
+            // (ADR 0012) while this wrote it: never point `current` at one
+            // whose manifest is not there, as written.
+            match self.get(&format!("{version}/manifest")).await? {
+                Some((bytes, _)) if bytes == text.as_bytes() => {}
+                _ => {
+                    return Err(DeployError::Bucket(format!(
+                        "{version}/manifest changed while deploying; retry"
+                    )));
+                }
+            }
+            let seq = read.as_ref().map_or(1, |(c, _)| c.seq + 1);
+            let previous = read.as_ref().map(|(c, _)| c.version.clone());
+            if let Some(marker) = &marker {
+                marker.check()?;
+            }
+            self.swap_current(read.map(|(_, v)| v), &version, seq, marked)
+                .await?;
+            // Deleted while this deployed (ADR 0028): what it wrote is left to
+            // `app delete`, which removes everything but the tombstone.
+            if self.tombstone().await?.is_some() {
+                return Err(DeployError::Refused(format!(
+                    "{} was deleted while this deployed: what the deploy wrote stays in the \
+                 bucket until `wasmkeep app delete` is run again",
+                    self.name()
                 )));
             }
+            Ok(Deployed {
+                repaired,
+                current: Current {
+                    version,
+                    seq,
+                    marked,
+                    rooted: true,
+                },
+                previous,
+                unchanged: false,
+                diff,
+                newly_marked: marked && from_before,
+            })
+        };
+        if has_assets {
+            self.with_assets_marker(|marker| publish(Some(marker)))
+                .await
+        } else {
+            publish(None).await
         }
-        let seq = read.as_ref().map_or(1, |(c, _)| c.seq + 1);
-        let previous = read.as_ref().map(|(c, _)| c.version.clone());
-        self.swap_current(read.map(|(_, v)| v), &version, seq, marked)
-            .await?;
-        // Deleted while this deployed (ADR 0028): what it wrote is left to
-        // `app delete`, which removes everything but the tombstone.
-        if self.tombstone().await?.is_some() {
-            return Err(DeployError::Refused(format!(
-                "{} was deleted while this deployed: what the deploy wrote stays in the \
-                 bucket until `wasmkeep app delete` is run again",
-                self.name()
-            )));
-        }
-        Ok(Deployed {
-            current: Current {
-                version,
-                seq,
-                marked,
-                rooted: true,
-            },
-            previous,
-            unchanged: false,
-            diff,
-            newly_marked: marked && from_before,
-        })
     }
 
     /// Makes the version deployed before the current one current again, with
@@ -1398,6 +1576,9 @@ impl AppRef {
             .clone()
             .ok_or(DeployError::Nothing("no previous version to roll back to"))?;
         let back = self.manifest(&previous).await?;
+        if let Some(hash) = &back.assets {
+            self.read_assets_index(hash).await?;
+        }
         let (access, config) = self.settings(&current.version, &manifest).await?;
         let now = Settings { access, config };
         let (access, config) = self.settings(&previous, &back).await?;
@@ -1421,6 +1602,7 @@ impl AppRef {
         self.swap_current(Some(read), &previous, seq, marked)
             .await?;
         Ok(Deployed {
+            repaired: 0,
             current: Current {
                 version: previous,
                 seq,
@@ -1568,6 +1750,7 @@ impl AppRef {
         // outage alone is not evidence of a policy; a decoded policy is.
         service.set_rate_limits_pending(!manifest.limits.is_empty());
         let Version {
+            assets,
             classes,
             access,
             config,
@@ -1602,7 +1785,8 @@ impl AppRef {
             None => None,
         };
         service
-            .apply_deployed(
+            .apply_deployed_assets(
+                assets,
                 current.seq,
                 &compiled,
                 &service.effective_rules(current.marked, &access),
@@ -1698,6 +1882,10 @@ impl Current {
 /// What `wasmkeep deploy` changes (ADR 0013).
 #[derive(Default)]
 pub struct Changes {
+    /// Keep, replace, or remove the static assets index.
+    pub assets: crate::assets::Change,
+    /// Read contents back as well as checking their sizes.
+    pub assets_verify: bool,
     /// The new class table; `None` keeps the current classes.
     pub classes: Option<Vec<(String, Vec<u8>)>>,
     /// `(class, spec)`: sets the class's rule (`open` removes it).
@@ -1771,6 +1959,7 @@ impl Changes {
         let mut changes = Self {
             classes: Some(Vec::new()),
             every_rule: true,
+            assets: crate::assets::Change::Remove,
             limits: Some(Default::default()),
             ..Self::default()
         };
@@ -1854,6 +2043,8 @@ struct Settings {
 /// What a deploy or rollback made current, and what changed.
 #[derive(Debug, Clone)]
 pub struct Deployed {
+    /// Content and index objects uploaded or repaired, excluding the marker.
+    pub repaired: usize,
     /// What `current` now points at.
     pub current: Current,
     /// The version `current` pointed at before (rolled back from, for a
@@ -1876,6 +2067,8 @@ pub struct Deployed {
 /// the values) of configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diff {
+    /// Assets added, changed, removed, or kept.
+    pub assets: Option<&'static str>,
     /// Classes added.
     pub added: Vec<String>,
     /// Each added class's rule (`open` when it has none): an added class
@@ -1925,6 +2118,7 @@ impl Diff {
 
     fn between(before: Option<(&Manifest, &Settings)>, after: (&Manifest, &Settings)) -> Self {
         let empty_manifest = Manifest {
+            assets: None,
             previous: None,
             classes: BTreeMap::new(),
             front: None,
@@ -1970,6 +2164,13 @@ impl Diff {
                 }
             }
         }
+        diff.assets = match (&bm.assets, &am.assets) {
+            (None, None) => None,
+            (None, Some(_)) => Some("added"),
+            (Some(_), None) => Some("removed"),
+            (Some(b), Some(a)) if b != a => Some("changed"),
+            _ => Some("unchanged"),
+        };
         diff.front = match (&bm.front, &am.front) {
             (None, None) => None,
             (None, Some(_)) => Some("added"),
@@ -2147,6 +2348,8 @@ fn more_open(before: &AccessRules, after: &AccessRules, class: &str) -> bool {
 /// and sizes, never a configuration value.
 #[derive(Clone)]
 pub struct Version {
+    /// Verified static assets of this version.
+    pub assets: Option<crate::assets::Deployed>,
     /// Each class's component bytes.
     pub classes: Vec<(String, Vec<u8>)>,
     /// The version's access rules (classes not listed are open).
@@ -2243,6 +2446,8 @@ fn parse_config(bytes: &[u8]) -> Result<Vars, String> {
 /// configuration digests, and the version before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
+    /// SHA-256 of the canonical static assets index (format 7).
+    pub assets: Option<String>,
     /// The version that was current when this one was deployed.
     pub previous: Option<String>,
     /// Class name -> SHA-256 of its component.
@@ -2289,6 +2494,9 @@ impl Manifest {
         if let Some(digest) = &self.front {
             out.push_str(&format!("front main {digest}\n"));
         }
+        if let Some(digest) = &self.assets {
+            out.push_str(&format!("assets {digest}\n"));
+        }
         for (class, spec) in &self.access {
             out.push_str(&format!("access {class} {spec}\n"));
         }
@@ -2330,7 +2538,9 @@ impl Manifest {
     /// ADR 0013, kept as the minimal one), else 2.
     #[must_use]
     pub fn format_number(&self) -> u8 {
-        if !self.limits.is_empty() {
+        if self.assets.is_some() {
+            7
+        } else if !self.limits.is_empty() {
             6
         } else if !self.batched.is_empty() {
             5
@@ -2364,9 +2574,11 @@ impl Manifest {
             "wasmkeep-manifest 4" => 4,
             "wasmkeep-manifest 5" => 5,
             "wasmkeep-manifest 6" => 6,
+            "wasmkeep-manifest 7" => 7,
             _ => return None,
         };
         let mut manifest = Self {
+            assets: None,
             previous: None,
             classes: BTreeMap::new(),
             front: None,
@@ -2410,6 +2622,13 @@ impl Manifest {
             }
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some("assets"), Some(d), None, None)
+                    if format == 7
+                        && manifest.assets.is_none()
+                        && crate::assets::valid_digest(d) =>
+                {
+                    manifest.assets = Some(d.into());
+                }
                 (Some("previous"), Some(v), None, None) => manifest.previous = Some(v.to_owned()),
                 // `_front` is never a class (no class of that name ever
                 // linked, in any format): it names the front.
@@ -2456,6 +2675,9 @@ impl Manifest {
                 }
                 _ => return None,
             }
+        }
+        if format == 7 && manifest.assets.is_none() {
+            return None;
         }
         let known = |c: &String| manifest.classes.contains_key(c);
         // The front's scope holds values and required names, never a rule,
@@ -2670,6 +2892,7 @@ mod tests {
 
     fn two_classes() -> Manifest {
         Manifest {
+            assets: None,
             previous: Some("abc".into()),
             classes: BTreeMap::from([
                 ("chat".into(), "11".into()),
@@ -2776,6 +2999,7 @@ mod tests {
         // (computed independently: `printf ... | sha256sum`); later ones
         // add the version they replaced.
         let first = Manifest {
+            assets: None,
             previous: None,
             ..m.clone()
         };
@@ -2791,10 +3015,12 @@ mod tests {
     #[test]
     fn the_version_it_replaced_is_part_of_the_id() {
         let after_a = Manifest {
+            assets: None,
             previous: Some("aaaa".into()),
             ..two_classes()
         };
         let after_b = Manifest {
+            assets: None,
             previous: Some("bbbb".into()),
             ..two_classes()
         };
@@ -2850,6 +3076,7 @@ mod tests {
     #[test]
     fn version_debug_shows_no_value() {
         let v = Version {
+            assets: None,
             classes: vec![("c".into(), vec![0; 3])],
             access: AccessRules::default(),
             config: BTreeMap::from([(
@@ -2867,6 +3094,24 @@ mod tests {
             shown.contains("URL") && !shown.contains("hidden"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn assets_format_7_round_trip_and_legacy_identity() {
+        let old = two_classes();
+        let text = format!(
+            "wasmkeep-manifest 7\nclass chat 11\nclass counter 22\nassets {}\n",
+            "a".repeat(64)
+        );
+        let m = Manifest::parse(&text).expect("format 7 with assets must parse");
+        assert_eq!(m.format(), text);
+        assert_ne!(m.version_id(), old.version_id());
+        assert!(Manifest::parse(&text.replace("manifest 7", "manifest 6")).is_none());
+        assert!(
+            Manifest::parse(&(text.clone() + &format!("assets {}\n", "a".repeat(64)))).is_none()
+        );
+        assert!(Manifest::parse("wasmkeep-manifest 7\nclass chat 11\n").is_none());
+        assert_eq!(Manifest::parse(&old.format()), Some(old));
     }
 
     #[test]
@@ -2894,8 +3139,8 @@ mod tests {
     fn manifests_with_unknown_or_inconsistent_lines_are_refused() {
         let base = "wasmkeep-manifest 2\nclass chat 11\n";
         for bad in [
-            // A format after this version's (6, ADR 0036).
-            "wasmkeep-manifest 7\nclass chat 11\n".to_owned(),
+            // A format after this version's (7, ADR 0030).
+            "wasmkeep-manifest 8\nclass chat 11\n".to_owned(),
             format!("{base}secret chat 11\n"),
             // Idle limits (ADR 0028): format 4 only, a known class, once,
             // between an hour and the longest.
@@ -2970,7 +3215,7 @@ mod tests {
             "wasmkeep-manifest 4\nclass chat 11\nwrites chat batched\n",
             "wasmkeep-manifest 1\nclass chat 11\nwrites chat batched\n",
             // A format this version does not know.
-            "wasmkeep-manifest 7\nclass chat 11\n",
+            "wasmkeep-manifest 8\nclass chat 11\n",
         ] {
             assert_eq!(Manifest::parse(bad), None, "{bad}");
         }
@@ -2984,7 +3229,7 @@ mod tests {
     }
 
     /// A live heartbeat of a node serving `default/shop` with these words.
-    async fn heartbeat(store: &Arc<dyn ObjectStore>, id: &str, words: &str) {
+    pub(super) async fn heartbeat(store: &Arc<dyn ObjectStore>, id: &str, words: &str) {
         let body = format!(
             "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n0.4.2\n{}\ndefault/shop\n\n\nserving\nsecrets\n{words}\n",
             crate::alarm::now_ms_i64()
@@ -3158,6 +3403,7 @@ mod tests {
         assert_ne!(none.version_id(), m.version_id());
         // A front alone, no class.
         let alone = Manifest {
+            assets: None,
             previous: None,
             classes: BTreeMap::new(),
             front: Some("44".into()),

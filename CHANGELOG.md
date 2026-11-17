@@ -9,6 +9,14 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Static assets (ADR 0030, section 9):** deploy project directories with
+  app-scoped indexes, hostname isolation, verified per-app caches, browser
+  cache rules, compressed variants and ranges. Deploy/collection markers
+  protect retained versions through concurrent collection and rollback;
+  unchanged deploys repair missing files. `wasmkeep dev` serves files live
+  with the same routing and headers. Format 7 requires the `assets`
+  capability. See [static assets](docs/static-assets.md).
+
 - **Big rooms (ADR 0040):** the Rust and TypeScript SDKs gain a
   directory (key ranges to actors, split and merge as durable
   transactions) and a broadcast group: a room actor that numbers messages

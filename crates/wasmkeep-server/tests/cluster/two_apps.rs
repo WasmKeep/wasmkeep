@@ -145,6 +145,7 @@ async fn process_inner(
                         .version(&current.version)
                         .await
                         .map_err(|e| e.to_string())?;
+                    config.assets = version.assets;
                     config.access = version.access;
                     cluster.follows_app = true;
                     follow = Some((app, current.seq));
@@ -1033,4 +1034,139 @@ async fn a_rolling_upgrade_from_single_app_nodes_and_back() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+/// A6: identical URL names belong to the hostname-selected app alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assets_are_isolated_by_hostname_and_cache_directory() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    for (name, body) in [("shop", b"shop"), ("blog", b"blog")] {
+        let mut change = super::assets::changes(body);
+        if let wasmkeep_server::assets::Change::Set(bundle) = &mut change.assets {
+            bundle.index.files.insert(
+                format!("{name}.txt"),
+                bundle.index.files["index.html"].clone(),
+            );
+            if name == "shop" {
+                let wasmkeep_server::assets::Change::Set(other) =
+                    super::assets::changes(b"blog").assets
+                else {
+                    unreachable!()
+                };
+                bundle.index.files.insert(
+                    "borrowed.txt".into(),
+                    other.index.files["index.html"].clone(),
+                );
+                bundle.contents.extend(other.contents);
+            }
+        }
+        AppRef::new(store.clone(), "", "acme", name)
+            .deploy_changes(&deploy_runtime(), change)
+            .await
+            .unwrap();
+    }
+    // Only blog owns these bytes; shop's otherwise valid index names them too.
+    use object_store::ObjectStoreExt as _;
+    store
+        .delete(
+            &format!(
+                "apps/acme/shop/_assets/content/{}",
+                wasmkeep_server::assets::digest(b"blog")
+            )
+            .into(),
+        )
+        .await
+        .unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let defs = [
+        Def {
+            deployed: true,
+            ..def(
+                "shop-assets",
+                "acme",
+                "shop",
+                &["shop.test", "www.shop.test"],
+            )
+        },
+        Def {
+            deployed: true,
+            ..def("blog-assets", "acme", "blog", &["blog.test"])
+        },
+    ];
+    let p = process(&store, d.path(), &defs).await;
+    for (host, body, node) in [
+        ("shop.test", "shop", "shop-assets"),
+        ("www.shop.test", "shop", "shop-assets"),
+        ("blog.test", "blog", "blog-assets"),
+    ] {
+        let r = to(
+            p.public,
+            host,
+            "GET",
+            "/index.html",
+            "X-Forwarded-Host: blog.test\r\nForwarded: host=blog.test\r\n",
+        )
+        .await;
+        assert_eq!((r.status, r.body.as_str()), (200, body));
+        let cache = d.path().join(node).join("assets/acme").join(body);
+        assert!(
+            cache
+                .join(wasmkeep_server::assets::digest(body.as_bytes()))
+                .exists(),
+            "{}",
+            cache.display()
+        );
+        assert!(
+            !cache
+                .join(wasmkeep_server::assets::digest(if body == "shop" {
+                    b"blog"
+                } else {
+                    b"shop"
+                }))
+                .exists()
+        );
+    }
+    assert_eq!(
+        to(p.public, "unknown.test", "GET", "/index.html", "")
+            .await
+            .status,
+        421
+    );
+    let metrics = wasmkeep_server::metrics::render(Default::default());
+    for name in ["shop", "blog"] {
+        for metric in [
+            "wasmkeep_asset_requests_total",
+            "wasmkeep_asset_bytes_total",
+            "wasmkeep_asset_cache_bytes",
+            "wasmkeep_asset_fetches_total",
+        ] {
+            assert!(
+                metrics.lines().any(|line| line.starts_with(metric)
+                    && line.contains("tenant=\"acme\"")
+                    && line.contains(&format!("app=\"{name}\""))),
+                "{metric}: {metrics}"
+            );
+        }
+    }
+    assert_eq!(
+        to(p.public, "shop.test", "GET", "/borrowed.txt", "")
+            .await
+            .status,
+        503
+    );
+    assert_eq!(
+        to(p.public, "shop.test", "GET", "/blog.txt", "")
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        to(p.public, "blog.test", "GET", "/shop.txt", "")
+            .await
+            .status,
+        404
+    );
 }

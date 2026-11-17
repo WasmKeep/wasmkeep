@@ -8,6 +8,7 @@ mod app_delete;
 mod app_format_cmd;
 use wasmkeep_cli::backup;
 use wasmkeep_cli::{open_bucket_unchecked, parse_app, parse_bucket};
+mod assets;
 mod dev;
 mod dev_project;
 mod diagnose;
@@ -43,6 +44,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Collect unused static assets and expired versions from an app's bucket.
+    #[command(subcommand)]
+    Assets(AssetsCommand),
     /// Export changed states to local Parquet files in one read-only poll.
     Feed(wasmkeep_cli::feed::CommandArgs),
     /// Create and verify lease-free online archives.
@@ -77,6 +81,47 @@ enum Command {
     /// Act on a whole app, through its bucket.
     #[command(subcommand)]
     App(AppCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum AssetsCommand {
+    /// Collect old versions and unused contents and indexes (ADR 0030).
+    Collect(AssetsCollectArgs),
+}
+
+#[derive(Debug, Args)]
+struct AssetsCollectArgs {
+    /// The app, TENANT/APP.
+    #[arg(long, value_parser = parse_app)]
+    app: (String, String),
+    /// Bucket shared by the cluster: s3://BUCKET[/PREFIX].
+    #[arg(long)]
+    bucket: String,
+    /// Minimum retention for old versions and unused assets, in seconds.
+    #[arg(long, default_value_t = 3600, value_name = "SECS")]
+    version_retention_secs: u64,
+}
+
+fn assets_collect(args: AssetsCollectArgs) -> anyhow::Result<()> {
+    let (store, prefix) = open_bucket(&args.bucket)?;
+    assets_collect_in(args, store, &prefix)
+}
+
+fn assets_collect_in(
+    args: AssetsCollectArgs,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    let app = AppRef::new(store, prefix, &args.app.0, &args.app.1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (versions, assets) = rt.block_on(app.collect(
+        wasmkeep_server::apps::KEEP_PREVIOUS,
+        std::time::Duration::from_secs(args.version_retention_secs),
+    ))?;
+    println!("removed {versions} old version(s) and {assets} asset object(s) from the bucket");
+    Ok(())
 }
 
 #[derive(Debug, Subcommand)]
@@ -406,6 +451,25 @@ struct DeployArgs {
     #[arg(long, value_name = "NAMES", value_parser = parse_names)]
     front_requires: Option<std::collections::BTreeSet<String>>,
 
+    /// Static files to deploy (ADR 0030).
+    #[arg(long, conflicts_with = "no_assets")]
+    assets: Option<PathBuf>,
+    /// Remove static assets from the new version.
+    #[arg(long)]
+    no_assets: bool,
+    #[arg(long, requires = "assets", value_parser = ["front", "spa", "404"])]
+    assets_not_found: Option<String>,
+    #[arg(long, requires = "assets", value_delimiter = ',')]
+    assets_front_first: Vec<String>,
+    #[arg(long, requires = "assets", value_delimiter = ',')]
+    assets_immutable: Vec<String>,
+    /// Download asset objects to detect and repair same-size corruption.
+    #[arg(long, conflicts_with = "no_assets")]
+    assets_verify: bool,
+    /// Confirm a changed deploy with assets without an interactive prompt.
+    #[arg(long)]
+    yes: bool,
+
     /// Go back to the version deployed before the current one, with its
     /// access rules, configuration and front.
     #[arg(
@@ -413,7 +477,8 @@ struct DeployArgs {
         conflicts_with_all = [
             "actors", "access", "config", "requires",
             "front", "no_front", "front_config", "front_requires",
-            "expire_after_idle",
+            "expire_after_idle", "assets", "no_assets", "assets_not_found",
+            "assets_front_first", "assets_immutable", "assets_verify",
         ]
     )]
     rollback: bool,
@@ -530,6 +595,10 @@ struct DevArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ServeArgs {
+    /// Process-wide static asset disk cache ceiling in bytes.
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    assets_cache_bytes: u64,
+
     /// The front: a stateless component (.wasm exporting
     /// wasi:http/incoming-handler) for every path outside /actor/ and
     /// /_wasmkeep/. It may call the --actor classes with actors.call, and
@@ -1266,6 +1335,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Assets(AssetsCommand::Collect(args)) => assets_collect(args),
         Command::Serve(args) => serve(*args),
         Command::Deploy(args) => deploy(args),
         Command::Cluster(ClusterCommand::Status(args)) => cluster_status(args),
@@ -1660,6 +1730,8 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             config.requires = deployed.requires;
             config.batched = deployed.batched;
             config.limits = deployed.limits;
+            config.assets = deployed.assets;
+            config.assets_cache = wasmkeep_server::assets::Cache::new(args.assets_cache_bytes);
             config.expire_after_idle = deployed
                 .expire
                 .iter()
@@ -2082,6 +2154,13 @@ fn deployed_line(
     rollback: bool,
 ) -> String {
     let current = &deployed.current;
+    if deployed.unchanged && deployed.diff.assets.is_some() {
+        return if deployed.repaired == 0 {
+            format!("{tenant}/{name}: unchanged")
+        } else {
+            format!("{tenant}/{name}: unchanged, {} repaired", deployed.repaired)
+        };
+    }
     match (&deployed.previous, rollback, deployed.unchanged) {
         (_, _, true) => format!(
             "{tenant}/{name}: nothing changed: version {} is already current (deploy {})",
@@ -2127,6 +2206,11 @@ fn refuse_front_scope(args: &DeployArgs) -> anyhow::Result<()> {
 /// among those given: refused beside a project file (ADR 0026).
 fn version_flags(args: &DeployArgs) -> Vec<&'static str> {
     [
+        ("--assets", args.assets.is_some()),
+        ("--no-assets", args.no_assets),
+        ("--assets-not-found", args.assets_not_found.is_some()),
+        ("--assets-front-first", !args.assets_front_first.is_empty()),
+        ("--assets-immutable", !args.assets_immutable.is_empty()),
         ("--actor", !args.actors.is_empty()),
         ("--access", !args.access.is_empty()),
         ("--config", !args.config.is_empty()),
@@ -2143,6 +2227,23 @@ fn version_flags(args: &DeployArgs) -> Vec<&'static str> {
     .collect()
 }
 
+fn asset_plan(diff: &wasmkeep_server::apps::Diff, scan: Option<&assets::Scan>, yes: bool) -> bool {
+    if let Some(scan) = scan {
+        scan.print();
+    }
+    if let Some(change) = diff.assets {
+        println!("  assets: {change}");
+    }
+    if diff.assets.is_none() || diff.assets == Some("removed") || yes {
+        return true;
+    }
+    use std::io::Write;
+    eprint!("Deploy these assets? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
 /// `wasmkeep deploy`: validate, upload, switch (or roll back).
 fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     let project = project::discover(args.project.as_deref(), args.no_project, args.rollback)?;
@@ -2155,6 +2256,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     // Builds run and files are read before the bucket is opened: a failed
     // build writes nothing. A rollback runs no build (ADR 0026).
     let mut file_changes = None;
+    let mut asset_scan = None;
     let app = match &project {
         Some(p) => {
             project::refuse_flags(p, &version_flags(&args))?;
@@ -2164,7 +2266,14 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                     project::run_builds(p)?;
                 }
                 let parts = project::read_parts(p, &mut |w| eprintln!("warning: {w}"))?;
-                file_changes = Some(project::to_changes(p, parts));
+                let mut changes = project::to_changes(p, parts);
+                if let Some(assets) = &p.assets {
+                    let scan = assets::scan(&assets.dir, assets.rules.clone())?;
+                    changes.assets = wasmkeep_server::assets::Change::Set(scan.bundle.clone());
+                    asset_scan = Some(scan);
+                }
+                changes.assets_verify = args.assets_verify;
+                file_changes = Some(changes);
             }
             app
         }
@@ -2175,6 +2284,20 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             )
         })?,
     };
+    if let Some(dir) = &args.assets {
+        asset_scan = Some(assets::scan(
+            dir,
+            wasmkeep_server::assets::Index {
+                not_found: args
+                    .assets_not_found
+                    .clone()
+                    .unwrap_or_else(|| "front".into()),
+                front_first: args.assets_front_first.iter().cloned().collect(),
+                immutable: args.assets_immutable.iter().cloned().collect(),
+                ..Default::default()
+            },
+        )?);
+    }
     refuse_front_scope(&args)?;
     let (tenant, name) = &app;
     let (store, prefix) = open_bucket(&args.bucket)?;
@@ -2201,7 +2324,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         let shown = p.path.display().to_string();
         rt.block_on(app_ref.deploy_changes_with(&runtime, changes, |diff| {
             project::print_plan(&shown, tenant, name, diff);
-            true
+            asset_plan(diff, asset_scan.as_ref(), args.yes)
         }))
         .map_err(named)?
     } else {
@@ -2215,7 +2338,10 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 && args.front_config.is_none()
                 && args.front_requires.is_none()
                 && args.expire_after_idle.is_empty()
-                && args.writes.is_empty()),
+                && args.writes.is_empty()
+                && args.assets.is_none()
+                && !args.no_assets
+                && !args.assets_verify),
             "nothing to deploy: give --actor, --access, --config, --requires, \
              --expire-after-idle, --writes or a front flag (--front, --no-front, --front-config, \
              --front-requires), or --rollback"
@@ -2262,6 +2388,12 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             }
         };
         let changes = wasmkeep_server::apps::Changes {
+            assets: match &asset_scan {
+                Some(scan) => wasmkeep_server::assets::Change::Set(scan.bundle.clone()),
+                None if args.no_assets => wasmkeep_server::assets::Change::Remove,
+                None => wasmkeep_server::assets::Change::Keep,
+            },
+            assets_verify: args.assets_verify,
             limits: None,
             front,
             front_config,
@@ -2298,8 +2430,10 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             },
             every_rule: false,
         };
-        rt.block_on(app_ref.deploy_changes(&runtime, changes))
-            .map_err(named)?
+        rt.block_on(app_ref.deploy_changes_with(&runtime, changes, |diff| {
+            asset_plan(diff, asset_scan.as_ref(), args.yes)
+        }))
+        .map_err(named)?
     };
     // From the file, the plan (and its warnings) was printed before the
     // switch; a deploy that changes nothing says so on its last line.
@@ -2336,11 +2470,13 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     // Old versions beyond what rollbacks need (ADR 0012). The deploy is
     // done either way: a failure here only leaves them for next time.
     let retention = std::time::Duration::from_secs(args.version_retention_secs);
-    match rt.block_on(app_ref.collect_versions(wasmkeep_server::apps::KEEP_PREVIOUS, retention)) {
-        Ok(0) => {}
-        Ok(n) => println!("removed {n} old version(s) from the bucket"),
+    match rt.block_on(app_ref.collect(wasmkeep_server::apps::KEEP_PREVIOUS, retention)) {
+        Ok((0, 0)) => {}
+        Ok((versions, assets)) => println!(
+            "removed {versions} old version(s) and {assets} asset object(s) from the bucket"
+        ),
         Err(e) => {
-            eprintln!("warning: removing old versions failed (the next deploy tries again): {e}")
+            eprintln!("warning: collection failed (the next deploy tries again): {e}")
         }
     }
     Ok(())

@@ -427,6 +427,7 @@ fn a_move_target_that_cannot_take_it_gets_a_warning() {
         can_end: true,
         can_flush: true,
         can_rate_limits: false,
+        can_assets: false,
         can_restore: true,
         can_actor_restore: false,
         instance: None,
@@ -570,6 +571,7 @@ fn a_deploy_says_whether_it_switched_rolled_back_or_changed_nothing() {
     };
     let deployed =
         |version, seq, previous: Option<&str>, unchanged| wasmkeep_server::apps::Deployed {
+            repaired: 0,
             current: current(version, seq),
             previous: previous.map(Into::into),
             unchanged,
@@ -601,6 +603,7 @@ fn a_deploy_says_whether_it_switched_rolled_back_or_changed_nothing() {
 #[test]
 fn a_rollback_names_its_version_above_its_changes() {
     let deployed = |unchanged| wasmkeep_server::apps::Deployed {
+        repaired: 0,
         current: wasmkeep_server::apps::Current {
             version: "8447609efdefe311".into(),
             seq: 3,
@@ -752,6 +755,7 @@ fn a_no_op_deploy_prints_no_changes() {
         ..Default::default()
     };
     let deployed = |unchanged| wasmkeep_server::apps::Deployed {
+        repaired: 0,
         current: wasmkeep_server::apps::Current {
             version: "8447609efdefe311".into(),
             seq: 2,
@@ -1466,4 +1470,87 @@ fn a_process_is_drained_through_every_node_id_it_runs() {
         super::process_node_ids(&nodes, "edge-1", now, 30_000),
         ["blog-1", "shop-1"]
     );
+}
+
+#[test]
+fn assets_flags_conflicts() {
+    use clap::Parser;
+    for extra in [
+        vec!["--assets-not-found", "spa"],
+        vec!["--assets-front-first", "api/"],
+        vec!["--assets", "web", "--no-assets"],
+        vec!["--rollback", "--assets", "web"],
+        vec!["--rollback", "--assets-verify"],
+    ] {
+        let mut args = vec![
+            "wasmkeep",
+            "deploy",
+            "--app",
+            "t/a",
+            "--bucket",
+            "s3://b",
+            "--no-project",
+        ];
+        args.extend(extra);
+        assert!(super::Cli::try_parse_from(args).is_err());
+    }
+}
+
+#[test]
+fn assets_unchanged_report_counts_the_index_as_a_repair() {
+    let mut deployed = wasmkeep_server::apps::Deployed {
+        current: wasmkeep_server::apps::Current {
+            version: "0123456789abcdef".into(),
+            seq: 1,
+            marked: true,
+            rooted: true,
+        },
+        previous: Some("0123456789abcdef".into()),
+        unchanged: true,
+        repaired: 0,
+        newly_marked: false,
+        diff: wasmkeep_server::apps::Diff {
+            assets: Some("unchanged"),
+            ..Default::default()
+        },
+    };
+    assert_eq!(
+        super::deployed_line("t", "a", &deployed, false),
+        "t/a: unchanged"
+    );
+    deployed.repaired = 2;
+    assert_eq!(
+        super::deployed_line("t", "a", &deployed, false),
+        "t/a: unchanged, 2 repaired"
+    );
+}
+
+#[test]
+fn assets_collect_command() {
+    use clap::Parser;
+    use object_store::{ObjectStoreExt as _, memory::InMemory, path::Path};
+    let parsed = crate::Cli::try_parse_from([
+        "wasmkeep",
+        "assets",
+        "collect",
+        "--app",
+        "acme/shop",
+        "--bucket",
+        "s3://bucket",
+        "--version-retention-secs",
+        "0",
+    ])
+    .unwrap();
+    let crate::Command::Assets(crate::AssetsCommand::Collect(args)) = parsed.command else {
+        panic!("wrong command");
+    };
+    let store = std::sync::Arc::new(InMemory::new());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let key = Path::from(format!("apps/acme/shop/_assets/content/{}", "a".repeat(64)));
+    runtime.block_on(store.put(&key, vec![].into())).unwrap();
+    crate::assets_collect_in(args, store.clone(), "").unwrap();
+    assert!(runtime.block_on(store.head(&key)).is_err());
 }

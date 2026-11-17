@@ -12,6 +12,7 @@ pub mod access;
 mod actor;
 mod alarm;
 pub mod apps;
+pub mod assets;
 mod cluster;
 mod cluster_tls;
 mod counted_store;

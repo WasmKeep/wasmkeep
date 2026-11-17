@@ -17,6 +17,7 @@ pub(crate) const FILE_NAME: &str = "wasmkeep.toml";
 /// A parsed project file. Paths are resolved against the file's directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Project {
+    pub(crate) assets: Option<Assets>,
     /// The file itself.
     pub(crate) path: PathBuf,
     /// Its directory: where builds run and relative paths start.
@@ -29,6 +30,14 @@ pub(crate) struct Project {
     pub(crate) classes: BTreeMap<String, Class>,
     pub(crate) dev: Dev,
     pub(crate) limits: wasmkeep_server::apps::limits::Policies,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Assets {
+    pub(crate) dir: PathBuf,
+    pub(crate) build: Option<String>,
+    pub(crate) watch: Vec<PathBuf>,
+    pub(crate) rules: wasmkeep_server::assets::Index,
 }
 
 /// What the front and a class have in common.
@@ -67,7 +76,7 @@ pub(crate) struct Dev {
     pub(crate) env_named: bool,
 }
 
-const TOP: &[&str] = &["app", "front", "classes", "dev", "limits"];
+const TOP: &[&str] = &["app", "front", "classes", "dev", "limits", "assets"];
 const APP: &[&str] = &["tenant", "name"];
 const FRONT: &[&str] = &["component", "build", "config", "requires", "watch"];
 const CLASS: &[&str] = &[
@@ -385,6 +394,7 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
     if app_only {
         let mut names = names.into_iter();
         return Ok(Project {
+            assets: None,
             path: path.to_path_buf(),
             dir: dir.clone(),
             tenant: names.next().unwrap_or_default(),
@@ -490,7 +500,53 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
             );
         }
     }
-    if front.is_none() && classes.is_empty() {
+    let assets = if let Some(t) = table(&src, root, "assets")? {
+        known_keys(
+            &src,
+            t,
+            "[assets]",
+            &[
+                "dir",
+                "build",
+                "not-found",
+                "front-first",
+                "immutable",
+                "watch",
+            ],
+        )?;
+        let asset_dir = string(&src, t, "dir", "[assets]")?
+            .ok_or_else(|| format!("{}: [assets] requires dir", src.at(0..0)))?;
+        let rules = wasmkeep_server::assets::Index {
+            not_found: string(&src, t, "not-found", "[assets]")?.unwrap_or_else(|| "front".into()),
+            front_first: strings(&src, t, "front-first", "[assets]")?
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect(),
+            immutable: strings(&src, t, "immutable", "[assets]")?
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect(),
+            ..Default::default()
+        };
+        rules.validate_rules().map_err(|e| {
+            format!(
+                "{}: [assets]: {e}",
+                src.at(get(root, "assets").map(|(_, v)| v.span()).unwrap_or(0..0))
+            )
+        })?;
+        Some(Assets {
+            dir: resolve(&dir, &asset_dir),
+            rules,
+            build: string(&src, t, "build", "[assets]")?,
+            watch: strings(&src, t, "watch", "[assets]")?
+                .into_iter()
+                .map(|(v, _)| resolve(&dir, &v))
+                .collect(),
+        })
+    } else {
+        None
+    };
+    if front.is_none() && classes.is_empty() && assets.is_none() {
         return Err(format!(
             "{}: nothing to deploy: give [front] or at least one [classes.<name>]",
             src.at(0..0)
@@ -591,6 +647,7 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
 
     let mut names = names.into_iter();
     Ok(Project {
+        assets,
         path: path.to_path_buf(),
         dir,
         tenant: names.next().unwrap_or_default(),
@@ -744,6 +801,11 @@ pub(crate) fn run_builds(project: &Project) -> anyhow::Result<()> {
                 project.path.display()
             );
         }
+    }
+    if let Some(assets) = &project.assets
+        && let Some(cmd) = &assets.build
+    {
+        run_build(&project.dir, "assets", cmd)?;
     }
     for (what, item) in items(project) {
         if let Some(cmd) = &item.build {
@@ -919,6 +981,14 @@ port = 9090
 data-dir = "state"
 env = ".env.dev"
 "#;
+
+    #[test]
+    fn assets_project_fields_and_prefix_refusal() {
+        parse_ok(
+            "[app]\ntenant = 'acme'\nname = 'shop'\n[assets]\ndir = 'web/dist'\nbuild = 'true'\nnot-found = 'spa'\nfront-first = ['api/']\nimmutable = ['assets/']\nwatch = ['web/src']\n",
+        );
+        assert!(parse_err("[app]\ntenant = 'acme'\nname = 'shop'\n[assets]\ndir = 'web'\nfront-first = ['api']\n").contains("prefix"));
+    }
 
     #[test]
     fn ingress_limits_project_grammar() {
@@ -1412,6 +1482,18 @@ env = ".env.dev"
         ] {
             assert!(lines.contains(&want.to_owned()), "{want}: {lines:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assets_build_before_front_and_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = parse("[app]\ntenant='a'\nname='b'\n[assets]\ndir='web'\nbuild='echo assets >> order'\n[front]\ncomponent='f.wasm'\nbuild='echo front >> order'\n[classes.c]\ncomponent='c.wasm'\nbuild='echo class >> order'\n", &dir.path().join(FILE_NAME)).unwrap();
+        run_builds(&p).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("order")).unwrap(),
+            "assets\nfront\nclass\n"
+        );
     }
 
     #[cfg(unix)]
