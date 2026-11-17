@@ -6,6 +6,7 @@ mod actor_read;
 mod actor_restore;
 mod app_delete;
 mod app_format_cmd;
+mod inspect;
 use wasmkeep_cli::backup;
 use wasmkeep_cli::{open_bucket_unchecked, parse_app, parse_bucket};
 mod assets;
@@ -44,6 +45,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open a local, read-only bucket inspector.
+    Inspect(inspect::Args),
     /// Collect unused static assets and expired versions from an app's bucket.
     #[command(subcommand)]
     Assets(AssetsCommand),
@@ -1335,6 +1338,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Inspect(args) => inspect::run(args),
         Command::Assets(AssetsCommand::Collect(args)) => assets_collect(args),
         Command::Serve(args) => serve(*args),
         Command::Deploy(args) => deploy(args),

@@ -14,6 +14,14 @@ name = "wasmkeep"
 path = "src/main.rs"
 
 [dependencies]
+# Inspector HTTP transport and bodies: reuse the workspace server stack.
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+# Inspector authentication: OS entropy and constant-time comparison, already locked.
+getrandom = "=0.4.3"
+subtle = "=2.6.1"
 # ADR 0030: validate and deterministically generate precompressed assets.
 brotli = "=8.0.3"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }

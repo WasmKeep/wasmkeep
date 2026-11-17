@@ -9,6 +9,11 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Local inspector:** `wasmkeep inspect --app TENANT/APP` serves an embedded,
+  authenticated loopback page for bucket status, class and actor listings,
+  retained history and constrained read-only SQL. No node endpoint or bucket
+  writes. See the [inspector guide](docs/inspector.md).
+
 - **A React quickstart:** `examples/react-todos` is a TypeScript actor
   and a React + Vite page over one typed contract, with Vite proxying to
   `wasmkeep dev` and the built page deployed as static assets
