@@ -993,7 +993,10 @@ impl ActorState {
                         )
                         .await
                         .map_err(|e| format!("writing the sweep record: {e}")),
-                    _ => Ok(()),
+                    // Files are off on this bucket: none to sweep.
+                    Some(_) => Ok(()),
+                    // No service to write the record with: no delete.
+                    None => Err("no service to write the sweep record with".to_owned()),
                 };
                 let mut replica = slot.lock().await;
                 let empty = all.clone();
@@ -1205,32 +1208,45 @@ impl ActorState {
     }
 
     /// The actor's blob incarnation, read from its database once per
-    /// instance (after the restore). In a cluster an absent value is the
-    /// first incarnation, which only a delete moves; on a node without a
-    /// bucket the database is the only record of it, so a database without
-    /// one (a new actor, or the next one after a delete) draws a new one,
-    /// and the files of any other incarnation of the address go.
+    /// instance (after the restore), by `blob_sweep::start`: a database a
+    /// delete reset without an incarnation (a node without `blobs`) draws a
+    /// fresh one, written into it before any file call and uploaded with
+    /// its next change, and never runs at `0`. On a node without a bucket
+    /// the database is the only record of it, so one without any (a new
+    /// actor, or the next one after a delete) draws one too, and the files
+    /// of any other incarnation of the address go; a class that imports no
+    /// `blobs` writes nothing (it cannot reach files).
     async fn blob_incarnation(
         &mut self,
         db: &mut ResidentDb,
         blobs: Option<&crate::blobs::Blobs>,
     ) -> Result<String, String> {
+        use wasmkeep_cluster::blob_sweep::{Start, start};
         let stored = db
             .meta(BLOB_INCARNATION_KEY)
             .map_err(|e| format!("reading the blob incarnation: {e}"))?;
-        if let Some(blobs) = blobs
-            && !blobs.on_a_bucket()
-            && self.cluster.is_none()
-        {
-            let incarnation = match stored {
-                Some(v) => wasmkeep_cluster::blob_sweep::incarnation_of(Some(&v))?,
-                None => {
-                    let fresh = crate::blobs::random_id().map_err(|e| format!("{e:?}"))?;
-                    db.set_meta(BLOB_INCARNATION_KEY, &fresh)
-                        .map_err(|e| format!("writing the blob incarnation: {e}"))?;
-                    fresh
-                }
-            };
+        let replaced = db
+            .meta("replaced")
+            .map_err(|e| format!("reading the delete mark: {e}"))?;
+        let local = blobs.is_some_and(|b| !b.on_a_bucket()) && self.cluster.is_none();
+        let started = match start(stored.as_deref(), replaced.as_deref())? {
+            Start::Use(i) if !(local && stored.is_none()) => Start::Use(i),
+            Start::Use(i) if !self.class_imports_blobs() => {
+                // On disk, a class without files: nothing to draw yet.
+                return Ok(i);
+            }
+            _ => Start::Draw,
+        };
+        let incarnation = match started {
+            Start::Use(i) => i,
+            Start::Draw => {
+                let fresh = crate::blobs::random_id().map_err(|e| format!("{e:?}"))?;
+                db.set_meta(BLOB_INCARNATION_KEY, &fresh)
+                    .map_err(|e| format!("writing the blob incarnation: {e}"))?;
+                fresh
+            }
+        };
+        if local && let Some(blobs) = blobs {
             blobs
                 .remove_local(
                     self.address.class(),
@@ -1238,9 +1254,19 @@ impl ActorState {
                     Some(&incarnation),
                 )
                 .await;
-            return Ok(incarnation);
         }
-        wasmkeep_cluster::blob_sweep::incarnation_of(stored.as_deref())
+        Ok(incarnation)
+    }
+
+    /// Whether the actor's class imports `wasmkeep:actor/blobs`.
+    fn class_imports_blobs(&self) -> bool {
+        let engine = self.runtime.engine();
+        self.class
+            .pre
+            .component()
+            .component_type()
+            .imports(engine)
+            .any(|(name, _)| name.starts_with("wasmkeep:actor/blobs@"))
     }
 
     /// The app's files, if the service is still there.

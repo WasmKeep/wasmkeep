@@ -30,6 +30,11 @@ pub const PENDING_JUDGED_AFTER_MS: u64 = 10 * 60 * 1000;
 pub const RELIST_AFTER_MS: u64 = 60 * 60 * 1000;
 pub const LAST_LIST_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// How long a record nobody can judge (the actor has no history to fence,
+/// no ownership record, or its class is gone) is kept before it is dropped:
+/// dropping a record never deletes a file, so it is always safe.
+pub const AGE_OUT_MS: u64 = 25 * 60 * 60 * 1000;
+
 /// How often the sweep node runs a pass.
 pub const PASS_EVERY_MS: u64 = 60 * 1000;
 
@@ -49,6 +54,32 @@ pub fn incarnation_of(meta: Option<&str>) -> Result<String, String> {
         None => Ok(FIRST.to_owned()),
         Some(v) if is_incarnation(v) && v != FIRST => Ok(v.to_owned()),
         Some(v) => Err(format!("the actor's blob incarnation {v:?} is not one")),
+    }
+}
+
+/// What an instance of the actor uses as its incarnation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// This one.
+    Use(String),
+    /// A fresh one, drawn and written into the database before any file
+    /// call: the database carries a delete's mark (`replaced` starting
+    /// `delete `) but no incarnation, a reset of a node without `blobs`.
+    /// Running it at [`FIRST`] would put it in the files of the actor
+    /// before that delete, or under a record that sweeps them.
+    Draw,
+}
+
+/// The incarnation an instance starts with, from the database's host meta
+/// `blob_incarnation` and `replaced`.
+///
+/// # Errors
+/// An incarnation value that is not one.
+pub fn start(incarnation: Option<&str>, replaced: Option<&str>) -> Result<Start, String> {
+    match incarnation {
+        Some(_) => incarnation_of(incarnation).map(Start::Use),
+        None if replaced.is_some_and(|r| r.starts_with("delete ")) => Ok(Start::Draw),
+        None => Ok(Start::Use(FIRST.to_owned())),
     }
 }
 
@@ -163,6 +194,7 @@ pub struct Ages {
     pub judge_after: u64,
     pub relist_after: u64,
     pub last_after: u64,
+    pub age_out: u64,
 }
 
 impl Default for Ages {
@@ -171,6 +203,7 @@ impl Default for Ages {
             judge_after: PENDING_JUDGED_AFTER_MS,
             relist_after: RELIST_AFTER_MS,
             last_after: LAST_LIST_AFTER_MS,
+            age_out: AGE_OUT_MS,
         }
     }
 }
@@ -201,11 +234,44 @@ pub enum Judged {
     NotDeleted,
 }
 
-pub fn judge(recorded: &str, current: &str) -> Judged {
-    if recorded == current {
+/// `current` is `None` for an actor whose next instance draws a fresh
+/// incarnation ([`Start::Draw`]): no file of it can be under any record.
+pub fn judge(recorded: &str, current: Option<&str>) -> Judged {
+    if current == Some(recorded) {
         Judged::NotDeleted
     } else {
         Judged::Deleted
+    }
+}
+
+/// What a pass does once it acted on a record: every action that removes
+/// files is a judged one, at the second and last listing too (an
+/// incarnation can come back, through a node without `blobs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Nothing now: the next pass asks again.
+    Skip,
+    /// Remove the namespace, then rewrite the record in this state, or
+    /// drop it (`None`).
+    Sweep(Option<State>),
+    /// Drop the record, touch no file: the actor is at that incarnation.
+    Drop,
+    /// Drop the record, touch no file: nobody could judge it for
+    /// [`AGE_OUT_MS`].
+    AgeOut,
+}
+
+/// The outcome of `action` on a record `age_ms` old, given the judgement
+/// (`None`: none could be made).
+pub fn outcome(action: Action, judged: Option<Judged>, age_ms: u64, ages: Ages) -> Outcome {
+    match (action, judged) {
+        (Action::Wait, _) => Outcome::Skip,
+        (_, None) if age_ms > ages.age_out => Outcome::AgeOut,
+        (_, None) => Outcome::Skip,
+        (_, Some(Judged::NotDeleted)) => Outcome::Drop,
+        (Action::Judge, Some(Judged::Deleted)) => Outcome::Sweep(Some(State::Swept)),
+        (Action::Relist, Some(Judged::Deleted)) => Outcome::Sweep(Some(State::Listed)),
+        (Action::Finish, Some(Judged::Deleted)) => Outcome::Sweep(None),
     }
 }
 
@@ -245,6 +311,21 @@ mod tests {
         ] {
             assert!(incarnation_of(Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_delete_mark_without_an_incarnation_draws_a_fresh_one() {
+        assert_eq!(start(None, None), Ok(Start::Use("0".into())));
+        assert_eq!(
+            start(None, Some("restore 4 1 a")),
+            Ok(Start::Use("0".into()))
+        );
+        assert_eq!(start(None, Some("delete 5 1 2")), Ok(Start::Draw));
+        assert_eq!(
+            start(Some("0123456789abcdef"), Some("delete 5 1 2")),
+            Ok(Start::Use("0123456789abcdef".into()))
+        );
+        assert!(start(Some("bad"), None).is_err());
     }
 
     #[test]
@@ -298,8 +379,23 @@ mod tests {
             action(State::Listed, LAST_LIST_AFTER_MS + 1),
             Action::Finish
         );
-        assert_eq!(judge("0", "0"), Judged::NotDeleted);
-        assert_eq!(judge("0", "0123456789abcdef"), Judged::Deleted);
+        assert_eq!(judge("0", Some("0")), Judged::NotDeleted);
+        assert_eq!(judge("0", Some("0123456789abcdef")), Judged::Deleted);
+        assert_eq!(judge("0", None), Judged::Deleted);
+        let ages = Ages::default();
+        for action in [Action::Judge, Action::Relist, Action::Finish] {
+            // The actor came back to the record's incarnation: no file goes.
+            assert_eq!(
+                outcome(action, Some(Judged::NotDeleted), 0, ages),
+                Outcome::Drop
+            );
+            assert_eq!(outcome(action, None, AGE_OUT_MS, ages), Outcome::Skip);
+            assert_eq!(outcome(action, None, AGE_OUT_MS + 1, ages), Outcome::AgeOut);
+        }
+        assert_eq!(
+            outcome(Action::Finish, Some(Judged::Deleted), 0, ages),
+            Outcome::Sweep(None)
+        );
     }
 
     #[test]

@@ -1157,6 +1157,7 @@ async fn sweeping_node_judging_at(
             judge_after,
             relist_after: 600,
             last_after: 900,
+            age_out: 3_000,
         };
         if batched {
             c.batched.insert("blob".into());
@@ -1382,6 +1383,7 @@ async fn judging_a_record_leaves_an_idle_actor_to_expire_on_schedule() {
                 judge_after: 2_000,
                 relist_after: 60_000,
                 last_after: 60_000,
+                age_out: 120_000,
             };
         },
     )
@@ -1484,4 +1486,121 @@ async fn a_node_alone_ends_a_deleted_actors_files() {
         "new"
     );
     assert_eq!(incarnations().len(), 1);
+}
+
+/// A record for the incarnation the actor is at again (the review's
+/// scenario: a node without `blobs` reset it to `0`, then files came back
+/// under `0`): every listing judges first, and the live files stay; the
+/// record goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swept_record_of_the_live_incarnation_never_removes_its_files() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let a = sweeping_node(d.path(), &store, false).await;
+    settle().await;
+    let n = "/actor/blob/back";
+    call(a.addr, "PUT", &format!("{n}/b/k"), "", b"live").await;
+    // History in the bucket, for the judgement's fence.
+    assert_eq!(
+        call(a.addr, "POST", &format!("{n}/touch"), "", b"")
+            .await
+            .body,
+        "touched"
+    );
+    let id = sha256_hex(b"back");
+    for state in [
+        wasmkeep_cluster::blob_sweep::State::Swept,
+        wasmkeep_cluster::blob_sweep::State::Listed,
+    ] {
+        let record = wasmkeep_cluster::blob_sweep::Record {
+            state,
+            epoch: wasmkeep_server::blobs::epoch(None, None),
+            name: "back".into(),
+        };
+        store
+            .put(
+                &object_store::path::Path::from(format!(
+                    "state/default/default/blob-sweeps/blob/{id}/0"
+                )),
+                record.encode().into_bytes().into(),
+            )
+            .await
+            .unwrap();
+        eventually("the record is judged and dropped", async || {
+            file_keys(&store).await.1.is_empty()
+        })
+        .await;
+        assert_eq!(
+            file_keys(&store).await.0.len(),
+            1,
+            "{state:?}: the live file stays"
+        );
+        let r = call(a.addr, "GET", &format!("{n}/b/k"), "", b"").await;
+        assert_eq!((r.status, r.body.as_str()), (200, "live"));
+    }
+}
+
+/// Without the recorded-head format, judging would rewrite an idle
+/// actor's record (its idle age): such an actor is not acquired to judge,
+/// and its record ages out, touching no file (decision 8).
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_recorded_head_an_idle_actor_is_not_acquired_and_its_record_ages_out() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let a = class_node_with(
+        Some(("a", &store)),
+        d.path(),
+        "blob",
+        blob_actor_wasm(),
+        |c| {
+            c.mailbox.idle_timeout = Duration::from_millis(200);
+            let cluster = c.cluster.as_mut().unwrap();
+            cluster.blob_sweep_every = Duration::from_millis(100);
+            cluster.blob_sweep_ages = wasmkeep_cluster::blob_sweep::Ages {
+                judge_after: 300,
+                relist_after: 60_000,
+                last_after: 60_000,
+                age_out: 2_000,
+            };
+        },
+    )
+    .await;
+    settle().await;
+    let n = "/actor/blob/idle";
+    call(a.addr, "PUT", &format!("{n}/b/k"), "", b"mine").await;
+    assert_eq!(
+        call(a.addr, "POST", &format!("{n}/touch"), "", b"")
+            .await
+            .body,
+        "touched"
+    );
+    // Hibernated: its record names nobody.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let owner = object_store::path::Path::from("state/default/default/owners/blob/idle");
+    let before = store.head(&owner).await.unwrap().last_modified;
+    let id = sha256_hex(b"idle");
+    let record = wasmkeep_cluster::blob_sweep::Record {
+        state: wasmkeep_cluster::blob_sweep::State::Pending,
+        epoch: wasmkeep_server::blobs::epoch(None, None),
+        name: "idle".into(),
+    };
+    store
+        .put(
+            &object_store::path::Path::from(format!(
+                "state/default/default/blob-sweeps/blob/{id}/0"
+            )),
+            record.encode().into_bytes().into(),
+        )
+        .await
+        .unwrap();
+    eventually("the record ages out", async || {
+        file_keys(&store).await.1.is_empty()
+    })
+    .await;
+    assert_eq!(
+        store.head(&owner).await.unwrap().last_modified,
+        before,
+        "never acquired"
+    );
+    assert_eq!(file_keys(&store).await.0.len(), 1, "no file touched");
 }

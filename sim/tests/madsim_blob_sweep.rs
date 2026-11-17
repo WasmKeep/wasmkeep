@@ -41,18 +41,28 @@ enum Broken {
     NoIncarnation,
     SweptOnSent,
     StagedIncarnation,
+    /// Relist and Finish remove the namespace without judging again, and a
+    /// database a node without `blobs` reset runs at `0` (both, as before
+    /// the review: either alone is covered by the other rule).
+    NoRejudge,
+    /// A database a node without `blobs` reset runs at `0`.
+    ZeroAfterOldDelete,
 }
 
-/// An actor's database state: its incarnation and the files its rows name.
+/// An actor's database state: its incarnation (`0` also when absent), the
+/// files its rows name, whether a delete reset it, and which life of the
+/// address it is (each delete starts the next).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Db {
     incarnation: String,
     rows: BTreeSet<u64>,
+    deleted: bool,
+    life: u64,
 }
 
-/// A file in the bucket: its incarnation folder and id, and the
-/// incarnation of the actor that wrote it.
-type Files = BTreeMap<(String, u64), String>;
+/// A file in the bucket: its incarnation folder and id, and the life of
+/// the actor that wrote it (or issued the link).
+type Files = BTreeMap<(String, u64), u64>;
 
 struct World {
     rng: Rng,
@@ -66,8 +76,10 @@ struct World {
     records: BTreeMap<String, (State, u64)>,
     /// The current holder: its restored state, its unsent rows.
     holder: Option<(Db, BTreeSet<u64>)>,
-    /// Links issued: the incarnation folder each writes to.
-    links: Vec<String>,
+    /// Links issued: the incarnation folder each writes to, and its life.
+    links: Vec<(String, u64)>,
+    /// Every file ever written: its folder and life.
+    written: BTreeMap<u64, (String, u64)>,
     next_file: u64,
     next_inc: u64,
     ages: Ages,
@@ -87,18 +99,22 @@ impl World {
             history: vec![Db {
                 incarnation: blob_sweep::FIRST.into(),
                 rows: BTreeSet::new(),
+                deleted: false,
+                life: 0,
             }],
             late_reset: None,
             files: Files::new(),
             records: BTreeMap::new(),
             holder: None,
             links: Vec::new(),
+            written: BTreeMap::new(),
             next_file: 1,
             next_inc: 1,
             ages: Ages {
                 judge_after: 50,
                 relist_after: 100,
                 last_after: 200,
+                age_out: 400,
             },
             deletes: 0,
             judged_deleted: 0,
@@ -109,6 +125,25 @@ impl World {
 
     fn head(&self) -> &Db {
         self.history.last().unwrap()
+    }
+
+    /// The incarnation an instance of `db` uses (`None`: it draws a fresh
+    /// one), by the server's rule.
+    fn effective(&self, db: &Db) -> Option<String> {
+        if self.broken == Broken::NoIncarnation {
+            return Some(blob_sweep::FIRST.into());
+        }
+        let replaced = db.deleted.then_some("delete 1 1 1");
+        let absent = db.incarnation == blob_sweep::FIRST;
+        match blob_sweep::start((!absent).then_some(db.incarnation.as_str()), replaced).unwrap() {
+            blob_sweep::Start::Use(i) => Some(i),
+            blob_sweep::Start::Draw
+                if matches!(self.broken, Broken::ZeroAfterOldDelete | Broken::NoRejudge) =>
+            {
+                Some(blob_sweep::FIRST.into())
+            }
+            blob_sweep::Start::Draw => None,
+        }
     }
 
     fn fresh_incarnation(&mut self) -> String {
@@ -127,7 +162,13 @@ impl World {
         {
             self.history.push(late);
         }
-        let db = self.head().clone();
+        let mut db = self.head().clone();
+        // The instance's start: a fresh incarnation, written into the
+        // database (uploaded with its next change), if it must draw one.
+        match self.effective(&db) {
+            Some(i) => db.incarnation = i,
+            None => db.incarnation = self.fresh_incarnation(),
+        }
         self.holder = Some((db, BTreeSet::new()));
     }
 
@@ -154,13 +195,30 @@ impl World {
         let id = self.next_file;
         self.next_file += 1;
         // The file first, durable at once; its row after.
-        self.files
-            .insert((db.incarnation.clone(), id), db.incarnation.clone());
+        self.files.insert((db.incarnation.clone(), id), db.life);
+        self.written.insert(id, (db.incarnation.clone(), db.life));
         unsent.insert(id);
         if self.rng.chance(30) {
-            let inc = db.incarnation.clone();
-            self.links.push(inc);
+            let link = (db.incarnation.clone(), db.life);
+            self.links.push(link);
         }
+    }
+
+    /// A delete by a node without `blobs` (mid-upgrade, or downgraded): its
+    /// reset carries no incarnation and it writes no record.
+    fn old_delete(&mut self) {
+        if self.holder.is_none() {
+            return;
+        }
+        self.upload_rows();
+        let life = self.holder.as_ref().unwrap().0.life + 1;
+        self.history.push(Db {
+            incarnation: blob_sweep::FIRST.into(),
+            rows: BTreeSet::new(),
+            deleted: true,
+            life,
+        });
+        self.holder = None;
     }
 
     fn link_upload(&mut self) {
@@ -168,10 +226,11 @@ impl World {
             return;
         }
         let i = self.rng.below(self.links.len() as u64) as usize;
-        let inc = self.links[i].clone();
+        let (inc, life) = self.links[i].clone();
         let id = self.next_file;
         self.next_file += 1;
-        self.files.insert((inc.clone(), id), inc);
+        self.written.insert(id, (inc.clone(), life));
+        self.files.insert((inc, id), life);
     }
 
     fn delete(&mut self) {
@@ -186,19 +245,17 @@ impl World {
         self.upload_rows();
         let old = self.holder.as_ref().unwrap().0.incarnation.clone();
         self.records.insert(old.clone(), (State::Pending, self.now));
+        let life = self.holder.as_ref().unwrap().0.life + 1;
         let reset = Db {
             incarnation: self.fresh_incarnation(),
             rows: BTreeSet::new(),
+            deleted: true,
+            life,
         };
         self.deletes += 1;
         match self.rng.below(4) {
             // Acknowledged under a valid hold: swept.
-            0 | 1 => {
-                self.history.push(reset);
-                self.records.insert(old.clone(), (State::Swept, self.now));
-                self.remove(&old);
-                self.holder = None;
-            }
+            0 | 1 => self.acknowledged(&old, reset),
             // Sent, the hold lapsed before the answer: it may land later.
             2 => {
                 if self.broken == Broken::SweptOnSent {
@@ -219,6 +276,34 @@ impl World {
         }
     }
 
+    /// A delete's reset acknowledged under a valid hold: the record
+    /// `swept`, the old namespace removed.
+    fn acknowledged(&mut self, old: &str, reset: Db) {
+        self.history.push(reset);
+        self.records
+            .insert(old.to_owned(), (State::Swept, self.now));
+        self.remove(old);
+        self.holder = None;
+    }
+
+    /// A delete by a node with `blobs` that the bucket acknowledged.
+    fn delete_now(&mut self) {
+        self.upload_rows();
+        let (old, life) = {
+            let db = &self.holder.as_ref().unwrap().0;
+            (db.incarnation.clone(), db.life + 1)
+        };
+        self.records.insert(old.clone(), (State::Pending, self.now));
+        let reset = Db {
+            incarnation: self.fresh_incarnation(),
+            rows: BTreeSet::new(),
+            deleted: true,
+            life,
+        };
+        self.deletes += 1;
+        self.acknowledged(&old, reset);
+    }
+
     /// `actor restore` to an earlier state of the history, as a new
     /// segment: the replacement keeps the current incarnation.
     fn restore(&mut self) {
@@ -227,6 +312,9 @@ impl World {
         }
         let i = self.rng.below(self.history.len() as u64 - 1) as usize;
         let mut staged = self.history[i].clone();
+        // The current actor, rewound: its rows, its life and its marks.
+        staged.life = self.head().life;
+        staged.deleted = self.head().deleted;
         if self.broken != Broken::StagedIncarnation {
             staged.incarnation = self.head().incarnation.clone();
         }
@@ -242,38 +330,53 @@ impl World {
         self.swept += 1;
     }
 
+    /// The judging hold: restore, fence, read the incarnation an instance
+    /// would use (`None`: a fresh one).
+    fn judge(&mut self, recorded: &str) -> Judged {
+        self.lapse();
+        if let Some(late) = self.late_reset.take()
+            && self.rng.chance(50)
+        {
+            self.history.push(late);
+        }
+        let head = self.head().clone();
+        blob_sweep::judge(recorded, self.effective(&head).as_deref())
+    }
+
     fn sweep_pass(&mut self) {
         let records: Vec<(String, (State, u64))> =
             self.records.iter().map(|(k, v)| (k.clone(), *v)).collect();
         for (inc, (state, at)) in records {
-            match blob_sweep::action_at(state, self.now - at, self.ages) {
-                Action::Wait => {}
-                Action::Judge => {
-                    // The judging hold: restore, fence, read.
-                    self.lapse();
-                    self.acquire();
-                    let current = self.holder.as_ref().unwrap().0.incarnation.clone();
-                    self.lapse();
-                    match blob_sweep::judge(&inc, &current) {
-                        Judged::Deleted => {
-                            self.judged_deleted += 1;
-                            self.records.insert(inc.clone(), (State::Swept, self.now));
-                            self.remove(&inc);
+            let age = self.now - at;
+            let action = blob_sweep::action_at(state, age, self.ages);
+            if action == Action::Wait {
+                continue;
+            }
+            let judged = if self.broken == Broken::NoRejudge && action != Action::Judge {
+                Judged::Deleted
+            } else {
+                self.judge(&inc)
+            };
+            match blob_sweep::outcome(action, Some(judged), age, self.ages) {
+                blob_sweep::Outcome::Sweep(then) => {
+                    if action == Action::Judge {
+                        self.judged_deleted += 1;
+                    }
+                    self.remove(&inc);
+                    match then {
+                        Some(state) => {
+                            self.records.insert(inc, (state, self.now));
                         }
-                        Judged::NotDeleted => {
-                            self.judged_kept += 1;
+                        None => {
                             self.records.remove(&inc);
                         }
                     }
                 }
-                Action::Relist => {
-                    self.remove(&inc);
-                    self.records.insert(inc, (State::Listed, self.now));
-                }
-                Action::Finish => {
-                    self.remove(&inc);
+                blob_sweep::Outcome::Drop => {
+                    self.judged_kept += 1;
                     self.records.remove(&inc);
                 }
+                blob_sweep::Outcome::Skip | blob_sweep::Outcome::AgeOut => {}
             }
         }
     }
@@ -281,10 +384,8 @@ impl World {
 
 fn simulate(seed: u64, broken: Broken) -> Result<World, String> {
     let mut w = World::new(seed, broken);
-    let mut written: BTreeMap<u64, String> = BTreeMap::new();
     for _ in 0..400 {
         w.now += 1 + w.rng.below(10);
-        let before = w.next_file;
         match w.rng.below(20) {
             0..=1 => w.acquire(),
             2 => w.lapse(),
@@ -298,34 +399,40 @@ fn simulate(seed: u64, broken: Broken) -> Result<World, String> {
             10 => w.delete(),
             11..=13 => w.link_upload(),
             14 => w.restore(),
+            15 => w.old_delete(),
             _ => w.sweep_pass(),
         }
-        for id in before..w.next_file {
-            if let Some(((_, _), writer)) = w.files.iter().find(|((_, i), _)| *i == id) {
-                written.insert(id, writer.clone());
-            }
-        }
-        check(&w, &written)?;
+        check(&w)?;
     }
     Ok(w)
 }
 
-fn check(w: &World, written: &BTreeMap<u64, String>) -> Result<(), String> {
+/// Every file a row file-id once named, with the folder and life it was
+/// written under: kept across sweeps (`files` loses entries).
+fn check(w: &World) -> Result<(), String> {
     let head = w.head();
-    for ((folder, id), writer) in &w.files {
-        if *folder == head.incarnation && *writer != head.incarnation {
+    let Some(current) = w.effective(head) else {
+        // The next instance draws a fresh incarnation: nothing is reachable.
+        return Ok(());
+    };
+    // A: what the actor reaches is its own life's.
+    for ((folder, id), life) in &w.files {
+        if *folder == current && *life != head.life {
             return Err(format!(
-                "file {id} of incarnation {writer} is in {folder}'s namespace"
+                "file {id} of life {life} is in the namespace of life {} ({folder})",
+                head.life
             ));
         }
     }
+    // B: what its rows name, written in its life under its incarnation, is there.
     for id in &head.rows {
-        let named_here = written.get(id).is_some_and(|inc| *inc == head.incarnation);
-        let there = w.files.contains_key(&(head.incarnation.clone(), *id));
-        if named_here && !there {
+        if let Some(life) = w.written.get(id)
+            && life.0 == current
+            && life.1 == head.life
+            && !w.files.contains_key(&(current.clone(), *id))
+        {
             return Err(format!(
-                "file {id}, named by a live row of {}, was deleted",
-                head.incarnation
+                "file {id}, named by a live row of {current}, was deleted"
             ));
         }
     }
@@ -366,6 +473,8 @@ fn each_broken_variant_is_caught() {
         Broken::NoIncarnation,
         Broken::SweptOnSent,
         Broken::StagedIncarnation,
+        Broken::NoRejudge,
+        Broken::ZeroAfterOldDelete,
     ] {
         let caught = (0..seeds()).any(|seed| simulate(seed, broken).is_err());
         assert!(caught, "{broken:?} was never caught");
@@ -382,4 +491,47 @@ fn a_seed_replays() {
         (a.deletes, a.swept, a.files.len()),
         (b.deletes, b.swept, b.files.len())
     );
+}
+
+/// The review's scenario (2026-11-17), step by step: a node with `blobs`
+/// deletes X (`0` becomes I1, the record for `0` is `swept`); a node
+/// without `blobs` deletes X again (its reset carries no incarnation); X
+/// then writes files and rows; the pass relists and finishes the record
+/// for `0`. No live file goes, and none of an earlier life is reachable.
+/// The code as it was (`NoRejudge`) removes the live files, and running
+/// at `0` after the old node's delete (`ZeroAfterOldDelete`, the
+/// downgrade case) reaches an earlier life's late upload.
+#[test]
+fn an_incarnation_coming_back_never_loses_a_live_file() {
+    let scenario = |broken| -> Result<World, String> {
+        let mut w = World::new(1, broken);
+        w.acquire();
+        w.write_file();
+        w.links.clear();
+        w.links.push((blob_sweep::FIRST.into(), 0));
+        w.upload_rows();
+        w.delete_now();
+        w.now += 1;
+        w.acquire();
+        w.old_delete();
+        // A late upload through the first life's link lands under `0`.
+        w.link_upload();
+        w.acquire();
+        w.write_file();
+        w.upload_rows();
+        check(&w)?;
+        for _ in 0..2 {
+            w.now += w.ages.last_after + 1;
+            w.sweep_pass();
+            check(&w)?;
+        }
+        Ok(w)
+    };
+    scenario(Broken::None).unwrap();
+    let e = scenario(Broken::NoRejudge).err().expect("NoRejudge caught");
+    assert!(e.contains("was deleted") || e.contains("of life"), "{e}");
+    let e = scenario(Broken::ZeroAfterOldDelete)
+        .err()
+        .expect("ZeroAfterOldDelete caught");
+    assert!(e.contains("of life 0"), "{e}");
 }

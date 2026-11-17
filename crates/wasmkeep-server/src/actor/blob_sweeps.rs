@@ -3,14 +3,16 @@
 //! `blob-sweeps/` once a minute and acts on each record by its age, and
 //! once an hour removes the files of epochs other than the app's own.
 //!
-//! A `pending` record is judged by a job in the actor's mailbox that runs
-//! no guest code: an acquisition only of a record naming nobody, as idle
-//! expiry acquires (or the hold already here), a restore, the fence, and a
-//! read of the incarnation. Only that answers "not deleted", which drops
-//! the record and touches no file; anything short of it judges nothing.
+//! Every removal is judged first, at the second and last listings too: a
+//! job in the actor's mailbox that runs no guest code (an acquisition only
+//! of a record naming nobody, as idle expiry acquires, or the hold already
+//! here; a restore; the fence; a read of the incarnation an instance would
+//! use). Another incarnation sweeps; the same one drops the record in the
+//! mailbox, on the version listed, and touches no file; no judgement for
+//! 25 hours drops the record and touches no file either.
 
 use super::*;
-use wasmkeep_cluster::blob_sweep::{self, Action, Judged, State};
+use wasmkeep_cluster::blob_sweep::{self, Action, Judged};
 
 /// Records a pass acts on, at most.
 const PER_PASS: usize = 1_000;
@@ -18,10 +20,16 @@ const PER_PASS: usize = 1_000;
 const JUDGE_WAIT: Duration = Duration::from_secs(60);
 
 impl ActorState {
-    /// Judges a `pending` sweep record of `recorded` incarnation: `None`
-    /// when this job could not tell (held elsewhere, a refused or failed
-    /// acquisition or restore, the fence not uploaded).
-    pub(super) async fn judge_files(&mut self, recorded: String) -> Option<Judged> {
+    /// Judges a sweep record of `recorded` incarnation (`listed`, as the
+    /// pass listed it): `None` when this job could not tell (held
+    /// elsewhere, a refused or failed acquisition or restore, the fence not
+    /// uploaded). A `NotDeleted` record is dropped here, in the mailbox,
+    /// and only if it is still the version listed: a delete that rewrote
+    /// it since keeps it.
+    pub(super) async fn judge_files(
+        &mut self,
+        listed: crate::blobs::sweep::Listed,
+    ) -> Option<Judged> {
         let cluster = self.cluster.clone()?;
         let held_here = self.held.as_ref().is_some_and(Held::is_valid);
         let mut kept_origin = None;
@@ -29,13 +37,19 @@ impl ActorState {
             if self.held.is_some() || self.live.is_some() {
                 return None;
             }
+            // Without the recorded-head format a release always rewrites
+            // the record, and with it the idle age: an idle actor is not
+            // acquired to judge it (decision 8); its record ages out.
+            if !cluster.owners.recorded_head() {
+                return None;
+            }
             // Only a record naming nobody, as listed, as idle expiry takes
             // it; its idle origin is kept at the release (decision 8).
-            let listed = cluster.owner_record_listed(&self.address).await.ok()??;
-            let origin = listed.idle_origin_ms();
+            let owner = cluster.owner_record_listed(&self.address).await.ok()??;
+            let origin = owner.idle_origin_ms();
             self.owner_hint = None;
             if self
-                .ensure_owner_with(Some((&listed.version, origin)))
+                .ensure_owner_with(Some((&owner.version, origin)))
                 .await
                 .is_err()
             {
@@ -47,8 +61,14 @@ impl ActorState {
         // The restored database, opened (and kept for the fence) without
         // instantiating the component.
         self.delete_marks().await.ok()?;
-        let current = self.restore_meta(BLOB_INCARNATION_KEY).await.ok()?;
-        let current = blob_sweep::incarnation_of(current.as_deref()).ok()?;
+        let incarnation = self.restore_meta(BLOB_INCARNATION_KEY).await.ok()?;
+        let replaced = self.restore_meta("replaced").await.ok()?;
+        // The incarnation an instance would use; `None`: it draws a fresh
+        // one, so no file of it is under any record.
+        let current = match blob_sweep::start(incarnation.as_deref(), replaced.as_deref()).ok()? {
+            blob_sweep::Start::Use(i) => Some(i),
+            blob_sweep::Start::Draw => None,
+        };
         // What was restored is the state only once this hold's own upload
         // ends the history: until then a late reset could still land.
         let fenced = self.fence().await;
@@ -61,15 +81,32 @@ impl ActorState {
         if !fenced {
             return None;
         }
-        Some(blob_sweep::judge(&recorded, &current))
+        let judged = blob_sweep::judge(&listed.incarnation, current.as_deref());
+        if judged == Judged::NotDeleted {
+            let blobs = self.blobs()?;
+            match blobs.drop_record_if_listed(&listed).await {
+                Ok(true) => crate::metrics::blob_sweep("not_deleted"),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "blob sweep: dropping a record failed");
+                    crate::metrics::blob_sweep("failed");
+                }
+            }
+        }
+        Some(judged)
     }
 }
+
+/// A record's body, by its key, as last read at a version: read again
+/// only when the listing shows another version.
+type Bodies = std::collections::HashMap<String, (Option<String>, blob_sweep::Record)>;
 
 /// Every pass period, while this node collects. Runs until the service is
 /// dropped or stops.
 pub(super) async fn sweep_loop(service: std::sync::Weak<ServiceInner>, cluster: Arc<Cluster>) {
     let every = cluster.blob_sweep_every;
     let mut epochs_due = tokio::time::Instant::now() + cluster.blob_epochs_every;
+    let mut bodies = Bodies::new();
     loop {
         tokio::time::sleep(every).await;
         let Some(inner) = service.upgrade() else {
@@ -84,7 +121,7 @@ pub(super) async fn sweep_loop(service: std::sync::Weak<ServiceInner>, cluster: 
         {
             continue;
         }
-        pass(&inner, &cluster).await;
+        pass(&inner, &cluster, &mut bodies).await;
         if tokio::time::Instant::now() >= epochs_due {
             epochs_due = tokio::time::Instant::now() + cluster.blob_epochs_every;
             epochs_pass(&inner, &cluster).await;
@@ -92,8 +129,10 @@ pub(super) async fn sweep_loop(service: std::sync::Weak<ServiceInner>, cluster: 
     }
 }
 
-/// One pass over the sweep records.
-pub(super) async fn pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>) {
+/// One pass over the sweep records: one listing; a body read only for a
+/// record old enough to act on whose version changed; then at most
+/// [`PER_PASS`] records acted on, every removal judged first.
+pub(super) async fn pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, bodies: &mut Bodies) {
     let blobs = Arc::clone(&inner.blobs);
     let Some(epoch) = blobs.epoch().map(str::to_owned) else {
         return;
@@ -105,76 +144,100 @@ pub(super) async fn pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>) {
             return;
         }
     };
+    let ages = cluster.blob_sweep_ages;
     let now = now_ms();
-    for l in records.into_iter().take(PER_PASS) {
+    let listed: std::collections::HashSet<String> = records.iter().map(|l| l.key()).collect();
+    bodies.retain(|k, _| listed.contains(k));
+    let mut due = Vec::new();
+    for l in records {
         let age = now.saturating_sub(l.modified_ms);
-        let Ok(Some(record)) = blobs.read_record(&l).await else {
+        // No state acts on a record younger than this: no read.
+        if age <= ages.judge_after {
             continue;
+        }
+        let key = l.key();
+        let record = match bodies.get(&key) {
+            Some((etag, r)) if *etag == l.etag => r.clone(),
+            _ => match blobs.read_record(&l).await {
+                Ok(Some(r)) => {
+                    bodies.insert(key, (l.etag.clone(), r.clone()));
+                    r
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "blob sweep: reading a record failed");
+                    continue;
+                }
+            },
         };
         // Another epoch's files go with it (the epochs pass); a record
         // whose name is not its key's is not acted on.
         if record.epoch != epoch || crate::blobs::keys::name_id(&record.name) != l.name_id {
             continue;
         }
-        let outcome = match blob_sweep::action_at(record.state, age, cluster.blob_sweep_ages) {
-            Action::Wait => continue,
-            Action::Judge => match judge_one(inner, &l.class, &record.name, &l.incarnation).await {
-                Some(Judged::Deleted) => match blobs
-                    .write_record(&l.class, &record.name, &l.incarnation, State::Swept)
+        let action = blob_sweep::action_at(record.state, age, ages);
+        if action != Action::Wait {
+            due.push((l, record, action, age));
+        }
+        if due.len() >= PER_PASS {
+            break;
+        }
+    }
+    for (l, record, action, age) in due {
+        let judged = judge_one(inner, &l.class, &record.name, &l).await;
+        let done = match blob_sweep::outcome(action, judged, age, ages) {
+            blob_sweep::Outcome::Skip | blob_sweep::Outcome::Drop => Ok(()),
+            blob_sweep::Outcome::AgeOut => {
+                crate::metrics::blob_sweep("aged_out");
+                tracing::warn!(class = %l.class, "blob sweep: a record nobody could judge for 25 hours is dropped; its files, if any, stay");
+                blobs.drop_record(&l).await
+            }
+            blob_sweep::Outcome::Sweep(then) => {
+                match blobs
+                    .remove_incarnation(&l.class, &l.name_id, &l.incarnation)
                     .await
                 {
-                    Ok(()) => blobs
-                        .remove_incarnation(&l.class, &l.name_id, &l.incarnation)
-                        .await
-                        .map(|_| ()),
+                    Ok(_) => match then {
+                        Some(state) => {
+                            crate::metrics::blob_sweep("swept");
+                            blobs
+                                .write_record(&l.class, &record.name, &l.incarnation, state)
+                                .await
+                        }
+                        None => {
+                            crate::metrics::blob_sweep("final");
+                            blobs.drop_record(&l).await
+                        }
+                    },
                     Err(e) => Err(e),
-                },
-                Some(Judged::NotDeleted) => blobs.drop_record(&l).await,
-                None => continue,
-            },
-            Action::Relist => match blobs
-                .remove_incarnation(&l.class, &l.name_id, &l.incarnation)
-                .await
-            {
-                Ok(_) => {
-                    blobs
-                        .write_record(&l.class, &record.name, &l.incarnation, State::Listed)
-                        .await
                 }
-                Err(e) => Err(e),
-            },
-            Action::Finish => match blobs
-                .remove_incarnation(&l.class, &l.name_id, &l.incarnation)
-                .await
-            {
-                Ok(_) => blobs.drop_record(&l).await,
-                Err(e) => Err(e),
-            },
+            }
         };
-        if let Err(e) = outcome {
+        if let Err(e) = done {
+            crate::metrics::blob_sweep("failed");
             tracing::warn!(class = %l.class, error = %e, "blob sweep: a record was not acted on; the next pass tries again");
         }
     }
 }
 
-/// A `pending` record's judging job, in the actor's mailbox.
+/// A record's judging job, in the actor's mailbox.
 async fn judge_one(
     inner: &Arc<ServiceInner>,
     class: &str,
     name: &str,
-    incarnation: &str,
+    listed: &crate::blobs::sweep::Listed,
 ) -> Option<Judged> {
     let address = ActorAddress::new(&inner.tenant, class, name).ok()?;
     if !read(&inner.classes).contains_key(class) {
         return None;
     }
-    let recorded = incarnation.to_owned();
+    let listed = listed.clone();
     let resident = inner.mailboxes.contains(&address);
     let job =
         inner
             .mailboxes
             .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
-                Box::pin(state.judge_files(recorded))
+                Box::pin(state.judge_files(listed))
             });
     let judged = match tokio::time::timeout(JUDGE_WAIT, job).await {
         Ok(Ok(j)) => j,

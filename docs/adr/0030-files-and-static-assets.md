@@ -414,6 +414,21 @@ deleting the file (a download) or rotating the credentials that signed
 it. So links are short-lived, narrow, and never logged by the host (logs
 name the key and the namespace).
 
+**Amendment (2026-11-17, as built): upload links are node links in
+`0.6.0`.** `object_store` refuses to sign `content-length` (the signer
+controls it), so a presigned `PUT` could not bind the size the app
+allowed, and an upload link is a node link even on a bucket whose proof
+passed. A node link's upload is a create-if-absent write; on a bucket
+that is one conditional `PUT` (a multipart upload takes no condition
+here), so an upload link takes at most 16 MiB there, and at most
+`--max-blob-bytes` on a node without a bucket. Downloads are presigned as
+below. The start proof and `cluster diagnose` check what a download
+relies on (the signed type and disposition, one key only, a changed
+parameter refused, the expiry); `presigned-upload` is reported skipped.
+To revisit after `0.6.0` if browsers need larger uploads: our own SigV4
+presign of `PUT` with `content-length` signed, or presigned multipart
+parts.
+
 **Presigned links** (a node with a bucket that passed the start proof
 below). `signed_url_opts` builds the URL from the store's own endpoint,
 so the node builds a second, signer-only `AmazonS3` for the link
@@ -619,7 +634,27 @@ once a minute and, for each record:
   the record is one hour old and again at 25 hours (by its last-modified
   time): an upload started before its link expired may land well after,
   and a node link aborts an upload one hour past expiry. Then the record
-  is deleted. An upload to a presigned link that is still running a day
+  is deleted.
+
+  **Amendment (2026-11-17, after the review of B1 to B5): every removal
+  is judged.** An incarnation can come back: a node without `blobs`
+  (mid-upgrade, or downgraded) deletes the actor with a reset that
+  carries no incarnation. So each listing, at one hour and at 25 hours
+  too, runs the judging job first; only another incarnation removes
+  anything, and the same one drops the record (in the mailbox, only if
+  it is still the version listed) and touches no file. And a database
+  that carries a delete's mark (`replaced` starting `delete `) but no
+  incarnation never runs at `0`: its next instance draws a fresh one,
+  written into the database before any file call and uploaded with its
+  next change (files written before that upload, if the node dies, are
+  under an incarnation nothing names: strays, never another actor's). A
+  record nobody can judge for 25 hours (no history to fence, no
+  ownership record, its class gone, or, in an app without the recorded
+  head, an actor that is not resident: acquiring it would rewrite its
+  idle age) is dropped, touching no file, and counted
+  (`wasmkeep_blob_sweeps_total{outcome="aged_out"}`). A pass reads a
+  record's body only when its listed version changed, and acts on at
+  most 1,000 records that are due, after filtering. An upload to a presigned link that is still running a day
   later leaks its file; the docs give a bucket lifecycle rule for
   `state/*/*/blobs/` as the backstop for such strays.
 
@@ -816,7 +851,8 @@ them until `backup prune` drops those runs, as its rows do (ADR 0033).
 | --- | --- |
 | key | 512 bytes, the alphabet of section 2 |
 | `get`, `put` | 16 MiB, as a call's body |
-| one file (streamed write, upload link) | `--max-blob-bytes`, default 1 GiB, at most 5 GiB (one presigned PUT's ceiling on S3) |
+| one file (streamed write) | `--max-blob-bytes`, default 1 GiB, at most 5 GiB (one presigned PUT's ceiling on S3) |
+| one upload link (amendment of 2026-11-17, as built) | 16 MiB on a bucket (one conditional `PUT`); `--max-blob-bytes` without one; section 4 |
 | `list` page | 1,000 |
 | content type | 256 bytes, `type/subtype` and `;`-parameters of RFC 9110 token and quoted-string characters only (no CR, LF or control characters) |
 | download filename | 255 bytes after the host strips `"`, `\`, `/`, CR, LF and control characters |
@@ -868,7 +904,7 @@ process's and carries no app label, since the start proof is):
 - `wasmkeep_blob_stored_bytes` and `wasmkeep_blob_stored_files`: the last
   hourly count.
 - `wasmkeep_blob_sweeps_total{outcome}`: `swept`, `not_deleted`,
-  `final`, `failed`.
+  `final`, `aged_out`, `failed`.
 
 ### 8. Security
 

@@ -687,9 +687,8 @@ impl ActorHost {
         // The sweep record first (ADR 0030, section 5): in the bucket
         // before any byte of the reset, or no delete.
         let address = self.deleter.as_ref().map(|(_, a)| a.clone());
-        if let (Some(a), Some(blobs)) = (&address, self.blob.handle())
-            && blobs.on_a_bucket()
-            && let Err(e) = blobs
+        let recorded = match (&address, self.blob.handle()) {
+            (Some(a), Some(blobs)) if blobs.on_a_bucket() => blobs
                 .write_record(
                     a.class(),
                     a.name(),
@@ -697,9 +696,15 @@ impl ActorHost {
                     wasmkeep_cluster::blob_sweep::State::Pending,
                 )
                 .await
-        {
+                .map_err(|e| format!("writing the sweep record: {e}")),
+            // Files are off on this bucket: none to sweep.
+            (Some(_), Some(_)) => Ok(()),
+            // No service to write the record with: no delete.
+            _ => Err("no service to write the sweep record with".to_owned()),
+        };
+        if let Err(e) = recorded {
             crate::metrics::delete_failed("self_durable");
-            return Ok(Err(not_durable(format!("writing the sweep record: {e}"))));
+            return Ok(Err(not_durable(e)));
         }
         // On failure the replica is marked failed: the event's end gives
         // the actor up, and its next event restores what the bucket has.

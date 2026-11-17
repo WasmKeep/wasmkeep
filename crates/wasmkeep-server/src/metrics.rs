@@ -371,6 +371,8 @@ pub(crate) struct Metrics {
     pub(crate) actor_deletes: Family<AtomicU64>,
     /// Actor deletes that failed to be recorded, by `how`.
     pub(crate) actor_delete_failures: Family<AtomicU64>,
+    /// Sweep records the blob sweep acted on, by `outcome` (ADR 0030).
+    pub(crate) blob_sweeps: Family<AtomicU64>,
     /// Idle-expiry passes this node ran as the collector (ADR 0028).
     pub(crate) expiry_passes: AtomicU64,
     /// Idle actors those passes found (candidates acted on).
@@ -683,6 +685,19 @@ pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
 /// `how` of `wasmkeep_actor_deletes_total` and
 /// `wasmkeep_actor_delete_failures_total` (ADR 0028).
 pub(crate) const DELETE_HOWS: [&str; 4] = ["self", "self_durable", "operator", "expired"];
+/// `outcome` of `wasmkeep_blob_sweeps_total` (ADR 0030, section 7): a
+/// namespace removed after a judgement (`swept`), a record dropped because
+/// the actor is at its incarnation (`not_deleted`) or after its last
+/// listing (`final`), one nobody could judge for 25 hours (`aged_out`),
+/// and a step that failed (`failed`).
+pub(crate) const BLOB_SWEEP_OUTCOMES: [&str; 5] =
+    ["swept", "not_deleted", "final", "aged_out", "failed"];
+
+/// Counts a sweep record acted on.
+pub(crate) fn blob_sweep(outcome: &str) {
+    inc(&METRICS.blob_sweeps.get(&[("outcome", outcome)]));
+}
+
 /// `reason` of `wasmkeep_expiry_kept_total` (ADR 0028).
 pub(crate) const EXPIRY_KEPT_REASONS: [&str; 5] =
     ["changed", "alarm", "socket", "active", "failed"];
@@ -773,6 +788,7 @@ impl Metrics {
         one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
         one(&m.actor_deletes, "how", &DELETE_HOWS);
         one(&m.actor_delete_failures, "how", &DELETE_HOWS);
+        one(&m.blob_sweeps, "outcome", &BLOB_SWEEP_OUTCOMES);
         one(&m.expiry_kept, "reason", &EXPIRY_KEPT_REASONS);
         one(
             &m.websocket_sweep_unreadable,
@@ -1177,6 +1193,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "wasmkeep_actor_delete_failures_total",
         "Actor deletes that failed to be recorded (the data stays), by how they were asked for.",
         &m.actor_delete_failures,
+    );
+    family(
+        &mut out,
+        "wasmkeep_blob_sweeps_total",
+        "Sweep records of deleted actors' files this node acted on, by outcome.",
+        &m.blob_sweeps,
     );
     counter(
         &mut out,
@@ -1964,6 +1986,11 @@ mod tests {
                 "wasmkeep_actor_delete_failures_total",
                 "how",
                 &DELETE_HOWS[..],
+            ),
+            (
+                "wasmkeep_blob_sweeps_total",
+                "outcome",
+                &BLOB_SWEEP_OUTCOMES[..],
             ),
             (
                 "wasmkeep_parked_releases_total",

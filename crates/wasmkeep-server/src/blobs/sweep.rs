@@ -21,6 +21,15 @@ pub(crate) struct Listed {
     pub(crate) name_id: String,
     pub(crate) incarnation: String,
     pub(crate) modified_ms: u64,
+    /// The record's version as listed.
+    pub(crate) etag: Option<String>,
+}
+
+impl Listed {
+    /// The record's key under `blob-sweeps/`.
+    pub(crate) fn key(&self) -> String {
+        format!("{}/{}/{}", self.class, self.name_id, self.incarnation)
+    }
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -49,13 +58,16 @@ impl Bucket {
         ))
         .map_err(err)?;
         let want = format!("{}/", prefix.as_ref());
-        let listed: Vec<Path> = self
-            .store
-            .list(Some(&prefix))
-            .filter_map(|m| async move { m.ok().map(|m| m.location) })
-            .filter(|p| futures_util::future::ready(p.as_ref().starts_with(&want)))
-            .collect()
-            .await;
+        // A listing that fails part way is an error, never a complete one:
+        // a record dropped on it would leave files behind.
+        let mut listed: Vec<Path> = Vec::new();
+        let mut listing = self.store.list(Some(&prefix));
+        while let Some(m) = listing.next().await {
+            let m = m.map_err(err)?;
+            if m.location.as_ref().starts_with(&want) {
+                listed.push(m.location);
+            }
+        }
         let n = listed.len();
         if n == 0 {
             return Ok(0);
@@ -122,6 +134,20 @@ impl Blobs {
             .map_err(err)
     }
 
+    /// Drops a sweep record only if it is still the version listed: a
+    /// delete that rewrote it since keeps it. `Ok(false)`: it changed.
+    pub(crate) async fn drop_record_if_listed(&self, l: &Listed) -> Result<bool, String> {
+        let b = self.bucket().ok_or("no bucket")?;
+        let path = b.record_path(&l.class, &l.name_id, &l.incarnation)?;
+        match b.store.head(&path).await {
+            Ok(meta) if meta.e_tag == l.etag => {}
+            Ok(_) => return Ok(false),
+            Err(object_store::Error::NotFound { .. }) => return Ok(true),
+            Err(e) => return Err(err(e)),
+        }
+        self.drop_record(l).await.map(|()| true)
+    }
+
     /// Drops a sweep record.
     pub(crate) async fn drop_record(&self, l: &Listed) -> Result<(), String> {
         let b = self.bucket().ok_or("no bucket")?;
@@ -156,6 +182,7 @@ impl Blobs {
                 name_id: name_id.to_owned(),
                 incarnation: incarnation.to_owned(),
                 modified_ms: u64::try_from(m.last_modified.timestamp_millis()).unwrap_or(0),
+                etag: m.e_tag.clone(),
             });
         }
         Ok(out)
@@ -366,7 +393,15 @@ mod tests {
             (r.state, r.name.as_str(), r.epoch.as_str()),
             (State::Pending, "n m", "00000000000000e1")
         );
-        blobs.drop_record(&listed[0]).await.unwrap();
+        // Rewritten since it was listed (a new delete): kept.
+        blobs
+            .write_record("c", "n m", "0", State::Swept)
+            .await
+            .unwrap();
+        assert!(!blobs.drop_record_if_listed(&listed[0]).await.unwrap());
+        assert_eq!(blobs.records().await.unwrap().len(), 1);
+        let again = blobs.records().await.unwrap();
+        assert!(blobs.drop_record_if_listed(&again[0]).await.unwrap());
         assert!(blobs.records().await.unwrap().is_empty());
     }
 }
