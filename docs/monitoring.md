@@ -198,6 +198,8 @@ its first request.
 | `wasmkeep_batched_waits_total{reason}` | counter | Times a batched actor's next event waited at the end of the one before (the event-start rule), by `reason`: `age` (a commit waited unsent past `--max-unsent-age`), `bytes` (the next segment was full, an event was over the cap, or the WAL asked for a checkpoint) and `budget` (the node's budget of segments in flight was full). |
 | `wasmkeep_flush_seconds` | histogram | How long a batched `storage.flush` (or `exec-durable`'s flush) took, answered `ok` or not. |
 | `wasmkeep_upload_budget_bytes_in_use` | gauge | Bytes of the node's 256 MiB budget of batched segments in flight in use now. |
+| `wasmkeep_budget_share_part` | gauge | Each app's equal part of a budget the process shares between its apps (`budget`: `uploads` in bytes, `restore_reads`, `restore_megabytes`), by tenant and app; half of it is a floor never lent to another app. |
+| `wasmkeep_budget_share_in_use` | gauge | What each app holds now of a shared budget, by budget, tenant and app. |
 
 Not there yet: `tenant` and `app` on the series without a class (one app
 per process for now: join on `wasmkeep_info`), traps by reason

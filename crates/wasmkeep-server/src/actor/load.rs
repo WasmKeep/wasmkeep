@@ -86,7 +86,11 @@ pub(super) fn load_source(
         let front_per_min = front_rate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sample(at, crate::metrics::METRICS.front_requests.total());
+            .sample(
+                at,
+                app.as_deref()
+                    .map_or(0, |a| crate::metrics::METRICS.front_requests.total_in(a)),
+            );
         // Gone (the service is stopping): nothing runs here any more.
         let (actors, sockets) = service.upgrade().map_or((0, 0), |inner| {
             (inner.mailboxes.resident(), inner.sockets.len())

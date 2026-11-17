@@ -80,7 +80,7 @@ use self::held::{Barrier, Dropped, Held};
 pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};
 pub use self::uploads::hold_node_upload_budget;
-pub(crate) use self::uploads::upload_budget_in_use;
+pub(crate) use self::uploads::{UPLOAD_SHARES, upload_budget_in_use};
 
 /// `--max-unsent-age`'s default and bounds (ADR 0034, section 3).
 pub(crate) const DEFAULT_UNSENT_AGE: Duration = Duration::from_millis(500);
@@ -737,6 +737,11 @@ impl ActorService {
     /// cluster listener (ADR 0011).
     pub(crate) fn cluster_tls(&self) -> Option<Arc<crate::cluster_tls::ClusterTls>> {
         self.inner.cluster.as_ref()?.tls().cloned()
+    }
+
+    /// Its app's metric labels ([`crate::metrics::app_labels`]).
+    pub(crate) fn app_labels(&self) -> Arc<str> {
+        Arc::clone(&self.inner.app_labels)
     }
 
     /// Number of actors currently resident in memory.

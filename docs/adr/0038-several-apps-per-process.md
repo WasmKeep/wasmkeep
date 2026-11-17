@@ -260,8 +260,8 @@ key change) or `no-secrets`; `env` by class and `front-env`; `access` by
 class, accepted only until access rules are deployed, as `--access` is;
 the egress settings `allow-outbound`, `allow-outbound-port` and
 `outbound-ca`; `no-alarms` (for a copy that must not fire the app's alarms); the front limits `max-front-requests` and
-`front-cpu-budget-ms`; and the ceilings `max-sockets`, `min-resident`,
-`max-resident` and the budget shares of section 8. Process settings
+`front-cpu-budget-ms`; and the ceilings `max-sockets`, `min-resident` and
+`max-resident`. Process settings
 (listeners, the bucket, cluster flags, `--max-instances`, the node socket
 ceiling) stay in `[process]`, `[listen]` and `[limits]` or on the command
 line. The bucket and its credentials stay where they are today (flags
@@ -422,10 +422,10 @@ holding every slot.
 
 **Every other shared budget** (pending uploads, restore read slots and
 bytes, public connections, front instance reservations) is divided the
-same way: each app has a reserved share, by default an equal part of the
-budget, settable per app in the node file; an app may use capacity above
-its share only while that capacity is not needed to honour another app's
-unused reservation. Units held briefly (uploads, restore reads, front
+same way. Each app has an equal part of the budget, and half of it is a
+floor never lent. An app may use any capacity outside the other apps'
+unused floors, but takes nothing above its equal part while an app below
+its own waits. Shares are not settable in 0.6.0. Units held briefly (uploads, restore reads, front
 reservations) return within their own deadlines; connections are held
 long, so a connection beyond the share is refused rather than borrowed
 when other apps' reservations need the room. Disk has no budget in

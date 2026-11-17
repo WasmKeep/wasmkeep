@@ -816,8 +816,8 @@ mod share_tests {
         }
         assert_eq!(
             held.len() as u64,
-            crate::replica::NODE_UPLOAD_BYTES / 2 / one,
-            "a stops at its share"
+            crate::replica::NODE_UPLOAD_BYTES * 3 / 4 / one,
+            "a stops at b's floor, half of b's part"
         );
         let b = tokio::time::timeout(
             std::time::Duration::from_secs(5),

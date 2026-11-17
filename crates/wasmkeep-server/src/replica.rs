@@ -4027,7 +4027,11 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert_eq!(held.len(), RESTORE_READS / 2, "a stops at its share");
+        assert_eq!(
+            held.len(),
+            RESTORE_READS * 3 / 4,
+            "a stops at b's floor, half of b's part"
+        );
         let mut b = turn("b/b");
         tokio::time::timeout(std::time::Duration::from_secs(5), b.take())
             .await

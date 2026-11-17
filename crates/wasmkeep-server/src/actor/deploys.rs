@@ -385,11 +385,7 @@ impl ActorService {
         // A secrets-blocked node may still forward direct actor requests.
         // The front's established response and outcome are unchanged.
         if !req.uri().path().starts_with("/actor/") && self.secrets_blocked() {
-            crate::metrics::inc(
-                &crate::metrics::METRICS
-                    .front_requests
-                    .get(&[("outcome", "unconfigured")]),
-            );
+            crate::metrics::front_request(&self.inner.app_labels, "unconfigured");
             return Some(crate::cluster::unavailable(
                 "this node cannot serve the app now; retry\n",
             ));
