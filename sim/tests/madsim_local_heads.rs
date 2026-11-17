@@ -91,6 +91,7 @@ struct Faults {
     lose_replace_reply: bool,
     /// The next get of the owner record fails.
     fail_get: bool,
+    lose_acquire_readback: bool,
 }
 
 /// Key -> (body, version).
@@ -174,6 +175,11 @@ impl Bucket for Mem {
         }
         let v = self.put(key, body);
         if key == KEY && std::mem::take(&mut self.faults.lock().unwrap().lose_replace_reply) {
+            let mut faults = self.faults.lock().unwrap();
+            if faults.lose_acquire_readback {
+                faults.fail_get = true;
+                faults.lose_acquire_readback = false;
+            }
             return Err(BucketError::Unavailable("reply lost".into()));
         }
         Ok(v)
@@ -730,5 +736,427 @@ fn every_broken_variant_is_caught() {
         let n = caught(breaks, cases);
         eprintln!("{name}: caught on {n} of {} seeds", seeds());
         assert!(n >= floor, "{name}: caught on {n}, want {floor}");
+    }
+}
+
+fn owners(mem: &Mem, node: &str, enabled: bool) -> Owners<Mem, SimClock> {
+    let o = Owners::new(
+        mem.clone(),
+        SimClock,
+        node,
+        "i1",
+        "nodes/",
+        LeaseConfig::new(1000, 500, 200, 300).unwrap(),
+    );
+    o.set_recorded_head(enabled);
+    o
+}
+
+fn fence(mem: &Mem, node: &str) {
+    mem.put(
+        &format!("nodes/{node}"),
+        NodeLeaseObject {
+            state: NodeState::Fenced,
+            instance: Some("i1".into()),
+            written_at_ms: 0,
+        }
+        .encode(),
+    );
+}
+
+/// Case 6 (crash half): no complete-inherited phase exists as built.
+/// The invariant is the identity/stamp, even though held bytes are lower-bound.
+async fn crash_window(seed: u64, window: u64, forget_floor: bool) -> bool {
+    let mem = Mem::new(seed);
+    let a = owners(&mem, "a", true);
+    let cell = Mutex::new(Some(a.acquire(KEY, || true, async || Ok(1)).await.unwrap()));
+    hold_cell::verify(&cell, || true, Position::Empty).unwrap();
+    let h = h_at(10 + seed % 30);
+    hold_cell::acknowledge(&cell, || true, Some(h)).unwrap();
+    let ended = hold_cell::end(&cell).unwrap();
+    assert_eq!(a.release(&ended).await, Released::Released);
+    let original = Requirement::of_record(&mem.record().unwrap()).unwrap();
+    let b = owners(&mem, "b", true);
+    if window == 1 {
+        let mut f = mem.faults.lock().unwrap();
+        f.lose_replace_reply = true;
+        f.lose_acquire_readback = true;
+    }
+    let acquired = b.acquire(KEY, || true, async || Ok(1)).await;
+    if window == 1 {
+        assert!(matches!(acquired, Err(AcquireError::Unresolved { .. })));
+    } else {
+        let hold = acquired.unwrap();
+        assert!(hold.head.acknowledged.is_none());
+        // Window 0: listing/backoff. Window 2: failed restore. Neither
+        // verifies or writes history; a process crash sends no release.
+        sleep(Duration::from_millis(1 + seed % 80)).await;
+        drop(hold);
+    }
+    drop(b);
+    fence(&mem, "b");
+    if forget_floor {
+        let mut record = mem.record().unwrap();
+        record.recorded = Some(wasmkeep_cluster::recorded_head::RecordedHead::UNKNOWN);
+        mem.put(KEY, record.encode());
+    }
+    let c = owners(&mem, "c", true);
+    let got = c.acquire(KEY, || true, async || Ok(1)).await.unwrap();
+    let inherited = got.head.inherited;
+    assert!(mem.record().unwrap().recorded.is_some());
+    inherited.is_some_and(|r| r.head == original.head && r.set_at == original.set_at)
+}
+
+#[test]
+fn crash_in_each_unverified_acquisition_window_keeps_the_floor() {
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            START.with(|s| s.set(Some(madsim::time::Instant::now())));
+            for window in 0..3 {
+                assert!(
+                    crash_window(seed, window, false).await,
+                    "seed {seed}, window {window}"
+                );
+                assert!(
+                    !crash_window(seed, window, true).await,
+                    "lost-floor mutant escaped"
+                );
+            }
+        });
+    }
+}
+
+// Frozen v1 ownership-reader contract, as used by old routing/CLI readers.
+// A decode refusal is not evidence of absence and cannot authorize creation.
+fn old_owner_generation(body: &[u8]) -> Option<u64> {
+    let mut lines = std::str::from_utf8(body).ok()?.lines();
+    if lines.next()? != "wasmkeep-owner 1" {
+        return None;
+    }
+    lines.next()?.split_once(' ')?;
+    lines.next()?.parse().ok()
+}
+
+/// Cases 11 and 18, plus whole-app replacement in 13. Namespace removal
+/// models the stopped CLI replacement; Owners/format codec/CAS are real.
+async fn format_lifecycle(seed: u64, erase_format: bool, allow_v1: bool) -> bool {
+    use wasmkeep_cluster::app_format::{self, AppFormat};
+    let mem = Mem::new(seed);
+    let setting = app_format::key("", "t", "c");
+    let a = owners(&mem, "a", false);
+    let old = a.acquire(KEY, || true, async || Ok(1)).await.unwrap();
+    assert!(
+        mem.record().unwrap().recorded.is_none(),
+        "capable binaries still write v1"
+    );
+    assert_eq!(a.release(&old).await, Released::Released);
+    // Pre-enable rollback can still acquire and release v1.
+    let rollback = owners(&mem, "old", false);
+    let v1 = rollback
+        .acquire(KEY, || true, async || Ok(1))
+        .await
+        .unwrap();
+    assert_eq!(rollback.release(&v1).await, Released::Released);
+    // Mixed serving registrations must all advertise the capability before
+    // enable/start. Stopped old nodes cease blocking; an old restart blocks.
+    use wasmkeep_cluster::membership::{NodeInfo, without_recorded_head};
+    let mut peer = NodeInfo {
+        id: "old".into(),
+        address: "old:1".into(),
+        version: "old".into(),
+        written_at_ms: SimClock.now_ms(),
+        app: "t/c".into(),
+        cluster_address: None,
+        tls_pins: Vec::new(),
+        drain: None,
+        reads_secrets: false,
+        can_take: false,
+        can_front: false,
+        can_handoff: false,
+        can_end: false,
+        can_flush: false,
+        can_rate_limits: false,
+        can_restore: false,
+        can_actor_restore: false,
+        can_recorded_head: false,
+        instance: Some("i1".into()),
+        lease: Some(NodeState::Live),
+        load: None,
+    };
+    let blocked = |peer: &NodeInfo| {
+        !without_recorded_head(std::slice::from_ref(peer), "t/c", SimClock.now_ms(), 15000)
+            .is_empty()
+    };
+    assert!(blocked(&peer));
+    peer.lease = Some(NodeState::Released);
+    assert!(!blocked(&peer));
+    peer.lease = Some(NodeState::Live);
+    assert!(
+        blocked(&peer),
+        "accidentally restarted old node blocks service"
+    );
+    peer.can_recorded_head = true;
+    assert!(!blocked(&peer), "upgraded peer permits explicit enablement");
+    mem.put(&setting, app_format::ENABLED_BODY.to_vec());
+    a.set_recorded_head(true);
+    let v2 = a.acquire(KEY, || true, async || Ok(1)).await.unwrap();
+    assert_eq!(a.release(&v2).await, Released::Released);
+    let before = mem.get(KEY).await.unwrap();
+    assert!(
+        old_owner_generation(&before.as_ref().unwrap().0).is_none(),
+        "old CLI/routing cannot interpret v2, including a released actor"
+    );
+    assert_eq!(
+        rollback.acquire(KEY, || true, async || Ok(1)).await,
+        Err(AcquireError::FormatMismatch)
+    );
+    assert_eq!(
+        mem.get(KEY).await.unwrap(),
+        before,
+        "disabled reader must not overwrite"
+    );
+    assert_ne!(
+        rollback.release(&v1).await,
+        Released::Released,
+        "delayed v1 CAS cannot overwrite v2"
+    );
+    assert_eq!(mem.get(KEY).await.unwrap(), before);
+    if allow_v1 {
+        // Mutant rollout permits a v1 writer at an absent actor after enable.
+        let bad = rollback
+            .acquire("owners/t/c/new", || true, async || Ok(1))
+            .await
+            .unwrap();
+        if !bad.head.recorded {
+            return false;
+        }
+    }
+    let mut local_files = BTreeMap::from([("restored", h_at(99)), ("removed", h_at(88))]);
+    for operation in ["deploy-backup", "delete-recreate"] {
+        mem.put("apps/t/c/current", b"old-deploy".to_vec());
+        mem.put("state/t/c/stale", b"old-state".to_vec());
+        // Stopped replacement removes owners and local sidecars. No backup
+        // owner or pre-enable format payload is imported. Generation marker
+        // is above every restored key, including removed actors.
+        mem.objects.lock().unwrap().retain(|k, _| {
+            k != KEY
+                && !k.starts_with("state/")
+                && !k.starts_with("apps/")
+                && !(erase_format && k == &setting)
+        });
+        local_files.clear(); // stopped replacement invalidates both sidecars
+        assert!(local_files.is_empty());
+        assert!(mem.get("state/t/c/stale").await.unwrap().is_none());
+        assert!(mem.get("apps/t/c/current").await.unwrap().is_none());
+        assert!(mem.record().is_none());
+        let body = mem.get(&setting).await.unwrap().map(|(b, _)| b);
+        let enabled = app_format::decode(body.as_deref()).unwrap() == AppFormat::RecordedHead;
+        let restarted = owners(&mem, "new", enabled);
+        let marker = 100 + seed;
+        let marker_bytes = wasmkeep_cluster::node_lease::encode_marker(marker);
+        let marker = wasmkeep_cluster::node_lease::decode_marker(&marker_bytes).unwrap();
+        let fresh = restarted
+            .acquire(KEY, || true, async || Ok(marker + 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.generation,
+            marker + 1,
+            "{operation}: seeded above restored history"
+        );
+        assert!(
+            fresh.head.inherited.is_none(),
+            "replacement has no invented complete floor"
+        );
+        if !fresh.head.recorded || !enabled {
+            return false;
+        }
+        assert_eq!(restarted.release(&fresh).await, Released::Released);
+        // Actor absent from the backup starts empty above its marker too.
+        let removed = restarted
+            .acquire("owners/t/c/removed", || true, async || Ok(marker + 1))
+            .await
+            .unwrap();
+        assert_eq!(removed.generation, marker + 1);
+        assert!(removed.head.inherited.is_none() && removed.head.recorded);
+        let removed = Mutex::new(Some(removed));
+        hold_cell::verify(&removed, || true, Position::Empty).unwrap();
+        assert_eq!(
+            restarted.release(&hold_cell::end(&removed).unwrap()).await,
+            Released::Released
+        );
+        mem.objects.lock().unwrap().remove("owners/t/c/removed");
+    }
+    true
+}
+
+#[test]
+fn format_survives_rollback_replacement_and_recreate() {
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            START.with(|s| s.set(Some(madsim::time::Instant::now())));
+            assert!(format_lifecycle(seed, false, false).await);
+            assert!(
+                !format_lifecycle(seed, true, false).await,
+                "erased-format mutant escaped"
+            );
+            assert!(
+                !format_lifecycle(seed, false, true).await,
+                "v1-writer mutant escaped"
+            );
+        });
+    }
+}
+
+/// Case 14: demonstrate the boundary, including the unsupported lag case.
+/// A parked process's in-memory H is intentionally lost on crash.
+#[test]
+fn writing_and_parked_crashes_do_not_turn_lower_bounds_into_complete_heads() {
+    use wasmkeep_cluster::local_heads::{Proof, prove};
+    use wasmkeep_cluster::recorded_head::Completeness;
+    use wasmkeep_cluster::replication::SegmentId;
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            START.with(|s| s.set(Some(madsim::time::Instant::now())));
+            for parked in [false, true] {
+                let mem = Mem::new(seed);
+                let a = owners(&mem, "a", true);
+                let cell = Mutex::new(Some(a.acquire(KEY, || true, async || Ok(1)).await.unwrap()));
+                hold_cell::verify(&cell, || true, Position::Empty).unwrap();
+                hold_cell::acknowledge(&cell, || true, Some(h_at(1))).unwrap();
+                assert_eq!(
+                    a.release(&hold_cell::end(&cell).unwrap()).await,
+                    Released::Released
+                );
+                let hold = a.acquire(KEY, || true, async || Ok(1)).await.unwrap();
+                let g = hold.generation;
+                let cell = Mutex::new(Some(hold));
+                hold_cell::verify(&cell, || true, h_at(1)).unwrap();
+                let h = Position::Known {
+                    generation: g,
+                    txid: 2,
+                    checksum: 62,
+                };
+                hold_cell::acknowledge(&cell, || true, Some(h)).unwrap();
+                let mut local = LocalHeads::default();
+                if parked {
+                    local.register(&hold_cell::end(&cell).unwrap());
+                }
+                drop(local);
+                drop(cell);
+                fence(&mem, "a");
+                let b = owners(&mem, "b", true);
+                let next = b.acquire(KEY, || true, async || Ok(1)).await.unwrap();
+                let floor = next.head.inherited.unwrap();
+                assert_eq!(floor.completeness, Completeness::LowerBound);
+                let strong = [
+                    (
+                        SegmentId {
+                            generation: 1,
+                            txid: 1,
+                        },
+                        Some(31),
+                    ),
+                    (
+                        SegmentId {
+                            generation: g,
+                            txid: 2,
+                        },
+                        Some(62),
+                    ),
+                ];
+                assert_eq!(prove(Some(&floor), &strong), Proof::Proven);
+                // Known inconsistent storage is an external admission policy;
+                // prove alone cannot detect a missing acknowledgement.
+                let lagging = &strong[..1];
+                assert_eq!(
+                    prove(Some(&floor), lagging),
+                    Proof::Proven,
+                    "undetected crash LIST lag is outside the guarantee"
+                );
+                assert_ne!(
+                    lagging.last(),
+                    strong.last(),
+                    "safety mutant: treating floor as complete loses H"
+                );
+                let admit = |known_bad: bool, bypass: bool| !known_bad || bypass;
+                assert!(!admit(true, false));
+                assert!(
+                    admit(true, true),
+                    "known-inconsistency bypass mutant is caught"
+                );
+            }
+        });
+    }
+}
+
+/// Case 19's storage half: every refused admission (including unchanged
+/// acquisition for expiry) releases the same floor and idle origin. This
+/// complements the node-owned cooldown model in madsim_floor_proof.
+async fn refused_cycles(seed: u64, refresh_idle: bool) -> bool {
+    let mem = Mem::new(seed);
+    let a = owners(&mem, "a", true);
+    let first = a.acquire(KEY, || true, async || Ok(1)).await.unwrap();
+    let cell = Mutex::new(Some(first));
+    hold_cell::verify(&cell, || true, Position::Empty).unwrap();
+    let h = h_at(10 + seed % 30);
+    hold_cell::acknowledge(&cell, || true, Some(h)).unwrap();
+    let mut released = hold_cell::end(&cell).unwrap();
+    // Idle origin starts at release, after verification cleared any old one.
+    released.head.idle_since_ms = Some(17);
+    assert_eq!(a.release(&released).await, Released::Released);
+    for (i, route) in ["request", "alarm", "move", "delete", "expiry", "request"]
+        .iter()
+        .enumerate()
+    {
+        let mut hold = if *route == "expiry" {
+            let (_, version) = mem.get(KEY).await.unwrap().unwrap();
+            a.acquire_unchanged(KEY, |v| *v == version, || true)
+                .await
+                .unwrap()
+        } else {
+            a.acquire(KEY, || true, async || Ok(1)).await.unwrap()
+        };
+        assert_eq!(hold.generation, u64::try_from(i).unwrap() + 2);
+        assert_eq!(hold.head.inherited.unwrap().head, h);
+        // Refused restore: do not verify. Each cycle has one acquisition
+        // and an identical-payload release, even after actor eviction.
+        if refresh_idle {
+            hold.head.idle_since_ms = Some(SimClock.now_ms());
+        }
+        assert_eq!(a.release(&hold).await, Released::Released);
+        let r = mem.record().unwrap();
+        if r.recorded.unwrap().idle_since_ms != Some(17) {
+            return false;
+        }
+        assert_eq!(Requirement::of_record(&r).unwrap().head, h);
+        assert_eq!(Requirement::of_record(&r).unwrap().set_at, 1);
+    }
+    // Visibility recovers: eligibility has not been made younger by retries.
+    let (_, version) = mem.get(KEY).await.unwrap().unwrap();
+    let hold = a
+        .acquire_unchanged(KEY, |v| *v == version, || true)
+        .await
+        .unwrap();
+    let cell = Mutex::new(Some(hold));
+    hold_cell::verify(&cell, || true, h).unwrap();
+    assert_eq!(
+        a.release(&hold_cell::end(&cell).unwrap()).await,
+        Released::Released
+    );
+    true
+}
+
+#[test]
+fn refused_cycles_preserve_floor_stamp_and_idle_origin_until_expiry_can_verify() {
+    for seed in 0..seeds() {
+        Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            START.with(|s| s.set(Some(madsim::time::Instant::now())));
+            assert!(refused_cycles(seed, false).await);
+            assert!(
+                !refused_cycles(seed, true).await,
+                "idle-age refresh mutant escaped"
+            );
+        });
     }
 }

@@ -3,12 +3,19 @@
 use super::*;
 
 /// The WebSocket upgrade's ownership probe acquires and restores an actor
-/// with no instance started. A client that hangs up right after sending
-/// its upgrade leaves it so, and the committed alarm must still be armed
-/// here: it used to wait for the sweep (review). Node a sets the alarm and
-/// dies without handing it over; once a is fenced, an upgrade to b that is
-/// abandoned at once takes the actor, and the alarm fires on b on time,
-/// with no other request to the actor.
+/// with no instance started. A client that hangs up while the probe runs
+/// leaves it so, and the committed alarm must still be armed here: it used
+/// to wait for the sweep (review). Node a sets the alarm and dies without
+/// handing it over; once a is fenced, an upgrade to b is abandoned while
+/// its probe is held at the ownership read, and the alarm fires on b with
+/// no socket opened, no other request to the actor, and the sweep an hour
+/// away.
+///
+/// The cancellation is synchronized, not raced: the test used to drop each
+/// connection right after writing it and retry every 200 ms until b held
+/// the actor, then required that before the alarm's time. A connection
+/// closed that early often never reaches the upgrade handler at all, and
+/// under load the retries ate the margin before the alarm.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_upgrade_that_takes_an_actor_arms_its_alarm() {
     use object_store::ObjectStoreExt as _;
@@ -16,12 +23,17 @@ async fn an_abandoned_upgrade_that_takes_an_actor_arms_its_alarm() {
     let down = Arc::new(AtomicBool::new(false));
     let seen_by_a: Arc<dyn ObjectStore> =
         Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
+    let seen_by_b = Arc::new(Flaky::new(
+        Arc::clone(&shared),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let b_store: Arc<dyn ObjectStore> = seen_by_b.clone();
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let idle = Duration::from_secs(30);
     let wall = Duration::from_secs(30);
-    // A slow sweep: only arming on the takeover can deliver it on time.
+    // Beyond nextest's whole-test timeout: the sweep cannot rescue a missing arm.
     let slow_sweep = |c: &mut ActorConfig| {
-        c.cluster.as_mut().unwrap().alarm_sweep = Duration::from_secs(60);
+        c.cluster.as_mut().unwrap().alarm_sweep = Duration::from_secs(3_600);
     };
     let wasm = test_actor_wasm();
     let a = node_configured(
@@ -39,7 +51,7 @@ async fn an_abandoned_upgrade_that_takes_an_actor_arms_its_alarm() {
     let b = node_configured(
         "b",
         db.path(),
-        &shared,
+        &b_store,
         idle,
         &["t"],
         wasm,
@@ -86,43 +98,86 @@ async fn an_abandoned_upgrade_that_takes_an_actor_arms_its_alarm() {
     }
     // ttl plus grace after a's last write: the record is free for b.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    assert!(now_ms() + 1_500 < due, "too slow to test before the alarm");
-    // Upgrades, each abandoned as soon as it is sent, until one's probe
-    // took the actor on b. A connection closed that early may also be
-    // dropped before its request reaches the probe (it failed so once,
-    // under load): then nothing happened, and the next one tries again.
-    // None opens a socket, so no event runs the actor on b.
-    let started = std::time::Instant::now();
-    while lease_holder(&shared, "al").await.as_deref() != Some("b") {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "b never took al"
-        );
-        let mut stream = TcpStream::connect(b.addr).await.unwrap();
-        stream
-            .write_all(
-                b"GET /actor/t/al HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        drop(stream);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    // Taken before the alarm's time, or on-time arming is not what this
-    // shows (under load the loop could run past it).
     assert!(
-        now_ms() + 200 < due,
-        "too slow: b took al after the alarm's time"
+        !index_entries_for(&shared, "al").await.is_empty(),
+        "a must leave its committed alarm pending"
     );
-    // Not asked before its time: a request would start the instance on b
-    // and arm the alarm whatever the probe did.
-    tokio::time::sleep(Duration::from_millis((due + 800).saturating_sub(now_ms()))).await;
+    // The cold routing hint reads the owner first; the second read belongs
+    // to the mailbox's ownership probe. Keep that job blocked while Hyper
+    // observes the disconnect and drops the request waiting for its answer.
+    // The upgrade is served on a connection of its own, as b's listener
+    // does, so the test sees Hyper end it before the probe goes on.
+    let (release, released) = oneshot::channel();
+    *seen_by_b.lease_get_release.lock().unwrap() = Some(released);
+    let reads = seen_by_b.lease_gets.load(Ordering::SeqCst);
+    seen_by_b
+        .hold_lease_get_at
+        .store(reads + 2, Ordering::SeqCst);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = b.service.clone();
+    let connection = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                hyper_util::rt::TokioIo::new(stream),
+                hyper::service::service_fn(move |req| {
+                    let service = service.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(service.upgrade("t", "al", req).await)
+                    }
+                }),
+            )
+            .with_upgrades()
+            .await
+    });
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /actor/t/al HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !seen_by_b.lease_held.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upgrade never reached the ownership probe");
+    drop(stream);
+    let _ = tokio::time::timeout(Duration::from_secs(10), connection)
+        .await
+        .expect("Hyper did not cancel the abandoned request")
+        .unwrap();
+    release.send(()).unwrap();
+    let released = now_ms();
+
+    // Only bucket observations until delivery is committed: even GET /fired
+    // could instantiate the actor and arm an otherwise forgotten alarm.
+    // The alarm may already be due on a loaded machine; the probe must arm
+    // it either way. The sweep is an hour away, so only the probe's arm can
+    // deliver it, and on time: from its time, or from the release if that
+    // came later, as the old test asked from the alarm's time.
+    wait_unindexed(&shared, "al", Duration::from_secs(15)).await;
+    let late = now_ms().saturating_sub(due.max(released));
+    assert!(
+        late < 800,
+        "the alarm was delivered {late} ms late: armed late, or not by the probe"
+    );
+    assert_eq!(lease_holder(&shared, "al").await.as_deref(), Some("b"));
     let r = send(b.addr, "GET", "/actor/t/al/fired", "").await;
     assert_eq!(
         (r.status, r.node.as_deref(), r.body.trim()),
         (200, Some("b"), "1"),
-        "the alarm did not fire within 800 ms of its time"
+        "the abandoned probe did not deliver the alarm"
+    );
+    let r = send(b.addr, "GET", "/actor/t/al/opened", "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref(), r.body.trim()),
+        (200, Some("b"), "none"),
+        "no socket event may arm the alarm"
     );
 }
 
