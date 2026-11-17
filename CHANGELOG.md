@@ -9,6 +9,20 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+## 0.5.1
+
+**Fixes and safer operations on 0.5.0.** Activations run under the same
+deadline as events; the guest SDKs keep HTTP headers lossless; destructive
+commands print an operation ID and can be resumed with `--resume`; a
+refused actor restore no longer disturbs the actor's sockets; the
+recorded-head format gets its follow-ups; `serve --no-alarms` runs a node
+that never fires alarms. No WIT or manifest format change: a 0.5.0
+cluster upgrades node by node, and actors built with the 0.5.0 SDKs keep
+running. During the upgrade, use the 0.5.1 CLI, and expect a superseded
+actor delete to show as dropped to a 0.5.0 CLI (below). The TypeScript
+SDK's `http.fetch(...).headers` changes behaviour (below). Still a
+**pre-alpha pre-release**.
+
 - Refused actor restores preserve existing WebSockets and upgrade admission.
   Snapshot validation and restore fences now precede the 1012 close; accepted
   restores retain their checked snapshot while the old sockets drain.
@@ -27,13 +41,13 @@ The text under a version's heading is its GitHub release text
   nor expires `.superseded`. Bindings, capability negotiation and durable
   receipts move to 0.6.0. See [operation recovery](docs/operations.md).
 
-- **Activation deadlines (0.5.1):** an actor's activation (instantiating
+- **Activation deadlines:** an actor's activation (instantiating
   its component and running its start function) runs under the same wall,
   lease and replication guard as an event; cut, it waits for its pending
   database work, gives up its hold and answers 503 with `Retry-After`. A
   front's validation runs under the front's wall budget. No new setting.
 
-- **Lossless HTTP headers in the guest SDKs (0.5.1):** the TypeScript,
+- **Lossless HTTP headers in the guest SDKs:** the TypeScript,
   Python and Rust SDKs keep headers as ordered (name, value) pairs, compare
   names without case, and never join `Set-Cookie`. `get(name)` is the first
   value, `getAll(name)` (`get_all`) every value in order, `append` adds and
