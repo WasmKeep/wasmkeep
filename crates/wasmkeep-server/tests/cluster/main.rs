@@ -911,6 +911,8 @@ struct Flaky {
     /// Deletes of delete requests (`.../deletes/...`, ADR 0028) fail
     /// while set.
     fail_request_deletes: Arc<AtomicBool>,
+    /// Keep operator deletes pending while another replacement commits.
+    hide_delete_requests: Arc<AtomicBool>,
     /// Listings of ownership records (`.../owners/...`, an idle-expiry
     /// pass, ADR 0028) are taken, then handed back only this many ms later.
     delay_owner_lists_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -941,6 +943,7 @@ impl Flaky {
             releases_held: Arc::default(),
             release_held_until_ms: Arc::default(),
             fail_request_deletes: Arc::default(),
+            hide_delete_requests: Arc::default(),
             delay_owner_lists_ms: Arc::default(),
             owner_lists_taken: Arc::default(),
             owner_lists_done: Arc::default(),
@@ -1356,9 +1359,18 @@ impl ObjectStore for Flaky {
             .flatten()
             .boxed();
         }
+        let hidden = self.hide_delete_requests.load(Ordering::SeqCst);
         let aged = self.aged_history.clone();
         self.inner
             .list(prefix)
+            .filter(move |meta| {
+                futures_util::future::ready(
+                    !hidden
+                        || !meta
+                            .as_ref()
+                            .is_ok_and(|m| m.location.as_ref().contains("/deletes/")),
+                )
+            })
             .map(move |meta| {
                 meta.map(|mut meta| {
                     if aged.lock().unwrap().contains(meta.location.as_ref()) {

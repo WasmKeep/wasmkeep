@@ -168,7 +168,7 @@ impl RestoreIntent {
 
 /// What became of a delete request: written by the node that carried it
 /// out, beside the request, before it deletes the request's key, and read
-/// (then deleted) by the command waiting for it. The key going away alone
+/// without consuming it by the command waiting for it. The key going away alone
 /// proves nothing (it also expires).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {
@@ -176,15 +176,18 @@ pub enum DeleteOutcome {
     Done,
     /// No such actor: nothing was deleted or created.
     Absent,
+    /// The target was replaced since this request was submitted.
+    Superseded,
 }
 
 impl DeleteOutcome {
-    const ALL: [Self; 2] = [Self::Done, Self::Absent];
+    const ALL: [Self; 3] = [Self::Done, Self::Absent, Self::Superseded];
 
     fn suffix(self) -> &'static str {
         match self {
             Self::Done => ".done",
             Self::Absent => ".absent",
+            Self::Superseded => ".superseded",
         }
     }
 
@@ -719,13 +722,15 @@ mod tests {
             checked_delete_key(&StateRoot::new("", "ac/me", "blog"), "cart", "x", "0a").is_err()
         );
         // Outcomes are not requests, and expire with them.
-        let done = DeleteOutcome::Done.key(&key);
-        assert_eq!(DeleteOutcome::of(&done, &key), Some(DeleteOutcome::Done));
-        assert_eq!(DeleteOutcome::of(&key, &key), None);
-        let (control, expired) = parse(&[(done.clone(), 1_000)], 1_000 + DELETE_TTL_MS);
-        assert_eq!((control, expired), (Control::default(), Vec::new()));
-        let (_, expired) = parse(&[(done.clone(), 1_000)], 1_001 + DELETE_TTL_MS);
-        assert_eq!(expired, [done]);
+        for outcome in DeleteOutcome::ALL {
+            let done = outcome.key(&key);
+            assert_eq!(DeleteOutcome::of(&done, &key), Some(outcome));
+            assert_eq!(DeleteOutcome::of(&key, &key), None);
+            let (control, expired) = parse(&[(done.clone(), 1_000)], 1_000 + DELETE_TTL_MS);
+            assert_eq!((control, expired), (Control::default(), Vec::new()));
+            let (_, expired) = parse(&[(done.clone(), 1_000)], 1_001 + DELETE_TTL_MS);
+            assert_eq!(expired, [done]);
+        }
         let (a, b) = (new_request_id(), new_request_id());
         assert!(request_id(&a) && a.len() == 16 && a != b, "{a} {b}");
     }

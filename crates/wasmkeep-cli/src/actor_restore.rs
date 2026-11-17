@@ -10,6 +10,9 @@ use wasmkeep_server::history::{self, Point};
 
 #[derive(Debug, Args)]
 pub(crate) struct RestoreArgs {
+    /// Resume this operation ID without submitting another request.
+    #[arg(long, conflicts_with_all = ["txid", "at", "from", "run", "if_head"])]
+    resume: Option<String>,
     /// CLASS/NAME (or default/CLASS/NAME without --app).
     actor: String,
     #[arg(long, value_parser = crate::parse_app)]
@@ -39,7 +42,7 @@ pub(crate) struct RestoreArgs {
 pub(crate) fn run(args: &RestoreArgs) -> anyhow::Result<()> {
     let ((tenant, app), class, name) = crate::move_target(&args.actor, args.app.as_ref())?;
     ensure!(
-        args.txid.is_some() || args.at.is_some() || args.from.is_some(),
+        args.resume.is_some() || args.txid.is_some() || args.at.is_some() || args.from.is_some(),
         "choose --txid, --at, or --from"
     );
     let point = match (&args.at, args.txid) {
@@ -60,7 +63,9 @@ pub(crate) fn run(args: &RestoreArgs) -> anyhow::Result<()> {
         .transpose()?;
     let (store, prefix) = crate::open_bucket(&args.bucket)?;
     crate::check_layout(&args.bucket, &store, &prefix, &tenant)?;
-    crate::refuse_deleted(&store, &prefix, &tenant, &app)?;
+    if args.resume.is_none() {
+        crate::refuse_deleted(&store, &prefix, &tenant, &app)?;
+    }
     crate::actor_read::run(execute(
         args, store, prefix, tenant, app, class, name, point, if_head,
     ))
@@ -82,6 +87,11 @@ async fn execute(
     let address = wasmkeep_runtime::ActorAddress::new(&tenant, &class, &name)?;
     let keys =
         wasmkeep_cluster::object_store::ObjectStoreBucket::new(store.clone(), prefix.clone());
+    if let Some(id) = &args.resume {
+        let key = control::checked_restore_key(&root, &class, &name, id)?;
+        println!("Operation ID: {id}");
+        return wait(args, &keys, &key, id, None).await;
+    }
     for node in wasmkeep_cluster::membership::all_heartbeats(&keys).await? {
         ensure!(
             node.app != format!("{tenant}/{app}") || node.can_actor_restore,
@@ -177,26 +187,41 @@ async fn execute(
         let _ = keys.delete(&format!("{key}.ltx")).await;
         bail!("announcing restore failed: {e}");
     }
+    println!("Operation ID: {id}");
+    wait(args, &keys, &key, &id, Some(export.position)).await
+}
+
+async fn wait(
+    args: &RestoreArgs,
+    keys: &impl control::Keys,
+    key: &str,
+    id: &str,
+    source: Option<wasmkeep_cluster::replication::SegmentId>,
+) -> anyhow::Result<()> {
     let until = std::time::Instant::now()
         + std::time::Duration::from_secs(if args.no_wait { 0 } else { args.wait });
     loop {
         for suffix in ["done", "conflict", "refused", "absent", "superseded"] {
             let outcome = format!("{key}.{suffix}");
-            if let Some(body) = keys.get_body(&outcome).await? {
-                let _ = keys.delete(&outcome).await;
+            let body = keys.get_body(&outcome).await?;
+            if let Some(body) = body {
                 if suffix != "done" {
                     bail!("restore {suffix}: {}", String::from_utf8_lossy(&body));
                 }
-                println!(
-                    "Restored to txid {} of generation {}, now {}",
-                    export.position.txid,
-                    export.position.generation,
-                    String::from_utf8_lossy(&body)
-                );
+                if let Some(source) = source {
+                    println!(
+                        "Restored to txid {} of generation {}, now {}",
+                        source.txid,
+                        source.generation,
+                        String::from_utf8_lossy(&body)
+                    );
+                } else {
+                    println!("Restore {id} done: now {}", String::from_utf8_lossy(&body));
+                }
                 return Ok(());
             }
         }
-        if keys.get_body(&key).await?.is_none() {
+        if keys.get_body(key).await?.is_none() {
             bail!("restore request dropped");
         }
         if std::time::Instant::now() >= until {
@@ -242,6 +267,7 @@ mod tests {
             .await
             .unwrap();
         let args = RestoreArgs {
+            resume: None,
             actor: "c/n".into(),
             app: Some(("t".into(), "a".into())),
             bucket: "s3://test".into(),
@@ -300,6 +326,104 @@ mod tests {
         assert_eq!(&file.pages[0].1[18..20], &[2, 2]);
         assert!(keys.get_body(control::CHANGED).await.unwrap().is_some());
         assert!(request.source.starts_with("live "));
+    }
+
+    #[tokio::test]
+    async fn stable_id_actor_restore_timeout_finish_recreate_resume() {
+        use object_store::{ObjectStoreExt as _, path::Path};
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let id = "0123456789abcdef";
+        let key = "state/t/a/restores/c/6e/0123456789abcdef";
+        store
+            .put(&Path::from(key), b"request".to_vec().into())
+            .await
+            .unwrap();
+        let args = RestoreArgs {
+            resume: Some(id.into()),
+            actor: "c/n".into(),
+            app: Some(("t".into(), "a".into())),
+            bucket: "s3://b".into(),
+            txid: None,
+            at: None,
+            from: None,
+            run: None,
+            if_head: None,
+            wait: 0,
+            no_wait: false,
+        };
+        let run = || {
+            execute(
+                &args,
+                store.clone(),
+                String::new(),
+                "t".into(),
+                "a".into(),
+                "c".into(),
+                "n".into(),
+                Point::Head,
+                None,
+            )
+        };
+        // A request whose wait ended before the node publishes its outcome.
+        assert!(run().await.is_ok());
+        store
+            .put(&Path::from(format!("{key}.done")), b"2:7".to_vec().into())
+            .await
+            .unwrap();
+        store.delete(&Path::from(key)).await.unwrap();
+        let current = Path::from("state/t/a/actors/c/n/new-incarnation");
+        store.put(&current, b"keep".to_vec().into()).await.unwrap();
+        for _ in 0..2 {
+            run().await.unwrap();
+            assert_eq!(
+                store.get(&current).await.unwrap().bytes().await.unwrap(),
+                "keep"
+            );
+            assert!(store.get(&Path::from(key)).await.is_err());
+            assert!(store.get(&Path::from(format!("{key}.done"))).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_actor_restore_resume_files_nothing() {
+        use object_store::{ObjectStoreExt as _, path::Path};
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let args = RestoreArgs {
+            resume: Some("0123456789abcdef".into()),
+            actor: "c/n".into(),
+            app: Some(("t".into(), "a".into())),
+            bucket: "s3://b".into(),
+            txid: None,
+            at: None,
+            from: None,
+            run: None,
+            if_head: None,
+            wait: 0,
+            no_wait: true,
+        };
+        assert!(
+            execute(
+                &args,
+                store.clone(),
+                String::new(),
+                "t".into(),
+                "a".into(),
+                "c".into(),
+                "n".into(),
+                Point::Head,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            store
+                .get(&Path::from("state/t/a/restores/c/6e/0123456789abcdef"))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

@@ -249,7 +249,7 @@ instance, no `on-init`):
    next pass. The snapshot and the erase follow; a failure there leaves
    old history objects in the bucket, which no restore uses, until the
    actor writes again (`wasmkeep_history_collect_failures_total`).
-   Outcomes nobody read expire with requests (one hour).
+   Outcomes remain readable and expire after the request TTL (one hour).
 
 **By the actor's state:**
 
@@ -274,7 +274,10 @@ written), and the tenant's layout must be the one of 0.4.0 (as `actor
 move`). It then writes the key and waits for its outcome: by default up
 to 60 s (`--wait SECS`, at most 3000, below the request's expiry;
 `--no-wait` returns at once). `.done` within the wait: it prints
-"Deleted" and removes the outcome. `.absent`: "no such actor", non-zero.
+"Deleted" and retains the outcome. `.absent`: "no such actor", non-zero.
+`.superseded`: the actor was replaced after submission, non-zero; its data
+is left intact. `--resume ID` reads the original operation without filing
+a request.
 The request gone with no outcome (expired, by a node's clock, or not an
 actor address): "dropped", non-zero, nothing known to be deleted. Still
 there: non-zero, "requested; the cluster keeps trying until <T + 1 h>".
@@ -571,3 +574,18 @@ fourteen times less. What that changes here:
   node of 0.4.1, which does not collect). Until then two nodes may both
   run a pass, as when views disagree, which the conditional acquire makes
   safe (section 4).
+
+## Stable operator handles
+
+Actor delete prints its request ID before waiting; `--resume ID` never files
+another request. The owner checks for a later operator-restore marker, or a
+`replaced` delete label whose reset bucket time is at or after the request,
+after checking whether that delete was already carried out. Such pending
+requests end `superseded`, preserving the replacement actor.
+
+Outcomes remain adjacent to requests without being consumed by readers and
+expire after the request TTL. After expiry an ID is unknown and nothing is
+filed. App delete resumes match the existing tombstone ID. A 0.5.0 CLI reports
+a superseded delete as dropped (fails closed); a 0.5.0 node neither recognises
+nor expires `.superseded`. Bindings and durable receipts move to 0.6.0.
+See [operation recovery](../operations.md).

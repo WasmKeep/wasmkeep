@@ -314,9 +314,9 @@ fn actor_delete_writes_its_request_and_waits_for_it() {
     // No such actor, by the node's look.
     let e = run_with(".absent").unwrap_err();
     assert!(e.contains("no such actor"), "{e}");
-    // Carried out: done, and the outcome read is removed.
+    // Carried out: done; outcomes remain readable for resumed waiters.
     run_with(".done").unwrap();
-    assert_eq!(requests(&store), [segment.to_string()], "left behind");
+    assert!(requests(&store).iter().any(|key| key.ends_with(".done")));
     assert!(
         super::Cli::try_parse_from([
             "wasmkeep",
@@ -878,6 +878,7 @@ fn app_delete_removes_both_prefixes_and_keeps_the_tombstone() {
         }
     });
     let ask = wasmkeep_server::apps::DeleteApp {
+        resume: None,
         wait: std::time::Duration::from_secs(1),
         force: false,
         who: "test".into(),
@@ -908,7 +909,7 @@ fn app_delete_removes_both_prefixes_and_keeps_the_tombstone() {
         store
             .list(None)
             .map_ok(|m| m.location.to_string())
-            .try_collect()
+            .try_collect::<Vec<_>>()
             .await
             .unwrap()
     });
@@ -1241,4 +1242,166 @@ fn serve_writes_names_served_classes_only() {
     assert!(serve_batched(&[("other".to_owned(), Writes::Batched)], &served, false).is_err());
     assert!(serve_batched(&given, &served, true).is_err(), "with --app");
     assert!(serve_batched(&[], &served, true).unwrap().is_empty());
+}
+
+// An operation handle must be accepted without selecting a new operation.
+fn resume_cli(command: &[&str]) {
+    use clap::Parser as _;
+    let mut argv = vec!["wasmkeep"];
+    argv.extend_from_slice(command);
+    argv.extend_from_slice(&[
+        "--bucket",
+        "s3://b",
+        "--app",
+        "acme/shop",
+        "--resume",
+        "0123456789abcdef",
+    ]);
+    assert!(super::Cli::try_parse_from(argv).is_ok());
+}
+#[test]
+fn stable_id_actor_delete_resume() {
+    resume_cli(&["actor", "delete", "room/x"]);
+}
+#[test]
+fn stable_id_app_delete_resume() {
+    resume_cli(&["app", "delete"]);
+}
+#[test]
+fn stable_id_actor_restore_resume() {
+    resume_cli(&["actor", "restore", "room/x"]);
+}
+#[test]
+fn stable_id_backup_restore_resume() {
+    resume_cli(&["backup", "restore", "--from", "s3://archive"]);
+}
+
+#[test]
+fn stable_id_actor_delete_timeout_finish_recreate_resume() {
+    use object_store::{ObjectStoreExt as _, path::Path};
+    let store: std::sync::Arc<dyn object_store::ObjectStore> =
+        std::sync::Arc::new(object_store::memory::InMemory::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let history = Path::from(
+        "wk/state/acme/shop/actors/room/x%201/snapshot/0000000000000001-0000000000000001.ltx",
+    );
+    rt.block_on(store.put(&history, b"history present".to_vec().into()))
+        .unwrap();
+    let open = || Ok((store.clone(), "wk".into()));
+    let poll = std::time::Duration::ZERO;
+    assert!(super::actor_delete_on(&delete_args(&["--wait", "0"]), open, poll).is_err());
+    let request = keys_of(&store)
+        .into_iter()
+        .find(|k| k.contains("/deletes/"))
+        .unwrap();
+    let id = request.rsplit('/').next().unwrap();
+    rt.block_on(async {
+        store
+            .put(
+                &Path::from(format!("wk/{}.done", request.strip_prefix("wk/").unwrap())),
+                Vec::new().into(),
+            )
+            .await
+            .unwrap();
+        store.delete(&Path::from(request.as_str())).await.unwrap();
+        store
+            .put(&history, b"new incarnation".to_vec().into())
+            .await
+            .unwrap();
+    });
+    let before = keys_of(&store);
+    for unknown in ["deadbeef", "../../invalid"] {
+        assert!(
+            super::actor_delete_on(
+                &delete_args(&["--resume", unknown, "--wait", "0"]),
+                open,
+                poll
+            )
+            .is_err()
+        );
+        assert_eq!(keys_of(&store), before);
+    }
+
+    for _ in 0..2 {
+        super::actor_delete_on(&delete_args(&["--resume", id, "--wait", "0"]), open, poll).unwrap();
+        assert_eq!(keys_of(&store), before);
+    }
+    rt.block_on(store.delete(&Path::from(format!("{request}.done"))))
+        .unwrap();
+    let expired = keys_of(&store);
+    assert!(
+        super::actor_delete_on(&delete_args(&["--resume", id, "--no-wait"]), open, poll).is_err()
+    );
+    assert_eq!(keys_of(&store), expired);
+    assert_eq!(
+        rt.block_on(async { store.get(&history).await.unwrap().bytes().await.unwrap() }),
+        "new incarnation"
+    );
+}
+
+#[test]
+fn stable_id_app_delete_timeout_finish_recreate_resume() {
+    use object_store::{ObjectStoreExt as _, path::Path};
+    let store: std::sync::Arc<dyn object_store::ObjectStore> =
+        std::sync::Arc::new(object_store::memory::InMemory::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let current = Path::from("apps/acme/shop/current");
+        store.put(&current, b"old".to_vec().into()).await.unwrap();
+        let mut ask = wasmkeep_server::apps::DeleteApp {
+            resume: None,
+            wait: std::time::Duration::ZERO,
+            force: false,
+            who: "test".into(),
+            late: std::time::Duration::from_secs(10),
+        };
+        let run = |ask: wasmkeep_server::apps::DeleteApp| {
+            let store = store.clone();
+            async move {
+                wasmkeep_server::apps::delete_app(
+                    store,
+                    "",
+                    "acme",
+                    "shop",
+                    &ask,
+                    &mut |_| {},
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                )
+                .await
+            }
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), run(ask.clone()))
+                .await
+                .is_err()
+        );
+        let app = wasmkeep_server::apps::AppRef::new(store.clone(), "", "acme", "shop");
+        let tombstone = app.tombstone().await.unwrap().unwrap();
+        let id = tombstone
+            .lines()
+            .find_map(|s| s.strip_prefix("id "))
+            .unwrap()
+            .to_owned();
+        ask.late = std::time::Duration::ZERO;
+        run(ask.clone()).await.unwrap();
+        ask.resume = Some(id.clone());
+        for _ in 0..2 {
+            run(ask.clone()).await.unwrap();
+        }
+        app.recreate(std::time::Duration::ZERO).await.unwrap();
+        store
+            .put(&current, b"new incarnation".to_vec().into())
+            .await
+            .unwrap();
+        ask.resume = Some(id);
+        for _ in 0..2 {
+            assert!(run(ask.clone()).await.is_err());
+            assert!(app.tombstone().await.unwrap().is_none());
+            assert_eq!(
+                store.get(&current).await.unwrap().bytes().await.unwrap(),
+                "new incarnation"
+            );
+        }
+    });
 }

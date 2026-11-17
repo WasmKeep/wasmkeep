@@ -43,6 +43,8 @@ pub(super) enum Deleted {
     Done,
     /// No such actor: nothing to delete, nothing created.
     NoSuchActor,
+    /// The submitted incarnation no longer exists.
+    Superseded,
     /// Another node holds the actor: it acts.
     HeldBy(String),
     /// A socket is open or closing: tried again on a later pass.
@@ -109,6 +111,46 @@ impl ActorState {
                 return Deleted::Refused("the restored delete is not this hold's yet".into());
             }
             return Deleted::Done;
+        }
+        // A replacement after submission makes this pending request stale.
+        // Use bucket time for delete labels, as operator restores do.
+        let marker = match self.restore_meta(OPERATOR_RESTORE_KEY).await {
+            Ok(marker) => marker,
+            Err(e) => return Deleted::Refused(e),
+        };
+        let replaced = match self.restore_meta("replaced").await {
+            Ok(replaced) => replaced,
+            Err(e) => return Deleted::Refused(e),
+        };
+        use wasmkeep_cluster::actor_restore::replay;
+        let later_restore = replay(marker.as_deref(), None, at_ms, &id) == Some("superseded");
+        let replaced = if !later_restore
+            && replaced
+                .as_deref()
+                .is_some_and(|label| label.starts_with("delete "))
+        {
+            if let (Some(slot), Some(cluster)) = (self.replica(), &self.cluster) {
+                match slot
+                    .lock()
+                    .await
+                    .delete_time(
+                        replaced.as_deref().unwrap_or_default(),
+                        cluster.history_retention,
+                        cluster.restore_delete_retention_bound(),
+                    )
+                    .await
+                {
+                    Ok(at) => at.map(|at| format!("delete 0 {at}")),
+                    Err(e) => return Deleted::Refused(e.to_string()),
+                }
+            } else {
+                replaced
+            }
+        } else {
+            replaced
+        };
+        if later_restore || replay(None, replaced.as_deref(), at_ms, &id) == Some("superseded") {
+            return Deleted::Superseded;
         }
         if self.sockets.reserved_by(&self.address) > 0 {
             for conn in self.sockets.of(&self.address, None) {
@@ -279,6 +321,12 @@ async fn delete_one(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, intent: &
             tracing::info!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), "delete request: no such actor; dropped");
             cluster
                 .end_delete_request(intent, Some(DeleteOutcome::Absent))
+                .await;
+            inner.mailboxes.hibernate(&address);
+        }
+        Deleted::Superseded => {
+            cluster
+                .end_delete_request(intent, Some(DeleteOutcome::Superseded))
                 .await;
             inner.mailboxes.hibernate(&address);
         }

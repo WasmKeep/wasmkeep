@@ -17,6 +17,8 @@ const ROUNDS: usize = 10;
 /// What `wasmkeep app delete` was asked.
 #[derive(Debug, Clone)]
 pub struct DeleteApp {
+    /// Resume the tombstone identified by this ID.
+    pub resume: Option<String>,
     /// How long to wait for the app's live nodes to stop.
     pub wait: Duration,
     /// Remove the data even though nodes still look live (after `cluster
@@ -73,6 +75,19 @@ pub async fn delete_app(
          prefixes (state/default/default/) yourself"
     );
     let app = super::AppRef::new(Arc::clone(&store), prefix, tenant, name);
+    if let Some(id) = &args.resume {
+        let root = wasmkeep_cluster::state_root::StateRoot::new("", tenant, name);
+        wasmkeep_cluster::control::checked_delete_key(&root, "app", "app", id)
+            .map_err(super::bucket)?;
+        say(format!("Operation ID: {id}"));
+        let tombstone = app.tombstone().await?;
+        ensure!(
+            tombstone
+                .as_deref()
+                .is_some_and(|body| body.lines().any(|line| line == format!("id {id}"))),
+            "operation {id} is unknown or its app incarnation changed; nothing removed"
+        );
+    }
     app.check_not_restoring().await?;
     let shown = app.name();
     let existed = app.tombstone().await?;
@@ -94,6 +109,10 @@ pub async fn delete_app(
     let mut since_ms = now();
     if existed.is_none() {
         ensure!(
+            args.resume.is_none(),
+            "delete tombstone disappeared; nothing filed"
+        );
+        ensure!(
             !app.app_keys().await?.is_empty(),
             "no such app: nothing of {shown} is in the bucket"
         );
@@ -114,6 +133,24 @@ pub async fn delete_app(
             "{shown}: already deleted (its tombstone is there); finishing"
         ));
     }
+    let tombstone = app
+        .tombstone()
+        .await?
+        .ok_or_else(|| DeployError::Refused("delete tombstone disappeared".into()))?;
+    if let Some(expected) = existed.as_ref() {
+        ensure!(
+            &tombstone == expected,
+            "app incarnation changed; delete stopped"
+        );
+    }
+    let id = tombstone
+        .lines()
+        .find_map(|line| line.strip_prefix("id "))
+        .ok_or_else(|| DeployError::Refused("delete tombstone has no operation ID".into()))?;
+    if let Some(expected) = &args.resume {
+        ensure!(expected == id, "delete operation changed; nothing removed");
+    }
+    say(format!("Operation ID: {id}"));
     // Then the data, once no live node of the app is left.
     let started = tokio::time::Instant::now();
     let wait = args.wait;
@@ -148,6 +185,10 @@ pub async fn delete_app(
     let mut removed = 0;
     let mut rounds = 0;
     loop {
+        ensure!(
+            app.tombstone().await?.as_deref() == Some(tombstone.as_str()),
+            "app incarnation changed; delete stopped"
+        );
         let keys = app.app_keys().await?;
         if keys.is_empty() {
             // A write sent before a node stopped can land until its

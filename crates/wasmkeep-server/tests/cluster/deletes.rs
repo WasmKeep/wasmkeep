@@ -319,3 +319,57 @@ async fn ending_a_delete_request_tells_the_other_nodes() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_operator_delete_is_superseded_by_self_delete_and_recreation() {
+    pending_delete_replacement(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_operator_delete_is_superseded_by_actor_restore() {
+    pending_delete_replacement(true).await;
+}
+
+async fn pending_delete_replacement(restore: bool) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(store.clone(), Arc::new(AtomicBool::new(false))));
+    flaky.hide_delete_requests.store(true, Ordering::SeqCst);
+    let seen: Arc<dyn ObjectStore> = flaky.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "replacement",
+        dir.path(),
+        &seen,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    write(a.addr, "pending", 2).await;
+    let stage = super::restore::actor_restore_stage(&store, "pending").await;
+    let request = request_delete(&store, "pending").await;
+    // Ensure the restore marker is strictly later even on second-resolution buckets.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    if restore {
+        let key =
+            super::restore::actor_restore_submit(&store, "pending", "1111111111111111", &stage)
+                .await;
+        super::restore::actor_restore_outcome(&store, &key, "done").await;
+    } else {
+        assert_eq!(
+            send(a.addr, "POST", "/actor/t/pending/delete-durable", "")
+                .await
+                .status,
+            200
+        );
+        write(a.addr, "pending", 1).await;
+    }
+    assert!(exists(&store, &request).await, "A must still be pending");
+    flaky.hide_delete_requests.store(false, Ordering::SeqCst);
+    announce_intent(&store).await;
+    ended_within(&store, &request, ".superseded", Duration::from_secs(10)).await;
+    assert_eq!(
+        read(a.addr, "pending").await,
+        if restore { "2" } else { "1" }
+    );
+}

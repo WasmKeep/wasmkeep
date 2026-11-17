@@ -162,3 +162,7 @@ Only the `.done` outcome acknowledges restoration; the request disappearing
 alone does not. During a rolling upgrade, older nodes do not process restore
 requests or preserve their markers through deletes: finish upgrading before
 using this command.
+
+Restore requests print an operation ID before waiting. Use `--resume ID`
+instead of selecting a source again after interruption; see
+[operation recovery](operations.md).

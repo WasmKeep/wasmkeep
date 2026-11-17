@@ -476,7 +476,7 @@ async fn actor_restore_refuses_absent_conflicting_corrupt_and_other_page_size() 
 }
 
 /// Construct a real, checksum-valid historical snapshot, also returning its head.
-async fn actor_restore_stage(
+pub(super) async fn actor_restore_stage(
     store: &Arc<dyn ObjectStore>,
     name: &str,
 ) -> (Vec<u8>, wasmkeep_cluster::actor_restore::Request) {
@@ -517,7 +517,7 @@ async fn actor_restore_stage(
     (bytes, request)
 }
 
-async fn actor_restore_submit(
+pub(super) async fn actor_restore_submit(
     store: &Arc<dyn ObjectStore>,
     name: &str,
     id: &str,
@@ -548,7 +548,11 @@ async fn actor_restore_submit(
     key
 }
 
-async fn actor_restore_outcome(store: &Arc<dyn ObjectStore>, key: &str, suffix: &str) -> String {
+pub(super) async fn actor_restore_outcome(
+    store: &Arc<dyn ObjectStore>,
+    key: &str,
+    suffix: &str,
+) -> String {
     let outcome = Key::from(format!("{key}.{suffix}"));
     eventually("restore outcome", async || {
         if suffix != "refused"

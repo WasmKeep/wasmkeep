@@ -23,6 +23,7 @@ pub(crate) fn run(args: &AppDeleteArgs) -> anyhow::Result<()> {
         .build()?;
     let (tenant, name) = &args.app;
     let ask = apps::DeleteApp {
+        resume: args.resume.clone(),
         wait: Duration::from_secs(args.wait),
         force: args.force,
         who: std::env::var("USER").unwrap_or_else(|_| "-".into()),

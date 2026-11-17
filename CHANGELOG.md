@@ -7,6 +7,19 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
+## Unreleased
+
+- Actor delete, app delete, actor restore and backup restore print operation IDs
+  before waiting and accept `--resume ID`, which never files a new request.
+  Actor outcomes are read without consuming them and last for the request TTL;
+  after expiry the ID is unknown and nothing is filed. App delete matches the
+  tombstone ID; backup restore matches the journal nonce or completed `restored`
+  marker. Pending actor deletes superseded by a later restore or a delete at
+  or after their bucket time leave the replacement intact. A 0.5.0 CLI reports
+  a superseded delete as dropped (fails closed); a 0.5.0 node neither recognises
+  nor expires `.superseded`. Bindings, capability negotiation and durable
+  receipts move to 0.6.0. See [operation recovery](docs/operations.md).
+
 ## 0.5.0
 
 **Batched writes, data access and per-node limits.** A class can batch

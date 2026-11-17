@@ -328,6 +328,11 @@ pub(super) async fn execute(
         name != "default/default",
         "implicit app does not follow restore fences"
     );
+    if let Some(id) = &args.resume {
+        let root = wasmkeep_cluster::state_root::StateRoot::new("", &args.app.0, &args.app.1);
+        wasmkeep_cluster::control::checked_restore_key(&root, "app", "app", id)?;
+        println!("Operation ID: {id}");
+    }
     let base = key(tp, &format!("apps/{name}"));
     let fence = key(&base, "restoring");
     // Pin the selected run across retries even when the undo backup moves latest.
@@ -336,6 +341,21 @@ pub(super) async fn execute(
         Some(bytes) => serde_json::from_slice(bytes).context("invalid restore journal")?,
         None => Value::Null,
     };
+    if let Some(id) = &args.resume {
+        if existing.is_none()
+            && optional(target, &key(&base, "restored")).await?.as_deref() == Some(id.as_bytes())
+        {
+            println!("Restore {id} done: {name}");
+            return Ok(());
+        }
+        ensure!(
+            journal["nonce"].as_str() == Some(id),
+            "operation {id} is unknown or no longer active; nothing changed"
+        );
+    }
+    if let Some(id) = journal["nonce"].as_str() {
+        println!("Operation ID: {id}");
+    }
     if args.abort {
         // Trust the persisted mode, never the invocation's --in-place flag.
         let empty_root = journal["binding"]["in_place"] == false;
@@ -556,6 +576,7 @@ pub(super) async fn execute(
                 "nonce":wasmkeep_cluster::control::new_request_id(),"started_ms":now_ms()?});
             json_put(target, &fence, &journal, false).await?;
         }
+        println!("Operation ID: {}", text(&journal, "nonce")?);
         // A distinct marker for every operation, stable across that operation's
         // retries. It is written before any state is removed or copied.
         replace_conditional(target, &key(&base, "restored"), text(&journal, "nonce")?.as_bytes().to_vec()).await?;
