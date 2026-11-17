@@ -166,7 +166,7 @@ async fn a_detached_db_worker_keeps_capacity_until_the_connection_closes() {
 }
 
 #[path = "../../tests/support/guests.rs"]
-mod guests;
+pub(super) mod guests;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_alarm_refused_for_capacity_retries_after_a_gated_blocker() {

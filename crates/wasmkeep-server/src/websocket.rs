@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
@@ -46,6 +46,77 @@ pub(crate) enum Outgoing {
     Close(u16, String),
 }
 
+/// The data queue and an independent, single-use close slot. A close takes
+/// priority even when every data permit or queued byte is occupied.
+pub(crate) struct OutgoingQueue {
+    data: mpsc::Receiver<Outgoing>,
+    close: oneshot::Receiver<(u16, String)>,
+    close_done: bool,
+    queued: Arc<AtomicUsize>,
+}
+
+impl OutgoingQueue {
+    fn discard(&mut self) {
+        self.data.close();
+        while let Ok(Outgoing::Message(msg)) = self.data.try_recv() {
+            self.queued.fetch_sub(queued_size(&msg), Ordering::AcqRel);
+        }
+    }
+
+    fn closed(&mut self, code: u16, reason: String) -> Outgoing {
+        // The actor asked to close: discard stale queued frames. The client
+        // reconnects and catches up instead of waiting behind its backlog.
+        self.discard();
+        Outgoing::Close(code, reason)
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<Outgoing> {
+        if !self.close_done {
+            tokio::select! {
+                biased;
+                close = &mut self.close => {
+                    self.close_done = true;
+                    if let Ok((code, reason)) = close {
+                        return Some(self.closed(code, reason));
+                    }
+                }
+                msg = self.data.recv() => return msg,
+            }
+        }
+        self.data.recv().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<Outgoing, mpsc::error::TryRecvError> {
+        if !self.close_done {
+            match self.close.try_recv() {
+                Ok((code, reason)) => {
+                    self.close_done = true;
+                    return Ok(self.closed(code, reason));
+                }
+                Err(oneshot::error::TryRecvError::Closed) => self.close_done = true,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        self.data.try_recv()
+    }
+}
+
+impl Drop for OutgoingQueue {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
+/// Releases an in-flight frame's bytes even if the writer is aborted.
+pub(crate) struct WritingBytes(pub(crate) Arc<AtomicUsize>, pub(crate) usize);
+
+impl Drop for WritingBytes {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::AcqRel);
+    }
+}
+
 /// Bytes a message holds while queued.
 pub(crate) fn queued_size(msg: &WsMessage) -> usize {
     msg.len()
@@ -68,6 +139,7 @@ struct Conn {
     // Taking the sender closes and hides the socket. Its registry slot is
     // retained until run_socket finishes delivering the guest close event.
     tx: Option<mpsc::Sender<Outgoing>>,
+    close: Option<oneshot::Sender<(u16, String)>>,
     /// Bytes queued and not yet written.
     queued: Arc<AtomicUsize>,
     /// `on-websocket-open` accepted it: until then it is invisible to the
@@ -128,7 +200,7 @@ pub(crate) struct Sockets {
 /// A connection's queue, for its writer.
 pub(crate) struct Opened {
     pub(crate) id: u64,
-    pub(crate) outgoing: mpsc::Receiver<Outgoing>,
+    pub(crate) outgoing: OutgoingQueue,
     pub(crate) queued: Arc<AtomicUsize>,
     /// Notified once the server closes it ([`Self::close_all`] and the like).
     pub(crate) closing: Arc<tokio::sync::Notify>,
@@ -196,7 +268,8 @@ impl Sockets {
         let mut registry = self.lock();
         self.room(&registry, &owner)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, outgoing) = mpsc::channel(SEND_QUEUE);
+        let (tx, data) = mpsc::channel(SEND_QUEUE);
+        let (close_tx, close) = oneshot::channel();
         let queued = Arc::new(AtomicUsize::new(0));
         let closing = Arc::new(tokio::sync::Notify::new());
         registry
@@ -210,6 +283,7 @@ impl Sockets {
                 owner,
                 opener,
                 tx: Some(tx),
+                close: Some(close_tx),
                 queued: Arc::clone(&queued),
                 accepted: false,
                 closing: Arc::clone(&closing),
@@ -218,7 +292,12 @@ impl Sockets {
         );
         Ok(Opened {
             id,
-            outgoing,
+            outgoing: OutgoingQueue {
+                data,
+                close,
+                close_done: false,
+                queued: Arc::clone(&queued),
+            },
             queued,
             closing,
         })
@@ -380,10 +459,14 @@ impl Sockets {
     /// closing already.
     fn close_conn(conn: &mut Conn, code: u16, reason: &str) -> bool {
         conn.accepted = false;
-        // If the queue is full the socket is dropped instead: still closed.
+        // Publish the close before dropping the data sender so the writer
+        // cannot mistake the disconnected queue for an ordinary EOF.
         match conn.tx.take() {
             Some(tx) => {
-                let _ = tx.try_send(Outgoing::Close(code, reason.to_owned()));
+                if let Some(close) = conn.close.take() {
+                    let _ = close.send((code, reason.to_owned()));
+                }
+                drop(tx);
                 // Kept as a permit if the reader is not waiting yet.
                 conn.closing.notify_one();
                 true
@@ -550,11 +633,95 @@ mod tests {
         assert_eq!(sockets.of(&a, None), vec![first.id, pending.id]);
     }
 
+    // ADR 0040 R3 requires the slow close to survive a full data queue.
+    #[test]
+    fn room_slow_close_survives_full_frame_queue() {
+        let sockets = Sockets::default();
+        let owner = actor("room-edge");
+        let mut conn = sockets.open(owner.clone()).unwrap();
+        sockets.accept(conn.id);
+        for _ in 0..SEND_QUEUE {
+            assert!(
+                sockets
+                    .send(&owner, conn.id, WsMessage::text("data"), None)
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            sockets.send(&owner, conn.id, WsMessage::text("behind"), None),
+            Err(SendError::Backpressure)
+        ));
+        sockets.close(&owner, conn.id, 4802, "slow".into());
+        let mut received_close = false;
+        while let Ok(outgoing) = conn.outgoing.try_recv() {
+            if let Outgoing::Close(4802, _) = outgoing {
+                received_close = true;
+            }
+        }
+        assert!(
+            received_close,
+            "4802 is lost when the 256-frame data queue is full"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_discards_a_full_byte_queue_and_releases_its_budget() {
+        let sockets = Sockets::default();
+        let owner = actor("slow-bytes");
+        let mut conn = sockets.open(owner.clone()).unwrap();
+        sockets.accept(conn.id);
+        assert!(
+            sockets
+                .send(
+                    &owner,
+                    conn.id,
+                    WsMessage::binary(vec![0; MAX_QUEUED_BYTES]),
+                    None
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            sockets.send(&owner, conn.id, WsMessage::text("x"), None),
+            Err(SendError::Backpressure)
+        ));
+        sockets.close(&owner, conn.id, 4802, "slow".into());
+        sockets.close_all(1012, "shutdown"); // The first close wins.
+        assert!(matches!(conn.outgoing.recv().await,
+            Some(Outgoing::Close(4802, reason)) if reason == "slow"));
+        assert!(conn.outgoing.recv().await.is_none());
+        assert_eq!(conn.queued.load(Ordering::Acquire), 0);
+        sockets.remove(conn.id);
+        assert_eq!(sockets.len(), 0);
+    }
+
+    #[test]
+    fn dropped_writer_releases_queued_and_in_flight_bytes() {
+        let sockets = Sockets::default();
+        let owner = actor("aborted");
+        let mut conn = sockets.open(owner.clone()).unwrap();
+        sockets.accept(conn.id);
+        for _ in 0..2 {
+            assert!(
+                sockets
+                    .send(&owner, conn.id, WsMessage::text("data"), None)
+                    .is_ok()
+            );
+        }
+        let Outgoing::Message(msg) = conn.outgoing.try_recv().unwrap() else {
+            panic!()
+        };
+        let writing = WritingBytes(Arc::clone(&conn.queued), queued_size(&msg));
+        drop(conn.outgoing);
+        assert_eq!(conn.queued.load(Ordering::Acquire), 4);
+        drop(writing);
+        assert_eq!(conn.queued.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn queued_bytes_are_capped_per_connection() {
         let sockets = Sockets::default();
         let a = actor("a");
-        let conn = sockets.open(a.clone()).unwrap();
+        let mut conn = sockets.open(a.clone()).unwrap();
         sockets.accept(conn.id);
         let big = vec![0u8; MAX_QUEUED_BYTES / 2];
         assert!(
@@ -571,7 +738,8 @@ mod tests {
             sockets.send(&a, conn.id, WsMessage::binary(big.clone()), None),
             Err(SendError::Backpressure)
         ));
-        // The writer took one: room again.
+        // The writer took and wrote one: room again.
+        assert!(matches!(conn.outgoing.try_recv(), Ok(Outgoing::Message(_))));
         conn.queued.fetch_sub(big.len(), Ordering::AcqRel);
         assert!(
             sockets

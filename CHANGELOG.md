@@ -9,6 +9,9 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- Actor-requested WebSocket closes preserve their code and reason even when the
+  data queue is full; queued frames are discarded and their byte budget released.
+
 - **Several apps per process (ADR 0038):** `wasmkeep serve --node-file
   wasmkeep-node.toml` serves several apps behind one public, one cluster
   and one metrics port. The public port routes by hostname (421 for an

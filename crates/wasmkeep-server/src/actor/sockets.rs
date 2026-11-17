@@ -273,7 +273,7 @@ pub(super) struct Accepted {
     registration: Arc<Registration>,
     address: ActorAddress,
     id: u64,
-    outgoing: tokio::sync::mpsc::Receiver<crate::websocket::Outgoing>,
+    outgoing: crate::websocket::OutgoingQueue,
     queued: Arc<std::sync::atomic::AtomicUsize>,
     closing: Arc<tokio::sync::Notify>,
     /// The close to send instead of serving it: the guest refused it, or
@@ -435,8 +435,9 @@ impl ServiceInner {
                     }
                 };
                 let size = crate::websocket::queued_size(&msg);
+                let bytes = crate::websocket::WritingBytes(Arc::clone(&queued), size);
                 let sent = sink.send(msg).await;
-                queued.fetch_sub(size, std::sync::atomic::Ordering::AcqRel);
+                drop(bytes);
                 if sent.is_err() {
                     break;
                 }
@@ -598,5 +599,76 @@ impl ServiceInner {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::admission_tests::guests;
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn websocket_actor_close_reaches_nonreading_client_with_full_queue() {
+        let wasm = guests::build_guest("tests/guests/test-actor", "test_actor");
+        let runtime = wasmkeep_runtime::Runtime::new(&Default::default()).unwrap();
+        let component = guests::compile(&runtime, &wasm);
+        let dir = tempfile::tempdir().unwrap();
+        let service = ActorService::new(
+            runtime,
+            ActorConfig::new(dir.path()),
+            vec![("t".into(), component, wasm)],
+        )
+        .unwrap();
+        let address = ActorAddress::new("default", "t", "slow").unwrap();
+        let permit = Arc::new(service.inner.sockets.reserve().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handshake = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(tcp).await.unwrap()
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let ws = handshake.await.unwrap();
+        // The connected client does not read while the actor fills the queue
+        // and closes it. As in serving, the writer starts after the open hook.
+        let accepted = service
+            .inner
+            .accept_socket(address.clone(), "/slow-close".into(), Opener::Outside)
+            .await
+            .unwrap();
+        assert!(accepted.refusal.is_none());
+        let queued = Arc::clone(&accepted.queued);
+        assert_eq!(queued.load(Ordering::Acquire), 256 * 4);
+        assert_eq!(service.inner.sockets.reserved_by(&address), 1);
+
+        let inner = Arc::clone(&service.inner);
+        let server = tokio::spawn(async move {
+            inner.run_socket(accepted, ws, permit).await;
+        });
+        // Stop reading until the full queue's actor close has reached the
+        // writer. No artificial CPU load or TCP-buffer-size race is needed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let frame = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WsMessage::Close(Some(frame)) = frame else {
+            panic!("queued data was not discarded: {frame:?}");
+        };
+        assert_eq!(u16::from(frame.code), 4802);
+        assert_eq!(frame.reason, "slow");
+        client.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert_eq!(service.inner.sockets.len(), 0);
+        assert_eq!(service.inner.sockets.budget.in_use(), 0);
     }
 }
