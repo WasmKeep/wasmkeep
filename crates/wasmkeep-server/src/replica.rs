@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
-use wasmkeep_cluster::local_heads::{Proof, Requirement, prove};
+use wasmkeep_cluster::local_heads::{Proof, Requirement, linked_back, prove};
 use wasmkeep_cluster::recorded_head::Position;
 use wasmkeep_cluster::replication::{
     EMPTY, Listing, Plan, Segment, SegmentId, collectable, plan_restore, segment_key, snapshot_key,
@@ -851,7 +851,19 @@ impl Replica {
             .chain(plan.segments.iter().copied())
             .map(|id| (id, None))
             .collect();
-        let structural = prove(floor, &chain);
+        let mut structural = prove(floor, &chain);
+        // Review M1: a snapshot above an exact floor hides it from the
+        // plan; the listing proves descent if it shows the floor and the
+        // links from the plan's base down to it. Nothing below the base is
+        // replayed, so the later checks have no floor left to see.
+        let mut floor = floor;
+        if structural == Proof::Missing
+            && let Some(base) = plan.snapshot
+            && linked_back(floor, base, &listing)
+        {
+            structural = Proof::Proven;
+            floor = None;
+        }
         if structural == Proof::Missing {
             return Err(ReplicaError::Visibility(format!(
                 "the listing's chain ends at {:?} and shows neither {:?} nor a later generation",

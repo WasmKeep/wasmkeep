@@ -172,6 +172,52 @@ pub fn prove(
     Proof::Missing
 }
 
+/// Proof 1 beyond the planner's snapshot stop (ADR 0035, section 3): the
+/// plan starts from snapshot `base`, above an exact floor the chain does
+/// not show. Proven if the floor's own position is listed (a segment or a
+/// snapshot) and `base` links back to it through listed segments, each
+/// naming its parent: the selected chain descends from the floor, though
+/// the restore never replays it.
+pub fn linked_back(
+    floor: Option<&Requirement>,
+    base: crate::replication::SegmentId,
+    listing: &crate::replication::Listing,
+) -> bool {
+    use crate::replication::SegmentId;
+    let Some(Requirement {
+        head: Position::Known {
+            generation, txid, ..
+        },
+        ..
+    }) = floor
+    else {
+        return false;
+    };
+    let target = SegmentId {
+        generation: *generation,
+        txid: *txid,
+    };
+    let listed =
+        listing.segments.iter().any(|s| s.id == target) || listing.snapshots.contains(&target);
+    if !listed {
+        return false;
+    }
+    let parents: std::collections::BTreeMap<SegmentId, SegmentId> = listing
+        .segments
+        .iter()
+        .map(|s| (s.id, s.parent()))
+        .collect();
+    let mut at = base;
+    // Each step lowers the txid: at most one step per transaction.
+    while at.txid > target.txid {
+        let Some(&parent) = parents.get(&at) else {
+            return false;
+        };
+        at = parent;
+    }
+    at == target
+}
+
 /// One actor's local evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalHead {
@@ -553,6 +599,62 @@ mod tests {
             ..floor
         };
         assert_eq!(prove(Some(&empty), &[]), Proof::Proven);
+    }
+
+    /// Review M1: a snapshot above an exact floor hides it from the plan;
+    /// the listing still shows the floor and the links up to the snapshot.
+    #[test]
+    fn a_snapshot_above_a_listed_floor_links_back_to_it() {
+        use crate::replication::{
+            Listing, Segment, SegmentId, plan_restore, segment_key, snapshot_key,
+        };
+        let id = |generation, txid| SegmentId { generation, txid };
+        let seg = |g, t, pg| {
+            segment_key(&Segment {
+                id: id(g, t),
+                parent_generation: pg,
+            })
+        };
+        let floor = Requirement {
+            head: at(5, 3),
+            set_at: 5,
+            completeness: Completeness::Complete,
+        };
+        // H = (5, 3); a late (5, 4) landed after it froze; the next owner
+        // snapshotted at (5, 4) without writing.
+        let keys = [
+            seg(5, 1, 0),
+            seg(5, 2, 5),
+            seg(5, 3, 5),
+            seg(5, 4, 5),
+            snapshot_key(id(5, 4)),
+        ];
+        let listing = Listing::from_keys(keys.iter().map(String::as_str));
+        let plan = plan_restore(&listing).unwrap();
+        assert_eq!(plan.snapshot, Some(id(5, 4)));
+        let chain: Vec<_> = plan.snapshot.into_iter().map(|i| (i, None)).collect();
+        assert_eq!(
+            prove(Some(&floor), &chain),
+            Proof::Missing,
+            "the plan alone"
+        );
+        assert!(linked_back(Some(&floor), id(5, 4), &listing));
+        // Not when the floor is not listed, or a link is missing.
+        let no_floor = Listing::from_keys(
+            [seg(5, 4, 5), snapshot_key(id(5, 4))]
+                .iter()
+                .map(String::as_str),
+        );
+        assert!(!linked_back(Some(&floor), id(5, 4), &no_floor));
+        let gap = [seg(5, 3, 5), snapshot_key(id(5, 5))];
+        let gap = Listing::from_keys(gap.iter().map(String::as_str));
+        assert!(!linked_back(Some(&floor), id(5, 5), &gap));
+        // Nor through another branch: (5, 4) built on generation 4's 3.
+        let fork = [seg(5, 3, 5), seg(5, 4, 4), snapshot_key(id(5, 4))];
+        let fork = Listing::from_keys(fork.iter().map(String::as_str));
+        assert!(!linked_back(Some(&floor), id(5, 4), &fork));
+        // A floor above the base is never linked back to.
+        assert!(!linked_back(Some(&floor), id(5, 2), &listing));
     }
 
     #[test]

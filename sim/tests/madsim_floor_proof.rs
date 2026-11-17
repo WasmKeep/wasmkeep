@@ -9,6 +9,10 @@
 //! (`replication::plan_restore`) selects a chain, the real `prove` judges
 //! it with the checksums a replay would find.
 //!
+//! Also the interleaving of review M1: an upload that landed after H
+//! froze and a snapshot at it hide H from the plan; the listing's links
+//! from the base down to H prove it (`linked_back`), as the server does.
+//!
 //! Checked: `prove` says proven only if the selected chain is on the true
 //! history and reaches H (exactly, with H's checksum, or through a true
 //! descendant in a generation above the stamp); with nothing hidden it
@@ -22,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use wasmkeep_cluster::local_heads::{Proof, Requirement, prove};
+use wasmkeep_cluster::local_heads::{Proof, Requirement, linked_back, prove};
 use wasmkeep_cluster::recorded_head::{Completeness, Position};
 use wasmkeep_cluster::replication::{
     Listing, Segment, SegmentId, plan_restore, segment_key, snapshot_key,
@@ -131,6 +135,24 @@ fn world(rng: &mut Rng) -> World {
     // The stamp: the hold that froze H, or a later one that inherited H
     // without writing (it re-froze it unchanged).
     let set_at = hold;
+    // Review M1: an upload that landed after H froze (in H's hold, at
+    // H + 1), and the next owner's snapshot there, written without a new
+    // segment: the snapshot hides H from the plan.
+    if truth.keys().next_back() == Some(&head) && rng.chance(35) {
+        let late = SegmentId {
+            generation: hold,
+            txid: head.txid + 1,
+        };
+        keys.insert(
+            segment_key(&Segment {
+                id: late,
+                parent_generation: head.generation,
+            }),
+            0,
+        );
+        keys.insert(snapshot_key(late), 0);
+        truth.insert(late, ());
+    }
     for id in truth.keys() {
         if id.generation > set_at {
             above.push(*id);
@@ -218,26 +240,52 @@ fn run(seed: u64, breaks: Breaks) -> Option<String> {
             .map(|id| (*id, Some(sum(*id, branch_of(id)))))
             .collect();
         let on_truth = ids.iter().all(|id| w.truth.contains_key(id));
-        let reaches = on_truth && (ids.contains(&h) || ids.iter().any(|id| w.above.contains(id)));
-        let verdict = judge(breaks, &w.floor, &replayed);
+        // The true history is one chain: a true base past H descends from it.
+        let base_past_h = plan
+            .snapshot
+            .is_some_and(|b| w.truth.contains_key(&b) && b.txid > h.txid);
+        let reaches = on_truth
+            && (ids.contains(&h) || ids.iter().any(|id| w.above.contains(id)) || base_past_h);
+        let mut verdict = judge(breaks, &w.floor, &replayed);
+        // The server's fallback (replica.rs): the base links back to a
+        // listed floor.
+        if verdict == Proof::Missing
+            && let Some(base) = plan.snapshot
+            && linked_back(Some(&w.floor), base, &listing)
+        {
+            verdict = Proof::Proven;
+            LINKED.with(|n| n.set(n.get() + 1));
+        }
         if verdict == Proof::Proven && !reaches {
             return Some(format!("proved {h:?} from {ids:?} (hidden: {hide})"));
         }
-        if !hide && breaks == Breaks::None && verdict != Proof::Proven && !w.above.is_empty() {
-            // The complete listing's chain is the true one, above the stamp.
+        if !hide && breaks == Breaks::None && verdict != Proof::Proven && on_truth {
+            // A complete listing whose chain is the true one always proves.
             return Some(format!("refused a complete listing {ids:?}"));
         }
     }
     None
 }
 
+thread_local! {
+    /// Floors proven by the base linking back to them (review M1).
+    static LINKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[test]
 fn only_exact_ancestry_or_a_later_generation_proves_the_floor() {
+    LINKED.with(|n| n.set(0));
     for seed in 0..seeds() {
         if let Some(why) = run(seed, Breaks::None) {
             panic!("seed {seed}: {why}");
         }
     }
+    let linked = LINKED.with(std::cell::Cell::get);
+    eprintln!(
+        "{} seeds: {linked} floors proven through the listing below the base",
+        seeds()
+    );
+    assert!(linked >= (seeds() / 20).max(1), "linked {linked}");
 }
 
 #[test]
