@@ -23,6 +23,8 @@ struct Def {
     deployed: bool,
     /// Its floor in the process's resident pool, when it has one.
     min_resident: Option<usize>,
+    /// Serve the blob test actor as class `blob` beside the counter.
+    blob: bool,
 }
 
 const fn def(
@@ -38,6 +40,7 @@ const fn def(
         hosts,
         deployed: false,
         min_resident: None,
+        blob: false,
     }
 }
 
@@ -156,7 +159,13 @@ async fn process_inner(
                         .collect()
                 } else {
                     let c = runtime.compile(counter_wasm()).unwrap();
-                    vec![("counter".to_owned(), c, counter_wasm().to_vec())]
+                    let mut classes = vec![("counter".to_owned(), c, counter_wasm().to_vec())];
+                    if d.blob {
+                        let wasm = super::blobs::blob_actor();
+                        let c = guests::compile(&runtime, wasm);
+                        classes.push(("blob".to_owned(), c, wasm.to_vec()));
+                    }
+                    classes
                 };
                 config.cluster = Some(cluster);
                 let service =
@@ -1169,4 +1178,56 @@ async fn assets_are_isolated_by_hostname_and_cache_directory() {
             .status,
         404
     );
+}
+
+/// Files of two apps in one process (ADR 0030, section 8): the same class,
+/// name and key read their own bytes, each under its own app's root.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_apps_with_the_same_class_name_and_key_keep_their_own_files() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let defs = [
+        Def {
+            blob: true,
+            ..def("shop-1", "acme", "shop", &["shop.test"])
+        },
+        Def {
+            blob: true,
+            ..def("blog-1", "acme", "blog", &["blog.test"])
+        },
+    ];
+    let p = process(&store, d.path(), &defs).await;
+    settle().await;
+    for host in ["shop.test", "blog.test"] {
+        let body = host.as_bytes();
+        let r = exchange(
+            p.public,
+            &format!(
+                "PUT /actor/blob/alice/b/k HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{host}",
+                body.len()
+            ),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{host}: {}", r.body);
+    }
+    for host in ["shop.test", "blog.test"] {
+        let r = to_reachable(p.public, host, "GET", "/actor/blob/alice/b/k").await;
+        assert_eq!((r.status, r.body.as_str()), (200, host));
+        let r = to_reachable(p.public, host, "GET", "/actor/blob/alice/list").await;
+        assert_eq!(r.body, "k 9 application/octet-stream\nnext=-", "{host}");
+    }
+    let keys = bucket_keys(&store).await;
+    let files: Vec<&String> = keys.iter().filter(|k| k.contains("/blobs/")).collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    for app in ["shop", "blog"] {
+        assert!(
+            files
+                .iter()
+                .any(|k| k.starts_with(&format!("state/acme/{app}/blobs/"))),
+            "{files:?}"
+        );
+    }
 }

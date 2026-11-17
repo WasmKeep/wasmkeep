@@ -22,6 +22,18 @@ use wit_parser::{
 /// listed here (and implemented in the SDKs). An empty name: that SDK does
 /// not have it yet.
 const SDK_NAMES: &[(&str, [&str; 5])] = &[
+    // Files (ADR 0030): the SDKs come with slice B2.
+    ("blobs.head", ["", "", "", "", ""]),
+    ("blobs.get", ["", "", "", "", ""]),
+    ("blobs.put", ["", "", "", "", ""]),
+    ("blobs.open-read", ["", "", "", "", ""]),
+    ("blobs.open-write", ["", "", "", "", ""]),
+    ("blobs.upload.body", ["", "", "", "", ""]),
+    ("blobs.upload.finish", ["", "", "", "", ""]),
+    ("blobs.delete", ["", "", "", "", ""]),
+    ("blobs.list", ["", "", "", "", ""]),
+    ("blobs.link-download", ["", "", "", "", ""]),
+    ("blobs.link-upload", ["", "", "", "", ""]),
     // Exports: what an actor implements.
     (
         "on-init",
@@ -277,7 +289,23 @@ fn type_id(resolve: &Resolve, id: TypeId) -> String {
             }
         }
         TypeDefKind::Type(t) => ty(resolve, t),
+        TypeDefKind::Handle(wit_parser::Handle::Own(r)) => type_id(resolve, *r),
+        TypeDefKind::Handle(wit_parser::Handle::Borrow(r)) => {
+            format!("borrow<{}>", type_id(resolve, *r))
+        }
         other => panic!("type not supported by the reference generator: {other:?}"),
+    }
+}
+
+/// A function's name as the reference shows it: a resource's methods as
+/// `resource.method`.
+fn display_name(f: &Function) -> String {
+    match &f.kind {
+        wit_parser::FunctionKind::Method(_) | wit_parser::FunctionKind::Static(_) => {
+            let resource = f.name.split_once(']').map_or("", |(_, r)| r);
+            resource.to_owned()
+        }
+        _ => f.name.clone(),
     }
 }
 
@@ -292,7 +320,11 @@ fn signature(resolve: &Resolve, f: &Function) -> String {
         .result
         .as_ref()
         .map_or(String::new(), |r| format!(" -> {}", ty(resolve, r)));
-    format!("{}: func({params}){result};", f.name)
+    let fixed = match &f.kind {
+        wit_parser::FunctionKind::Static(_) => "static ",
+        _ => "",
+    };
+    format!("{}: {fixed}func({params}){result};", f.item_name())
 }
 
 fn docs(out: &mut String, d: &Docs) {
@@ -333,7 +365,7 @@ fn sdk_table(out: &mut String, key: &str) {
 }
 
 fn function(out: &mut String, resolve: &Resolve, f: &Function, key: &str) {
-    writeln!(out, "### `{}`\n", f.name).unwrap();
+    writeln!(out, "### `{}`\n", display_name(f)).unwrap();
     writeln!(out, "```wit\n{}\n```\n", signature(resolve, f)).unwrap();
     docs(out, &f.docs);
     sdk_table(out, key);
@@ -376,10 +408,15 @@ fn type_def(out: &mut String, resolve: &Resolve, name: &str, id: TypeId) {
         ),
         // `use`d from another interface: documented there.
         TypeDefKind::Type(_) => return,
+        // Its methods follow the interface's functions.
+        TypeDefKind::Resource => ("resource", Vec::new()),
         other => panic!("type not supported by the reference generator: {other:?}"),
     };
     writeln!(out, "### `{name}` ({kind})\n").unwrap();
     docs(out, &def.docs);
+    if rows.is_empty() {
+        return;
+    }
     let header = if kind == "record" { "Field" } else { "Case" };
     writeln!(out, "| {header} | |\n| --- | --- |").unwrap();
     for (item, doc) in rows {
@@ -395,7 +432,7 @@ fn interface(out: &mut String, resolve: &Resolve, name: &str, iface: &Interface)
         type_def(out, resolve, type_name, *id);
     }
     for f in iface.functions.values() {
-        function(out, resolve, f, &format!("{name}.{}", f.name));
+        function(out, resolve, f, &format!("{name}.{}", display_name(f)));
     }
 }
 
@@ -443,6 +480,10 @@ fn generate() -> String {
     for item in world.imports.values() {
         if let WorldItem::Interface { id, .. } = item {
             let iface = &resolve.interfaces[*id];
+            // `wasi:io`, which `blobs` uses, is WASI's: see "Also available".
+            if iface.package != Some(package_id) {
+                continue;
+            }
             let name = iface.name.as_deref().unwrap();
             if name != "types" {
                 interface(&mut out, &resolve, name, iface);
@@ -458,7 +499,8 @@ fn generate() -> String {
          The `actor` world includes the standard `wasi:http/proxy` world: \
          outbound HTTP (`wasi:http/outgoing-handler`), clocks, randomness and \
          stdio (what an actor writes to stdout and stderr goes to the node's \
-         log, line by line, within `--guest-log-rate`). The \
+         log, line by line, within `--guest-log-rate`), and the `wasi:io` \
+         streams `blobs` reads and writes files through. The \
          `wasi:cli` interfaces most standard libraries import are present but \
          empty: no arguments, environment or terminal. `wasi:filesystem` and \
          `wasi:sockets`, which many toolchains import whether or not the code \
@@ -484,8 +526,15 @@ fn function_keys() -> BTreeSet<String> {
     for item in world.imports.values() {
         if let WorldItem::Interface { id, .. } = item {
             let iface = &resolve.interfaces[*id];
+            if iface.package != Some(package_id) {
+                continue;
+            }
             for f in iface.functions.values() {
-                keys.insert(format!("{}.{}", iface.name.as_deref().unwrap(), f.name));
+                keys.insert(format!(
+                    "{}.{}",
+                    iface.name.as_deref().unwrap(),
+                    display_name(f)
+                ));
             }
         }
     }

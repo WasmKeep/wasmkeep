@@ -768,6 +768,13 @@ impl ActorState {
         };
         // A batched flush waits until the wall less one second at most
         // (ADR 0034, section 4).
+        // A write of a file needs this node to hold the actor (ADR 0030,
+        // section 3); alone, it always does.
+        let gate = match (&self.cluster, &self.held) {
+            (None, _) => crate::blobs::host::Gate::Free,
+            (Some(_), Some(held)) => crate::blobs::host::Gate::Held(held.lease().view()),
+            (Some(_), None) => crate::blobs::host::Gate::Unheld,
+        };
         let batched = stop.is_some().then(|| BatchedEvent {
             flush_until: tokio::time::Instant::now() + wall.saturating_sub(Duration::from_secs(1)),
             completion: self.completion(),
@@ -778,6 +785,7 @@ impl ActorState {
             host.replica_stop = stop.clone();
             host.egress.replica_stop = stop;
             host.batched = batched;
+            host.blob.new_event(gate);
         }
     }
 
@@ -1271,6 +1279,16 @@ impl ActorState {
                 crate::logging::actor(&self.address).to_string(),
             );
             host.env = Arc::clone(&self.class.env);
+            // Its own namespace, at incarnation 0 until deletes draw new
+            // ones (ADR 0030, slice B4); writes wait for the event's hold.
+            host.blob = crate::blobs::host::Caller::new(
+                self.service
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .map(|s| Arc::clone(&s.blobs)),
+                crate::blobs::Namespace::actor(self.address.class(), self.address.name(), "0"),
+                crate::blobs::host::Gate::Unheld,
+            );
             host.alarm_index = self
                 .cluster
                 .as_ref()

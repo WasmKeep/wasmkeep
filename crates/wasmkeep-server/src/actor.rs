@@ -213,6 +213,16 @@ pub struct ActorConfig {
     /// Join a cluster: actors run only on the node holding their lease, and
     /// requests reaching another node are forwarded. `None` runs alone.
     pub cluster: Option<ClusterConfig>,
+    /// The app's epoch (ADR 0030, section 2): the segment after `blobs/`
+    /// in every file key, from the app's `recreated` and `restored`
+    /// markers ([`crate::blobs::epoch`], as
+    /// [`crate::apps::AppRef::prepare_local`] returns it). By default the
+    /// epoch of an app with neither marker.
+    pub blob_epoch: String,
+    /// One file's largest size, streamed (`--max-blob-bytes`): by default
+    /// [`crate::blobs::DEFAULT_MAX_FILE`], at most
+    /// [`crate::blobs::MAX_FILE_CEILING`].
+    pub max_blob_bytes: u64,
     /// How long a WebSocket client may stay silent before the server pings
     /// it: 25 s, under a load balancer's usual 60 s idle timeout. Tests
     /// shorten it.
@@ -259,6 +269,8 @@ impl ActorConfig {
             assets: None,
             local_assets: None,
             assets_cache: crate::assets::default_cache(),
+            blob_epoch: crate::blobs::epoch(None, None),
+            max_blob_bytes: crate::blobs::DEFAULT_MAX_FILE,
             websocket_ping_after: crate::websocket::PING_AFTER,
             websocket_close_wait: crate::websocket::CLOSE_WAIT,
         }
@@ -354,6 +366,8 @@ struct ServiceInner {
     /// Set once the app's tombstone was seen and this node stopped serving
     /// it (ADR 0028, section 5).
     app_deleted: tokio::sync::watch::Sender<bool>,
+    /// The app's files (ADR 0030), in the bucket or on this node's disk.
+    blobs: Arc<crate::blobs::Blobs>,
 }
 
 impl ServiceInner {
@@ -654,6 +668,11 @@ impl ActorService {
             .is_some_and(|c| c.app_unchecked())
     }
 
+    /// The app's files (ADR 0030), for the front's `blobs` calls.
+    pub(crate) fn blobs(&self) -> Option<Arc<crate::blobs::Blobs>> {
+        Some(Arc::clone(&self.inner.blobs))
+    }
+
     /// The app's folder under the data directory.
     pub fn local_app_dir(&self) -> &std::path::Path {
         &self.inner.local_app_dir
@@ -948,7 +967,11 @@ struct ActorHost {
     /// The running event's, when its hold is batched (ADR 0034): where
     /// `flush` stops waiting, and whom its uploads tell when they land.
     batched: Option<BatchedEvent>,
+    /// The actor's files (ADR 0030): its namespace, and its hold for writes.
+    blob: crate::blobs::host::Caller,
 }
+
+crate::blobs::host::impl_blobs_host!(ActorHost);
 
 /// What a batched hold's event gives its `flush` (ADR 0034, section 4).
 struct BatchedEvent {

@@ -40,6 +40,8 @@ bytes.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 thiserror.workspace = true
+# The index of an actor's files on a node without a bucket (ADR 0030, section 2); already in the tree through wasmkeep-storage.
+rusqlite.workspace = true
 # Implementing object_store's async trait (the request-counting bucket); already in the tree through object_store.
 async-trait = "=0.1.92"
 

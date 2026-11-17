@@ -215,7 +215,7 @@ async fn start_runtime(
     // A deleted app is never served, and this node's files of it go
     // (ADR 0028).
     let local = wasmkeep_server::local_app_dir(&args.data_dir, &tenant, &name);
-    app_ref
+    let blob_epoch = app_ref
         .prepare_local(&local)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -228,6 +228,8 @@ async fn start_runtime(
     let mut config = ActorConfig::new(&args.data_dir);
     config.tenant = tenant.clone();
     config.app = name.clone();
+    config.blob_epoch = blob_epoch;
+    config.max_blob_bytes = args.max_blob_bytes;
     config.egress = egress.clone();
     config.guest_log = shared.guest_log.clone();
     config.storage.max_sql_cpu_per_event = std::time::Duration::from_millis(args.sql_cpu_budget_ms);

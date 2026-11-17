@@ -20,7 +20,6 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use wasmkeep_runtime::{ActorAddress, CpuBudgetExceeded, Runtime};
-use wasmkeep_wit::FrontCore;
 use wasmkeep_wit::wasmkeep::actor::actors::{
     self, CallError, Request as CallRequest, Response as CallResponse,
 };
@@ -75,7 +74,11 @@ struct FrontHost {
     waits: Arc<Waits>,
     /// How many of them one actor, and the node, may have.
     bounds: Bounds,
+    /// The front's files (ADR 0030): its own namespace, `_front/main`.
+    blob: crate::blobs::host::Caller,
 }
+
+crate::blobs::host::impl_blobs_host!(FrontHost);
 
 impl WasiView for FrontHost {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -374,8 +377,22 @@ impl FrontVersion {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(Error::linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(Error::linker)?;
-        FrontCore::add_to_linker::<FrontHost, HasSelf<FrontHost>>(&mut linker, |h| h)
-            .map_err(Error::linker)?;
+        // Interface by interface: the world's own `add_to_linker` would
+        // define `wasi:io` again, which `blobs` uses and WASI linked above.
+        {
+            use wasmkeep_wit::wasmkeep::actor::{actors, blobs, calls, env};
+            fn get(h: &mut FrontHost) -> &mut FrontHost {
+                h
+            }
+            actors::add_to_linker::<FrontHost, HasSelf<FrontHost>>(&mut linker, get)
+                .map_err(Error::linker)?;
+            calls::add_to_linker::<FrontHost, HasSelf<FrontHost>>(&mut linker, get)
+                .map_err(Error::linker)?;
+            env::add_to_linker::<FrontHost, HasSelf<FrontHost>>(&mut linker, get)
+                .map_err(Error::linker)?;
+            blobs::add_to_linker::<FrontHost, HasSelf<FrontHost>>(&mut linker, get)
+                .map_err(Error::linker)?;
+        }
         let instance_pre = runtime
             .instantiate_pre(&linker, component)
             .map_err(Error::not_http)?;
@@ -681,6 +698,11 @@ impl HttpComponent {
                 per_actor: (self.max_requests / 4).max(1),
                 per_node: self.max_requests,
             },
+            blob: crate::blobs::host::Caller::new(
+                actors.and_then(ActorService::blobs),
+                crate::blobs::Namespace::front(),
+                crate::blobs::host::Gate::Free,
+            ),
         }
     }
 

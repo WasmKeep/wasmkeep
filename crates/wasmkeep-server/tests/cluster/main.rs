@@ -55,6 +55,8 @@ mod assets;
 mod assets_deploy;
 #[path = "batched.rs"]
 mod batched;
+#[path = "blobs.rs"]
+mod blobs;
 #[path = "bucket.rs"]
 mod bucket;
 #[path = "deletes.rs"]

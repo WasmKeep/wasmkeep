@@ -3,8 +3,9 @@
 //! The WIT files live in `wit/` (with WASI 0.2.12 vendored in `wit/deps/`).
 //! Host bindings cover the `actor-core` world: WasmKeep's own imports and the
 //! `on-init` / `on-alarm` exports, and the `front-core` world (the imports a
-//! front gets, [`FrontCore`]), which shares the `actors`, `calls` and `env`
-//! types.
+//! front gets, [`FrontCore`]), which shares the `actors`, `calls`, `env` and
+//! `blobs` types. `blobs` streams are `wasi:io` ones, mapped to
+//! `wasmtime-wasi`'s bindings.
 //! The `wasi:http/proxy` half of the `actor` and `front` worlds is served by
 //! `wasmtime-wasi-http`.
 
@@ -28,6 +29,11 @@ mod generated {
         world: "actor-core",
         imports: { default: async | trappable },
         exports: { default: async },
+        // `blobs` streams are WASI's own (ADR 0030, section 3): the ones
+        // `wasmtime-wasi` keeps in the resource table.
+        with: {
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
+        },
     });
 }
 
@@ -48,11 +54,13 @@ mod front_generated {
             "wasmkeep:actor/actors": crate::generated::wasmkeep::actor::actors,
             "wasmkeep:actor/calls": crate::generated::wasmkeep::actor::calls,
             "wasmkeep:actor/env": crate::generated::wasmkeep::actor::env,
+            "wasmkeep:actor/blobs": crate::generated::wasmkeep::actor::blobs,
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
         },
     });
 }
 
-/// The `front-core` world's imports (`actors`, `calls` and `env`), for
-/// linking a front. Its interfaces are those of [`ActorCore`]: one `Host`
-/// impl of `actors`, `calls` and `env` serves both.
+/// The `front-core` world's imports (`actors`, `calls`, `env` and `blobs`),
+/// for linking a front. Its interfaces are those of [`ActorCore`]: one
+/// `Host` impl of each serves both.
 pub use front_generated::FrontCore;

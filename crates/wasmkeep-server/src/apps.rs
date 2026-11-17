@@ -687,9 +687,13 @@ impl AppRef {
     /// (`local` is the app's folder under the data directory), so no
     /// deleted actor comes back from a disk.
     ///
+    /// Returns the app's epoch (ADR 0030, section 2), from the two
+    /// markers it read: the segment every file key of this run carries
+    /// ([`crate::ActorConfig::blob_epoch`]).
+    ///
     /// # Errors
     /// [`DeployError::Deleted`], the bucket, or the local folder.
-    pub async fn prepare_local(&self, local: &std::path::Path) -> Result<(), DeployError> {
+    pub async fn prepare_local(&self, local: &std::path::Path) -> Result<String, DeployError> {
         let remove = |why: &str| {
             if local.exists() {
                 tracing::warn!(dir = %local.display(), "{why}: removing this node's local files of the app");
@@ -710,6 +714,10 @@ impl AppRef {
             (RECREATED_LOCAL, self.get(RECREATED).await?),
             (".restored", self.get("restored").await?),
         ];
+        let epoch = crate::blobs::epoch(
+            markers[0].1.as_ref().map(|(body, _)| body.as_slice()),
+            markers[1].1.as_ref().map(|(body, _)| body.as_slice()),
+        );
         if markers.iter().any(|(file, value)| {
             value.as_ref().is_some_and(|(body, _)| {
                 !marker_matches(
@@ -726,7 +734,7 @@ impl AppRef {
                 }
             }
         }
-        Ok(())
+        Ok(epoch)
     }
 
     async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, UpdateVersion)>, DeployError> {

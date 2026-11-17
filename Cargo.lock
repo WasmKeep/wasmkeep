@@ -3691,6 +3691,7 @@ dependencies = [
  "parquet",
  "rcgen",
  "ring",
+ "rusqlite",
  "rustix",
  "rustls",
  "serde_json",

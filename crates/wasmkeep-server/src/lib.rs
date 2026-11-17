@@ -13,6 +13,7 @@ mod actor;
 mod alarm;
 pub mod apps;
 pub mod assets;
+pub mod blobs;
 mod cluster;
 mod cluster_tls;
 mod counted_store;

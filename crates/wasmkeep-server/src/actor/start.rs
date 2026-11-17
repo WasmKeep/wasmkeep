@@ -257,8 +257,27 @@ impl ActorService {
         );
         assets.initialize()?;
         assets.clone().prefetch();
+        // The app's files (ADR 0030): in the bucket with a cluster, else on
+        // this node's disk, under the app's epoch either way.
+        let local_app_dir = data_dir.join(root.local_root(wasmkeep_storage::encode_segment));
+        let blobs = Arc::new(match &cluster {
+            Some(c) => crate::blobs::Blobs::on_bucket(
+                Arc::clone(&c.store),
+                root.prefix(),
+                &root.bucket(),
+                &config.blob_epoch,
+                local_app_dir.join(".blob-spool"),
+                config.max_blob_bytes,
+            ),
+            None => crate::blobs::Blobs::on_disk(
+                &local_app_dir,
+                &config.blob_epoch,
+                config.max_blob_bytes,
+            ),
+        });
         let service = Self {
             inner: Arc::new(ServiceInner {
+                blobs,
                 assets: std::sync::RwLock::new(assets),
                 app_labels,
                 app_name,
@@ -297,7 +316,7 @@ impl ActorService {
                 handed: std::sync::Mutex::default(),
                 metrics_identity,
                 expiry: std::sync::RwLock::new(config.expire_after_idle.clone()),
-                local_app_dir: data_dir.join(root.local_root(wasmkeep_storage::encode_segment)),
+                local_app_dir,
                 app_deleted: tokio::sync::watch::Sender::new(false),
             }),
         };

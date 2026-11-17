@@ -480,6 +480,11 @@ impl ActorHost {
             batched: None,
             egress: crate::egress::EgressHooks::default(),
             env: Arc::default(),
+            blob: crate::blobs::host::Caller::new(
+                None,
+                crate::blobs::Namespace::front(),
+                crate::blobs::host::Gate::Unheld,
+            ),
         }
     }
 

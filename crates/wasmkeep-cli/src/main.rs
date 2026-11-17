@@ -810,6 +810,13 @@ struct ServeArgs {
     #[arg(long, value_name = "N")]
     max_front_requests: Option<usize>,
 
+    /// One file's largest size, in bytes, for a streamed write of an
+    /// actor's or the front's files (ADR 0030): at most 5 GiB, one
+    /// presigned PUT's ceiling on S3. The process's, shared by every app.
+    #[arg(long, value_name = "BYTES", default_value_t = wasmkeep_server::blobs::DEFAULT_MAX_FILE,
+          value_parser = clap::value_parser!(u64).range(1..=wasmkeep_server::blobs::MAX_FILE_CEILING))]
+    max_blob_bytes: u64,
+
     /// Never fire an actor's alarms on this node: no delivery, no sweep of
     /// the cluster's alarm index. Requests are still served, and alarms
     /// stay recorded and pending, so a node started without this flag fires
@@ -1685,6 +1692,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             classes.push((class.clone(), component, wasm));
         }
         let mut config = ActorConfig::new(&args.data_dir);
+        config.max_blob_bytes = args.max_blob_bytes;
         // With --app: whether rules were ever deployed (ADR 0013), and the
         // version's own.
         let mut deployed_rules = None;
@@ -1702,8 +1710,10 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             // go; after a `--recreate`, files from before the delete go
             // too (ADR 0028).
             let local = wasmkeep_server::local_app_dir(&args.data_dir, tenant, name);
-            rt.block_on(app_ref.prepare_local(&local))
+            let blob_epoch = rt
+                .block_on(app_ref.prepare_local(&local))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            config.blob_epoch = blob_epoch;
             // Before the first deploy: wait for one, as a running node
             // waits for the next (nothing below can start without it).
             let Some((current, deployed)) = rt.block_on(async {
