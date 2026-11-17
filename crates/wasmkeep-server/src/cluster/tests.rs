@@ -4281,3 +4281,91 @@ async fn a_refused_expiry_cycle_keeps_the_idle_origin() {
         "kept by the release of a hold never activated"
     );
 }
+
+/// ADR 0035 follow-up S4: a local file whose sidecar names the recorded
+/// head but whose checksum is another (a database changed outside
+/// replication) is not proof of a conflict in the bucket: it is set aside
+/// and the history downloaded, which proves the floor.
+#[tokio::test]
+async fn a_conflicting_local_file_is_set_aside_and_downloaded() {
+    use crate::replica::{Replica, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(
+        StorageConfig::new(dir.path()),
+        crate::state_dir(&StateRoot::new("", "t", "default")),
+    );
+    let path = storage.db_path("c", "x");
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path.clone(),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    let head = replica.head();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // Changed outside replication, its sidecar rewritten to match.
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("INSERT INTO t VALUES (99)", &[]).unwrap();
+    drop(db);
+    let page_size = 4096;
+    let sum = wasmkeep_storage::wal::WalCapture::start(&path, page_size)
+        .unwrap()
+        .checksum();
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(".replica");
+    std::fs::write(
+        std::path::PathBuf::from(sidecar),
+        format!("{} {} {}\n", head.generation, head.txid, sum.value()),
+    )
+    .unwrap();
+    assert_eq!(
+        wasmkeep_storage::local_is_at(&path, head.generation, head.txid),
+        Some(sum),
+        "the local file claims the recorded head"
+    );
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let restored = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        path.clone(),
+        1 << 30,
+    )
+    .await
+    .expect("set aside and downloaded, not refused");
+    assert_eq!(restored.verified_head(), h);
+}

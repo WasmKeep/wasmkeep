@@ -907,10 +907,12 @@ impl Replica {
             let usable = match structural {
                 Proof::NeedsReplay => match prove(floor, &at_head) {
                     Proof::Proven => true,
+                    // A file changed outside replication proves nothing of
+                    // the bucket (ADR 0035, S4): set aside, as the download
+                    // installs its result; the replay judges the history.
                     Proof::Conflict => {
-                        return Err(ReplicaError::Restore(
-                            "the local database at the recorded head has another checksum".into(),
-                        ));
+                        tracing::warn!(prefix = %replica.prefix, head = ?plan.head(), "the local database at the recorded head has another checksum; downloading instead");
+                        false
                     }
                     Proof::Missing | Proof::NeedsReplay => false,
                 },
