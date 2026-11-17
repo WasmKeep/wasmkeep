@@ -11,6 +11,21 @@ The text under a version's heading is its GitHub release text
 
 Since 0.4.2, in no release yet.
 
+- **Recorded head on hand-over (0.5.0, [ADR 0035](docs/adr/0035-a-recorded-head-on-hand-over.md)):**
+  an app enabled with `wasmkeep app format --enable` writes ownership
+  records as `wasmkeep-owner 2`, carrying the position each releasing
+  node acknowledged. The next node activates only once its restore
+  proves it (the exact position, or a later generation on the selected
+  chain); a bucket listing that lags answers 503 with `Retry-After`
+  after at most ten listings in 15 s, with a per-actor cooldown, instead
+  of serving older state. Off by default; one way; every node of the
+  app must run 0.5.0 or later (heartbeat word `recorded-head`) and the
+  app must be stopped to enable it. All readers accept both record
+  versions; binaries before 0.5.0 cannot read version 2. `actor export`
+  shows a record's recorded head; `cluster status` warns when an app's
+  nodes differ on the capability. See
+  [the operator guide](docs/cluster.md#the-recorded-head-ownership-format).
+
 - **Configurable socket admission (0.5.0):** `serve` accepts
   `--max-sockets-per-actor` (1,000 requested) and `--max-sockets-per-node`
   (50,000 requested), plus `--max-sockets-per-app` (defaults to the node cap;

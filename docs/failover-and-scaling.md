@@ -41,6 +41,13 @@ node has rebuilt the database from the bucket (unless its local copy is
 already current). Clients whose socket closed with 1012 open it again and
 reach the new holder.
 
+With the [recorded-head format](cluster.md#the-recorded-head-ownership-format)
+enabled, each release also records the position the node acknowledged,
+and the next node does not start the actor until its bucket listing
+shows that position: on a bucket whose listings lag, a request may get a
+503 for a few seconds instead of an older state. A release that does not
+land within the 3 s falls back to the crash path below.
+
 To empty a node before stopping it, [drain it](cluster.md#draining-a-node):
 it hands its actors over while it still forwards requests, and each
 actor's pending alarm moves to the new holder's timer.

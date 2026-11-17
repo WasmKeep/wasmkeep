@@ -1321,6 +1321,56 @@ removes the data anyway: only after `wasmkeep cluster fence` of each node
 still listed. A delete cannot be undone, except from a bucket that keeps
 old versions ([backup and restore](deploy/backup-and-restore.md)).
 
+## The recorded-head ownership format
+
+A successful upload does not mean every S3-compatible bucket lists it at
+once. When an actor changes hands, a listing that lags by a few seconds
+can show a complete but older history: the next node would restore it
+and write on, leaving acknowledged writes on an abandoned branch. The
+recorded-head format ([ADR 0035](adr/0035-a-recorded-head-on-hand-over.md))
+closes that gap for complete hand-overs (hibernation, drain, move, a
+clean stop): the releasing node writes the position it acknowledged into
+the actor's ownership record (`wasmkeep-owner 2`), and the next node
+activates only once its restore provably reaches it. While the listing
+does not show it yet, the node lists again (at most ten times within
+15 s), then answers **503 with `Retry-After`**, keeps the requirement in
+the record and waits 1, 2, 4, 8, 16, then 30 s before that actor's next
+try. Nothing is served from the older history.
+
+It is off until you enable it, one app at a time:
+
+```bash
+wasmkeep app format --app acme/shop --bucket s3://my-bucket/prefix           # show
+wasmkeep app format --app acme/shop --bucket s3://my-bucket/prefix --enable  # switch
+```
+
+Before `--enable`, upgrade every node of the app to 0.5.0 or later (each
+announces `recorded-head`; `cluster status` warns while an app's nodes
+differ), then **stop and drain the app**. The command refuses, writing
+nothing, while a registered node of the app does not announce
+`recorded-head` (upgrade it, or `cluster forget` it once stopped), while
+one still runs the app, or within 40 s of the last one stopping. It then
+writes `formats/<tenant>/<app>/recorded-head`, outside the app's own
+prefixes: deploys, rollbacks, `app delete --recreate` and `backup
+restore` keep it. Start the nodes again: their records are converted on
+first use, starting with no recorded position.
+
+**There is no way back.** An enabled app cannot return to version 1
+records, and binaries older than 0.5.0 cannot read version 2 ones (they
+treat them as unreadable, never as free). Rolling back the binary means a
+release that still reads and enforces the format. An enabled app refuses
+service on any node while a live node of it lacks `recorded-head`, so a
+mistakenly started old binary stops the app rather than corrupting it:
+stop that node.
+
+What it does not cover: a node that crashes after writing (it records no
+head), where the next owner relies on the bucket's strongly consistent
+listing, as before. Nor does a clean stop always count as complete: a
+node gives each actor 3 s for its release, after which it writes its own
+lease `released` and its remaining actors take the crash path (their
+last recorded floor still holds). `cluster diagnose` checks the bucket's
+semantics, not this setting.
+
 ## Upgrading WasmKeep
 
 Upgrading the `wasmkeep` binary itself (not your application: that is

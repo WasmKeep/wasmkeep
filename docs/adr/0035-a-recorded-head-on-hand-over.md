@@ -1,8 +1,11 @@
 # 0035. A recorded head on hand-over
 
-- Status: proposed; not implemented or verified by this record
+- Status: accepted, as built (2026-11-17), with the deviations in
+  "As built" below; proposed 2026-11-15 after two adversarial reviews,
+  then one review of the implementation, whose one required fix (a
+  snapshot above a listed floor) is applied
 - Date: 2026-11-15
-- Amends, if accepted: [ADR 0007](0007-replication-protocol.md),
+- Amends: [ADR 0007](0007-replication-protocol.md),
   [ADR 0020](0020-one-lease-per-node.md) and
   [ADR 0024](0024-socket-home.md)
 - Follows: [ADR 0033](0033-data-access-export-and-online-backup.md)
@@ -624,9 +627,61 @@ Amend ADRs 0028 and 0033 to state these rules explicitly.
 Offline history, export and backup gain no current-head guarantee here:
 they do not acquire ownership and retain their LIST assumptions.
 
-## Verification (to build)
+## As built (0.5.0)
 
-No simulation or implementation result is claimed by this record. Extend
+The decision above is built, off by default and enabled per app with
+`wasmkeep app format --enable`. Where the build differs, the review of
+the implementation judged each difference acceptable:
+
+- **(a) No `complete-inherited` phase is written.** A held record stores
+  `lower-bound`; only a verified hold's release writes `complete`.
+  Nothing reads completeness: every requirement is a minimum floor the
+  gate must prove, so the pre-upload demotion write, simulation case 15
+  and the demotion half of case 6 are not needed. The cost is liveness
+  only: the "complete requirement is a usable base" sidecar shortcut of
+  proof 3 is not built either, and a future one must trust only released
+  `complete` records.
+- **(b) The setting and the peers' capability are read once per lease
+  epoch,** on the first acquisition (and again after a format mismatch),
+  not at startup and not on a timer.
+- **(c) No outer deadline on one listing stream.** Attempts are bounded
+  (ten in 15 s), a single listing keeps its idle rule, and caller
+  deadlines are not propagated.
+- **(d) A local file at the selected chain's head is used** when the
+  listing alone proves the floor by a later generation, before the replay
+  validates that witness.
+- **Proof 1 beyond the snapshot stop** is structural: when the plan's
+  base is a snapshot above an exact floor, the floor is proven if it is
+  listed and the base links back to it through listed segments (each
+  naming its parent generation). No checksum is compared at the floor on
+  that route; nothing below the base is replayed.
+- **Local evidence** is dropped when the ownership record is absent
+  (only a delete and recreate or a whole-app restore removes one, and
+  either removes the history it names).
+- **Known limit:** a clean stop gives each actor 3 s for its release,
+  then writes the node lease `released`; actors whose release has not
+  landed take the crash path, with the floor last recorded.
+
+Applied amendments: the headers of ADRs 0007, 0020 and 0024 point here.
+The rules this record states for ADRs 0012, 0028, 0033 and 0034 are
+stated here and hold as built.
+
+## Verification
+
+Built and checked by: codec fixtures (both versions, phases, holder
+tokens, tombstones, the frozen old decoder); hold-cell, local-heads,
+`prove`, `combine` and `linked_back` unit tests; cluster tests of the
+real path (a lagging listing refused with 503 then served on two real
+nodes, a collected floor proven by a later generation, a replacement
+recorded, refusal beside an incapable peer, the format setting across
+delete and recreate); and simulations for cases 2, 3, 4 (in part), 7,
+8 (with the snapshot-above-floor interleaving), 12, 16 and 17. Cases 1,
+5, 11, 13, 18 and the crash half of 6 are covered by real-code tests
+only; 9, 10, 14, 15 (moot), 19 and the full broken-variant list are left
+to the testing pass, as is a real-bucket hand-over check.
+
+The original plan follows. No simulation or implementation result was
+claimed by this record before it was built. Extend
 `sim/tests/madsim_replication.rs` and the shared ownership model, using
 ADR 0034's split upload/acknowledgement model where needed. Independently
 delay LIST while GET, PUT and conditional writes complete. Model snapshots,
@@ -780,7 +835,8 @@ contract; the discovery bound is not a total restore-time promise.
 
 ## Exact amendments to earlier records
 
-Do not apply these amendments while this record is proposed.
+Applied to the headers of 0007, 0020 and 0024 on acceptance
+(2026-11-17); see "As built".
 
 - **0007, metadata and Restore:** add the stamped floor and three proof
   routes before activation; bound complete listing streams and discovery
@@ -810,6 +866,22 @@ Do not apply these amendments while this record is proposed.
   plain replies never count as the recorded durable head.
 
 ## Open questions
+
+Follow-ups from the review of the build:
+
+- **S3:** `idle-since` is never written as an integer, so an actor whose
+  every cycle is refused never ages into idle expiry.
+- **S4:** a local file at the floor with a conflicting checksum refuses
+  (500) instead of being set aside and downloaded.
+- **S5:** `app format --enable` judges liveness and the late-write window
+  with the default heartbeat and lease timings, not the cluster's.
+- **S6:** with a floor to reach, a missing link is a visibility miss: a
+  truly corrupt listing answers 503 forever instead of surfacing as a
+  corruption.
+- **S7:** the simulations test the shared protocol code and a model of
+  the server's ordering, not the server's own ordering.
+
+Earlier questions:
 
 - Measure the 15 s discovery bound and ten attempts under concurrent
   hand-overs before changing their defaults; neither is a consistency claim.
