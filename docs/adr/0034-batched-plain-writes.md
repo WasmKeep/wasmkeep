@@ -1371,3 +1371,25 @@ listed below describe batched classes as needing nodes built with
 both modes (`SOAK_WRITES=batched bench/soak.sh` builds the binary with
 the feature and starts the nodes with `--writes t=batched`; the default
 runs strict), and for the docs to state the loss bound from its data.
+
+**As built: flag removed.** The `batched-writes` feature is gone from
+`wasmkeep-server` and `wasmkeep-cli`: one binary runs both modes, and
+strict stays the default (a class is batched only when its version says
+`writes = "batched"`). A deploy that names a batched class no longer
+refuses it, and a class a version names batched runs batched on every
+node of this release, so the mixed-build case of S9 no longer arises
+among nodes of it; nodes of 0.4.2 and earlier still cannot run it, and a
+format 5 deploy is held back while a live node lacks `flush`. `serve
+--writes` and `--max-unsent-age` are no longer hidden. The batched tests
+(`tests/cluster/batched.rs`, the batched cases of `restore.rs` and
+`writes_deploys.rs`, the soak's batched mode) are part of the default
+suite, and `scripts/check.sh` has no separate batched steps.
+`SOAK_WRITES=batched bench/soak.sh` starts the nodes with `--writes
+t=batched` on the same build as the strict run. No new capability word
+was added. The soak ran on the branch tip, three OVH VPS, 2 h and 39 kills
+per mode ([strict](../../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-strict-57b76c2.csv) and [batched](../../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-batched-57b76c2-batched.csv)): durable writes lost 0 in both; plain writes lost
+2 of 208,101 acknowledged in strict and 785 of 1,237,008 in batched
+(about 20 per kill), as aggregate counts over all actors and kills:
+evidence for section 3's bound (the segment in flight plus the uncaptured
+commits, `2r + e` with a healthy bucket), not a proof of it; durable p50 and p99 78.8 ms and 999 ms strict, 76.8 ms and 920 ms
+batched. The docs state section 3's bound.

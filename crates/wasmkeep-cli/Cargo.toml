@@ -13,11 +13,6 @@ publish.workspace = true
 name = "wasmkeep"
 path = "src/main.rs"
 
-[features]
-# Batched plain writes (ADR 0034), as wasmkeep-server's flag: a binary built
-# with it runs batched classes; the soak's batched mode needs it.
-batched-writes = ["wasmkeep-server/batched-writes"]
-
 [dependencies]
 # Content-addressed backup objects and manifest integrity; already in workspace.
 sha2.workspace = true

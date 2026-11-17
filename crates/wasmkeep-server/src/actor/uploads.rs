@@ -34,9 +34,7 @@ pub(crate) fn upload_budget_in_use() -> usize {
 }
 
 /// Takes the whole node budget of batched uploads until the guard is
-/// dropped, as a node whose budget is full: for tests, in a binary built
-/// with `batched-writes`.
-#[cfg(feature = "batched-writes")]
+/// dropped, as a node whose budget is full: for tests.
 #[doc(hidden)]
 pub fn hold_node_upload_budget() -> impl Drop + Send {
     NODE_BUDGET.hold_all()

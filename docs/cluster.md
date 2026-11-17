@@ -282,11 +282,13 @@ Each actor's database follows it from node to node (ADR 0007):
   `wasmkeep_snapshot_upload_failures_total` ([monitoring](monitoring.md)).
 - `storage.exec` commits locally; its upload follows when the event ends.
   If the node dies in between, that write can be lost. In a class with
-  batched writes ([ADR 0034](adr/0034-batched-plain-writes.md), nodes
-  built with `batched-writes`) the upload follows behind the actor's next
+  batched writes ([ADR 0034](adr/0034-batched-plain-writes.md); strict is
+  the default) the upload follows behind the actor's next
   events, one segment in flight at a time, and a node's death loses the
-  segment in flight and what was committed behind it: about the last one
-  or two round trips of writes. A drain, a move, a hibernation, parking
+  segment in flight and what was committed behind it: about two upload round trips plus one event with a healthy bucket,
+  up to `--max-unsent-age` (500 ms by default) plus one event after a
+  bucket stalls; durable writes are never lost
+  ([measured](failover-and-scaling.md#what-callers-get-meanwhile)). A drain, a move, a hibernation, parking
   and a clean stop flush first and lose nothing with a healthy bucket. A
   clean stop ends a batched actor's running event at its deadline (10 s,
   for events and flushes together) and gives up what is not uploaded by

@@ -112,13 +112,12 @@ pub(super) fn build_class(
 }
 
 /// A class's mode of writes (ADR 0034, section 1): batched if the version
-/// says so and this binary runs batched writes
-/// ([`crate::apps::BATCHED_BUILT`]), else strict.
+/// says so, else strict.
 pub(super) fn writes_of(
     batched: &std::collections::BTreeSet<String>,
     class: &str,
 ) -> crate::apps::Writes {
-    if crate::apps::BATCHED_BUILT && batched.contains(class) {
+    if batched.contains(class) {
         crate::apps::Writes::Batched
     } else {
         crate::apps::Writes::Strict
@@ -208,18 +207,13 @@ fn merge_values(
 
 #[cfg(test)]
 mod tests {
-    /// A class named batched runs batched only in a binary built with
-    /// `batched-writes` (ADR 0034, section 15); never one not named.
+    /// A class named batched runs batched (ADR 0034, section 15); never one
+    /// not named.
     #[test]
-    fn a_batched_class_runs_strict_unless_built_with_the_flag() {
+    fn only_a_named_class_runs_batched() {
         use crate::apps::Writes;
         let named: std::collections::BTreeSet<String> = ["rooms".to_owned()].into();
-        let expected = if crate::apps::BATCHED_BUILT {
-            Writes::Batched
-        } else {
-            Writes::Strict
-        };
-        assert_eq!(super::writes_of(&named, "rooms"), expected);
+        assert_eq!(super::writes_of(&named, "rooms"), Writes::Batched);
         assert_eq!(super::writes_of(&named, "other"), Writes::Strict);
     }
 

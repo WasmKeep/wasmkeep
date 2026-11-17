@@ -394,8 +394,7 @@ struct DeployArgs {
 
     /// How a class's plain writes reach the bucket, as CLASS=MODE: `strict`
     /// (each event's writes before the next event, the default) or
-    /// `batched` (several events to a segment, ADR 0034; needs nodes built
-    /// with `batched-writes`). Part of the version; classes not named keep
+    /// `batched` (several events to a segment, ADR 0034). Part of the version; classes not named keep
     /// theirs. Repeatable.
     #[arg(long = "writes", value_name = "CLASS=MODE", value_parser = parse_writes)]
     writes: Vec<(String, wasmkeep_server::apps::Writes)>,
@@ -685,18 +684,16 @@ struct ServeArgs {
     max_front_requests: Option<usize>,
 
     /// How a class given with --actor writes, as CLASS=MODE: `strict` (the
-    /// default) or `batched` (ADR 0034; a node built with `batched-writes`
-    /// runs it batched in a cluster, any other runs it strict). Not with
-    /// --app: a deployed version names its classes' modes. Repeatable.
-    /// Hidden while batched writes need that build.
-    #[arg(long = "writes", value_name = "CLASS=MODE", value_parser = parse_writes, hide = true)]
+    /// default) or `batched` (ADR 0034: plain writes are uploaded
+    /// behind the events). Not with --app: a deployed version names its classes' modes.
+    /// Repeatable.
+    #[arg(long = "writes", value_name = "CLASS=MODE", value_parser = parse_writes)]
     writes: Vec<(String, wasmkeep_server::apps::Writes)>,
 
     /// How long a committed write of a batched class may wait unsent behind
     /// the segment in flight, in milliseconds, before its actor stops
-    /// starting events (ADR 0034, section 3): 100 to 5000. Hidden while
-    /// batched writes need a build with `batched-writes`.
-    #[arg(long = "max-unsent-age", value_name = "MS", default_value_t = 500, hide = true,
+    /// starting events (ADR 0034, section 3): 100 to 5000.
+    #[arg(long = "max-unsent-age", value_name = "MS", default_value_t = 500,
           value_parser = clap::value_parser!(u64).range(100..=5000))]
     max_unsent_age_ms: u64,
 

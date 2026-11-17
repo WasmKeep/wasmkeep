@@ -79,7 +79,6 @@ use self::held::{Barrier, Dropped, Held};
 
 pub(crate) use self::routing::is_wasmkeep_header;
 pub(crate) use self::routing::{BodyBudget, refuse_batch};
-#[cfg(feature = "batched-writes")]
 pub use self::uploads::hold_node_upload_budget;
 pub(crate) use self::uploads::upload_budget_in_use;
 
@@ -159,8 +158,7 @@ pub struct ActorConfig {
     /// only; classes not listed never expire).
     pub expire_after_idle: std::collections::BTreeMap<String, Duration>,
     /// The classes whose writes are batched (ADR 0034, section 1): the
-    /// deployed version's; every other class is strict. Batched only in a
-    /// binary built with `batched-writes` ([`crate::apps::BATCHED_BUILT`]).
+    /// deployed version's; every other class is strict.
     pub batched: std::collections::BTreeSet<String>,
     /// Public ingress rate limits for this app.
     pub limits: crate::apps::limits::Policies,

@@ -7,9 +7,8 @@
 # `set -a; . file; set +a`), and a label for the store: SOAK_LABEL=r2.
 # WASMKEEP_SOAK_SECS (1800 by default) and WASMKEEP_SOAK_KILL_EVERY (180)
 # set its length and how often a node is killed. SOAK_WRITES=batched runs
-# the soak's class with batched plain writes (ADR 0034): the binary is
-# built with the `batched-writes` feature and the nodes start with
-# `--writes t=batched`; strict (the default) runs it as before. The mode is
+# the soak's class with batched plain writes (ADR 0034): the nodes start
+# with `--writes t=batched`; strict (the default) runs it as before. The mode is
 # part of the results file's name and of each row's bench name.
 # SOAK_RESTORE_DRILL=1 takes one online backup while writers/kills continue,
 # restores the restore-drill/fixture app to a new root and compares the frozen
@@ -24,8 +23,7 @@ export WASMKEEP_SOAK_KILL_EVERY=${WASMKEEP_SOAK_KILL_EVERY:-180}
 export SOAK_RESTORE_DRILL=${SOAK_RESTORE_DRILL:-0}
 writes=${SOAK_WRITES:-strict}
 case "$writes" in
-  strict) features=() ;;
-  batched) features=(--features batched-writes) ;;
+  strict|batched) ;;
   *) echo "SOAK_WRITES=$writes: strict or batched" >&2; exit 2 ;;
 esac
 export WASMKEEP_SOAK_WRITES=$writes
@@ -59,7 +57,7 @@ interrupted() {
 }
 trap interrupted INT TERM
 status=0
-cargo nextest run -p wasmkeep-cli "${features[@]}" --test soak --no-capture 2>&1 | tee "$log" || status=$?
+cargo nextest run -p wasmkeep-cli --test soak --no-capture 2>&1 | tee "$log" || status=$?
 
 mkdir -p bench/results
 suffix=""

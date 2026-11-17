@@ -200,8 +200,8 @@ directory; the rest of those patterns remains later, on demand.
 
 There is no directory or broadcast-group SDK API to use today. The
 planned feature would distribute a logical room among actors; each
-actor would still execute on one node at a time. The separate planned
-`0.5.0` [batched plain-write mode](what-saved-means.md#planned-opt-in-to-batched-plain-writes)
+actor would still execute on one node at a time. The separate
+[batched plain-write mode](what-saved-means.md#opt-in-to-batched-plain-writes)
 addresses storage waits, not socket distribution. Size today's design
 from measured workloads, and keep its routing and retry contracts
 explicit enough to migrate later.

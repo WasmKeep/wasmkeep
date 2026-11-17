@@ -127,10 +127,6 @@ pub enum DeployError {
         /// The classes importing it.
         what: String,
     },
-    /// A class is `writes = "batched"`, which this release does not run
-    /// yet (ADR 0034): nothing was written.
-    #[error("class {0:?}: {BATCHED_NOT_YET}")]
-    BatchedNotYet(String),
     /// The app was deleted (`wasmkeep app delete`, ADR 0028): its
     /// tombstone is in the bucket.
     #[error(
@@ -171,7 +167,7 @@ pub enum Writes {
     #[default]
     Strict,
     /// Opt in: plain writes are uploaded behind the events, one segment in
-    /// flight per actor. Only in a binary built with `batched-writes`.
+    /// flight per actor.
     Batched,
 }
 
@@ -197,17 +193,6 @@ impl Writes {
         }
     }
 }
-
-/// Whether this binary runs batched plain writes (ADR 0034, section 15):
-/// built with the `batched-writes` feature. Without it a deploy refuses a
-/// batched class ([`DeployError::BatchedNotYet`]) and a class a version
-/// names batched runs strict, so a default build behaves as before.
-pub const BATCHED_BUILT: bool = cfg!(feature = "batched-writes");
-
-/// What a deploy that names a batched class answers, while batched writes
-/// are not built (ADR 0034, slices S7 to S12).
-pub const BATCHED_NOT_YET: &str = "writes = \"batched\" is not yet available in this release \
-     (ADR 0034): deploy the class without `writes`, or with writes = \"strict\"";
 
 fn bucket(e: impl std::fmt::Display) -> DeployError {
     DeployError::Bucket(e.to_string())
@@ -1249,11 +1234,6 @@ impl AppRef {
                     batched.insert(class);
                 }
             }
-        }
-        // Not built into this binary (ADR 0034, section 15): refused
-        // before anything is written.
-        if !BATCHED_BUILT && let Some(class) = batched.first() {
-            return Err(DeployError::BatchedNotYet(class.clone()));
         }
         let mut manifest = Manifest {
             previous: None,
