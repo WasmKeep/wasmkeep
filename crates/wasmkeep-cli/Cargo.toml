@@ -14,6 +14,8 @@ name = "wasmkeep"
 path = "src/main.rs"
 
 [dependencies]
+# Writes Parquet, the format warehouses read; no smaller maintained writer exists.
+parquet = { version = "=60.1.0", default-features = false }
 # Content-addressed backup objects and manifest integrity; already in workspace.
 sha2.workspace = true
 # Local export queries and result values, using the server's SQLite build.

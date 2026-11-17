@@ -83,6 +83,15 @@ domain dedication, both permissive.
 `scripts/sbom.sh` writes a CycloneDX SBOM of the `wasmkeep` binary for one
 target.
 
+The CLI alone uses `parquet` 60.1.0 (Apache-2.0) for the change-feed
+writer (ADR 0039, slice F1): it writes Parquet, the file format DuckDB
+and every warehouse read; no smaller maintained writer exists.
+It sets `default-features = false` and enables **no optional features**:
+the column writer and reader need neither Arrow arrays nor a compression
+codec. Files are uncompressed; no Arrow array crates or codec dependencies
+are added. The licence allow-list is unchanged. This writer primitive does
+not yet expose a `feed` command.
+
 Development-only tools, never part of WasmKeep: workerd (Apache-2.0, in
 `bench/workerd`), the Go LTX conformance tool, wasm-tools and wit-bindgen
 (Apache-2.0 WITH LLVM-exception), Zig (MIT), TinyGo (BSD-3-Clause),

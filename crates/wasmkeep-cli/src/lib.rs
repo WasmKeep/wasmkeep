@@ -3,6 +3,7 @@
 
 use anyhow::Context;
 pub mod backup;
+pub mod feed;
 
 /// Parses `TENANT/APP`.
 pub fn parse_app(s: &str) -> Result<(String, String), String> {
