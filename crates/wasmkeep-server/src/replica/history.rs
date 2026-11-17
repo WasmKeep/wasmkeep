@@ -250,6 +250,58 @@ async fn attempt_export(
     raw: bool,
 ) -> Result<Export, Error> {
     let objects = list_objects(store, prefix).await?;
+    attempt_from_objects(store, prefix, point, output, max, raw, &objects, false).await
+}
+
+/// Read a head from the caller's fresh app listing. No ownership record is read.
+/// Missing links/objects and stale identities retry with an actor listing, at
+/// most eight attempts in total. Returns the listing actually verified.
+pub async fn export_from_listing(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    mut objects: BTreeMap<String, ObjectMeta>,
+    output: &Path,
+    max: u64,
+) -> Result<(Export, BTreeMap<String, ObjectMeta>), Error> {
+    let mut last = String::new();
+    for attempt in 1..=8 {
+        if attempt > 1 {
+            objects = list_objects(store, prefix).await?;
+        }
+        match attempt_from_objects(
+            store,
+            prefix,
+            Point::Head,
+            output,
+            max,
+            false,
+            &objects,
+            true,
+        )
+        .await
+        {
+            Ok(mut result) => {
+                result.attempts = attempt;
+                return Ok((result, objects));
+            }
+            Err(e @ (Error::Missing(_) | Error::Stale(_))) => last = e.to_string(),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Missing(format!("{last}; refused after 8 attempts")))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attempt_from_objects(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    point: Point,
+    output: &Path,
+    max: u64,
+    raw: bool,
+    objects: &BTreeMap<String, ObjectMeta>,
+    head_from_replay: bool,
+) -> Result<Export, Error> {
     let sizes: BTreeMap<_, _> = objects
         .iter()
         .map(|(key, meta)| (key.clone(), meta.size))
@@ -267,7 +319,7 @@ async fn attempt_export(
     let mut reader = Reader {
         store,
         prefix,
-        objects: &objects,
+        objects,
         max_object,
         read_count: 0,
     };
@@ -276,12 +328,20 @@ async fn attempt_export(
         sizes.len(),
         sizes.values().copied().fold(0, u64::saturating_add),
     );
-    let (plan, stamp) = tokio::time::timeout(
-        allowed,
-        select(&listing, &current, &chain, point, &mut reader),
-    )
-    .await
-    .map_err(|_| read_deadline(point, "history selection"))??;
+    let (plan, mut stamp) = if head_from_replay && (!current.segments.is_empty() || head.txid == 1)
+    {
+        // A head segment (or the first snapshot) is already in the replay.
+        // Take its capture stamp there, without fetching it twice. A later
+        // snapshot alone still needs its head segment to date the commit.
+        (current.clone(), 0)
+    } else {
+        tokio::time::timeout(
+            allowed,
+            select(&listing, &current, &chain, point, &mut reader),
+        )
+        .await
+        .map_err(|_| read_deadline(point, "history selection"))??
+    };
     let position = plan.head();
     let parent = output
         .parent()
@@ -339,6 +399,9 @@ async fn attempt_export(
         reader.read_count += data.len();
         for (bytes, id, snapshot) in data {
             let header = checked_header(&bytes, id, snapshot)?;
+            if head_from_replay && id == head && (!snapshot || id.txid == 1) {
+                stamp = header.timestamp_ms;
+            }
             let expected = u64::from(header.commit) * u64::from(header.page_size);
             let present = std::fs::metadata(&path)?.len();
             check_space(scratch.path(), expected.saturating_sub(present))?;
