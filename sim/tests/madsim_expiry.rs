@@ -280,6 +280,7 @@ async fn expiry_pass(
                 name: k.strip_prefix(OWNERS)?.to_owned(),
                 modified_ms,
                 version,
+                idle_since_ms: None,
             })
         })
         .collect();

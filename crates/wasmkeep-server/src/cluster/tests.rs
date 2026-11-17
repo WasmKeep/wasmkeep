@@ -4221,3 +4221,63 @@ async fn heartbeats_name_the_app_the_capability_checks_compare() {
         vec!["a"]
     );
 }
+
+/// ADR 0035 follow-up S3: an idle expiry whose cycle is refused (its
+/// restore cannot prove the floor) rewrites the record twice, acquire and
+/// release; the record must keep the idle origin the expiry judged, as
+/// `idle-since`, or a refused actor never ages into expiry again.
+#[tokio::test]
+async fn a_refused_expiry_cycle_keeps_the_idle_origin() {
+    use wasmkeep_cluster::app_format;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    assert_eq!(
+        owner_record(&store, &key)
+            .await
+            .recorded
+            .and_then(|r| r.idle_since_ms),
+        None,
+        "an ordinary release starts a new idle period"
+    );
+    // The expiry takes the record as listed, idle since 1234 by its
+    // listed last-modified time, and its cycle ends without activation.
+    let etag = store
+        .head(&StorePath::from(key.clone()))
+        .await
+        .unwrap()
+        .e_tag
+        .unwrap();
+    let hold = LeaseHold::acquire_with(&a, &x, Some((etag.as_str(), 1_234)))
+        .await
+        .unwrap();
+    assert_eq!(
+        owner_record(&store, &key)
+            .await
+            .recorded
+            .and_then(|r| r.idle_since_ms),
+        Some(1_234),
+        "carried by the expiry's acquisition"
+    );
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    assert_eq!(
+        owner_record(&store, &key)
+            .await
+            .recorded
+            .and_then(|r| r.idle_since_ms),
+        Some(1_234),
+        "kept by the release of a hold never activated"
+    );
+}

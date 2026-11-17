@@ -1068,11 +1068,15 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         &self,
         inherited: Option<Requirement>,
         before: Option<&OwnerRecord>,
+        idle_origin_ms: Option<u64>,
     ) -> Option<RecordedHead> {
         self.recorded_head().then(|| {
+            // A carried origin, else the one the caller judged (an expiry's
+            // listed last-modified time): never a fresh one from a rewrite.
             let idle = before
                 .and_then(|b| b.recorded)
-                .and_then(|r| r.idle_since_ms);
+                .and_then(|r| r.idle_since_ms)
+                .or(idle_origin_ms);
             Requirement::stored(inherited, true, idle)
         })
     }
@@ -1126,7 +1130,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                attempted = self.mine(first, self.acquiring(inherited, None));
+                attempted = self.mine(first, self.acquiring(inherited, None, None));
                 let written = self.bucket.create(key, checked(&attempted)?).await;
                 (first, None, written)
             }
@@ -1161,7 +1165,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
+                attempted = self.mine(generation, self.acquiring(inherited, Some(&record), None));
                 let written = self
                     .bucket
                     .replace(key, checked(&attempted)?, &version)
@@ -1204,16 +1208,21 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         unchanged: impl Fn(&Version) -> bool,
         lease_valid: impl Fn() -> bool,
     ) -> Result<Hold, AcquireError> {
-        self.acquire_unchanged_prepared(key, unchanged, lease_valid, |_, _| Ok(None))
+        self.acquire_unchanged_prepared(key, unchanged, None, lease_valid, |_, _| Ok(None))
             .await
     }
 
     /// [`Self::acquire_unchanged`] with the preparation hook of
-    /// [`Self::acquire_prepared`].
+    /// [`Self::acquire_prepared`]. `idle_origin_ms` is the record's idle
+    /// origin as the expiry judged it (its listed last-modified time, or a
+    /// carried `idle-since`): a version 2 record that carries none is
+    /// rewritten with it, so a refused cycle does not restart the actor's
+    /// idle clock (ADR 0035, section 3).
     pub async fn acquire_unchanged_prepared(
         &self,
         key: &str,
         unchanged: impl Fn(&Version) -> bool,
+        idle_origin_ms: Option<u64>,
         lease_valid: impl Fn() -> bool,
         prepare: impl FnOnce(
             Option<&OwnerRecord>,
@@ -1241,7 +1250,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         if !lease_valid() {
             return Err(AcquireError::LeaseInvalid);
         }
-        let attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
+        let attempted = self.mine(
+            generation,
+            self.acquiring(inherited, Some(&record), idle_origin_ms),
+        );
         let written = self
             .bucket
             .replace(key, checked(&attempted)?, &version)

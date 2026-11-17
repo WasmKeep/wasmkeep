@@ -475,7 +475,7 @@ impl ActorState {
     /// owner is never taken as one (the caller refuses those first).
     pub(super) async fn ensure_owner_with(
         &mut self,
-        listed: Option<&str>,
+        listed: Option<(&str, u64)>,
     ) -> Result<(), OwnershipError> {
         let blocked = self
             .secrets_blocked

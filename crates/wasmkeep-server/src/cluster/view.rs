@@ -389,6 +389,7 @@ impl Cluster {
                         name: name.to_owned(),
                         modified_ms: m.modified_ms,
                         version: m.etag.unwrap_or_default(),
+                        idle_since_ms: None,
                     }
                 })
             })
