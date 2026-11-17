@@ -414,7 +414,10 @@ snapshots succeed):
   segments), and its whole state is written again, however small the
   change. The feed keeps no replayed copy between polls: the state
   directory stays small, at the price of `1 + s` GETs where ADR 0033's
-  table said "one per new segment". A busy large actor is the worst
+  table said "one per new segment". A later snapshot exactly at the head
+  needs one extra segment GET to preserve ADR 0033's commit timestamp:
+  six GETs for one changed actor with no replay segments, not five.
+  A busy large actor is the worst
   case: an actor of 1 GiB that changes at every poll is read and
   written whole at every poll. `--max-bytes` and `--classes` are the
   tools for it.

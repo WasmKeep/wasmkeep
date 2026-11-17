@@ -1,5 +1,5 @@
-//! ADR 0039 F2: a single read-only poll. Interrupted publication requires new
-//! directories until F3 adds recovery; replacement kinds remain gated on F4.
+//! ADR 0039: one read-only poll with durable, resumable batches.
+//! Replacement kinds remain gated on F4.
 pub mod writer;
 
 use anyhow::{Context, ensure};
@@ -79,7 +79,18 @@ struct Changed {
 /// Inject a local test bucket, or the CLI's S3 store. Returns 2 for actors left
 /// unadvanced. This entry point never obtains a node or writes to the store.
 pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> anyhow::Result<i32> {
-    std::fs::create_dir_all(&args.state)?;
+    poll_inner(args, store, prefix, &mut |_| Ok(()), 10_000, 1 << 30).await
+}
+
+async fn poll_inner(
+    args: &Args,
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    checkpoint: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+    max_actors: usize,
+    max_rows: usize,
+) -> anyhow::Result<i32> {
+    durable_directory(&args.state)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -87,7 +98,7 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
         .truncate(false)
         .open(args.state.join("lock"))?;
     lock.try_lock().context("feed state is locked")?;
-    std::fs::create_dir_all(&args.out)?;
+    durable_directory(&args.out)?;
     let out = args.out.canonicalize()?;
     let state = args.state.canonicalize()?;
     ensure!(
@@ -95,7 +106,28 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
         "output and state directories must be separate"
     );
     let mut db = Connection::open(state.join("state.db"))?;
-    db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS feed (id INTEGER PRIMARY KEY CHECK(id=1), binding TEXT NOT NULL, incarnation TEXT NOT NULL, seq INTEGER NOT NULL, pending INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS heads (class TEXT NOT NULL, name TEXT NOT NULL, generation INTEGER NOT NULL, txid INTEGER NOT NULL, identity TEXT NOT NULL, PRIMARY KEY(class,name)); CREATE INDEX IF NOT EXISTS heads_order ON heads((class || '/' || name || '/'));")?;
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS feed (id INTEGER PRIMARY KEY CHECK(id=1), binding TEXT NOT NULL, incarnation TEXT NOT NULL, seq INTEGER NOT NULL, pending INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS heads (class TEXT NOT NULL, name TEXT NOT NULL, generation INTEGER NOT NULL, txid INTEGER NOT NULL, identity TEXT NOT NULL, PRIMARY KEY(class,name)); CREATE INDEX IF NOT EXISTS heads_order ON heads((class || '/' || name || '/'));")?;
+    // Upgrade F2 progress without changing its binding or committed sequence.
+    let has_reserved: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('feed') WHERE name='reserved')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_reserved {
+        let tx = db.transaction()?;
+        tx.execute_batch("ALTER TABLE feed ADD COLUMN reserved INTEGER NOT NULL DEFAULT 0; UPDATE feed SET reserved=seq+pending;")?;
+        tx.commit()?;
+    }
+    let has_head_seq: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('heads') WHERE name='seq')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_head_seq {
+        db.execute_batch("ALTER TABLE heads ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    std::fs::File::open(&state)?.sync_all()?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS columns (class TEXT NOT NULL, table_name TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE, kind INTEGER NOT NULL, PRIMARY KEY(class,table_name,name));")?;
     let binding = serde_json::json!({"format":1,"bucket":args.bucket,"prefix":prefix,"tenant":args.app.0,"app":args.app.1,"out":out,"feed_id":state}).to_string();
     let recorded: Option<(String, String, u64, bool)> = db
         .query_row(
@@ -104,15 +136,16 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
             |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64, r.get(3)?)),
         )
         .optional()?;
-    if let Some((old, _, _, pending)) = &recorded {
+    if let Some((old, _, _, _)) = &recorded {
         ensure!(
             old == &binding,
             "state belongs to another bucket, app or output"
         );
-        ensure!(
-            !pending,
-            "interrupted feed: F3 recovery is not implemented; use new state and output directories"
-        );
+        if !out.join("_wk_feed.json").exists() {
+            let reserved: i64 = db.query_row("SELECT reserved FROM feed", [], |r| r.get(0))?;
+            ensure!(reserved == 0, "output identity missing after publication");
+            publish_identity(&out, &binding)?;
+        }
         ensure!(
             std::fs::read_to_string(out.join("_wk_feed.json"))? == binding,
             "output identity differs from state"
@@ -123,6 +156,14 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
             "new state requires an empty output directory"
         );
     }
+    if let Some((_, _, committed, _)) = &recorded {
+        recover(&out, *committed)?;
+    }
+    let scratch = state.join("scratch");
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch)?;
+    }
+    std::fs::create_dir_all(&scratch)?;
     let (tenant, app) = &args.app;
     let base = format!(
         "{}apps/{tenant}/{app}",
@@ -160,19 +201,12 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
         );
     }
     if recorded.is_none() {
-        std::fs::write(out.join("_wk_feed.json"), &binding)?;
         db.execute(
-            "INSERT INTO feed VALUES(1,?1,?2,0,0)",
+            "INSERT INTO feed VALUES(1,?1,?2,0,0,0)",
             params![binding, incarnation],
         )?;
+        publish_identity(&out, &binding)?;
     }
-    let seq = recorded
-        .as_ref()
-        .map_or(0, |r| r.2)
-        .checked_add(1)
-        .context("sequence exhausted")?;
-    let scratch = state.join("scratch");
-    std::fs::create_dir_all(&scratch)?;
     let root = wasmkeep_cluster::state_root::StateRoot::new(prefix, tenant, app);
     let history_prefix = format!(
         "{}/",
@@ -185,7 +219,8 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
     {
         // Both scans use the bucket's byte ordering, including the slash after
         // each class/name. Only one recorded head is held ahead of the listing.
-        let mut statement = db.prepare("SELECT class || '/' || name || '/', class, generation, txid, identity FROM heads ORDER BY class || '/' || name || '/'")?;
+        let scan = Connection::open(state.join("state.db"))?;
+        let mut statement = scan.prepare("SELECT class || '/' || name || '/', class, generation, txid, identity FROM heads ORDER BY class || '/' || name || '/'")?;
         let mut rows = statement.query([])?;
         let mut saved = next_saved(&mut rows)?;
         let absent_found = std::cell::Cell::new(false);
@@ -217,7 +252,6 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
                         actor_prefix,
                         objects,
                         old,
-                        seq,
                     ))
                 })
                 .try_buffer_unordered(16);
@@ -225,7 +259,7 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
             while let Some(result) = jobs.next().await {
                 match result {
                     Ok(Some(actor)) => {
-                        row_bytes += actor
+                        let actor_bytes = actor
                             .tables
                             .iter()
                             .flat_map(|(_, r)| &r.values)
@@ -236,11 +270,16 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
                                 _ => 8,
                             })
                             .sum::<usize>();
-                        ensure!(
-                            changed.len() < 10_000 && row_bytes <= 1 << 30,
-                            "poll exceeds F2 batch limit; F3 batching is required"
-                        );
+                        if !changed.is_empty()
+                            && (changed.len() >= max_actors
+                                || row_bytes.saturating_add(actor_bytes) > max_rows)
+                        {
+                            commit_batch(&mut db, &out, std::mem::take(&mut changed), checkpoint)?;
+                            row_bytes = 0;
+                        }
+                        row_bytes += actor_bytes;
                         changed.push(actor);
+                        checkpoint("listed")?;
                     }
                     Ok(None) => (),
                     Err(e) => {
@@ -256,11 +295,27 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
             saved = next_saved(&mut rows)?;
         }
     }
-    if changed.is_empty() {
-        return Ok(if failed { 2 } else { 0 });
+    if !changed.is_empty() {
+        commit_batch(&mut db, &out, changed, checkpoint)?;
     }
-    // F2 stops safely on interrupted publication; F3 supplies recovery.
-    db.execute("UPDATE feed SET pending=1 WHERE id=1", [])?;
+    Ok(if failed { 2 } else { 0 })
+}
+
+fn commit_batch(
+    db: &mut Connection,
+    out: &std::path::Path,
+    mut changed: Vec<Changed>,
+    checkpoint: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let tx = db.transaction()?;
+    let reserved: i64 = tx.query_row("SELECT reserved FROM feed WHERE id=1", [], |r| r.get(0))?;
+    let seq = reserved.checked_add(1).context("sequence exhausted")?;
+    tx.execute("UPDATE feed SET reserved=?1,pending=1 WHERE id=1", [seq])?;
+    tx.commit()?;
+    checkpoint("reserved")?;
+    for actor in &mut changed {
+        actor.state.actor.seq = seq as u64;
+    }
     let mut tables: BTreeMap<(String, String), Vec<writer::ActorTable>> = BTreeMap::new();
     for actor in &mut changed {
         for (table, rows) in std::mem::take(&mut actor.tables) {
@@ -272,46 +327,158 @@ pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> an
                 .push(data);
         }
     }
+    let mut column_updates = Vec::new();
     for ((class, table), actors) in tables {
         let dir = out
             .join("tables")
             .join(encode_segment(&class))
             .join(encode_segment(&table));
-        std::fs::create_dir_all(&dir)?;
+        durable_directory(&dir)?;
+        let previous = db
+            .prepare("SELECT name,kind FROM columns WHERE class=?1 AND table_name=?2")?
+            .query_map(params![class, table], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?))
+            })?
+            .map(|r| {
+                let (name, kind) = r?;
+                Ok((name, decode_type(kind)?))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         let written = writer::write_table(
             &dir.join(format!("{seq:020}.parquet")),
             &class,
             &table,
             &actors,
-            &BTreeMap::new(),
+            &previous,
         )?;
+        column_updates.push((class, table, written.columns));
+        checkpoint("data")?;
         for warning in written.warnings {
             eprintln!("{warning}");
         }
     }
+    checkpoint("data_complete")?;
     let states_dir = out.join("_wk_states");
-    std::fs::create_dir_all(&states_dir)?;
+    durable_directory(&states_dir)?;
+    let states = changed.iter().map(|c| &c.state).collect::<Vec<_>>();
+    writer::write_states(&states_dir.join(format!("{seq:020}.parquet")), &states)?;
+    checkpoint("states")?;
+    checkpoint("before_state")?;
     let tx = db.transaction()?;
+    for (class, table, columns) in column_updates {
+        for (name, kind) in columns {
+            tx.execute("INSERT INTO columns VALUES(?1,?2,?3,?4) ON CONFLICT(class,table_name,name) DO UPDATE SET kind=excluded.kind",params![class,table,name,kind as u8])?;
+        }
+    }
     for actor in &changed {
         tx.execute(
-            "INSERT OR REPLACE INTO heads VALUES(?1,?2,?3,?4,?5)",
+            "INSERT OR REPLACE INTO heads VALUES(?1,?2,?3,?4,?5,?6)",
             params![
                 actor.class,
                 actor.encoded,
                 actor.position.generation as i64,
                 actor.position.txid as i64,
-                actor.identity
+                actor.identity,
+                seq
             ],
         )?;
+        checkpoint("head")?;
     }
-    let states = changed.into_iter().map(|c| c.state).collect::<Vec<_>>();
-    writer::write_states(&states_dir.join(format!("{seq:020}.parquet")), &states)?;
-    tx.execute(
-        "UPDATE feed SET seq=?1,pending=0 WHERE id=1",
-        [i64::try_from(seq)?],
-    )?;
+    tx.execute("UPDATE feed SET seq=?1,pending=0 WHERE id=1", [seq])?;
     tx.commit()?;
-    Ok(if failed { 2 } else { 0 })
+    checkpoint("advanced")?;
+    Ok(())
+}
+
+// Sync each newly created directory's entry, not only the leaf containing files.
+fn durable_directory(path: &std::path::Path) -> anyhow::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        durable_directory(parent)?;
+        std::fs::create_dir(path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+    } else {
+        std::fs::create_dir(path)?;
+        std::fs::File::open(".")?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn publish_identity(out: &std::path::Path, binding: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let partial = out.join("_wk_feed.json.partial");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&partial)?;
+    file.write_all(binding.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    tempfile::TempPath::try_from_path(partial)?.persist_noclobber(out.join("_wk_feed.json"))?;
+    std::fs::File::open(out)?.sync_all()?;
+    Ok(())
+}
+
+fn decode_type(kind: u8) -> anyhow::Result<writer::ColumnType> {
+    use writer::ColumnType::*;
+    match kind {
+        0 => Ok(Integer),
+        1 => Ok(Real),
+        2 => Ok(Text),
+        3 => Ok(Blob),
+        _ => anyhow::bail!("invalid recorded column type {kind}"),
+    }
+}
+
+fn recover(out: &std::path::Path, committed: u64) -> anyhow::Result<()> {
+    fn sweep(dir: &std::path::Path, out: &std::path::Path, committed: u64) -> anyhow::Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            ensure!(
+                !kind.is_symlink(),
+                "symlink in feed output: {}",
+                path.display()
+            );
+            if kind.is_dir() {
+                sweep(&path, out, committed)?;
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_str().context("invalid feed filename")?;
+            let partial = name.ends_with(".partial");
+            let stem = name
+                .trim_end_matches(".partial")
+                .strip_suffix(".parquet")
+                .context("invalid feed file")?;
+            let seq: u64 = stem.parse().context("invalid feed sequence")?;
+            if partial
+                || (seq > committed
+                    && !out
+                        .join("_wk_states")
+                        .join(format!("{seq:020}.parquet"))
+                        .exists())
+            {
+                std::fs::remove_file(&path)?;
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+    let partial = out.join("_wk_feed.json.partial");
+    if partial.exists() {
+        std::fs::remove_file(partial)?;
+        std::fs::File::open(out)?.sync_all()?;
+    }
+    sweep(&out.join("tables"), out, committed)?;
+    sweep(&out.join("_wk_states"), out, committed)
 }
 
 struct Saved {
@@ -356,7 +523,6 @@ async fn read_changed(
     actor_prefix: String,
     objects: BTreeMap<String, ObjectMeta>,
     old: Option<Saved>,
-    seq: u64,
 ) -> anyhow::Result<Option<Changed>> {
     let (tenant, app) = &args.app;
     let relative = actor_prefix
@@ -436,7 +602,7 @@ async fn read_changed(
         tenant: tenant.clone(),
         app: app.clone(),
         name,
-        seq,
+        seq: 0, // Assigned only after the batch reserves its number.
         generation: position.generation,
         txid: position.txid,
         committed_at: export.timestamp_ms,
@@ -464,3 +630,6 @@ async fn read_changed(
         tables: data,
     }))
 }
+
+#[cfg(test)]
+mod poll_tests;

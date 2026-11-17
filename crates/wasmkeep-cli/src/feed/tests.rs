@@ -216,3 +216,69 @@ fn immutable_files_and_invalid_input() {
     );
     assert_eq!(std::fs::read(partial).unwrap(), b"other writer");
 }
+
+#[test]
+fn numeric_mixture_and_sticky_real() {
+    let dir = tempfile::tempdir().unwrap();
+    for (i, integer) in [-(1i64 << 53), 1 << 53, -(1 << 53) - 1, (1 << 53) + 1]
+        .into_iter()
+        .enumerate()
+    {
+        for reverse in [false, true] {
+            let path = dir.path().join(format!("{i}-{reverse}.parquet"));
+            let mut values = vec![vec![Integer(integer)], vec![Real(2.5)], vec![Null]];
+            if reverse {
+                values.reverse();
+            }
+            let written = write_table(
+                &path,
+                "c",
+                "t",
+                &[actor(&["amount"], values)],
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let safe = integer.abs() <= 1 << 53;
+            assert_eq!(
+                written.columns["amount"],
+                if safe {
+                    ColumnType::Real
+                } else {
+                    ColumnType::Text
+                }
+            );
+            assert_eq!(written.warnings.is_empty(), safe);
+            let rows = read(&path);
+            assert_eq!(
+                rows[if reverse { 2 } else { 0 }]["amount"],
+                if safe {
+                    Field::Double(integer as f64)
+                } else {
+                    Field::Str(integer.to_string())
+                }
+            );
+        }
+    }
+    for (i, value) in [Integer(7), Integer((1 << 53) + 1), Null]
+        .into_iter()
+        .enumerate()
+    {
+        let path = dir.path().join(format!("sticky-{i}.parquet"));
+        let written = write_table(
+            &path,
+            "c",
+            "t",
+            &[actor(&["AMOUNT"], vec![vec![value]])],
+            &BTreeMap::from([("amount".into(), ColumnType::Real)]),
+        )
+        .unwrap();
+        assert_eq!(
+            written.columns["AMOUNT"],
+            if i == 1 {
+                ColumnType::Text
+            } else {
+                ColumnType::Real
+            }
+        );
+    }
+}

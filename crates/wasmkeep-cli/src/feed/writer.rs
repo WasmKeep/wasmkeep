@@ -81,6 +81,7 @@ pub fn write_table(
                     },
                     kind: None,
                     mixed: false,
+                    large_integer: false,
                 });
             }
         }
@@ -91,11 +92,22 @@ pub fn write_table(
             );
             for (key, i) in &mapping {
                 let column = &mut columns[indices[key]];
+                if let SqlValue::Integer(v) = &row[*i] {
+                    column.large_integer |= !(-(1i64 << 53)..=(1i64 << 53)).contains(v);
+                }
                 if let Some(kind) = value_type(&row[*i]) {
                     match column.kind {
                         None => column.kind = Some(kind),
                         Some(old) if old != kind => {
-                            column.mixed = true;
+                            if matches!(
+                                (old, kind),
+                                (ColumnType::Integer, ColumnType::Real)
+                                    | (ColumnType::Real, ColumnType::Integer)
+                            ) {
+                                column.kind = Some(ColumnType::Real);
+                            } else {
+                                column.mixed = true;
+                            }
                         }
                         _ => {}
                     }
@@ -121,6 +133,10 @@ pub fn write_table(
             ));
         }
         let recorded = prior.get(&column.name.to_ascii_lowercase()).copied();
+        if recorded == Some(ColumnType::Real) && column.kind == Some(ColumnType::Integer) {
+            column.kind = Some(ColumnType::Real);
+        }
+        column.mixed |= column.kind == Some(ColumnType::Real) && column.large_integer;
         if column.mixed {
             warnings.push(format!(
                 "{class}.{table}.{} has mixed SQLite types; writing text",
@@ -263,6 +279,7 @@ struct Column {
     output: String,
     kind: Option<ColumnType>,
     mixed: bool,
+    large_integer: bool,
 }
 
 fn value_type(value: &SqlValue) -> Option<ColumnType> {
@@ -329,6 +346,7 @@ fn write_values(
             let data = present
                 .map(|v| match v {
                     SqlValue::Real(v) => Ok(*v),
+                    SqlValue::Integer(v) => Ok(*v as f64),
                     _ => anyhow::bail!("expected real"),
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -387,7 +405,7 @@ pub struct State {
 }
 
 /// Write the batch's visibility record after all table files are complete.
-pub fn write_states(path: &Path, states: &[State]) -> anyhow::Result<()> {
+pub fn write_states(path: &Path, states: &[&State]) -> anyhow::Result<()> {
     let names = [
         "_wk_tenant",
         "_wk_app",
@@ -470,7 +488,8 @@ pub fn write_states(path: &Path, states: &[State]) -> anyhow::Result<()> {
     group.close()?;
     writer.close()?;
     File::open(&partial)?.sync_all()?;
-    std::fs::rename(&partial, path)?;
+    tempfile::TempPath::try_from_path(std::path::PathBuf::from(partial))?
+        .persist_noclobber(path)?;
     File::open(path.parent().context("states parent")?)?.sync_all()?;
     Ok(())
 }
