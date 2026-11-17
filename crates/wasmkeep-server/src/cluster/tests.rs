@@ -4369,3 +4369,91 @@ async fn a_conflicting_local_file_is_set_aside_and_downloaded() {
     .expect("set aside and downloaded, not refused");
     assert_eq!(restored.verified_head(), h);
 }
+
+/// ADR 0035 follow-up S6: with a recorded floor to reach, a missing link
+/// is first taken for a listing behind its writes and listed again; once
+/// the discovery bound is spent with the link still missing, it is
+/// reported as the corruption it then is (500), not a 503 for ever.
+#[tokio::test]
+async fn a_missing_link_past_the_bound_is_a_corruption() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use futures_util::StreamExt as _;
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(dir.path());
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    replica
+        .ship_snapshot(&db.snapshot().unwrap(), SnapshotKind::First)
+        .await
+        .unwrap();
+    for v in 1..4 {
+        db.exec(&format!("INSERT INTO t VALUES ({v})"), &[])
+            .unwrap();
+        replica
+            .ship(&db.take_changes().unwrap().unwrap())
+            .await
+            .unwrap();
+    }
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // A middle segment is gone for good.
+    let history = StorePath::from(format!("{}/", a.history_key(&x)));
+    let mut wal: Vec<StorePath> = store
+        .list(Some(&history))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|m| m.unwrap().location)
+        .filter(|l| l.as_ref().contains("/wal/"))
+        .collect();
+    wal.sort();
+    store.delete(&wal[1]).await.unwrap();
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let got = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(other.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(&got, Err(ReplicaError::Restore(why)) if why.contains("missing")),
+        "{:?}",
+        got.err()
+    );
+}
