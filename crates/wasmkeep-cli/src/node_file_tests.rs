@@ -125,19 +125,31 @@ fn the_adr_example_parses_every_field_with_paths_from_the_file() {
 }
 
 #[test]
-fn a_second_app_is_refused_after_every_other_check() {
+fn a_second_app_is_served_and_each_entry_maps_as_its_flags() {
+    // SHOP has a cluster listener; BLOG names its own data directory.
     let two = format!("{SHOP}{BLOG}");
-    // Valid as a file of two apps...
-    assert_eq!(parse_any(&two, at()).unwrap().apps.len(), 2);
-    // ...but not served by this version, naming the second entry's line.
-    let e = err(&two);
-    let line = two.lines().position(|l| l.contains("acme/blog")).unwrap();
-    assert!(e.contains("second [[app]]"), "{e}");
-    assert!(
-        e.starts_with(&format!("/etc/wasmkeep/wasmkeep-node.toml:{line}:")),
-        "{e}"
-    );
-    // A mistake in the second entry is still reported as that mistake.
+    let file = parse(&two, at()).unwrap();
+    assert_eq!(file.apps.len(), 2);
+    assert!(file.several());
+    let mut base = serve(&["--bucket", "s3://b", "--node-file", "unused.toml"]).unwrap();
+    file.apply_entry(1, &mut base).unwrap();
+    assert_eq!(base.app, Some(("acme".to_owned(), "blog".to_owned())));
+    assert_eq!(base.node_id.as_deref(), Some("blog-1"));
+    assert_eq!(base.data_dir, PathBuf::from("/etc/wasmkeep/data/blog"));
+    assert!(base.no_secrets);
+    assert_eq!(base.cluster_listen, Some("0.0.0.0:7443".parse().unwrap()));
+    // An entry's resident floors are not served yet.
+    let mut base = serve(&["--bucket", "s3://b", "--node-file", "unused.toml"]).unwrap();
+    let e = file.apply_entry(0, &mut base).unwrap_err().to_string();
+    assert!(e.contains("min-resident"), "{e}");
+    // One app with no hostname table is served as one app.
+    let one = parse(
+        &app("acme/shop", "x", "").replace("node-id = \"x\"\n", ""),
+        at(),
+    )
+    .unwrap();
+    assert!(!one.several());
+    // A mistake in the second entry is reported as that mistake.
     let e = err(&format!(
         "{SHOP}{}",
         BLOG.replace("no-secrets", "no-secret")

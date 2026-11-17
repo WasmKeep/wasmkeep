@@ -83,15 +83,7 @@ pub(crate) fn read(path: &Path) -> anyhow::Result<NodeFile> {
 /// Parses and checks `text`, read from `path`: [`parse_any`], then a
 /// second `[[app]]` refused.
 pub(crate) fn parse(text: &str, path: &Path) -> Result<NodeFile, String> {
-    let file = parse_any(text, path)?;
-    if let Some(second) = file.apps.get(1) {
-        return Err(format!(
-            "{}: a second [[app]] ({}/{}): this version serves one app per process; \
-             run another process for it",
-            second.at, second.tenant, second.name
-        ));
-    }
-    Ok(file)
+    parse_any(text, path)
 }
 
 /// The top-level tables, and the keys of each.
@@ -558,6 +550,23 @@ fn hostname(host: &str) -> Option<String> {
 }
 
 impl NodeFile {
+    /// Whether the file is served as several apps (ADR 0038): more than
+    /// one entry, or a hostname table.
+    pub(crate) fn several(&self) -> bool {
+        self.apps.len() > 1 || self.apps.iter().any(|a| !a.hostnames.is_empty())
+    }
+
+    /// Sets on `args` what entry `i` says, as the matching flags would,
+    /// with the file's listeners and limits: one app runtime of several.
+    /// Its hostnames route to it; they are not a flag.
+    pub(crate) fn apply_entry(&self, i: usize, args: &mut crate::ServeArgs) -> anyhow::Result<()> {
+        let a = self
+            .apps
+            .get(i)
+            .ok_or_else(|| anyhow::anyhow!("{}: no [[app]] {i}", self.path.display()))?;
+        self.apply_app(a, args)
+    }
+
     /// The data directory `app` uses.
     fn data_dir_of<'a>(&'a self, app: &'a AppEntry) -> Option<&'a Path> {
         app.data_dir.as_deref().or(self.process.data_dir.as_deref())
@@ -737,9 +746,20 @@ impl NodeFile {
         if !a.hostnames.is_empty() {
             return Err(not_yet(
                 "hostnames",
-                "routing by hostname comes with several apps per process; one app serves every host",
+                "a file with hostnames is served by hostname, as several apps are",
             ));
         }
+        self.apply_app(a, args)
+    }
+
+    /// [`Self::apply_to`] for the entry `a`.
+    fn apply_app(&self, a: &AppEntry, args: &mut crate::ServeArgs) -> anyhow::Result<()> {
+        let not_yet = |field: &str, why: &str| {
+            anyhow::anyhow!(
+                "{}: {field} is not available in this version ({why}); remove it",
+                a.at
+            )
+        };
         if a.min_resident.is_some() {
             return Err(not_yet(
                 "min-resident",

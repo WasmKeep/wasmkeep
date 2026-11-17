@@ -4,11 +4,12 @@
 //! `nodes/`. Owned by the process ([`crate::Supervisor`]); each app's
 //! [`Cluster`] holds it.
 //!
-//! This version serves exactly one app per process: the first app's
-//! cluster builds the transport from its configuration (its node id names
-//! the certificate, its cluster flags choose TLS), and a second app is
-//! refused.
+//! The first app's cluster builds the transport (the certificate named for
+//! the process, or that app's node id); every other app of the process
+//! shares it, and must publish the same cluster address under the same
+//! bucket prefix. One node id joins a process once at a time.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use wasmkeep_cluster::lease::BucketError;
@@ -22,15 +23,25 @@ use crate::cluster_tls::{ClusterConnector, ClusterTls};
 /// and given to the app's [`ClusterConfig::process`]; a cluster made
 /// without one has a process of its own.
 pub struct NodeProcess {
-    /// The process's name ([`NodeProcess::named`]): its certificate's.
+    /// The process's name ([`NodeProcess::named`]): its certificate's, and
+    /// `process=` in each of its node ids' heartbeats.
     name: Option<String>,
     transport: Mutex<Option<Arc<Transport>>>,
+    /// The node ids whose clusters are in the process now, each with the
+    /// number of its place ([`Joined`]).
+    joined: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Numbers places, so a place left early is never confused with the
+    /// node id's next one.
+    places: std::sync::atomic::AtomicU64,
+    /// Set by a supervisor serving several apps ([`Self::serve_several`]).
+    several: AtomicBool,
 }
 
 impl std::fmt::Debug for NodeProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeProcess")
-            .field("serves", &self.serves())
+            .field("name", &self.name)
+            .field("serves", &self.serving())
             .finish()
     }
 }
@@ -38,20 +49,42 @@ impl std::fmt::Debug for NodeProcess {
 impl NodeProcess {
     /// A process serving no app yet.
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            name: None,
-            transport: Mutex::new(None),
-        })
+        Self::make(None)
     }
 
     /// A process named `name` (`[process] id`, ADR 0038): its one
     /// certificate is the process's, named for it, whichever of its apps
     /// made it.
     pub fn named(name: &str) -> Arc<Self> {
+        Self::make(Some(name.to_owned()))
+    }
+
+    fn make(name: Option<String>) -> Arc<Self> {
         Arc::new(Self {
-            name: Some(name.to_owned()),
+            name,
             transport: Mutex::new(None),
+            joined: Mutex::new(std::collections::BTreeMap::new()),
+            places: std::sync::atomic::AtomicU64::new(0),
+            several: AtomicBool::new(false),
         })
+    }
+
+    /// The process's name, if it has one.
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Marks the process as serving several apps: its runtimes then require
+    /// the sender and the forward proof on every hop, and the `multi-app`
+    /// word of every live node (ADR 0038, sections 5 and 10).
+    pub fn serve_several(&self) {
+        self.several.store(true, Ordering::Release);
+    }
+
+    /// Whether it serves several apps (marked, or several joined now).
+    pub(crate) fn several(&self) -> bool {
+        self.several.load(Ordering::Acquire)
+            || self.joined.lock().unwrap_or_else(|p| p.into_inner()).len() > 1
     }
 
     /// The name of its certificate, once made: the process's, or the
@@ -61,14 +94,28 @@ impl NodeProcess {
         self.transport()?.tls.as_ref().map(|t| t.name().to_owned())
     }
 
-    /// The node id of the app this process serves, once its cluster was
-    /// made.
-    pub fn serves(&self) -> Option<String> {
+    /// The process's cluster TLS identity, once an app's cluster made it.
+    pub(crate) fn cluster_tls(&self) -> Option<Arc<ClusterTls>> {
         self.transport
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .map(|t| t.node_id.clone())
+            .and_then(|t| t.tls.clone())
+    }
+
+    /// The node ids whose clusters are in the process now.
+    pub fn serving(&self) -> Vec<String> {
+        self.joined
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// The node id of the first app this process serves now.
+    pub fn serves(&self) -> Option<String> {
+        self.serving().into_iter().next()
     }
 
     /// The transport, once an app's cluster made it.
@@ -80,54 +127,127 @@ impl NodeProcess {
             .clone()
     }
 
-    /// The transport for the app whose cluster `config` describes, made
-    /// from that configuration; `nodes` reads the bucket's `nodes/` (the
-    /// cluster's counted store, under its prefix). Refuses a second app.
+    /// The transport for the app whose cluster `config` describes: made
+    /// from that configuration by the first app, shared by the others;
+    /// `nodes` reads the bucket's `nodes/` (the cluster's counted store,
+    /// under its prefix). Refuses a node id already in the process, and an
+    /// app whose cluster address, plaintext mode or prefix differs from
+    /// the transport's. The node id leaves when the guard is dropped.
     pub(crate) fn attach(
-        &self,
+        self: &Arc<Self>,
         config: &ClusterConfig,
         nodes: ObjectStoreBucket,
-    ) -> Result<Arc<Transport>, crate::Error> {
+    ) -> Result<(Arc<Transport>, Joined), crate::Error> {
         let mut slot = self.transport.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(first) = slot.as_ref() {
+        let refuse_plaintext = config.cluster_plaintext == ClusterPlaintext::Refuse;
+        let advertise = config.cluster_tls.as_ref().map(|t| t.advertise.clone());
+        let transport = match slot.as_ref() {
+            Some(t) => {
+                let same_address = t.tls.as_ref().map(|tls| tls.advertise().to_owned())
+                    == advertise
+                        .as_ref()
+                        .map(|a| a.trim_end_matches('/').to_owned());
+                if !same_address
+                    || t.refuse_plaintext != refuse_plaintext
+                    || t.prefix != config.prefix
+                {
+                    return Err(crate::Error::Config(format!(
+                        "node {} does not share this process's cluster listener, plaintext mode \
+                         and bucket prefix: the apps of one process share them",
+                        config.node_id
+                    )));
+                }
+                Arc::clone(t)
+            }
+            None => {
+                if refuse_plaintext && config.cluster_tls.is_none() {
+                    return Err(crate::Error::ClusterTls(
+                        "refusing plain HTTP between nodes needs a cluster listener".into(),
+                    ));
+                }
+                let tls = match &config.cluster_tls {
+                    Some(t) => Some(Arc::new(
+                        ClusterTls::generate(
+                            self.name.as_deref().unwrap_or(&config.node_id),
+                            &t.advertise,
+                        )
+                        .map_err(crate::Error::ClusterTls)?,
+                    )),
+                    None => None,
+                };
+                let connector = ClusterConnector::new(tls.clone(), refuse_plaintext);
+                let t = Arc::new(Transport {
+                    tls,
+                    refuse_plaintext,
+                    prefix: config.prefix.clone(),
+                    clients: RwLock::new(Clients::new(&connector)),
+                    connector,
+                    nodes,
+                });
+                *slot = Some(Arc::clone(&t));
+                t
+            }
+        };
+        let mut joined = self.joined.lock().unwrap_or_else(|p| p.into_inner());
+        if joined.contains_key(&config.node_id) {
             return Err(crate::Error::Config(format!(
-                "this process already serves node {} and serves one app per process in this                  version: node {} needs a process of its own",
-                first.node_id, config.node_id
+                "node {} already runs in this process",
+                config.node_id
             )));
         }
-        let refuse_plaintext = config.cluster_plaintext == ClusterPlaintext::Refuse;
-        if refuse_plaintext && config.cluster_tls.is_none() {
-            return Err(crate::Error::ClusterTls(
-                "refusing plain HTTP between nodes needs a cluster listener".into(),
-            ));
+        let place = self.places.fetch_add(1, Ordering::Relaxed);
+        joined.insert(config.node_id.clone(), place);
+        Ok((
+            transport,
+            Joined {
+                process: Arc::clone(self),
+                node: config.node_id.clone(),
+                place,
+            },
+        ))
+    }
+}
+
+/// A node id's place in its process; it leaves when this is dropped.
+#[derive(Debug)]
+pub(crate) struct Joined {
+    process: Arc<NodeProcess>,
+    node: String,
+    place: u64,
+}
+
+impl Joined {
+    /// The process.
+    pub(crate) fn process(&self) -> &Arc<NodeProcess> {
+        &self.process
+    }
+
+    /// Leaves the process now (a stopped runtime, ADR 0038, section 3);
+    /// again when dropped, which then does nothing.
+    pub(crate) fn leave(&self) {
+        let mut joined = self
+            .process
+            .joined
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if joined.get(&self.node) == Some(&self.place) {
+            joined.remove(&self.node);
         }
-        let tls = match &config.cluster_tls {
-            Some(t) => Some(Arc::new(
-                ClusterTls::generate(
-                    self.name.as_deref().unwrap_or(&config.node_id),
-                    &t.advertise,
-                )
-                .map_err(crate::Error::ClusterTls)?,
-            )),
-            None => None,
-        };
-        let connector = ClusterConnector::new(tls.clone(), refuse_plaintext);
-        let transport = Arc::new(Transport {
-            node_id: config.node_id.clone(),
-            tls,
-            clients: RwLock::new(Clients::new(&connector)),
-            connector,
-            nodes,
-        });
-        *slot = Some(Arc::clone(&transport));
-        Ok(transport)
+    }
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        self.leave();
     }
 }
 
 /// The process's transport to other nodes, and its view of `nodes/`.
 pub(crate) struct Transport {
-    /// The app whose cluster made it.
-    node_id: String,
+    /// Refuse mode (ADR 0011, phase B), as its first app chose it.
+    refuse_plaintext: bool,
+    /// The bucket prefix its apps share.
+    prefix: String,
     /// The process's TLS identity and its peers' pins, with a cluster
     /// listener (ADR 0011).
     pub(crate) tls: Option<Arc<ClusterTls>>,
@@ -207,7 +327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_cluster_uses_the_process_transport_and_a_second_app_is_refused() {
+    async fn apps_of_a_process_share_its_transport_and_a_node_id_joins_once() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let process = NodeProcess::new();
         assert!(process.transport().is_none());
@@ -218,19 +338,39 @@ mod tests {
         .unwrap();
         let transport = process.transport().expect("made by the first app");
         assert!(Arc::ptr_eq(&shop.transport, &transport));
-        assert_eq!(process.serves().as_deref(), Some("shop-1"));
-
-        let e = Cluster::new(
+        assert!(!process.several());
+        // A second app shares it.
+        let blog = Cluster::new(
             &config("blog-1", &store, &process),
             &StateRoot::new("", "acme", "blog"),
         )
+        .unwrap();
+        assert!(Arc::ptr_eq(&blog.transport, &transport));
+        assert_eq!(process.serving(), ["blog-1", "shop-1"]);
+        assert!(process.several());
+        // One node id once: a second runtime of shop-1 is refused...
+        let e = Cluster::new(
+            &config("shop-1", &store, &process),
+            &StateRoot::new("", "acme", "shop"),
+        )
         .unwrap_err()
         .to_string();
-        assert!(e.contains("one app"), "{e}");
-        assert!(e.contains("shop-1") && e.contains("blog-1"), "{e}");
-        // The first app keeps the transport.
-        assert!(Arc::ptr_eq(&process.transport().unwrap(), &transport));
-
+        assert!(e.contains("already runs in this process"), "{e}");
+        // ...until the first has left.
+        drop(shop);
+        assert_eq!(process.serving(), ["blog-1"]);
+        Cluster::new(
+            &config("shop-1", &store, &process),
+            &StateRoot::new("", "acme", "shop"),
+        )
+        .unwrap();
+        // An app with another cluster address is refused.
+        let mut other = config("misc-1", &store, &process);
+        other.cluster_tls = Some(crate::cluster::ClusterTlsConfig::new("https://o.test:7443"));
+        let e = Cluster::new(&other, &StateRoot::new("", "acme", "misc"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not share"), "{e}");
         // A cluster made without a process has one of its own.
         let solo = Cluster::new(
             &ClusterConfig::new("solo", "http://solo", Arc::clone(&store)),

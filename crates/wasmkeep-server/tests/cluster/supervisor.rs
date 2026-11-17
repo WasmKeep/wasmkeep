@@ -120,7 +120,7 @@ async fn nodes_served_through_a_supervisor_answer_as_before() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_process_serves_exactly_one_app() {
+async fn a_process_takes_several_apps_and_each_node_id_once() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let da = tempfile::tempdir().unwrap();
     let process = NodeProcess::new();
@@ -146,12 +146,13 @@ async fn a_process_serves_exactly_one_app() {
     };
     let shop = build("shop-1", "shop").unwrap();
     assert_eq!(process.serves().as_deref(), Some("shop-1"));
-    let e = build("blog-1", "blog").unwrap_err().to_string();
-    assert!(e.contains("one app"), "{e}");
-    assert!(e.contains("shop-1"), "{e}");
-    // The first app is untouched by the refusal.
+    // A second app joins the process (ADR 0038, M5).
+    let _blog = build("blog-1", "blog").unwrap();
+    assert_eq!(process.serving(), ["blog-1", "shop-1"]);
+    // One node id once.
+    let e = build("shop-1", "shop").unwrap_err().to_string();
+    assert!(e.contains("already runs in this process"), "{e}");
     shop.node_id_checked().await.unwrap();
-    assert_eq!(process.serves().as_deref(), Some("shop-1"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

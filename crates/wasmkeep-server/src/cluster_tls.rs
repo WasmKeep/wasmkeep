@@ -750,6 +750,8 @@ mod tests {
             lease: None,
             load: None,
             can_recorded_head: false,
+            can_multi_app: false,
+            process: None,
         }
     }
 

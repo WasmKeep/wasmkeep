@@ -235,7 +235,12 @@ impl Cluster {
         req: &mut Request<B>,
     ) -> Result<(), String> {
         // No-policy forwards must never fetch a secret or wait on storage.
+        // With several apps a forward always carries its proof (ADR 0038,
+        // section 5): without the secret it is refused, not sent unsigned.
         let Some(secret) = self.secret.get() else {
+            if self.several_apps() {
+                return Err("the cluster secret is not loaded: cannot sign the forward".into());
+            }
             return Ok(());
         };
         let Some(peer) = req.extensions().get::<crate::http::PeerAddress>() else {

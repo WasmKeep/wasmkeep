@@ -144,6 +144,8 @@ impl App {
     }
 }
 
+pub(crate) mod apps;
+
 /// The path and query a request arrived with, before routing rewrote it to
 /// what the actor sees; forwarding to another node uses it.
 #[derive(Debug, Clone)]
@@ -557,6 +559,35 @@ pub(crate) async fn serve_with_cluster(
     if let Some(front) = app.front.as_mut() {
         front.wall = limits.front_wall;
     }
+    serve_served(listener, cluster, Served::One(app), shutdown, limits).await
+}
+
+/// What a process's ports serve: one app, as before, or several by
+/// hostname and signed app (ADR 0038).
+#[derive(Clone)]
+pub(crate) enum Served {
+    One(App),
+    Table(Arc<apps::AppTable>),
+}
+
+impl Served {
+    /// The apps running now.
+    fn running(&self) -> Vec<App> {
+        match self {
+            Self::One(app) => vec![app.clone()],
+            Self::Table(t) => t.running(),
+        }
+    }
+}
+
+/// [`serve_with_cluster`] for what `served` names.
+pub(crate) async fn serve_served(
+    listener: TcpListener,
+    cluster: Option<ClusterPort>,
+    app: Served,
+    shutdown: impl Future<Output = ()>,
+    limits: ServeLimits,
+) -> Result<(), Error> {
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
     let mut accept_errors = 0u32;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -619,8 +650,11 @@ pub(crate) async fn serve_with_cluster(
     }
 
     // Not ready from now on, for load balancers still checking.
-    if let Some(actors) = &app.actors {
-        actors.begin_shutdown();
+    let running = app.running();
+    for a in &running {
+        if let Some(actors) = &a.actors {
+            actors.begin_shutdown();
+        }
     }
     drop(listener);
     let _ = stop_tx.send(true);
@@ -645,10 +679,14 @@ pub(crate) async fn serve_with_cluster(
             let _ = cluster_loop.await;
         }
     }
-    // Then stop the actors, releasing their leases.
-    if let Some(actors) = &app.actors {
-        actors.shutdown(SHUTDOWN_GRACE).await;
-    }
+    // Then stop the actors, releasing their leases: every app's at once,
+    // under one deadline (ADR 0038, section 2).
+    futures_util::future::join_all(running.iter().filter_map(|a| {
+        a.actors
+            .as_ref()
+            .map(|actors| actors.shutdown(SHUTDOWN_GRACE))
+    }))
+    .await;
     Ok(())
 }
 
@@ -658,7 +696,7 @@ pub(crate) async fn serve_with_cluster(
 /// `cluster_serves` paths. Returns once its connections have finished.
 async fn serve_cluster_port(
     port: ClusterPort,
-    app: App,
+    app: Served,
     header_read_timeout: Duration,
     max_connections: usize,
     stop: tokio::sync::watch::Receiver<bool>,
@@ -746,7 +784,7 @@ async fn serve_cluster_port(
 /// marked, the peer's pin checked again on each request).
 async fn serve_connection<I>(
     io: I,
-    app: App,
+    app: Served,
     cluster: Option<ClusterPeer>,
     header_read_timeout: Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
@@ -754,12 +792,19 @@ async fn serve_connection<I>(
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // The app of the connection's first request, on the public port of a
+    // process serving several (ADR 0038, section 6).
+    let first: Arc<std::sync::Mutex<Option<usize>>> = Arc::default();
     let service = service_fn(move |mut req: Request<Incoming>| {
-        let (app, cluster) = (app.clone(), cluster.clone());
+        let (app, cluster, first) = (app.clone(), cluster.clone(), Arc::clone(&first));
         async move {
             req.extensions_mut().insert(PeerAddress(peer));
             let Some(cluster) = cluster else {
-                return Ok::<_, std::convert::Infallible>(app.route(req).await);
+                let response = match &app {
+                    Served::One(app) => app.route(req).await,
+                    Served::Table(t) => t.route_public(req, &first).await,
+                };
+                return Ok::<_, std::convert::Infallible>(response);
             };
             if !cluster.is_live() {
                 // Its heartbeat expired or its pin changed since the
@@ -787,7 +832,10 @@ async fn serve_connection<I>(
             let cluster = cluster.sent_by(sender.as_deref());
             req.extensions_mut()
                 .insert(ArrivedOnClusterPort(cluster.clone()));
-            let response = app.route(req).await;
+            let response = match &app {
+                Served::One(app) => app.route(req).await,
+                Served::Table(t) => t.route_cluster(req).await,
+            };
             // Nor is an answer delivered to a peer whose pin lapsed while
             // its request ran, or streamed on after that. The connection
             // stays: its next request is refused, and closes it.

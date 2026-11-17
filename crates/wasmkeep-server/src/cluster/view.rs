@@ -510,6 +510,7 @@ impl Cluster {
                 self.note_old_versions(&all);
                 self.note_future_leases(&all);
                 let nodes = self.membership.live(all.clone());
+                self.note_multi_app(&nodes);
                 let mixed = older_nodes(&self.node_id, &nodes);
                 let now = now_ms();
                 let period = u64::try_from(self.heartbeat_every.as_millis()).unwrap_or(u64::MAX);

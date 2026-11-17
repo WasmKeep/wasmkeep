@@ -253,3 +253,141 @@ fn a_lapsed_senders_answers_and_relays_stop_while_the_siblings_go_on() {
         Some(&conn)
     ));
 }
+
+/// Node `id` of `t/default` in a process serving several apps.
+async fn node_of_several(id: &str) -> Arc<Cluster> {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(SECRET_KEY),
+            SECRET.as_bytes().to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let process = NodeProcess::new();
+    process.serve_several();
+    let mut config = ClusterConfig::new(id, format!("http://{id}"), store);
+    config.heartbeat = Duration::from_secs(3_600);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+    config.process = Some(process);
+    Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap()
+}
+
+#[tokio::test]
+async fn a_process_of_several_apps_requires_the_sender() {
+    let b = node_of_several("b").await;
+    b.load_secret().await;
+    *b.peers.write().unwrap() = HashMap::from([("a".to_owned(), peer("t/default"))]);
+    let m = hyper::Method::POST;
+    assert!(
+        b.is_internal(&m, PATH, &call("b", PATH, None), true)
+            .is_none()
+    );
+    assert!(
+        b.is_internal(&m, PATH, &call("b", PATH, Some("a")), true)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_forwarder_of_several_apps_without_the_secret_does_not_forward_unsigned() {
+    let a = node_of_several("a").await;
+    let mut fwd = Request::get("/actor/c/x").body(()).unwrap();
+    fwd.extensions_mut()
+        .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+    assert!(a.sign_admission("b", "/actor/c/x", &mut fwd).await.is_err());
+    // One app: as before, forwarded without a proof.
+    let one = node("c").await;
+    let fresh = {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        Cluster::new(
+            &ClusterConfig::new("d", "http://d", store),
+            &StateRoot::new("", "t", "default"),
+        )
+        .unwrap()
+    };
+    drop(one);
+    let mut fwd = Request::get("/actor/c/x").body(()).unwrap();
+    fwd.extensions_mut()
+        .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+    assert!(
+        fresh
+            .sign_admission("b", "/actor/c/x", &mut fwd)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn a_live_node_without_multi_app_makes_several_apps_not_ready() {
+    let b = node_of_several("b").await;
+    b.load_secret().await;
+    let n = |id: &str, multi: bool| NodeInfo {
+        id: id.into(),
+        address: "http://x".into(),
+        version: "0".into(),
+        written_at_ms: 0,
+        app: "t/default".into(),
+        cluster_address: None,
+        tls_pins: Vec::new(),
+        drain: None,
+        reads_secrets: false,
+        can_take: true,
+        can_front: true,
+        can_handoff: true,
+        can_end: true,
+        can_flush: true,
+        can_rate_limits: true,
+        can_restore: true,
+        can_actor_restore: true,
+        instance: None,
+        lease: None,
+        load: None,
+        can_recorded_head: true,
+        can_multi_app: multi,
+        process: None,
+    };
+    b.note_multi_app(&[n("a", true), n("old", false)]);
+    assert_eq!(b.multi_app_missing(), ["old"]);
+    let why = b.multi_app_reason().expect("not ready");
+    assert!(why.contains("multi-app"), "{why}");
+    b.note_multi_app(&[n("a", true)]);
+    assert!(b.multi_app_missing().is_empty());
+}
+
+/// Outbound (ADR 0038, section 5): an answer or a relayed socket from a
+/// process whose certificate two node ids publish stays trusted only while
+/// the destination node id itself does.
+#[tokio::test]
+async fn an_answer_is_trusted_only_while_its_destination_node_id_is() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let mut config = ClusterConfig::new("me", "http://me", store);
+    config.heartbeat = Duration::from_secs(3_600);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+    config.cluster_tls = Some(ClusterTlsConfig::new("https://me.test:7443"));
+    let me = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+    let k = TlsIdentity::generate("p", "p.test").unwrap();
+    let n = |id: &str, written: u64| {
+        let mut n = NodeInfo::decode(
+            format!("wasmkeep-node 2\n{written}\n{id}\nhttp://x\n0\nt/default\nhttps://p.test:7443\n\nserving\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        n.id = id.into();
+        n.written_at_ms = written;
+        n.cluster_address = Some("https://p.test:7443".into());
+        n.tls_pins = vec![k.pin()];
+        n
+    };
+    let now = now_ms();
+    me.transport
+        .refresh_trust(&[n("shop-1", now), n("blog-1", now)], 60_000);
+    let base = "https://p.test:7443";
+    let shop = me.revocation(base, "shop-1").unwrap()(Some(k.pin()));
+    let blog = me.revocation(base, "blog-1").unwrap()(Some(k.pin()));
+    assert!(shop() && blog());
+    me.transport
+        .refresh_trust(&[n("shop-1", now), n("blog-1", now - 120_000)], 60_000);
+    assert!(shop(), "the healthy node id's answer streams on");
+    assert!(!blog(), "the lapsed node id's is cut");
+}

@@ -691,7 +691,7 @@ pub(crate) const FRONT_CALL_OUTCOMES: [&str; 4] = ["ok", "busy", "timeout", "fai
 /// [`crate::ActorService::not_ready`], of the cluster's readiness and the
 /// words of a stopped node. A reason not listed here is still rendered
 /// while it holds; a test keeps the list complete.
-pub(crate) const NOT_READY_REASONS: [&str; 19] = [
+pub(crate) const NOT_READY_REASONS: [&str; 20] = [
     "shutting down",
     "checking that no other process runs with this node id",
     "another process runs with this node id",
@@ -704,6 +704,7 @@ pub(crate) const NOT_READY_REASONS: [&str; 19] = [
     "this node holds no lease",
     "the bucket does not enforce conditional writes",
     "cluster secret not loaded",
+    "a live node of an older version (no multi-app) runs in this cluster",
     "bucket unreachable (node lease not renewed)",
     "cluster identity not published for a heartbeat period yet",
     "disk not checked yet",

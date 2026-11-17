@@ -16,6 +16,7 @@ mod new_cmd;
 mod node_file;
 mod project;
 mod secrets_cmd;
+mod serve_many;
 mod status;
 mod usage;
 
@@ -519,7 +520,7 @@ struct DevArgs {
     access: Vec<(String, String)>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct ServeArgs {
     /// The front: a stateless component (.wasm exporting
     /// wasi:http/incoming-handler) for every path outside /actor/ and
@@ -1386,6 +1387,12 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             for w in file.warnings() {
                 tracing::warn!("{w}");
+            }
+            // Several apps, or a hostname table: one runtime per app behind
+            // the process's ports (ADR 0038).
+            if file.several() {
+                tracing::info!(file = %path.display(), apps = file.apps.len(), "node file read");
+                return serve_many::serve_many(&file, &args);
             }
             file.apply_to(&mut args)?;
             tracing::info!(file = %path.display(), "node file read");

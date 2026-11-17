@@ -97,6 +97,11 @@ pub(crate) const CHAIN: &str = "x-wasmkeep-chain";
 /// sends, and never reaches a guest.
 pub(crate) const APP: &str = "x-wasmkeep-app";
 
+/// Readiness while a live node lacks `multi-app` and the process serves
+/// several apps (ADR 0038, section 10).
+pub(crate) const MULTI_APP_MISSING: &str =
+    "a live node of an older version (no multi-app) runs in this cluster";
+
 /// What only nodes send each other on a hop, removed before a guest sees
 /// the request (a call, or a WebSocket's open): the signature, the
 /// sender's proof (ADR 0038), the caller and chain it vouches for, and a
@@ -369,6 +374,8 @@ pub(crate) struct Cluster {
     /// The process's TLS identity, trust table, clients to other nodes
     /// and listing of `nodes/` (ADR 0038, section 2).
     transport: Arc<process::Transport>,
+    /// Its node id's place in the process (ADR 0038): left when dropped.
+    joined: process::Joined,
     /// When this node's identity first reached the bucket in a heartbeat
     /// (ms; 0: not yet): for readiness.
     published_ms: std::sync::atomic::AtomicU64,
@@ -496,6 +503,9 @@ pub(crate) struct Cluster {
     /// they expire, likewise.
     ended_deletes: Mutex<Vec<control::DeleteIntent>>,
     ended_restores: Mutex<Vec<control::RestoreIntent>>,
+    /// Live nodes the last listing found without `multi-app`, while the
+    /// process serves several apps (ADR 0038, section 10).
+    multi_app_missing: Mutex<Vec<String>>,
 }
 
 /// One page of the alarm index, as the sweep reads it.
@@ -660,11 +670,16 @@ impl Cluster {
         let membership = membership.with_instance(instance.clone());
         let refuse_plaintext = config.cluster_plaintext == ClusterPlaintext::Refuse;
         // The process's transport: made by its first (and only) app.
-        let transport = config
+        let (transport, joined) = config
             .process
             .clone()
             .unwrap_or_else(NodeProcess::new)
             .attach(config, bucket.clone())?;
+        // Its heartbeat names the process (ADR 0038, section 2).
+        let membership = match joined.process().name() {
+            Some(name) => membership.with_process(name),
+            None => membership,
+        };
         let membership = match &transport.tls {
             Some(t) => membership.with_cluster_tls(t.advertise(), vec![t.pin()]),
             None => membership,
@@ -693,6 +708,7 @@ impl Cluster {
             plain_peers_logged_ms: std::sync::atomic::AtomicU64::new(0),
             invalid_releases: lease_hold::InvalidReleases::default(),
             transport,
+            joined,
             published_ms: std::sync::atomic::AtomicU64::new(0),
             secret: tokio::sync::OnceCell::new(),
             ttl: Duration::from_millis(config.lease.ttl_ms()),
@@ -750,6 +766,7 @@ impl Cluster {
             deleted_moves: Mutex::new(Vec::new()),
             ended_deletes: Mutex::new(Vec::new()),
             ended_restores: Mutex::new(Vec::new()),
+            multi_app_missing: Mutex::new(Vec::new()),
         });
         if refuse_plaintext {
             tracing::info!(
@@ -782,6 +799,59 @@ impl Cluster {
             Family::Alarms,
             &alarm_index::key_tail(address.class(), address.name(), entry),
         ))
+    }
+
+    /// Leaves the process: a stopped runtime's node id may start again.
+    pub(crate) fn leave_process(&self) {
+        self.joined.leave();
+    }
+
+    /// Whether its process serves several apps (ADR 0038): hops then must
+    /// name their sender, forwards carry their proof, and every live node
+    /// must announce `multi-app`.
+    pub(crate) fn several_apps(&self) -> bool {
+        self.joined.process().several()
+    }
+
+    /// Notes the live nodes that lack the `multi-app` word, for readiness
+    /// (ADR 0038, section 10): checked at every listing while the process
+    /// serves several apps.
+    pub(super) fn note_multi_app(&self, live: &[NodeInfo]) {
+        let missing: Vec<String> = if self.several_apps() {
+            live.iter()
+                .filter(|n| !n.can_multi_app)
+                .map(|n| n.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut last = self
+            .multi_app_missing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !missing.is_empty() && *last != missing {
+            tracing::error!(
+                nodes = %missing.join(", "),
+                "nodes of an older version (no multi-app) are live in this cluster: this \
+                 process serves several apps and reports not ready until they are upgraded"
+            );
+        }
+        *last = missing;
+    }
+
+    /// The live nodes found without `multi-app` at the last listing.
+    pub(crate) fn multi_app_missing(&self) -> Vec<String> {
+        self.multi_app_missing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Why this runtime is not ready for want of `multi-app`, if it is not.
+    #[cfg(test)]
+    pub(crate) fn multi_app_reason(&self) -> Option<String> {
+        let missing = self.multi_app_missing();
+        (!missing.is_empty()).then(|| format!("{MULTI_APP_MISSING}: {}", missing.join(", ")))
     }
 
     /// What this node serves, `tenant/app`.
@@ -1134,7 +1204,7 @@ impl Cluster {
                 tracing::warn!(owner, error = %e, "forwarding an upgrade refused");
                 return unavailable("the actor's node is not reachable; retry\n");
             }
-            let revocation = self.revocation(&base);
+            let revocation = self.revocation(&base, owner);
             let upgrade = self.clients().upgrade.clone();
             match tokio::time::timeout(FORWARD_TIMEOUT, upgrade.request(out)).await {
                 Ok(Ok(r)) => break (base, revocation, r),
@@ -1168,7 +1238,7 @@ impl Cluster {
             // The owner refused (or it moved again): pass its answer on,
             // checked like any answer from a peer.
             return self
-                .trusted_response(&base, response)
+                .trusted_response(&base, owner, response)
                 .unwrap_or_else(|| unavailable("the actor's node is no longer trusted; retry\n"));
         }
         let headers = response.headers().clone();
@@ -1392,6 +1462,11 @@ impl Cluster {
     ) -> Result<Option<String>, &'static str> {
         let mut values = headers.get_all(SENDER).iter();
         let Some(first) = values.next() else {
+            // Required once several apps share the process (ADR 0038,
+            // section 5): every live node then sends it.
+            if self.several_apps() {
+                return Err("hop names no sender (several apps per process require it)");
+            }
             return Ok(None);
         };
         if values.next().is_some() {
@@ -1483,6 +1558,14 @@ impl Cluster {
             Identity::Taken(stopped, _) => return Some(stopped.words()),
             Identity::Refused(_) => return Some("the bucket does not enforce conditional writes"),
             Identity::Unique => {}
+        }
+        if !self.multi_app_missing().is_empty() {
+            // MULTI_APP_MISSING, spelled out for the list of reasons.
+            debug_assert_eq!(
+                MULTI_APP_MISSING,
+                "a live node of an older version (no multi-app) runs in this cluster"
+            );
+            return Some("a live node of an older version (no multi-app) runs in this cluster");
         }
         if self.secret.get().is_none() {
             return Some("cluster secret not loaded");
@@ -1697,7 +1780,7 @@ impl Cluster {
         let call = self.clients().call.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, call.request(req)).await {
             Ok(Ok(response)) => self
-                .trusted_response(&base, response)
+                .trusted_response(&base, owner, response)
                 .ok_or_else(|| CallFailure::Other(format!("node {owner} is no longer trusted"))),
             // Never read by the peer, so sent again once this node's
             // heartbeat is live there: a refused handshake, or a TLS
@@ -2262,19 +2345,26 @@ impl Cluster {
         tls.expected(&uri).map(|_| ())
     }
 
-    /// For an answer or a connection from `base`: given the pin the peer
+    /// For an answer or a connection from `base`, node `node`: given the pin the peer
     /// presented, whether that pin is still trusted there (checked again
     /// for as long as the answer streams or the connection stays open).
     /// `None` for plain HTTP.
     #[allow(clippy::type_complexity)]
-    fn revocation(
+    pub(crate) fn revocation(
         &self,
         base: &str,
+        node: &str,
     ) -> Option<Box<dyn FnOnce(Option<[u8; 32]>) -> crate::cluster_tls::StillTrusted + Send>> {
         let tls = Arc::clone(self.transport.tls.as_ref()?);
         let uri: hyper::Uri = base.parse().ok().filter(|_| base.starts_with("https://"))?;
+        // Trusted while the pin is published at the address and by the
+        // destination node id itself (ADR 0038, section 5): a sibling app's
+        // heartbeat on the same process never keeps it trusted.
+        let node = node.to_owned();
         Some(Box::new(move |pin| {
-            Arc::new(move || tls.still_trusted(&uri, pin))
+            Arc::new(move || {
+                tls.still_trusted(&uri, pin) && pin.is_some_and(|p| tls.pins().publishes(&p, &node))
+            })
         }))
     }
 
@@ -2285,13 +2375,14 @@ impl Cluster {
     fn trusted_response(
         &self,
         base: &str,
+        node: &str,
         response: Response<Incoming>,
     ) -> Option<Response<HyperOutgoingBody>> {
         let pin = response
             .extensions()
             .get::<crate::cluster_tls::PeerPin>()
             .map(|p| p.0);
-        let still = self.revocation(base).map(|r| r(pin));
+        let still = self.revocation(base, node).map(|r| r(pin));
         if still.as_ref().is_some_and(|s| !s()) {
             return None;
         }
@@ -2361,10 +2452,12 @@ impl Cluster {
         }
         let client = self.clients().request.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
-            Ok(Ok(response)) => self.trusted_response(&base, response).unwrap_or_else(|| {
-                tracing::warn!(owner, "forwarding: the node is no longer trusted");
-                unavailable("the actor's node is no longer trusted; retry\n")
-            }),
+            Ok(Ok(response)) => self
+                .trusted_response(&base, owner, response)
+                .unwrap_or_else(|| {
+                    tracing::warn!(owner, "forwarding: the node is no longer trusted");
+                    unavailable("the actor's node is no longer trusted; retry\n")
+                }),
             // Every failure before an answer, none sent again from here:
             // a connection that could not be opened, a request the client
             // handed back unsent on a new connection, and a request

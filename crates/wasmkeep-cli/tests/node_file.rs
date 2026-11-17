@@ -57,10 +57,13 @@ no-secrets = true
 "#;
 
 #[test]
-fn a_second_app_is_refused_before_anything_starts() {
+fn a_second_app_without_a_cluster_listener_is_refused_before_anything_starts() {
     let err = refused(TWO);
     assert!(err.contains("wasmkeep-node.toml:12:1"), "{err}");
-    assert!(err.contains("second [[app]] (acme/blog)"), "{err}");
+    assert!(
+        err.contains("second [[app]] (acme/blog) needs a cluster listener"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -76,6 +79,6 @@ fn an_unknown_field_is_refused_before_anything_starts() {
 #[test]
 fn a_field_this_version_cannot_honour_is_refused_before_anything_starts() {
     let one = TWO.split("\n[[app]]\nname = \"acme/blog\"").next().unwrap();
-    let err = refused(&format!("{one}hostnames = [\"shop.example.com\"]\n"));
-    assert!(err.contains("hostnames is not available"), "{err}");
+    let err = refused(&format!("{one}min-resident = 10\n"));
+    assert!(err.contains("min-resident is not available"), "{err}");
 }

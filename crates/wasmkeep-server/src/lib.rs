@@ -34,7 +34,9 @@ mod socket_limits;
 mod supervisor;
 mod websocket;
 pub use socket_limits::{SocketBudget, SocketLimits};
-pub use supervisor::{Listeners, Supervisor};
+pub use supervisor::{
+    AppSpec, BuildRuntime, Listeners, Runtime, Supervisor, nodes_without_multi_app,
+};
 
 pub use access::{Access, AccessRules};
 #[doc(hidden)]

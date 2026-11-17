@@ -99,6 +99,8 @@ mod signed_calls;
 mod snapshots;
 #[path = "supervisor.rs"]
 mod supervisor;
+#[path = "two_apps.rs"]
+mod two_apps;
 #[path = "websockets.rs"]
 mod websockets;
 #[path = "writes_deploys.rs"]

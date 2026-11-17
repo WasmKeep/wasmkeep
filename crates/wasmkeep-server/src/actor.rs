@@ -739,6 +739,14 @@ impl ActorService {
         self.inner.cluster.as_ref()?.tls().cloned()
     }
 
+    /// After [`Self::shutdown`]: its node id leaves its process, so the
+    /// app's runtime may start again in place (ADR 0038, section 3).
+    pub fn leave_process(&self) {
+        if let Some(c) = &self.inner.cluster {
+            c.leave_process();
+        }
+    }
+
     /// Its app's metric labels ([`crate::metrics::app_labels`]).
     pub(crate) fn app_labels(&self) -> Arc<str> {
         Arc::clone(&self.inner.app_labels)
