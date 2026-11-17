@@ -402,6 +402,8 @@ pub struct State {
     pub class: String,
     pub tables: Vec<String>,
     pub emitted_at: i64,
+    pub kind: String,
+    pub reason: Option<String>,
 }
 
 /// Write the batch's visibility record after all table files are complete.
@@ -468,8 +470,8 @@ pub fn write_states(path: &Path, states: &[&State]) -> anyhow::Result<()> {
                 SqlValue::Text(s.class.clone()),
                 SqlValue::Text(a.name.clone()),
                 SqlValue::Integer(a.seq as i64),
-                SqlValue::Text("state".into()),
-                SqlValue::Null,
+                SqlValue::Text(s.kind.clone()),
+                s.reason.clone().map_or(SqlValue::Null, SqlValue::Text),
                 SqlValue::Integer(a.generation as i64),
                 SqlValue::Integer(a.txid as i64),
                 SqlValue::Integer(a.committed_at),

@@ -616,21 +616,25 @@ ever the database at the position it names
   `rebase`. Descent is never asked across incarnations.
 - **Generation 0.** `ActorState` builds its replica with
   `hold.generation().unwrap_or(0)`: a hold lost between the acquire and
-  the restore gives a replica of generation 0. Its lease is already
-  invalid, so nothing it uploads is acknowledged, but an upload's first
-  attempt is sent before the lease is looked at. Whether such an object
-  can land was not shown either way, and two lost holds would share the
-  number. The feed therefore never takes a position of generation 0 as
-  proof (rule 5), and falls back to the listed ancestry, then `fork` or
-  `unproven`.
-- **A delete whose label is behind.** Rule 2 wants the label's txid to
-  be the head's. The label is computed (`head + 1`) before the reset is
-  shipped, under a lock released in between. If a batched segment were
-  acknowledged in that gap, the reset would land one txid later and the
-  actor would be emitted as `rebase`, reason `delete`, with no table:
-  the projection is right (no rows), the kind is not. F4 tests it; if
-  it can happen, rule 2 compares "at or below the head's txid, in the
-  head's generation, and no app table" instead.
+  the restore gives a replica of generation 0. F4 checked the complete
+  path: `Replica::restore` calls `LeaseView::verify` before returning,
+  and `hold_cell::verify` refuses an empty hold cell. Restore itself
+  does not upload. This replica therefore cannot reach a first upload;
+  the feed sees no object from it. The upload's first attempt does run
+  before acknowledgement checks validity, but only for a replica that
+  already passed restore. The conservative feed rule stays: generation
+  0 cannot establish same-generation descent. F4's node-produced LTX
+  fixtures under zero-generation keys verify `unproven` after collection.
+- **A delete whose label is behind.** F4 found no path for a batched
+  acknowledgement to advance the head between label construction and
+  reset. `delete_recorded` first flushes to `Barrier::Flushed` (no
+  pending replica work or database boundaries), then ends capture,
+  before calling `replicate_delete`. The durable host call also flushes
+  first and holds the replica lock across label construction and
+  `ship_reset`. F4 tests plain, durable and operator deletes with a
+  batched upload pending: the label's txid equals the reset head, and
+  the feed emits `deleted`. Rule 2 therefore keeps its exact-txid
+  comparison; no server change or relaxed delete inference is needed.
 
 **Revisit if** a write path is added that writes under `actors/` without
 holding the actor (a repair tool, a node-written change index), or the

@@ -1,5 +1,5 @@
 //! ADR 0039: one read-only poll with durable, resumable batches.
-//! Replacement kinds remain gated on F4.
+//! Kinds describe replacement labels, incarnations and retained ancestry.
 pub mod writer;
 
 use anyhow::{Context, ensure};
@@ -72,6 +72,8 @@ struct Changed {
     encoded: String,
     position: SegmentId,
     identity: String,
+    label: Option<String>,
+    incarnation: String,
     state: writer::State,
     tables: Vec<(String, Rows)>,
 }
@@ -80,6 +82,17 @@ struct Changed {
 /// unadvanced. This entry point never obtains a node or writes to the store.
 pub async fn poll(args: &Args, store: &Arc<dyn ObjectStore>, prefix: &str) -> anyhow::Result<i32> {
     poll_inner(args, store, prefix, &mut |_| Ok(()), 10_000, 1 << 30).await
+}
+
+/// Deterministic publication fault injection for integration tests.
+#[doc(hidden)]
+pub async fn poll_with_checkpoint(
+    args: &Args,
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    checkpoint: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<i32> {
+    poll_inner(args, store, prefix, checkpoint, 1, 1 << 30).await
 }
 
 async fn poll_inner(
@@ -125,6 +138,25 @@ async fn poll_inner(
     )?;
     if !has_head_seq {
         db.execute_batch("ALTER TABLE heads ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    for (column, definition) in [
+        ("label", "TEXT"),
+        ("kind", "TEXT NOT NULL DEFAULT 'state'"),
+        ("incarnation", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('heads') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            db.execute_batch(&format!(
+                "ALTER TABLE heads ADD COLUMN {column} {definition}"
+            ))?;
+            if column == "incarnation" {
+                db.execute_batch("UPDATE heads SET incarnation=coalesce((SELECT incarnation FROM feed WHERE id=1),'')")?;
+            }
+        }
     }
     std::fs::File::open(&state)?.sync_all()?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS columns (class TEXT NOT NULL, table_name TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE, kind INTEGER NOT NULL, PRIMARY KEY(class,table_name,name));")?;
@@ -194,12 +226,9 @@ async fn poll_inner(
         return Ok(2);
     }
     let incarnation = serde_json::to_string(&markers[2..])?;
-    if let Some((_, old, _, _)) = &recorded {
-        ensure!(
-            old == &incarnation,
-            "incarnation changed: requires F4 kinds"
-        );
-    }
+    let app_changed = recorded
+        .as_ref()
+        .is_some_and(|(_, old, _, _)| old != &incarnation);
     if recorded.is_none() {
         db.execute(
             "INSERT INTO feed VALUES(1,?1,?2,0,0,0)",
@@ -220,39 +249,63 @@ async fn poll_inner(
         // Both scans use the bucket's byte ordering, including the slash after
         // each class/name. Only one recorded head is held ahead of the listing.
         let scan = Connection::open(state.join("state.db"))?;
-        let mut statement = scan.prepare("SELECT class || '/' || name || '/', class, generation, txid, identity FROM heads ORDER BY class || '/' || name || '/'")?;
+        let mut statement = scan.prepare("SELECT class || '/' || name || '/', class, generation, txid, identity, label, kind, incarnation FROM heads ORDER BY class || '/' || name || '/'")?;
         let mut rows = statement.query([])?;
-        let mut saved = next_saved(&mut rows)?;
-        let absent_found = std::cell::Cell::new(false);
+        let saved = next_saved(&mut rows)?;
+        let groups = crate::actor_groups::actor_groups(store, &history_prefix);
+        futures_util::pin_mut!(groups);
         {
-            let jobs = crate::actor_groups::actor_groups(store, &history_prefix)
-                .map(|group| {
-                    let (actor_prefix, objects) = group?;
-                    let key = actor_prefix
-                        .strip_prefix(&history_prefix)
-                        .context("actor outside app")?;
-                    while saved.as_ref().is_some_and(|s| s.key.as_str() < key) {
-                        if let Some(s) = &saved {
-                            absent_found.set(absent_found.get() | absent(s, args));
-                        }
-                        saved = next_saved(&mut rows)?;
+            let history_prefix = history_prefix.as_str();
+            // Merge one saved row and one listed group at a time, including
+            // absent actors. The same bounded reader handles either case.
+            let merged = futures_util::stream::try_unfold(
+                (groups, rows, saved, None),
+                |(mut groups, mut rows, mut saved, mut group)| async move {
+                    if group.is_none() {
+                        group = groups.try_next().await?;
                     }
-                    let old = if saved.as_ref().is_some_and(|s| s.key == key) {
-                        let old = saved.take();
+                    let take_saved = saved.as_ref().is_some_and(|s| {
+                        group.as_ref().is_none_or(|(prefix, _)| {
+                            format!("{history_prefix}{}", s.key) < *prefix
+                        })
+                    });
+                    let job = if take_saved {
+                        let old = saved.take().context("saved head missing")?;
+                        let prefix = format!("{history_prefix}{}", old.key);
                         saved = next_saved(&mut rows)?;
-                        old
+                        (prefix, BTreeMap::new(), Some(old), true)
+                    } else if let Some((prefix, objects)) = group.take() {
+                        let old = if saved
+                            .as_ref()
+                            .is_some_and(|s| format!("{history_prefix}{}", s.key) == prefix)
+                        {
+                            let old = saved.take();
+                            saved = next_saved(&mut rows)?;
+                            old
+                        } else {
+                            None
+                        };
+                        (prefix, objects, old, false)
                     } else {
-                        None
+                        return Ok::<_, anyhow::Error>(None);
                     };
-                    Ok::<_, anyhow::Error>(read_changed(
+                    Ok(Some((job, (groups, rows, saved, group))))
+                },
+            );
+            let jobs = merged
+                .map_ok(|(actor_prefix, objects, old, missing)| {
+                    read_changed(
                         args,
                         store,
                         &scratch,
-                        &history_prefix,
+                        history_prefix,
                         actor_prefix,
                         objects,
                         old,
-                    ))
+                        &incarnation,
+                        app_changed,
+                        missing,
+                    )
                 })
                 .try_buffer_unordered(16);
             futures_util::pin_mut!(jobs);
@@ -289,14 +342,12 @@ async fn poll_inner(
                 }
             }
         }
-        failed |= absent_found.get();
-        while let Some(s) = saved {
-            failed |= absent(&s, args);
-            saved = next_saved(&mut rows)?;
-        }
     }
     if !changed.is_empty() {
         commit_batch(&mut db, &out, changed, checkpoint)?;
+    }
+    if !failed {
+        db.execute("UPDATE feed SET incarnation=?1 WHERE id=1", [&incarnation])?;
     }
     Ok(if failed { 2 } else { 0 })
 }
@@ -372,14 +423,14 @@ fn commit_batch(
     }
     for actor in &changed {
         tx.execute(
-            "INSERT OR REPLACE INTO heads VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT OR REPLACE INTO heads (class,name,generation,txid,identity,seq,label,kind,incarnation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 actor.class,
                 actor.encoded,
                 actor.position.generation as i64,
                 actor.position.txid as i64,
                 actor.identity,
-                seq
+                seq, actor.label, actor.state.kind, actor.incarnation
             ],
         )?;
         checkpoint("head")?;
@@ -483,37 +534,29 @@ fn recover(out: &std::path::Path, committed: u64) -> anyhow::Result<()> {
 
 struct Saved {
     key: String,
-    class: String,
     position: SegmentId,
     identity: String,
+    label: Option<String>,
+    kind: String,
+    incarnation: String,
 }
 fn next_saved(rows: &mut rusqlite::Rows<'_>) -> anyhow::Result<Option<Saved>> {
     rows.next()?
         .map(|r| {
             Ok(Saved {
                 key: r.get(0)?,
-                class: r.get(1)?,
                 position: SegmentId {
                     generation: r.get::<_, i64>(2)? as u64,
                     txid: r.get::<_, i64>(3)? as u64,
                 },
                 identity: r.get(4)?,
+                label: r.get(5)?,
+                kind: r.get(6)?,
+                incarnation: r.get(7)?,
             })
         })
         .transpose()
 }
-fn absent(saved: &Saved, args: &Args) -> bool {
-    if args.classes.is_empty() || args.classes.contains(&saved.class) {
-        eprintln!(
-            "{}: absent actor requires F4 kinds; head not advanced",
-            saved.key
-        );
-        true
-    } else {
-        false
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn read_changed(
     args: &Args,
@@ -521,8 +564,11 @@ async fn read_changed(
     scratch: &std::path::Path,
     history_prefix: &str,
     actor_prefix: String,
-    objects: BTreeMap<String, ObjectMeta>,
+    mut objects: BTreeMap<String, ObjectMeta>,
     old: Option<Saved>,
+    incarnation: &str,
+    app_changed: bool,
+    missing: bool,
 ) -> anyhow::Result<Option<Changed>> {
     let (tenant, app) = &args.app;
     let relative = actor_prefix
@@ -533,11 +579,58 @@ async fn read_changed(
     if !args.classes.is_empty() && !args.classes.iter().any(|c| c == class) {
         return Ok(None);
     }
+    let new_incarnation = old
+        .as_ref()
+        .map_or(app_changed, |o| o.incarnation != incarnation);
+    if missing {
+        let saved = old.as_ref().context("absent actor without recorded head")?;
+        if saved.kind == "deleted" {
+            return Ok(None);
+        }
+        if !new_incarnation {
+            objects = history::list_objects(store, &actor_prefix).await?;
+        }
+        if objects.is_empty() {
+            if !new_incarnation {
+                eprintln!("{relative}: absent from app and actor listings");
+            }
+            return Ok(Some(Changed {
+                class: class.into(),
+                encoded: encoded.into(),
+                position: saved.position,
+                identity: String::new(),
+                label: saved.label.clone(),
+                incarnation: incarnation.into(),
+                state: writer::State {
+                    actor: writer::ActorTable {
+                        tenant: tenant.clone(),
+                        app: app.clone(),
+                        name: decode_segment(encoded).context("invalid encoded actor name")?,
+                        seq: 0,
+                        generation: saved.position.generation,
+                        txid: saved.position.txid,
+                        committed_at: 0,
+                        rows: Rows {
+                            columns: vec![],
+                            values: vec![],
+                        },
+                    },
+                    class: class.into(),
+                    tables: vec![],
+                    emitted_at: now_ms()?,
+                    kind: "deleted".into(),
+                    reason: Some("absent".into()),
+                },
+                tables: vec![],
+            }));
+        }
+    }
     // An incomplete plan is retried by the reader below.
-    if let Ok((position, identity)) = head(&objects)
-        && old
-            .as_ref()
-            .is_some_and(|o| o.position == position && o.identity == identity)
+    if !new_incarnation
+        && let Ok((position, identity)) = head(&objects)
+        && old.as_ref().is_some_and(|o| {
+            o.position == position && o.identity == identity && !(o.kind == "deleted" && missing)
+        })
     {
         return Ok(None);
     }
@@ -545,28 +638,16 @@ async fn read_changed(
     let path = temp.path().join("actor.db");
     let (export, objects) =
         history::export_from_listing(store, &actor_prefix, objects, &path, args.max_bytes).await?;
-    ensure!(
-        export.verification.replaced.is_none(),
-        "{relative}: replacement label requires F4 kinds"
-    );
     let (position, identity) = head(&objects)?;
-    if let Some(saved) = old {
-        let SegmentId { generation, txid } = saved.position;
-        let old_identity = saved.identity;
-        let chain = history::ancestry(
-            &Listing::from_keys(objects.keys().map(String::as_str)),
-            position,
-        );
-        ensure!(
-            !(position.generation == generation
-                && position.txid == txid
-                && old_identity != identity)
-                && chain
-                    .iter()
-                    .any(|p| p.generation == generation && p.txid >= txid),
-            "{relative}: unproven descent requires F4 kinds"
-        );
-    }
+    let label = export.verification.replaced.clone();
+    let (kind, reason) = classify(
+        old.as_ref(),
+        position,
+        &identity,
+        label.as_deref(),
+        new_incarnation,
+        &objects,
+    );
     let name = decode_segment(encoded).context("invalid encoded actor name")?;
     let connection =
         Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -611,21 +692,21 @@ async fn read_changed(
             values: vec![],
         },
     };
-    let emitted_at = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis(),
-    )?;
+    let emitted_at = now_ms()?;
     Ok::<_, anyhow::Error>(Some(Changed {
         class: class.into(),
         encoded: encoded.into(),
         position,
         identity,
+        label,
+        incarnation: incarnation.into(),
         state: writer::State {
             actor,
             class: class.into(),
             tables,
             emitted_at,
+            kind: kind.into(),
+            reason: reason.map(str::to_owned),
         },
         tables: data,
     }))
@@ -633,3 +714,71 @@ async fn read_changed(
 
 #[cfg(test)]
 mod poll_tests;
+
+fn now_ms() -> anyhow::Result<i64> {
+    Ok(i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?)
+}
+
+fn classify(
+    old: Option<&Saved>,
+    head: SegmentId,
+    identity: &str,
+    label: Option<&str>,
+    incarnation: bool,
+    objects: &BTreeMap<String, ObjectMeta>,
+) -> (&'static str, Option<&'static str>) {
+    if incarnation {
+        return ("rebase", Some("incarnation"));
+    }
+    if label != old.and_then(|o| o.label.as_deref()) {
+        if let Some(label) = label {
+            let mut parts = label.split_whitespace();
+            let action = parts.next();
+            let txid = parts.next().and_then(|n| n.parse::<u64>().ok());
+            if action == Some("delete") && txid == Some(head.txid) {
+                return ("deleted", Some("delete"));
+            }
+            return (
+                "rebase",
+                Some(if action == Some("delete") {
+                    "delete"
+                } else {
+                    "restore"
+                }),
+            );
+        }
+        return ("rebase", Some("restore"));
+    }
+    let Some(old) = old else {
+        return ("state", None);
+    };
+    let chain = history::ancestry(
+        &Listing::from_keys(objects.keys().map(String::as_str)),
+        head,
+    );
+    // Identity changes at an identical position cannot prove descent.
+    if !(head == old.position && identity != old.identity)
+        && chain.iter().any(|p| {
+            *p == old.position
+                || (p.generation != 0
+                    && p.generation == old.position.generation
+                    && p.txid >= old.position.txid)
+        })
+    {
+        return ("state", None);
+    }
+    (
+        "rebase",
+        Some(
+            if head.txid < old.position.txid || chain.iter().any(|p| p.txid == old.position.txid) {
+                "fork"
+            } else {
+                "unproven"
+            },
+        ),
+    )
+}
