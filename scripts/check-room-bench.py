@@ -39,23 +39,44 @@ def main():
                 else:
                     raise RuntimeError('smoke node did not become ready')
                 subprocess.run(['node', 'bench/room-group.mjs', '--url', f'http://127.0.0.1:{port}',
-                                '--clients', '24', '--duration', '8', '--rate', '4',
+                                '--clients', '16', '--duration', '8', '--rate', '4',
+                                '--payload-bytes', '1500', '--stalled-readers', '1',
+                                '--stall-after', '1', '--stall-for', '3',
+                                '--ramp', 'join:8:2,hold:2,leave:6:2',
                                 '--reconnect-every', '1', '--smoke', '--out', str(out)],
                                cwd=ROOT, check=True, timeout=max(1, deadline - time.monotonic()))
                 result = json.loads(out.read_text())
+                counters = result['counters']
                 assert result['incomplete_clients'] == []
                 assert len(result['final_cursors']) == 24
-                assert len(result['acknowledged_positions']) == result['counters']['publish_ok']
-                assert result['ready_at_start'] == 24
-                assert result['counters']['deliveries'] >= 24
-                assert result['counters']['reconnect_attempts'] > 0
-                assert result['counters']['smoke_dropped_frames'] == 1
-                assert result['counters']['gaps_recovered'] > 0
-                assert result['counters']['recovered_messages'] > 0
+                assert result['joined_total'] == 24 and result['peak_clients'] == 24
+                assert counters['clients_left'] == 6 and result['active_at_end'] == 18
+                assert len(result['acknowledged_positions']) == counters['publish_ok']
+                assert result['ready_at_start'] == 16
+                assert counters['deliveries'] >= 24
+                assert counters['reconnect_attempts'] > 0
+                assert counters['smoke_dropped_frames'] == 1
+                assert counters['gaps_recovered'] > 0
+                assert counters['recovered_messages'] > 0
                 assert result['reconnect_latency']['count'] > 0
                 assert result['samples'] and any(s['edges'] is not None for s in result['samples'])
                 assert result['delivery_latency']['p99_ms'] is not None
-                print('Room benchmark smoke passed: 24 clients, paced publishes, reconnects, HTTP recovery, topology.')
+                assert result['payload_bytes'] == 1500 and result['targets'] == 1
+                phases = result['phases']
+                assert {'0-admit', '1-join', '2-hold', '3-leave', 'drain'} <= set(phases)
+                assert phases['1-join']['counters']['clients_joined'] == 8
+                assert phases['3-leave']['counters']['clients_left'] == 6
+                assert phases['2-hold']['delivery_latency']['count'] > 0
+                assert result['topology'] and any(t['phase'] == '3-leave' for t in result['topology'])
+                stalled = result['stalled_readers']
+                assert stalled['count'] == 1
+                assert counters['stall_pauses'] == 1 and counters['stall_resumes'] == 1
+                assert stalled['catchup_after_resume']['count'] == 1
+                assert stalled['delivery_latency']['count'] > 0
+                generator = result['generator']
+                assert generator['peak_rss_bytes'] > 0 and generator['peak_cpu_cores'] > 0
+                assert 'valid' in generator and generator['peak_loop_delay_p99_ms'] is not None
+                print('Room benchmark smoke passed: 24 clients over a short ramp, a stalled reader, 1.5 KB messages, reconnects, HTTP recovery, topology.')
             finally:
                 node.terminate()
                 try:

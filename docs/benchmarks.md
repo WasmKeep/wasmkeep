@@ -1300,7 +1300,28 @@ then wait up to 30 seconds for admission before the timed publishing phase.
 `--reconnect-every 5` drops one socket every five seconds to exercise rejoin.
 Natural close codes and SDK backoff/recovery are always observed. Custom SDK
 fronts must expose the example's join/publish/history/stats JSON contract.
-This driver does not implement R8's grow/shrink schedule or stalled readers.
+
+Options for the 10,000-client run ([ADR 0040](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md), R8):
+
+| Option | Meaning |
+|---|---|
+| `--payload-bytes N` | Message text size. The example front accepts at most 2,000 |
+| `--publish-rate R` | Publishes per second per publisher, replacing the aggregate `--rate`. `--publishers 0` makes a clients-only process, which checks completeness against the room head from the front's `stats` call |
+| `--ramp STEPS` | Comma list of `join:N:SECONDS`, `hold:SECONDS`, `leave:M:SECONDS`, run from the publishing start, for example `join:8000:60,hold:30,leave:8000:60`. Joins are evenly spaced, leaves take the newest clients first, and `--duration` defaults to the ramp length. Each step is a phase of the results |
+| `--stalled-readers K` | The last K initial clients stop reading (their socket is paused, so the server sees a slow client) at `--stall-after` seconds for `--stall-for` seconds, then resume and catch up. They report to their own histograms, not the phases |
+| `--url` (repeated) | Clients and publishers take the targets round robin, to reach every node |
+| `--history-concurrency N` | History requests in flight per process (256); queue wait is reported |
+
+The generator's own load is in every sample and in `generator`: CPU in cores,
+resident memory, event-loop delay, sockets and open descriptors. The result is
+marked `generator.valid: false` (and the run exits 1) when at least 10% of
+samples show event-loop delay p99 of 100 ms or more or CPU of 0.9 core or more,
+or history requests queued for a second: then the load generator, not the room,
+was the limit, and the run proves nothing about the room. Add processes (each
+with its own artifact) until it is valid. The run also stops at the start if the
+open-file soft limit is below peak clients plus history concurrency plus 64.
+`phases` hold per-step percentiles and counters; `topology` is the edge/relay
+count over time.
 
 The JSON includes the harness Git revision (dirty when applicable), Node
 version, settings, admitted clients, delivery/repeat/void/reset counters,
@@ -1332,13 +1353,17 @@ prebuilt CLI and ts-big-room components, then run:
 python3 -I scripts/check-room-bench.py
 ```
 
-The script starts a temporary loopback node without a bucket, runs 24 clients
-for eight publishing seconds at four messages/s with forced reconnects,
-drops one received frame to exercise HTTP gap recovery, checks the
-delivery/reconnect/recovery/topology output, and removes its data and results.
+The script starts a temporary loopback node without a bucket, runs 16 clients
+that grow to 24 and shrink to 18 over a short ramp, with one stalled reader,
+1,500-byte messages at four messages/s and forced reconnects, drops one
+received frame to exercise HTTP gap recovery, checks the
+delivery/reconnect/recovery/phase/topology/generator output, and removes its
+data and results. A 4802 close is not required: a paused loopback socket does
+not fill its buffers in that time.
 Its total timeout is under 30 seconds. `WASMKEEP_BIN` selects a prebuilt CLI.
-Direct `--smoke` runs require a loopback URL, at most 32 clients, 15 publishing
-seconds, five messages/s and two publishers. Neither smoke is fleet evidence.
+Direct `--smoke` runs require loopback URLs, at most 32 clients in total, 15
+publishing seconds, five messages/s, two publishers, two stalled readers and
+64 KiB messages. Neither smoke is fleet evidence.
 
 Output goes only to the explicitly supplied `--out`, written through a
 partial file on completion. Keep raw runs in scratch storage. Publish only
