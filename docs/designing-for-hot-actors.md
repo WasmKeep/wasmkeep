@@ -27,8 +27,8 @@ changes are not automatically undone. The CPU settings are
 `--cpu-budget-ms` and `--sql-cpu-budget-ms`; raising a budget allows
 longer events, not parallel execution within an actor.
 
-Socket caps are fixed today; configurable caps are planned on the
-[roadmap](../ROADMAP.md#now). The
+Socket caps are configurable with `--max-sockets-per-actor` and
+`--max-sockets-per-node`. The
 [room benchmark](benchmarks.md#one-big-room) documents the caps and the
 upgrade refusals. A socket cap is not a tested capacity promise:
 broadcast size, event rate and slow clients can become limiting sooner.
@@ -159,49 +159,72 @@ message rates there too. Keep flood protection and broad ingress rate
 limits at the proxy or CDN. Declarative per-node rate limits in
 `wasmkeep.toml` are **planned**, not a current front setting.
 
-## Build fan-out explicitly today
+## Use the reconnecting room for one ordered stream
 
-For a logical room too large for one actor, keep a durable message log
-and route clients to delivery actors. On each message, relay its stable
-id and sequence to the delivery actors, which send it to their own
-sockets. Assigning every sequence at one actor retains a single order,
-but that sequencer remains a throughput limit; batch there as well or
-relax ordering to independent streams.
+Use the SDK broadcast room when one logical stream needs more sockets than
+one actor can hold, with ordered delivery and reconnect recovery. The room
+is still one sequencer; independent streams should use independent rooms.
+Rust exposes `wasmkeep_sdk::directory` and `wasmkeep_sdk::broadcast`;
+TypeScript exposes `directory`, `broadcast` and the browser-only
+`@wasmkeep/sdk/room-client`. See the runnable
+[TypeScript room](../examples/ts-big-room/README.md) and
+[ADR 0040](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md).
 
-Use `actors::call` / `actors.call` for individual relays, or
-`calls::call_many` / `actors.callMany` for parallel calls (at most 16
-per batch).
-Check each returned error and HTTP status. The batch is not an atomic
-broadcast: some recipients can succeed while others fail. A recipient
-must not call back into an actor waiting on it; that is re-entry.
+Deploy an internal directory, room, edge and relay class. The front admits
+clients, looks up their edge through the directory and hands off the socket.
+Publish over HTTP through the front; the socket accepts only keepalive pings.
+The room numbers messages, batches pushes and retries failed children. Edges
+hold sockets; above 16 edges, one relay layer distributes the pushes.
+Calls go downward: an edge never calls the room, and a relay only calls its
+edges. Calling back into an actor waiting for you would stall the chain.
 
-Keep a membership map, deterministic assignment or an application
-directory of your own. Decide how clients find their delivery actor,
-how membership expires, and how failed relays retry without duplicating
-messages. Persist replayable messages before broadcasting when clients
-must recover them. On reconnect, clients report their last sequence
-and fetch gaps. A successful socket send queues a frame; it does not
-prove the client received or stored it. Detect slow clients and dropped
-sends, then let them catch up or reconnect.
+The defaults and ceilings are **protocol limits, not measured capacity**:
 
-The TypeScript `sockets.broadcast` helper loops over the current
-actor's connections. It does not discover or broadcast to other actors.
-Trees of relay actors can reduce direct fan-out at the root, but today
-the application builds and maintains that tree itself.
+| Setting | Bound |
+| --- | --- |
+| Sockets per edge | 500 by default, no higher than the host's per-actor cap |
+| Fan-out per room or relay | 16 children |
+| One relay layer | 256 edges maximum; 128,000 sockets is only the arithmetic ceiling at 500 each |
+| Room history | Last 2,000 messages or 8 MiB, whichever is less |
+| Edge buffer | Last 512 messages or 1 MiB |
+| Host send queue per socket | 256 frames or 4 MiB |
 
-## Planned for 0.6.0: a shared directory and broadcast groups
+The example deliberately uses **150 sockets per edge** to demonstrate
+splits sooner. An edge splits at 80% capacity; small neighbours can merge
+with hysteresis. Movement closes affected sockets with **4801**. If a slow
+client falls behind the edge buffer, it fetches history; if the edge cannot
+even queue the behind notification, it closes that socket with **4802**.
+More nodes do not automatically rebalance existing edges.
 
-The [roadmap](../ROADMAP.md#next) plans a common directory for scaling
-patterns, starting with broadcast groups and fan-out trees whose layers
-grow and shrink within configured limits. It calls for measurements
-against the big-room baseline, including slow clients, reconnects and
-failed nodes. Aggregation and sharding with resharding would reuse that
-directory; the rest of those patterns remains later, on demand.
+Delivery is **at least once, in order**, within the retained history window.
+Each message has an epoch and number `(e, n)`; repeats are discarded by that
+identity. A new epoch can reuse numbers lost with a batched room's node:
+clients must invalidate the announced void range, not mistake the replacement
+for a duplicate. With `confirm: false` (default), a broadcast can precede
+upload; the loss bound is about the last one or two bucket round trips.
+With `confirm: true`, the room flushes before pushing, so it never broadcasts
+a number that is later lost, at the cost of waiting for upload. This is not
+an acknowledgement that every client has received or stored the message.
+Choose batched writes in the room's deployment configuration explicitly;
+see [What saved means](what-saved-means.md#opt-in-to-batched-plain-writes).
 
-There is no directory or broadcast-group SDK API to use today. The
-planned feature would distribute a logical room among actors; each
-actor would still execute on one node at a time. The separate
-[batched plain-write mode](what-saved-means.md#opt-in-to-batched-plain-writes)
-addresses storage waits, not socket distribution. Size today's design
-from measured workloads, and keep its routing and retry contracts
-explicit enough to migrate later.
+Use `RoomClient` or implement all of the ADR's client rules:
+
+- Retain `(e, n)`, discard repeats and handle void ranges through `onLost`.
+- Hold live frames while fetching history pages after a gap, `behind`, or
+  inconsistent `ready`/`pong`. Handle `reset` by reloading application state
+  when history or the last 64 epochs no longer cover the position.
+- Reconnect through the front, with the last position and exponential full
+  jitter (up to 30 seconds); handle 4801, 4802, 1012 and failed opens.
+- Ping after 45 seconds without a frame; reconnect after another 10 seconds
+  without a response. Honour HTTP 429/503 and `Retry-After`.
+- Retry an uncertain HTTP publish with the same id while it remains in the
+  history window. Authorization, presence and application state remain the
+  application's responsibility.
+
+The [reconnecting-room harness](benchmarks.md#reconnecting-room-harness)
+records delivery and reconnect latency, recovery and topology on a deployed
+cluster. Its small smoke check is correctness evidence only. The real-bucket
+10,000-client growth, shrink, node-loss and slow-client benchmark is R8 and
+has not been measured by R7. The older single-actor room trial above is a
+separate workload, not evidence for this pattern's capacity.

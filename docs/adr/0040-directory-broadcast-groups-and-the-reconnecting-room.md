@@ -2,7 +2,8 @@
 
 - Status: partially implemented (2026-11-17). R1–R6 provide the directory,
   room core, edges, browser client, scaling, one relay layer, the large-room
-  example and the 300-client cluster proof. R7–R8 remain planned.
+  example and the 300-client cluster proof. R7 adds the remote benchmark
+  harness and hot-actors guide. R8 remains planned.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -690,3 +691,17 @@ catch-up with no reset or loss, and resumed live delivery for every client.
 HTTP recovery is concurrency-bounded and publishes use stable retry ids.
 The 300-client proof is enabled by default; it is paced rather than a benchmark.
 R7/R8 still own benchmark publication and real-bucket scale claims.
+
+
+### R7 implementation notes
+
+`bench/room-group.mjs` drives the TypeScript SDK client against a deployed
+example-compatible front, with paced HTTP publishers, configurable clients
+and duration, reconnects, latency histograms, recovery/repeat/void counters,
+close reasons and sampled topology/optional node metrics. Results require an
+explicit output file; no measurements are published by this slice.
+`scripts/check-room-bench.py` checks 24 clients against a temporary local node,
+including forced reconnects and one dropped frame recovered over HTTP, within
+30 seconds. See the [harness contract](../benchmarks.md#reconnecting-room-harness)
+and [room design guide](../designing-for-hot-actors.md#use-the-reconnecting-room-for-one-ordered-stream).
+R8 still owns real-bucket load, grow/shrink, slow-client and node-loss evidence.
