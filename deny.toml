@@ -11,6 +11,11 @@ ignore = [
     # through madsim, the simulation tool behind wasmkeep-sim (dev-only,
     # never shipped).
     { id = "RUSTSEC-2025-0141", reason = "dev-only via madsim (wasmkeep-sim)" },
+    # chrono and humantime: unmaintained (no known vulnerability), reached
+    # only through object_store, the bucket client; no maintained release of
+    # object_store drops them yet. Revisit when object_store moves off them.
+    { id = "RUSTSEC-2026-0543", reason = "chrono, transitive via object_store" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime, transitive via object_store" },
 ]
 
 [licenses]
