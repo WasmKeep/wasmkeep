@@ -39,6 +39,7 @@ import type { ActorRequest, ActorResponse } from "./request";
  * `new db.Client("db/main")`); see ./db.ts. */
 export * as db from "./db";
 export * as directory from "./directory";
+export * as broadcast from "./broadcast";
 /** Key-value storage over shard actors (`new kv.Client("kv", 8)`); see ./kv.ts. */
 export * as kv from "./kv";
 /** Queues over queue actors (`new queue.Client("queue/jobs")`,

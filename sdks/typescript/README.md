@@ -435,3 +435,24 @@ binary protocol and uses the same point hash.
 
 This implements R1 of the proposed ADR only; broadcast groups and rooms
 are not provided by this module.
+
+### Room core (ADR 0040, R2)
+
+`broadcast.define({ confirm: false })` defines an internal room actor.
+A stateless front imports `broadcast` from `@wasmkeep/sdk/front` and uses
+`new broadcast.Client("room/name")`. It authorizes HTTP publishes and
+`GET /history?after=e.n` requests before calling `publish` or `history`.
+Positions and timestamps are `bigint`; preserve their precision when mapping
+them to the application's HTTP representation. History returns `lost`,
+`reset`, `more`, the head and individually positioned messages; continue a
+page from its last message's position. The internal binary protocol matches
+Rust.
+
+Use a batched class. One durable epoch boundary is recorded at the first
+operation after each cold start, including history, so reconnects learn
+losses before the next publish. Plain publishes schedule a 20 ms alarm and
+retain 2,000 messages or 8 MiB of UTF-8 bodies. History replies, including
+framing, stay within 256 KiB. With `confirm: true`, the alarm's confirmation
+barrier flushes before permitting a round; an upload still pending retries
+50 ms later. There are no delivery children in R2. R3–R5 add edge delivery,
+join/poke, scaling and relays.

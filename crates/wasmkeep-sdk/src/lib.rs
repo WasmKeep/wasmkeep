@@ -61,6 +61,7 @@ pub mod bindings {
     });
 }
 
+pub mod broadcast;
 #[cfg(feature = "actor")]
 pub mod db;
 #[cfg(feature = "actor")]
@@ -76,7 +77,6 @@ pub mod problem;
 pub mod queue;
 #[cfg(feature = "actor")]
 mod value;
-#[cfg(feature = "actor")]
 mod wire;
 #[cfg(feature = "actor")]
 pub mod workflow;

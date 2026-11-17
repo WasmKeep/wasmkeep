@@ -299,3 +299,24 @@ event and sees either side of a change, never a partial change.
 
 This implements R1 of the proposed ADR only; broadcast groups and rooms
 are not provided by this module.
+
+### Room core (ADR 0040, R2)
+
+`broadcast::Room` is an internal room actor; `broadcast::Client` is available
+also without the `actor` feature for a stateless HTTP front. The front
+handles authorization and maps its publish and `GET /history?after=e.n`
+requests to the client's `publish` and `history` methods. The internal
+`/wasmkeep-room/v1/` protocol uses the SDK's binary framing; positions retain
+all 63 SQLite integer bits. History returns `lost`, `reset`, `more`, the head,
+and messages with their individual positions. Continue a paginated read from
+the last returned message's position.
+
+Deploy the room with batched writes. The first operation after each cold
+start, including history, records one durable epoch boundary so a reconnect
+can learn of a loss before another publish. Publishes use plain writes and
+schedule a 20 ms alarm. The window holds 2,000 messages or 8 MiB of UTF-8
+bodies; history replies include framing within their 256 KiB bound.
+For confirmation, delegate initialization to `broadcast::handler::init(true)`;
+`before_push` flushes and permits a round only on success, scheduling a 50 ms
+retry while uploading. R2 has no delivery children: its alarm only runs this
+barrier. Edge delivery, join/poke, scaling and relays follow in R3–R5.
