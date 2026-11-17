@@ -171,6 +171,10 @@ jobs:
                 python3 -I scripts/check-benchmark-paths.py --range "$root..HEAD"
               fi
             done
+          elif base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null); then
+            # A manual or scheduled run has no event base: check every
+            # commit since the latest release tag before this commit.
+            python3 -I scripts/check-benchmark-paths.py --range "$base..HEAD"
           else
             echo "::error::Cannot determine the base commit; refusing a final-tree-only publication check."
             exit 2

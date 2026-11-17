@@ -30,6 +30,14 @@ filter = 'binary(soak) | binary(failover)'
 slow-timeout = { period = "300s" }
 
 [[profile.default.overrides]]
+# The open-file tests run a node under a hard 1,024-descriptor limit and
+# churn 2,000 actors through residency with sockets open (ADR 0037 leaves
+# about 96 resident at that limit); a slower runner, such as macOS CI,
+# needs more than two minutes for that. Still ended if it hangs.
+filter = 'binary(open_files)'
+slow-timeout = { period = "120s", terminate-after = 4 }
+
+[[profile.default.overrides]]
 # `wasmkeep new`: each test builds a generated project from cold (a fresh
 # target directory, release builds with LTO), then serves it.
 filter = 'binary(new_project)'

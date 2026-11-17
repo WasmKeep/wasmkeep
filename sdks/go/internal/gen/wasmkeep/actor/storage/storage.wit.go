@@ -38,6 +38,8 @@ type SQLError = types.SQLError
 //
 // Runs a statement that returns no rows; returns the number of rows
 // changed. Returns once the write is committed to the local database.
+// Its upload follows: when the event ends in a class with strict writes
+// (the default), behind later events in one with batched writes.
 //
 //	exec: func(sql: string, params: list<value>) -> result<u64, sql-error>
 //
@@ -57,7 +59,11 @@ func Exec(sql string, params cm.List[Value]) (result cm.Result[SQLErrorShape, ui
 // whole transaction durable; any other statement there is refused with
 // `not-allowed` before it runs. Outside one it does not take a
 // statement that opens or controls a transaction (`BEGIN`, `SAVEPOINT`):
-// run those with `exec`.
+// run those with `exec`. `internal` means the write is committed here
+// but not known to be durable: fail the request. In a class with strict
+// writes replication then stopped, and the actor is restored from the
+// bucket by its next event. In one with batched writes it is `exec`
+// then `flush`, and its `internal` means what `flush`'s does.
 //
 //	exec-durable: func(sql: string, params: list<value>) -> result<u64, sql-error>
 //
