@@ -24,9 +24,8 @@ struct Shared {
     guest_log: wasmkeep_server::GuestLog,
     socket_budget: Arc<wasmkeep_server::SocketBudget>,
     requested_sockets: usize,
-    /// Each app's part of the resident limit (a process-wide pool with
-    /// floors replaces it later).
-    resident_per_app: usize,
+    /// The process's resident pool (ADR 0038, section 8).
+    residents: Arc<wasmkeep_runtime::ResidentPool>,
     front_requests: usize,
     max_connections: usize,
     process: Arc<wasmkeep_server::NodeProcess>,
@@ -117,7 +116,7 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         guest_log: wasmkeep_server::GuestLog::new(base.guest_log_rate),
         socket_budget,
         requested_sockets,
-        resident_per_app: (effective.resident_actors / entries.len().max(1)).max(1),
+        residents: wasmkeep_runtime::ResidentPool::new(effective.resident_actors.max(1)),
         front_requests: front,
         max_connections: effective.public_connections,
         process: supervisor.process(),
@@ -126,7 +125,8 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         bucket: bucket.clone(),
     });
     let mut specs = Vec::new();
-    for (args, hostnames) in entries {
+    for (i, (args, hostnames)) in entries.into_iter().enumerate() {
+        let floors = (file.apps[i].min_resident, file.apps[i].max_resident);
         let (tenant, name) = args.app.clone().context("an [[app]] names its app")?;
         // Before anything reads or writes the app's state (ADR 0022).
         let migrated = check_layout(&bucket, &shared.store, &shared.prefix, &tenant)?;
@@ -134,7 +134,7 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         let build: wasmkeep_server::BuildRuntime = Arc::new(move || {
             let (shared, args) = (Arc::clone(&shared), Arc::clone(&args));
             Box::pin(async move {
-                start_runtime(&shared, &args, migrated)
+                start_runtime(&shared, &args, migrated, floors)
                     .await
                     .map_err(|e| format!("{e:#}"))
             })
@@ -197,6 +197,7 @@ async fn start_runtime(
     shared: &Shared,
     args: &ServeArgs,
     migrated: bool,
+    (min_resident, max_resident): (Option<usize>, Option<usize>),
 ) -> anyhow::Result<wasmkeep_server::Runtime> {
     let (tenant, name) = args.app.clone().context("no app")?;
     let node_id = args.node_id.clone().context("no node id")?;
@@ -301,7 +302,13 @@ async fn start_runtime(
         config.flag_access = Some(config.access.clone());
     }
     config.mailbox.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
-    config.mailbox.max_resident = shared.resident_per_app;
+    // Residents from the process's pool, this app's floor kept; its own
+    // cap at most the pool's limit.
+    config.mailbox.max_resident = max_resident
+        .unwrap_or(usize::MAX)
+        .min(shared.residents.limit());
+    config.resident_pool = Some(Arc::clone(&shared.residents));
+    config.min_resident = min_resident;
     config.socket_limits.per_actor = args.max_sockets_per_actor;
     config.socket_limits.per_app = args.max_sockets_per_app.unwrap_or(shared.requested_sockets);
     config.socket_budget = Arc::clone(&shared.socket_budget);

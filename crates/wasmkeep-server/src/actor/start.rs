@@ -91,6 +91,8 @@ impl ActorService {
         // Its work is recorded under its app (ADR 0038, section 9).
         let app_labels = crate::metrics::app_labels(root.tenant(), root.app());
         let factory_app_labels = Arc::clone(&app_labels);
+        let app_name: Arc<str> = Arc::from(format!("{}/{}", root.tenant(), root.app()));
+        let factory_app_name = Arc::clone(&app_name);
         // A cluster node's app takes its share of the process's upload and
         // restore budgets while it is served (ADR 0038, section 8).
         let shares = match &cluster {
@@ -190,6 +192,7 @@ impl ActorService {
                 let secrets_blocked = Arc::clone(&factory_blocked);
                 let factory_moves = Arc::clone(&factory_moves_outer);
                 let factory_app_labels = Arc::clone(&factory_app_labels);
+                let factory_app_name = Arc::clone(&factory_app_name);
                 async move {
                     let class = class.ok_or_else(|| -> BoxError {
                         format!("unknown class {}", address.class()).into()
@@ -203,6 +206,7 @@ impl ActorService {
                     Ok(ActorState {
                         address,
                         app_labels: Arc::clone(&factory_app_labels),
+                        app_name: Arc::clone(&factory_app_name),
                         class,
                         runtime,
                         storage,
@@ -231,10 +235,16 @@ impl ActorService {
             },
             ActorState::before_drop,
         );
+        // Several apps in one process draw residents from one pool, each
+        // with its floor (ADR 0038, section 8).
+        if let Some(pool) = &config.resident_pool {
+            mailboxes.join_pool(pool, config.min_resident);
+        }
 
         let service = Self {
             inner: Arc::new(ServiceInner {
                 app_labels,
+                app_name,
                 _shares: shares,
                 restoring: Default::default(),
                 tenant: config.tenant,

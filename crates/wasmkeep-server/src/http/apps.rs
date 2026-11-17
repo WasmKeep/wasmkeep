@@ -47,12 +47,58 @@ pub(crate) struct AppTable {
     pub(crate) slots: Vec<Arc<AppSlot>>,
     by_host: HashMap<String, usize>,
     by_name: HashMap<String, usize>,
+    /// The public port's connections, shared between the apps (ADR 0038,
+    /// section 8): a connection beyond an app's share is refused, never
+    /// waited for.
+    connections: Arc<crate::shares::Shares>,
+    _members: Vec<crate::shares::Member>,
+}
+
+/// The app a public connection belongs to (its first request's), with its
+/// place in that app's share of connections, held while it lasts.
+#[derive(Default)]
+pub(crate) struct ConnectionApp(Mutex<Option<(usize, crate::shares::SharePermit)>>);
+
+impl AppTable {
+    /// Takes the connection for app `i`, or checks it is already that
+    /// app's: `Err` with the answer that refuses it otherwise.
+    pub(crate) fn admit_connection(
+        &self,
+        i: usize,
+        connection: &ConnectionApp,
+    ) -> Result<(), Box<Response<HyperOutgoingBody>>> {
+        let mut first = connection.0.lock().unwrap_or_else(|p| p.into_inner());
+        match first.as_ref() {
+            Some((app, _)) if *app != i => Err(Box::new(text_response(
+                StatusCode::MISDIRECTED_REQUEST,
+                "this connection belongs to another app's host\n",
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                // Refused, never waited for: a connection is held long
+                // (ADR 0038, section 8).
+                let Some(place) = self.connections.try_acquire(&self.slots[i].name, 1) else {
+                    let mut r = text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "this app has all the connections it may hold now; retry\n",
+                    );
+                    r.headers_mut().insert(
+                        hyper::header::CONNECTION,
+                        hyper::header::HeaderValue::from_static("close"),
+                    );
+                    return Err(Box::new(r));
+                };
+                *first = Some((i, place));
+                Ok(())
+            }
+        }
+    }
 }
 
 impl AppTable {
     /// `apps`: each app's `tenant/app` and normalized hostnames (checked
     /// unique by the node file).
-    pub(crate) fn new(apps: &[(String, Vec<String>)]) -> Self {
+    pub(crate) fn new(apps: &[(String, Vec<String>)], max_connections: usize) -> Self {
         let mut by_host = HashMap::new();
         let mut by_name = HashMap::new();
         let mut slots = Vec::new();
@@ -66,10 +112,17 @@ impl AppTable {
                 state: RwLock::new(SlotState::Starting),
             }));
         }
+        let connections = Arc::new(crate::shares::Shares::new(max_connections as u64));
+        let _members = apps
+            .iter()
+            .map(|(name, _)| connections.join(name))
+            .collect();
         Self {
             slots,
             by_host,
             by_name,
+            connections,
+            _members,
         }
     }
 
@@ -90,7 +143,7 @@ impl AppTable {
     pub(crate) async fn route_public(
         &self,
         mut req: Request<Incoming>,
-        connection: &Mutex<Option<usize>>,
+        connection: &ConnectionApp,
     ) -> Response<HyperOutgoingBody> {
         strip_node_headers(req.headers_mut());
         let get = matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
@@ -104,18 +157,8 @@ impl AppTable {
         let Some(&i) = self.by_host.get(&host) else {
             return text_response(StatusCode::MISDIRECTED_REQUEST, "unknown host\n");
         };
-        {
-            let mut first = connection.lock().unwrap_or_else(|p| p.into_inner());
-            match *first {
-                Some(app) if app != i => {
-                    return text_response(
-                        StatusCode::MISDIRECTED_REQUEST,
-                        "this connection belongs to another app's host\n",
-                    );
-                }
-                Some(_) => {}
-                None => *first = Some(i),
-            }
+        if let Err(refused) = self.admit_connection(i, connection) {
+            return *refused;
         }
         self.serve(i, req).await
     }
@@ -271,6 +314,38 @@ mod tests {
             .headers_mut()
             .insert("x-forwarded-host", "b.test".parse().unwrap());
         assert_eq!(authority(&forwarded), Ok("a.test".into()));
+    }
+
+    #[test]
+    fn a_connection_beyond_an_apps_share_is_refused_never_waited_for() {
+        let table = AppTable::new(
+            &[
+                ("acme/shop".to_owned(), vec!["shop.test".to_owned()]),
+                ("acme/blog".to_owned(), vec!["blog.test".to_owned()]),
+            ],
+            4,
+        );
+        // Parts of 2, floors of 1: shop takes all but blog's floor.
+        let shop: Vec<ConnectionApp> = (0..4).map(|_| ConnectionApp::default()).collect();
+        let taken = shop
+            .iter()
+            .filter(|c| table.admit_connection(0, c).is_ok())
+            .count();
+        assert_eq!(taken, 3);
+        // A second request on an admitted connection takes nothing more.
+        assert!(table.admit_connection(0, &shop[0]).is_ok());
+        // Another app's host on it: 421.
+        let r = table.admit_connection(1, &shop[0]).unwrap_err();
+        assert_eq!(r.status(), StatusCode::MISDIRECTED_REQUEST);
+        // Blog gets its floor at once; the refusals are 503s.
+        let blog = ConnectionApp::default();
+        assert!(table.admit_connection(1, &blog).is_ok());
+        let more = ConnectionApp::default();
+        let r = table.admit_connection(1, &more).unwrap_err();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A closed connection gives its place back.
+        drop(shop);
+        assert!(table.admit_connection(1, &more).is_ok());
     }
 
     #[test]

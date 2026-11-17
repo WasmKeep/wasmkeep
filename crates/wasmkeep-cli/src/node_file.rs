@@ -749,29 +749,23 @@ impl NodeFile {
                 "a file with hostnames is served by hostname, as several apps are",
             ));
         }
-        self.apply_app(a, args)
-    }
-
-    /// [`Self::apply_to`] for the entry `a`.
-    fn apply_app(&self, a: &AppEntry, args: &mut crate::ServeArgs) -> anyhow::Result<()> {
-        let not_yet = |field: &str, why: &str| {
-            anyhow::anyhow!(
-                "{}: {field} is not available in this version ({why}); remove it",
-                a.at
-            )
-        };
         if a.min_resident.is_some() {
             return Err(not_yet(
                 "min-resident",
-                "resident floors come with several apps per process",
+                "resident floors apply between the apps of one process",
             ));
         }
         if a.max_resident.is_some() {
             return Err(not_yet(
                 "max-resident",
-                "resident caps come with several apps per process",
+                "resident caps apply between the apps of one process",
             ));
         }
+        self.apply_app(a, args)
+    }
+
+    /// [`Self::apply_to`] for the entry `a`.
+    fn apply_app(&self, a: &AppEntry, args: &mut crate::ServeArgs) -> anyhow::Result<()> {
         args.app = Some((a.tenant.clone(), a.name.clone()));
         args.node_id.clone_from(&a.node_id);
         args.advertise.clone_from(&self.listen.public_advertise);

@@ -600,7 +600,7 @@ impl ActorState {
                 return;
             }
             other => {
-                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?other, "periodic snapshot failed");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?other, "periodic snapshot failed");
                 return;
             }
         };
@@ -629,7 +629,7 @@ impl ActorState {
                 self.abandon(&format!("periodic snapshot refused: {e}"));
             }
             Err(e) => {
-                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "periodic snapshot failed");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "periodic snapshot failed");
             }
         }
     }
@@ -653,7 +653,7 @@ impl ActorState {
             // may find capture ended by a step before a drop that an event
             // cut short: enabled again first, as before an event.
             if let Err(e) = self.ensure_batched_capture().await {
-                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "batched capture could not start");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "batched capture could not start");
                 return Some(Barrier::GaveUp(Dropped::Failure));
             }
             // No completion jobs: the step before a drop applies them
@@ -716,7 +716,7 @@ impl ActorState {
             })
             .await;
         if !matches!(finished, Ok(None | Some(Ok(())))) {
-            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), ?finished, "leaving batched capture failed; its WAL stays");
+            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?finished, "leaving batched capture failed; its WAL stays");
         }
         if let Some(held) = self.held.as_mut() {
             held.end_capture();
@@ -775,7 +775,7 @@ impl ActorState {
         }
         if want == crate::apps::Writes::Batched {
             held.switch_writes(want, Barrier::Flushed);
-            tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), writes = want.as_str(), "the hold now runs the class's new mode of writes");
+            tracing::info!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), writes = want.as_str(), "the hold now runs the class's new mode of writes");
             return Ok(());
         }
         let deadline = self.upload_deadline().await;
@@ -785,7 +785,7 @@ impl ActorState {
                 if let Some(held) = self.held.as_mut()
                     && held.switch_writes(want, Barrier::Flushed)
                 {
-                    tracing::info!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), writes = want.as_str(), "the hold now runs the class's new mode of writes");
+                    tracing::info!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), writes = want.as_str(), "the hold now runs the class's new mode of writes");
                 }
                 Ok(())
             }

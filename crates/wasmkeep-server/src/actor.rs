@@ -144,6 +144,13 @@ pub struct ActorConfig {
     /// setting fires them later. For a node on a restored copy, which must
     /// not run the app's side effects a second time.
     pub no_alarms: bool,
+    /// The process's resident pool when it serves several apps (ADR 0038,
+    /// section 8): this app's residents count against it, and
+    /// `mailbox.max_resident` stays this app's own cap.
+    pub resident_pool: Option<Arc<wasmkeep_runtime::ResidentPool>>,
+    /// This app's floor in `resident_pool` (`min-resident`); by default the
+    /// pool's limit divided by twice its apps.
+    pub min_resident: Option<usize>,
     /// Which addresses actors' outbound HTTP may reach: public ones, plus
     /// the ranges this allows.
     pub egress: crate::egress::EgressPolicy,
@@ -224,6 +231,8 @@ impl ActorConfig {
             alarm_retry_initial: Duration::from_secs(1),
             alarm_retry_max: Duration::from_secs(300),
             no_alarms: false,
+            resident_pool: None,
+            min_resident: None,
             cluster: None,
             egress: crate::egress::EgressPolicy::default(),
             guest_log: crate::guest_log::GuestLog::default(),
@@ -256,6 +265,8 @@ pub struct ActorService {
 struct ServiceInner {
     /// Its app's metric labels ([`crate::metrics::app_labels`]).
     app_labels: Arc<str>,
+    /// Its app, `tenant/app`, for log lines (ADR 0038, section 9).
+    app_name: Arc<str>,
     /// Its app's shares of the process's budgets (ADR 0038, section 8),
     /// while it is served.
     _shares: Vec<crate::shares::Member>,

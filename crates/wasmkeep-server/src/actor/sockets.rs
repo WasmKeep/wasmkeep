@@ -180,7 +180,7 @@ impl ActorState {
         // hibernated with the socket open): on a draining node that closes
         // it, and the client's reconnect goes to the peer (ADR 0014).
         if let Err(e) = self.ensure_owner().await {
-            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = ?e, "websocket event: no longer the owner");
+            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = ?e, "websocket event: no longer the owner");
             match e {
                 // Another node owns the actor, or this draining node sends
                 // it to a peer: every socket of the actor here is on the
@@ -207,7 +207,7 @@ impl ActorState {
         if let Err(e) = self.ensure_ready().await {
             // Close rather than drop the message silently: the client
             // reconnects, and is answered (or refused) like a new socket.
-            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "websocket event: actor not ready");
+            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "websocket event: actor not ready");
             self.sockets.close(
                 &self.address,
                 conn,
@@ -228,7 +228,7 @@ impl ActorState {
 
     pub(super) async fn ws_done(&mut self, ok: bool) {
         if !ok {
-            tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), "websocket event trapped; instance discarded");
+            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "websocket event trapped; instance discarded");
         }
         self.finish_event(!ok).await;
     }
@@ -349,11 +349,11 @@ impl ServiceInner {
             Ok(Ok(Err(reason))) => Some((1008, reason)),
             Err(MailboxError::Capacity(_)) => Some((1013, "try again later".to_owned())),
             Ok(Err(e)) => {
-                tracing::warn!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
                 Some((1008, "unavailable".to_owned()))
             }
             Err(e) => {
-                tracing::warn!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
                 Some((1008, "unavailable".to_owned()))
             }
         };
@@ -593,7 +593,7 @@ impl ServiceInner {
                     refusals = refusals.wrapping_add(1);
                 }
                 Err(error) => {
-                    tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), error = %error, "websocket close not delivered");
+                    tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(address), error = %error, "websocket close not delivered");
                     break;
                 }
             }

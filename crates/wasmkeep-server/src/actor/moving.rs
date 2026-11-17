@@ -152,7 +152,7 @@ impl ActorState {
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "reading the alarm failed; the sweep delivers it");
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "reading the alarm failed; the sweep delivers it");
             }
         }
     }
@@ -308,7 +308,7 @@ impl ActorService {
             }
             Taken::NoSuchActor => text_response(StatusCode::NOT_FOUND, "no such actor\n"),
             Taken::Refused(why) => {
-                tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %why, "take refused");
+                tracing::debug!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(address), %why, "take refused");
                 crate::cluster::unavailable("cannot take the actor now; retry\n")
             }
         }

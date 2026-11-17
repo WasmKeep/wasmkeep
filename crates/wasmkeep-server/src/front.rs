@@ -295,14 +295,22 @@ impl Drop for Waiting {
 }
 
 /// A slot held while one front instance lives; the gauge counts them.
-struct Slot(#[allow(dead_code, reason = "held for its drop")] tokio::sync::OwnedSemaphorePermit);
+struct Slot(
+    #[allow(dead_code, reason = "held for its drop")] tokio::sync::OwnedSemaphorePermit,
+    /// Its app's place in the process's front reservations (ADR 0038).
+    #[allow(dead_code, reason = "held for its drop")]
+    Option<crate::shares::SharePermit>,
+);
 
 impl Slot {
-    fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+    fn new(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        share: Option<crate::shares::SharePermit>,
+    ) -> Self {
         METRICS
             .front_slots_in_use
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self(permit)
+        Self(permit, share)
     }
 }
 
@@ -502,6 +510,10 @@ pub struct HttpComponent {
     max_requests: usize,
     /// Calls waiting on each actor, for the per-actor bound.
     waits: Arc<Waits>,
+    /// The process's front reservations shared between its apps, and this
+    /// front's app (ADR 0038, section 8): a request beyond the app's share
+    /// is refused as busy, never waited for.
+    pub(crate) share: Option<(Arc<crate::shares::Shares>, Arc<str>)>,
 }
 
 impl std::fmt::Debug for HttpComponent {
@@ -531,6 +543,7 @@ impl HttpComponent {
             slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
             max_requests,
             waits: Arc::default(),
+            share: None,
         })
     }
 
@@ -552,6 +565,16 @@ impl HttpComponent {
             slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
             max_requests,
             waits: Arc::default(),
+            share: None,
+        }
+    }
+
+    /// This front's app's place in the process's front reservations, if it
+    /// shares them: `Err` when the app is past its share.
+    pub(crate) fn take_share(&self) -> Result<Option<crate::shares::SharePermit>, ()> {
+        match &self.share {
+            None => Ok(None),
+            Some((shares, app)) => shares.try_acquire(app, 1).map(Some).ok_or(()),
         }
     }
 
@@ -746,7 +769,11 @@ impl HttpComponent {
             outcome(&app, "busy");
             return busy();
         };
-        let slot = Slot::new(permit);
+        let Ok(share) = self.take_share() else {
+            outcome(&app, "busy");
+            return busy();
+        };
+        let slot = Slot::new(permit, share);
         strip_wasmkeep_headers(req.headers_mut());
         // A WebSocket upgrade: kept aside, for a hand-off (ADR 0027), and
         // marked for the front after the strip, so only the host sets it.
@@ -1238,6 +1265,45 @@ impl hyper::body::Body for Timed {
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    /// ADR 0038, section 8: the fronts of two apps share the process's
+    /// front reservations; one past its share is refused, the other keeps
+    /// its floor.
+    #[test]
+    fn a_front_past_its_apps_share_is_refused() {
+        let runtime = wasmkeep_runtime::Runtime::new(&wasmkeep_runtime::RuntimeConfig {
+            max_instances: 8,
+            ..wasmkeep_runtime::RuntimeConfig::default()
+        })
+        .unwrap();
+        let shares = std::sync::Arc::new(crate::shares::Shares::new(4));
+        let _m = [shares.join("a/a"), shares.join("b/b")];
+        let front = |app: &str| {
+            let mut f = super::HttpComponent {
+                runtime: runtime.clone(),
+                version: std::sync::Arc::default(),
+                egress: std::sync::Arc::default(),
+                guest_log: crate::guest_log::GuestLog::default(),
+                wall: std::time::Duration::from_secs(1),
+                cpu_budget: super::DEFAULT_CPU_BUDGET,
+                slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+                max_requests: 8,
+                waits: std::sync::Arc::default(),
+                share: None,
+            };
+            f.share = Some((std::sync::Arc::clone(&shares), std::sync::Arc::from(app)));
+            f
+        };
+        let (a, b) = (front("a/a"), front("b/b"));
+        let held: Vec<_> = (0..4).filter_map(|_| a.take_share().ok()).collect();
+        assert_eq!(held.len(), 3, "a stops at b's floor");
+        let floor = b.take_share().unwrap();
+        assert!(floor.is_some(), "b gets its floor at once");
+        assert!(b.take_share().is_err(), "the reservations are all taken");
     }
 }
 

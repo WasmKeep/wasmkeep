@@ -226,6 +226,13 @@ pub(crate) struct Member {
     app: String,
 }
 
+impl Member {
+    /// Its app.
+    pub(crate) fn app(&self) -> &str {
+        &self.app
+    }
+}
+
 impl Drop for Member {
     fn drop(&mut self) {
         self.shares.leave(&self.app);

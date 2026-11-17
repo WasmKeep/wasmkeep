@@ -21,6 +21,8 @@ struct Def {
     /// Serve the app's deployed version (and follow its tombstone), rather
     /// than the counter class.
     deployed: bool,
+    /// Its floor in the process's resident pool, when it has one.
+    min_resident: Option<usize>,
 }
 
 const fn def(
@@ -35,6 +37,7 @@ const fn def(
         app,
         hosts,
         deployed: false,
+        min_resident: None,
     }
 }
 
@@ -52,6 +55,17 @@ impl Proc {
 }
 
 async fn process(store: &Arc<dyn ObjectStore>, data: &Path, defs: &[Def]) -> Proc {
+    process_pooled(store, data, defs, None).await
+}
+
+/// [`process`], its apps' residents drawn from a pool of `pool` residents.
+async fn process_pooled(
+    store: &Arc<dyn ObjectStore>,
+    data: &Path,
+    defs: &[Def],
+    pool: Option<usize>,
+) -> Proc {
+    let pool = pool.map(wasmkeep_runtime::ResidentPool::new);
     let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let cluster = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let public_addr = public.local_addr().unwrap();
@@ -60,11 +74,12 @@ async fn process(store: &Arc<dyn ObjectStore>, data: &Path, defs: &[Def]) -> Pro
     let services: Arc<std::sync::Mutex<HashMap<String, ActorService>>> = Arc::default();
     let mut specs = Vec::new();
     for d in defs.iter().cloned() {
-        let (store, data, process, services) = (
+        let (store, data, process, services, pool) = (
             Arc::clone(store),
             data.join(d.node),
             supervisor.process(),
             Arc::clone(&services),
+            pool.clone(),
         );
         let advertise = cluster_advertise.clone();
         let (name, hostnames) = (
@@ -72,13 +87,14 @@ async fn process(store: &Arc<dyn ObjectStore>, data: &Path, defs: &[Def]) -> Pro
             d.hosts.iter().map(|h| (*h).to_owned()).collect(),
         );
         let build = move || {
-            let (store, data, process, services, advertise, d) = (
+            let (store, data, process, services, advertise, d, pool) = (
                 Arc::clone(&store),
                 data.clone(),
                 Arc::clone(&process),
                 Arc::clone(&services),
                 advertise.clone(),
                 d.clone(),
+                pool.clone(),
             );
             Box::pin(async move {
                 let runtime = Runtime::new(&RuntimeConfig {
@@ -90,6 +106,11 @@ async fn process(store: &Arc<dyn ObjectStore>, data: &Path, defs: &[Def]) -> Pro
                 config.tenant = d.tenant.into();
                 config.app = d.app.into();
                 config.mailbox.idle_timeout = Duration::from_secs(30);
+                if let Some(pool) = pool {
+                    config.mailbox.max_resident = pool.limit();
+                    config.resident_pool = Some(pool);
+                    config.min_resident = d.min_resident;
+                }
                 let mut cluster =
                     ClusterConfig::new(d.node, "http://127.0.0.1:9", Arc::clone(&store));
                 cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
@@ -622,4 +643,63 @@ async fn the_start_refusal_finds_the_live_nodes_without_multi_app() {
         .await
         .unwrap();
     assert_eq!(older, ["old"]);
+}
+
+/// ADR 0038, section 8: the residents of a process's apps count against
+/// one pool; with the pool full of app A's idle actors, app B's wake-up
+/// evicts one of them; with A at its floor, B's waits and is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_apps_idle_residents_make_room_for_anothers_wake_up() {
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let d = tempfile::tempdir().unwrap();
+    let p = process_pooled(&store, d.path(), &SHOP_BLOG, Some(2)).await;
+    for name in ["a", "b"] {
+        let r = to_reachable(
+            p.public,
+            "shop.test",
+            "POST",
+            &format!("/actor/counter/{name}"),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    assert_eq!(p.service("shop-1").unwrap().resident(), 2);
+    let r = to_reachable(p.public, "blog.test", "POST", "/actor/counter/x").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+    eventually("shop gave a resident up", async || {
+        p.service("shop-1").unwrap().resident() == 1
+    })
+    .await;
+
+    // Shop at its floor (the whole pool): blog's wake-up is refused.
+    let d = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let floor = [
+        Def {
+            min_resident: Some(2),
+            ..def("shop-2", "acme", "shop", &["shop.test"])
+        },
+        def("blog-2", "acme", "blog", &["blog.test"]),
+    ];
+    let p = process_pooled(&store, d.path(), &floor, Some(2)).await;
+    for name in ["a", "b"] {
+        let r = to_reachable(
+            p.public,
+            "shop.test",
+            "POST",
+            &format!("/actor/counter/{name}"),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let r = to(p.public, "blog.test", "POST", "/actor/counter/x", "").await;
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(
+        p.service("shop-2").unwrap().resident(),
+        2,
+        "shop kept its floor"
+    );
 }

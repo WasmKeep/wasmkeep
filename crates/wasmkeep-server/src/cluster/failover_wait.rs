@@ -237,7 +237,7 @@ impl Cluster {
             counts.total += 1;
             counts.actors.insert(address.clone(), actor + 1);
         }
-        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), owner, ?verdict, "keeping a request for a takeover");
+        tracing::debug!(app = %crate::logging::named(&self.serves), actor = %crate::logging::actor(address), owner, ?verdict, "keeping a request for a takeover");
         Some(Ticket {
             cluster: self,
             address: address.clone(),

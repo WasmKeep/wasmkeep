@@ -12,6 +12,7 @@ mod config;
 mod cpu;
 mod error;
 mod mailbox;
+mod pool;
 mod residency;
 mod runtime;
 
@@ -23,5 +24,6 @@ pub use error::Error;
 pub use mailbox::{
     BoxError, BoxFuture, DropCause, MailboxConfig, MailboxError, Mailboxes, StepOutcome,
 };
+pub use pool::ResidentPool;
 pub use residency::{Residency, Retained};
 pub use runtime::Runtime;

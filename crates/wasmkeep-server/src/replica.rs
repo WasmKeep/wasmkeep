@@ -864,7 +864,7 @@ impl Replica {
         };
         if let (Err(ReplicaError::Visibility(why)), Some(key)) = (&restored, &key) {
             cluster.pending.refused(key);
-            tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), generation, required = ?floor, attempts = attempt + 1, elapsed = ?started.elapsed(), reason = %why, "refused to activate: the recorded head is not visible");
+            tracing::warn!(app = %crate::logging::named(cluster.serves()), actor = %crate::logging::actor(address), generation, required = ?floor, attempts = attempt + 1, elapsed = ?started.elapsed(), reason = %why, "refused to activate: the recorded head is not visible");
         }
         let restored = restored.and_then(|replica| {
             // The verified head goes into the hold cell, under its

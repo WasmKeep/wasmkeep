@@ -172,6 +172,8 @@ struct Inner<S> {
     /// `submit_wait` callers currently waiting for a slot: how many slots
     /// evictions should be freeing.
     waiting: std::sync::atomic::AtomicUsize,
+    /// The pool its residents are drawn from too, if it joined one.
+    pool: std::sync::OnceLock<Arc<crate::ResidentPool>>,
 }
 
 impl<S: Send + 'static> Mailboxes<S> {
@@ -243,6 +245,7 @@ impl<S: Send + 'static> Mailboxes<S> {
                 capacity_changed,
                 residency_released,
                 waiting: std::sync::atomic::AtomicUsize::new(0),
+                pool: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -321,6 +324,17 @@ impl<S: Send + 'static> Mailboxes<S> {
         async move {
             queued?;
             answer.await.map_err(|_| MailboxError::Gone(address))?
+        }
+    }
+
+    /// Draws this set's residents from `pool` too (ADR 0038, section 8),
+    /// with `floor` (default: the pool's limit divided by twice its
+    /// members): its own `max_resident` stays its cap. Set once, before the
+    /// first event.
+    pub fn join_pool(&self, pool: &Arc<crate::ResidentPool>, floor: Option<usize>) {
+        if self.inner.pool.set(Arc::clone(pool)).is_ok() {
+            let member: Arc<dyn crate::pool::Member> = Arc::clone(&self.inner) as _;
+            pool.join(Arc::downgrade(&member), floor);
         }
     }
 
@@ -417,11 +431,28 @@ impl<S: Send + 'static> Mailboxes<S> {
             },
             None => job,
         };
-        let Some(residency) = Residency::try_acquire(
+        let pool = self.inner.pool.get().map(|p| {
+            let back = Arc::clone(p);
+            let back: Arc<dyn Fn() + Send + Sync> = Arc::new(move || back.released());
+            (&p.used, p.limit(), back)
+        });
+        let Some(residency) = Residency::try_acquire_in(
             &self.inner.tasks,
             self.inner.config.max_resident,
+            pool,
             Some(Arc::clone(&self.inner.residency_released)),
         ) else {
+            // The shared pool is full (this set is under its own cap):
+            // room is made across its members, by their floors (ADR 0038,
+            // section 8), with no registry held.
+            if let Some(pool) = self.inner.pool.get()
+                && self.inner.tasks.load(std::sync::atomic::Ordering::SeqCst)
+                    < self.inner.config.max_resident
+            {
+                drop(actors);
+                pool.make_room(usize::from(!counted));
+                return Err((MailboxError::Capacity(address.clone()), job));
+            }
             // Slots already on their way back: actors asked to go that are
             // still registered, and actors gone from the registry whose
             // state or resources are still closing. Evict only for demand
@@ -600,6 +631,53 @@ impl<S> Drop for Waiting<S> {
         self.0
             .waiting
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl<S: Send + 'static> crate::pool::Member for Inner<S> {
+    fn resident(&self) -> usize {
+        self.tasks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn oldest_idle(&self) -> Option<u64> {
+        lock(self)
+            .values()
+            .filter(|e| {
+                !e.activity
+                    .evicting
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .map(|e| e.activity.last.load(std::sync::atomic::Ordering::Relaxed))
+            .filter(|last| *last != u64::MAX)
+            .min()
+    }
+
+    fn evict_oldest(&self) {
+        evict_one(&lock(self));
+    }
+
+    fn returning(&self) -> usize {
+        let actors = lock(self);
+        let evicting = actors
+            .values()
+            .filter(|e| {
+                e.activity
+                    .evicting
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .count();
+        self.tasks
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .saturating_sub(actors.len())
+            + evicting
+    }
+
+    fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn wake(&self) {
+        self.capacity_changed.notify_waiters();
     }
 }
 

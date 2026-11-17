@@ -138,10 +138,11 @@ fn a_second_app_is_served_and_each_entry_maps_as_its_flags() {
     assert_eq!(base.data_dir, PathBuf::from("/etc/wasmkeep/data/blog"));
     assert!(base.no_secrets);
     assert_eq!(base.cluster_listen, Some("0.0.0.0:7443".parse().unwrap()));
-    // An entry's resident floors are not served yet.
+    // An entry's resident floor and cap are the pool's business, not a
+    // flag: the entry still maps.
     let mut base = serve(&["--bucket", "s3://b", "--node-file", "unused.toml"]).unwrap();
-    let e = file.apply_entry(0, &mut base).unwrap_err().to_string();
-    assert!(e.contains("min-resident"), "{e}");
+    file.apply_entry(0, &mut base).unwrap();
+    assert_eq!(base.app, Some(("acme".to_owned(), "shop".to_owned())));
     // One app with no hostname table is served as one app.
     let one = parse(
         &app("acme/shop", "x", "").replace("node-id = \"x\"\n", ""),

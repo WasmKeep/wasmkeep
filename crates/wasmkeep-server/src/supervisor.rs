@@ -191,8 +191,13 @@ impl Supervisor {
                 .iter()
                 .map(|a| (a.name.clone(), a.hostnames.clone()))
                 .collect::<Vec<_>>(),
+            limits.max_connections,
         ));
         let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
+        // The process's front reservations, shared between the apps' fronts
+        // (ADR 0038, section 8): sized once the first front is known.
+        let fronts: Arc<std::sync::OnceLock<Arc<crate::shares::Shares>>> = Arc::default();
+        let front_members: Arc<std::sync::Mutex<Vec<crate::shares::Member>>> = Arc::default();
         // Each app's first start, before the ports open: its start check
         // is the one a new process runs.
         let mut runners = Vec::new();
@@ -204,6 +209,8 @@ impl Supervisor {
                 spec,
                 slot,
                 limits.front_wall,
+                Arc::clone(&fronts),
+                Arc::clone(&front_members),
                 stopping.clone(),
                 first_tx,
             )));
@@ -229,11 +236,11 @@ impl Supervisor {
         };
         if let Some(metrics) = listeners.metrics {
             // One page for the process: app series carry their app's labels
-            // (ADR 0038, section 9); the gauges are the first app's runtime.
-            let actors = table.running().into_iter().find_map(|a| a.actors);
+            // (ADR 0038, section 9); the process's gauges sum the apps'.
+            let metered = crate::http::Metered::Table(Arc::clone(&table));
             let stop = stop();
             tokio::spawn(async move {
-                let _ = crate::http::serve_metrics(metrics, actors, stop).await;
+                let _ = crate::http::serve_metrics_of(metrics, metered, stop).await;
             });
         }
         let shutdown = stop();
@@ -272,6 +279,8 @@ async fn run_app(
     spec: AppSpec,
     slot: Arc<crate::http::apps::AppSlot>,
     front_wall: std::time::Duration,
+    fronts: Arc<std::sync::OnceLock<Arc<crate::shares::Shares>>>,
+    front_members: Arc<std::sync::Mutex<Vec<crate::shares::Member>>>,
     mut stopping: tokio::sync::watch::Receiver<bool>,
     started: tokio::sync::oneshot::Sender<()>,
 ) {
@@ -302,6 +311,21 @@ async fn run_app(
         backoff = RESTART_FIRST;
         if let Some(front) = app.front.as_mut() {
             front.wall = front_wall;
+            // Its app's share of the process's front reservations: the
+            // first front's slots size them (every app's are the same).
+            let shares = fronts
+                .get_or_init(|| Arc::new(crate::shares::Shares::new(front.max_requests() as u64)));
+            if !front
+                .share
+                .as_ref()
+                .is_some_and(|(s, _)| Arc::ptr_eq(s, shares))
+            {
+                let mut members = front_members.lock().unwrap_or_else(|p| p.into_inner());
+                if !members.iter().any(|m| m.app() == slot.name) {
+                    members.push(shares.join(&slot.name));
+                }
+                front.share = Some((Arc::clone(shares), Arc::from(slot.name.as_str())));
+            }
         }
         let Some(actors) = app.actors.clone() else {
             slot.set(SlotState::Running(app));

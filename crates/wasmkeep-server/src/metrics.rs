@@ -785,6 +785,24 @@ pub struct Gauges {
     pub not_ready: Option<&'static str>,
 }
 
+impl Gauges {
+    /// The process's gauges from each app runtime's (ADR 0038, section 9):
+    /// residents, WebSockets and classes summed; the socket budget, shared,
+    /// once; the first reason not to be ready.
+    pub(crate) fn of_process(apps: &[Gauges]) -> Gauges {
+        let Some(first) = apps.first() else {
+            return Gauges::default();
+        };
+        Gauges {
+            resident: apps.iter().map(|g| g.resident).sum(),
+            websockets: apps.iter().map(|g| g.websockets).sum(),
+            classes: apps.iter().map(|g| g.classes).sum(),
+            not_ready: apps.iter().find_map(|g| g.not_ready),
+            ..*first
+        }
+    }
+}
+
 /// The metrics page of a process serving no actors ([`render_for`] with
 /// the implicit app `default/default` and no node).
 pub fn render(gauges: Gauges) -> String {
@@ -1370,6 +1388,26 @@ mod tests {
             page.matches("# TYPE wasmkeep_budget_share_part ").count(),
             1
         );
+    }
+
+    #[test]
+    fn a_process_of_several_apps_sums_their_gauges() {
+        let g = |resident, websockets, not_ready| Gauges {
+            socket_sessions: 7,
+            socket_requested: 100,
+            socket_effective: 90,
+            socket_actor_requested: 10,
+            socket_actor_effective: 10,
+            resident,
+            websockets,
+            classes: 2,
+            not_ready,
+        };
+        let p = Gauges::of_process(&[g(3, 1, None), g(4, 2, Some("disk almost full"))]);
+        assert_eq!((p.resident, p.websockets, p.classes), (7, 3, 4));
+        assert_eq!((p.socket_sessions, p.socket_effective), (7, 90));
+        assert_eq!(p.not_ready, Some("disk almost full"));
+        assert_eq!(Gauges::of_process(&[]).resident, 0);
     }
 
     /// Two apps' fronts in one process: each request and call is counted

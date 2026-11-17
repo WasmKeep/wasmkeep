@@ -794,7 +794,7 @@ async fn serve_connection<I>(
 {
     // The app of the connection's first request, on the public port of a
     // process serving several (ADR 0038, section 6).
-    let first: Arc<std::sync::Mutex<Option<usize>>> = Arc::default();
+    let first: Arc<apps::ConnectionApp> = Arc::default();
     let service = service_fn(move |mut req: Request<Incoming>| {
         let (app, cluster, first) = (app.clone(), cluster.clone(), Arc::clone(&first));
         async move {
@@ -893,6 +893,49 @@ pub async fn serve_metrics(
     actors: Option<ActorService>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
+    serve_metrics_of(listener, Metered::One(actors), shutdown).await
+}
+
+/// What a metrics page is rendered from.
+#[derive(Clone)]
+pub(crate) enum Metered {
+    One(Option<ActorService>),
+    /// A process serving several apps: its gauges summed over the apps
+    /// running now (ADR 0038, section 9).
+    Table(Arc<apps::AppTable>),
+}
+
+impl Metered {
+    fn page(&self) -> String {
+        match self {
+            Self::One(actors) => actors.as_ref().map_or_else(
+                || crate::metrics::render(crate::metrics::Gauges::default()),
+                |a| crate::metrics::render_for(a.gauges(), a.metrics_identity()),
+            ),
+            Self::Table(table) => {
+                let running: Vec<ActorService> = table
+                    .running()
+                    .into_iter()
+                    .filter_map(|a| a.actors)
+                    .collect();
+                let gauges: Vec<crate::metrics::Gauges> =
+                    running.iter().map(ActorService::gauges).collect();
+                let process = crate::metrics::Gauges::of_process(&gauges);
+                match running.first() {
+                    Some(a) => crate::metrics::render_for(process, a.metrics_identity()),
+                    None => crate::metrics::render(process),
+                }
+            }
+        }
+    }
+}
+
+/// [`serve_metrics`] for what `metered` names.
+pub(crate) async fn serve_metrics_of(
+    listener: TcpListener,
+    metered: Metered,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), Error> {
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -914,17 +957,14 @@ pub async fn serve_metrics(
             },
             () = &mut shutdown => return Ok(()),
         };
-        let actors = actors.clone();
+        let metered = metered.clone();
         let service = service_fn(move |req: Request<Incoming>| {
-            let actors = actors.clone();
+            let metered = metered.clone();
             async move {
                 let page = req.uri().path() == "/metrics"
                     && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
                 let response = if page {
-                    let body = actors.as_ref().map_or_else(
-                        || crate::metrics::render(crate::metrics::Gauges::default()),
-                        |a| crate::metrics::render_for(a.gauges(), a.metrics_identity()),
-                    );
+                    let body = metered.page();
                     let mut r = text_response(StatusCode::OK, &body);
                     r.headers_mut().insert(
                         hyper::header::CONTENT_TYPE,
