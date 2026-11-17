@@ -540,8 +540,9 @@ it, and again after every WasmKeep upgrade:
 5. Write down how long the copy and the first requests took. That is
    your restore time.
 
-The drill reads every object only for the actors it requests. Until a
-verify command exists, the sample is the measure of the copy.
+The live-node checks cover the actors requested. For online archives, run
+full `backup verify` as well: replay verification and serving restored
+actors test different parts of recovery.
 
 ## Migrating to 0.4.0
 
@@ -562,3 +563,71 @@ A bucket prefix that holds actor state is migrated once, offline, by
   `actors/<tenant>/` must move to `state/<tenant>/<app>/`.
 - On a versioned bucket, the old keys keep their noncurrent versions until
   the lifecycle rules expire them.
+
+## Automated fixture drill
+
+`./scripts/check.sh --s3` runs `scripts/drills/backup-restore.sh` against
+its moto server, or the configured `WASMKEEP_TEST_S3_BUCKET`. It creates
+a two-node fixture cluster and four counters, acknowledges durable writes,
+and continues modest writes during online backup, full verification and
+restore. The restore uses a fresh prefix, data directory and loopback ports.
+Every sampled counter must answer with at least the durable count captured
+before backup began. This is a per-actor lower bound, not an app-wide snapshot;
+acknowledgements after backup started are outside that bound.
+
+Prerequisites are the normal Rust/wasm32-wasip2 toolchains, Python 3 and
+AWS CLI. **Additional tool justification:** AWS CLI supplies authenticated,
+paginated scratch-object enumeration and deletion without adding a Rust or
+Python package dependency. It uses the same credentials and `AWS_ENDPOINT`
+as the node. No backup-prune command is required.
+
+The drill creates a random top-level scratch prefix and refuses overlap
+with an externally supplied source. Only the standalone fixture setup writes
+to its source; backup of a supplied soak source is read-only. Cleanup stops
+all owned nodes before deleting the exact scratch prefix and the temporary
+data directory, on success and ordinary failure/interrupt. Cleanup errors
+fail the drill. SIGKILL or machine loss cannot run cleanup; operators must
+remove that run's `restore-drill-<random>/` prefix afterwards. Use dedicated
+test credentials and a test bucket; a versioned bucket may retain old object
+versions after deletion.
+
+For a soak, set `SOAK_RESTORE_DRILL=1 ./bench/soak.sh`. It runs one drill
+alongside the existing writers and kills, snapshots their maximum acknowledged
+durable counts into `drill-acks.json`, and makes a drill failure fail the soak.
+The local soak deploys its fixture before starting nodes when this option is
+set. A remote soak additionally needs `WASMKEEP_SOAK_BUCKET=s3://BUCKET/PREFIX`
+and an already deployed `restore-drill/fixture` app served with `--app` with class `t`, built from the
+same test-actor source. The hook never deploys to the remote source. To invoke
+the hook manually while that source is running:
+
+```sh
+./scripts/drills/backup-restore.sh --source s3://test/soak-run --acks drill-acks.json
+```
+
+The acknowledgement file is a nonempty JSON object mapping routes such as
+`/actor/t/s123-0/durable` to positive integer counts. Capture it before the
+command starts. The automated soak hook captures it from client responses,
+not by reading the source after backup.
+
+**Alarm isolation and remaining gap:** there is no start-without-alarms
+option. This drill accepts only archived components byte-identical to the
+local test actor, refuses other classes and fronts, and starts the local
+fixture with `--app restore-drill/fixture` after replacing the scratch
+deploy with an exact local fixture project (no archived configuration or front). Its alarm handler only
+changes its own database and alarm; it cannot send a webhook. Archived
+configuration and fronts are not executed. Listeners are loopback-only and
+there are no external client requests. This is not a general-purpose drill
+for arbitrary applications: those still need the outbound firewall isolation
+in the manual procedure above. A future start-without-alarms mode remains
+unimplemented. The nodes follow restore fences; this drill does not validate secrets.
+
+Each successful run writes a unique CSV in `bench/results/` (or `--output`),
+after cleanup succeeds. It records create, verify, restore and startup times,
+checked actors, acknowledged floors, and the restored node's
+`wasmkeep_bucket_requests_total` counters at the end of actor checks. Those
+are ObjectStore operation counts, including startup/background work: one
+listing counts once even if it spans pages, and a multipart upload counts
+once when it starts. They exclude the backup CLI, source nodes, fixture
+validation downloads and cleanup. They are **not** total billed S3 requests
+or a measurement of the entire backup cost. Fleet timing and full request
+cost still require a real-bucket run.

@@ -1614,7 +1614,11 @@ fn actor_groups(
     source: &Store,
     prefix: &str,
 ) -> futures_util::stream::BoxStream<'static, anyhow::Result<ActorGroup>> {
-    let list = source.list(Some(&Key::from(prefix.trim_end_matches('/'))));
+    // The last group is yielded after observing EOF. The next group poll
+    // must not poll S3's non-fused pagination stream a second time at EOF.
+    let list = source
+        .list(Some(&Key::from(prefix.trim_end_matches('/'))))
+        .fuse();
     let prefix = prefix.to_owned();
     futures_util::stream::try_unfold(
         (list, None, prefix),

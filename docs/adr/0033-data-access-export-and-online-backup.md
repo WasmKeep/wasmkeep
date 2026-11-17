@@ -1071,6 +1071,13 @@ between actors of one class, and how many actors one feed follows.
 
 ### 8. Cost in bucket requests
 
+The [automated fixture drill](../deploy/backup-and-restore.md#automated-fixture-drill)
+now records timings and the restored node's ObjectStore operation counters
+in `bench/results/*-restore-drill-*.csv`. These counters exclude backup CLI
+requests, S3 pagination/retries and cleanup; the table below remains derived,
+not an end-to-end measured request bill. A moto run proves the drill path,
+not real-bucket cost or fleet recovery latency.
+
 Counts per operation, from the code's request patterns, with `n` the
 objects under an actor's prefix (at most about 65 at rest after
 collection, plus write rate times `W` for a busy actor), `s` the
@@ -1353,6 +1360,9 @@ One PR each, with tests that fail before it:
    additions; an adversarial review of the job.
 8. `backup prune` (implemented; destination-only retention, permanent pins,
    marker handshake and conditional publication/deletion lock).
-9. The drill in `check.sh --s3` and in the soak; section 8 measured.
+9. The drill in `check.sh --s3` and opt-in in the soak is implemented
+   for the known test fixture. Section 8 records the measurement boundary;
+   full request cost and a fleet run remain outstanding. Arbitrary guest
+   alarm isolation still requires an operator firewall.
 10. The change feed, after its open questions are answered in a record
     of its own.
