@@ -34,6 +34,13 @@ pub struct HoldHead {
     /// record's): what its restore must reach, and what it freezes again,
     /// unchanged, if it ends unverified.
     pub inherited: Option<crate::local_heads::Requirement>,
+    /// Acquired in the recorded-head format (`wasmkeep-owner 2`): its
+    /// release writes its frozen head, and its restore must reach what it
+    /// inherited (ADR 0035, sections 1 and 3).
+    pub recorded: bool,
+    /// An idle origin carried from the record it acquired (Unix ms; ADR
+    /// 0035, section 3), kept until a verified activation clears it.
+    pub idle_since_ms: Option<u64>,
 }
 
 /// An upload completed when its hold could no longer acknowledge it: the
@@ -86,6 +93,8 @@ pub fn verify(
         return Err(Late);
     }
     hold.head.acknowledged = Some(position);
+    // A verified activation starts a new idle period at its release.
+    hold.head.idle_since_ms = None;
     Ok(())
 }
 

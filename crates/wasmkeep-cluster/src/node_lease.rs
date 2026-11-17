@@ -943,6 +943,9 @@ pub struct Owners<B, C> {
     nodes_prefix: String,
     config: LeaseConfig,
     unresolved_wait_ms: u64,
+    /// The app has enabled the recorded-head format (ADR 0035, section 5):
+    /// acquisitions and releases write version 2.
+    recorded_head: std::sync::atomic::AtomicBool,
 }
 
 impl<B: Bucket, C: Clock> Owners<B, C> {
@@ -964,6 +967,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             nodes_prefix: nodes_prefix.into(),
             config,
             unresolved_wait_ms: UNRESOLVED_WAIT_MS,
+            recorded_head: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -997,13 +1001,52 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         self.clock.now_ms()
     }
 
-    fn mine(&self, generation: u64) -> Vec<u8> {
+    /// Whether this app writes the recorded-head format, as its setting
+    /// was last read (ADR 0035, section 5). Only ever set by a reader of
+    /// the setting; never inferred from a record seen.
+    pub fn set_recorded_head(&self, enabled: bool) {
+        self.recorded_head
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether acquisitions and releases write version 2.
+    pub fn recorded_head(&self) -> bool {
+        self.recorded_head.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The record an acquisition at `generation` writes: version 1, or
+    /// version 2 with the requirement it carries.
+    fn mine(&self, generation: u64, recorded: Option<RecordedHead>) -> OwnerRecord {
         OwnerRecord {
             holder: Some((self.node.clone(), self.instance.clone())),
             generation,
-            recorded: None,
+            recorded,
         }
-        .encode()
+    }
+
+    /// What a record already there lets an acquisition do in this app's
+    /// format: a version 2 record is refused unless the app enabled it;
+    /// any record is read under the enabled format.
+    fn format_allows(&self, record: &OwnerRecord) -> Result<(), AcquireError> {
+        if record.recorded.is_some() && !self.recorded_head() {
+            return Err(AcquireError::FormatMismatch);
+        }
+        Ok(())
+    }
+
+    /// The version 2 fields of an acquisition carrying `inherited`, over
+    /// `before` (its idle origin carried), if the format is enabled.
+    fn acquiring(
+        &self,
+        inherited: Option<Requirement>,
+        before: Option<&OwnerRecord>,
+    ) -> Option<RecordedHead> {
+        self.recorded_head().then(|| {
+            let idle = before
+                .and_then(|b| b.recorded)
+                .and_then(|r| r.idle_since_ms);
+            Requirement::stored(inherited, true, idle)
+        })
     }
 
     /// Acquires the record at `key` at generation + 1 if it names nobody,
@@ -1043,6 +1086,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             .map_err(|_| AcquireError::Unavailable)?;
         let mut previous = None;
         let inherited;
+        let attempted;
         let (generation, before, written) = match read {
             None => {
                 let first = first_generation().await?;
@@ -1050,14 +1094,13 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                let written = self.bucket.create(key, self.mine(first)).await;
+                attempted = self.mine(first, self.acquiring(inherited, None));
+                let written = self.bucket.create(key, attempted.encode()).await;
                 (first, None, written)
             }
             Some((body, version)) => {
                 let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
-                if record.recorded.is_some() {
-                    return Err(AcquireError::FormatMismatch);
-                }
+                self.format_allows(&record)?;
                 if let Some((node, instance)) = &record.holder
                     && !(node == &self.node && instance == &self.instance)
                 {
@@ -1086,16 +1129,14 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if !lease_valid() {
                     return Err(AcquireError::LeaseInvalid);
                 }
-                let written = self
-                    .bucket
-                    .replace(key, self.mine(generation), &version)
-                    .await;
+                attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
+                let written = self.bucket.replace(key, attempted.encode(), &version).await;
                 (generation, Some((version, record)), written)
             }
         };
         let version = match written {
             Ok(version) => version,
-            Err(_) => self.read_back(key, generation, before).await?,
+            Err(_) => self.read_back(key, &attempted, before).await?,
         };
         Ok(Hold {
             key: key.to_owned(),
@@ -1105,6 +1146,8 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             head: HoldHead {
                 acknowledged: None,
                 inherited,
+                recorded: attempted.recorded.is_some(),
+                idle_since_ms: attempted.recorded.and_then(|r| r.idle_since_ms),
             },
         })
     }
@@ -1148,9 +1191,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             return Err(AcquireError::Changed);
         };
         let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
-        if record.recorded.is_some() {
-            return Err(AcquireError::FormatMismatch);
-        }
+        self.format_allows(&record)?;
         if record.holder.is_some() || !unchanged(&version) {
             return Err(AcquireError::Changed);
         }
@@ -1162,14 +1203,12 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         if !lease_valid() {
             return Err(AcquireError::LeaseInvalid);
         }
-        let written = self
-            .bucket
-            .replace(key, self.mine(generation), &version)
-            .await;
+        let attempted = self.mine(generation, self.acquiring(inherited, Some(&record)));
+        let written = self.bucket.replace(key, attempted.encode(), &version).await;
         let version = match written {
             Ok(version) => version,
             Err(_) => {
-                self.read_back(key, generation, Some((version, record)))
+                self.read_back(key, &attempted, Some((version, record)))
                     .await?
             }
         };
@@ -1181,6 +1220,8 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             head: HoldHead {
                 acknowledged: None,
                 inherited,
+                recorded: attempted.recorded.is_some(),
+                idle_since_ms: attempted.recorded.and_then(|r| r.idle_since_ms),
             },
         })
     }
@@ -1199,9 +1240,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     async fn read_back(
         &self,
         key: &str,
-        generation: u64,
+        attempted: &OwnerRecord,
         before: Option<(Version, OwnerRecord)>,
     ) -> Result<Version, AcquireError> {
+        let generation = attempted.generation;
         let (before_version, before) = before.unzip();
         let unresolved = AcquireError::Unresolved {
             generation,
@@ -1214,12 +1256,12 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             return Err(unresolved);
         }
         let decoded = OwnerRecord::decode(&body);
-        // This binary writes only version 1: a version 2 record is never
-        // this attempt's write.
-        let v1 = decoded.as_ref().is_some_and(|r| r.recorded.is_none());
+        // This attempt's write only if exactly its bytes (holder,
+        // generation and, in version 2, the requirement it carried).
+        let exact = decoded.as_ref() == Some(attempted);
         match decoded.and_then(|r| r.holder.map(|h| (h, r.generation))) {
             Some(((node, instance), g)) if node == self.node && instance == self.instance => {
-                if g == generation && v1 {
+                if g == generation && exact {
                     Ok(version)
                 } else {
                     Err(unresolved)
@@ -1277,7 +1319,12 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         let body = OwnerRecord {
             holder: None,
             generation: hold.generation,
-            recorded: None,
+            // ADR 0035, section 1: a hold acquired in version 2 releases
+            // with what it froze (complete if verified, else what it
+            // inherited, stamp unchanged) and its carried idle origin.
+            recorded: hold.head.recorded.then(|| {
+                Requirement::stored(Requirement::frozen(hold), false, hold.head.idle_since_ms)
+            }),
         }
         .encode();
         match self.bucket.replace(&hold.key, body, &hold.version).await {
@@ -1373,8 +1420,10 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     ) -> Released {
         match self.bucket.get(key).await {
             Ok(Some((body, version))) => match OwnerRecord::decode(&body) {
-                // Unexpected bytes at this process's own generation (this
-                // binary writes only version 1): never released over.
+                // A version 2 attempt of this process that landed: released
+                // with the requirement its bytes carried (ADR 0035, section
+                // 2), never reconstructed from an older floor. In an app
+                // that has not enabled the format, never released over.
                 Some(r)
                     if r.recorded.is_some()
                         && r.generation == generation
@@ -1382,7 +1431,22 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                             .as_ref()
                             .is_some_and(|(n, i)| n == &self.node && i == &self.instance) =>
                 {
-                    Released::Pending
+                    if !self.recorded_head() {
+                        return Released::Pending;
+                    }
+                    let hold = Hold {
+                        key: key.to_owned(),
+                        generation,
+                        version,
+                        previous: None,
+                        head: HoldHead {
+                            acknowledged: None,
+                            inherited: Requirement::of_record(&r),
+                            recorded: true,
+                            idle_since_ms: r.recorded.and_then(|x| x.idle_since_ms),
+                        },
+                    };
+                    self.release(&hold).await
                 }
                 Some(r)
                     if r.generation == generation

@@ -37,6 +37,45 @@ pub struct Requirement {
 }
 
 impl Requirement {
+    /// The requirement a version 2 record carries; `None` for an unknown
+    /// position (no evidence) or a version 1 record.
+    pub fn of_record(record: &OwnerRecord) -> Option<Self> {
+        let r = record.recorded?;
+        (r.head != Position::Unknown).then_some(Self {
+            head: r.head,
+            set_at: r.set_at,
+            completeness: r.completeness,
+        })
+    }
+
+    /// As stored in a record at `generation`, released (`held == false`)
+    /// or held. A held record stores `lower-bound`: this version writes no
+    /// `complete-inherited` phase, so it never needs the pre-upload
+    /// demotion (ADR 0035, section 1); a released one keeps `complete`
+    /// only from a hold that froze it.
+    pub fn stored(
+        requirement: Option<Self>,
+        held: bool,
+        idle_since_ms: Option<u64>,
+    ) -> crate::recorded_head::RecordedHead {
+        use crate::recorded_head::RecordedHead;
+        match requirement {
+            None => RecordedHead {
+                idle_since_ms,
+                ..RecordedHead::UNKNOWN
+            },
+            Some(r) => RecordedHead {
+                head: r.head,
+                set_at: r.set_at,
+                completeness: match (held, r.completeness) {
+                    (false, Completeness::Complete) => Completeness::Complete,
+                    _ => Completeness::LowerBound,
+                },
+                idle_since_ms,
+            },
+        }
+    }
+
     /// What an ended hold proves. A verified hold froze every
     /// acknowledgement under its cell's lock: its acknowledged head,
     /// complete, established in its own generation (the head itself may
@@ -52,6 +91,85 @@ impl Requirement {
             None => hold.head.inherited,
         }
     }
+}
+
+/// The requirement an acquisition carries, from this process's local
+/// evidence (`local`, with the generation of the hold that froze it) and
+/// the record's (`record`, with the record's generation). Not a numeric
+/// maximum of positions: whichever was established by the later hold of
+/// this lineage covers the other. A local entry at or above the record's
+/// generation is this process's own hold, which inherited the record's
+/// requirement and verified or kept it; a record above the entry (after
+/// retirement, only this process's own attempt, whose bytes carried the
+/// entry) covers it.
+pub fn combine(
+    local: Option<(Requirement, u64)>,
+    record: Option<(Requirement, u64)>,
+) -> Option<Requirement> {
+    match (local, record) {
+        (Some((l, gl)), Some((r, gr))) => Some(if gl >= gr { l } else { r }),
+        (Some((l, _)), None) => Some(l),
+        (None, Some((r, _))) => Some(r),
+        (None, None) => None,
+    }
+}
+
+/// Whether a restore's selected chain covers a required floor (ADR 0035,
+/// section 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proof {
+    /// Proven: no floor to reach, the exact position with its checksum,
+    /// or a validated object on the chain in a generation above the
+    /// floor's stamp.
+    Proven,
+    /// The exact position is on the chain: proven once its checksum, known
+    /// only by replaying it, matches.
+    NeedsReplay,
+    /// Nothing on the chain proves it: the listing may be behind; list
+    /// again within the bound, then refuse.
+    Missing,
+    /// The exact position is on the chain with another checksum: a
+    /// conflicting history, not a visibility miss.
+    Conflict,
+}
+
+/// Proves `floor` against the selected chain `chain`: each object's
+/// position, ascending (base snapshot first), with the database checksum
+/// after it when known (replayed). A larger transaction id, or a
+/// generation above the floor's head generation but not above its stamp,
+/// proves nothing; so does an object on another branch (not in `chain`).
+/// Every generation above the stamp could upload only after verifying its
+/// predecessor's requirement, by induction this floor (capability gating:
+/// no writer that skips this check writes after a floor was established).
+pub fn prove(
+    floor: Option<&Requirement>,
+    chain: &[(crate::replication::SegmentId, Option<u64>)],
+) -> Proof {
+    let Some(floor) = floor else {
+        return Proof::Proven;
+    };
+    let Position::Known {
+        generation,
+        txid,
+        checksum,
+    } = floor.head
+    else {
+        return Proof::Proven;
+    };
+    if let Some((_, sum)) = chain
+        .iter()
+        .find(|(id, _)| id.generation == generation && id.txid == txid)
+    {
+        return match sum {
+            Some(s) if *s == checksum => Proof::Proven,
+            Some(_) => Proof::Conflict,
+            None => Proof::NeedsReplay,
+        };
+    }
+    if chain.iter().any(|(id, _)| id.generation > floor.set_at) {
+        return Proof::Proven;
+    }
+    Proof::Missing
 }
 
 /// One actor's local evidence.
@@ -235,6 +353,7 @@ mod tests {
             head: HoldHead {
                 acknowledged,
                 inherited,
+                ..HoldHead::default()
             },
         }
     }
@@ -401,6 +520,53 @@ mod tests {
         assert_eq!(heads.len(), 1, "one reservation left");
         heads.finished("owners/x");
         assert!(heads.is_empty());
+    }
+
+    /// Case 8: only the exact position with its checksum, or a selected-
+    /// chain object in a generation above the stamp, proves the floor.
+    #[test]
+    fn only_exact_ancestry_or_a_later_generation_proves_a_floor() {
+        use crate::replication::SegmentId;
+        let id = |generation, txid| SegmentId { generation, txid };
+        let floor = Requirement {
+            head: at(4, 10),
+            set_at: 5,
+            completeness: Completeness::Complete,
+        };
+        let f = Some(&floor);
+        assert_eq!(prove(None, &[]), Proof::Proven);
+        assert_eq!(prove(f, &[]), Proof::Missing, "an empty listing");
+        // Exact: needs the replayed checksum, which must match.
+        assert_eq!(prove(f, &[(id(4, 10), None)]), Proof::NeedsReplay);
+        assert_eq!(prove(f, &[(id(4, 10), Some(10))]), Proof::Proven);
+        assert_eq!(prove(f, &[(id(4, 10), Some(11))]), Proof::Conflict);
+        // A larger txid in the floor's own generations proves nothing.
+        assert_eq!(
+            prove(f, &[(id(4, 9), None), (id(5, 40), None)]),
+            Proof::Missing
+        );
+        // Above the stamp, on the chain: proven even after collection.
+        assert_eq!(prove(f, &[(id(6, 70), None)]), Proof::Proven);
+        // Unknown or empty floors need nothing.
+        let empty = Requirement {
+            head: Position::Empty,
+            ..floor
+        };
+        assert_eq!(prove(Some(&empty), &[]), Proof::Proven);
+    }
+
+    #[test]
+    fn combining_follows_the_later_hold_of_the_lineage() {
+        let r = |txid| Requirement {
+            head: at(4, txid),
+            set_at: 4,
+            completeness: Completeness::Complete,
+        };
+        assert_eq!(combine(Some((r(10), 6)), Some((r(5), 5))), Some(r(10)));
+        assert_eq!(combine(Some((r(10), 5)), Some((r(12), 7))), Some(r(12)));
+        assert_eq!(combine(Some((r(10), 6)), Some((r(5), 6))), Some(r(10)));
+        assert_eq!(combine(None, Some((r(5), 5))), Some(r(5)));
+        assert_eq!(combine(None, None), None);
     }
 
     #[test]

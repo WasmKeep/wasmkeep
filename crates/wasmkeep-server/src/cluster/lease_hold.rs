@@ -122,6 +122,10 @@ pub(crate) struct Pending {
     /// The app's ownership format as last read, and the lease epoch it
     /// was read in (ADR 0035, section 5): read again in each new epoch.
     format: Mutex<Option<(u64, AppFormat)>>,
+    /// Per actor key, successive visibility refusals and until when the
+    /// next cycle waits (ADR 0035, section 3). Kept until a verified
+    /// activation or shutdown.
+    cooldowns: Mutex<HashMap<String, (u32, tokio::time::Instant)>>,
 }
 
 /// Records the parked set's size moving from `before` to `after` in the
@@ -214,7 +218,46 @@ impl Pending {
         {
             return Err(AcquireError::LocalHold);
         }
-        Ok(self.local().prepare(key, record, attempted, node, instance))
+        let mut local = self.local();
+        let carried = local
+            .prepare(key, record, attempted, node, instance)
+            .zip(local.get(key).map(|e| e.generation));
+        drop(local);
+        // The record's own requirement (version 2), combined by lineage.
+        let recorded = record.and_then(|r| Requirement::of_record(r).map(|q| (q, r.generation)));
+        Ok(wasmkeep_cluster::local_heads::combine(carried, recorded))
+    }
+
+    /// Whether `key` is cooling down after visibility refusals (ADR 0035,
+    /// section 3): how long until its next cycle may start.
+    pub(crate) fn cooldown(&self, key: &str) -> Option<Duration> {
+        let cooldowns = self.cooldowns.lock().unwrap_or_else(|p| p.into_inner());
+        let (_, until) = cooldowns.get(key)?;
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// A visibility refusal of `key`: the next cycle waits 1, 2, 4, 8, 16,
+    /// then 30 s, with up to 20 percent more.
+    pub(crate) fn refused(&self, key: &str) {
+        const STEPS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+        let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = cooldowns
+            .entry(key.to_owned())
+            .or_insert((0, tokio::time::Instant::now()));
+        let step = STEPS[usize::try_from(entry.0)
+            .unwrap_or(usize::MAX)
+            .min(STEPS.len() - 1)];
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = tokio::time::Instant::now() + crate::replica::jittered(Duration::from_secs(step));
+    }
+
+    /// A verified activation of `key`: its cooldown ends.
+    pub(crate) fn clear_cooldown(&self, key: &str) {
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key);
     }
 
     /// A release of `hold` landed: its frozen head's entry ends, once no
@@ -558,6 +601,12 @@ impl LeaseHold {
             return Err(OwnershipError::Refused(why.into()));
         }
         cluster.format_gate(epoch).await?;
+        if let Some(left) = cluster.pending.cooldown(&key) {
+            return Err(OwnershipError::Unavailable(format!(
+                "the actor's recorded head was not visible in the bucket; retry in {} s",
+                left.as_secs().max(1)
+            )));
+        }
         // ADR 0035, section 2: after the authoritative read, before the
         // write, this process's local evidence goes into the attempt.
         let mut prepared = false;
@@ -881,10 +930,9 @@ impl LeaseHold {
 impl Cluster {
     /// The app's ownership-format setting (ADR 0035, section 5), read
     /// once per lease epoch (so again after a lapse), before any
-    /// acquisition. Absent: version 1, as before. Enabled: this version
-    /// reads the recorded-head format but does not enforce it yet, so it
-    /// serves the app nowhere rather than write version 1 records there.
-    /// Unreadable: refused. Unanswered: retry.
+    /// acquisition. Absent: version 1, as before. Enabled: version 2
+    /// records, and the acquirer gate. Unreadable: refused. Unanswered:
+    /// retry.
     async fn format_gate(&self, epoch: u64) -> Result<(), OwnershipError> {
         let cached = *self
             .pending
@@ -926,14 +974,11 @@ impl Cluster {
                 format
             }
         };
-        match format {
-            AppFormat::Version1 => Ok(()),
-            AppFormat::RecordedHead => Err(OwnershipError::Refused(
-                "the app has enabled the recorded-head ownership format (ADR 0035), which this \
-                 server version reads but does not enforce: serve it with a version that does"
-                    .into(),
-            )),
-        }
+        // Enabled: acquisitions and releases write version 2, and every
+        // activation proves the recorded floor (ADR 0035, sections 1-3).
+        self.owners
+            .set_recorded_head(format == AppFormat::RecordedHead);
+        Ok(())
     }
 
     /// The ownership record of an actor (ADR 0020). The name is encoded
@@ -1400,7 +1445,7 @@ impl LeaseView {
                 // Verified at the explicit pre-history position.
                 head: wasmkeep_cluster::hold_cell::HoldHead {
                     acknowledged: Some(wasmkeep_cluster::recorded_head::Position::Empty),
-                    inherited: None,
+                    ..Default::default()
                 },
             }))),
             epoch: 0,
@@ -1443,6 +1488,20 @@ impl LeaseView {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .and_then(|h| h.head.acknowledged)
+    }
+
+    /// What the hold's restore must reach before activation (ADR 0035,
+    /// section 3): its inherited requirement, in an app that writes the
+    /// recorded-head format (`None` otherwise), and its record's key.
+    pub(crate) fn floor(&self) -> (Option<Requirement>, Option<String>) {
+        let cell = self.cell.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(hold) = cell.as_ref() else {
+            return (None, None);
+        };
+        (
+            hold.head.inherited.filter(|_| hold.head.recorded),
+            Some(hold.key.clone()),
+        )
     }
 
     /// The requirement the hold inherited at acquisition (tests).

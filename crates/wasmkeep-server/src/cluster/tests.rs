@@ -3625,46 +3625,283 @@ async fn a_re_acquire_inherits_the_head_its_predecessor_froze() {
     assert_eq!(a.pending.local_head(&key), None);
 }
 
-/// ADR 0035, section 5: the app's format setting fails closed. Absent,
-/// acquisitions proceed (version 1). Enabled, this version, which cannot
-/// enforce the recorded-head format yet, serves the app nowhere; anything
-/// else is refused as unreadable. Neither writes an ownership record.
+/// ADR 0035, section 5: the app's format setting. Unreadable, it fails
+/// closed without writing a record; absent, records are version 1;
+/// enabled, version 2 (an acquisition over nothing carries no evidence).
 #[tokio::test]
-async fn the_app_format_setting_fails_closed() {
+async fn the_app_format_setting_decides_the_record_version() {
     use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::recorded_head::RecordedHead;
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let a = fast_node("a", &store);
     a.identity().await.unwrap();
     wait_lease_valid(&a).await;
     let x = ActorAddress::new("t", "c", "x").unwrap();
+    let record = StorePath::from(a.owner_key(&x));
     let setting = StorePath::from(app_format::key("", "t", "default"));
-    for (body, want) in [
-        (app_format::ENABLED_BODY.to_vec(), "refused"),
-        (b"wasmkeep-recorded-head 9\n".to_vec(), "broken"),
-    ] {
-        store.put(&setting, body.into()).await.unwrap();
-        // A new epoch: the setting is read again.
-        a.validity.bump_epoch();
-        let got = LeaseHold::acquire(&a, &x).await;
-        match (&got, want) {
-            (Err(OwnershipError::Refused(why)), "refused") => {
-                assert!(why.contains("recorded-head"), "{why}");
-            }
-            (Err(OwnershipError::Broken(why)), "broken") => {
-                assert!(why.contains("setting"), "{why}");
-            }
-            _ => panic!("{want}: {:?}", got.as_ref().map(|_| ())),
-        }
-        let record = StorePath::from(a.owner_key(&x));
-        assert!(
-            matches!(
-                store.head(&record).await,
-                Err(object_store::Error::NotFound { .. })
-            ),
-            "no ownership record written"
-        );
-    }
+    store
+        .put(&setting, b"wasmkeep-recorded-head 9\n".to_vec().into())
+        .await
+        .unwrap();
+    a.validity.bump_epoch();
+    let got = LeaseHold::acquire(&a, &x).await;
+    assert!(
+        matches!(&got, Err(OwnershipError::Broken(why)) if why.contains("setting")),
+        "{:?}",
+        got.as_ref().map(|_| ())
+    );
+    assert!(matches!(
+        store.head(&record).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    // Absent: version 1.
     store.delete(&setting).await.unwrap();
     a.validity.bump_epoch();
-    LeaseHold::acquire(&a, &x).await.unwrap();
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(owner_record(&store, &a.owner_key(&x)).await.recorded, None);
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    // Enabled: the v1 record is converted, with no evidence.
+    store
+        .put(&setting, app_format::ENABLED_BODY.to_vec().into())
+        .await
+        .unwrap();
+    a.validity.bump_epoch();
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    assert_eq!(
+        owner_record(&store, &a.owner_key(&x)).await.recorded,
+        Some(RecordedHead::UNKNOWN)
+    );
+    drop(hold);
+}
+
+/// A bucket whose listings leave out history keys written while `lag` is
+/// on (a LIST that lags its PUTs), until `reveal`.
+#[derive(Debug)]
+struct LaggingList {
+    inner: Arc<dyn ObjectStore>,
+    lag: std::sync::atomic::AtomicBool,
+    hidden: Mutex<std::collections::BTreeSet<String>>,
+    lists: std::sync::atomic::AtomicU64,
+}
+
+impl LaggingList {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            lag: std::sync::atomic::AtomicBool::new(false),
+            hidden: Mutex::default(),
+            lists: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn reveal(&self) {
+        self.hidden.lock().unwrap().clear();
+    }
+}
+
+impl std::fmt::Display for LaggingList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LaggingList")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for LaggingList {
+    async fn put_opts(
+        &self,
+        location: &StorePath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self.lag.load(std::sync::atomic::Ordering::SeqCst)
+            && location.as_ref().contains("/actors/")
+        {
+            self.hidden
+                .lock()
+                .unwrap()
+                .insert(location.as_ref().to_owned());
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &StorePath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &StorePath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<'static, object_store::Result<StorePath>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<StorePath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        use futures_util::StreamExt as _;
+        if prefix.is_some_and(|p| p.as_ref().contains("/actors/")) {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let hidden = self.hidden.lock().unwrap().clone();
+        self.inner
+            .list(prefix)
+            .filter(move |m| {
+                let keep = m
+                    .as_ref()
+                    .map_or(true, |m| !hidden.contains(m.location.as_ref()));
+                std::future::ready(keep)
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &StorePath,
+        to: &StorePath,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// ADR 0035, sections 1 and 3, the bug itself: with the recorded-head
+/// format enabled, a release records its head in a version 2 record; a
+/// node whose listing still hides that history refuses to activate (503,
+/// after the bounded re-list) instead of restoring an older head, and
+/// activates once the history is visible.
+#[tokio::test]
+async fn a_lagging_listing_cannot_hide_a_recorded_head() {
+    use crate::replica::{Replica, ReplicaError, SnapshotKind};
+    use wasmkeep_cluster::app_format;
+    use wasmkeep_cluster::recorded_head::{Completeness, Position};
+    use wasmkeep_storage::{Storage, StorageConfig};
+    let lagging = LaggingList::new();
+    let store: Arc<dyn ObjectStore> = Arc::clone(&lagging) as Arc<dyn ObjectStore>;
+    store
+        .put(
+            &StorePath::from(app_format::key("", "t", "default")),
+            app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let a = fast_node("a", &store);
+    let b = fast_node("b", &store);
+    for n in [&a, &b] {
+        n.identity().await.unwrap();
+        wait_lease_valid(n).await;
+    }
+    let x = ActorAddress::new("t", "c", "x").unwrap();
+    let key = a.owner_key(&x);
+    let storage_in = |dir: &std::path::Path| {
+        Storage::new(
+            StorageConfig::new(dir),
+            crate::state_dir(&StateRoot::new("", "t", "default")),
+        )
+    };
+    let a_dir = tempfile::tempdir().unwrap();
+    let storage = storage_in(a_dir.path());
+    // a writes a first snapshot (visible), then a segment the listing
+    // hides, and releases.
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let generation = hold.generation().unwrap();
+    let mut replica = Replica::restore(
+        &a,
+        &x,
+        hold.view(),
+        generation,
+        storage.db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    let mut db = storage.open("c", "x").unwrap();
+    db.exec("CREATE TABLE t(v)", &[]).unwrap();
+    db.start_capture().unwrap();
+    let all = db.snapshot().unwrap();
+    replica
+        .ship_snapshot(&all, SnapshotKind::First)
+        .await
+        .unwrap();
+    lagging.lag.store(true, std::sync::atomic::Ordering::SeqCst);
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    replica
+        .ship(&db.take_changes().unwrap().unwrap())
+        .await
+        .unwrap();
+    let h = replica.verified_head();
+    drop((db, replica));
+    assert_eq!(hold.release().await, LeaseReturn::Released);
+    let record = owner_record(&store, &key).await;
+    let recorded = record.recorded.expect("a version 2 record");
+    assert_eq!(recorded.head, h);
+    assert_eq!(recorded.set_at, generation);
+    assert_eq!(recorded.completeness, Completeness::Complete);
+
+    // b's listing misses the segment: no activation from the older head.
+    let b_dir = tempfile::tempdir().unwrap();
+    let hold = LeaseHold::acquire(&b, &x).await.unwrap();
+    let floor = hold.view().inherited().expect("the record's floor");
+    assert_eq!(floor.head, h);
+    let lists = lagging.lists.load(std::sync::atomic::Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let refused = Replica::restore(
+        &b,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(b_dir.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ReplicaError::Visibility(_))),
+        "{:?}",
+        refused.err()
+    );
+    let listed = lagging.lists.load(std::sync::atomic::Ordering::SeqCst) - lists;
+    assert!((2..=10).contains(&listed), "{listed} listings");
+    assert!(started.elapsed() < Duration::from_secs(16));
+    // Given up, the floor intact in the record.
+    drop(hold);
+    assert!(b.releases_done(Duration::from_secs(5)).await);
+    let after = owner_record(&store, &key).await;
+    assert_eq!(after.recorded.map(|r| r.head), Some(h));
+    assert!(matches!(h, Position::Known { .. }));
+
+    // Visible now: b activates at H.
+    lagging.reveal();
+    b.pending.clear_cooldown(&key);
+    let hold = LeaseHold::acquire(&b, &x).await.unwrap();
+    let restored = Replica::restore(
+        &b,
+        &x,
+        hold.view(),
+        hold.generation().unwrap(),
+        storage_in(b_dir.path()).db_path("c", "x"),
+        1 << 30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.verified_head(), h);
 }
