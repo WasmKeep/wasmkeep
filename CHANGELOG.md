@@ -9,6 +9,18 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **The change feed (ADR 0039):** `wasmkeep feed --to parquet --out DIR
+  --state DIR` reads an app's actors from the bucket, read-only, and
+  writes one append-only Parquet file per class and table for the actors
+  that changed since the last poll, with `_wk_states` saying which state
+  each row is (`state`, `deleted`, `rebase` after a restore or a recreated
+  app). A stopped or crashed feed resumes without gaps; delivery is at
+  least once, ordered per actor. Each poll regenerates
+  `views.duckdb.sql`, the latest state of every actor per table, with
+  columns united across schema changes. `wasmkeep feed compact` keeps
+  only each actor's latest state. See [the change
+  feed](docs/change-feed.md).
+
 - Actor-requested WebSocket closes preserve their code and reason even when the
   data queue is full; queued frames are discarded and their byte budget released.
 
