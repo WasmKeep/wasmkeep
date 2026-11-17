@@ -112,3 +112,46 @@ async fn residents_of_every_app_count_against_one_pool() {
     );
     assert_eq!(b_live.load(Ordering::SeqCst), 1);
 }
+
+/// An app at its own `max-resident` under a larger pool: a waiting wake-up
+/// is woken by slots coming back, not by its own failed tries (no spin).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiter_at_its_own_cap_does_not_spin() {
+    let pool = ResidentPool::new(10);
+    let live = Arc::new(AtomicUsize::new(0));
+    let l = Arc::clone(&live);
+    let m = Mailboxes::new(
+        MailboxConfig {
+            idle_timeout: Duration::from_secs(60),
+            max_resident: 1,
+            ..MailboxConfig::default()
+        },
+        move |_| {
+            let l = Arc::clone(&l);
+            async move {
+                l.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, BoxError>(Live(l))
+            }
+        },
+    );
+    m.join_pool(&pool, None);
+    // One resident, busy.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let g = Arc::clone(&gate);
+    let busy = m.submit(&addr("a"), move |_: &mut Live| {
+        Box::pin(async move { g.notified().await })
+    });
+    let busy = tokio::spawn(busy);
+    while live.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let before = m.tries();
+    let waited = m
+        .submit_wait(&addr("b"), Duration::from_millis(300), touch)
+        .await;
+    assert!(waited.is_err());
+    let tries = m.tries() - before;
+    assert!(tries < 20, "the waiter spun: {tries} tries in 300 ms");
+    gate.notify_one();
+    busy.await.unwrap().unwrap();
+}

@@ -483,6 +483,9 @@ async fn a_twin_stops_one_apps_runtime_and_it_comes_back_in_place() {
         r.status == 200
     })
     .await;
+    // The stopped runtime's actors all ended before the new one started
+    // over the same data directory.
+    assert_eq!(old.resident(), 0);
     let after = store
         .get(&object_store::path::Path::from("nodes/shop-1"))
         .await

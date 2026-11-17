@@ -51,7 +51,7 @@ pub(crate) struct AppTable {
     /// section 8): a connection beyond an app's share is refused, never
     /// waited for.
     connections: Arc<crate::shares::Shares>,
-    _members: Vec<crate::shares::Member>,
+    members: Mutex<Vec<Option<crate::shares::Member>>>,
 }
 
 /// The app a public connection belongs to (its first request's), with its
@@ -113,16 +113,30 @@ impl AppTable {
             }));
         }
         let connections = Arc::new(crate::shares::Shares::new(max_connections as u64));
-        let _members = apps
-            .iter()
-            .map(|(name, _)| connections.join(name))
-            .collect();
+        let members = Mutex::new(
+            apps.iter()
+                .map(|(name, _)| Some(connections.join(name)))
+                .collect(),
+        );
         Self {
             slots,
             by_host,
             by_name,
             connections,
-            _members,
+            members,
+        }
+    }
+
+    /// The app `i` is gone for good (deleted): its share of connections is
+    /// given back to the others.
+    pub(crate) fn release_app(&self, i: usize) {
+        if let Some(m) = self
+            .members
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(i)
+        {
+            m.take();
         }
     }
 
@@ -173,6 +187,12 @@ impl AppTable {
         if req.uri().path() == HEALTH_PATH && get {
             return text_response(StatusCode::OK, "ok\n");
         }
+        // Every hop between nodes carries its proof with several apps (ADR
+        // 0038, section 5): a node call's signature or a forward's.
+        if !carries_proof(req.headers()) {
+            tracing::warn!("a request on the cluster port with no node's proof refused");
+            return crate::cluster::unavailable("a hop must carry its proof\n");
+        }
         let mut names = req.headers().get_all(crate::cluster::APP).iter();
         let (Some(name), None) = (names.next(), names.next()) else {
             tracing::warn!("a hop naming no app, or two, refused");
@@ -194,6 +214,12 @@ impl AppTable {
             }
         }
     }
+}
+
+/// Whether a request carries a node's proof: a node call's signature, or a
+/// forward's signed client identity.
+pub(crate) fn carries_proof(headers: &hyper::HeaderMap) -> bool {
+    headers.contains_key(crate::cluster::INTERNAL) || headers.contains_key(crate::cluster::ADMITTED)
 }
 
 fn refusal(status: StatusCode) -> &'static str {
@@ -346,6 +372,43 @@ mod tests {
         // A closed connection gives its place back.
         drop(shop);
         assert!(table.admit_connection(1, &more).is_ok());
+    }
+
+    #[test]
+    fn a_deleted_app_gives_its_share_of_connections_back() {
+        let table = AppTable::new(
+            &[
+                ("acme/shop".to_owned(), vec!["shop.test".to_owned()]),
+                ("acme/blog".to_owned(), vec!["blog.test".to_owned()]),
+            ],
+            4,
+        );
+        let held: Vec<ConnectionApp> = (0..4).map(|_| ConnectionApp::default()).collect();
+        assert_eq!(
+            held.iter()
+                .filter(|c| table.admit_connection(0, c).is_ok())
+                .count(),
+            3
+        );
+        table.release_app(1);
+        let more = ConnectionApp::default();
+        assert!(
+            table.admit_connection(0, &more).is_ok(),
+            "blog's floor is free now"
+        );
+    }
+
+    #[test]
+    fn a_hop_with_no_proof_is_refused() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(crate::cluster::APP, "acme/shop".parse().unwrap());
+        assert!(!carries_proof(&h));
+        let mut signed = h.clone();
+        signed.insert(crate::cluster::INTERNAL, "v4 1 a b c".parse().unwrap());
+        assert!(carries_proof(&signed));
+        let mut forwarded = h;
+        forwarded.insert(crate::cluster::ADMITTED, "v4 1 a b c".parse().unwrap());
+        assert!(carries_proof(&forwarded));
     }
 
     #[test]

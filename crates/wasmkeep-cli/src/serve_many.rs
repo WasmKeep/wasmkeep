@@ -148,6 +148,7 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
     let limits = wasmkeep_server::ServeLimits {
         max_connections: shared.max_connections,
         cluster_connections: effective.cluster_connections,
+        front_reservations: Some(shared.front_requests),
         ..wasmkeep_server::ServeLimits::default()
     };
     let public = file.listen.public.unwrap_or(base.listen);
@@ -312,7 +313,12 @@ async fn start_runtime(
     config.socket_limits.per_actor = args.max_sockets_per_actor;
     config.socket_limits.per_app = args.max_sockets_per_app.unwrap_or(shared.requested_sockets);
     config.socket_budget = Arc::clone(&shared.socket_budget);
-    config.max_front_requests = Some(shared.front_requests);
+    // Its own max-front-requests, within the process's front reservations.
+    let front_requests = args
+        .max_front_requests
+        .unwrap_or(shared.front_requests)
+        .min(shared.front_requests);
+    config.max_front_requests = Some(front_requests);
     config.no_alarms = args.no_alarms;
     config.max_unsent_age = std::time::Duration::from_millis(args.max_unsent_age_ms);
     config.front_env = front_env;
@@ -367,7 +373,7 @@ async fn start_runtime(
         .with_egress(egress)
         .with_guest_log(shared.guest_log.clone())
         .with_cpu_budget(std::time::Duration::from_millis(args.front_cpu_budget_ms))
-        .with_max_requests(shared.front_requests);
+        .with_max_requests(front_requests);
     if let Err(e) = front.check_instantiates(Some(&service)).await {
         tracing::error!(app = %format!("{tenant}/{name}"), error = %format!("{:#}", anyhow::Error::from(e)), "the deployed front does not instantiate: its requests will fail until a deploy replaces it");
     }

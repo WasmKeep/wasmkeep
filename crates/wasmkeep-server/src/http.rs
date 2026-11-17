@@ -97,6 +97,14 @@ impl App {
                 _ => text_response(StatusCode::NOT_FOUND, "not found\n"),
             };
         }
+        // A signed hop that is refused answers 503: it never runs as a
+        // client's request (ADR 0038, section 5).
+        if let Some(actors) = &self.actors
+            && let Some(why) = actors.hop_refused(&req)
+        {
+            tracing::warn!(reason = why, "a signed hop refused");
+            return crate::cluster::unavailable("this hop is refused; retry\n");
+        }
         if (req.extensions().get::<ArrivedOnClusterPort>().is_none()
             || req.headers().contains_key(crate::cluster::FORWARDED))
             && let Some(actors) = &self.actors
@@ -384,6 +392,9 @@ pub struct ServeLimits {
     /// Connections the cluster port holds at once, when it is served
     /// ([`serve_with_cluster_listener`]); more wait in the kernel's backlog.
     pub cluster_connections: usize,
+    /// The process's front reservations, shared between the apps it serves
+    /// (ADR 0038, section 8); by default the first front's.
+    pub front_reservations: Option<usize>,
 }
 
 impl Default for ServeLimits {
@@ -393,6 +404,7 @@ impl Default for ServeLimits {
             header_read_timeout: Duration::from_secs(30),
             front_wall: Duration::from_secs(30),
             cluster_connections: crate::fds::CLUSTER_CONNECTIONS,
+            front_reservations: None,
         }
     }
 }
@@ -921,10 +933,11 @@ impl Metered {
                 let gauges: Vec<crate::metrics::Gauges> =
                     running.iter().map(ActorService::gauges).collect();
                 let process = crate::metrics::Gauges::of_process(&gauges);
-                match running.first() {
-                    Some(a) => crate::metrics::render_for(process, a.metrics_identity()),
-                    None => crate::metrics::render(process),
-                }
+                let identities: Vec<crate::metrics::Identity> = running
+                    .iter()
+                    .map(|a| a.metrics_identity().clone())
+                    .collect();
+                crate::metrics::render_for_apps(process, &identities)
             }
         }
     }

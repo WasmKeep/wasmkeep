@@ -1481,12 +1481,16 @@ impl Cluster {
         if path == HELLO_PATH {
             return Ok(Some(sender));
         }
-        let app = self
-            .peers
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&sender)
-            .map(|p| p.app.clone());
+        // The process's view of the live nodes, every runtime's listings
+        // merged, as its pins are: a node a sibling runtime listed first is
+        // live here too. This runtime's own peers cover the rest.
+        let app = self.transport.live_app(&sender).or_else(|| {
+            self.peers
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&sender)
+                .map(|p| p.app.clone())
+        });
         match app {
             Some(app) if app == self.serves => Ok(Some(sender)),
             Some(_) => Err("hop's sender is a node of another app"),
@@ -1495,6 +1499,43 @@ impl Cluster {
                 Err("hop's sender is not a live node")
             }
             None => Ok(Some(sender)),
+        }
+    }
+
+    /// Why a signed hop must be refused with 503 rather than served as a
+    /// client's request (ADR 0038, section 5): its sender is forged, of
+    /// another app or not live, or, on the cluster port, its signature does
+    /// not hold. `None` for a hop accepted, or for a request that is no
+    /// node's (no signature, or junk on the public port).
+    pub(crate) fn hop_refused(
+        &self,
+        method: &hyper::Method,
+        path: &str,
+        headers: &hyper::HeaderMap,
+        on_cluster_port: bool,
+    ) -> Option<&'static str> {
+        let given = headers.get(INTERNAL)?.to_str().ok()?;
+        if self.refuse_plaintext && !on_cluster_port {
+            // The public port in refuse mode: never a node's call.
+            return None;
+        }
+        let Some(secret) = self.secret.get() else {
+            return on_cluster_port.then_some("cluster secret not loaded yet");
+        };
+        match verify(
+            secret,
+            given,
+            now_ms(),
+            &self.node_id,
+            method,
+            path,
+            headers,
+        ) {
+            Some(_) => self
+                .sender_checked(headers, secret, "internal", given, path, on_cluster_port)
+                .err(),
+            None if on_cluster_port => Some("bad, expired or misaddressed signature"),
+            None => None,
         }
     }
 

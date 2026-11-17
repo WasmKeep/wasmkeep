@@ -671,6 +671,16 @@ fn several_apps_need_the_cluster_port_and_refuse_plain_http_between_nodes() {
     assert!(file.check_plaintext(false).is_ok());
     let e = file.check_plaintext(true).unwrap_err();
     assert!(e.contains("--cluster-plaintext accept"), "{e}");
+    // One app routed by hostname is served as several are: refused too.
+    let hosts = parse(
+        &format!(
+            "{LISTEN}{}",
+            app("acme/shop", "shop-1", "hostnames = [\"a.test\"]")
+        ),
+        at(),
+    )
+    .unwrap();
+    assert!(hosts.check_plaintext(true).is_err());
     // One app keeps today's behaviour in both modes.
     let one = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
     assert!(one.check_plaintext(true).is_ok());

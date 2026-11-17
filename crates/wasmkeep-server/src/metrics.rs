@@ -813,12 +813,26 @@ pub fn render(gauges: Gauges) -> String {
 /// far plus `gauges`, and the runtime's CPU-budget traps. Series with a
 /// class carry its tenant and app; `wasmkeep_info` its version and node.
 pub fn render_for(gauges: Gauges, identity: &Identity) -> String {
-    render_with(&METRICS, gauges, identity)
+    render_with(&METRICS, gauges, std::slice::from_ref(identity))
 }
 
-/// [`render_for`], from `m`.
-fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
-    let app = identity.app_labels();
+/// The page of a process serving several apps (ADR 0038, section 9): one
+/// `wasmkeep_info` per app's node, and each app's front series from the
+/// first scrape.
+pub(crate) fn render_for_apps(gauges: Gauges, identities: &[Identity]) -> String {
+    render_with(&METRICS, gauges, identities)
+}
+
+/// [`render_for`], from `m`, for the nodes `identities` name (at least the
+/// implicit app's).
+fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
+    let implicit = [Identity::default()];
+    let identities = if identities.is_empty() {
+        &implicit[..]
+    } else {
+        identities
+    };
+    let apps: Vec<String> = identities.iter().map(Identity::app_labels).collect();
     let mut out = String::new();
     let head = |out: &mut String, name: &str, kind: &str, help: &str| {
         let _ = writeln!(out, "# HELP {name} {help}");
@@ -845,15 +859,17 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
         "gauge",
         "Always 1: the running version, and the tenant, app and node id (in a cluster) of the node, for joining with other series.",
     );
-    let mut info = vec![
-        ("version", wasmkeep_cluster::VERSION),
-        ("tenant", identity.tenant.as_str()),
-        ("app", identity.app.as_str()),
-    ];
-    if !identity.node.is_empty() {
-        info.push(("node", identity.node.as_str()));
+    for identity in identities {
+        let mut info = vec![
+            ("version", wasmkeep_cluster::VERSION),
+            ("tenant", identity.tenant.as_str()),
+            ("app", identity.app.as_str()),
+        ];
+        if !identity.node.is_empty() {
+            info.push(("node", identity.node.as_str()));
+        }
+        let _ = writeln!(out, "wasmkeep_info{{{}}} 1", render_labels(&info));
     }
-    let _ = writeln!(out, "wasmkeep_info{{{}}} 1", render_labels(&info));
     gauge(
         &mut out,
         "wasmkeep_actors_resident",
@@ -1270,7 +1286,9 @@ fn render_with(m: &Metrics, gauges: Gauges, identity: &Identity) -> String {
             head(out, name, "counter", help);
             let mut rows = BTreeMap::new();
             for o in outcomes {
-                rows.insert(join_labels(&app, &render_labels(&[("outcome", o)])), 0);
+                for app in &apps {
+                    rows.insert(join_labels(app, &render_labels(&[("outcome", o)])), 0);
+                }
             }
             f.each(|labels, v| {
                 rows.insert(labels.to_owned(), v.load(Ordering::Relaxed));
@@ -1388,6 +1406,33 @@ mod tests {
             page.matches("# TYPE wasmkeep_budget_share_part ").count(),
             1
         );
+    }
+
+    #[test]
+    fn a_process_of_several_apps_has_an_info_line_per_app() {
+        let id = |app: &str, node: &str| Identity {
+            tenant: "acme".into(),
+            app: app.into(),
+            node: node.into(),
+        };
+        let page = render_for_apps(
+            Gauges::default(),
+            &[id("shop", "shop-1"), id("blog", "blog-1")],
+        );
+        let v = wasmkeep_cluster::VERSION;
+        for line in [
+            format!(
+                "\nwasmkeep_info{{version=\"{v}\",tenant=\"acme\",app=\"shop\",node=\"shop-1\"}} 1\n"
+            ),
+            format!(
+                "\nwasmkeep_info{{version=\"{v}\",tenant=\"acme\",app=\"blog\",node=\"blog-1\"}} 1\n"
+            ),
+            "\nwasmkeep_front_requests_total{tenant=\"acme\",app=\"blog\",outcome=\"ok\"} "
+                .to_owned(),
+        ] {
+            assert!(page.contains(&line), "no {line} in\n{page}");
+        }
+        assert_eq!(page.matches("# TYPE wasmkeep_info ").count(), 1);
     }
 
     #[test]
@@ -1723,7 +1768,7 @@ mod tests {
         inc(&m
             .events
             .get(&[("class", "c"), ("kind", "request"), ("outcome", "failed")]));
-        let page = render_with(&m, Gauges::default(), &Identity::default());
+        let page = render_with(&m, Gauges::default(), &[Identity::default()]);
         let mut names = std::collections::BTreeSet::new();
         let mut rest = exprs.as_str();
         while let Some(at) = rest.find("wasmkeep_") {
@@ -1819,7 +1864,11 @@ mod tests {
     /// A page rendered from a fresh, seeded [`Metrics`]: what a node
     /// serves before anything happened.
     fn fresh_page() -> String {
-        render_with(&Metrics::seeded(), Gauges::default(), &Identity::default())
+        render_with(
+            &Metrics::seeded(),
+            Gauges::default(),
+            &[Identity::default()],
+        )
     }
 
     /// Families whose label values are a fixed set have every series on
@@ -1932,7 +1981,7 @@ mod tests {
                 not_ready: Some(why),
                 ..Gauges::default()
             },
-            &Identity::default(),
+            &[Identity::default()],
         ));
         assert_eq!(not_ready.len(), NOT_READY_REASONS.len(), "{not_ready:?}");
         let ones: Vec<_> = not_ready.iter().filter(|(_, v)| v == "1").collect();
@@ -1980,7 +2029,7 @@ mod tests {
         m.segment_bytes.observe(5_000);
         crate::metrics::inc(&m.batched_waits.get(&[("reason", "age")]));
         m.flush_seconds.observe(Duration::from_millis(60));
-        let page = render_with(&m, Gauges::default(), &Identity::default());
+        let page = render_with(&m, Gauges::default(), &[Identity::default()]);
         for want in [
             "wasmkeep_unsent_age_seconds_count 1",
             "wasmkeep_segment_events_bucket{le=\"5\"} 1",

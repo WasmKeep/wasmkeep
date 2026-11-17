@@ -205,10 +205,14 @@ impl Supervisor {
         for (spec, slot) in apps.into_iter().zip(table.slots.iter().cloned()) {
             let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
             started.push(first_rx);
+            let index = runners.len();
             runners.push(tokio::spawn(run_app(
                 spec,
                 slot,
+                Arc::clone(&table),
+                index,
                 limits.front_wall,
+                limits.front_reservations,
                 Arc::clone(&fronts),
                 Arc::clone(&front_members),
                 stopping.clone(),
@@ -257,13 +261,32 @@ impl Supervisor {
             limits,
         )
         .await;
-        for r in runners {
-            r.abort();
+        // A runtime stopping after a verdict finishes its stop; the rest
+        // return at the stop. Bounded, then aborted.
+        let all = futures_util::future::join_all(runners.iter_mut());
+        if tokio::time::timeout(crate::http::SHUTDOWN_GRACE * 2, all)
+            .await
+            .is_err()
+        {
+            for r in &runners {
+                r.abort();
+            }
         }
         for slot in &table.slots {
             slot.set(SlotState::Starting);
         }
         served
+    }
+}
+
+/// The wait before the next start after a verdict, given the current
+/// `backoff` and how long the runtime `ran`: back to the first only after a
+/// runtime that ran for the longest wait, so repeated verdicts back off.
+fn next_wait(ran: std::time::Duration, backoff: std::time::Duration) -> std::time::Duration {
+    if ran >= RESTART_MOST {
+        RESTART_FIRST
+    } else {
+        backoff
     }
 }
 
@@ -275,10 +298,14 @@ const RESTART_MOST: std::time::Duration = std::time::Duration::from_secs(60);
 /// starts it, then waits for a verdict on its node id (it is stopped and
 /// started again in place, after a backoff) or its tombstone (stopped for
 /// good), until the process stops. `started` is sent after the first try.
+#[allow(clippy::too_many_arguments)] // one runner's state, passed once
 async fn run_app(
     spec: AppSpec,
     slot: Arc<crate::http::apps::AppSlot>,
+    table: Arc<crate::http::apps::AppTable>,
+    index: usize,
     front_wall: std::time::Duration,
+    front_reservations: Option<usize>,
     fronts: Arc<std::sync::OnceLock<Arc<crate::shares::Shares>>>,
     front_members: Arc<std::sync::Mutex<Vec<crate::shares::Member>>>,
     mut stopping: tokio::sync::watch::Receiver<bool>,
@@ -308,13 +335,16 @@ async fn run_app(
                 continue;
             }
         };
-        backoff = RESTART_FIRST;
+        let began = tokio::time::Instant::now();
         if let Some(front) = app.front.as_mut() {
             front.wall = front_wall;
             // Its app's share of the process's front reservations: the
             // first front's slots size them (every app's are the same).
-            let shares = fronts
-                .get_or_init(|| Arc::new(crate::shares::Shares::new(front.max_requests() as u64)));
+            let shares = fronts.get_or_init(|| {
+                Arc::new(crate::shares::Shares::new(
+                    front_reservations.unwrap_or_else(|| front.max_requests()) as u64,
+                ))
+            });
             if !front
                 .share
                 .as_ref()
@@ -356,16 +386,30 @@ async fn run_app(
         for t in tasks {
             t.abort();
         }
+        // Not cut by a stop of the process: this runtime's stop completes.
         actors.begin_shutdown();
         actors.shutdown(crate::http::SHUTDOWN_GRACE).await;
+        // Every actor of this runtime ends, its resources closed, before the
+        // node id may start again over the same data directory: none of
+        // them writes beside the next runtime's.
+        while !actors.drained(std::time::Duration::from_secs(5)).await {
+            tracing::warn!(app = %slot.name, still = actors.resident(), "the stopped runtime's actors have not all ended; the restart waits for them");
+        }
         // Its node id leaves the process now, whoever still holds the
         // stopped service: the next start may take it.
         actors.leave_process();
         drop(actors);
         if deleted {
             tracing::error!(app = %slot.name, "the app was deleted (wasmkeep app delete): this process no longer serves it");
+            // Its shares go back to the other apps.
+            table.release_app(index);
+            front_members
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|m| m.app() != slot.name);
             return;
         }
+        backoff = next_wait(began.elapsed(), backoff);
         tokio::select! {
             () = tokio::time::sleep(backoff) => {}
             _ = stopping.wait_for(|s| *s) => return,
@@ -402,4 +446,23 @@ pub async fn nodes_without_multi_app(
         .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon) && !n.can_multi_app)
         .map(|n| n.id)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn repeated_verdicts_back_off_and_a_long_run_starts_over() {
+        assert_eq!(
+            next_wait(Duration::from_secs(1), RESTART_FIRST * 4),
+            RESTART_FIRST * 4
+        );
+        assert_eq!(
+            next_wait(Duration::from_secs(5), RESTART_FIRST),
+            RESTART_FIRST
+        );
+        assert_eq!(next_wait(RESTART_MOST, RESTART_FIRST * 8), RESTART_FIRST);
+    }
 }

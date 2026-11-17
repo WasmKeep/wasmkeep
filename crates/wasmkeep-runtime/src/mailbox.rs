@@ -174,6 +174,8 @@ struct Inner<S> {
     waiting: std::sync::atomic::AtomicUsize,
     /// The pool its residents are drawn from too, if it joined one.
     pool: std::sync::OnceLock<Arc<crate::ResidentPool>>,
+    /// Tries to queue a job (for tests: a waiter must not spin).
+    tries: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: Send + 'static> Mailboxes<S> {
@@ -246,6 +248,7 @@ impl<S: Send + 'static> Mailboxes<S> {
                 residency_released,
                 waiting: std::sync::atomic::AtomicUsize::new(0),
                 pool: std::sync::OnceLock::new(),
+                tries: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -325,6 +328,12 @@ impl<S: Send + 'static> Mailboxes<S> {
             queued?;
             answer.await.map_err(|_| MailboxError::Gone(address))?
         }
+    }
+
+    /// How many times a job was offered to the registry, for tests.
+    #[doc(hidden)]
+    pub fn tries(&self) -> usize {
+        self.inner.tries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Draws this set's residents from `pool` too (ADR 0038, section 8),
@@ -414,6 +423,9 @@ impl<S: Send + 'static> Mailboxes<S> {
         job: Job<S>,
         counted: bool,
     ) -> Result<(), (MailboxError, Job<S>)> {
+        self.inner
+            .tries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut actors = lock(&self.inner);
         // Checked under the registry lock that `close` takes too, so no job
         // slips in after an actor decided its queue was empty.

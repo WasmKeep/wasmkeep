@@ -750,6 +750,23 @@ impl ActorService {
         self.inner.cluster.as_ref()?.tls().cloned()
     }
 
+    /// Why a signed hop in `req` must answer 503 rather than run as a
+    /// client's request (see `Cluster::hop_refused`).
+    pub(crate) fn hop_refused<B>(&self, req: &hyper::Request<B>) -> Option<&'static str> {
+        let cluster = self.inner.cluster.as_ref()?;
+        let on_cluster_port = req
+            .extensions()
+            .get::<crate::http::ArrivedOnClusterPort>()
+            .is_some();
+        let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+        cluster.hop_refused(req.method(), path, req.headers(), on_cluster_port)
+    }
+
+    /// Whether every actor has ended, its resources closed, within `limit`.
+    pub async fn drained(&self, limit: Duration) -> bool {
+        self.inner.mailboxes.drained(limit).await
+    }
+
     /// After [`Self::shutdown`]: its node id leaves its process, so the
     /// app's runtime may start again in place (ADR 0038, section 3).
     pub fn leave_process(&self) {

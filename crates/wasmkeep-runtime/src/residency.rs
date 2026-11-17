@@ -83,22 +83,23 @@ impl Residency {
         pool: Option<PoolSlot<'_>>,
         released: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Option<Self> {
+        // Its own slot first: at its own cap the pool is never touched.
+        // A slot taken and given back at once (the other limit was full)
+        // wakes nobody: no waiter could use it, and the caller would wake
+        // itself into a loop.
+        if !take(count, limit) {
+            return None;
+        }
         let pooled = match pool {
             Some((used, pool_limit, back)) => {
                 if !take(used, pool_limit) {
+                    count.fetch_sub(1, Ordering::SeqCst);
                     return None;
                 }
                 Some((Arc::clone(used), back))
             }
             None => None,
         };
-        if !take(count, limit) {
-            if let Some((used, back)) = pooled {
-                used.fetch_sub(1, Ordering::SeqCst);
-                back();
-            }
-            return None;
-        }
         Some(Self {
             reservation: Arc::new(Reservation {
                 count: Arc::clone(count),

@@ -183,6 +183,7 @@ impl NodeProcess {
                     clients: RwLock::new(Clients::new(&connector)),
                     connector,
                     nodes,
+                    live: RwLock::default(),
                 });
                 *slot = Some(Arc::clone(&t));
                 t
@@ -258,6 +259,11 @@ pub(crate) struct Transport {
     pub(crate) connector: ClusterConnector,
     /// The bucket, for `nodes/`.
     nodes: ObjectStoreBucket,
+    /// The live nodes as every runtime of the process last listed them:
+    /// each one's app, and until when its heartbeat is live (ms). The
+    /// sender of a hop is checked against it, as its pin is against the
+    /// process's pins (ADR 0038, section 5).
+    live: RwLock<std::collections::HashMap<String, (String, u64)>>,
 }
 
 impl Transport {
@@ -271,12 +277,35 @@ impl Transport {
     /// address changed hands (or its node left), drops every pooled
     /// connection, so none to a previous holder is used.
     pub(super) fn refresh_trust(&self, nodes: &[NodeInfo], horizon_ms: u64) {
+        {
+            let now = crate::cluster_tls::now_ms();
+            let mut live = self.live.write().unwrap_or_else(|p| p.into_inner());
+            for n in nodes {
+                let until = n.written_at_ms.saturating_add(horizon_ms);
+                let at = live.entry(n.id.clone()).or_insert((n.app.clone(), 0));
+                if until >= at.1 {
+                    *at = (n.app.clone(), until);
+                }
+            }
+            live.retain(|_, (_, until)| *until >= now);
+        }
         if let Some(tls) = &self.tls
             && tls.refresh(nodes, horizon_ms)
         {
             *self.clients.write().unwrap_or_else(|p| p.into_inner()) =
                 Clients::new(&self.connector);
         }
+    }
+
+    /// The app of node `id`, if a runtime of the process last listed it live.
+    pub(super) fn live_app(&self, id: &str) -> Option<String> {
+        let now = crate::cluster_tls::now_ms();
+        self.live
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .filter(|(_, until)| *until >= now)
+            .map(|(app, _)| app.clone())
     }
 
     /// Every readable heartbeat under `nodes/`, live or not, sorted by id:

@@ -644,7 +644,7 @@ impl NodeFile {
     /// Refuses `--cluster-plaintext accept` (`accept`) with several apps
     /// (ADR 0038, section 5); one app keeps today's behaviour.
     pub(crate) fn check_plaintext(&self, accept: bool) -> Result<(), String> {
-        if accept && self.apps.len() > 1 {
+        if accept && self.several() {
             return Err(format!(
                 "{}: several apps in one process talk to other nodes on the cluster port only: \
                  --cluster-plaintext accept is refused with them (finish moving the cluster to \

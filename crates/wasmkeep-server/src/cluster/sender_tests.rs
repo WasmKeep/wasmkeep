@@ -391,3 +391,72 @@ async fn an_answer_is_trusted_only_while_its_destination_node_id_is() {
     assert!(shop(), "the healthy node id's answer streams on");
     assert!(!blog(), "the lapsed node id's is cut");
 }
+
+/// The live nodes are the process's view (every runtime's listings), not
+/// one runtime's: a node of this app that a sibling app's runtime listed
+/// first is live here too, and its honest hops are taken (ADR 0038).
+#[tokio::test]
+async fn a_sender_a_sibling_runtime_listed_is_live() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(SECRET_KEY),
+            SECRET.as_bytes().to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let process = NodeProcess::new();
+    let make = |id: &str, app: &str| {
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), Arc::clone(&store));
+        config.heartbeat = Duration::from_secs(3_600);
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    let shop = make("shop-1", "shop");
+    let blog = make("blog-1", "blog");
+    shop.load_secret().await;
+    // Blog's runtime lists a new shop node before shop's runtime does.
+    let mut fresh = NodeInfo::decode(
+        format!(
+            "wasmkeep-node 2\n{}\nshop-2\nhttp://x\n0\nt/shop\n\n\nserving\n",
+            now_ms()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    fresh.id = "shop-2".into();
+    fresh.app = "t/shop".into();
+    fresh.written_at_ms = now_ms();
+    blog.transport.refresh_trust(&[fresh], 60_000);
+    let m = hyper::Method::POST;
+    let hop = call("shop-1", PATH, Some("shop-2"));
+    assert!(shop.is_internal(&m, PATH, &hop, true).is_some());
+    assert_eq!(shop.hop_refused(&m, PATH, &hop, true), None);
+}
+
+/// ADR 0038, section 5: a signed hop that is refused answers 503; it is
+/// never served as a client's request.
+#[tokio::test]
+async fn a_refused_signed_hop_is_named_for_its_503() {
+    let b = node("b").await;
+    *b.peers.write().unwrap() = HashMap::from([("a".to_owned(), peer("t/default"))]);
+    b.transport.refresh_trust(&[], 60_000);
+    let m = hyper::Method::POST;
+    // A forged sender, on either port.
+    let mut forged = call("b", PATH, Some("a"));
+    forged.insert(SENDER, "a 00".parse().unwrap());
+    assert!(b.hop_refused(&m, PATH, &forged, true).is_some());
+    assert!(b.hop_refused(&m, PATH, &forged, false).is_some());
+    // A bad signature on the cluster port.
+    let mut bad = call("b", PATH, None);
+    bad.insert(INTERNAL, "v4 1 a b c".parse().unwrap());
+    assert!(b.hop_refused(&m, PATH, &bad, true).is_some());
+    // No signature at all, or junk on the public port: no node's, a
+    // client's request as before.
+    assert_eq!(
+        b.hop_refused(&m, PATH, &hyper::HeaderMap::new(), true),
+        None
+    );
+    assert_eq!(b.hop_refused(&m, PATH, &bad, false), None);
+}
