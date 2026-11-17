@@ -239,3 +239,72 @@ fn acknowledging_outside_the_cell_is_caught() {
     let floor = (seeds() / 10).max(1);
     assert!(caught >= floor, "caught on {caught} seeds, want {floor}");
 }
+
+/// Case 13: replacement copies past content, but is a new write at the
+/// verified live head + 1. A hand-over hiding that write must refuse even
+/// when the historical source snapshot is visible and has the same digest.
+fn replacement_floor(seed: u64, record_source: bool) -> bool {
+    use wasmkeep_cluster::local_heads::{Proof, Requirement, prove};
+    use wasmkeep_cluster::replication::{
+        Listing, Segment, SegmentId, plan_restore, segment_key, snapshot_key,
+    };
+    let mut rng = Rng::new(seed);
+    let live_txid = 10 + rng.below(100);
+    let source = SegmentId {
+        generation: 1,
+        txid: 1,
+    };
+    let replacement = SegmentId {
+        generation: 7,
+        txid: live_txid + 1,
+    };
+    let checksum = 123 + seed;
+    let position = |id: SegmentId| Position::Known {
+        generation: id.generation,
+        txid: id.txid,
+        checksum,
+    };
+    let cell = Mutex::new(Some(Hold {
+        key: "owners/t/c/a".into(),
+        generation: 7,
+        version: Version("v7".into()),
+        previous: None,
+        head: HoldHead::default(),
+    }));
+    hold_cell::verify(&cell, || true, at(live_txid)).unwrap();
+    hold_cell::acknowledge(
+        &cell,
+        || true,
+        Some(position(if record_source { source } else { replacement })),
+    )
+    .unwrap();
+    let frozen = hold_cell::end(&cell).unwrap();
+    let floor = Requirement::frozen(&frozen).unwrap();
+    let hidden = [(source, Some(checksum))];
+    if prove(Some(&floor), &hidden) != Proof::Missing {
+        return false;
+    }
+    let keys = [
+        snapshot_key(source),
+        snapshot_key(replacement),
+        segment_key(&Segment {
+            id: replacement,
+            parent_generation: 7,
+        }),
+    ];
+    let plan = plan_restore(&Listing::from_keys(keys.iter().map(String::as_str))).unwrap();
+    assert_eq!(plan.head(), replacement);
+    let chain = [(replacement, Some(checksum))];
+    floor.head == position(replacement) && prove(Some(&floor), &chain) == Proof::Proven
+}
+
+#[test]
+fn replacement_records_new_position_not_historical_source() {
+    for seed in 0..seeds() {
+        assert!(replacement_floor(seed, false), "seed {seed}");
+        assert!(
+            !replacement_floor(seed, true),
+            "source-position mutant escaped: {seed}"
+        );
+    }
+}

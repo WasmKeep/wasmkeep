@@ -3013,8 +3013,8 @@ struct PrunePause {
     inner: Store,
     at: &'static str,
     paused: std::sync::atomic::AtomicBool,
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 impl std::fmt::Display for PrunePause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3049,6 +3049,15 @@ impl ObjectStore for PrunePause {
         path: &Key,
         opts: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        // pin() has completed its first marker snapshot when it asks for
+        // the pin. Pause before that GET, not before marker publication.
+        if self.at == "@pin-snapshot"
+            && path.as_ref().starts_with("restoring/")
+            && !self.paused.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         self.inner.get_opts(path, opts).await
     }
     fn list(
@@ -3061,7 +3070,32 @@ impl ObjectStore for PrunePause {
         &self,
         keys: futures_util::stream::BoxStream<'static, object_store::Result<Key>>,
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<Key>> {
-        self.inner.delete_stream(keys)
+        if self.at != "@delete" || self.paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return self.inner.delete_stream(keys);
+        }
+        let inner = self.inner.clone();
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        use futures_util::StreamExt;
+        keys.then(move |key| {
+            let inner = inner.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                let key = key?;
+                // The request has left the client: dropping its future does
+                // not cancel the remote DELETE. Explicitly drain this task
+                // before recovery clears the lock.
+                let task = tokio::spawn(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    inner.delete(&key).await?;
+                    Ok(key)
+                });
+                task.await.unwrap()
+            }
+        })
+        .boxed()
     }
     async fn list_with_delimiter(
         &self,
@@ -3338,4 +3372,129 @@ async fn actor_groups_does_not_repoll_an_exhausted_s3_listing() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].0, "state/acme/shop/actors/counter/alice/");
     assert_eq!(groups[0].1.len(), 1);
+}
+
+/// Unlike an injected error, cancellation never reaches execute's finish
+/// block. Test a landed marker and an accepted but still pending DELETE.
+#[tokio::test]
+async fn prune_dropped_future_leaves_barrier_until_late_delete_is_drained() {
+    for at in ["prunes/", "@delete"] {
+        let f = Fixture::new().await;
+        let old = f.create().await;
+        let latest = f.create().await;
+        let pause = Arc::new(PrunePause {
+            inner: f.dest.clone(),
+            at,
+            paused: false.into(),
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        let store: Store = pause.clone();
+        let mut pruning = Box::pin(prune::execute(&store, "", 0, prune_time()));
+        tokio::select! {
+            biased;
+            () = pause.entered.notified() => {},
+            result = &mut pruning => panic!("prune completed before pause: {result:?}"),
+        }
+        drop(pruning);
+        assert!(prune::markers(&f.dest, "").await.is_err());
+        assert!(prune::execute(&f.dest, "", 0, prune_time()).await.is_err());
+        assert!(prune::pin(&f.dest, "", &latest).await.is_err());
+        assert!(create(&f.args(), &f.source, "", &f.dest, "").await.is_err());
+        if at == "@delete" {
+            // The first DELETE targets old/complete. It has not landed yet.
+            let complete = format!("runs/{old}/complete");
+            assert!(optional(&f.dest, &complete).await.unwrap().is_some());
+            pause.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while optional(&f.dest, &complete).await.unwrap().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        verify(&f.dest, "", &latest, None).await.unwrap();
+        // Model the documented operator recovery only after remote I/O drains.
+        f.dest.delete(&Key::from("prune-lock")).await.unwrap();
+        prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+        assert!(load(&f.dest, "", &old).await.is_err());
+        verify(&f.dest, "", &latest, None).await.unwrap();
+        prune::markers(&f.dest, "").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn pin_paused_after_first_marker_snapshot_detects_a_whole_prune() {
+    let f = Fixture::new().await;
+    let old = f.create().await;
+    let latest = f.create().await;
+    let pause = Arc::new(PrunePause {
+        inner: f.dest.clone(),
+        at: "@pin-snapshot",
+        paused: false.into(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let store: Store = pause.clone();
+    let pinning = prune::pin(&store, "", &old);
+    let interleave = async {
+        pause.entered.notified().await;
+        prune::execute(&f.dest, "", 0, prune_time()).await.unwrap();
+        assert!(load(&f.dest, "", &old).await.is_err());
+        pause.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(pinning, interleave);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("prune raced restore pin")
+    );
+    assert!(
+        optional(&f.dest, &format!("restoring/{old}"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        load(&f.dest, "", &old).await.is_err(),
+        "failed pin cannot resurrect a run"
+    );
+    verify(&f.dest, "", &latest, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn prune_waits_for_delayed_delete_before_finalizing() {
+    let f = Fixture::new().await;
+    let old = f.create().await;
+    let latest = f.create().await;
+    let pause = Arc::new(PrunePause {
+        inner: f.dest.clone(),
+        at: "@delete",
+        paused: false.into(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let store: Store = pause.clone();
+    let pruning = prune::execute(&store, "", 0, prune_time());
+    let interleave = async {
+        pause.entered.notified().await;
+        assert!(
+            optional(&f.dest, &format!("runs/{old}/complete"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(prune::markers(&f.dest, "").await.is_err());
+        assert!(prune::pin(&f.dest, "", &old).await.is_err());
+        assert!(prune::execute(&f.dest, "", 0, prune_time()).await.is_err());
+        verify(&f.dest, "", &latest, None).await.unwrap();
+        pause.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(pruning, interleave);
+    result.unwrap();
+    prune::markers(&f.dest, "").await.unwrap();
+    assert!(load(&f.dest, "", &old).await.is_err());
+    verify(&f.dest, "", &latest, None).await.unwrap();
 }
