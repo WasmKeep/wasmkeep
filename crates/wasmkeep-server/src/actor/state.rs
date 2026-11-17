@@ -98,6 +98,8 @@ pub(super) struct ActorState {
     /// The last `ensure_ready` failed because the actor already ran a newer
     /// deploy than this node has: a temporary refusal (503), not an error.
     pub(super) behind_deploy: bool,
+    /// Instantiation was interrupted; callers may retry in a fresh mailbox.
+    pub(super) activation_interrupted: bool,
     /// What the actor's outbound HTTP may reach.
     pub(super) egress: Arc<crate::egress::EgressPolicy>,
     /// Where the instance's stdout and stderr go.
@@ -643,9 +645,10 @@ impl ActorState {
     {
         self.chain = chain;
         if let Err(e) = self.ensure_ready().await {
-            // This node is behind a deploy the actor already ran: it is
-            // updating, so retry (503), not an actor error.
-            let outcome = if std::mem::take(&mut self.behind_deploy) {
+            // A newer deploy or an interrupted activation is temporary:
+            // retry (503), rather than reporting an actor error.
+            let outcome = if std::mem::take(&mut self.behind_deploy) || self.activation_interrupted
+            {
                 Outcome::Refused(e)
             } else {
                 Outcome::Failed(e)
@@ -1207,6 +1210,7 @@ impl ActorState {
     /// dropped, so the next event redoes every step it may have missed.
     pub(super) async fn ensure_ready(&mut self) -> Result<(), String> {
         self.behind_deploy = false;
+        self.activation_interrupted = false;
         match self.prepare().await {
             // `on-init`'s own outcome: its event is already finished.
             Ok(outcome) => outcome,
@@ -1276,16 +1280,45 @@ impl ActorState {
                 .map(|c| (Arc::clone(c), self.address.clone()));
             let (mut store, meter) = self.runtime.new_metered_async_store(host);
             let started = std::time::Instant::now();
-            let instance = match self.class.pre.instantiate_async(&mut store).await {
-                Ok(i) => {
+            // Instantiation executes guest start functions, which can wait on
+            // host I/O just like an event. Keep both the wall and ownership
+            // guard active until all those functions return.
+            let instance = match limit(
+                self.limits.wall,
+                self.held.as_ref(),
+                self.class.pre.instantiate_async(&mut store),
+            )
+            .await
+            {
+                Ok(Ok(i)) => {
                     crate::metrics::METRICS
                         .instantiate_seconds
                         .observe(started.elapsed());
                     i
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     self.db = store.data_mut().db.take();
                     return Err(format!("instantiate: {e:#}"));
+                }
+                Err(cut) => {
+                    // Cancelling instantiation does not stop its blocking SQL
+                    // worker. Keep ownership until it can no longer commit.
+                    if let Err(e) = store.data_mut().drain_db().await {
+                        tracing::warn!(app = %crate::logging::app(&self.address), actor = %crate::logging::actor(&self.address), error = %e, "activation database worker failed");
+                    }
+                    // End the capture/hold before the unfinished store closes.
+                    // Start functions may have written, so give up rather than
+                    // treating an incomplete activation as a flushed event.
+                    self.drop_hold(match cut {
+                        Cut::Lease => Dropped::Lapse,
+                        Cut::Stop => Dropped::Stop,
+                        Cut::Wall(_) | Cut::Replica => Dropped::Failure,
+                    });
+                    self.activation_interrupted = true;
+                    if let Some(service) = self.service.get().and_then(std::sync::Weak::upgrade) {
+                        service.mailboxes.hibernate(&self.address);
+                    }
+                    return Err(format!("activation {cut}; retry"));
                 }
             };
             let core = ActorCore::new(&mut store, &instance).map_err(|e| format!("{e:#}"))?;

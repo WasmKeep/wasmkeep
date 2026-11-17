@@ -197,6 +197,7 @@ impl ActorService {
                         held: None,
                         owner_hint: None,
                         behind_deploy: false,
+                        activation_interrupted: false,
                         egress: Arc::clone(&egress),
                         guest_log,
                         residency,

@@ -695,7 +695,15 @@ impl HttpComponent {
             self.host(None, Arc::clone(&version.env)),
             self.cpu_budget,
         );
-        version.pre.instantiate_async(&mut store).await.map(drop)
+        tokio::time::timeout(self.wall, version.pre.instantiate_async(&mut store))
+            .await
+            .map_err(|_| {
+                wasmtime::format_err!(
+                    "front validation exceeded the {:?} wall-clock limit; retry",
+                    self.wall
+                )
+            })?
+            .map(drop)
     }
 
     /// Handles one request in a fresh instance, without the node's actors.
@@ -1235,6 +1243,22 @@ mod tests {
             (canon lift (core func $i "handle")))
         (instance $h (export "handle" (func $handle)))
         (export "wasi:http/incoming-handler@0.2.0" (instance $h)))"#;
+
+    #[tokio::test]
+    async fn activation_deadline_bounds_front_validation() {
+        let runtime = Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+        let wasm = wat::parse_str(include_str!("../tests/support/activation.wat")).unwrap();
+        let component = runtime.compile(&wasm).unwrap();
+        let mut front = HttpComponent::new(runtime, &component).unwrap();
+        front.wall = Duration::from_millis(50);
+        let result = tokio::time::timeout(Duration::from_secs(2), front.check_instantiates(None))
+            .await
+            .expect("front validation did not terminate");
+        let error = result.unwrap_err();
+        let cause = std::error::Error::source(&error).unwrap().to_string();
+        assert!(cause.contains("wall-clock"), "{cause}");
+        assert!(cause.contains("retry"), "{cause}");
+    }
 
     /// At start, a front whose required values are not set is not
     /// instantiated to test it: it would run without them, while requests

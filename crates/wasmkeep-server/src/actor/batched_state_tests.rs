@@ -79,6 +79,7 @@ fn state(
         held: None,
         owner_hint: None,
         behind_deploy: false,
+        activation_interrupted: false,
         egress: Arc::default(),
         guest_log: crate::guest_log::GuestLog::default(),
         residency,
