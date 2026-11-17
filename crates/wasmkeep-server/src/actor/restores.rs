@@ -3,6 +3,7 @@ use super::*;
 use wasmkeep_cluster::{
     actor_restore::{Request as RestoreRequest, replay},
     control::RestoreIntent,
+    replication::SegmentId,
 };
 use wasmkeep_storage::wal::{Changes, Restorer};
 
@@ -65,15 +66,70 @@ impl ActorState {
     }
 }
 
-#[derive(Debug)]
 enum Restored {
     End(&'static str, String),
     Retry,
-    Busy,
+    Busy(Box<Prepared>),
+}
+
+// Retain the validated image and exact precondition across socket draining.
+// Close callbacks may write, which must conflict with a conditional restore.
+struct Prepared {
+    checked_head: Option<SegmentId>,
+    db: Option<ActorDb>,
+    scratch: std::path::PathBuf,
+}
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        self.db.take();
+        let _ = std::fs::remove_dir_all(&self.scratch);
+    }
+}
+
+struct Admission {
+    checked_head: Arc<std::sync::OnceLock<SegmentId>>,
+    inner: Arc<ServiceInner>,
+    address: ActorAddress,
+    closed: std::sync::atomic::AtomicBool,
+}
+impl Admission {
+    fn close(&self) {
+        if !self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            *self
+                .inner
+                .restoring
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(self.address.clone())
+                .or_default() += 1;
+        }
+    }
+}
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut active = self
+                .inner
+                .restoring
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(count) = active.get_mut(&self.address) {
+                *count -= 1;
+                if *count == 0 {
+                    active.remove(&self.address);
+                }
+            }
+        }
+    }
 }
 
 impl ActorState {
-    async fn operator_restore(&mut self, intent: RestoreIntent) -> Restored {
+    async fn operator_restore(
+        &mut self,
+        intent: RestoreIntent,
+        admission: Arc<Admission>,
+        prepared: Option<Box<Prepared>>,
+    ) -> Restored {
         let Some(cluster) = self.cluster.clone() else {
             return Restored::Retry;
         };
@@ -104,6 +160,18 @@ impl ActorState {
             Ok(v) => v,
             Err(_) => return Restored::Retry,
         };
+        // Keep our own acknowledged reset's replay outcome. Otherwise any
+        // head movement after acceptance is a conflict, including another
+        // restore that would ordinarily supersede this request.
+        let head = slot.lock().await.head();
+        if replay(marker.as_deref(), None, intent.written_at_ms, &intent.id) != Some("done")
+            && admission
+                .checked_head
+                .get()
+                .is_some_and(|expected| *expected != head)
+        {
+            return Restored::End("conflict", format!("{}:{}", head.generation, head.txid));
+        }
         let replaced = match self.restore_meta("replaced").await {
             Ok(v) => v,
             Err(_) => return Restored::Retry,
@@ -168,12 +236,8 @@ impl ActorState {
             let head = slot.lock().await.head();
             return Restored::End(outcome, format!("{}:{}", head.generation, head.txid));
         }
-        if self.sockets.reserved_by(&self.address) > 0 {
-            for conn in self.sockets.of(&self.address, None) {
-                self.sockets
-                    .close(&self.address, conn, 1012, "actor restored".into());
-            }
-            return Restored::Busy;
+        if let Some(prepared) = prepared {
+            return self.finish_restore(intent, prepared, admission).await;
         }
         let request = match cluster.restore_object(&intent.key(), 4096).await {
             Ok(bytes) => match RestoreRequest::decode(&bytes) {
@@ -185,6 +249,9 @@ impl ActorState {
         let head = slot.lock().await.head();
         if request.if_head.is_some_and(|expected| expected != head) {
             return Restored::End("conflict", format!("{}:{}", head.generation, head.txid));
+        }
+        if request.if_head.is_some() {
+            let _ = admission.checked_head.set(head);
         }
         let cap = self.storage.config().max_db_bytes;
         if request.size > cap.saturating_mul(2) {
@@ -198,17 +265,8 @@ impl ActorState {
             Err(e) if e.contains("exceeds limit") => return Restored::End("refused", e),
             Err(_) => return Restored::Retry,
         };
-        let (delete, stale, _) = match self.delete_marks().await {
-            Ok(v) => v,
-            Err(_) => return Restored::Retry,
-        };
         if head.txid == u64::MAX {
             return Restored::End("refused", "transaction id exhausted".into());
-        }
-        let mut stale_debt = String::new();
-        if let Some(stale) = &stale {
-            stale_debt.push_str(&alarm_index::to_meta(Some(stale)));
-            stale_debt.push('\n');
         }
         // Scratch files are unique per attempt, including concurrent requests.
         let scratch = self.storage.scratch_dir().join(format!(
@@ -276,31 +334,86 @@ impl ActorState {
                 return Restored::End("refused", reason);
             }
         };
-        let alarm = match db.alarm() {
-            Ok(a) => a,
-            Err(_) => {
-                drop(db);
-                let _ = std::fs::remove_dir_all(&scratch);
-                return Restored::Retry;
-            }
+        if db.alarm().is_err() {
+            drop(db);
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Restored::Retry;
+        }
+        self.finish_restore(
+            intent,
+            Box::new(Prepared {
+                checked_head: admission.checked_head.get().copied(),
+                db: Some(db),
+                scratch,
+            }),
+            admission,
+        )
+        .await
+    }
+
+    async fn finish_restore(
+        &mut self,
+        intent: RestoreIntent,
+        mut prepared: Box<Prepared>,
+        admission: Arc<Admission>,
+    ) -> Restored {
+        let Some(cluster) = self.cluster.clone() else {
+            return Restored::Retry;
+        };
+        let Some(slot) = self.replica().cloned() else {
+            return Restored::Retry;
+        };
+        // Opening host metadata also supplies the local database needed to
+        // fence a cold actor before any socket is closed.
+        let (delete, stale, _) = match self.delete_marks().await {
+            Ok(v) => v,
+            Err(_) => return Restored::Retry,
         };
         let generation = slot.lock().await.generation();
-        // The previous attempt may have uploaded without receiving an answer.
-        // Fence the restored head before retiring entries not named by that head.
-        if !self.fence().await
+        // Validate both fences before any externally visible disruption. They
+        // are checked again on retries and immediately before the reset.
+        if !cluster.actor_restore_allowed().await
+            || !self.fence().await
+            || !slot.lock().await.collector().lease_valid()
             || self
                 .retire_restore_alarms(&cluster, generation)
                 .await
                 .is_err()
         {
-            drop(db);
-            let _ = std::fs::remove_dir_all(&scratch);
             return Restored::Retry;
         }
-        let Some(txid) = slot.lock().await.head().txid.checked_add(1) else {
-            drop(db);
-            let _ = std::fs::remove_dir_all(&scratch);
+        // Fencing can itself advance a newly acquired head. No advancement,
+        // including host writes, may silently weaken the exact precondition.
+        let head = slot.lock().await.head();
+        if prepared
+            .checked_head
+            .is_some_and(|expected| expected != head)
+        {
+            return Restored::End("conflict", format!("{}:{}", head.generation, head.txid));
+        }
+        let Some(txid) = head.txid.checked_add(1) else {
             return Restored::End("refused", "transaction id exhausted".into());
+        };
+        admission.close();
+        if self.sockets.reserved_by(&self.address) > 0 {
+            for conn in self.sockets.of(&self.address, None) {
+                self.sockets
+                    .close(&self.address, conn, 1012, "actor restored".into());
+            }
+            return Restored::Busy(prepared);
+        }
+        let mut stale_debt = String::new();
+        if let Some(stale) = &stale {
+            stale_debt.push_str(&alarm_index::to_meta(Some(stale)));
+            stale_debt.push('\n');
+        }
+        let Some(mut db) = prepared.db.take() else {
+            return Restored::Retry;
+        };
+        let scratch = prepared.scratch.clone();
+        let alarm = match db.alarm() {
+            Ok(a) => a,
+            Err(_) => return Restored::Retry,
         };
         let entry = if let Some(at) = alarm {
             let candidates = match cluster.alarm_entries_at(&self.address, at).await {
@@ -463,9 +576,15 @@ impl ActorState {
 }
 
 #[derive(Default)]
+struct RetryState {
+    failures: u32,
+    checked_head: Arc<std::sync::OnceLock<SegmentId>>,
+}
+
+#[derive(Default)]
 pub(super) struct Active {
     running: deletes::Active,
-    failures: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    failures: Arc<std::sync::Mutex<HashMap<String, RetryState>>>,
 }
 
 fn retry_delay(failures: u32, heartbeat: Duration) -> Duration {
@@ -490,12 +609,19 @@ pub(super) fn restores_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, a
             }
         }
         let failures = active.failures.clone();
+        let checked_head = failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .checked_head
+            .clone();
         let (inner, cluster, active) = (inner.clone(), cluster.clone(), active.running.clone());
         tokio::spawn(async move {
-            if restore_one(&inner, &cluster, intent).await {
+            if restore_one(&inner, &cluster, intent, checked_head).await {
                 let delay = {
                     let mut failures = failures.lock().unwrap_or_else(|p| p.into_inner());
-                    let count = failures.entry(key.clone()).or_default();
+                    let count = &mut failures.entry(key.clone()).or_default().failures;
                     let delay = retry_delay(*count, cluster.heartbeat_period());
                     *count = count.saturating_add(1);
                     delay
@@ -503,12 +629,10 @@ pub(super) fn restores_pass(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, a
                 // Admission is open again, but this request stays active so
                 // heartbeat passes cannot bypass its growing backoff.
                 tokio::time::sleep(delay).await;
-            } else {
-                failures
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&key);
             }
+            // Only pruning a finished/expired intent clears its checked head.
+            // A pass skipped by an app fence or ownership check can return
+            // without Retry, but must not forget an earlier precondition.
             active
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -520,6 +644,7 @@ async fn restore_one(
     inner: &Arc<ServiceInner>,
     cluster: &Arc<Cluster>,
     intent: RestoreIntent,
+    checked_head: Arc<std::sync::OnceLock<SegmentId>>,
 ) -> bool {
     let Ok(address) = ActorAddress::new(&intent.tenant, &intent.class, &intent.name) else {
         return false;
@@ -537,34 +662,24 @@ async fn restore_one(
     if !cluster.actor_restore_allowed().await {
         return false;
     }
-    struct Admission<'a>(&'a ServiceInner, ActorAddress);
-    impl Drop for Admission<'_> {
-        fn drop(&mut self) {
-            let mut active = self.0.restoring.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(count) = active.get_mut(&self.1) {
-                *count -= 1;
-                if *count == 0 {
-                    active.remove(&self.1);
-                }
-            }
-        }
-    }
-    *inner
-        .restoring
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .entry(address.clone())
-        .or_default() += 1;
-    let _admission = Admission(inner, address.clone());
+    let admission = Arc::new(Admission {
+        checked_head,
+        inner: inner.clone(),
+        address: address.clone(),
+        closed: Default::default(),
+    });
+    let mut prepared = None;
     inner.forget_owner(&address);
     for attempt in 0..=3 {
         let request = intent.clone();
+        let admission = admission.clone();
+        let checked = prepared.take();
         // Do not cancel an admitted job: timeout would allow another pass to
         // race its outcome. The mailbox and bucket operations are bounded.
         let result = inner
             .mailboxes
             .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
-                Box::pin(state.operator_restore(request))
+                Box::pin(async move { state.operator_restore(request, admission, checked).await })
             })
             .await;
         match result {
@@ -572,10 +687,11 @@ async fn restore_one(
                 cluster.end_restore_request(&intent, suffix, body).await;
                 return false;
             }
-            Ok(Restored::Busy) if attempt < 3 => {
+            Ok(Restored::Busy(checked)) if attempt < 3 => {
+                prepared = Some(checked);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            Ok(Restored::Busy) => {
+            Ok(Restored::Busy(_)) => {
                 cluster
                     .end_restore_request(&intent, "refused", "sockets did not close".into())
                     .await;

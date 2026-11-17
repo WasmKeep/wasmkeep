@@ -90,6 +90,7 @@ pub(crate) enum SendError {
 /// Why `open` refused a socket.
 #[derive(Debug)]
 pub(crate) enum OpenError {
+    RestorePending,
     ActorFull,
     NodeFull,
 }

@@ -321,7 +321,15 @@ impl ServiceInner {
         path: String,
         opener: Opener,
     ) -> Result<Accepted, crate::websocket::OpenError> {
-        let opened = self.sockets.open_as(address.clone(), opener)?;
+        let opened = {
+            // Serialize registration with the validated restore gate. An
+            // upgrade may have passed its early check before preflight ended.
+            let restoring = self.restoring.lock().unwrap_or_else(|p| p.into_inner());
+            if restoring.contains_key(&address) {
+                return Err(crate::websocket::OpenError::RestorePending);
+            }
+            self.sockets.open_as(address.clone(), opener)?
+        };
         let id = opened.id;
         let registration = Arc::new(Registration {
             sockets: Arc::clone(&self.sockets),

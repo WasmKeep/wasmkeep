@@ -91,3 +91,36 @@ fn a_call_drops_every_wasmkeep_header_the_guest_set() {
     assert_eq!(req.headers()["x-wasmkeep-actor"], "default/b/y");
     assert_eq!(req.headers()["x-other"], "kept");
 }
+
+#[tokio::test]
+async fn socket_registration_restore_gate_is_not_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        wasmkeep_runtime::Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+    let service = ActorService::new(runtime, ActorConfig::new(dir.path()), vec![]).unwrap();
+    let address = ActorAddress::new("default", "t", "late").unwrap();
+    service
+        .inner
+        .restoring
+        .lock()
+        .unwrap()
+        .insert(address.clone(), 1);
+    let result = service
+        .inner
+        .accept_socket(address.clone(), "/".into(), crate::websocket::Opener::Front)
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("restore gate admitted a socket"),
+    };
+    assert!(matches!(error, crate::websocket::OpenError::RestorePending));
+    let response = super::upgrade::open_error_response(error);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[hyper::header::RETRY_AFTER], "1");
+    use http_body_util::BodyExt as _;
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "actor restore pending\n"
+    );
+    assert_eq!(service.inner.sockets.reserved_by(&address), 0);
+}

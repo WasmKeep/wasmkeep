@@ -9,6 +9,13 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- Refused actor restores preserve existing WebSockets and upgrade admission.
+  Snapshot validation and restore fences now precede the 1012 close; accepted
+  restores retain their checked snapshot while the old sockets drain.
+  Conditional restores keep `--if-head` exact through draining and retries:
+  intervening writes produce a conflict and survive. Late upgrade refusals
+  report "actor restore pending" with `Retry-After: 1`, not capacity exhaustion.
+
 - Actor delete, app delete, actor restore and backup restore print operation IDs
   before waiting and accept `--resume ID`, which never files a new request.
   Actor outcomes are read without consuming them and last for the request TTL;
