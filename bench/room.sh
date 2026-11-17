@@ -117,6 +117,8 @@ start_node() {
     --actor "room=bench/room/target/wasm32-wasip2/release/room.wasm" \
     --data-dir "$dir/data" --cache-dir "$dir/cache" \
     --listen "$listen" --metrics-listen "$metrics" \
+    --max-sockets-per-actor "${ROOM_MAX_SOCKETS_PER_ACTOR:-$(( n + 1000 ))}" \
+    --max-sockets-per-node "${ROOM_MAX_SOCKETS_PER_NODE:-$(( n + 1000 ))}" \
     --max-connections $(( n + 1000 )) "${cluster[@]}" >"$dir/node.log" 2>&1 &
   node_pid=$!
   # A new node first checks that no other process runs its node id (about

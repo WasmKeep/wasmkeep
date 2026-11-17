@@ -206,7 +206,13 @@ impl ActorService {
                     Held::Answer(response) => return response,
                     Held::Forward => {}
                 }
-                let response = cluster.forward_upgrade(&owner, req, opener).await;
+                let Some(permit) = self.inner.sockets.reserve() else {
+                    crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                    return crate::cluster::unavailable("socket capacity exhausted; retry\n");
+                };
+                let response = cluster
+                    .forward_upgrade(&owner, req, opener, permit, self.inner.close_wait)
+                    .await;
                 if response.status().is_server_error() {
                     self.inner.forget_owner(&address);
                 }
@@ -294,7 +300,15 @@ impl ActorService {
                             Held::Answer(response) => return response,
                             Held::Forward => {}
                         }
-                        return cluster.forward_upgrade(&owner, req, opener).await;
+                        let Some(permit) = self.inner.sockets.reserve() else {
+                            crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                            return crate::cluster::unavailable(
+                                "socket capacity exhausted; retry\n",
+                            );
+                        };
+                        return cluster
+                            .forward_upgrade(&owner, req, opener, permit, self.inner.close_wait)
+                            .await;
                     }
                     Ok(Err(Some((peer, true)))) => {
                         self.inner.mailboxes.hibernate(&address);
@@ -305,7 +319,15 @@ impl ActorService {
                         // of an older version) says nothing of the peer.
                         let sent = !crate::cluster::never_forward(&req)
                             && (opener == Opener::Outside || cluster.can_handoff(&peer));
-                        let response = cluster.forward_upgrade(&peer, req, opener).await;
+                        let Some(permit) = self.inner.sockets.reserve() else {
+                            crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                            return crate::cluster::unavailable(
+                                "socket capacity exhausted; retry\n",
+                            );
+                        };
+                        let response = cluster
+                            .forward_upgrade(&peer, req, opener, permit, self.inner.close_wait)
+                            .await;
                         if sent && response.status().is_server_error() {
                             cluster.suspect(&peer);
                         }
@@ -335,6 +357,10 @@ impl ActorService {
             );
             return r;
         }
+        let Some(permit) = self.inner.sockets.reserve() else {
+            crate::metrics::refused(crate::metrics::Refusal::Capacity);
+            return crate::cluster::unavailable("socket capacity exhausted; retry\n");
+        };
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
         let path = req
             .uri()
@@ -363,6 +389,7 @@ impl ActorService {
         let inner = Arc::clone(&self.inner);
         let opening = address.clone();
         tokio::spawn(async move {
+            let permit = Arc::new(permit);
             let accepted = match inner.accept_socket(opening.clone(), path, opener).await {
                 Ok(accepted) => accepted,
                 Err(e) => {
@@ -394,7 +421,7 @@ impl ActorService {
                 Some(crate::websocket::config()),
             )
             .await;
-            inner.run_socket(accepted, ws).await;
+            inner.run_socket(accepted, ws, permit).await;
         });
         match opened_rx.await {
             Ok(Ok(())) => {}

@@ -246,9 +246,31 @@ pub(super) fn truncate_reason(mut reason: String) -> String {
     reason
 }
 
+/// Removes an actor slot even if its owning task is cancelled.
+struct Registration {
+    sockets: Arc<Sockets>,
+    id: u64,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.sockets.remove(self.id);
+    }
+}
+
+/// Cancels the separately spawned writer if the reader is aborted or panics.
+struct CancelWriter(tokio::task::AbortHandle);
+
+impl Drop for CancelWriter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A socket registered with its actor and past `on-websocket-open`, whose
 /// stream does not exist yet (the upgrade answers 101 after this).
 pub(super) struct Accepted {
+    registration: Arc<Registration>,
     address: ActorAddress,
     id: u64,
     outgoing: tokio::sync::mpsc::Receiver<crate::websocket::Outgoing>,
@@ -301,6 +323,10 @@ impl ServiceInner {
     ) -> Result<Accepted, crate::websocket::OpenError> {
         let opened = self.sockets.open_as(address.clone(), opener)?;
         let id = opened.id;
+        let registration = Arc::new(Registration {
+            sockets: Arc::clone(&self.sockets),
+            id,
+        });
         let result = self
             .mailboxes
             .submit_wait(&address, self.wall, move |s: &mut ActorState| {
@@ -324,6 +350,7 @@ impl ServiceInner {
             }
         };
         Ok(Accepted {
+            registration,
             address,
             id,
             outgoing: opened.outgoing,
@@ -345,6 +372,7 @@ impl ServiceInner {
     /// before its stream existed, so the actor sees an abnormal close.
     pub(super) async fn abandon_socket(self: Arc<Self>, accepted: Accepted) {
         let Accepted {
+            registration: _registration,
             address,
             id,
             outgoing,
@@ -366,12 +394,14 @@ impl ServiceInner {
         self: Arc<Self>,
         accepted: Accepted,
         ws: tokio_tungstenite::WebSocketStream<S>,
+        permit: Arc<crate::socket_limits::SessionPermit>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         use futures_util::{SinkExt, StreamExt};
 
         let Accepted {
+            registration,
             address,
             id,
             mut outgoing,
@@ -381,7 +411,13 @@ impl ServiceInner {
             ..
         } = accepted;
         let (mut sink, mut stream) = ws.split();
+        // The writer owns half of the transport. Even an aborted reader must
+        // not release its reservations while that half is still alive.
+        let writer_permit = Arc::clone(&permit);
+        let writer_registration = Arc::clone(&registration);
         let mut writer = tokio::spawn(async move {
+            let _permit = writer_permit;
+            let _registration = writer_registration;
             while let Some(out) = outgoing.recv().await {
                 let msg = match out {
                     Outgoing::Message(m) => m,
@@ -399,6 +435,7 @@ impl ServiceInner {
             }
             let _ = sink.close().await;
         });
+        let _cancel_writer = CancelWriter(writer.abort_handle());
 
         if let Some((code, reason)) = refusal {
             self.sockets

@@ -171,7 +171,8 @@ fn wasmkeep(label: &str, wasm: &Path) -> Server {
         .arg("--cache-dir")
         .arg(dir.0.join("cache"))
         .args(["--listen", &addr.to_string(), "--max-instances", "2000"])
-        .args(["--max-connections", &MAX_CONNECTIONS.to_string()]);
+        .args(["--max-connections", &MAX_CONNECTIONS.to_string()])
+        .args(["--max-sockets-per-node", "0"]);
     if let Some(bucket) = BUCKET.get() {
         // A one-node cluster: a node with a bucket is a cluster node. Plain
         // HTTP between nodes is accepted, as there are no others.
@@ -799,17 +800,22 @@ mod tests {
     fn the_minimum_limit_keeps_every_actor_resident_on_the_server() {
         // What `wasmkeep serve --max-instances 2000` wants resident.
         let wanted = 2000 / 10 * 9;
+        let requested = wasmkeep_server::fds::Budget {
+            public_connections: MAX_CONNECTIONS,
+            resident_actors: wanted,
+            ..Default::default()
+        };
         for quick in [false, true] {
             let workload = Workload::for_quick(quick);
             let limit = workload.minimum_descriptors() as u64;
-            let (_, resident) = wasmkeep_server::fds::budget(limit, MAX_CONNECTIONS, wanted);
+            let resident = wasmkeep_server::fds::budget(limit, requested).resident_actors;
             assert!(
                 resident >= workload.actors + 2,
                 "{quick}: {resident} at {limit}"
             );
             // And the floor is not padded past the next power of two.
             let below = limit / 2;
-            let (_, resident) = wasmkeep_server::fds::budget(below, MAX_CONNECTIONS, wanted);
+            let resident = wasmkeep_server::fds::budget(below, requested).resident_actors;
             assert!(
                 resident < workload.actors + 2,
                 "{quick}: {limit} is not minimal"

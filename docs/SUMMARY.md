@@ -91,3 +91,6 @@ are designs, not available capabilities. -->
 - [0034 Batched plain writes (proposed)](adr/0034-batched-plain-writes.md)
 - [0035 A recorded head on hand-over (proposed)](adr/0035-a-recorded-head-on-hand-over.md)
 - [0036 Per-node ingress rate limits (proposed)](adr/0036-per-node-ingress-rate-limits.md)
+- [0037 Socket session admission (proposed)](adr/0037-socket-session-admission.md)
+
+- [Socket admission options](reference/socket-limits.md)

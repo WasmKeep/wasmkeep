@@ -1005,3 +1005,173 @@ async fn a_parked_room_with_a_socket_never_expires() {
     stays_open(&mut client, Duration::from_secs(4)).await;
     assert_eq!(chat_holder(&store, "lobby").await.as_deref(), Some("a"));
 }
+
+/// Both the owner and a relay reserve before 101; close and TCP abort
+/// return the process slot so another upgrade can be admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_caps_refuse_and_release_local_and_relay_sessions() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::{connect_async, tungstenite::Error};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let make = |limit| {
+        move |c: &mut ActorConfig| {
+            c.websocket_close_wait = Duration::from_millis(500);
+            c.socket_limits.per_actor = 2;
+            c.socket_budget = wasmkeep_server::SocketBudget::new(limit, limit);
+        }
+    };
+    let a = node_configured(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_secs(30),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        make(2),
+    )
+    .await;
+    let b = node_configured(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        make(1),
+    )
+    .await;
+    settle().await;
+    let url = |addr| format!("ws://{addr}/actor/chat/capped");
+    let (mut owner, _) = connect_async(url(a.addr)).await.unwrap();
+    let (relay, _) = connect_async(url(b.addr)).await.unwrap();
+    assert_eq!(b.service.socket_sessions(), 1);
+    for addr in [a.addr, b.addr] {
+        match connect_async(url(addr)).await.unwrap_err() {
+            Error::Http(r) => {
+                assert_eq!(r.status(), 503);
+                assert!(r.headers().contains_key("retry-after"));
+            }
+            e => panic!("expected HTTP capacity refusal: {e}"),
+        }
+    }
+    drop(relay);
+    eventually("relay abort releases its permit", async || {
+        b.service.socket_sessions() == 0
+    })
+    .await;
+    eventually("owner drops aborted relay", async || {
+        a.service.socket_sessions() == 1
+    })
+    .await;
+    owner.close(None).await.unwrap();
+    while let Some(Ok(_)) = owner.next().await {}
+    eventually("close releases owner permit", async || {
+        a.service.socket_sessions() == 0
+    })
+    .await;
+    let (again, _) = connect_async(url(b.addr)).await.unwrap();
+    drain(&store, "a").await;
+    // Keep the client open and idle: it never acknowledges the owner close.
+    eventually("owner finishes closing its transport", async || {
+        a.service.socket_sessions() == 0
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while b.service.socket_sessions() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("owner EOF must promptly release the idle ingress permit");
+    drop(again);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_caps_release_when_relay_owner_refuses() {
+    use tokio_tungstenite::{connect_async, tungstenite::Error};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node_configured(
+        "a",
+        da.path(),
+        &store,
+        Duration::from_secs(30),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        |c| {
+            c.socket_limits.per_actor = 0;
+        },
+    )
+    .await;
+    // Establish ownership without a socket.
+    send(a.addr, "GET", "/actor/chat/refused", "").await;
+    let b = node_configured(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        |c| {
+            c.socket_budget = wasmkeep_server::SocketBudget::new(1, 1);
+        },
+    )
+    .await;
+    settle().await;
+    for _ in 0..2 {
+        match connect_async(format!("ws://{}/actor/chat/refused", b.addr))
+            .await
+            .unwrap_err()
+        {
+            Error::Http(r) => assert_eq!(r.status(), 503),
+            e => panic!("expected refusal: {e}"),
+        }
+        assert_eq!(b.service.socket_sessions(), 0);
+        assert_eq!(a.service.socket_sessions(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_caps_release_after_owner_connect_failure() {
+    use tokio_tungstenite::connect_async;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, proxy) = node_behind_proxy("a", da.path(), &store, "chat", chat_wasm()).await;
+    let b = node_configured(
+        "b",
+        db.path(),
+        &store,
+        Duration::from_secs(30),
+        &["chat"],
+        chat_wasm(),
+        Duration::from_secs(30),
+        "",
+        |c| {
+            c.socket_budget = wasmkeep_server::SocketBudget::new(1, 1);
+        },
+    )
+    .await;
+    settle().await;
+    let (owner, _) = connect_async(format!("ws://{}/actor/chat/offline", a.addr))
+        .await
+        .unwrap();
+    drop(owner);
+    eventually("owner transport closed", async || {
+        a.service.socket_sessions() == 0
+    })
+    .await;
+    proxy.refuse_connections().await;
+    let failed = connect_async(format!("ws://{}/actor/chat/offline", b.addr)).await;
+    assert!(failed.is_err(), "the owner listener is stopped");
+    assert_eq!(b.service.socket_sessions(), 0);
+    assert_eq!(a.service.socket_sessions(), 0);
+}

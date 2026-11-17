@@ -782,6 +782,22 @@ async fn sample(args: SampleArgs) {
             break;
         };
         let page = http_get(server, &host, &path).await.unwrap_or_default();
+        // Separate records preserve the existing sample/merge format.
+        for name in [
+            "wasmkeep_socket_limit_requested",
+            "wasmkeep_socket_limit_effective",
+            "wasmkeep_socket_actor_limit_requested",
+            "wasmkeep_socket_actor_limit_effective",
+            "wasmkeep_socket_sessions",
+        ] {
+            writeln!(
+                out,
+                "socket_limit {} {name} {}",
+                now_ns(),
+                metric(&page, name, &[])
+            )
+            .unwrap();
+        }
         writeln!(
             out,
             "sample {} {ticks} {rss} {fds} {} {} {} {}",
