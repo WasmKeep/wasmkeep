@@ -2422,3 +2422,6 @@ impl wasmkeep_cluster::lease::Clock for WallClock {
 
 #[path = "feed.rs"]
 mod feed;
+
+#[path = "s3.rs"]
+mod s3;

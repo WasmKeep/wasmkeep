@@ -59,9 +59,9 @@ def address():
         return f"127.0.0.1:{listener.getsockname()[1]}"
 
 
-def http(addr, path, method="GET"):
+def http(addr, path, method="GET", body=None):
     request = urllib.request.Request(f"http://{addr}{path}", method=method,
-                                     data=b"" if method == "POST" else None)
+                                     data=body if body is not None else (b"" if method == "POST" else None))
     # Ignore proxy environment variables for private listeners.
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5) as r:
         return r.read().decode()
@@ -87,6 +87,7 @@ def main():
     binary = str(Path(os.environ["DRILL_BIN"]).resolve())
     wasm = Path(os.environ["DRILL_WASM"]).resolve()
     fixture = wasm.read_bytes()
+    blob_wasm = Path(os.environ["DRILL_BLOB_WASM"]).resolve()
     aws = ["aws", "--no-cli-pager"]
     if os.environ.get("AWS_ENDPOINT"):
         aws += ["--endpoint-url", os.environ["AWS_ENDPOINT"]]
@@ -107,6 +108,7 @@ def main():
     failure = None
     owned = False
     def measure(name, action):
+        print(f"{name}...", flush=True)
         start = time.monotonic_ns()
         result = action()
         rows.append((name, time.monotonic_ns() - start, "ns"))
@@ -132,7 +134,7 @@ def main():
                 "--bucket", root, "--node-id", name, "--listen", addr,
                 "--advertise", f"http://{addr}", "--cluster-plaintext", "accept",
                 "--metrics-listen", metrics, "--data-dir", str(directory / name),
-                *(["--no-alarms"] if name == "restored" else [])],
+                *(["--no-alarms"] if "restored" in name else [])],
                 stdout=log, stderr=log, env={**os.environ, "TOKIO_WORKER_THREADS": "2"})
             children.append(child)
             deadline = time.monotonic() + 60
@@ -145,6 +147,86 @@ def main():
                 except (OSError, urllib.error.URLError):
                     time.sleep(0.2)
             raise RuntimeError(f"{name} did not become ready")
+
+        def files_drill():
+            # Even with --source, these writes stay in the owned scratch root.
+            # The fleet's running soak fixture is never changed or redeployed.
+            live = scratch + "/files-source"
+            backup = scratch + "/files-archive"
+            target = scratch + "/files-restored"
+            assets = directory / "assets"
+            assets.mkdir()
+            (assets / "fixture.txt").write_text("static fixture")
+            file_project = directory / "files.toml"
+            file_project.write_text(
+                '[app]\ntenant = "restore-drill"\nname = "fixture"\n'
+                '[classes.blob]\ncomponent = ' + json.dumps(str(blob_wasm)) +
+                '\naccess = "open"\n[assets]\ndir = ' + json.dumps(str(assets)) + '\n')
+            cli("deploy", "--project", str(file_project), "--no-build", "--yes", "--bucket", live)
+            original, _ = node(live, "files-source")
+            route = "/actor/blob/file"
+            http(original, route + "/touch", "POST")
+            http(original, route + "/b/saved.txt?type=text/plain", "PUT", b"saved file")
+            measure("files_backup_create", lambda: cli("backup", "create", "--bucket", live,
+                    "--app", "restore-drill/fixture", "--to", backup))
+            cli("backup", "verify", "--from", backup)
+            measure("files_backup_restore", lambda: cli("backup", "restore", "--from", backup,
+                    "--app", "restore-drill/fixture", "--bucket", target))
+            # Check the archived code before starting it, just as for the soak.
+            for obj in objects(target):
+                if obj["Key"].endswith(".wasm"):
+                    dest = directory / "file-component.wasm"
+                    run(aws + ["get-object", "--bucket", bucket, "--key", obj["Key"], str(dest)])
+                    if not obj["Key"].endswith("/blob.wasm") or dest.read_bytes() != blob_wasm.read_bytes():
+                        raise RuntimeError("unexpected file fixture component")
+            recovered, _ = node(target, "files-restored")
+            if http(recovered, route + "/b/saved.txt") != "saved file":
+                raise RuntimeError("whole-app restore lost the actor file")
+            if http(recovered, "/fixture.txt") != "static fixture":
+                raise RuntimeError("whole-app restore lost the static asset")
+
+            def restore_actor():
+                cli("actor", "restore", "blob/file", "--app", "restore-drill/fixture",
+                    "--bucket", target, "--from", backup)
+
+            # Rewinding rows within the same incarnation must keep newer bytes.
+            http(recovered, route + "/b/saved.txt", "PUT", b"newer file")
+            restore_actor()
+            if http(recovered, route + "/b/saved.txt") != "newer file":
+                raise RuntimeError("actor restore rewound file contents")
+            http(recovered, route + "/delete-durable", "POST")
+            # S3 Last-Modified has whole-second resolution. A restore whose
+            # request ties the delete's timestamp is correctly superseded.
+            time.sleep(1.1)
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    http(recovered, route + "/touch", "POST")
+                    break
+                except urllib.error.HTTPError as error:
+                    if error.code != 503 or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.2)
+            http(recovered, route + "/b/current.txt", "PUT", b"current incarnation")
+            def current_key():
+                keys = [o["Key"] for o in objects(target)
+                        if "/blobs/" in o["Key"] and o["Key"].endswith("/current.txt")]
+                if len(keys) != 1:
+                    raise RuntimeError("expected exactly one current file namespace")
+                return keys[0]
+            namespace = current_key()
+            restore_actor()
+            if current_key() != namespace or http(recovered, route + "/b/current.txt") != "current incarnation":
+                raise RuntimeError("actor restore changed the current file namespace")
+            try:
+                http(recovered, route + "/b/saved.txt")
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
+            else:
+                raise RuntimeError("actor restore resurrected the deleted file namespace")
+            rows.extend([("files_checked", 1, "count"), ("assets_checked", 1, "count"),
+                         ("actor_file_restores_checked", 2, "count")])
 
         try:
             if objects(scratch):
@@ -216,6 +298,7 @@ def main():
                 if errors or not acknowledgements:
                     raise RuntimeError(f"online writer failed or made no progress: {errors}")
                 rows.append(("concurrent_writes_acked", len(acknowledgements), "count"))
+            files_drill()
         except BaseException as error:
             failure = error
         finally:
