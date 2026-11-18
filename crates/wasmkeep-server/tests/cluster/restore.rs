@@ -1319,3 +1319,55 @@ async fn actor_restore_keeps_the_current_blob_incarnation() {
         Some(drawn)
     );
 }
+
+/// The backup-restore drill's files sequence: written, staged (the
+/// backup), written again, restored, deleted durably, recreated and
+/// restored again from the same stage. Each restore ends `done`, and no
+/// request is deleted before its outcome exists: the command waiting on
+/// it reads a request gone with no outcome as dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_restore_twice_around_a_durable_delete_always_publishes_before_ending() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(store.clone(), Arc::new(AtomicBool::new(false))));
+    let seen: Arc<dyn ObjectStore> = flaky.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_configured(
+        "restore-twice",
+        dir.path(),
+        &seen,
+        Duration::from_millis(200),
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |_| {},
+    )
+    .await;
+    super::deletes::write(a.addr, "drill", 2).await;
+    let backup = actor_restore_stage(&store, "drill").await;
+    let r = send_runnable(a.addr, "POST", "/actor/t/drill/durable", "").await;
+    assert_eq!(r.body.trim(), "3", "{}", r.body);
+    let first = actor_restore_submit(&store, "drill", "6666666666666666", &backup).await;
+    actor_restore_outcome(&store, &first, "done").await;
+    assert_eq!(super::deletes::read(a.addr, "drill").await, "2");
+    let r = send_runnable(a.addr, "POST", "/actor/t/drill/delete-durable", "").await;
+    assert_eq!(r.body.trim(), "deleted", "{}", r.body);
+    // A whole second later, as the drill waits for Last-Modified.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let r = send_runnable(a.addr, "POST", "/actor/t/drill/durable", "").await;
+    assert_eq!(r.body.trim(), "1", "{}", r.body);
+    let second = actor_restore_submit(&store, "drill", "7777777777777777", &backup).await;
+    actor_restore_outcome(&store, &second, "done").await;
+    assert_eq!(super::deletes::read(a.addr, "drill").await, "2");
+    eventually("both requests ended", async || {
+        store.head(&Key::from(first.clone())).await.is_err()
+            && store.head(&Key::from(second.clone())).await.is_err()
+    })
+    .await;
+    assert_eq!(
+        flaky
+            .restore_requests_ended_without_outcome
+            .load(Ordering::SeqCst),
+        0
+    );
+}

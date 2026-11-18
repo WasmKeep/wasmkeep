@@ -166,7 +166,10 @@ has been collected, restore requires history retention of at least 3003 seconds
 with the default clock skew; the default 3600 seconds clears this bound.
 Shorter retention refuses restoration when the reset is missing.
 Only the `.done` outcome acknowledges restoration; the request disappearing
-alone does not. During a rolling upgrade, older nodes do not process restore
+alone does not. Right after `.done`, the actor can answer 503 with
+`Retry-After: 1` for a moment, while the owner ships the replacement's
+snapshot and ends its previous hold of the actor; clients retry it like any
+other 503. During a rolling upgrade, older nodes do not process restore
 requests or preserve their markers through deletes: finish upgrading before
 using this command.
 

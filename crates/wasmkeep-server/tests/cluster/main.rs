@@ -963,6 +963,10 @@ struct Flaky {
     /// Deletes of delete requests (`.../deletes/...`, ADR 0028) fail
     /// while set.
     fail_request_deletes: Arc<AtomicBool>,
+    /// Deletes of actor-restore requests (`.../restores/<..>/<id>`, no
+    /// suffix) made while no outcome of theirs existed: an operator would
+    /// read such a request as dropped.
+    restore_requests_ended_without_outcome: Arc<std::sync::atomic::AtomicU32>,
     /// Keep operator deletes pending while another replacement commits.
     hide_delete_requests: Arc<AtomicBool>,
     /// Listings of ownership records (`.../owners/...`, an idle-expiry
@@ -997,6 +1001,7 @@ impl Flaky {
             releases_held: Arc::default(),
             release_held_until_ms: Arc::default(),
             fail_request_deletes: Arc::default(),
+            restore_requests_ended_without_outcome: Arc::default(),
             hide_delete_requests: Arc::default(),
             delay_owner_lists_ms: Arc::default(),
             owner_lists_taken: Arc::default(),
@@ -1350,6 +1355,7 @@ impl ObjectStore for Flaky {
     {
         use futures_util::StreamExt as _;
         let refuse = Arc::clone(&self.fail_request_deletes);
+        let unannounced = Arc::clone(&self.restore_requests_ended_without_outcome);
         let (inner, hold, held, applied, release) = (
             Arc::clone(&self.inner),
             Arc::clone(&self.hold_alarm_deletes),
@@ -1360,6 +1366,7 @@ impl ObjectStore for Flaky {
         locations
             .then(move |location| {
                 let refuse = Arc::clone(&refuse);
+                let unannounced = Arc::clone(&unannounced);
                 let (inner, hold, held, applied, mut release) = (
                     Arc::clone(&inner),
                     Arc::clone(&hold),
@@ -1377,6 +1384,21 @@ impl ObjectStore for Flaky {
                             store: "flaky",
                             source: "delete refused".into(),
                         });
+                    }
+                    if path.as_ref().contains("/restores/")
+                        && path.filename().is_some_and(|name| !name.contains('.'))
+                    {
+                        let mut announced = false;
+                        for suffix in ["done", "conflict", "refused", "absent", "superseded"] {
+                            let outcome =
+                                object_store::path::Path::from(format!("{path}.{suffix}"));
+                            announced |= object_store::ObjectStoreExt::head(&inner, &outcome)
+                                .await
+                                .is_ok();
+                        }
+                        if !announced {
+                            unannounced.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                     let one = |p: object_store::path::Path| {
                         futures_util::stream::once(async move { Ok(p) }).boxed()

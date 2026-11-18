@@ -9,6 +9,15 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **`actor restore` no longer reports a done restore as dropped.** The
+  command read the outcomes, then the request: a node ending the request
+  between the two (outcome written, then request deleted) made it exit 1
+  with "restore request dropped" although the actor was restored. It now
+  reads the request first. A request that is really gone with no outcome
+  says so: it expired or was removed, nothing says the actor was
+  restored, and a new request is needed. The backup-restore drill
+  retries a 503 after an actor restore, as a client must.
+
 - **A room never wedges at the default CPU budget.** Every per-event path
   of the room is bounded whatever the room went through: publish and
   history no longer load the whole 2,000-message window, a round reads
