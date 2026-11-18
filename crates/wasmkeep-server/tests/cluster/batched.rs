@@ -327,10 +327,34 @@ async fn next_after_a_write(addr: SocketAddr) -> Duration {
     started.elapsed()
 }
 
+/// The reasons `wasmkeep_plain_events_dropped_total` counted anything
+/// under in this process, with their counts.
+fn dropped_by_reason() -> Vec<(&'static str, u64)> {
+    [
+        "stop",
+        "failure",
+        "lapse",
+        "lost_lease",
+        "panic",
+        "app_deleted",
+        "unbarriered",
+    ]
+    .into_iter()
+    .map(|why| (why, wasmkeep_server::metrics::plain_events_dropped_by(why)))
+    .filter(|(_, n)| *n > 0)
+    .collect()
+}
+
 /// A redeploy from batched to strict reaches a resident actor at a
 /// `Flushed` barrier before its next event, and its writes go up inline
 /// from then on; nothing is given up (ADR 0034, section 1). Strict to
 /// batched needs no flush.
+///
+/// The hold runs under a 3 s lease: its segments take 1.2 s, and under
+/// the usual 1 s lease a runner stalled for 0.8 s lapses the hold while
+/// one is in flight, which ADR 0034 (sections 3 and 6) counts as given up
+/// whatever the mode (one `failure` when the segment lands `Late`). The
+/// segment in flight at the switch is held, not timed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mode_switch_waits_for_a_flushed_barrier() {
     use wasmkeep_server::apps::{Changes, Writes};
@@ -351,12 +375,13 @@ async fn a_mode_switch_waits_for_a_flushed_barrier() {
         .await
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let (node, service) = node_app(
+    let (node, service) = node_app_leased(
         "a",
         dir.path(),
         &store,
         Duration::from_secs(30),
         Duration::from_millis(100),
+        LeaseConfig::new(3_000, 200, 200, 100).unwrap(),
     )
     .await;
     let r = send_runnable(node.addr, "POST", "/actor/t/x/plain", "").await;
@@ -366,25 +391,40 @@ async fn a_mode_switch_waits_for_a_flushed_barrier() {
     let batched = next_after_a_write(node.addr).await;
     assert!(batched < Duration::from_millis(800), "batched: {batched:?}");
 
-    // A segment in flight as the version turns strict (its upload takes
-    // longer than the node takes to follow the deploy).
-    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    // A segment in flight as the version turns strict: its upload is held
+    // until the next write is seen waiting for it.
+    flaky.hold_wal_puts.send_replace(true);
     let r = send(node.addr, "POST", "/actor/t/x/plain", "").await;
     assert_eq!(r.status, 200, "{}", r.body);
+    let started = std::time::Instant::now();
+    while flaky.held_wal_puts.load(Ordering::SeqCst) == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no segment went up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let done = app
         .deploy_changes(&rt, deploy(Writes::Strict))
         .await
         .unwrap();
     runs_deploy(&service, done.current.seq).await;
+    let addr = node.addr;
+    let write = tokio::spawn(async move { send(addr, "POST", "/actor/t/x/plain", "").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !write.is_finished(),
+        "the switch waits for the segment in flight"
+    );
+    flaky.hold_wal_puts.send_replace(false);
+    let r = write.await.unwrap();
+    assert_eq!(r.status, 200, "{}", r.body);
     let strict = next_after_a_write(node.addr).await;
     assert!(strict >= Duration::from_millis(1_000), "strict: {strict:?}");
     let r = send(node.addr, "GET", "/actor/t/x/plain", "").await;
-    assert_eq!((r.status, r.body.trim()), (200, "4"), "{}", r.body);
-    assert_eq!(
-        wasmkeep_server::metrics::plain_events_dropped_total(),
-        0,
-        "nothing given up"
-    );
+    assert_eq!((r.status, r.body.trim()), (200, "5"), "{}", r.body);
+    assert_eq!(dropped_by_reason(), [], "nothing given up");
+    assert_eq!(wasmkeep_server::metrics::plain_events_dropped_total(), 0);
 
     // And back: no flush needed.
     let done = app
@@ -397,6 +437,9 @@ async fn a_mode_switch_waits_for_a_flushed_barrier() {
         again < Duration::from_millis(800),
         "batched again: {again:?}"
     );
+    let r = send(node.addr, "GET", "/actor/t/x/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "6"), "{}", r.body);
+    assert_eq!(dropped_by_reason(), [], "nothing given up switching back");
 }
 
 /// An idle batched actor's step before the drop flushes it: nothing it

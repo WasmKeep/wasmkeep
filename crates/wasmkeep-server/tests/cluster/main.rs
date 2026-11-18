@@ -1810,6 +1810,27 @@ async fn node_app(
     idle: Duration,
     follow: Duration,
 ) -> (Node, ActorService) {
+    node_app_leased(
+        id,
+        data,
+        store,
+        idle,
+        follow,
+        LeaseConfig::new(1_000, 200, 200, 100).unwrap(),
+    )
+    .await
+}
+
+/// [`node_app`] under `lease`: a test whose uploads outlast the usual 1 s
+/// lease gives it room, so a stalled runner does not lapse its hold.
+async fn node_app_leased(
+    id: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    idle: Duration,
+    follow: Duration,
+    lease: LeaseConfig,
+) -> (Node, ActorService) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let runtime = Runtime::new(&RuntimeConfig {
@@ -1833,7 +1854,7 @@ async fn node_app(
     config.batched = version.batched;
     config.mailbox.idle_timeout = idle;
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
-    cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
+    cluster.lease = lease;
     cluster.heartbeat = Duration::from_millis(100);
     cluster.failover_wait = Some(Duration::ZERO);
     config.cluster = Some(cluster);
