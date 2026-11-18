@@ -37,6 +37,22 @@ fn blob_error(e: blobs::BlobError) -> (u16, Vec<u8>) {
     (status, text.into_bytes())
 }
 
+/// The bytes of `b` added up, eight at a time: cheap enough for the
+/// event's CPU budget over 16 MiB on a slow machine.
+fn blob_byte_sum(b: &[u8]) -> u64 {
+    const BYTES: u64 = 0x00ff_00ff_00ff_00ff;
+    const PAIRS: u64 = 0x0000_ffff_0000_ffff;
+    let mut words = b.chunks_exact(8);
+    let mut sum = 0u64;
+    for w in &mut words {
+        let w = u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+        let pairs = (w & BYTES) + ((w >> 8) & BYTES);
+        let quads = (pairs & PAIRS) + ((pairs >> 16) & PAIRS);
+        sum += (quads & 0xffff_ffff) + (quads >> 32);
+    }
+    sum + words.remainder().iter().map(|&x| u64::from(x)).sum::<u64>()
+}
+
 /// The answer to a blob route, or `None` for a path that is not one.
 fn blob_route(
     method: &str,
@@ -141,7 +157,15 @@ fn blob_route(
                     Ok(s) => s,
                     Err(e) => return Some(blob_error(e)),
                 };
-                let bytes: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+                // `i % 251`, made by copying one period: cheap enough for
+                // the event's CPU budget on a slow machine (computing each
+                // byte of 16 MiB is not).
+                let period: Vec<u8> = (0..251u8).collect();
+                let mut bytes = Vec::with_capacity(n);
+                while bytes.len() < n {
+                    let take = (n - bytes.len()).min(period.len());
+                    bytes.extend_from_slice(&period[..take]);
+                }
                 // `check-write`, `write`, waiting when it takes nothing: the
                 // stream's own protocol, at most C bytes a write.
                 let mut rest = &bytes[..];
@@ -181,7 +205,7 @@ fn blob_route(
                         let (mut read, mut sum) = (0u64, 0u64);
                         while let Ok(b) = stream.blocking_read(65_536) {
                             read += b.len() as u64;
-                            sum += b.iter().map(|&x| u64::from(x)).sum::<u64>();
+                            sum += blob_byte_sum(&b);
                         }
                         ok(format!("size={} read={read} sum={sum}", info.size))
                     }
