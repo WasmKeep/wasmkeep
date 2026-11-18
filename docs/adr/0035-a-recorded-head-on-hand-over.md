@@ -896,12 +896,14 @@ Follow-ups from the review of the build:
   Nor is the structural route beyond the snapshot stop (a listed floor
   the base snapshot links back to through listed segments) a safety gap
   for want of a checksum at the floor, under these preconditions:
-  - **Segments are bound to their writer.** A segment key names its
+  - **Segments are bound per key.** A segment key names its
     generation, transaction and parent generation; only that
     generation's holder writes it, created once (`If-None-Match`), and
     its bytes carry the writer's own pre- and post-apply checksums,
-    which every replay checks. A listed segment at the floor's identity
-    is the object the floor names.
+    which every replay checks. Create-only holds per key, not per
+    position: the planner refuses a listing with two segment keys at one
+    (generation, txid), so a listed segment at the floor's identity is
+    the one object the floor names.
   - **Snapshots are not.** A periodic, after-delete or after-restore
     snapshot is labelled at the head it holds (`self.head`, an older
     generation's position), so a later holder may write a snapshot key
@@ -929,7 +931,20 @@ Follow-ups from the review of the build:
   route indeed compares no checksum at the floor, but a local file is used
   only after the listing proves the floor and only at the plan's head,
   so proof 3 would add no comparison there; the route rests on the
-  preconditions above, each checked in code.
+  preconditions above, each checked in code. 2026-11-18, after a second
+  review: the residual is that after `linked_back` a base snapshot with
+  no segments above it, or a local file at the head, is trusted on its
+  label alone. What would break the route, none of it caught by proof 3
+  or a floor checksum: a store without conditional create; a late PUT
+  from a deleted app landing after `--recreate` (generations restart, so
+  an old snapshot key can become a base; only the `LATE_WRITES` wait
+  prevents it); two segments with one id (now refused by the planner).
+  The last needs a hold restoring twice in its own generation, which the
+  server does not do: `Replica::restore` runs only right after an
+  acquisition (`ActorState::ensure_owner_with`); a failed restore
+  releases the hold, and a replica that stops replicating is given up
+  (`abandon`, the hold dropped), so the next event acquires again at a
+  new generation.
 
 Earlier questions:
 

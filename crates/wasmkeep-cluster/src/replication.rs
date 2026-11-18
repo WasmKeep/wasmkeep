@@ -86,6 +86,14 @@ pub enum PlanError {
         /// The missing position.
         missing: SegmentId,
     },
+    /// Two segment keys at one position (another parent generation): the
+    /// history is not one chain. Create-only is per key, and the planner,
+    /// `linked_back` and the replay index segments by position.
+    #[error("two segments at {at:?}: the history has two objects for one position")]
+    Duplicate {
+        /// The position.
+        at: SegmentId,
+    },
 }
 
 /// Plans a restore (ADR 0007):
@@ -99,11 +107,16 @@ pub enum PlanError {
 /// that a later generation built on, so they are not restored (unless
 /// nobody wrote after them, in which case they are simply late commits).
 pub fn plan_restore(listing: &Listing) -> Result<Plan, PlanError> {
-    let parents: BTreeMap<SegmentId, SegmentId> = listing
-        .segments
-        .iter()
-        .map(|s| (s.id, s.parent()))
-        .collect();
+    let mut parents: BTreeMap<SegmentId, SegmentId> = BTreeMap::new();
+    for s in &listing.segments {
+        // The same key listed twice is one object.
+        if parents
+            .insert(s.id, s.parent())
+            .is_some_and(|p| p != s.parent())
+        {
+            return Err(PlanError::Duplicate { at: s.id });
+        }
+    }
     let snapshots: BTreeSet<SegmentId> = listing.snapshots.iter().copied().collect();
 
     let newest =
@@ -331,6 +344,28 @@ mod tests {
         // upload of 4 extends the history it restored, so it is kept.
         let l = listing(&[(1, 1, 0), (1, 2, 1), (1, 3, 1), (1, 4, 1)], &[]);
         assert_eq!(plan_restore(&l).unwrap().head(), id(1, 4));
+    }
+
+    #[test]
+    fn two_segments_at_one_position_are_refused() {
+        // Create-only is per key, and a segment key names its parent
+        // generation: two keys can share one (generation, txid), which the
+        // planner, `linked_back` and the replay all index by. Refused,
+        // whichever one the chain would reach.
+        let l = listing(
+            &[(1, 1, 0), (1, 2, 1), (2, 2, 1), (2, 3, 1), (2, 3, 2)],
+            &[],
+        );
+        assert_eq!(
+            plan_restore(&l),
+            Err(PlanError::Duplicate { at: id(2, 3) }),
+            "a listing with two segments at (2, 3) was planned"
+        );
+        let l = listing(&[(1, 1, 0), (2, 2, 1), (2, 2, 0)], &[(2, 2)]);
+        assert_eq!(plan_restore(&l), Err(PlanError::Duplicate { at: id(2, 2) }));
+        // One key listed twice (pages overlapping) is one object.
+        let l = listing(&[(1, 1, 0), (1, 2, 1), (1, 2, 1)], &[]);
+        assert_eq!(plan_restore(&l).unwrap().head(), id(1, 2));
     }
 
     #[test]

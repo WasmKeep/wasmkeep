@@ -56,8 +56,10 @@
 //! within their lag, so missing links are relisted.
 //!
 //! Broken orderings (each must be caught): using the local file at the
-//! plan's head before the floor is proven, and taking a snapshot base as
-//! proof without `linked_back`.
+//! plan's head before the floor is proven, taking a snapshot base as
+//! proof without `linked_back`, and labelling a snapshot at the head over
+//! another database (caught on the `linked_back` route, where the base is
+//! trusted on its label alone).
 //!
 //! The order is transcribed by hand: reordering `replica.rs` would not
 //! fail this simulation. Moving the gate's ordering into the cluster crate
@@ -333,6 +335,9 @@ enum Breaks {
     LocalFirst,
     /// A snapshot base taken as proof without `linked_back`.
     SnapshotProves,
+    /// A snapshot at the head labelled over another database (in review
+    /// M1's shape, where only the `linked_back` route takes it as base).
+    Mislabel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +376,8 @@ enum Counter {
 #[derive(Default)]
 struct Outcome {
     violation: Option<String>,
+    /// The violating activation took the `linked_back` route.
+    via_linked_back: bool,
     counts: BTreeMap<Counter, u64>,
 }
 
@@ -379,6 +386,8 @@ struct Ctx {
     lineage: Lineage,
     breaks: Breaks,
     out: Mutex<Outcome>,
+    /// Whether the last gate took the `linked_back` route.
+    linked: AtomicBool,
     /// The last acknowledged write of any hold: (position, checksum).
     acked: Mutex<(SegmentId, u64)>,
 }
@@ -400,6 +409,7 @@ async fn restore_within(
     rng: &Mutex<Rng>,
     floor: Option<&Requirement>,
 ) -> Result<(SegmentId, u64, Via), Fail> {
+    ctx.linked.store(false, Ordering::SeqCst);
     let latency = rng.lock().unwrap().below(20);
     sleep(Duration::from_millis(1 + latency)).await;
     // `list_sized`, then `Listing::from_keys` (`restore_within`).
@@ -412,7 +422,7 @@ async fn restore_within(
         {
             Fail::MissingLink
         }
-        PlanError::Missing { .. } => Fail::Restore,
+        _ => Fail::Restore,
     })?;
     let file = *node.file.lock().unwrap();
     if ctx.breaks == Breaks::LocalFirst
@@ -440,6 +450,7 @@ async fn restore_within(
         structural = Proof::Proven;
         floor = None;
         ctx.count(Counter::LinkedBack);
+        ctx.linked.store(true, Ordering::SeqCst);
     }
     if structural == Proof::Missing {
         return Err(Fail::Visibility);
@@ -761,6 +772,9 @@ async fn hand_over(
             Ok((head, sum, via)) => {
                 let (last, last_sum) = *ctx.acked.lock().unwrap();
                 if !descends(&ctx.lineage, sum, last_sum) {
+                    if ctx.out.lock().unwrap().violation.is_none() {
+                        ctx.out.lock().unwrap().via_linked_back = ctx.linked.load(Ordering::SeqCst);
+                    }
                     ctx.fail(format!(
                         "generation {generation} activated at {head:?} ({via:?}), \
                          not descending from the acknowledged {last:?}"
@@ -823,7 +837,22 @@ async fn hand_over(
     for i in 0..=writes {
         if (i == 0 && snapshot_first) || (i > 0 && rng.lock().unwrap().chance(20)) {
             if head != EMPTY
-                && ship_snapshot(ctx, rng, &cell, &valid, head, sum, generation, lag).await
+                && ship_snapshot(
+                    ctx,
+                    rng,
+                    &cell,
+                    &valid,
+                    head,
+                    // Broken: the snapshot holds another database.
+                    if shape.m1 && ctx.breaks == Breaks::Mislabel {
+                        sum ^ 0x5a5a
+                    } else {
+                        sum
+                    },
+                    generation,
+                    lag,
+                )
+                .await
             {
                 ctx.count(Counter::Collections);
             }
@@ -942,6 +971,7 @@ fn simulate(seed: u64, breaks: Breaks) -> Outcome {
             lineage: Arc::default(),
             breaks,
             out: Mutex::new(Outcome::default()),
+            linked: AtomicBool::new(false),
             acked: Mutex::new((EMPTY, 0)),
         });
         let rng = Arc::new(Mutex::new(Rng::new(seed ^ 0x0035_5707)));
@@ -1052,9 +1082,14 @@ fn hand_overs_in_the_server_order_keep_every_acknowledged_write() {
 
 #[test]
 fn broken_orderings_are_caught() {
-    for breaks in [Breaks::LocalFirst, Breaks::SnapshotProves] {
+    for breaks in [Breaks::LocalFirst, Breaks::SnapshotProves, Breaks::Mislabel] {
         let caught = (0..seeds())
-            .filter(|&seed| simulate(seed, breaks).violation.is_some())
+            .filter(|&seed| {
+                let o = simulate(seed, breaks);
+                // A mislabelled snapshot must be caught where only its
+                // label is trusted: after `linked_back`.
+                o.violation.is_some() && (breaks != Breaks::Mislabel || o.via_linked_back)
+            })
             .count() as u64;
         eprintln!("{} seeds: {breaks:?} caught on {caught}", seeds());
         let floor = (seeds() / 20).max(1);
