@@ -78,3 +78,21 @@ test("expired epoch metadata uses HTTP recovery rather than inventing a base", (
     assert.deepEqual(requests.at(-1).messages, []);
     assert.equal(requests.at(-1).recover, true); db.close();
 });
+test("stalled-only lag backs off alarm writes, new messages reset the delay", () => {
+    db.install(":memory:");
+    const core = new Core(db, alarms); core.init(); core.publish([{body:'one'}],0n);
+    let head = 1, lagging = 1;
+    install((_a,r) => ({status:200,headers:[],body:new TextEncoder().encode(r.path.endsWith('init')?'{}':JSON.stringify({e:1,n:head,lagging,stalled:lagging}))}));
+    const round = new Round(['edge/e']); round.run(core,0);
+    const beforeWrites = alarms.writes;
+    let now = 20;
+    const delays: number[] = [];
+    for(let i=0;i<15;i++) { round.run(core,now); const delay=Number(alarms.pending)-now; delays.push(delay); now+=delay; }
+    assert.equal(alarms.writes - beforeWrites, 15);
+    assert(now > 60000); // formerly 15 alarm writes in just 300 ms
+    assert.deepEqual(delays.slice(0,5), [20,40,80,160,320]);
+    assert.equal(delays.at(-1), 45000);
+    head=2; core.publish([{body:'healthy'}],BigInt(now)); round.run(core,now);
+    assert.equal(alarms.pending,BigInt(now+20));
+    lagging=0; round.run(core,now+20); db.close();
+});

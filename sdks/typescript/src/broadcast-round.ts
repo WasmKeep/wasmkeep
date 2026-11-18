@@ -17,6 +17,8 @@ interface Child {
     initialized: boolean;
     suspect: Suspect;
     sockets?: number;
+    stallDelay?: number;
+    stalled?: number;
 }
 export class Round {
     private children: Child[];
@@ -126,11 +128,16 @@ export class Round {
                     const a = JSON.parse(new TextDecoder().decode(r.val.body));
                     if (![a.e, a.n, a.lagging].every(n => Number.isSafeInteger(n) && n >= 0) || BigInt(a.e) > epoch.e || (BigInt(a.e) === epoch.e && BigInt(a.n) > head))
                         throw Error("invalid acknowledgment");
-                    c.position = { e: BigInt(a.e), n: BigInt(a.n) };
+                    const position = { e: BigInt(a.e), n: BigInt(a.n) };
+                    const stalledOnly = a.lagging > 0 && a.stalled === a.lagging && position.e === epoch.e && position.n === head;
+                    const unchanged = c.position?.e === position.e && c.position?.n === position.n && c.stalled === a.stalled;
+                    c.stallDelay = stalledOnly && unchanged ? Math.min(45000, (c.stallDelay ?? 10) * 2) : 20;
+                    c.stalled = stalledOnly ? a.stalled : undefined;
+                    c.position = position;
                     if (Number.isSafeInteger(a.sockets) && a.sockets >= 0)
                         c.sockets = a.sockets;
-                    if (c.position.e !== epoch.e || c.position.n < head || a.lagging)
-                        next = Math.min(next, now + 20);
+                    if (position.e !== epoch.e || position.n < head || a.lagging)
+                        next = Math.min(next, now + (stalledOnly ? c.stallDelay : 20));
                 }
                 c.suspect.success();
             }

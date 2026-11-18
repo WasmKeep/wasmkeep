@@ -187,6 +187,7 @@ The defaults and ceilings are **protocol limits, not measured capacity**:
 | One relay layer | 256 edges maximum; 128,000 sockets is only the arithmetic ceiling at 500 each |
 | Room history | Last 2,000 messages or 8 MiB, whichever is less |
 | Edge buffer | Last 512 messages or 1 MiB |
+| Edge fan-out per event | 16 distinct cursor frames or 1 MiB of frame bytes; caught-up group first |
 | Host send queue per socket | 256 frames or 4 MiB |
 
 The example deliberately uses **150 sockets per edge** to demonstrate
@@ -194,7 +195,22 @@ splits sooner. An edge splits at 80% capacity; small neighbours can merge
 with hysteresis. Movement closes affected sockets with **4801**. If a slow
 client falls behind the edge buffer, it fetches history; if the edge cannot
 even queue the behind notification, it closes that socket with **4802**.
-More nodes do not automatically rebalance existing edges.
+A room's tree of edges runs on the room's node until that node passes
+placement's floor. More nodes do not automatically spread or rebalance the
+tree. Spreading would move only fan-out CPU; the room remains the sequencer.
+A later `placement = "spread"` class key is possible if the bounded edge
+still saturates a node.
+
+The per-event bound limits frame construction; copying a large replay to
+hundreds of sockets still consumes CPU in each host send. The 500-socket
+50 ms gate covers a full retained buffer with caught-up sockets at 2 msg/s,
+not simultaneous full-buffer replay to every socket.
+
+Edges keep serialized items and share each frame across sockets at the same
+cursor. Deferred groups retain their cursor and count as lagging; only an
+`ok` send advances a cursor. Catch-up retries stay at 20 ms. When only stalled
+sockets lag, unchanged answers double that interval up to 45 seconds. New
+publishes and healthy catch-up work keep their normal cadence.
 
 Delivery is **at least once, in order**, within the retained history window.
 Each message has an epoch and number `(e, n)`; repeats are discarded by that

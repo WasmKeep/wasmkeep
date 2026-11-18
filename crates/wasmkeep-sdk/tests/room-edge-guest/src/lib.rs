@@ -2,25 +2,64 @@ use wasmkeep_sdk::broadcast::{Client, Position, Publish, handler};
 use wasmkeep_sdk::broadcast::{EdgeActor, Round};
 use wasmkeep_sdk::{Actor, http, storage};
 thread_local! { static ROUND: std::cell::RefCell<Round> = std::cell::RefCell::new(Round::new(&["edge/e"]).unwrap()); }
+thread_local! { static FANOUT: std::cell::RefCell<wasmkeep_sdk::broadcast::Edge> = Default::default(); }
+fn fanout() -> bool {
+    wasmkeep_sdk::actors::self_address().class == "fanout"
+}
 fn edge() -> bool {
     wasmkeep_sdk::actors::self_address().class == "edge"
 }
 struct TestRoom;
 impl Actor for TestRoom {
     fn on_init() -> Result<(), String> {
-        if edge() {
+        if fanout() {
+            FANOUT.with_borrow_mut(|edge| {
+                edge.push(
+                    &wasmkeep_sdk::broadcast::Push {
+                        recover: false,
+                        e: 1,
+                        base: 0,
+                        first: 1,
+                        head: 512,
+                        messages: (0..512)
+                            .map(|_| wasmkeep_sdk::broadcast::Item {
+                                epoch: None,
+                                at: 0,
+                                id: None,
+                                body: "x".repeat(100),
+                            })
+                            .collect(),
+                    },
+                    &mut wasmkeep_sdk::broadcast::HostSockets,
+                );
+            });
+            Ok(())
+        } else if edge() {
             EdgeActor::on_init()
         } else {
             handler::init(false)
         }
     }
     fn on_websocket_open(id: u64, path: String) -> Result<(), String> {
+        if fanout() {
+            return FANOUT.with_borrow_mut(|edge| {
+                if edge.open(id, None, &mut wasmkeep_sdk::broadcast::HostSockets) {
+                    Ok(())
+                } else {
+                    Err("full".into())
+                }
+            });
+        }
         EdgeActor::on_websocket_open(id, path)
     }
     fn on_websocket_message(id: u64, msg: wasmkeep_sdk::Message) {
         EdgeActor::on_websocket_message(id, msg);
     }
     fn on_websocket_close(id: u64, code: u16, reason: String) {
+        if fanout() {
+            FANOUT.with_borrow_mut(|edge| edge.forget(id));
+            return;
+        }
         EdgeActor::on_websocket_close(id, code, reason);
     }
     fn on_alarm() -> Result<(), String> {
@@ -38,6 +77,28 @@ impl TestRoom {
 }
 impl http::Guest for TestRoom {
     fn handle(req: http::IncomingRequest, out: http::ResponseOutparam) {
+        if fanout() {
+            let ack = FANOUT.with_borrow_mut(|edge| {
+                edge.push(
+                    &wasmkeep_sdk::broadcast::Push {
+                        recover: false,
+                        e: 1,
+                        base: 0,
+                        first: edge.head.unwrap().n + 1,
+                        head: edge.head.unwrap().n + 1,
+                        messages: vec![wasmkeep_sdk::broadcast::Item {
+                            epoch: None,
+                            at: 0,
+                            id: None,
+                            body: "new".into(),
+                        }],
+                    },
+                    &mut wasmkeep_sdk::broadcast::HostSockets,
+                )
+            });
+            http::respond(out, 200, "application/json", ack.encode().as_bytes());
+            return;
+        }
         if edge() {
             EdgeActor::handle(req, out);
             return;

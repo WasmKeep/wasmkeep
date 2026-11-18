@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { publishWithRetry } from './room-publish.mjs';
 // Remote ADR 0040 driver. No server lifecycle or benchmark result publication.
 import { parseArgs } from 'node:util';
 import { createRequire } from 'node:module';
@@ -91,7 +92,7 @@ class Histogram {
   add(ms) { const b = Math.ceil(Math.log(Math.max(1, ms)) / Math.log(1.01)); this.bins.set(b, (this.bins.get(b) ?? 0) + 1); this.count++; if (ms > this.max) this.max = ms; }
   summary() { const entries = [...this.bins].sort((a, b) => a[0] - b[0]); return Object.fromEntries([['count', this.count], ...[50, 95, 99].map(p => { let n = 0; const found = entries.find(([, k]) => (n += k) >= Math.ceil(this.count * p / 100)); return [`p${p}_ms`, found ? 1.01 ** found[0] : null]; }), ['max_ms', this.count ? this.max : null]]); }
 }
-const COUNTERS = ['deliveries', 'repeats', 'history_requests', 'gaps_recovered', 'recovered_messages', 'void_numbers', 'resets', 'reconnect_attempts', 'close_4801', 'close_4802', 'errors', 'publish_ok', 'publish_failed', 'publish_retries', 'forced_disconnects', 'smoke_dropped_frames', 'clients_joined', 'clients_left', 'stall_pauses', 'stall_resumes'];
+const COUNTERS = ['deliveries', 'repeats', 'history_requests', 'gaps_recovered', 'recovered_messages', 'void_numbers', 'resets', 'reconnect_attempts', 'close_4801', 'close_4802', 'errors', 'publish_ok', 'publish_failed', 'publish_unacknowledged', 'publish_retries', 'forced_disconnects', 'smoke_dropped_frames', 'clients_joined', 'clients_left', 'stall_pauses', 'stall_resumes'];
 const zero = () => Object.fromEntries(COUNTERS.map(k => [k, 0]));
 const counters = zero();
 const delivery = new Histogram(), reconnect = new Histogram(), historyWait = new Histogram();
@@ -105,7 +106,7 @@ function setPhase(name) {
   phases.push(phase = newPhase(name));
 }
 const bump = (key, n = 1) => { counters[key] += n; phase.counters[key] += n; };
-const acknowledged = [];
+const acknowledged = [], unacknowledged = [], publishFailuresByStatus = {};
 const run = randomUUID().slice(0, 8), clients = [], sockets = new Set(), samples = [];
 const prefix = `wkbench:${run}:`;
 let stopped = false, readyCount = 0, activeCount = 0, openRaw = 0;
@@ -281,33 +282,27 @@ try {
     let seq = 0;
     const target = bases[publisher % bases.length];
     // Fixed schedule; a slow request delays later publishes but never causes a catch-up burst.
-    let next = publishingStart + publisher * period / publishers;
-    while (!stopped && next < end) {
+    const offset = publisher * period / publishers;
+    const publishLimit = Math.ceil((duration * 1000 - offset) / period);
+    let next = publishingStart + offset;
+    // An integer limit avoids a floating-point extra slot at the end boundary.
+    while (!stopped && next < end && seq < publishLimit) {
       await sleepUntil(next);
       const sent = performance.now(), id = `${run}-${publisher}-${seq++}`;
       const head = `${prefix}${sent}:`;
       const text = payloadBytes ? head + 'x'.repeat(Math.max(0, payloadBytes - head.length)) : head + 'payload';
       const body = JSON.stringify({ id, text });
-      let ok = false;
-      for (let k = 0; k < 3 && performance.now() < end && !stopped; k++) {
-        try {
-          const r = await boundedFetch(endpoint(target, 'publish', `p${run}-${publisher}`), { method: 'POST', headers: { 'content-type': 'application/json' }, body });
-          if (r.ok) {
-            const positions = await r.json();
-            if (!Array.isArray(positions) || positions.length !== 1 || positions.some(p => !Number.isSafeInteger(p.e) || p.e < 1 || !Number.isSafeInteger(p.n) || p.n < 1)) throw Error('invalid publish acknowledgement');
-            acknowledged.push(...positions);
-            ok = true; break;
-          }
-          await r.arrayBuffer();
-          if (![429, 503].includes(r.status)) break;
-          const retry = r.headers.get('retry-after') ?? '0';
-          const delay = Number.isFinite(Number(retry)) ? Number(retry) * 1000 : Math.max(0, Date.parse(retry) - Date.now());
-          await sleep(Math.min(Math.max(0, end - performance.now()), (delay || 0) + Math.random() * 500));
-        } catch { /* Unknown outcome: retry exactly the same id and body. */ }
-        bump('publish_retries');
-        await sleep(Math.random() * 250);
-      }
-      bump(ok ? 'publish_ok' : 'publish_failed');
+      const retryBudget = v.smoke ? Math.max(1, Math.min(2000, end - performance.now())) : 30000;
+      const positions = await publishWithRetry({
+        body,
+        // Smoke keeps its entire run below 30 seconds, including drain/cleanup.
+        budgetMs: retryBudget,
+        send: (body, remaining) => boundedFetch(endpoint(target, 'publish', `p${run}-${publisher}`), { method: 'POST', headers: { 'content-type': 'application/json' }, body, signal: AbortSignal.timeout(remaining) }),
+        failure: status => { publishFailuresByStatus[status] = (publishFailuresByStatus[status] ?? 0) + 1; bump('publish_failed'); },
+        retry: () => bump('publish_retries'),
+      });
+      if (positions) { acknowledged.push(...positions); bump('publish_ok'); }
+      else { unacknowledged.push({ id, sent_ms: sent, retry_budget_ms: retryBudget }); bump('publish_unacknowledged'); }
       next = Math.max(next + period, performance.now());
     }
   })());
@@ -386,11 +381,11 @@ try {
   const max = f => samples.reduce((m, s) => Math.max(m, s.generator[f] ?? 0), 0);
   const generator = { valid: !reasons.length, saturation_judged: judged, invalid_reasons: reasons, saturated_sample_share: saturatedShare, peak_cpu_cores: max('cpu_cores'), peak_rss_bytes: peakRss, peak_loop_delay_p99_ms: max('loop_delay_p99_ms'), peak_open_fds: peakFds, open_file_soft_limit: fdLimit === Infinity ? 'unlimited' : fdLimit, history_concurrency: historyConcurrency, history_queue_wait: historyWait.summary() };
   const phaseSummary = Object.fromEntries(phases.map(p => [p.name, { start_s: p.start_s, end_s: p.end_s, ready_at_end: p.ready_at_end, active_at_end: p.active_at_end, counters: p.counters, delivery_latency: p.delivery.summary(), reconnect_latency: p.reconnect.summary() }]));
-  const result = { schema: 2, acknowledged_positions: acknowledged, final_cursors: finalCursors, incomplete_clients: incomplete, date: new Date().toISOString(), commit, node: process.version, smoke: !!v.smoke, clients: initial, peak_clients: peak, joined_total: clients.length, left_total: counters.clients_left, targets: bases.length, payload_bytes: payloadBytes || null, ramp, duration_s: duration, rate_per_s: aggregateRate, publish_rate_per_publisher: perPublisherRate, publishers, ready_at_start: readyAtStart, ready_at_end: readyCount, active_at_end: activeCount, counters, delivery_latency: delivery.summary(), reconnect_latency: reconnect.summary(), phases: phaseSummary, stalled_readers: { count: stalledCount, stall_after_s: stallAfter, stall_for_s: stallFor, delivery_latency: stalledDelivery.summary(), reconnect_latency: stalledReconnect.summary(), catchup_after_resume: stalledCatchup.summary() }, topology, generator, samples };
+  const result = { schema: 2, publish_failures_by_status: publishFailuresByStatus, unacknowledged_publishes: unacknowledged, acknowledged_positions: acknowledged, final_cursors: finalCursors, incomplete_clients: incomplete, date: new Date().toISOString(), commit, node: process.version, smoke: !!v.smoke, clients: initial, peak_clients: peak, joined_total: clients.length, left_total: counters.clients_left, targets: bases.length, payload_bytes: payloadBytes || null, ramp, duration_s: duration, rate_per_s: aggregateRate, publish_rate_per_publisher: perPublisherRate, publishers, ready_at_start: readyAtStart, ready_at_end: readyCount, active_at_end: activeCount, counters, delivery_latency: delivery.summary(), reconnect_latency: reconnect.summary(), phases: phaseSummary, stalled_readers: { count: stalledCount, stall_after_s: stallAfter, stall_for_s: stallFor, delivery_latency: stalledDelivery.summary(), reconnect_latency: stalledReconnect.summary(), catchup_after_resume: stalledCatchup.summary() }, topology, generator, samples };
   await writeFile(`${v.out}.partial`, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
   await rename(`${v.out}.partial`, v.out);
   console.log(JSON.stringify({ counters, delivery_latency: result.delivery_latency, reconnect_latency: result.reconnect_latency, generator: { valid: generator.valid, invalid_reasons: reasons, peak_cpu_cores: generator.peak_cpu_cores, peak_rss_bytes: peakRss } }));
-  if (counters.void_numbers || incomplete.length || !readyAtStart || (publishers && !counters.publish_ok) || (publishers && !delivery.count) || (!v.smoke && !generator.valid) || (v.smoke && (readyAtStart !== initial || counters.errors || counters.publish_failed))) process.exitCode = 1;
+  if (counters.publish_unacknowledged || counters.void_numbers || incomplete.length || !readyAtStart || (publishers && !counters.publish_ok) || (publishers && !delivery.count) || (!v.smoke && !generator.valid) || (v.smoke && (readyAtStart !== initial || counters.errors || counters.publish_failed))) process.exitCode = 1;
 } finally {
   stopped = true; stop.abort(); loopDelay.disable(); for (const { client } of clients) client.close();
   await Promise.allSettled([...tasks, ...runTasks]);

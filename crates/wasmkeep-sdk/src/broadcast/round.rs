@@ -14,6 +14,7 @@ struct Child {
     initialized: bool,
     suspect: Suspect,
     sockets: Option<u64>,
+    lag_retry: LagRetry,
 }
 #[derive(Debug, Default)]
 struct Suspect {
@@ -26,6 +27,29 @@ impl Suspect {
         self.failures = self.failures.saturating_add(1);
     }
 }
+
+/// Only unchanged, entirely backpressured lag can slow retries. A new head,
+/// catch-up work, or a changing stalled count keeps the 20 ms cadence.
+#[derive(Debug, Default)]
+struct LagRetry {
+    position: Option<Position>,
+    stalled: u64,
+    delay: u64,
+}
+impl LagRetry {
+    fn delay(&mut self, p: Position, head: u64, lagging: u64, stalled: u64) -> u64 {
+        let only_stalled = lagging > 0 && stalled == lagging && p.n == head;
+        self.delay = if only_stalled && self.position == Some(p) && self.stalled == stalled {
+            (self.delay * 2).clamp(20, 45000)
+        } else {
+            20
+        };
+        self.position = Some(p);
+        self.stalled = if only_stalled { stalled } else { 0 };
+        self.delay
+    }
+}
+
 impl Round {
     pub fn sync(&mut self, children: &[ScaleChild]) {
         self.children
@@ -38,6 +62,7 @@ impl Round {
                     initialized: true,
                     suspect: Suspect::default(),
                     sockets: None,
+                    lag_retry: LagRetry::default(),
                 });
             }
         }
@@ -70,6 +95,7 @@ impl Round {
                     initialized: false,
                     suspect: Suspect::default(),
                     sockets: None,
+                    lag_retry: LagRetry::default(),
                 })
                 .collect(),
         })
@@ -234,18 +260,28 @@ impl Round {
             let ok = result.filter(|r| r.status == 200).and_then(|r| {
                 if !child.initialized {
                     child.initialized = true;
-                    return Some(true);
+                    return Some(20);
                 }
                 let (p, more) = acknowledgment(&r.body, epoch.e, head)?;
                 child.position = Some(p);
                 child.sockets = crate::json::parse_unique(std::str::from_utf8(&r.body).ok()?)
                     .and_then(|j| super::edge::number(&j, "sockets").ok());
-                Some(more)
+                let j = crate::json::parse_unique(std::str::from_utf8(&r.body).ok()?)?;
+                let lagging = super::edge::number(&j, "lagging").ok()?;
+                let stalled = super::edge::number(&j, "stalled").unwrap_or(0);
+                let delay = child.lag_retry.delay(
+                    p,
+                    head,
+                    lagging,
+                    if p.e == epoch.e { stalled } else { 0 },
+                );
+                Some(if more { delay } else { 0 })
             });
-            if let Some(more) = ok {
+            if let Some(delay) = ok {
                 child.suspect = Suspect::default();
-                if more {
-                    next = Some(now.saturating_add(20));
+                if delay > 0 {
+                    let at = now.saturating_add(delay);
+                    next = Some(next.map_or(at, |n: u64| n.min(at)));
                 }
             } else {
                 child.suspect.fail(now);
@@ -305,5 +341,19 @@ mod tests {
         assert!(acknowledgment(br#"{"e":2,"n":5,"lagging":0}"#, 2, 3).is_none());
         assert!(acknowledgment(br#"{"e":3,"n":0,"lagging":0}"#, 2, 3).is_none());
         assert!(acknowledgment(br#"{"e":2,"n":3,"lagging":-1}"#, 2, 3).is_none());
+    }
+}
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    #[test]
+    fn stalled_only_alarm_backoff_resets_for_healthy_work() {
+        let mut retry = LagRetry::default();
+        let p = Position { e: 1, n: 1 };
+        let delays: Vec<_> = (0..15).map(|_| retry.delay(p, 1, 1, 1)).collect();
+        assert_eq!(&delays[..5], &[20, 40, 80, 160, 320]);
+        assert_eq!(delays[14], 45000);
+        assert_eq!(retry.delay(Position { e: 1, n: 2 }, 2, 1, 1), 20);
+        assert_eq!(retry.delay(Position { e: 1, n: 2 }, 2, 2, 1), 20);
     }
 }

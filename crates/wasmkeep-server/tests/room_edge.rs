@@ -269,3 +269,100 @@ async fn room_edge_slow_socket_and_restart() {
     let _ = stop.send(());
     let _ = server.await;
 }
+
+// A full 512-item retained buffer, 500 caught-up loopback sockets, 2 pushes/s.
+// Keep the default 50 ms event CPU budget; bulk replay is a separate workload.
+async fn fanout_budget(engine: &str) {
+    // nextest runs engines in separate processes; keep loopback sockets <=500.
+    let lock = std::fs::File::create(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fanout-test.lock"),
+    )
+    .unwrap();
+    lock.lock().unwrap();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wasmkeep_runtime=debug,wasmkeep_server=warn")
+        .with_test_writer()
+        .try_init();
+    let wasm = if engine == "rust" {
+        guests::build_guest("../wasmkeep-sdk/tests/room-edge-guest", "room_edge_guest")
+    } else {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("edge.wasm");
+        assert!(
+            std::process::Command::new("node")
+                .current_dir(root)
+                .args([
+                    "sdks/typescript/bin/wasmkeep-ts.mjs",
+                    "build",
+                    "crates/wasmkeep-server/tests/guests/room-fanout/edge.ts",
+                    "--engine",
+                    engine,
+                    "-o"
+                ])
+                .arg(&output)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::read(output).unwrap()
+    };
+    let runtime_config = RuntimeConfig::default();
+    assert_eq!(runtime_config.cpu_budget, Duration::from_millis(50));
+    let runtime = Runtime::new(&runtime_config).unwrap();
+    let component = guests::compile(&runtime, &wasm);
+    let data = tempfile::tempdir().unwrap();
+    let mut config = ActorConfig::new(data.path());
+    config.mailbox.idle_timeout = Duration::from_secs(60);
+    let service =
+        ActorService::new(runtime, config, vec![("fanout".into(), component, wasm)]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(wasmkeep_server::serve(listener, service, async {
+        let _ = stopped.await;
+    }));
+    let mut sockets = Vec::new();
+    for _ in 0..500 {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/actor/fanout/e/"))
+            .await
+            .unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(ready.to_text().unwrap().contains("ready"));
+        sockets.push(ws);
+    }
+    for n in 513..=516 {
+        let response = request(addr, "/actor/fanout/e/push").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{engine}: {response}");
+        for ws in &mut sockets {
+            let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let frame: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["n"], n);
+            assert_eq!(frame["m"].as_array().unwrap().len(), 1);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    drop(sockets);
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_500_quickjs_default_budget() {
+    fanout_budget("quickjs").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_500_starlingmonkey_default_budget() {
+    fanout_budget("starlingmonkey").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_500_rust_default_budget() {
+    fanout_budget("rust").await;
+}

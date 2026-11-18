@@ -26,6 +26,7 @@ export interface SocketIO {
 interface Cursor {
     n: number;
     lagging: boolean;
+    stalled?: boolean;
 }
 const bytes = (s: string) => new TextEncoder().encode(s).length;
 export class Edge {
@@ -33,11 +34,13 @@ export class Edge {
         n: number;
         e: number;
         b: number;
-        item: Item;
+        json: string;
+        bytes: number;
     }[] = [];
     head?: Position;
     floor = 0;
     private cursors = new Map<bigint, Cursor>();
+    private index = new Map<number, (typeof this.buffer)[number]>();
     private size = 0;
     private slow = 0;
     constructor(private io: SocketIO, readonly capacity = 500) { }
@@ -85,7 +88,8 @@ export class Edge {
         }
         if (p.e > this.head.e) {
             this.buffer = this.buffer.filter(m => m.n <= p.b);
-            this.size = this.buffer.reduce((n, m) => n + bytes(JSON.stringify(m.item)), 0);
+            this.size = this.buffer.reduce((n, m) => n + m.bytes, 0);
+            this.index = new Map(this.buffer.map(m => [m.n, m]));
             this.head = { e: p.e, n: Math.min(this.head.n, p.b) };
             this.floor = Math.min(this.floor, p.b);
             for (const c of this.cursors.values())
@@ -93,12 +97,14 @@ export class Edge {
         }
         if (p.recover) {
             this.buffer = [];
+            this.index.clear();
             this.size = 0;
             this.floor = p.head;
             this.head.n = p.head;
         }
         if (p.messages.length && p.first > this.head.n + 1) {
             this.buffer = [];
+            this.index.clear();
             this.size = 0;
             this.floor = p.first - 1;
             this.head.n = this.floor;
@@ -109,73 +115,74 @@ export class Edge {
                 continue;
             const item = p.messages[i];
             const payload = { a: item.a, i: item.i, d: item.d };
-            this.buffer.push({ n, e: item.e ?? p.e, b: item.b ?? p.b, item: payload });
-            this.size += bytes(JSON.stringify(payload));
+            const json = JSON.stringify(payload);
+            const stored = { n, e: item.e ?? p.e, b: item.b ?? p.b, json, bytes: bytes(json) };
+            this.buffer.push(stored);
+            this.index.set(n, stored);
+            this.size += stored.bytes;
             this.head.n = n;
             while (this.buffer.length > 512 || this.size > 1024 * 1024) {
                 const old = this.buffer.shift()!;
                 this.floor = old.n;
-                this.size -= bytes(JSON.stringify(old.item));
+                this.size -= old.bytes;
+                this.index.delete(old.n);
             }
         }
-        for (const id of this.cursors.keys())
-            this.deliver(id);
+        this.deliverMany([...this.cursors.keys()]);
         return this.answer();
     }
-    private behind(id: bigint, c: Cursor) {
-        const result = this.send(id, { t: "behind", ...this.head });
-        if (result === "backpressure") {
-            this.io.close(id, 4802);
-            this.slow++;
-            this.forget(id);
+    private deliver(id: bigint) { this.deliverMany([id]); }
+    private deliverMany(ids: bigint[]) {
+        if (!this.head) return;
+        const groups = new Map<number, bigint[]>();
+        for (const id of ids) {
+            const c = this.cursors.get(id);
+            if (!c || c.n >= this.head.n) continue;
+            const group = groups.get(c.n) ?? [];
+            group.push(id); groups.set(c.n, group);
         }
-        else if (result === "gone")
-            this.forget(id);
-        else {
-            c.n = this.head!.n;
-            c.lagging = false;
+        let frames = 0, frameBytes = 0;
+        // Highest cursor first: the group caught up before this push leads.
+        for (const [n, group] of [...groups].sort((a, b) => b[0] - a[0])) {
+            if (frames >= 16 || frameBytes >= 1024 * 1024) {
+                for (const id of group) { const c = this.cursors.get(id)!; c.lagging = true; c.stalled = false; }
+                continue;
+            }
+            const first = this.index.get(n + 1);
+            let behind = n < this.floor || !first;
+            let frame = '', last = n, length = 0;
+            if (!behind && first) {
+                const prefix = `{"t":"m","e":${first.e},"b":${first.b},"n":${first.n},"m":[`;
+                const items: string[] = [];
+                length = bytes(prefix) + 2;
+                for (let at = n + 1; at <= this.head.n; at++) {
+                    const m = this.index.get(at);
+                    if (!m || m.e !== first.e || length + m.bytes + (items.length ? 1 : 0) > 65536) break;
+                    length += m.bytes + (items.length ? 1 : 0);
+                    items.push(m.json); last = at;
+                }
+                behind = !items.length;
+                if (!behind) frame = prefix + items.join(',') + ']}';
+            }
+            if (behind) { frame = JSON.stringify({t:'behind', ...this.head}); length = bytes(frame); last = this.head.n; }
+            // Each frame is <=64 KiB, so 16 frames also bound bytes to 1 MiB.
+            frames++; frameBytes += length;
+            for (const id of group) {
+                const c = this.cursors.get(id)!;
+                const result = this.io.send(id, frame);
+                if (result === 'gone') this.forget(id);
+                else if (result === 'backpressure' && behind) {
+                    this.io.close(id, 4802); this.slow++; this.forget(id);
+                } else {
+                    if (result === 'ok') c.n = last;
+                    c.lagging = c.n < this.head.n;
+                    c.stalled = result === 'backpressure';
+                }
+            }
         }
-    }
-    private deliver(id: bigint) {
-        const c = this.cursors.get(id);
-        if (!c || !this.head)
-            return;
-        if (c.n < this.floor) {
-            this.behind(id, c);
-            return;
-        }
-        const pending = this.buffer.filter(m => m.n > c.n);
-        if (!pending.length)
-            return;
-        const first = pending[0], items: Item[] = [];
-        let frame = "";
-        for (const m of pending) {
-            if (m.e !== first.e)
-                break;
-            const next = JSON.stringify({ t: "m", e: first.e, b: first.b, n: first.n, m: [...items, m.item] });
-            if (bytes(next) > 65536)
-                break;
-            items.push(m.item);
-            frame = next;
-        }
-        // A single maximum-size text can exceed the JSON frame bound: recover it
-        // through history, which already supports 256 KiB responses.
-        if (!items.length) {
-            this.behind(id, c);
-            return;
-        }
-        const result = this.io.send(id, frame);
-        if (result === "ok") {
-            c.n = first.n + items.length - 1;
-            c.lagging = c.n < this.head.n;
-        }
-        else if (result === "gone")
-            this.forget(id);
-        else
-            c.lagging = true;
     }
     private answer() {
-        const answer = { ...this.head!, sockets: this.cursors.size, lagging: [...this.cursors.values()].filter(c => c.lagging).length, slow: this.slow };
+        const answer = { ...this.head!, sockets: this.cursors.size, lagging: [...this.cursors.values()].filter(c => c.lagging).length, stalled: [...this.cursors.values()].filter(c => c.lagging && c.stalled).length, slow: this.slow };
         this.slow = 0;
         return answer;
     }
