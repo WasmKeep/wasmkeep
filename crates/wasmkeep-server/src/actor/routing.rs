@@ -71,6 +71,17 @@ pub(crate) fn refuse_batch(
     Some(calls.iter().map(|_| Err(refusal.clone())).collect())
 }
 
+/// Where a cold address goes ([`ServiceInner::cold_route`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Cold {
+    /// Another node holds it.
+    Owner(String),
+    /// Nobody holds it: a placeable wake-up may be placed.
+    Nobody,
+    /// Try here.
+    Here,
+}
+
 impl ServiceInner {
     /// Route a cold address before it consumes a local actor slot. A live
     /// mailbox checks its own lease, preserving service during bucket
@@ -82,19 +93,36 @@ impl ServiceInner {
     /// local mailbox: a stale one costs one relay that the old owner sends
     /// back as "ownership is changing", which also drops the hint.
     pub(super) async fn remote_owner(&self, address: &ActorAddress) -> Option<String> {
-        let cluster = self.cluster.as_ref()?;
-        if self.mailboxes.contains(address) {
-            return None;
+        match self.cold_route(address).await {
+            Cold::Owner(owner) => Some(owner),
+            Cold::Nobody | Cold::Here => None,
+        }
+    }
+
+    /// [`Self::remote_owner`] in three answers, from the same single read
+    /// (ADR 0041, section 1): another node holds it, nobody does, or try
+    /// here (resident or parked here, a record naming a node this read
+    /// does not send to, or a read that failed or timed out). Only
+    /// [`Cold::Nobody`] may lead to a placement.
+    pub(super) async fn cold_route(&self, address: &ActorAddress) -> Cold {
+        let Some(cluster) = self.cluster.as_ref() else {
+            return Cold::Here;
+        };
+        if self.mailboxes.contains(address) || cluster.is_parked(address) {
+            return Cold::Here;
         }
         if let Some(owner) = self.cached_owner(address) {
-            return Some(owner);
+            return Cold::Owner(owner);
         }
-        let owner = tokio::time::timeout(ADMISSION_WAIT, cluster.other_owner(address))
-            .await
-            .ok()?
-            .ok()??;
-        self.remember_owner(address, &owner);
-        Some(owner)
+        use wasmkeep_cluster::node_lease::Route;
+        match tokio::time::timeout(ADMISSION_WAIT, cluster.route(address)).await {
+            Ok(Ok(Route::Owner(owner))) => {
+                self.remember_owner(address, &owner);
+                Cold::Owner(owner)
+            }
+            Ok(Ok(Route::Nobody)) => Cold::Nobody,
+            _ => Cold::Here,
+        }
     }
 
     pub(super) fn owner_hints(
@@ -195,7 +223,33 @@ impl ServiceInner {
         let waiting = Arc::clone(&chain);
 
         let call = async {
-            if let Some(owner) = self.remote_owner(&target).await
+            let route = self.cold_route(&target).await;
+            let mut req = req;
+            let mut owner = match &route {
+                Cold::Owner(owner) => Some(owner.clone()),
+                Cold::Nobody | Cold::Here => None,
+            };
+            // Nobody holds it: placement may send it to a lighter node,
+            // once (ADR 0041). After a refusal it runs here: the record is
+            // read again.
+            if route == Cold::Nobody
+                && let Some(cluster) = &self.cluster
+            {
+                match self
+                    .place_call(cluster, &target, &waiting, req, budget, head)
+                    .await
+                {
+                    Ok(done) => return done,
+                    Err(back) => {
+                        let (back, read_again) = *back;
+                        req = back;
+                        if read_again {
+                            owner = self.remote_owner(&target).await;
+                        }
+                    }
+                }
+            }
+            if let Some(owner) = owner
                 && let Some(cluster) = &self.cluster
             {
                 return match cluster.call(&owner, &target, &waiting, req).await {
@@ -282,6 +336,67 @@ impl ServiceInner {
         tokio::time::timeout(limit, call)
             .await
             .unwrap_or(Err(CallError::Timeout))
+    }
+}
+
+impl ServiceInner {
+    /// An `actors.call` of an actor nobody holds (ADR 0041): placed on a
+    /// lighter node if the rule says so, the call's answer then. `Err`
+    /// hands the call back to run here, with whether the record must be
+    /// read again (a hop that was refused or never read).
+    #[allow(clippy::type_complexity)]
+    async fn place_call(
+        &self,
+        cluster: &crate::cluster::Cluster,
+        target: &ActorAddress,
+        chain: &[ActorAddress],
+        req: Request<http_body_util::Full<bytes::Bytes>>,
+        budget: &BodyBudget,
+        head: bool,
+    ) -> Result<
+        Result<CallResponse, CallError>,
+        Box<(Request<http_body_util::Full<bytes::Bytes>>, bool)>,
+    > {
+        use crate::cluster::{Choice, Hop};
+        let (node, fill) = match cluster.choose_placement(target, super::load::rooms(self), true) {
+            Choice::NotPlaceable => return Err(Box::new((req, false))),
+            Choice::Keep(reason) => {
+                crate::metrics::placement_kept(&self.app_labels, reason);
+                return Err(Box::new((req, false)));
+            }
+            Choice::Place { node, fill } => (node, fill),
+        };
+        let (parts, body) = req.into_parts();
+        let body = match http_body_util::BodyExt::collect(body).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(never) => match never {},
+        };
+        let hop = Request::from_parts(parts.clone(), http_body_util::Full::new(body.clone()));
+        let sent = cluster.call_placed(&node, target, chain, hop, fill).await;
+        crate::metrics::placement_sent(&self.app_labels, "call", sent.outcome());
+        match sent {
+            Hop::Answered(response) => {
+                if response
+                    .headers()
+                    .get(SERVED_BY)
+                    .is_some_and(|v| v.as_bytes() == node.as_bytes())
+                {
+                    self.remember_owner(target, &node);
+                }
+                Ok(collect_response(response, budget, head).await)
+            }
+            Hop::Refused | Hop::Unsent => {
+                cluster.placement_backoff(&node);
+                Err(Box::new((
+                    Request::from_parts(parts, http_body_util::Full::new(body)),
+                    true,
+                )))
+            }
+            Hop::Failed(e) => {
+                cluster.placement_backoff(&node);
+                Ok(Err(CallError::Failed(e)))
+            }
+        }
     }
 }
 

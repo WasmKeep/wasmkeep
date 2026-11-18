@@ -352,6 +352,7 @@ async fn start_runtime(
     cluster.failover_wait_max = shared.max_connections / 4;
     cluster.follows_app = true;
     cluster.reads_secrets = !args.no_secrets;
+    cluster.placement = !args.no_placement;
     cluster.app = format!("{tenant}/{name}");
     cluster.cluster_tls = args
         .cluster_advertise

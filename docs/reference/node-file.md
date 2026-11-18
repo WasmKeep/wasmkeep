@@ -77,6 +77,7 @@ Relative paths are read from the file's directory.
 | --- | --- |
 | `id` | The process's name: its cluster certificate is named for it, and each of its node ids publishes `process=<id>` in its heartbeat. |
 | `data-dir` | Every app's data directory unless its entry names its own (default `.wasmkeep/data`, as `--data-dir`). |
+| `placement` | `false` turns placement at wake-up off for every app of the process, as `--no-placement` ([ADR 0041](../adr/0041-placement-at-wake-up.md)): its node ids keep every actor they wake and do not announce `place`. Default `true`. |
 
 `[listen]`: `public`, `public-advertise`, `cluster`, `cluster-advertise`
 and `metrics`, as `--listen`, `--advertise`, `--cluster-listen`,

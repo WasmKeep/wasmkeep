@@ -127,6 +127,11 @@ pub struct NodeInfo {
     /// word `multi-app`): a process serving several apps refuses to start,
     /// and reports not ready, while a live node lacks it.
     pub can_multi_app: bool,
+    /// It publishes the room fields, reads the placed mark and has
+    /// placement on (heartbeat line 11, `place`, ADR 0041, section 9):
+    /// only such a node is a candidate, or counts in `N`. `false` from
+    /// nodes that predate it, and from a process with placement off.
+    pub can_place: bool,
     /// The process that runs it (heartbeat line 11, `process=<id>`, ADR
     /// 0038): the node ids of one process share its address and
     /// certificate. `None` from nodes that predate it or name none.
@@ -148,7 +153,8 @@ pub struct NodeInfo {
 }
 
 /// Payload line 10 (format 3): how much a node runs, as of its last
-/// heartbeat. Shown, never acted on: no placement or routing reads it.
+/// heartbeat. Shown by `cluster status`; placement (ADR 0041) reads a
+/// fresh one's rooms to choose candidates, never to decide ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Load {
     /// Actors resident in memory.
@@ -162,25 +168,45 @@ pub struct Load {
     /// is; `None` until a minute of samples exists, and from a node of a
     /// version before it (which writes no `front_per_min`).
     pub front_per_min: Option<u64>,
+    /// How many more residents its app could have on this node now, its
+    /// cap, its floor and the process's limit counted (ADR 0041, section
+    /// 2); `None` from a node of a version before placement.
+    pub actor_room: Option<u64>,
+    /// How many more socket sessions its app could open on this node now,
+    /// its ceiling and the process's counted; `None` as `actor_room`.
+    pub socket_room: Option<u64>,
 }
 
 impl Load {
     /// The line: `load actors=<n> sockets=<n> events_per_min=<n|->
-    /// front_per_min=<n|->`.
+    /// front_per_min=<n|-> actor_room=<n> socket_room=<n>`, each room
+    /// only when known.
     fn line(&self) -> String {
         let rate = |r: Option<u64>| r.map_or_else(|| "-".to_owned(), |n| n.to_string());
-        format!(
+        let mut line = format!(
             "load actors={} sockets={} events_per_min={} front_per_min={}",
             self.actors,
             self.sockets,
             rate(self.events_per_min),
             rate(self.front_per_min)
-        )
+        );
+        // ADR 0041, section 2: after the four fields, so an older reader,
+        // which skips unknown keys, reads the line as before.
+        for (key, room) in [
+            ("actor_room", self.actor_room),
+            ("socket_room", self.socket_room),
+        ] {
+            if let Some(n) = room {
+                line.push_str(&format!(" {key}={n}"));
+            }
+        }
+        line
     }
 
     /// Reads the line: the word `load`, then `key=value` words in any
     /// order. `actors` and `sockets` are required; `events_per_min` and
-    /// `front_per_min` may be `-` or absent (unknown). Unknown keys and words without `=` are
+    /// `front_per_min` may be `-` or absent (unknown), `actor_room` and
+    /// `socket_room` absent (a node before placement). Unknown keys and words without `=` are
     /// skipped, for later versions; a known key repeated or with a value
     /// that is not a count is `None`.
     fn parse(line: &str) -> Option<Self> {
@@ -189,6 +215,7 @@ impl Load {
             return None;
         }
         let (mut actors, mut sockets, mut events, mut front) = (None, None, None, None);
+        let (mut actor_room, mut socket_room) = (None, None);
         for word in words {
             let Some((key, value)) = word.split_once('=') else {
                 continue;
@@ -198,6 +225,8 @@ impl Load {
                 "sockets" => &mut sockets,
                 "events_per_min" => &mut events,
                 "front_per_min" => &mut front,
+                "actor_room" => &mut actor_room,
+                "socket_room" => &mut socket_room,
                 _ => continue,
             };
             if slot.is_some() {
@@ -215,6 +244,8 @@ impl Load {
             sockets: sockets??,
             events_per_min: events.flatten(),
             front_per_min: front.flatten(),
+            actor_room: actor_room.flatten(),
+            socket_room: socket_room.flatten(),
         })
     }
 }
@@ -451,6 +482,7 @@ impl NodeInfo {
             can_actor_restore: words.can_actor_restore,
             can_recorded_head: words.can_recorded_head,
             can_multi_app: words.can_multi_app,
+            can_place: words.can_place,
             process: words.process,
             instance: lease.instance,
             lease: Some(lease.state),
@@ -478,6 +510,7 @@ impl NodeInfo {
             (self.can_multi_app, "multi-app"),
             (self.can_assets, "assets"),
             (self.can_blobs, "blobs"),
+            (self.can_place, "place"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -514,6 +547,7 @@ impl NodeInfo {
             can_actor_restore: words.contains(&"actor-restore"),
             can_recorded_head: words.contains(&"recorded-head"),
             can_multi_app: words.contains(&"multi-app"),
+            can_place: words.contains(&"place"),
             process: words.iter().find_map(|w| {
                 let id = w.strip_prefix("process=")?;
                 validate_node_id(id).is_ok().then(|| id.to_owned())
@@ -614,6 +648,8 @@ pub struct Membership<D, C> {
     /// from `load_source` as each payload is built (the last read kept).
     load: std::sync::Mutex<Option<Load>>,
     load_source: std::sync::OnceLock<LoadFn>,
+    /// Published on line 11 as `place` (ADR 0041, section 9).
+    place: bool,
     /// A heartbeat older than this (plus `max_skew_ms`) means the node is gone.
     ttl_ms: u64,
     max_skew_ms: u64,
@@ -645,6 +681,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             process: None,
             load: std::sync::Mutex::new(None),
             load_source: std::sync::OnceLock::new(),
+            place: false,
             ttl_ms,
             max_skew_ms,
         })
@@ -669,6 +706,15 @@ impl<D: Directory, C: Clock> Membership<D, C> {
     /// Publishes the process's id (`process=<id>`, ADR 0038) on line 11.
     pub fn with_process(mut self, id: impl Into<String>) -> Self {
         self.process = Some(id.into());
+        self
+    }
+
+    /// Announces `place` on line 11 (ADR 0041, section 9): this node
+    /// publishes the room fields, reads the placed mark and has placement
+    /// on.
+    #[must_use]
+    pub fn with_place(mut self, place: bool) -> Self {
+        self.place = place;
         self
     }
 
@@ -781,6 +827,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_actor_restore: true,
             can_recorded_head: true,
             can_multi_app: true,
+            can_place: self.place,
             process: self.process.clone(),
             instance: self.instance.clone(),
             lease: None,
@@ -1058,6 +1105,7 @@ mod tests {
             load: None,
             can_recorded_head: false,
             can_multi_app: false,
+            can_place: false,
             process: None,
         };
         mem.0.borrow_mut().insert("nodes/x".into(), forged.encode());
@@ -1103,6 +1151,7 @@ mod tests {
             load: None,
             can_recorded_head: false,
             can_multi_app: false,
+            can_place: false,
             process: None,
         };
         assert_eq!(NodeInfo::decode(&info.encode()), Some(info));
@@ -1184,6 +1233,7 @@ mod tests {
             load: None,
             can_recorded_head: false,
             can_multi_app: false,
+            can_place: false,
             process: None,
         }
     }
@@ -1566,6 +1616,7 @@ mod tests {
             load: None,
             can_recorded_head: false,
             can_multi_app: false,
+            can_place: false,
             process: None,
         })
     }
@@ -1583,6 +1634,8 @@ mod tests {
                 sockets: 3,
                 events_per_min: Some(840),
                 front_per_min: Some(90),
+                actor_room: None,
+                socket_room: None,
             }),
             ..tls_node()
         }
@@ -1949,6 +2002,8 @@ mod tests {
                 sockets,
                 events_per_min,
                 front_per_min: None,
+                actor_room: None,
+                socket_room: None,
             })
         };
         assert_eq!(read("load actors=1 sockets=2"), ok(1, 2, None));
@@ -1981,6 +2036,108 @@ mod tests {
         );
     }
 
+    /// `Load::parse` of 0.5.x and of 0.6 before placement, verbatim but
+    /// for its result (the four fields it knew): frozen, so a change to the
+    /// line that an older reader cannot read fails here (ADR 0041,
+    /// section 2).
+    fn frozen_parse_before_rooms(line: &str) -> Option<(u64, u64, Option<u64>, Option<u64>)> {
+        let mut words = line.split_whitespace();
+        if words.next()? != "load" {
+            return None;
+        }
+        let (mut actors, mut sockets, mut events, mut front) = (None, None, None, None);
+        for word in words {
+            let Some((key, value)) = word.split_once('=') else {
+                continue;
+            };
+            let slot = match key {
+                "actors" => &mut actors,
+                "sockets" => &mut sockets,
+                "events_per_min" => &mut events,
+                "front_per_min" => &mut front,
+                _ => continue,
+            };
+            if slot.is_some() {
+                return None;
+            }
+            let rate = key == "events_per_min" || key == "front_per_min";
+            *slot = Some(if rate && value == "-" {
+                None
+            } else {
+                Some(number(value)?)
+            });
+        }
+        Some((actors??, sockets??, events.flatten(), front.flatten()))
+    }
+
+    #[test]
+    fn the_load_line_carries_the_rooms_and_older_readers_skip_them() {
+        let load = Load {
+            actors: 12,
+            sockets: 3,
+            events_per_min: Some(840),
+            front_per_min: None,
+            actor_room: Some(88),
+            socket_room: Some(997),
+        };
+        let line = load.line();
+        assert_eq!(
+            line,
+            "load actors=12 sockets=3 events_per_min=840 front_per_min=- actor_room=88 socket_room=997"
+        );
+        assert_eq!(Load::parse(&line), Some(load));
+        // A reader of 0.5.x, or of 0.6 before placement, reads the rest.
+        assert_eq!(
+            frozen_parse_before_rooms(&line),
+            Some((12, 3, Some(840), None))
+        );
+        // Through the whole heartbeat too: line 10 as written.
+        let node = NodeInfo {
+            load: Some(load),
+            can_place: true,
+            ..loaded_node()
+        };
+        let body = format3(&node, NodeState::Live, "beef");
+        let read = NodeInfo::decode(&body).unwrap();
+        assert_eq!(read.load, Some(load));
+        assert!(read.can_place);
+        let payload = String::from_utf8(node.payload()).unwrap();
+        let line10 = payload.lines().nth(9).unwrap();
+        assert_eq!(
+            frozen_parse_before_rooms(line10),
+            Some((12, 3, Some(840), None))
+        );
+        assert_eq!(
+            decode_before_load(&body).map(|n| (n.id, n.can_take)),
+            Some((read.id.clone(), true))
+        );
+        // Without rooms (a node of an earlier version): none read.
+        let old = "load actors=1 sockets=2 events_per_min=- front_per_min=-";
+        assert_eq!(
+            Load::parse(old).map(|l| (l.actor_room, l.socket_room)),
+            Some((None, None))
+        );
+        // Rooms are counts; one repeated or malformed spoils the line.
+        for bad in [
+            "load actors=1 sockets=2 actor_room=-",
+            "load actors=1 sockets=2 actor_room=x",
+            "load actors=1 sockets=2 socket_room=1 socket_room=2",
+            "load actors=1 sockets=2 actor_room=-1",
+        ] {
+            assert_eq!(Load::parse(bad), None, "{bad:?}");
+        }
+        // One room alone is read as given.
+        assert_eq!(
+            Load::parse("load actors=1 sockets=2 actor_room=5").map(|l| l.actor_room),
+            Some(Some(5))
+        );
+        // `place` is a capability word like the others, off by default.
+        assert!(NodeInfo::words(Some("take place")).can_place);
+        assert!(!NodeInfo::words(Some("take")).can_place);
+        assert!(node.capabilities().any(|w| w == "place"));
+        assert!(!loaded_node().capabilities().any(|w| w == "place"));
+    }
+
     #[test]
     fn a_node_publishes_its_load_once_set() {
         let mem = Mem::default();
@@ -1999,6 +2156,8 @@ mod tests {
             sockets: 1,
             events_per_min: None,
             front_per_min: None,
+            actor_room: None,
+            socket_room: None,
         };
         a.set_load(load);
         let body = format3(
@@ -2030,6 +2189,8 @@ mod tests {
             sockets: 0,
             events_per_min: None,
             front_per_min: None,
+            actor_room: None,
+            socket_room: None,
         }));
         let line = |a: &Membership<&Mem, At<'_>>| {
             String::from_utf8(a.lease_payload())

@@ -570,11 +570,15 @@ impl Cluster {
                 // Plain `http://` bases and `https://` cluster listeners
                 // only: calls between nodes carry signatures, and the
                 // forwarding clients speak HTTP, over TLS or not.
-                let peers = nodes
+                let mut peers = nodes
                     .iter()
                     .filter_map(|n| Some((n.id.clone(), Peer::of(n)?)))
                     .collect();
-                *self.peers.write().unwrap_or_else(|p| p.into_inner()) = peers;
+                {
+                    let mut view = self.peers.write().unwrap_or_else(|p| p.into_inner());
+                    carry_first_seen(&view, &mut peers);
+                    *view = peers;
+                }
                 // The same bodies, for the requests kept until a dead
                 // node's actors are free: no bucket request.
                 self.failover.observe(&all, now);

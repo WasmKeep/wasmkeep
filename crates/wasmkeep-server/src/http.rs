@@ -112,7 +112,11 @@ impl App {
             && let Some(why) = actors.hop_refused(&req)
         {
             tracing::warn!(reason = why, "a signed hop refused");
-            return crate::cluster::unavailable("this hop is refused; retry\n");
+            // A placed call refused so never ran: its sender runs it.
+            return crate::cluster::refuse_if_placed(
+                req.headers(),
+                crate::cluster::unavailable("this hop is refused; retry\n"),
+            );
         }
         if (req.extensions().get::<ArrivedOnClusterPort>().is_none()
             || req.headers().contains_key(crate::cluster::FORWARDED))

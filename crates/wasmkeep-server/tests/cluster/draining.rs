@@ -97,9 +97,11 @@ async fn draining_hands_resident_actors_over_with_their_alarms() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let idle = Duration::from_secs(30);
-    // A slow sweep: only the hand-over can deliver the alarm on time.
+    // A slow sweep: only the hand-over can deliver the alarm on time. Five
+    // actors on a, which this test keeps there: placement off.
     let slow_sweep = |c: &mut ActorConfig| {
         c.cluster.as_mut().unwrap().alarm_sweep = Duration::from_secs(60);
+        no_placement(c);
     };
     let wall = Duration::from_secs(30);
     let wasm = test_actor_wasm();

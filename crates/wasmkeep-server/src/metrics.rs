@@ -306,6 +306,15 @@ pub(crate) struct Metrics {
     /// Requests and calls sent to the node that owns the actor, by kind
     /// (`request`, `websocket`, `call`).
     pub(crate) forwards: Family<AtomicU64>,
+    /// Placement at wake-up (ADR 0041, section 11), each with its app:
+    /// decisions that sent an event, by `kind` and `outcome`.
+    pub(crate) placements: Family<AtomicU64>,
+    /// Placed events received, by `outcome`.
+    pub(crate) placements_received: Family<AtomicU64>,
+    /// Placeable wake-ups kept here, by `reason`.
+    pub(crate) placement_kept: Family<AtomicU64>,
+    /// This node id's fill in thousandths, by `kind` (a gauge).
+    pub(crate) placement_fill: Family<AtomicU64>,
     /// Requests kept until a dead node's actor could be taken over, by
     /// kind (`request`, `websocket`) and how the wait ended.
     pub(crate) failover_waits: Family<AtomicU64>,
@@ -752,6 +761,32 @@ pub(crate) fn blob_link(app: &str, kind: &str) {
 /// ([`BLOB_NODE_LINK_OUTCOMES`]).
 pub(crate) fn blob_node_link(app: &str, outcome: &str) {
     inc(&METRICS.blob_node_links.get_in(app, &[("outcome", outcome)]));
+}
+/// A placed hop of `kind` (`request`, `call`) that ended as `outcome`
+/// (ADR 0041, section 11).
+pub(crate) fn placement_sent(app: &str, kind: &str, outcome: &str) {
+    inc(&METRICS
+        .placements
+        .get_in(app, &[("kind", kind), ("outcome", outcome)]));
+}
+/// A placed event received here that ended as `outcome`.
+pub(crate) fn placement_received(app: &str, outcome: &str) {
+    inc(&METRICS
+        .placements_received
+        .get_in(app, &[("outcome", outcome)]));
+}
+/// A placeable wake-up kept here for `reason`.
+pub(crate) fn placement_kept(app: &str, reason: &str) {
+    inc(&METRICS.placement_kept.get_in(app, &[("reason", reason)]));
+}
+/// This node id's fills, in thousandths.
+pub(crate) fn placement_fill(app: &str, residents: u64, sockets: u64) {
+    for (kind, v) in [("residents", residents), ("sockets", sockets)] {
+        METRICS
+            .placement_fill
+            .get_in(app, &[("kind", kind)])
+            .store(v, Ordering::Relaxed);
+    }
 }
 /// The last count of `app`'s files.
 pub(crate) fn blob_stored(app: &str, bytes: u64, files: u64) {
@@ -1452,6 +1487,37 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         ("wasmkeep_asset_cache_bytes", "gauge", &m.asset_cache),
     ] {
         head(&mut out, name, kind, "Static assets, by tenant and app.");
+        family.each(|labels, value| {
+            let _ = writeln!(out, "{name}{{{labels}}} {}", value.load(Ordering::Relaxed));
+        });
+    }
+    for (name, kind, help, family) in [
+        (
+            "wasmkeep_placements_total",
+            "counter",
+            "Wake-ups this node sent to another node (ADR 0041), by tenant, app, kind and outcome.",
+            &m.placements,
+        ),
+        (
+            "wasmkeep_placements_received_total",
+            "counter",
+            "Placed wake-ups received, by tenant, app and outcome.",
+            &m.placements_received,
+        ),
+        (
+            "wasmkeep_placement_kept_total",
+            "counter",
+            "Placeable wake-ups kept on this node, by tenant, app and reason.",
+            &m.placement_kept,
+        ),
+        (
+            "wasmkeep_placement_fill",
+            "gauge",
+            "This node id's fill in thousandths, by tenant, app and kind.",
+            &m.placement_fill,
+        ),
+    ] {
+        head(&mut out, name, kind, help);
         family.each(|labels, value| {
             let _ = writeln!(out, "{name}{{{labels}}} {}", value.load(Ordering::Relaxed));
         });

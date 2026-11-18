@@ -38,6 +38,19 @@ cluster: it cannot check the sender of a hop, and reads several node ids
 at one address as it always has.
 
 
+## Placement at wake-up
+
+0.6.0 nodes publish two more fields on their heartbeat's load line
+(`actor_room`, `socket_room`), which older readers skip, and announce
+`place` ([ADR 0041](../adr/0041-placement-at-wake-up.md)). A node places
+a wake-up only on a node that announces `place`, and counts only those
+nodes in its budget: during a rolling upgrade older nodes keep every
+actor they wake and receive nothing placed, while upgraded nodes place
+among themselves. Nothing refuses to start. Placement is on by default;
+`serve --no-placement`, or `placement = false` under `[process]` in the
+node file, turns it off for a process before or after the upgrade. A
+downgrade needs nothing: an older node ignores the fields and the word.
+
 ## Static assets
 
 Upgrade every app node before deploying [static assets](../static-assets.md).

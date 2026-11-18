@@ -236,6 +236,19 @@ impl Sockets {
         })
     }
 
+    /// How many more sessions this app could open on this node now (ADR
+    /// 0041, section 2): its ceiling and the process's, with what each has
+    /// in use.
+    pub(crate) fn session_room(&self) -> u64 {
+        let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        wasmkeep_cluster::placement::socket_room(
+            n(self.app_budget.effective()),
+            n(self.app_budget.in_use()),
+            n(self.budget.effective()),
+            n(self.budget.in_use()),
+        )
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.registry.lock().unwrap_or_else(|p| p.into_inner())
     }

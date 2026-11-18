@@ -51,6 +51,7 @@ pub mod migrate;
 pub mod node_lease;
 #[cfg(feature = "object-store")]
 pub mod object_store;
+pub mod placement;
 pub mod recorded_head;
 pub mod replication;
 pub mod restore_fence;

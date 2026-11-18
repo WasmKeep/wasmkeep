@@ -103,5 +103,6 @@ are designs, not available capabilities. -->
 - [0038 Several apps per process (accepted, as built)](adr/0038-several-apps-per-process.md)
 - [0039 The change feed (accepted, as built)](adr/0039-the-change-feed.md)
 - [0040 Directory, broadcast groups and the reconnecting room (accepted, as built)](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)
+- [0041 Placement at wake-up (proposed)](adr/0041-placement-at-wake-up.md)
 
 - [Socket admission options](reference/socket-limits.md)

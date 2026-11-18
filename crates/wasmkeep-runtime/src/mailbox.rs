@@ -97,6 +97,21 @@ impl Default for MailboxConfig {
     }
 }
 
+/// What a set's resident room is computed from ([`Mailboxes::resident_share`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentShare {
+    /// Its residents, reservations not yet returned counted.
+    pub residents: usize,
+    /// Its own cap (`max_resident`).
+    pub cap: usize,
+    /// Its floor in the process's pool; 0 without one.
+    pub floor: usize,
+    /// The pool's limit; its own cap without one.
+    pub limit: usize,
+    /// The pool's residents, every member counted; its own without one.
+    pub process: usize,
+}
+
 /// Why an event did not run.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -344,6 +359,29 @@ impl<S: Send + 'static> Mailboxes<S> {
         if self.inner.pool.set(Arc::clone(pool)).is_ok() {
             let member: Arc<dyn crate::pool::Member> = Arc::clone(&self.inner) as _;
             pool.join(Arc::downgrade(&member), floor);
+        }
+    }
+
+    /// The figures its resident room is computed from (ADR 0041, section
+    /// 2), read now: numbers only.
+    pub fn resident_share(&self) -> ResidentShare {
+        let residents = self.inner.tasks.load(std::sync::atomic::Ordering::SeqCst);
+        let cap = self.inner.config.max_resident;
+        match self.inner.pool.get() {
+            Some(pool) => ResidentShare {
+                residents,
+                cap,
+                floor: pool.floor_of(Arc::as_ptr(&self.inner).cast::<()>()),
+                limit: pool.limit(),
+                process: pool.used(),
+            },
+            None => ResidentShare {
+                residents,
+                cap,
+                floor: 0,
+                limit: cap,
+                process: residents,
+            },
         }
     }
 

@@ -492,6 +492,11 @@ impl Report {
                     "sockets": n.load().map(|l| l.sockets),
                     "events_per_min": n.load().and_then(|l| l.events_per_min),
                     "front_per_min": n.load().and_then(|l| l.front_per_min),
+                    // ADR 0041: its app's rooms, and its resident fill in
+                    // thousandths; null from a version without them.
+                    "actor_room": n.load().and_then(|l| l.actor_room),
+                    "socket_room": n.load().and_then(|l| l.socket_room),
+                    "fill": resident_fill(n.load()),
                     // ADR 0038: the process the node id runs in.
                     "process": n.info.process,
                 })
@@ -551,7 +556,7 @@ impl Report {
         if self.nodes.is_empty() {
             out.push_str("No nodes.\n");
         } else {
-            let rows: Vec<[String; 14]> = self
+            let rows: Vec<[String; 15]> = self
                 .nodes
                 .iter()
                 .map(|n| {
@@ -574,6 +579,8 @@ impl Report {
                         count(n.load().map(|l| l.sockets)),
                         count(n.load().and_then(|l| l.events_per_min)),
                         count(n.load().and_then(|l| l.front_per_min)),
+                        resident_fill(n.load())
+                            .map_or_else(|| "-".to_owned(), |f| format!("{}.{}%", f / 10, f % 10)),
                         n.info.version.clone(),
                         or_dash(&n.info.app),
                         n.info.address.clone(),
@@ -601,6 +608,7 @@ impl Report {
                     "SOCKETS",
                     "EV/MIN",
                     "FRONT/MIN",
+                    "FILL",
                     "VERSION",
                     "APP",
                     "ADDRESS",
@@ -687,6 +695,16 @@ impl Report {
 }
 
 /// A count, or `-` when unknown.
+/// A node's resident fill in thousandths (ADR 0041, section 2), from its
+/// load line's rooms; `None` without them.
+fn resident_fill(load: Option<membership::Load>) -> Option<u64> {
+    let load = load?;
+    Some(wasmkeep_cluster::placement::fill(
+        load.actors,
+        load.actor_room?,
+    ))
+}
+
 fn count(n: Option<u64>) -> String {
     n.map_or_else(|| "-".to_owned(), |n| n.to_string())
 }
@@ -1150,6 +1168,7 @@ mod tests {
                 sockets,
                 events_per_min,
                 front_per_min,
+                ..membership::Load::default()
             })
         };
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1160,7 +1179,12 @@ mod tests {
                 NOW,
                 false,
                 "acme/shop",
-                load(3, 1, Some(120), Some(45)),
+                // ADR 0041: with its rooms, so its fill shows.
+                load(3, 1, Some(120), Some(45)).map(|l| membership::Load {
+                    actor_room: Some(7),
+                    socket_room: Some(99),
+                    ..l
+                }),
             )
             .await;
             beat_with(&store, "b", NOW, false, "acme/shop", load(2, 0, None, None)).await;
@@ -1227,6 +1251,11 @@ mod tests {
         };
         assert_eq!(cells(0), (json!(3), json!(1), json!(120), json!(45)));
         assert_eq!(cells(1), (json!(2), json!(0), Value::Null, Value::Null));
+        // The rooms and the resident fill (ADR 0041), null without rooms.
+        assert_eq!(j["nodes"][0]["actor_room"], 7);
+        assert_eq!(j["nodes"][0]["socket_room"], 99);
+        assert_eq!(j["nodes"][0]["fill"], 300);
+        assert_eq!(j["nodes"][1]["fill"], Value::Null);
         for i in 2..5 {
             assert_eq!(
                 cells(i),
@@ -1273,6 +1302,9 @@ mod tests {
             "{text}"
         );
         assert_eq!(row("a")[4..8], ["3", "1", "120", "45"], "{text}");
+        assert_eq!(header[8], "FILL", "{text}");
+        assert_eq!(row("a")[8], "30.0%", "{text}");
+        assert_eq!(row("b")[8], "-", "{text}");
         assert_eq!(row("b")[4..8], ["2", "0", "-", "-"], "{text}");
         for id in ["c", "d"] {
             assert_eq!(row(id)[4..8], ["-", "-", "-", "-"], "{text}");
@@ -1337,6 +1369,7 @@ mod tests {
                 sockets: 0,
                 events_per_min: None,
                 front_per_min: None,
+                ..membership::Load::default()
             };
             beat_with(&store, "a", NOW, false, "acme/shop", Some(load)).await;
             put(

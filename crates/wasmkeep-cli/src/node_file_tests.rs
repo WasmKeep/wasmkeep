@@ -752,3 +752,31 @@ fn blob_link_base_is_an_apps_field() {
         Some("https://files.example.net")
     );
 }
+
+/// ADR 0041, section 9: `[process] placement = false` turns placement off
+/// for every app of the process, as `serve --no-placement` does; on by
+/// default, and a value that is not a boolean is refused.
+#[test]
+fn placement_is_a_process_switch_on_by_default() {
+    let on = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
+    assert_eq!(on.process.placement, None);
+    assert!(!through_file(&on).no_placement);
+    let off = parse(
+        &format!(
+            "[process]\nplacement = false\n{LISTEN}{}",
+            app("acme/shop", "shop-1", "")
+        ),
+        at(),
+    )
+    .unwrap();
+    assert_eq!(off.process.placement, Some(false));
+    assert!(through_file(&off).no_placement);
+    let e = err(&format!(
+        "[process]\nplacement = \"no\"\n{LISTEN}{}",
+        app("acme/shop", "shop-1", "")
+    ));
+    assert!(e.contains("placement"), "{e}");
+    // The flag.
+    assert!(serve(&["--no-placement"]).unwrap().no_placement);
+    assert!(!serve(&[]).unwrap().no_placement);
+}

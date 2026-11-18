@@ -94,8 +94,9 @@ async fn a_node_s_restores_share_one_limit_on_reads() {
     let seen_by_b: Arc<dyn ObjectStore> = flaky_b.clone();
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let idle = Duration::from_secs(30);
-    let a = node_with("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
-    let b = node_with("b", db.path(), &seen_by_b, idle, "t", test_actor_wasm()).await;
+    // Six actors on a, which this test keeps there.
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &seen_by_b, idle, "t", test_actor_wasm()).await;
     settle().await;
     let names: Vec<String> = (0..6)
         .map(|i| format!("/actor/t/many{i}/durable"))
@@ -499,7 +500,8 @@ async fn large_actors_cut_off(
     let seen_by_b: Arc<dyn ObjectStore> = flaky_b.clone();
     let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let idle = Duration::from_secs(30);
-    let a = node_with("a", dirs.0.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    // Several actors on a, which this test keeps there.
+    let a = node_unplaced("a", dirs.0.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
     let b = node_configured(
         "b",
         dirs.1.path(),
@@ -511,6 +513,7 @@ async fn large_actors_cut_off(
         "",
         |config: &mut ActorConfig| {
             config.cluster.as_mut().unwrap().restore_budget = Duration::from_millis(500);
+            no_placement(config);
         },
     )
     .await;

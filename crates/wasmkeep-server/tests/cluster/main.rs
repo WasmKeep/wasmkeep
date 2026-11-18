@@ -92,6 +92,8 @@ mod listings;
 mod migrate;
 #[path = "node_leases.rs"]
 mod node_leases;
+#[path = "placement.rs"]
+mod placement;
 #[path = "project_file.rs"]
 mod project_file;
 #[path = "recorded_head.rs"]
@@ -237,6 +239,35 @@ async fn node_configured(
     )
     .await
     .0
+}
+
+/// Placement at wake-up off (ADR 0041): for a test that fills a node past
+/// a fifth of its room and says in advance where each actor wakes.
+fn no_placement(config: &mut ActorConfig) {
+    config.cluster.as_mut().unwrap().placement = false;
+}
+
+/// Like `node_with`, with placement at wake-up off ([`no_placement`]).
+async fn node_unplaced(
+    id: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    idle: Duration,
+    class: &str,
+    wasm: &[u8],
+) -> Node {
+    node_configured(
+        id,
+        data,
+        store,
+        idle,
+        &[class],
+        wasm,
+        Duration::from_secs(30),
+        "",
+        no_placement,
+    )
+    .await
 }
 
 /// Like `node_with`, with other nodes reaching it through a TCP proxy that
@@ -499,6 +530,9 @@ async fn start_node(
     // Off unless a test asks (`failover_wait.rs`): every other test sees
     // the answer a node gives at once.
     cluster.failover_wait = Some(Duration::ZERO);
+    // Placement at wake-up (ADR 0041) stays on, the product's default: a
+    // test that fills a node past a fifth of its room and says in advance
+    // where each actor wakes turns it off.
     config.cluster = Some(cluster);
     adjust(&mut config);
     let cluster_port = cluster_listener(&mut config).await;

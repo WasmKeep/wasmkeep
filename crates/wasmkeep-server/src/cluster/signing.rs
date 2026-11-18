@@ -46,6 +46,7 @@ pub(super) fn verify(
         mac: unhex32(mac)?,
         ts,
         body: body.to_owned(),
+        sender: None,
     })
 }
 
@@ -77,6 +78,9 @@ pub(crate) struct Signed {
     pub(super) ts: u64,
     /// The body's SHA-256 it signs, lowercase hex.
     pub(crate) body: String,
+    /// The node its [`SENDER`] names, bound to this signature and checked
+    /// a live node of this app; `None` without one (an older node).
+    pub(crate) sender: Option<String>,
 }
 
 /// SHA-256 of a call's body, lowercase hex, as signed in [`INTERNAL`].
@@ -244,7 +248,18 @@ pub(super) fn signature(
     // (ADR 0022): a call without it signs as an older node's did, and the
     // receiver refuses it for the missing header, not the signature.
     // The upgrade mark of a front's hand-off (ADR 0027) likewise.
-    for name in [CALLER, CHAIN, ALARM_HANDOFF, TAKE, APP, UPGRADE_MARK] {
+    // The placed mark (ADR 0041, section 8) likewise: a hop without it
+    // signs as before, and one with it goes only to nodes announcing
+    // `place`, which sign it too.
+    for name in [
+        CALLER,
+        CHAIN,
+        ALARM_HANDOFF,
+        TAKE,
+        APP,
+        UPGRADE_MARK,
+        PLACED,
+    ] {
         for v in headers.get_all(name) {
             msg.extend_from_slice(name.as_bytes());
             msg.push(b':');

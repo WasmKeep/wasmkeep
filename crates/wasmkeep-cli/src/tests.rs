@@ -436,6 +436,7 @@ fn a_move_target_that_cannot_take_it_gets_a_warning() {
         load: None,
         can_recorded_head: false,
         can_multi_app: false,
+        can_place: false,
         process: None,
     };
     assert!(move_warnings(&node(true, Some(DrainState::Serving)), "acme/shop").is_empty());

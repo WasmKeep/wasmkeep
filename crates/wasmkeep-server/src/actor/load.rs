@@ -1,7 +1,9 @@
 //! This node's load, published with its heartbeat (payload line 10 of the
 //! node lease, `load actors=<n> sockets=<n> events_per_min=<n|->
-//! front_per_min=<n|->`) for `wasmkeep cluster status`. Advisory: nothing
-//! decides on it.
+//! front_per_min=<n|-> actor_room=<n> socket_room=<n>`) for `wasmkeep
+//! cluster status` and for placement at wake-up (ADR 0041): other nodes
+//! read the rooms to choose where to send a wake-up, never to decide who
+//! holds an actor. This node's own decisions read [`rooms`] from memory.
 
 use std::collections::VecDeque;
 
@@ -91,17 +93,57 @@ pub(super) fn load_source(
                 app.as_deref()
                     .map_or(0, |a| crate::metrics::METRICS.front_requests.total_in(a)),
             );
-        // Gone (the service is stopping): nothing runs here any more.
-        let (actors, sockets) = service.upgrade().map_or((0, 0), |inner| {
-            (inner.mailboxes.resident(), inner.sockets.len())
-        });
+        // Gone (the service is stopping): nothing runs here any more, and
+        // there is no room.
+        let Some(inner) = service.upgrade() else {
+            return Load {
+                events_per_min,
+                front_per_min,
+                actor_room: Some(0),
+                socket_room: Some(0),
+                ..Load::default()
+            };
+        };
+        let load = rooms(&inner);
+        if let (Some(app), Some(actor_room), Some(socket_room)) =
+            (app.as_deref(), load.actor_room, load.socket_room)
+        {
+            crate::metrics::placement_fill(
+                app,
+                wasmkeep_cluster::placement::fill(load.actors, actor_room),
+                wasmkeep_cluster::placement::fill(load.sockets, socket_room),
+            );
+        }
         Load {
-            actors: u64::try_from(actors).unwrap_or(u64::MAX),
-            sockets: u64::try_from(sockets).unwrap_or(u64::MAX),
             events_per_min,
             front_per_min,
+            ..load
         }
     })
+}
+
+/// This app's residents and sockets on this node now, with their rooms
+/// (ADR 0041, section 2): read from memory, for the heartbeat and for
+/// this node's own placement decisions. Rates are left unknown.
+pub(super) fn rooms(inner: &ServiceInner) -> Load {
+    let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+    let share = inner.mailboxes.resident_share();
+    Load {
+        // Counted as the room is (review item 8): residents with what is
+        // still closing, so actors plus room is the app's capacity here.
+        actors: n(share.residents),
+        sockets: n(inner.sockets.len()),
+        events_per_min: None,
+        front_per_min: None,
+        actor_room: Some(wasmkeep_cluster::placement::actor_room(
+            n(share.residents),
+            n(share.cap),
+            n(share.floor),
+            n(share.limit),
+            n(share.process),
+        )),
+        socket_room: Some(inner.sockets.session_room()),
+    }
 }
 
 #[cfg(test)]
