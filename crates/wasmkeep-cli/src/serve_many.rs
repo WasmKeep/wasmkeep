@@ -262,9 +262,11 @@ async fn start_runtime(
         .map(|(c, s)| (c.clone(), std::time::Duration::from_secs(*s)))
         .collect();
     if let Some(front) = deployed.front {
-        let component = shared
-            .cache
-            .get_or_compile(&front.wasm)
+        let cache = shared.cache.clone();
+        let wasm = front.wasm;
+        let component = tokio::task::spawn_blocking(move || cache.get_or_compile(&wasm))
+            .await
+            .context("compiling the deployed front")?
             .context("compiling the deployed front")?;
         config.front = Some(wasmkeep_server::DeployedFront {
             component,
@@ -303,14 +305,22 @@ async fn start_runtime(
         }
         follow_secrets = Some((secrets, keys, opened.map(|(seq, _)| seq)));
     }
-    let mut classes = Vec::new();
-    for (class, wasm) in deployed.classes {
-        let component = shared
-            .cache
-            .get_or_compile(&wasm)
-            .with_context(|| format!("compiling class {class}"))?;
-        classes.push((class, component, wasm));
-    }
+    // Compiled on a blocking thread: the other apps of this process serve
+    // on this runtime meanwhile, and a component embedding a JavaScript
+    // engine takes seconds to compile on a cache miss.
+    let cache = shared.cache.clone();
+    let classes = tokio::task::spawn_blocking(move || {
+        let mut classes = Vec::new();
+        for (class, wasm) in deployed.classes {
+            let component = cache
+                .get_or_compile(&wasm)
+                .with_context(|| format!("compiling class {class}"))?;
+            classes.push((class, component, wasm));
+        }
+        anyhow::Ok(classes)
+    })
+    .await
+    .context("compiling the deployed classes")??;
     let served: Vec<&str> = classes.iter().map(|(c, _, _)| c.as_str()).collect();
     config.env = load_env(&args.env, &served, false)?;
     serve_batched(&args.writes, &served, true)?;
