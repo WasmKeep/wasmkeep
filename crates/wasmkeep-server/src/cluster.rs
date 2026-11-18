@@ -1709,6 +1709,19 @@ impl Cluster {
         if !self.node_lease_valid() {
             return Some("bucket unreachable (node lease not renewed)");
         }
+        // Nor before this node may acquire an actor: a node following its
+        // app first checks, with its lease valid, that the app was not
+        // deleted (ADR 0028, section 5), a bucket round trip or two after
+        // its first lease write (and again after a lapse). Until then
+        // every first request for an actor is refused with a 503. The
+        // words of `app_refusal`.
+        match self.app_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            APP_OPEN => {}
+            APP_UNCHECKED => {
+                return Some("this node has not yet checked whether its app was deleted");
+            }
+            _ => return Some("the app was deleted"),
+        }
         // Peers refuse this node's handshakes until they have listed its
         // pin: give them a heartbeat period (ADR 0011), and half of one more
         // for their listing's own latency.
@@ -2615,18 +2628,19 @@ impl Cluster {
         };
         let client = self.clients().call.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
+            // The owner answered, so it read the request: it may have run.
             Ok(Ok(response)) => self
                 .trusted_response(&base, owner, response)
-                .unwrap_or_else(|| unavailable("the actor's node is no longer trusted; retry\n")),
+                .unwrap_or_else(|| outcome_unknown("the actor's node is no longer trusted")),
             Ok(Err(e)) => {
                 self.failover.connect_failed(owner, &e);
                 tracing::warn!(owner, error = %e, "forwarding failed");
-                unavailable("the actor's node did not answer; retry\n")
+                failed_forward(&base, &e)
             }
-            Err(_) => text_response(
+            Err(_) => mark_unknown(text_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "the actor's node did not answer in time\n",
-            ),
+            )),
         }
     }
 
@@ -2642,11 +2656,12 @@ impl Cluster {
         };
         let client = self.clients().request.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
+            // The owner answered, so it read the request: it may have run.
             Ok(Ok(response)) => self
                 .trusted_response(&base, owner, response)
                 .unwrap_or_else(|| {
                     tracing::warn!(owner, "forwarding: the node is no longer trusted");
-                    unavailable("the actor's node is no longer trusted; retry\n")
+                    outcome_unknown("the actor's node is no longer trusted")
                 }),
             // Every failure before an answer, none sent again from here:
             // a connection that could not be opened, a request the client
@@ -2662,23 +2677,40 @@ impl Cluster {
             // once, a request the owner provably never read
             // (`never_read_by_peer`: refused at the TLS handshake, or
             // handed back unsent on a new TLS connection), and nothing
-            // else; this path answers 503 for all of them.
+            // else; this path answers 503 for all of them, saying whether
+            // the owner may have run it ([`failed_forward`]).
             Ok(Err(e)) => {
                 // No connection could be opened: requests that arrive
                 // later for this node's actors may be kept (`keep`). This
                 // one is answered as ever.
                 self.failover.connect_failed(owner, &e);
                 tracing::warn!(owner, error = %e, "forwarding failed");
-                unavailable("the actor's node did not answer; retry\n")
+                failed_forward(&base, &e)
             }
             Err(_) => {
                 tracing::warn!(owner, "forwarding timed out");
-                text_response(
+                mark_unknown(text_response(
                     StatusCode::GATEWAY_TIMEOUT,
                     "the actor's node did not answer in time\n",
-                )
+                ))
             }
         }
+    }
+}
+
+/// The answer for a forward to `base` that failed before an answer: the
+/// plain retryable 503 when the owner provably never got the request (no
+/// connection, or [`never_read_by_peer`]), else 503 with the outcome
+/// unknown ([`OUTCOME`]): it was written to the owner, which may have run
+/// it and lost the connection.
+fn failed_forward(
+    base: &str,
+    error: &hyper_util::client::legacy::Error,
+) -> Response<HyperOutgoingBody> {
+    if error.is_connect() || never_read_by_peer(base, error) {
+        unavailable("the actor's node did not answer; retry\n")
+    } else {
+        outcome_unknown("the actor's node did not answer")
     }
 }
 

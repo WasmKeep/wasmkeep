@@ -430,8 +430,9 @@ impl ActorService {
             Hop::Failed(why) => {
                 cluster.placement_backoff(&node);
                 tracing::warn!(node, error = %why, "a placed request's hop failed");
-                // It may have run there: never run again here.
-                crate::cluster::unavailable("the actor's node did not answer; retry\n")
+                // It may have run there: never run again here, and the
+                // client is told the outcome is unknown.
+                crate::cluster::outcome_unknown("the actor's node did not answer")
             }
         })
     }
@@ -732,7 +733,13 @@ impl ActorService {
                         "actor unavailable\n",
                     ))
                 }
-                _ => text_response(StatusCode::INTERNAL_SERVER_ERROR, "actor error\n"),
+                // The event started and ended with no response: cut by
+                // its wall or a lease lapse, or a trap. A durable write in
+                // it may have landed: the outcome is unknown.
+                _ => crate::cluster::mark_unknown(text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "actor error\n",
+                )),
             }),
         }
     }

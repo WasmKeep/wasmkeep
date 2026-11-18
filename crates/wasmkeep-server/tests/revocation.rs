@@ -273,7 +273,21 @@ async fn node(id: &str, data: &Path, shared: &Arc<dyn ObjectStore>) -> Node {
 struct Reply {
     status: u16,
     node: Option<String>,
+    /// The status line and headers.
+    head: String,
     body: String,
+}
+
+impl Reply {
+    /// The first header `name` (any case), trimmed.
+    fn header(&self, name: &str) -> Option<String> {
+        self.head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_owned())
+        })
+    }
 }
 
 /// A request to a node's public port, on a connection of its own. No
@@ -315,6 +329,7 @@ async fn send(addr: SocketAddr, method: &str, path: &str) -> Reply {
     Reply {
         status,
         node,
+        head: head.to_owned(),
         body: body.trim().to_owned(),
     }
 }
@@ -629,7 +644,7 @@ async fn a_stops_trusting_b(how: Revoke) {
     let (a_addr, b_addr) = (a.addr, b.addr);
     let (refusal, sends) = within("a sending to b", since, bound, move || async move {
         let r = send(a_addr, "GET", "/actor/t/on-b/fired").await;
-        let sent = r.status != 503 || r.body == "the actor's node is no longer trusted; retry";
+        let sent = r.status != 503 || r.header("x-wasmkeep-outcome").is_some();
         (!sent).then_some(r.body)
     })
     .await;
@@ -652,8 +667,7 @@ async fn a_stops_trusting_b(how: Revoke) {
         bound,
         move || async move {
             let r = send(b_addr, "GET", "/actor/t/on-a/fired").await;
-            let admitted = r.status == 200
-                || r.body == "the node's certificate stopped being live during the request";
+            let admitted = r.status == 200 || r.header("x-wasmkeep-outcome").is_some();
             (!admitted).then_some(r)
         },
     )
@@ -746,6 +760,70 @@ async fn a_stops_trusting_b(how: Revoke) {
     );
     if let Some(w) = writer {
         w.abort();
+    }
+}
+
+/// A request that ran while trust between its two nodes lapsed: its answer
+/// is withheld, by the owner (it no longer trusts the forwarding node) or
+/// by the forwarding node (it no longer trusts the owner). Either way the
+/// event ran, so the 503 says the outcome is unknown, with no
+/// `Retry-After`: a client that retried a write on it would run it twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_withheld_after_its_request_ran_says_the_outcome_is_unknown() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node("a", da.path(), &store).await;
+    let b = node("b", db.path(), &store).await;
+    for (n, name) in [(&a, "on-a"), (&b, "on-b")] {
+        let r = send(n.addr, "GET", &format!("/actor/t/{name}/slept")).await;
+        assert_eq!(r.status, 200, "{name}: {}", r.body);
+    }
+    let started = Instant::now();
+    loop {
+        let ab = send(a.addr, "GET", "/actor/t/on-b/slept").await;
+        let ba = send(b.addr, "GET", "/actor/t/on-a/slept").await;
+        if (ab.status, ab.node.as_deref(), ba.status, ba.node.as_deref())
+            == (200, Some("b"), 200, Some("a"))
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the nodes never reached each other: {ab:?} {ba:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let slow = |via: SocketAddr, actor: &'static str| {
+        tokio::spawn(
+            async move { send(via, "POST", &format!("/actor/t/{actor}/sleep?ms=1500")).await },
+        )
+    };
+    // b forwards to a, which runs it; a forwards to b, which runs it.
+    let (to_a, to_b) = (slow(b.addr, "on-a"), slow(a.addr, "on-b"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    revoke(Revoke::ListingFails, &store, &a, &b).await;
+    for (what, reply) in [
+        ("withheld by the owner", to_a.await.unwrap()),
+        ("withheld by the forwarding node", to_b.await.unwrap()),
+    ] {
+        assert_eq!(
+            (
+                reply.status,
+                reply.header("x-wasmkeep-outcome").as_deref(),
+                reply.header("retry-after")
+            ),
+            (503, Some("unknown"), None),
+            "{what}: {reply:?}"
+        );
+        assert!(
+            reply.body.ends_with("the request may have run"),
+            "{what}: {reply:?}"
+        );
+    }
+    // Both ran, once.
+    for (n, name) in [(&a, "on-a"), (&b, "on-b")] {
+        let r = send(n.addr, "GET", &format!("/actor/t/{name}/slept")).await;
+        assert_eq!((r.status, r.body.as_str()), (200, "1"), "{name}");
     }
 }
 

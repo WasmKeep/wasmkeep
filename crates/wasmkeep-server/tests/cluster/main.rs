@@ -96,6 +96,8 @@ mod node_leases;
 mod placement;
 #[path = "project_file.rs"]
 mod project_file;
+#[path = "readiness.rs"]
+mod readiness;
 #[path = "recorded_head.rs"]
 mod recorded_head;
 mod restore;

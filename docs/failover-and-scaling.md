@@ -89,7 +89,11 @@ the dead node had already accepted, and then never answered, waits 30 s
 and gets `504` with the body `the actor's node did not answer in time` and
 no `Retry-After`. That is on purpose: the request was written to the node,
 which may have run it, so the answer does not invite a retry that could
-run a request that is not idempotent twice. A WebSocket upgrade forwarded
+run a request that is not idempotent twice; it carries
+`x-wasmkeep-outcome: unknown`, as does a `503` for a request written to
+the node whose connection then broke (the body ends `the request may have
+run`, with no `Retry-After`; see
+[What "saved" means](what-saved-means.md)). A WebSocket upgrade forwarded
 the same way gets `503` with `Retry-After: 1` instead: it carries no body,
 and a client opens a socket again anyway.
 

@@ -318,13 +318,20 @@ async fn each_answer_to_a_placed_hop_is_handled_as_the_table_says() {
     // An ordinary forward now: no mark.
     assert_eq!(header_of(followed, "x-wasmkeep-placed"), None, "{followed}");
 
-    // Ambiguous (read, then the connection dropped): 503, not run here.
+    // Ambiguous (read, then the connection dropped): 503, not run here,
+    // and the outcome unknown (it may have run there): no `Retry-After`.
     fake.set(Answer::Drop);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let before = fake.hops().len();
     let (dropped, reply) = wake_until_hop(&a, &fake, "d", before).await;
     assert_eq!(reply.status, 503, "{}", reply.head);
-    assert_eq!(reply.retry_after.as_deref(), Some("1"));
+    assert_eq!(reply.retry_after, None, "{}", reply.head);
+    assert_eq!(
+        reply.header("x-wasmkeep-outcome").as_deref(),
+        Some("unknown"),
+        "{}",
+        reply.head
+    );
     assert_eq!(lease_holder(&store, &dropped).await, None);
 
     // A client's mark, with the forwarded mark: handled as that forward

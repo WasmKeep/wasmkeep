@@ -569,8 +569,9 @@ async fn a_request_after_the_owner_closed_the_idle_connection_goes_on_a_new_one(
 /// is not sent again: the forwarding node cannot tell an owner that never
 /// read it from one that ran it and lost the connection (its client
 /// reports the same error for both), and an event must not run twice. The
-/// client gets a 503 with `Retry-After` and decides. Here the request is
-/// first lost on the way (the event does not run), then delivered with its
+/// client gets a 503 that says the outcome is unknown (no `Retry-After`,
+/// `x-wasmkeep-outcome: unknown`) and decides. Here the request is first
+/// lost on the way (the event does not run), then delivered with its
 /// answer lost (the event runs exactly once); the same for `actors.call`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_written_before_its_connection_closed_is_not_sent_again() {
@@ -584,8 +585,18 @@ async fn a_request_written_before_its_connection_closed_is_not_sent_again() {
     };
     let unanswered = |r: &Reply| {
         assert_eq!(
-            (r.status, r.body.trim(), r.retry_after.as_deref()),
-            (503, "the actor's node did not answer; retry", Some("1"))
+            (
+                r.status,
+                r.body.trim(),
+                r.retry_after.as_deref(),
+                r.header("x-wasmkeep-outcome").as_deref()
+            ),
+            (
+                503,
+                "the actor's node did not answer; the request may have run",
+                None,
+                Some("unknown")
+            )
         );
     };
 
@@ -593,7 +604,16 @@ async fn a_request_written_before_its_connection_closed_is_not_sent_again() {
     let before = proxy.accepted.load(Ordering::SeqCst);
     proxy.swallow_next_request();
     let r = send(b.addr, "POST", "/actor/t/x/sleep?ms=100", "").await;
-    unanswered(&r);
+    // b cannot tell this from a lost answer, unless TLS showed the request
+    // was never read: then a plain retryable 503.
+    if r.retry_after.is_none() {
+        unanswered(&r);
+    } else {
+        assert_eq!(
+            (r.status, r.body.trim(), r.header("x-wasmkeep-outcome")),
+            (503, "the actor's node did not answer; retry", None)
+        );
+    }
     assert_eq!(proxy.accepted.load(Ordering::SeqCst), before, "sent once");
     assert_eq!(slept().await, "0");
 
@@ -624,6 +644,31 @@ async fn a_request_written_before_its_connection_closed_is_not_sent_again() {
     assert!(r.body.starts_with("failed:node a: "), "{}", r.body);
     assert_eq!(proxy.accepted.load(Ordering::SeqCst), before, "sent once");
     assert_eq!(slept().await, "4", "the callee ran once, not twice");
+}
+
+/// A forward that never reached the owner (the connection refused) was
+/// not run: the plain retryable 503, never the unknown outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_whose_connection_is_refused_answers_not_run() {
+    let (a, b, proxy, _dirs) = b_with_a_pooled_connection_to_a().await;
+    proxy.refuse_connections().await;
+    let r = send(b.addr, "POST", "/actor/t/x/sleep?ms=100", "").await;
+    assert_eq!(
+        (
+            r.status,
+            r.body.trim(),
+            r.retry_after.as_deref(),
+            r.header("x-wasmkeep-outcome")
+        ),
+        (
+            503,
+            "the actor's node did not answer; retry",
+            Some("1"),
+            None
+        )
+    );
+    let r = send(a.addr, "GET", "/actor/t/x/slept", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "0"), "it did not run");
 }
 
 /// Sends a POST with `len` bytes of body, all of it whatever the node

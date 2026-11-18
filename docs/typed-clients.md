@@ -314,7 +314,9 @@ stay committed, and repeating the mutation is not the answer.
 
 The client never retries, and no result says a call is safe to retry. After a
 `transport` failure, a timeout, or a 503, a mutation may already have
-committed. Make retryable business operations idempotent (an idempotency key
+committed. A host answer with `x-wasmkeep-outcome: unknown` says so
+explicitly (the request reached the actor or its node, and its answer was
+lost). Make retryable business operations idempotent (an idempotency key
 in the input that the actor stores with the write) and let the caller decide.
 
 ## Changing a contract over time
