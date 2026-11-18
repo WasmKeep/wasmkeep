@@ -79,7 +79,7 @@ use std::time::Duration;
 use std::rc::Rc;
 
 use madsim::net::NetSim;
-use madsim::runtime::{Handle, Runtime};
+use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::lease::{Clock, LeaseConfig};
 use wasmkeep_cluster::node_lease::{AcquireError, OwnerRecord};
@@ -87,6 +87,10 @@ use wasmkeep_sim::check::{double_ownership, stop};
 use wasmkeep_sim::driver::{Claim, Env};
 use wasmkeep_sim::node::{Breaks, Held, LeaseNode, NodeBuckets, NodeSetup, take_fences};
 use wasmkeep_sim::rng::Rng;
+
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::Runtime;
 
 #[path = "support/bucket.rs"]
 mod bucket;

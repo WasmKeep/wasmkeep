@@ -68,7 +68,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use madsim::net::NetSim;
-use madsim::runtime::{Handle, Runtime};
+use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::lease::{Bucket, LeaseConfig};
 use wasmkeep_cluster::node_lease::Released;
@@ -78,6 +78,10 @@ use wasmkeep_cluster::replication::{
 use wasmkeep_sim::driver::Env;
 use wasmkeep_sim::node::{Breaks, Held, LeaseNode, NodeBuckets, NodeSetup, take_fences};
 use wasmkeep_sim::rng::Rng;
+
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::Runtime;
 
 #[path = "support/bucket.rs"]
 mod bucket;
@@ -1520,22 +1524,22 @@ fn acting_until_a_release_after_a_lapse_is_answered_is_caught() {
         act_until_answered: true,
         ..SAFE_CUT
     };
-    let caught: Vec<u64> = (0..seeds())
-        .filter(|&s| check(&simulate(s, rules, Duration::from_secs(30))).is_err())
-        .collect();
+    let (mut caught, mut first) = (0u64, None);
+    for seed in 0..seeds() {
+        if check(&simulate(seed, rules, Duration::from_secs(30))).is_err() {
+            caught += 1;
+            first.get_or_insert(seed);
+        }
+    }
     eprintln!(
         "replication: acting until a release after a lapse is answered caught on {} of {} \
          seeds, first {:?}",
-        caught.len(),
+        caught,
         seeds(),
-        caught.first()
+        first
     );
     let floor = (seeds() / 20).max(1);
-    assert!(
-        u64::try_from(caught.len()).unwrap() >= floor,
-        "caught on {} seeds, want {floor}",
-        caught.len()
-    );
+    assert!(caught >= floor, "caught on {caught} seeds, want {floor}");
 }
 
 #[test]

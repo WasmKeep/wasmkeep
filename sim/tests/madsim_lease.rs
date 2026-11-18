@@ -10,12 +10,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
 use madsim::net::NetSim;
-use madsim::runtime::{Handle, Runtime};
+use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::lease::{Clock, LeaseConfig, LeaseError, Leases};
 use wasmkeep_sim::check::{double_ownership, stop};
 use wasmkeep_sim::driver::{Claim, Decision, Env, Observer, SkewedClock, run_node};
 use wasmkeep_sim::rng::Rng;
+
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::Runtime;
 
 #[path = "support/bucket.rs"]
 mod bucket;
@@ -415,9 +419,36 @@ fn handover_gaps(run: &Run) -> Vec<u64> {
         .collect()
 }
 
-fn median(mut v: Vec<u64>) -> u64 {
-    v.sort_unstable();
-    v.get(v.len() / 2).copied().unwrap_or(0)
+/// Count gaps by simulated millisecond, rather than retaining samples from
+/// every seed. The simulation duration bounds the number of histogram bins.
+#[derive(Default)]
+struct Gaps(std::collections::BTreeMap<u64, u64>);
+
+impl Gaps {
+    fn record(&mut self, run: &Run) {
+        for gap in handover_gaps(run) {
+            *self.0.entry(gap).or_default() += 1;
+        }
+    }
+
+    fn median(&self) -> u64 {
+        let middle = self.0.values().sum::<u64>() / 2;
+        let mut seen = 0;
+        for (&gap, &count) in &self.0 {
+            seen += count;
+            if seen > middle {
+                return gap;
+            }
+        }
+        0
+    }
+}
+
+#[test]
+fn gap_histogram_preserves_the_upper_median() {
+    assert_eq!(Gaps::default().median(), 0);
+    assert_eq!(Gaps([(10, 2), (20, 2)].into()).median(), 20);
+    assert_eq!(Gaps([(10, 3), (20, 2)].into()).median(), 10);
 }
 
 #[test]
@@ -425,7 +456,7 @@ fn never_two_owners_when_owners_release() {
     // Holders give the lease up (hibernation, shutdown) on 3% of ticks, half
     // of the time with a renewal still in flight, on top of skew, late
     // delivery, crashes and bucket outages.
-    let (mut releases, mut gaps, mut control) = (0, Vec::new(), Vec::new());
+    let (mut releases, mut gaps, mut control) = (0, Gaps::default(), Gaps::default());
     for seed in 0..seeds() {
         let run = simulate(
             seed,
@@ -439,7 +470,7 @@ fn never_two_owners_when_owners_release() {
             panic!("seed {seed}: two owners: {v:?}");
         }
         releases += run.releases;
-        gaps.extend(handover_gaps(&run));
+        gaps.record(&run);
         // The same seed with nodes going away without releasing.
         let run = simulate(
             seed,
@@ -449,10 +480,10 @@ fn never_two_owners_when_owners_release() {
             Releases::Abandon(3),
             Duration::from_secs(30),
         );
-        control.extend(handover_gaps(&run));
+        control.record(&run);
     }
     assert!(releases > seeds(), "few releases ({releases})");
-    let (with, without) = (median(gaps), median(control));
+    let (with, without) = (gaps.median(), control.median());
     eprintln!(
         "lease with releases: {} seeds x 30 s, {releases} releases; median handover {with} ms, \
          {without} ms when nodes go away without releasing",

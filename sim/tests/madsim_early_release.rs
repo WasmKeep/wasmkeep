@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use madsim::runtime::{Handle, Runtime};
+use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::lease::{Bucket, LeaseConfig};
 use wasmkeep_cluster::node_lease::{OwnerRecord, Released};
@@ -49,6 +49,10 @@ use wasmkeep_sim::check::{double_ownership, stop_process};
 use wasmkeep_sim::driver::{Claim, Env, SkewedClock};
 use wasmkeep_sim::node::{Breaks, Held, LeaseNode, NodeBuckets, NodeSetup};
 use wasmkeep_sim::rng::Rng;
+
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::Runtime;
 
 #[path = "support/bucket.rs"]
 mod bucket;

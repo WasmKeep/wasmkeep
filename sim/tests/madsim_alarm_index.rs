@@ -36,13 +36,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use madsim::net::NetSim;
-use madsim::runtime::{Handle, Runtime};
+use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::alarm_index::{self, Entry};
 use wasmkeep_cluster::lease::{Bucket, LeaseConfig};
 use wasmkeep_sim::driver::Env;
 use wasmkeep_sim::node::{Breaks, Held, LeaseNode, NodeBuckets, NodeSetup};
 use wasmkeep_sim::rng::Rng;
+
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::Runtime;
 
 #[path = "support/bucket.rs"]
 mod bucket;
