@@ -291,6 +291,14 @@ measured the 0.4.1 code at 0.334 PUT, 1.10 LIST and 1.33 GET per node
 (2.6 million, 8.6 million and 13 million a month). It is shown for
 comparison only; 0.4.2 is current.
 
+Measured since (2026-11-18, 0.6.0 build `14f7ea2`, three nodes, one app,
+ten minutes at rest; `docs/benchmarks.md`, "Bucket requests at rest",
+[`bench/results/2026-11-18-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv`](../../bench/results/2026-11-18-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv)):
+0.333 PUT, 0.12 to 0.13 LIST and **3.1 to 3.3 GET** per node and second.
+GETs run above the 2.33 modeled here, so the GET figures below are a
+floor: at the measured rate, about 25 million GETs a month for three
+nodes, not 18.1 million. The table below is not recomputed.
+
 | Monthly, three idle nodes | GCS Standard, single region [G13] | Azure Hot LRS, East US [A13] |
 | --- | --- | --- |
 | How a PUT is billed | Class A, $0.005 per 1,000 | Write, $0.05 per 10,000 |
