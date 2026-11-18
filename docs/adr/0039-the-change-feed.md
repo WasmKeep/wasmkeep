@@ -3,7 +3,10 @@
 - Status: accepted, as built (2026-11-17), slices F1 to F5 and F7:
   `wasmkeep feed` and `wasmkeep feed compact`
   ([the change feed](../change-feed.md)). Slice F6, the listing measured
-  at 100,000 actors, is still to run and may revise the cost section.
+  at 100,000 actors, ran on 2026-11-18: 51.4 s a poll at rest with 2
+  history objects per actor
+  ([benchmarks](../benchmarks.md#the-change-feed-at-100000-actors)); a
+  large history lists for minutes, and parallel listing is the follow-up.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, fourth item
 - Follows: [ADR 0033](0033-data-access-export-and-online-backup.md)

@@ -45,7 +45,11 @@ LIST requests, plus retries. For 100,000 actors with 20 objects each, that is
 2,000 pages per poll, about 86.4 million LISTs in 30 days at one poll per minute.
 Changed actors also cost a full restore; unchanged actors need no history GETs.
 There are four marker GETs per poll. Lag includes the scheduling interval,
-listing and restore time. These are estimates, not F6 measurements.
+listing and restore time. Measured at 100,000 actors with 2 history objects
+each, a poll at rest takes about 51 s, and the listing grows with history: at 20
+objects per actor, expect minutes per poll
+([benchmarks](benchmarks.md#the-change-feed-at-100000-actors)), so poll a large
+app less often.
 
 ## Load the generated views
 
