@@ -179,6 +179,8 @@ struct World {
     late_ms: Mutex<u64>,
     /// Actors that cannot start: their entries never leave.
     poisoned: HashSet<u64>,
+    /// Task handles, pruned as deliveries finish; bounded by in-flight work.
+    deliveries: Mutex<Vec<madsim::task::JoinHandle<()>>>,
 }
 
 impl World {
@@ -341,13 +343,16 @@ async fn sweeper(
             if !in_flight.lock().unwrap().insert(key.1) {
                 continue;
             }
-            let (world, in_flight) = (Arc::clone(&world), Arc::clone(&in_flight));
+            let (delivery_world, in_flight) = (Arc::clone(&world), Arc::clone(&in_flight));
             let mut rng = Rng::new(rng.next_u64());
-            madsim::task::spawn(async move {
-                if deliver(world, node, key, &mut rng).await {
+            let delivery = madsim::task::spawn(async move {
+                if deliver(delivery_world, node, key, &mut rng).await {
                     in_flight.lock().unwrap().remove(&key.1);
                 }
             });
+            let mut deliveries = world.deliveries.lock().unwrap();
+            deliveries.retain(|task| !task.is_finished());
+            deliveries.push(delivery);
         }
     }
 }
@@ -396,6 +401,7 @@ fn simulate_with(seed: u64, rule: Rule, schedule: Schedule, backlog: u64) -> Out
             drained_ms: Mutex::default(),
             late_ms: Mutex::default(),
             poisoned,
+            deliveries: Mutex::default(),
         });
         let nodes: Vec<_> = (0..2)
             .map(|node| {
@@ -420,20 +426,35 @@ fn simulate_with(seed: u64, rule: Rule, schedule: Schedule, backlog: u64) -> Out
         while world.start.elapsed() < DEADLINE && left(&world) > 0 {
             sleep(Duration::from_millis(100)).await;
         }
-        for node in nodes {
+        for node in &nodes {
             node.abort();
         }
         let left = left(&world);
         let drained_ms = *world.drained_ms.lock().unwrap();
         let not_owner = *world.not_owner.lock().unwrap();
         let late_ms = *world.late_ms.lock().unwrap();
-        Outcome {
+        let outcome = Outcome {
             views,
             left,
             drained_ms,
             not_owner,
             late_ms,
+        };
+        // Freeze the observations first. Aborting a sweeper does not abort
+        // its detached deliveries, and madsim Runtime::drop does not do so
+        // either. Poll cancellation before this seed's World is dropped.
+        for node in nodes {
+            let _ = node.await;
         }
+        let deliveries = std::mem::take(&mut *world.deliveries.lock().unwrap());
+        for task in &deliveries {
+            task.abort();
+        }
+        for task in deliveries {
+            let _ = task.await;
+        }
+        assert_eq!(Arc::strong_count(&world), 1, "seed retained delivery state");
+        outcome
     })
 }
 

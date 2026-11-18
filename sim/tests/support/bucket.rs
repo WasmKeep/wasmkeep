@@ -73,18 +73,31 @@ thread_local! {
 }
 
 /// Starts the last-modified clock at 0 and forgets every time recorded: a
-/// simulation that lists with times calls it first.
+/// simulation that lists with times holds the returned guard for its run.
 #[allow(dead_code, reason = "not every simulation lists with times")]
-pub(crate) fn reset_modified() {
+pub(crate) fn reset_modified() -> ModifiedGuard {
     MODIFIED.with(|m| *m.borrow_mut() = (Some(madsim::time::Instant::now()), BTreeMap::new()));
+    ModifiedGuard
+}
+
+/// Timestamp history belongs to one seed, not the test thread. Simulations
+/// that do not list timestamps never enable it or retain their object keys.
+#[must_use]
+pub(crate) struct ModifiedGuard;
+
+impl Drop for ModifiedGuard {
+    fn drop(&mut self) {
+        MODIFIED.with(|m| *m.borrow_mut() = (None, BTreeMap::new()));
+    }
 }
 
 fn note_modified(key: &str) {
     MODIFIED.with(|m| {
         let mut m = m.borrow_mut();
-        let at = m.0.map_or(0, |t| {
-            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-        });
+        let Some(start) = m.0 else {
+            return;
+        };
+        let at = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         m.1.insert(key.to_owned(), at);
     });
 }
@@ -431,5 +444,26 @@ impl Bucket for CutWrites {
             return Err(e);
         }
         self.inner.replace(key, body, expected).await
+    }
+}
+
+#[test]
+fn modification_history_is_scoped_to_one_simulation() {
+    for seed in 0..2 {
+        madsim::runtime::Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            note_modified("untracked");
+            MODIFIED.with(|m| assert!(m.borrow().1.is_empty()));
+            {
+                let _timestamps = reset_modified();
+                madsim::time::sleep(Duration::from_millis(10)).await;
+                note_modified("tracked");
+                assert!(modified("tracked") >= 10);
+                MODIFIED.with(|m| assert_eq!(m.borrow().1.len(), 1));
+            }
+            MODIFIED.with(|m| {
+                assert!(m.borrow().0.is_none());
+                assert!(m.borrow().1.is_empty());
+            });
+        });
     }
 }

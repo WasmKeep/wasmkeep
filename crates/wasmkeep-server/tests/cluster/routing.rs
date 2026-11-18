@@ -262,8 +262,10 @@ async fn awkward_names_work_across_nodes() {
         Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down)));
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let idle = Duration::from_secs(30);
-    let a = node_with("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
-    let b = node_with("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    // Every name wakes first on a: placement at wake-up would send some to
+    // b once a holds a fifth of its 14-resident room (ADR 0041).
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
     settle().await;
 
     for name in awkward_names() {

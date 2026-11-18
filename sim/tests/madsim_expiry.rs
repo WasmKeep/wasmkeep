@@ -38,7 +38,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use madsim::runtime::{Handle, Runtime};
+use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::expiry::{Listed, candidates};
 use wasmkeep_cluster::lease::{Clock, LeaseConfig};
@@ -46,6 +46,10 @@ use wasmkeep_cluster::node_lease::AcquireError;
 use wasmkeep_sim::driver::{Env, SkewedClock};
 use wasmkeep_sim::node::{Breaks, LeaseNode, NodeBuckets, NodeSetup};
 use wasmkeep_sim::rng::Rng;
+
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::Runtime;
 
 #[path = "support/bucket.rs"]
 mod bucket;
@@ -347,7 +351,7 @@ fn simulate(seed: u64, wrong: Wrong, duration: Duration) -> Outcome {
     let shared = Arc::new(Mutex::new(Shared::default()));
     let out = Arc::clone(&shared);
     rt.block_on(async move {
-        reset_modified();
+        let _timestamps = reset_modified();
         let handle = Handle::current();
         let env = SimEnv(Instant::now());
         let mut rng = Rng::new(seed ^ 0x0E1D_1E57);

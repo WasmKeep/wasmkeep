@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use madsim::net::NetSim;
-use madsim::runtime::{Handle, Runtime};
+use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::failover::{OwnerWatch, Seen, Step, Verdict, Waiter};
 use wasmkeep_cluster::lease::{Bucket, Clock, LeaseConfig};
@@ -58,6 +58,10 @@ use wasmkeep_sim::node::{
     Breaks, Held, LeaseNode, NodeBuckets, NodeSetup, take_fences, take_old_epoch_acts,
 };
 use wasmkeep_sim::rng::Rng;
+
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::Runtime;
 
 #[path = "support/bucket.rs"]
 mod bucket;
