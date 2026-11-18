@@ -1814,25 +1814,16 @@ impl AppRef {
         // Everything compiled first, then swapped in at once with the
         // sequence, the rules and the values: a node that cannot build a
         // version keeps the previous one whole, and no event sees part of
-        // a deploy.
+        // a deploy. Compiled on a blocking thread: a component embedding
+        // a JavaScript engine takes seconds, which on a runtime worker
+        // would hold back events and lease renewals queued behind it. This
+        // follower waits for it, so the swap still comes after it.
         let runtime = service.runtime().clone();
-        let mut compiled = Vec::with_capacity(classes.len());
-        for (name, bytes) in classes {
-            let component = runtime
-                .compile(&bytes)
-                .map_err(|e| DeployError::Invalid(name.clone(), format!("{e:#}")))?;
-            compiled.push((name, component, bytes));
-        }
-        let front = match front {
-            Some(f) => Some(crate::front::DeployedFront {
-                component: runtime
-                    .compile(&f.wasm)
-                    .map_err(|e| DeployError::Front(format!("{e:#}")))?,
-                config: f.config,
-                requires: f.requires,
-            }),
-            None => None,
-        };
+        let app = self.name();
+        let (compiled, front) =
+            tokio::task::spawn_blocking(move || compile_version(&runtime, &app, classes, front))
+                .await
+                .map_err(|e| DeployError::Bucket(format!("compiling the version: {e}")))??;
         service
             .apply_deployed_assets(
                 assets,
@@ -1856,6 +1847,91 @@ impl AppRef {
         tracing::info!(version = %current.version, seq = current.seq, "now running the deployed version");
         Ok(true)
     }
+}
+
+/// A followed version's classes and front, compiled (on a blocking
+/// thread: [`AppRef::update`]).
+#[allow(
+    clippy::type_complexity,
+    reason = "the classes as `apply_deployed` takes them"
+)]
+fn compile_version(
+    runtime: &Runtime,
+    app: &str,
+    classes: Vec<(String, Vec<u8>)>,
+    front: Option<VersionFront>,
+) -> Result<
+    (
+        Vec<(String, wasmtime::component::Component, Vec<u8>)>,
+        Option<crate::front::DeployedFront>,
+    ),
+    DeployError,
+> {
+    slow_compile::wait(app);
+    let mut compiled = Vec::with_capacity(classes.len());
+    for (name, bytes) in classes {
+        let component = runtime
+            .compile(&bytes)
+            .map_err(|e| DeployError::Invalid(name.clone(), format!("{e:#}")))?;
+        compiled.push((name, component, bytes));
+    }
+    let front = match front {
+        Some(f) => Some(crate::front::DeployedFront {
+            component: runtime
+                .compile(&f.wasm)
+                .map_err(|e| DeployError::Front(format!("{e:#}")))?,
+            config: f.config,
+            requires: f.requires,
+        }),
+        None => None,
+    };
+    Ok((compiled, front))
+}
+
+/// A test's slow compile: the deploy follower of an app named here takes
+/// this much longer to compile each version, on the thread that compiles,
+/// as a component embedding a JavaScript engine does.
+mod slow_compile {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static SLOW: Mutex<BTreeMap<String, Duration>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn wait(app: &str) {
+        let by = SLOW
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(app)
+            .copied();
+        if let Some(by) = by {
+            std::thread::sleep(by);
+        }
+    }
+
+    pub(super) struct Slow(pub(super) String);
+
+    impl Drop for Slow {
+        fn drop(&mut self) {
+            SLOW.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.0);
+        }
+    }
+
+    pub(super) fn set(app: String, by: Duration) -> Slow {
+        SLOW.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(app.clone(), by);
+        Slow(app)
+    }
+}
+
+/// Test hook: until the guard drops, the deploy follower of `app`
+/// (`tenant/app`) takes `by` longer to compile each version it follows.
+#[doc(hidden)]
+pub fn slow_follower_compiles(app: &str, by: std::time::Duration) -> impl Drop + Send {
+    slow_compile::set(app.to_owned(), by)
 }
 
 /// The third token of `current` once the app's state is under its root

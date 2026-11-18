@@ -1230,3 +1230,82 @@ async fn a_deploy_says_what_it_replaced_and_an_unchanged_one_writes_nothing() {
         (v1.version.as_str(), 3)
     );
 }
+
+/// A deploy whose components take seconds to compile (a JavaScript engine
+/// inside, simulated by the follower's slow-compile hook) holds back no
+/// event and no lease renewal while the node follows it: the follower
+/// compiles off the async runtime. One runtime worker, so a compile on it
+/// would stall everything; the 1 s lease would lapse within it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_slow_compile_holds_back_no_event_and_no_lease() {
+    use wasmkeep_server::apps::Changes;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    let classes = |names: &[&str]| Changes {
+        classes: Some(
+            names
+                .iter()
+                .map(|n| ((*n).to_owned(), test_actor_wasm().to_vec()))
+                .collect(),
+        ),
+        ..Changes::default()
+    };
+    app.deploy_changes(&rt, classes(&["t"])).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (node, service) = node_app(
+        "a",
+        dir.path(),
+        &store,
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+    )
+    .await;
+    let r = send_runnable(node.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    let compile = Duration::from_millis(2_500);
+    let _slow = wasmkeep_server::apps::slow_follower_compiles("default/shop", compile);
+    // The lease is read from a thread of its own, every 20 ms: the
+    // runtime may be the one held back.
+    let watching = Arc::new(AtomicBool::new(true));
+    let lapsed = std::thread::spawn({
+        let (service, watching) = (service.clone(), Arc::clone(&watching));
+        move || {
+            let mut lapsed = 0;
+            while watching.load(Ordering::SeqCst) {
+                if !service.lease_valid_now() {
+                    lapsed += 1;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            lapsed
+        }
+    });
+    let done = app.deploy_changes(&rt, classes(&["t", "u"])).await.unwrap();
+    let started = std::time::Instant::now();
+    let (mut slowest, mut events) = (Duration::ZERO, 0);
+    while service.deploy_seq() < done.current.seq {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the node never followed the deploy"
+        );
+        let sent = std::time::Instant::now();
+        let r = send(node.addr, "GET", "/actor/t/x/plain", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+        slowest = slowest.max(sent.elapsed());
+        events += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    watching.store(false, Ordering::SeqCst);
+    let lapsed = lapsed.join().unwrap();
+    assert!(started.elapsed() >= compile, "the compile was not slow");
+    assert!(events >= 10, "events kept running: {events}");
+    assert!(
+        slowest < Duration::from_millis(500),
+        "an event waited for the compile: {slowest:?}"
+    );
+    assert_eq!(lapsed, 0, "the node lease lapsed during the compile");
+    let r = send(node.addr, "POST", "/actor/u/y/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+}
