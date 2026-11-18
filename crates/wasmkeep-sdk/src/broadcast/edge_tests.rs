@@ -227,3 +227,47 @@ fn r4_replayed_range_preserves_owned_sockets_and_closes_unknown_after_wake() {
     e.push(&push(2), &mut io);
     assert!(io.frames.last().unwrap().contains("\"n\":2"));
 }
+#[test]
+fn distinct_cursor_budget_prioritizes_caught_up() {
+    let mut edge = Edge::default();
+    let mut io = Io::default();
+    edge.push(
+        &Push {
+            head: 32,
+            messages: (0..32)
+                .map(|_| Item {
+                    epoch: None,
+                    at: 0,
+                    id: None,
+                    body: "é".repeat(1000),
+                })
+                .collect(),
+            ..push(1)
+        },
+        &mut io,
+    );
+    io.blocked = true;
+    for n in 0..20 {
+        edge.open(n, Some(Position { e: 1, n }), &mut io);
+    }
+    edge.open(100, None, &mut io);
+    edge.open(101, None, &mut io);
+    io.blocked = false;
+    io.frames.clear();
+    let ack = edge.push(&push(33), &mut io);
+    assert!(io.frames[0].contains("\"n\":33"));
+    assert_eq!(io.frames.len(), 17);
+    assert_eq!(ack.lagging, 5);
+    io.frames.clear();
+    let ack = edge.push(
+        &Push {
+            first: 34,
+            head: 33,
+            messages: vec![],
+            ..push(1)
+        },
+        &mut io,
+    );
+    assert_eq!(ack.lagging, 0);
+    assert_eq!(io.frames.len(), 5);
+}

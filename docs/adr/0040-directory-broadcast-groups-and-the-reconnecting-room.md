@@ -225,6 +225,7 @@ On its alarm the room runs one **round**: a `call-many` to its children
   the window, the push starts at the window's first message and the edge
   drops its buffer (section 5).
 - An edge answers `(e, n)` it now has, its socket count, lagging count,
+  and an optional `stalled` count (lagging sockets whose send hit backpressure),
   and counters since its last answer (opens, refusals by reason, slow
   closes). A missed or failed push is thus resent by the next round;
   an edge drops numbers it already has in the same epoch.
@@ -244,7 +245,23 @@ On its alarm the room runs one **round**: a `call-many` to its children
 One request to a child stays under 1 MiB, so 16 of them fit the batch's
 16 MiB.
 
+When every lagging socket in an edge's answer is stalled, repeated unchanged
+answers back off the retry alarm from 20 ms by doubling, capped at the
+45-second keepalive interval. New positions, changing stalled counts, or
+catch-up work reset it to 20 ms. New publishes still schedule their normal
+push immediately; healthy sockets do not wait for a stalled reader's retry.
+Older edges without `stalled` retain the 20 ms retry behavior.
+
 ### 5. The edge
+
+**Per-event fan-out bound.** Both SDKs index retained messages by number and
+keep each item's JSON from insertion. A push groups sockets by cursor and
+builds one frame per distinct cursor, with the caught-up group first. It
+builds at most 16 frames or 1 MiB of frame bytes per event (each frame remains
+at most 64 KiB); per socket it only sends the shared frame. Deferred groups
+keep their cursor and count as lagging. A cursor advances only on `ok`;
+below the buffer floor it still receives `behind`, then closes with 4802 if
+that notification is backpressured. No WIT change is required.
 
 An edge holds sockets, at most `edge_cap` (500, which must not exceed
 `--max-sockets-per-actor`). It writes only its configuration row
@@ -258,9 +275,9 @@ created, its range changes or it drains. Everything else is memory:
 
 **The queue bound and the overflow.** There is no second queue: the
 bound is the host's, 256 frames or 4 MiB per socket. On a push the edge
-sends each socket whose cursor is at or above the floor one frame with
-the messages after its cursor (64 KiB at most per frame) and moves the
-cursor. On `backpressure` the cursor stays: the socket is **lagging**
+sends each scheduled cursor group one shared frame with the messages after
+its cursor (64 KiB at most per frame), within the per-event bound above.
+Each socket cursor moves only when its send succeeds. On `backpressure` the cursor stays: the socket is **lagging**
 and is tried again at each push and at each frame from that client.
 When a lagging cursor falls below the floor, the edge sends `behind`
 and sets the cursor to the head: the client fetches the gap over HTTP
@@ -520,9 +537,11 @@ group benchmark), the API reference, the ROADMAP item.
 
 ## Open questions
 
-1. Where new edges land. A call creates the edge on a node the cluster
-   chooses; nothing here spreads a room's edges over nodes. Placement at
-   wake-up is its own roadmap item.
+1. **Resolved: placement limit.** A room's tree of edges runs on the room's
+   node until that node passes placement's floor. The tree does not spread
+   automatically across the fleet. Spreading would move only fan-out CPU;
+   the room remains the sequencer. A later `placement = "spread"` class key
+   is possible if the bounded edge implementation still saturates a node.
 2. Publishing on the socket, by an outbox the room collects in push
    answers.
 3. Giving a dead edge's range to its neighbours during the takeover

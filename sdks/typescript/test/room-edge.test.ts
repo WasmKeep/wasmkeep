@@ -76,3 +76,20 @@ test("an explicit empty history hole sends behind", () => {
     edge.push({e:70,b:1,first:2,head:1,messages:[],recover:true} as unknown as Push);
     assert.equal(frames.at(-1).t,"behind"); assert.equal(frames.at(-1).n,1);
 });
+test("a push budgets distinct cursor frames and prioritizes caught-up sockets", () => {
+    let blocked = true;
+    const sent: bigint[] = [];
+    const edge = new Edge({ send(id, text) { if (JSON.parse(text).t === 'm') sent.push(id); return blocked ? 'backpressure' : 'ok'; }, close() {} });
+    const messages = Array.from({length: 32}, () => ({a:0,d:'é'.repeat(1000)}));
+    edge.push({e:1,b:0,first:1,head:32,messages});
+    for (let n=0; n<20; n++) edge.open(BigInt(n), {e:1,n});
+    edge.open(100n); edge.open(101n);
+    blocked = false; sent.length = 0;
+    const ack = edge.push({e:1,b:0,first:33,head:33,messages:[{a:0,d:'healthy'}]});
+    assert.deepEqual(sent.slice(0,2), [100n,101n]);
+    assert.equal(sent.length, 17); // healthy group + 15 other distinct cursors
+    assert.equal(ack.lagging, 5);
+    sent.length = 0;
+    assert.equal(edge.push({e:1,b:0,first:34,head:33,messages:[]}).lagging, 0);
+    assert.equal(sent.length, 5);
+});

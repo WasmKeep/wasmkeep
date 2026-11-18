@@ -48,6 +48,9 @@ def main():
                 result = json.loads(out.read_text())
                 counters = result['counters']
                 assert result['incomplete_clients'] == []
+                assert result['unacknowledged_publishes'] == []
+                assert result['publish_failures_by_status'] == {}
+                assert counters['publish_unacknowledged'] == 0
                 assert len(result['final_cursors']) == 24
                 assert result['joined_total'] == 24 and result['peak_clients'] == 24
                 assert counters['clients_left'] == 6 and result['active_at_end'] == 18

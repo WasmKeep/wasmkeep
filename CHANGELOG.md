@@ -9,6 +9,14 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Bounded big-room fan-out.** Rust and TypeScript edges share serialized
+  frames by cursor, serving caught-up sockets first and building at most
+  16 frames / 1 MiB per event. Stalled-only retry alarms back off to the
+  keepalive interval without delaying new publishes. The room benchmark
+  counts publish failures by status, retries the same id for up to 30 seconds,
+  and separately reports unacknowledged publishes. ADR 0040 states the
+  current single-node placement limit for a room's tree.
+
 - **Busy actors fit backup/feed listings.** History grouping now accounts for
   retained metadata and string capacities with a 32 MiB per-actor budget,
   replacing the 8 MiB budget's fixed 1,024-byte surcharge per object. Tests

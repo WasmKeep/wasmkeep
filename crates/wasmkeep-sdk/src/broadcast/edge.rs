@@ -162,6 +162,7 @@ pub(super) struct Buffered {
 struct Cursor {
     n: u64,
     lagging: bool,
+    stalled: bool,
 }
 #[derive(Debug, Default)]
 pub struct Edge {
@@ -180,6 +181,7 @@ pub struct Ack {
     pub position: Position,
     pub sockets: usize,
     pub lagging: usize,
+    pub stalled: usize,
     pub slow: u64,
     pub opens: u64,
     pub refusals: [u64; 3],
@@ -187,11 +189,12 @@ pub struct Ack {
 impl Ack {
     pub fn encode(&self) -> String {
         format!(
-            "{{\"e\":{},\"n\":{},\"sockets\":{},\"lagging\":{},\"slow\":{},\"opens\":{},\"refusals\":{{\"unknown\":{},\"moved\":{},\"full\":{}}}}}",
+            "{{\"e\":{},\"n\":{},\"sockets\":{},\"lagging\":{},\"stalled\":{},\"slow\":{},\"opens\":{},\"refusals\":{{\"unknown\":{},\"moved\":{},\"full\":{}}}}}",
             self.position.e,
             self.position.n,
             self.sockets,
             self.lagging,
+            self.stalled,
             self.slow,
             self.opens,
             self.refusals[0],
@@ -239,7 +242,14 @@ impl Edge {
             self.head.map_or(0, |p| p.n)
         };
         self.opens += 1;
-        self.cursors.insert(id, Cursor { n, lagging: false });
+        self.cursors.insert(
+            id,
+            Cursor {
+                n,
+                lagging: false,
+                stalled: false,
+            },
+        );
         let ready = if self.head.is_none() || (position.is_some() && !resume) {
             "null".into()
         } else {
@@ -268,6 +278,7 @@ impl Edge {
                 self.cursors.entry(*id).or_insert(Cursor {
                     n: h.n,
                     lagging: false,
+                    stalled: false,
                 });
             }
         }
@@ -350,71 +361,85 @@ impl Edge {
             }
         }
         self.head = Some(h);
-        for id in self.cursors.keys().copied().collect::<Vec<_>>() {
-            self.deliver(id, io);
-        }
+        self.deliver_many(self.cursors.keys().copied().collect(), io);
         self.answer()
     }
-    fn behind(&mut self, id: u64, io: &mut impl SocketIo) {
-        let Some(h) = self.head else { return };
-        match io.send(
-            id,
-            &format!("{{\"t\":\"behind\",\"e\":{},\"n\":{}}}", h.e, h.n),
-        ) {
-            SendResult::Backpressure => {
-                io.close(id, 4802);
-                self.slow += 1;
-                self.forget(id);
-            }
-            SendResult::Gone => self.forget(id),
-            SendResult::Ok => {
-                if let Some(c) = self.cursors.get_mut(&id) {
-                    c.n = h.n;
-                    c.lagging = false;
-                }
-            }
-        }
-    }
     fn deliver(&mut self, id: u64, io: &mut impl SocketIo) {
-        let Some(c) = self.cursors.get(&id) else {
-            return;
-        };
-        if c.n < self.floor {
-            self.behind(id, io);
-            return;
-        }
-        let mut pending = self.buffer.iter().filter(|m| m.n > c.n);
-        let Some(first) = pending.next() else { return };
-        let mut frame = format!(
-            "{{\"t\":\"m\",\"e\":{},\"b\":{},\"n\":{},\"m\":[",
-            first.e, first.base, first.n
-        );
-        let mut last = None;
-        for m in std::iter::once(first).chain(pending) {
-            if m.e != first.e
-                || frame.len() + m.json.len() + usize::from(last.is_some()) + 2 > 65536
-            {
-                break;
+        self.deliver_many(vec![id], io);
+    }
+    fn deliver_many(&mut self, ids: Vec<u64>, io: &mut impl SocketIo) {
+        let Some(head) = self.head else { return };
+        let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for id in ids {
+            if let Some(c) = self.cursors.get(&id).filter(|c| c.n < head.n) {
+                groups.entry(c.n).or_default().push(id);
             }
-            if last.is_some() {
-                frame.push(',');
-            }
-            frame.push_str(&m.json);
-            last = Some(m.n);
         }
-        let Some(last) = last else {
-            self.behind(id, io);
-            return;
-        };
-        frame.push_str("]}");
-        match io.send(id, &frame) {
-            SendResult::Gone => self.forget(id),
-            result => {
-                if let Some(c) = self.cursors.get_mut(&id) {
-                    if result == SendResult::Ok {
-                        c.n = last;
+        let mut frame_bytes = 0;
+        // Descending cursors put the previously caught-up group first.
+        for (frames, (n, ids)) in groups.into_iter().rev().enumerate() {
+            if frames >= 16 || frame_bytes >= 1024 * 1024 {
+                for id in ids {
+                    if let Some(c) = self.cursors.get_mut(&id) {
+                        c.lagging = true;
+                        c.stalled = false;
                     }
-                    c.lagging = self.head.is_some_and(|h| c.n < h.n);
+                }
+                continue;
+            }
+            // Retained numbers are contiguous, including across epoch rollback.
+            let offset = self
+                .buffer
+                .front()
+                .and_then(|first| (n + 1).checked_sub(first.n))
+                .and_then(|offset| usize::try_from(offset).ok());
+            let mut frame = String::new();
+            let mut last = n;
+            if n >= self.floor
+                && let Some(offset) = offset
+                && let Some(first) = self.buffer.get(offset)
+            {
+                frame = format!(
+                    "{{\"t\":\"m\",\"e\":{},\"b\":{},\"n\":{},\"m\":[",
+                    first.e, first.base, first.n
+                );
+                for m in self.buffer.range(offset..) {
+                    if m.e != first.e
+                        || frame.len() + m.json.len() + usize::from(last != n) + 2 > 65536
+                    {
+                        break;
+                    }
+                    if last != n {
+                        frame.push(',');
+                    }
+                    frame.push_str(&m.json);
+                    last = m.n;
+                }
+                frame.push_str("]}");
+            }
+            let behind = last == n;
+            if behind {
+                frame = format!("{{\"t\":\"behind\",\"e\":{},\"n\":{}}}", head.e, head.n);
+                last = head.n;
+            }
+            frame_bytes += frame.len();
+            for id in ids {
+                match io.send(id, &frame) {
+                    SendResult::Gone => self.forget(id),
+                    SendResult::Backpressure if behind => {
+                        io.close(id, 4802);
+                        self.slow += 1;
+                        self.forget(id);
+                    }
+                    result => {
+                        if let Some(c) = self.cursors.get_mut(&id) {
+                            if result == SendResult::Ok {
+                                c.n = last;
+                            }
+                            c.lagging = c.n < head.n;
+                            c.stalled = result == SendResult::Backpressure;
+                        }
+                    }
                 }
             }
         }
@@ -424,6 +449,11 @@ impl Edge {
             position: self.head.unwrap_or(Position { e: 0, n: 0 }),
             sockets: self.cursors.len(),
             lagging: self.cursors.values().filter(|c| c.lagging).count(),
+            stalled: self
+                .cursors
+                .values()
+                .filter(|c| c.lagging && c.stalled)
+                .count(),
             slow: std::mem::take(&mut self.slow),
             opens: std::mem::take(&mut self.opens),
             refusals: std::mem::take(&mut self.refusals),

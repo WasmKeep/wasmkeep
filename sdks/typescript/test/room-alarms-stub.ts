@@ -1,5 +1,7 @@
+export let writes = 0;
 export let pending: bigint | undefined;
 export function setAlarm(at: bigint): void {
+    writes++;
     pending = at;
 }
 
