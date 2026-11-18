@@ -571,6 +571,23 @@ impl ClusterPeer {
         self.pins.publishes(&self.pin, node)
     }
 
+    /// Whether the one sender `headers` name publishes this connection's
+    /// pin once this node listed the heartbeats again (waiting at most
+    /// [`PinSet::sender_wait`]): its heartbeat may not have
+    /// been listed here yet. Two senders, or a malformed one: false.
+    pub(crate) async fn sender_listed_soon(&self, headers: &hyper::HeaderMap) -> bool {
+        let mut values = headers.get_all(crate::cluster::SENDER).iter();
+        let (Some(value), None) = (values.next(), values.next()) else {
+            return false;
+        };
+        let Some(node) = value.to_str().ok().and_then(crate::cluster::sender_named) else {
+            return false;
+        };
+        self.pins
+            .publishes_soon(&self.pin, node, self.pins.sender_wait())
+            .await
+    }
+
     /// Whether the peer's pin is still live: for a request that named its
     /// sender, while that node id's own heartbeat publishes it; otherwise
     /// while any node id's does.
@@ -874,7 +891,9 @@ async fn serve_connection<I>(
             // A hop that names its sender must come over that node's own
             // connection (ADR 0038, section 5); its signature, checked
             // later, binds the name.
-            if !crate::cluster::sender_presented(req.headers(), Some(&cluster)) {
+            if !crate::cluster::sender_presented(req.headers(), Some(&cluster))
+                && !cluster.sender_listed_soon(req.headers()).await
+            {
                 return Ok(text_response(
                     StatusCode::FORBIDDEN,
                     "the hop's sender does not publish this connection's certificate\n",
@@ -1469,6 +1488,109 @@ mod cluster_port_tests {
         let text = String::from_utf8_lossy(&raw);
         assert!(text.starts_with("HTTP/1.1 503"), "{text}");
         assert!(text.contains("not a live node"), "{text}");
+    }
+
+    /// GET `path` over TLS as `client`, the hop naming node `sender`: the
+    /// status line and body.
+    async fn get_tls_sent_by(
+        addr: std::net::SocketAddr,
+        client: &Identity,
+        server_pin: [u8; 32],
+        path: &str,
+        sender: &str,
+    ) -> String {
+        let config = client_config(client, vec![server_pin]).unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("node.test").unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(config)
+            .connect(name, tcp)
+            .await
+            .unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: n\r\n{}: {sender} 00\r\nConnection: close\r\n\r\n",
+            crate::cluster::SENDER
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        tls.read_to_end(&mut raw).await.unwrap();
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    /// A process's certificate is live under one node id; its second node
+    /// id's first hop arrives before this node listed that one's heartbeat
+    /// (a node starting, or restarting with a new certificate, during a
+    /// rolling upgrade). The hop waits for an early listing rather than
+    /// being refused; a sender no listing names is still refused.
+    #[tokio::test]
+    async fn a_hop_from_a_sender_not_yet_listed_waits_for_the_next_listing() {
+        let (server, peer) = (
+            Identity::generate("b", "b.test").unwrap(),
+            Identity::generate("p", "p.test").unwrap(),
+        );
+        // `n0` publishes `peer`'s pin; `blog-m` (the same process) has not
+        // been listed yet.
+        let run = start(&server, &[&peer], Duration::from_secs(5)).await;
+        let pins = Arc::clone(&run.pins);
+        let (peer_pin, server_pin) = (peer.pin(), server.pin());
+        let listing = tokio::spawn(async move {
+            // The early listing the unknown sender asked for.
+            tokio::time::timeout(Duration::from_secs(5), pins.unknown_seen())
+                .await
+                .expect("an early listing is asked for");
+            pins.replace([
+                ("n0", &[peer_pin][..], u64::MAX),
+                ("n1", &[server_pin][..], u64::MAX),
+                ("blog-m", &[peer_pin][..], u64::MAX),
+            ]);
+        });
+        let text = get_tls_sent_by(run.cluster, &peer, server.pin(), "/actor/c/x", "blog-m").await;
+        assert!(
+            !text.contains("does not publish this connection's certificate"),
+            "{text}"
+        );
+        listing.await.unwrap();
+        // A sender that no listing names (forged, or lapsed): refused,
+        // after at most the wait.
+        let started = std::time::Instant::now();
+        let text = get_tls_sent_by(run.cluster, &peer, server.pin(), "/actor/c/x", "forged").await;
+        assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+        assert!(
+            text.contains("does not publish this connection's certificate"),
+            "{text}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// The early listing is not made (this period listed already): the
+    /// hop waits for the next scheduled one, a period later.
+    #[tokio::test]
+    async fn an_unlisted_senders_hop_waits_out_a_period_when_no_early_listing_is_made() {
+        let (server, peer) = (
+            Identity::generate("b", "b.test").unwrap(),
+            Identity::generate("p", "p.test").unwrap(),
+        );
+        let run = start(&server, &[&peer], Duration::from_secs(5)).await;
+        let period = Duration::from_secs(3);
+        run.pins.listed_every(period);
+        assert!(run.pins.sender_wait() > period + Duration::from_millis(500));
+        let pins = Arc::clone(&run.pins);
+        let (peer_pin, server_pin) = (peer.pin(), server.pin());
+        let listing = tokio::spawn(async move {
+            pins.unknown_seen().await;
+            // Asked, but not until the next period.
+            tokio::time::sleep(period + Duration::from_millis(200)).await;
+            pins.replace([
+                ("n0", &[peer_pin][..], u64::MAX),
+                ("n1", &[server_pin][..], u64::MAX),
+                ("blog-m", &[peer_pin][..], u64::MAX),
+            ]);
+        });
+        let text = get_tls_sent_by(run.cluster, &peer, server.pin(), "/actor/c/x", "blog-m").await;
+        assert!(
+            !text.contains("does not publish this connection's certificate"),
+            "{text}"
+        );
+        listing.await.unwrap();
     }
 
     #[tokio::test]

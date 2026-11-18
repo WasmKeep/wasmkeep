@@ -1261,6 +1261,12 @@ pub(crate) mod pinning {
         /// us): the heartbeats are listed again sooner (rate-limited by the
         /// waiter, so strangers cannot make this node hammer the bucket).
         unknown: tokio::sync::Notify,
+        /// Counts the replacements (listings applied): a hop whose sender
+        /// is not listed yet waits for the next one.
+        listings: tokio::sync::watch::Sender<u64>,
+        /// The longest period of the loops listing for this set (ms): an
+        /// asked-for listing may come only at the next period.
+        period_ms: std::sync::atomic::AtomicU64,
     }
 
     impl PinSet {
@@ -1286,6 +1292,54 @@ pub(crate) mod pinning {
                 }
             }
             *self.by_pin.write().unwrap_or_else(|p| p.into_inner()) = by_pin;
+            self.listings.send_modify(|n| *n = n.wrapping_add(1));
+        }
+
+        /// A loop lists for this set every `period`.
+        pub(crate) fn listed_every(&self, period: std::time::Duration) {
+            let ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX);
+            self.period_ms
+                .fetch_max(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// How long a hop from a sender not listed yet waits for a listing:
+        /// two periods of the slowest loop listing for this set (the one
+        /// asked for may come only at the next period, plus the bucket's
+        /// latency), and at least [`super::LAPSED_WAIT`].
+        pub(crate) fn sender_wait(&self) -> std::time::Duration {
+            let period = self.period_ms.load(std::sync::atomic::Ordering::Relaxed);
+            super::LAPSED_WAIT.max(std::time::Duration::from_millis(period.saturating_mul(2)))
+        }
+
+        /// Whether `node`'s heartbeat publishes `pin`, asking for an early
+        /// listing and waiting for one (at most `wait`) when it does not
+        /// yet: a node's first hops may arrive before its heartbeat was
+        /// listed here (a node started, or restarted with a new
+        /// certificate, while another node id of its process was already
+        /// listed). Still not named when the wait ends (a forged sender,
+        /// or a lapsed one): false.
+        pub(crate) async fn publishes_soon(
+            &self,
+            pin: &Pin32,
+            node: &str,
+            wait: std::time::Duration,
+        ) -> bool {
+            if self.publishes(pin, node) {
+                return true;
+            }
+            let mut listed = self.listings.subscribe();
+            listed.mark_unchanged();
+            self.note_unknown();
+            let deadline = tokio::time::Instant::now() + wait;
+            while tokio::time::timeout_at(deadline, listed.changed())
+                .await
+                .is_ok_and(|r| r.is_ok())
+            {
+                if self.publishes(pin, node) {
+                    return true;
+                }
+            }
+            self.publishes(pin, node)
         }
 
         /// Records that a pin was not known: see [`PinSet::unknown_seen`].

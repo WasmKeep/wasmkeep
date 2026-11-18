@@ -79,6 +79,10 @@ pub(super) async fn fence_loop(
 pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Duration) {
     // Held apart from the cluster, so waiting does not keep it alive.
     let tls = cluster.upgrade().and_then(|c| c.transport.tls.clone());
+    if let Some(t) = &tls {
+        // An unlisted sender's hop waits for this loop's next listing.
+        t.pins().listed_every(every);
+    }
     let Some(asked) = cluster.upgrade().map(|c| Arc::clone(&c.listing_asked)) else {
         return;
     };
