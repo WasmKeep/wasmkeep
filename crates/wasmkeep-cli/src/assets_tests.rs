@@ -86,12 +86,16 @@ fn refuses_symlinks_non_utf8_and_non_regular_files() {
     let _socket = UnixListener::bind(root.path().join("socket")).unwrap();
     assert!(scan(root.path(), Index::default()).is_err());
     let root = tempfile::tempdir().unwrap();
-    std::fs::write(
+    match std::fs::write(
         root.path().join(std::ffi::OsString::from_vec(vec![255])),
         b"x",
-    )
-    .unwrap();
-    assert!(scan(root.path(), Index::default()).is_err());
+    ) {
+        Ok(()) => assert!(scan(root.path(), Index::default()).is_err()),
+        // APFS refuses non-UTF-8 names (EILSEQ), so scan cannot encounter one.
+        #[cfg(target_os = "macos")]
+        Err(e) if e.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {}
+        Err(e) => panic!("creating non-UTF-8 fixture: {e}"),
+    }
 }
 
 #[test]

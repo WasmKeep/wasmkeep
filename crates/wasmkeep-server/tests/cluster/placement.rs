@@ -561,51 +561,77 @@ async fn a_class_the_receiver_lacks_runs_on_the_sender() {
     drop(b);
 }
 
-/// Review item 7: a real receiver's own count refuses a hop its heartbeat
-/// did not show coming (`fuller`), and the sender runs the event: a
-/// request, or an `actors.call`. a reads the others' heartbeats every 3 s,
-/// so it still sees b empty while b fills from its own requests.
+/// A real receiver's live count refuses a hop its advertised load did not
+/// show coming (`fuller`), and the sender runs the request or `actors.call`.
 async fn fuller_then_run_here(call: bool) {
-    // b, reading heartbeats every 100 ms, sees a's (every 3 s) as stale:
-    // over TLS that also drops a's pins there. Plain HTTP only.
     if over_tls() {
         return;
     }
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let every = Duration::from_secs(3);
-    let a = placing_node_full("a", dirs.0.path(), &store, 10, true, &["t"], Some(every)).await;
-    // Its view's periods count from its start check.
-    let started = tokio::time::Instant::now();
-    // Alone: a keeps its nine (no candidate).
+    let a_bucket = Arc::new(Flaky::new(Arc::clone(&store), Arc::default()));
+    let a_store: Arc<dyn ObjectStore> = a_bucket.clone();
+    let a = placing_node_full("a", dirs.0.path(), &a_store, 10, true, &["t"], Some(every)).await;
     for i in 0..9 {
         assert_eq!(wake(&a, &format!("a{i}")).await.node.as_deref(), Some("a"));
     }
+    // Exercise delayed discovery without CPU load or a startup-phase guess.
+    a_bucket.fail_node_list.store(true, Ordering::SeqCst);
+    let b_bucket = Arc::new(Flaky::new(Arc::clone(&store), Arc::default()));
+    let b_store: Arc<dyn ObjectStore> = b_bucket.clone();
     let b = placing_node_full(
         "b",
         dirs.1.path(),
-        &store,
+        &b_store,
         10,
         true,
         &["t"],
         Some(Duration::from_millis(100)),
     )
     .await;
-    // a's next view after b started (a reads every 3 s from its start)
-    // shows b empty.
-    let mut seen = started + every;
-    while seen < tokio::time::Instant::now() + Duration::from_millis(200) {
-        seen += every;
-    }
-    tokio::time::sleep_until(seen + Duration::from_millis(800)).await;
-    // b fills itself: a is fuller, so b keeps all seven.
-    for i in 0..7 {
+    assert_eq!(wake(&b, "b0").await.node.as_deref(), Some("b"));
+    // Keep a real published load (0 or 1 resident), but renew the heartbeat
+    // normally. Even a refresh during the fills below must not reveal them:
+    // the test is about the receiver checking live, not advertised, capacity.
+    use object_store::ObjectStoreExt as _;
+    let body = store
+        .get(&"nodes/b".into())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let body = std::str::from_utf8(&body).unwrap();
+    let load = body.lines().find(|line| line.starts_with("load ")).unwrap();
+    *b_bucket.frozen_node_load.lock().unwrap() = Some(load.to_owned());
+    let advertised = wasmkeep_cluster::membership::NodeInfo::decode(body.as_bytes())
+        .unwrap()
+        .load
+        .unwrap();
+    assert!(advertised.actors <= 1);
+    assert_eq!(advertised.actor_room, Some(10 - advertised.actors));
+    // b0 has an owner, so this probe never places or changes a's load. Until
+    // discovery succeeds a cannot route to b. Its first successful forward
+    // proves it installed b's fresh heartbeat, including the load above.
+    let probe = wake(&a, "b0").await;
+    assert_eq!(
+        probe.status, 503,
+        "discovery was meant to be held: {}",
+        probe.head
+    );
+    a_bucket.fail_node_list.store(false, Ordering::SeqCst);
+    eventually(
+        "a's fresh view routes to b with its advertised load",
+        async || {
+            let r = wake(&a, "b0").await;
+            r.status == 200 && r.node.as_deref() == Some("b")
+        },
+    )
+    .await;
+    for i in 1..7 {
         assert_eq!(wake(&b, &format!("b{i}")).await.node.as_deref(), Some("b"));
     }
-    assert!(
-        seen.elapsed() < every - Duration::from_millis(500),
-        "too slow to test"
-    );
     let fuller = || {
         metric(&format!(
             r#"wasmkeep_placements_received_total{{{APP},outcome="fuller"}}"#
@@ -617,7 +643,7 @@ async fn fuller_then_run_here(call: bool) {
             r#"wasmkeep_placements_total{{{APP},kind="{kind}",outcome="refused"}}"#
         ))
     };
-    // a at 9 of 10 (900) with b seen at 0: t = 7, a share of 7, sent;
+    // a at 9 of 10 (900), b seen at 0 or 1: t = 7, positive share, sent;
     // b holds 7, so the actor would put it at 8, above 7: refused.
     let r = if call {
         send(a.addr, "POST", "/actor/t/a0/call?to=t%2Fz", "").await
