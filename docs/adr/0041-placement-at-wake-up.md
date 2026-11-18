@@ -663,6 +663,12 @@ Each slice is one change and says what it proves.
 - A placed hop that gets no answer in time answers `503` with
   `Retry-After`, as section 6 says, where an ordinary forward answers
   `504`.
+- Amended 2026-11-18 (0.6.0 testing pass): the ambiguous row of section
+  6 (the hop failed after the write, no answer in time, an answer from a
+  node no longer trusted) answers `503` with `x-wasmkeep-outcome:
+  unknown` and no `Retry-After`, as every host answer for a request that
+  may have run now does ([what "saved" means](../what-saved-means.md)).
+  The event is still never run again here.
 - The cluster tests' nodes run with placement on, the default. The
   golden trace runs both ways (with it on, b has one resident slot like
   a, so a full node's wake-up of another actor is evaluated and kept, a

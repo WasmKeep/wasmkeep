@@ -16,7 +16,10 @@ process runs with its node id (for good if either fails: `serve` exits),
 while it has not loaded the cluster secret or its node lease (the heartbeat,
 [ADR 0020](adr/0020-one-lease-per-node.md)) is not valid, which takes the
 bucket refusing or not answering its writes for the lease's ttl minus its
-safety margin (8 s by default; calls and durable writes would fail); and when the
+safety margin (8 s by default; calls and durable writes would fail); until a
+node following its app (`serve --app`) has checked, with its lease valid,
+that the app was not deleted (a bucket round trip after its first lease
+write and after a lapse: it could not acquire an actor before that); and when the
 disk holding `--data-dir` has less than 1 GiB free (or 5% of a smaller
 disk), sampled every 5 s off the request path. The public answer gives no
 reason (the port faces clients); `wasmkeep_not_ready{reason}` at 1 on the

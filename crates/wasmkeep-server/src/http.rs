@@ -914,11 +914,12 @@ async fn serve_connection<I>(
             };
             // Nor is an answer delivered to a peer whose pin lapsed while
             // its request ran, or streamed on after that. The connection
-            // stays: its next request is refused, and closes it.
+            // stays: its next request is refused, and closes it. The
+            // request ran (a durable write in it may have landed): the
+            // answer says the outcome is unknown, never "retry".
             if !cluster.is_live() {
-                return Ok(text_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "the node's certificate stopped being live during the request\n",
+                return Ok(crate::cluster::outcome_unknown(
+                    "the node's certificate stopped being live during the request",
                 ));
             }
             Ok(response.map(|body| {

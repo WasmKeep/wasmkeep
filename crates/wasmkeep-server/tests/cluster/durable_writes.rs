@@ -94,7 +94,18 @@ async fn a_durable_write_cut_mid_upload_is_not_built_on() {
     // while the upload is in flight.
     p.flaky.delay_wal_ms.store(3_000, Ordering::SeqCst);
     let r = send(p.a.addr, "POST", "/actor/t/x/durable", "").await;
-    assert_eq!(r.status, 500);
+    // The write may land (below, it does): the answer says the outcome is
+    // unknown, never one a client could take as "not done".
+    assert_eq!(
+        (
+            r.status,
+            r.header("x-wasmkeep-outcome").as_deref(),
+            r.retry_after.as_deref()
+        ),
+        (500, Some("unknown"), None),
+        "{}",
+        r.head
+    );
     p.flaky.delay_wal_ms.store(0, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(3_000)).await; // let it land
 

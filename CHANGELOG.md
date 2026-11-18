@@ -9,6 +9,25 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **An answer for a request that may have run says so.** A host answer
+  whose request was handed to the owner or the guest and whose own answer
+  was lost or withheld now carries `x-wasmkeep-outcome: unknown` and no
+  `Retry-After`, and its body ends `the request may have run`: a forward
+  written to the owner whose connection then failed, an answer from a
+  node no longer trusted, an answer withheld because the forwarding
+  node's certificate stopped being live while the request ran (seen in a
+  rolling upgrade: a 503 whose durable write had landed), a placed hop
+  that failed, both `504`s, and a `500 actor error` for an event that
+  ended with no response. Forwards that provably never reached the owner
+  keep the plain `503` with `Retry-After: 1`.
+- **`/_wasmkeep/ready` waits for the app's tombstone check.** A node
+  following its app answered ready as soon as its first lease write
+  landed, before its check that the app was not deleted (ADR 0028), and
+  refused every actor until then: on a real bucket the first request
+  after ready could get `503 this node cannot run the actor now`. The
+  reasons `this node has not yet checked whether its app was deleted` and
+  `the app was deleted` join `wasmkeep_not_ready`.
+
 - Every command now writes its logs to stderr, `wasmkeep serve` included;
   stdout carries only a command's own output, so `--json` stays JSON when the
   bucket client retries. A service that collected a node's logs by

@@ -147,6 +147,21 @@ operation's recorded outcome, and retry only with the same operation
 identity. [Cluster failure handling](cluster.md#when-a-node-dies-what-a-caller-sees)
 describes which requests wait and which are refused.
 
+When the host itself answers for a request that may have run, it says so:
+the answer carries `x-wasmkeep-outcome: unknown` and no `Retry-After`. That
+is a forward written to the owner whose connection then failed, an answer
+from a node no longer trusted, an answer withheld because the forwarding
+node's certificate stopped being live while the request ran, a `504` after
+the request was sent, and a `500 actor error` for an event that ended with
+no response (cut by its wall or a lease lapse, or a trap). A durable write
+in such a request may have landed. Read the outcome before repeating a
+write that is not idempotent; never retry it blindly. A host `503` with
+`Retry-After: 1` and no such header was refused before the actor ran (a
+connection that could not be opened, ownership changing, a node that
+cannot run the actor now). The guest's own answers are its own: a `503`
+the actor sends, or the SDK's `unavailable` helper in a front after a
+failed `actors.call`, carries neither guarantee.
+
 ## Give retries an identity
 
 An idempotency key is an application protocol, not something WasmKeep

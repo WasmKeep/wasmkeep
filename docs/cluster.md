@@ -132,7 +132,10 @@ everything else: a request with a body, any other method (`POST`, `PUT`,
 `DELETE`, ...), an `actors.call` (the calling actor gets its error), a
 request another node forwarded, and any request over the caps below. Such
 a 503 still means the request was not run here; nothing with a body is
-ever kept, so a write is never run late for a caller that gave up. An
+ever kept, so a write is never run late for a caller that gave up. A
+request that was sent to the owner and may have run there is never
+answered this way: its 503 or 504 carries `x-wasmkeep-outcome: unknown`
+and no `Retry-After` ([what "saved" means](what-saved-means.md)). An
 owner that is alive keeps its actors: a node that renews its lease is
 never taken from, however slow it is to answer, and a request for one of
 its actors is sent to it as before. The one exception is a node that is

@@ -28,6 +28,39 @@ pub(crate) fn percent_encode(s: &str) -> String {
     out
 }
 
+/// The header on a host's answer for a request that may have run although
+/// its answer is not the actor's: `unknown`. The request was handed to the
+/// owner or to the guest, and its answer was lost or withheld (a hop that
+/// failed after the request was written, an answer from a node no longer
+/// trusted, a peer whose pin lapsed while its request ran, a timeout after
+/// the request was sent). A durable write in it may have landed: such an
+/// answer has no `Retry-After`, and a client reads the outcome before it
+/// repeats a write that is not idempotent. A host refusal made before
+/// anything ran (`Retry-After: 1`) never carries it.
+pub(crate) const OUTCOME: &str = "x-wasmkeep-outcome";
+
+/// `response`, marked as an answer whose request may have run
+/// ([`OUTCOME`]), with any `Retry-After` removed.
+pub(crate) fn mark_unknown(
+    mut response: Response<HyperOutgoingBody>,
+) -> Response<HyperOutgoingBody> {
+    response.headers_mut().remove(hyper::header::RETRY_AFTER);
+    response.headers_mut().insert(
+        hyper::header::HeaderName::from_static(OUTCOME),
+        hyper::header::HeaderValue::from_static("unknown"),
+    );
+    response
+}
+
+/// 503 for a request that may have run ([`OUTCOME`]): `why`, then that the
+/// request may have run.
+pub(crate) fn outcome_unknown(why: &str) -> Response<HyperOutgoingBody> {
+    mark_unknown(text_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("{why}; the request may have run\n"),
+    ))
+}
+
 pub(crate) fn unavailable(text: &str) -> Response<HyperOutgoingBody> {
     let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, text);
     r.headers_mut().insert(
