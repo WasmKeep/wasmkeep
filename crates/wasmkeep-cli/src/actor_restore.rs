@@ -202,6 +202,11 @@ async fn wait(
     let until = std::time::Instant::now()
         + std::time::Duration::from_secs(if args.no_wait { 0 } else { args.wait });
     loop {
+        // The request first, then its outcomes. A node publishes the outcome
+        // before it deletes the request, so a request seen gone has its
+        // outcome visible to the reads below. The other order reads a
+        // restore that ended between the two as dropped.
+        let pending = keys.get_body(key).await?.is_some();
         for suffix in ["done", "conflict", "refused", "absent", "superseded"] {
             let outcome = format!("{key}.{suffix}");
             let body = keys.get_body(&outcome).await?;
@@ -222,8 +227,14 @@ async fn wait(
                 return Ok(());
             }
         }
-        if keys.get_body(key).await?.is_none() {
-            bail!("restore request dropped");
+        if !pending {
+            bail!(
+                "restore {id}: the request is gone and left no outcome: it expired ({} minutes \
+                 after its bucket timestamp) or was removed, so nothing says the actor was \
+                 restored. Check the actor's data; if it still needs restoring, stage a new \
+                 request (--resume cannot revive this one)",
+                control::RESTORE_TTL_MS / 60_000
+            );
         }
         if std::time::Instant::now() >= until {
             println!(
@@ -384,6 +395,111 @@ mod tests {
             assert!(store.get(&Path::from(key)).await.is_err());
             assert!(store.get(&Path::from(format!("{key}.done"))).await.is_ok());
         }
+    }
+
+    /// The node's ending (`end_restore_request`: the outcome, then the
+    /// request's deletion) landing between the command's outcome reads and
+    /// its read of the request, as on a real bucket where each read is a
+    /// round trip: a restore that is done must not read as dropped.
+    #[tokio::test]
+    async fn actor_restore_wait_sees_an_outcome_written_while_it_polls() {
+        use wasmkeep_cluster::lease::BucketError;
+        struct EndsDuringPoll {
+            inner: wasmkeep_cluster::object_store::ObjectStoreBucket,
+            request: String,
+            ended: std::sync::atomic::AtomicBool,
+        }
+        impl EndsDuringPoll {
+            async fn node_ends(&self) {
+                if !self.ended.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let done = format!("{}.done", self.request);
+                    self.inner.put_body(&done, b"2:8".to_vec()).await.unwrap();
+                    self.inner.delete(&self.request).await.unwrap();
+                }
+            }
+        }
+        impl control::Keys for EndsDuringPoll {
+            async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>, BucketError> {
+                self.inner.list_keys(prefix).await
+            }
+            async fn put_empty(&self, key: &str) -> Result<(), BucketError> {
+                self.inner.put_empty(key).await
+            }
+            async fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+                self.inner.put_body(key, body).await
+            }
+            async fn get_body(&self, key: &str) -> Result<Option<Vec<u8>>, BucketError> {
+                // The node ends the request right after the command's
+                // last outcome read of a poll.
+                let got = self.inner.get_body(key).await;
+                if key.ends_with(".superseded") {
+                    self.node_ends().await;
+                }
+                got
+            }
+            async fn delete(&self, key: &str) -> Result<(), BucketError> {
+                self.inner.delete(key).await
+            }
+        }
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let request = "state/t/a/restores/c/6e/0123456789abcdef".to_owned();
+        let keys = EndsDuringPoll {
+            inner: wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, String::new()),
+            request: request.clone(),
+            ended: Default::default(),
+        };
+        keys.put_body(&request, b"request".to_vec()).await.unwrap();
+        let args = RestoreArgs {
+            resume: Some("0123456789abcdef".into()),
+            actor: "c/n".into(),
+            app: Some(("t".into(), "a".into())),
+            bucket: "s3://b".into(),
+            txid: None,
+            at: None,
+            from: None,
+            run: None,
+            if_head: None,
+            wait: 5,
+            no_wait: false,
+        };
+        wait(&args, &keys, &request, "0123456789abcdef", None)
+            .await
+            .expect("a done restore read as dropped");
+    }
+
+    /// A request gone with no outcome says why and what to do.
+    #[tokio::test]
+    async fn actor_restore_wait_explains_a_request_gone_without_outcome() {
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, String::new());
+        let args = RestoreArgs {
+            resume: Some("0123456789abcdef".into()),
+            actor: "c/n".into(),
+            app: Some(("t".into(), "a".into())),
+            bucket: "s3://b".into(),
+            txid: None,
+            at: None,
+            from: None,
+            run: None,
+            if_head: None,
+            wait: 5,
+            no_wait: false,
+        };
+        let error = wait(
+            &args,
+            &keys,
+            "state/t/a/restores/c/6e/0123456789abcdef",
+            "0123456789abcdef",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no outcome"), "{error}");
+        assert!(error.contains("50 minutes"), "{error}");
+        assert!(error.contains("new request"), "{error}");
     }
 
     #[tokio::test]

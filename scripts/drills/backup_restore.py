@@ -67,6 +67,21 @@ def http(addr, path, method="GET", body=None):
         return r.read().decode()
 
 
+def http_served(addr, path, method="GET", body=None):
+    """Like a client: retry a 503 (Retry-After) for up to 30 s. An actor
+    restore or delete publishes its outcome while the node is still ending
+    its old hold of the actor (shipping the replacement's snapshot), and
+    the actor answers 503 until then."""
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return http(addr, path, method, body)
+        except urllib.error.HTTPError as error:
+            if error.code != 503 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", help="running soak fixture's S3 root; never mutated by this drill")
@@ -192,21 +207,13 @@ def main():
             # Rewinding rows within the same incarnation must keep newer bytes.
             http(recovered, route + "/b/saved.txt", "PUT", b"newer file")
             restore_actor()
-            if http(recovered, route + "/b/saved.txt") != "newer file":
+            if http_served(recovered, route + "/b/saved.txt") != "newer file":
                 raise RuntimeError("actor restore rewound file contents")
             http(recovered, route + "/delete-durable", "POST")
             # S3 Last-Modified has whole-second resolution. A restore whose
             # request ties the delete's timestamp is correctly superseded.
             time.sleep(1.1)
-            deadline = time.monotonic() + 30
-            while True:
-                try:
-                    http(recovered, route + "/touch", "POST")
-                    break
-                except urllib.error.HTTPError as error:
-                    if error.code != 503 or time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.2)
+            http_served(recovered, route + "/touch", "POST")
             http(recovered, route + "/b/current.txt", "PUT", b"current incarnation")
             def current_key():
                 keys = [o["Key"] for o in objects(target)
@@ -216,10 +223,10 @@ def main():
                 return keys[0]
             namespace = current_key()
             restore_actor()
-            if current_key() != namespace or http(recovered, route + "/b/current.txt") != "current incarnation":
+            if current_key() != namespace or http_served(recovered, route + "/b/current.txt") != "current incarnation":
                 raise RuntimeError("actor restore changed the current file namespace")
             try:
-                http(recovered, route + "/b/saved.txt")
+                http_served(recovered, route + "/b/saved.txt")
             except urllib.error.HTTPError as error:
                 if error.code != 404:
                     raise
