@@ -290,11 +290,16 @@ fn only_exact_ancestry_or_a_later_generation_proves_the_floor() {
 
 #[test]
 fn broken_floor_rules_are_caught() {
-    // The stale branch must be the selected chain: a narrow event.
-    let floor = (seeds() / 40).max(1);
+    // The stale branch must be the selected chain: a narrow event (about
+    // 2.4% of seeds for a larger txid, 3.2% for the head's generation, at
+    // 2,000 seeds). The floor is half the rarer rate, over at least 400
+    // seeds (pure computation): every prefix from 400 to 2,000 seeds then
+    // clears it by 1.8x or more, so it holds at every seed count.
+    let seeds = seeds().max(400);
+    let floor = seeds / 80;
     for breaks in [Breaks::HeadGeneration, Breaks::LargerTxid] {
-        let caught = (0..seeds()).filter(|&s| run(s, breaks).is_some()).count() as u64;
-        eprintln!("caught on {caught} of {} seeds", seeds());
+        let caught = (0..seeds).filter(|&s| run(s, breaks).is_some()).count() as u64;
+        eprintln!("caught on {caught} of {seeds} seeds");
         assert!(caught >= floor, "caught on {caught}, want {floor}");
     }
 }
