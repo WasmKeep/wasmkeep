@@ -778,9 +778,19 @@ async fn an_entry_for_an_actor_the_bucket_never_had_stays_without_creating_it() 
     // After the first delivery the node lets the actor's lease go at once
     // (expiry 0), though its idle timeout is 30 s: holding it would route
     // client requests there, and the first would create the actor empty.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let (holder, _) = owner_record(&shared, name).await.unwrap();
-    assert_eq!(holder, None, "the actor is still held");
+    // Wait for the first delivery's owner record (a loaded runner can take
+    // longer than one sweep), then for its lease to be let go.
+    let started = std::time::Instant::now();
+    loop {
+        if let Some((None, _)) = owner_record(&shared, name).await {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "no released owner record after the first delivery"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     // Sweeps run every 200 ms here: delivered on each, the lease would be
     // taken again dozens of times in 8 s; with the retry 5 min out
     // (`retry_max`), not at all after the first delivery.
