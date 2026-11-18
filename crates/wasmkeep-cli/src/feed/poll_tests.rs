@@ -593,10 +593,13 @@ async fn review_excluded_large_actor_does_not_starve_later_actors() {
 
 async fn large_actor_does_not_starve(classes: Vec<String>) {
     let store = fixture().await;
-    for i in 0..8000 {
+    // Exceed the 32 MiB retained-metadata budget with keys below S3's
+    // 1,024-byte key limit. The former 8,000 short keys now correctly fit.
+    let tail = "x".repeat(960);
+    for i in 0..34_000 {
         store
             .put(
-                &Key::from(format!("state/t/a/actors/b/large/history-{i:06}")),
+                &Key::from(format!("state/t/a/actors/b/large/history-{i:06}-{tail}")),
                 Vec::new().into(),
             )
             .await
