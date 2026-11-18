@@ -53,8 +53,8 @@ fn a_log_written_to_a_file_has_no_colour_codes() {
         // NO_COLOR would hide colours whether or not the file is checked.
         .env_remove("NO_COLOR")
         .stdin(Stdio::null())
-        .stdout(std::fs::File::create(&log).unwrap())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .stdout(Stdio::null())
         .spawn()
         .unwrap();
     let mut node = Node(child);

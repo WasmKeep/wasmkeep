@@ -48,6 +48,26 @@ node a     node b     node c       any node takes any request;
 - **Never expose** the metrics listener (`--metrics-listen`) or the
   node-to-node traffic to the internet.
 
+## Readiness with several apps
+
+For a [node file](../reference/node-file.md) with several apps or a
+hostname table:
+
+Health checks on the public port must send one of the app's configured
+hostnames, for example `Host: shop.example.com`, with
+`GET /_wasmkeep/ready`. This checks that app, so probe each app separately
+if the balancer tracks their readiness independently. An unknown host
+returns 421; a missing Host returns 421 on HTTP/1.0 or 400 on HTTP/1.1.
+The metrics port (`[listen].metrics` / `--metrics-listen`) serves
+`/metrics` only: `/_wasmkeep/ready` there returns 404, not readiness.
+The public port's `/_wasmkeep/health` works without an app hostname but
+checks process liveness only; it is not a readiness substitute.
+
+The HAProxy example below sends an app hostname. Replace it with a
+hostname configured on every backend it probes. For nginx, Caddy, cloud
+load balancers and the curl probe below, configure the same Host header
+(for curl, add `-H "Host: shop.example.com"`).
+
 ## Route by actor (recommended)
 
 Hash the actor's path, `/actor/<class>/<name>`, so that every request for
@@ -79,7 +99,8 @@ frontend public
 backend wasmkeep
     balance uri depth 3
     hash-type consistent
-    option httpchk GET /_wasmkeep/ready
+    option httpchk
+    http-check send meth GET uri /_wasmkeep/ready ver HTTP/1.1 hdr Host shop.example.com
     http-check expect status 200
     # Above the failover wait (25 s) plus a forward to the new owner.
     timeout server 60s

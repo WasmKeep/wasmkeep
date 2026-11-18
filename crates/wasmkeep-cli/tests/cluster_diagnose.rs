@@ -206,3 +206,99 @@ fn an_empty_scratch_prefix_is_refused_before_any_request() {
         "{shown}"
     );
 }
+
+/// Exercise object_store's real retry logger through the CLI, without a bucket.
+/// Listings are empty; the first conditional replacement conflicts, then
+/// replacements are denied. Even
+/// an unsuccessful diagnosis must emit a JSON report with logs only on stderr.
+#[tokio::test]
+async fn retry_logs_do_not_corrupt_json_stdout() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use bytes::Bytes;
+    use http_body_util::{BodyExt as _, Full};
+    use hyper::{Request, Response, body::Incoming, service::service_fn};
+    use hyper_util::rt::TokioIo;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let conflicted = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&conflicted);
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conflicted = Arc::clone(&conflicted);
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let conflicted = Arc::clone(&conflicted);
+                    async move {
+                        let method = req.method().clone();
+                        let conditional = req.headers().contains_key("if-match");
+                        req.into_body().collect().await.unwrap();
+                        let (status, body) = match method.as_str() {
+                            "GET" => (
+                                200,
+                                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                            ),
+                            "PUT" if conditional && !conflicted.swap(true, Ordering::SeqCst) => (
+                                409,
+                                "<Error><Code>ConditionalRequestConflict</Code></Error>",
+                            ),
+                            "PUT" if !conditional => (200, ""),
+                            "DELETE" => (204, ""),
+                            "HEAD" => (404, ""),
+                            _ => (403, "<Error><Code>AccessDenied</Code></Error>"),
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("etag", "\"fake\"")
+                                .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+            .args([
+                "cluster",
+                "diagnose",
+                "--bucket",
+                "s3://fake/test",
+                "--json",
+                "--skip-paging",
+                "--skip-links",
+            ])
+            .env("AWS_ENDPOINT", endpoint)
+            .env("AWS_ALLOW_HTTP", "true")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "test")
+            .env("AWS_SECRET_ACCESS_KEY", "test")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env("RUST_LOG", "info")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "fake store must trigger a conflict"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}; {}", text(&out)));
+    assert!(report["checks"].is_array(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("409") && stderr.contains("backing off"),
+        "{}",
+        text(&out)
+    );
+}

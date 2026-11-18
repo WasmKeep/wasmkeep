@@ -70,9 +70,9 @@ fn start(id: &str, dir: &Path, wasm: &Path, bucket: &str) -> Node {
         // tests/cluster_tls.rs).
         .args(["--cluster-plaintext", "accept"])
         .env("RUST_LOG", "wasmkeep_server=info,wasmkeep=info")
-        // The log goes to stdout.
-        .stdout(std::fs::File::create(&log).unwrap())
-        .stderr(Stdio::null())
+        // The log goes to stderr.
+        .stderr(std::fs::File::create(&log).unwrap())
+        .stdout(Stdio::null())
         .spawn()
         .unwrap();
     Node { child, addr, log }

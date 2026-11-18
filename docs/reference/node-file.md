@@ -114,8 +114,9 @@ A file with more than one `[[app]]`, or with `hostnames`, is served as
 several apps behind the process's three ports:
 
 - **The public port routes by hostname only.** Exactly one `Host` is
-  required (400 otherwise, and when an absolute-form target names another
-  authority); an unknown host answers **421**, and so does a second host on
+  required (400 on HTTP/1.1 otherwise; 421 on HTTP/1.0 without Host;
+  400 when an absolute-form target names another authority); an unknown
+  host answers **421**, and so does a second host on
   one connection; `Forwarded` and `X-Forwarded-Host` are ignored. Every
   `x-wasmkeep-*` request header is removed: on this port every request is a
   client's. `/_wasmkeep/health` is the process's; an app's readiness is
@@ -135,6 +136,16 @@ several apps behind the process's three ports:
   it a floor never lent; an app may use any capacity outside the other
   apps' unused floors, but takes nothing above its part while an app below
   its own waits. `min-resident` sets an app's resident floor.
+
+Health checks on the public port must send one of the app's configured
+hostnames, for example `Host: shop.example.com`, with
+`GET /_wasmkeep/ready`. This checks that app, so probe each app separately
+if the balancer tracks their readiness independently. An unknown host
+returns 421; a missing Host returns 421 on HTTP/1.0 or 400 on HTTP/1.1.
+The metrics port (`[listen].metrics` / `--metrics-listen`) serves
+`/metrics` only: `/_wasmkeep/ready` there returns 404, not readiness.
+The public port's `/_wasmkeep/health` works without an app hostname but
+checks process liveness only; it is not a readiness substitute.
 
 Start refuses, before binding a listener or writing a heartbeat: an
 unknown field; a duplicate app, node id or hostname; an invalid name or
