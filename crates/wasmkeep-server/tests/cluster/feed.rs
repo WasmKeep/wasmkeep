@@ -1046,13 +1046,13 @@ async fn archive_command(
 async fn copy_bucket(source: &Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
     let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     for meta in source.list(None).try_collect::<Vec<_>>().await.unwrap() {
-        let bytes = source
-            .get(&meta.location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        // The source is live: an object listed may be gone before its GET
+        // (a restore's staging object is removed once the restore ends).
+        let bytes = match source.get(&meta.location).await {
+            Ok(got) => got.bytes().await.unwrap(),
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(e) => panic!("copying {}: {e}", meta.location),
+        };
         target.put(&meta.location, bytes.into()).await.unwrap();
     }
     target
