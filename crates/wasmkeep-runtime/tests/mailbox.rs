@@ -513,10 +513,12 @@ async fn deregistration_does_not_free_capacity_before_the_state_is_dropped() {
             ),
         }
     }
+    // The actor stays registered until its state is gone, so an event for
+    // it queues there instead of building a second state beside this one.
     assert_eq!(
         mailboxes.resident(),
-        0,
-        "actor must leave the registry before Drop finishes"
+        1,
+        "actor must stay registered until Drop finishes"
     );
     assert_capacity(mailboxes.submit(&addr("b"), |_| Box::pin(async {})).await);
     assert_eq!(created.load(Ordering::SeqCst), 1);

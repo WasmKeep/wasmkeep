@@ -222,7 +222,8 @@ impl<S: Send + 'static> Mailboxes<S> {
     /// state is dropped only once the step's future resolves.
     ///
     /// - The step runs with the actor still registered, before the check
-    ///   that nothing is queued, so no second state is built beside it.
+    ///   that nothing is queued, so no second state is built beside it;
+    ///   the state is dropped before the actor leaves the registry too.
     /// - An event that arrives during the step wins: the step's future is
     ///   dropped (it must be cancel-safe), the event runs on the same state
     ///   and the idle wait starts over. The check is made again after any
@@ -862,12 +863,26 @@ async fn run_actor<S: Send + 'static>(
                     }
                     Stepped::Done(Ok(_)) => {}
                 }
+                // Nothing queued: the state goes (hibernation), with the
+                // actor still registered, so an event arriving meanwhile
+                // queues here instead of building a second state beside
+                // this one; it then runs on a new state, built after this
+                // one is gone. (A queued event keeps the state.)
+                // Counted as on its way out meanwhile, so an admission does
+                // not evict another actor for the slot this one returns.
+                let leaving = rx.is_empty() && state.is_some();
+                if leaving {
+                    own.activity
+                        .evicting
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    drop(state.take());
+                }
                 // Deregister under the lock that `enqueue` sends under, and
                 // only if nothing was queued meanwhile; otherwise keep going.
                 let mut actors = lock(&inner);
                 if rx.is_empty() {
-                    // (A queued event keeps it resident; `last` was set to
-                    // busy by the eviction and is refreshed below.)
+                    // (`last` was set to busy by the eviction and is
+                    // refreshed below.)
                     if actors
                         .get(&address)
                         .is_some_and(|e| e.tx.same_channel(&own.tx))
@@ -875,16 +890,20 @@ async fn run_actor<S: Send + 'static>(
                         actors.remove(&address);
                     }
                     drop(actors);
-                    drop(state.take()); // hibernation
                     drop(running);
                     return;
                 }
                 // A job raced the hibernation before we acquired the
-                // registry lock. An eviction stays pending while the biased
+                // registry lock (on the state, or on none if it was already
+                // dropped). An eviction stays pending while the biased
                 // receive branch drains those accepted events; an idle
                 // timeout simply starts over.
                 if evicted {
                     own.activity.evict.notify_one();
+                } else if leaving {
+                    own.activity
+                        .evicting
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
                 continue 'events;
             }

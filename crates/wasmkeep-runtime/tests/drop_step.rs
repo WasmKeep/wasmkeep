@@ -471,3 +471,93 @@ async fn a_panicking_step_drops_the_state_and_the_actor_recovers() {
     assert_eq!(f.mailboxes.submit(&a, increment).await.unwrap(), 1);
     assert_eq!(f.created.load(Ordering::SeqCst), 2);
 }
+
+/// A state whose drop takes time (a store flushing, a database closing),
+/// for the window between an actor leaving the registry and its state
+/// being gone.
+struct SlowDrop {
+    live: Arc<AtomicUsize>,
+    dropping: Arc<AtomicBool>,
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        self.dropping.store(true, Ordering::SeqCst);
+        let (lock, cvar) = &*self.release;
+        let released = lock.lock().unwrap();
+        let _released = cvar
+            .wait_timeout_while(released, Duration::from_secs(5), |r| !*r)
+            .unwrap();
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn ready(_state: &mut SlowDrop, _cause: DropCause) -> BoxFuture<'_, StepOutcome> {
+    Box::pin(async { StepOutcome::Ready })
+}
+
+fn noop(_state: &mut SlowDrop) -> BoxFuture<'_, ()> {
+    Box::pin(async {})
+}
+
+/// An event arriving while a hibernating state is still being dropped
+/// must wait for that drop: the actor stays registered until its state is
+/// gone, so the event never builds a second state beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_during_the_drop_waits_for_the_state_to_be_gone() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let created = Arc::new(AtomicUsize::new(0));
+    let dropping = Arc::new(AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (l, m, c, d, r) = (
+        Arc::clone(&live),
+        Arc::clone(&most),
+        Arc::clone(&created),
+        Arc::clone(&dropping),
+        Arc::clone(&release),
+    );
+    let mailboxes = Mailboxes::new_with_step(
+        idle(Duration::from_secs(600)),
+        move |_address, _residency| {
+            let (l, m, c, d, r) = (
+                Arc::clone(&l),
+                Arc::clone(&m),
+                Arc::clone(&c),
+                Arc::clone(&d),
+                Arc::clone(&r),
+            );
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                m.fetch_max(l.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                Ok::<_, BoxError>(SlowDrop {
+                    live: l,
+                    dropping: d,
+                    release: r,
+                })
+            }
+        },
+        ready,
+    );
+    let a = addr("a");
+    mailboxes.submit(&a, noop).await.unwrap();
+    mailboxes.hibernate(&a);
+    while !dropping.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // The old state is mid-drop: queue the next event now.
+    let next = tokio::spawn(mailboxes.submit(&a, noop));
+    // Give a wrongly admitted second actor time to build its state.
+    for _ in 0..200 {
+        if created.load(Ordering::SeqCst) > 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    next.await.unwrap().unwrap();
+    assert_eq!(most.load(Ordering::SeqCst), 1, "two states at once");
+    assert_eq!(created.load(Ordering::SeqCst), 2);
+}
