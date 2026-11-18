@@ -885,7 +885,10 @@ Follow-ups from the review of the build:
   discovery bound; still missing then, it is reported as an incomplete
   history (500).
 - **S7:** the simulations test the shared protocol code and a model of
-  the server's ordering, not the server's own ordering.
+  the server's ordering, not the server's own ordering. 2026-11-17:
+  `sim/tests/madsim_server_order.rs` runs hand-overs in the server's
+  order over a lagging LIST; no violation at 2,000 seeds. Its order is
+  copied by hand: sharing the gate from the cluster crate would close it.
 
 - **The exact-floor sidecar proof (proof 3, case 10)** stays unbuilt:
   it would let an actor activate from its own local file while the
@@ -921,6 +924,12 @@ Follow-ups from the review of the build:
   record and the history, and generations may start again from 1; no
   floor survives it (the record is gone, and local evidence is dropped
   on an absent record).
+
+- **Case 10 scoped (2026-11-17): liveness, not built.** The structural
+  route indeed compares no checksum at the floor, but a local file is used
+  only after the listing proves the floor and only at the plan's head,
+  so proof 3 would add no comparison there; the route rests on the
+  preconditions above, each checked in code.
 
 Earlier questions:
 
