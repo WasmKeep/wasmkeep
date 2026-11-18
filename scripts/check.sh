@@ -193,16 +193,26 @@ if $deep; then
   step "simulations ($seeds seeds, release, one at a time)"
   mkdir -p target/deep
   log="target/deep/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)-$seeds.log"
+  # A failing suite does not stop the sweep: every suite runs, then the
+  # failures are listed and the run exits non-zero (pipefail sees cargo's
+  # status through tee).
+  deep_failed=()
   for test in sim/tests/madsim_*.rs; do
     [ -e "$test" ] || continue
     name=$(basename "$test" .rs)
     started=$(date +%s)
+    status=0
     RUSTFLAGS='--cfg madsim' WASMKEEP_SIM_SEEDS=$seeds nice -n 19 \
       cargo test -p wasmkeep-sim --locked --release --target-dir target/madsim-release \
-      --test "$name" -- --nocapture --test-threads 1 2>&1 | tee -a "$log"
-    echo "deep: $name $seeds seeds in $(( $(date +%s) - started )) s" | tee -a "$log"
+      --test "$name" -- --nocapture --test-threads 1 2>&1 | tee -a "$log" || status=$?
+    [ "$status" -eq 0 ] || deep_failed+=("$name")
+    echo "deep: $name $seeds seeds in $(( $(date +%s) - started )) s (exit $status)" | tee -a "$log"
   done
   echo "deep: log in $log"
+  if [ "${#deep_failed[@]}" -gt 0 ]; then
+    echo "deep: failed: ${deep_failed[*]}" | tee -a "$log" >&2
+    exit 1
+  fi
 fi
 if $s3; then
   step 'S3 suites'

@@ -182,6 +182,22 @@ esac
         self.assertIn('deep: madsim_node_lease 50 seeds in', result.stdout)
         self.assertTrue(list((self.root / 'target' / 'deep').glob('*-50.log')))
 
+    def test_deep_fails_when_a_simulation_fails_and_still_runs_the_rest(self):
+        self.write('sim/tests/madsim_lease.rs', '')
+        self.write('sim/tests/madsim_node_lease.rs', '')
+        self.git('add', '.')
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'sims')
+        self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        env = dict(self.env, CHECK_DEEP_SEEDS='50', FAIL_MATCH='--test madsim_lease ')
+        result = subprocess.run(['bash', 'scripts/check.sh', '--deep'], cwd=self.root, env=env,
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('deep: madsim_lease 50 seeds in', result.stdout)
+        self.assertIn('(exit 9)', result.stdout)
+        self.assertIn('--test madsim_node_lease -- --nocapture',
+                      (self.root / 'calls').read_text())
+        self.assertIn('deep: failed: madsim_lease', result.stderr)
+
     def test_script_only_runs_script_tests(self):
         self.write('scripts/change.py', '')
         result, calls = self.run_check()
