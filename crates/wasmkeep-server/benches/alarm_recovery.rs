@@ -28,6 +28,7 @@ use futures_util::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
+use wasmkeep_cluster::state_root::{Family, StateRoot};
 use wasmkeep_server::{ActorConfig, ClusterConfig, LeaseConfig};
 
 #[path = "support/scale.rs"]
@@ -38,9 +39,12 @@ use scale::{Client, Node, admission_retries, alarms_fired, now_ms, post_all};
 /// Alarms left behind by the dead node.
 const SIZES: [usize; 3] = [100, 1_000, 10_000];
 
-fn node(id: &str, data: &std::path::Path, store: &Arc<dyn ObjectStore>) -> Node {
+fn node(id: &str, data: &std::path::Path, store: &Arc<dyn ObjectStore>, root: &StateRoot) -> Node {
     let mut config = ActorConfig::new(data);
+    config.tenant = root.tenant().to_owned();
+    config.app = root.app().to_owned();
     let mut cluster = ClusterConfig::new(id, String::new(), Arc::clone(store));
+    cluster.prefix = root.prefix().to_owned();
     // A tenth of the defaults (ttl 10 s, grace 5 s, safety 2 s, skew 1 s;
     // heartbeat 3 s; sweep 10 s).
     cluster.lease = LeaseConfig::new(1_000, 500, 200, 100).unwrap();
@@ -67,14 +71,17 @@ fn count(rt: &tokio::runtime::Runtime, store: &Arc<dyn ObjectStore>, prefix: &st
 /// it grows if the setup did not finish in time.
 fn recover(rt: &tokio::runtime::Runtime, n: usize, lead: &mut Duration) -> Duration {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let root = StateRoot::new("", "default", "default");
+    let alarms = root.bucket_base(Family::Alarms);
+    let history = root.bucket_base(Family::History);
     let dirs = [
         tempfile::tempdir().unwrap(),
         tempfile::tempdir().unwrap(),
         tempfile::tempdir().unwrap(),
     ];
-    let a = node("a", dirs[0].path(), &store);
-    let b = node("b", dirs[1].path(), &store);
-    let c = node("c", dirs[2].path(), &store);
+    let a = node("a", dirs[0].path(), &store, &root);
+    let b = node("b", dirs[1].path(), &store, &root);
+    let c = node("c", dirs[2].path(), &store, &root);
     for addr in [a.addr, b.addr, c.addr] {
         let _ = Client::until_ok(
             addr,
@@ -89,15 +96,15 @@ fn recover(rt: &tokio::runtime::Runtime, n: usize, lead: &mut Duration) -> Durat
     let at = now_ms() + u64::try_from(lead.as_millis()).unwrap();
     post_all(a.addr, n, 32, |i| format!("/actor/t/x{i}/alarm?at={at}"));
     // Every alarm indexed, then every actor's objects uploaded (they
-    // follow the answer): the count under `actors/` stops moving.
+    // follow the answer): the count under the app's history prefix stops moving.
     let deadline = Instant::now() + Duration::from_secs(120);
-    while count(rt, &store, "alarms") < n {
+    while count(rt, &store, &alarms) < n {
         assert!(Instant::now() < deadline, "alarms never all indexed");
         std::thread::sleep(Duration::from_millis(20));
     }
     let mut last = 0;
     loop {
-        let now = count(rt, &store, "actors");
+        let now = count(rt, &store, &history);
         if now == last {
             break;
         }
@@ -122,12 +129,12 @@ fn recover(rt: &tokio::runtime::Runtime, n: usize, lead: &mut Duration) -> Durat
     std::thread::sleep(left);
     let due = Instant::now();
     let deadline = due + Duration::from_secs(900);
-    while alarms_fired() < fired + n as u64 || count(rt, &store, "alarms") > 0 {
+    while alarms_fired() < fired + n as u64 || count(rt, &store, &alarms) > 0 {
         assert!(
             Instant::now() < deadline,
             "{} of {n} alarms fired, {} index entries left",
             alarms_fired() - fired,
-            count(rt, &store, "alarms")
+            count(rt, &store, &alarms)
         );
         std::thread::sleep(Duration::from_millis(10));
     }
