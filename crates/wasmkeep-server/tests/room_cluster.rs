@@ -69,6 +69,12 @@ async fn node(
                 HttpComponent::new(runtime.clone(), &guests::compile(&runtime, &front)).unwrap();
             let mut config = ActorConfig::new(path);
             config.mailbox.idle_timeout = Duration::from_secs(180);
+            // The slow client never reads, so it never answers the server's
+            // pings: with the default ping timings its edge closes it 1001
+            // (idle) once it has been silent for 55 s, and on a slow runner
+            // the 350 rounds before it speaks take longer than that. This
+            // test is about the 4802 slow close, not the idle one.
+            config.websocket_ping_after = Duration::from_secs(600);
             for class in ["room", "edge", "directory", "relay"] {
                 config.access.set(class, wasmkeep_server::Access::Internal);
             }
