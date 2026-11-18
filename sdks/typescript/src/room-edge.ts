@@ -28,7 +28,7 @@ interface Cursor {
     lagging: boolean;
     stalled?: boolean;
 }
-const bytes = (s: string) => new TextEncoder().encode(s).length;
+import { byteLength as bytes } from "./room-utf8";
 export class Edge {
     buffer: {
         n: number;

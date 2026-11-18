@@ -6,6 +6,8 @@ pub struct Round {
     children: Vec<Child>,
     relays: Vec<Relay>,
     relay_suspects: std::collections::BTreeMap<String, Suspect>,
+    /// The child the last round deferred first: the next round starts there.
+    resume: Option<String>,
 }
 #[derive(Debug)]
 struct Child {
@@ -87,6 +89,7 @@ impl Round {
         Ok(Self {
             relays: vec![],
             relay_suspects: Default::default(),
+            resume: None,
             children: addresses
                 .iter()
                 .map(|address| Child {
@@ -108,12 +111,27 @@ impl Round {
             return Ok(());
         }
         let epoch = core.wake()?;
-        let rows = core.messages()?;
         let epochs = core.epochs()?;
-        let head = rows.last().map_or(epoch.base, |m| m.position.n);
+        let head = core.last()?.unwrap_or(epoch.base);
         let mut indices = vec![];
         let mut requests = vec![];
-        for (index, child) in self.children.iter().enumerate() {
+        // Slices by start: children at one position share one read and one
+        // encoding. One round builds at most ROUND_BYTES of messages (one
+        // slice at least); the rest keep their positions for 20 ms later.
+        let mut slices: std::collections::BTreeMap<(u64, u64), Slice> = Default::default();
+        let mut read = 0usize;
+        let mut budget = ROUND_BYTES;
+        let mut deferred = false;
+        // A continuation starts at the child the last round deferred first,
+        // so under sustained publishing every child takes its turn.
+        let start = self
+            .resume
+            .take()
+            .and_then(|a| self.children.iter().position(|c| c.address == a))
+            .unwrap_or(0);
+        let order: Vec<usize> = (start..self.children.len()).chain(0..start).collect();
+        for index in order {
+            let child = &self.children[index];
             if child.suspect.due > now
                 || self.relays.iter().any(|r| {
                     r.edges.contains(&child.address)
@@ -153,29 +171,42 @@ impl Round {
                     head,
                     messages: vec![],
                 };
-                if let Some(n) = n {
-                    for m in rows.iter().filter(|m| m.position.n > n) {
-                        let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
-                            push.recover = true;
-                            push.messages.clear();
-                            break;
-                        };
-                        if push.messages.is_empty() {
-                            push.first = m.position.n;
+                if let Some(n) = n.filter(|n| *n < head) {
+                    let key = (n, push.base);
+                    if let std::collections::btree_map::Entry::Vacant(e) = slices.entry(key) {
+                        if read >= ROUND_BYTES || budget == 0 {
+                            deferred = true;
+                            self.resume.get_or_insert_with(|| child.address.clone());
+                            continue;
                         }
-                        push.messages.push(Item {
-                            epoch: Some(Epoch {
-                                e: m.position.e,
-                                base: boundary.base,
-                            }),
-                            at: m.at,
-                            id: m.id.clone(),
-                            body: m.body.clone(),
-                        });
-                        if push.messages.len() > 512 || push.encode().len() > 512 * 1024 {
-                            push.messages.pop();
-                            break;
+                        // Never more rows than the budget has left (one at least).
+                        let rows = ((ROUND_BYTES - read) / ROW_COST).clamp(1, 513);
+                        let slice = Slice::read(core, &epochs, n + 1, rows)?;
+                        read += slice.read;
+                        e.insert(slice);
+                    }
+                    let slice = &slices[&key];
+                    if slice.recover {
+                        push.recover = true;
+                    } else if let Some(&first) = slice.first.as_ref() {
+                        // The cut: at most 512 messages and 512 KiB of JSON per request.
+                        push.first = first;
+                        let fixed = push.encode().len();
+                        let (mut k, mut total) = (0, fixed);
+                        while k < slice.items.len()
+                            && k < 512
+                            && total + slice.sizes[k] + usize::from(k > 0) <= 512 * 1024
+                        {
+                            total += slice.sizes[k] + usize::from(k > 0);
+                            k += 1;
                         }
+                        if k > 0 && total - fixed > budget && budget < ROUND_BYTES {
+                            deferred = true;
+                            self.resume.get_or_insert_with(|| child.address.clone());
+                            continue;
+                        }
+                        budget = budget.saturating_sub(total - fixed);
+                        push.messages = slice.items[..k].to_vec();
                     }
                 }
                 let body = push.encode();
@@ -193,7 +224,7 @@ impl Round {
                 },
             ));
         }
-        let mut next = None;
+        let mut next = deferred.then(|| now.saturating_add(20));
         let mut skip = std::collections::BTreeSet::new();
         let results = if self.relays.is_empty() {
             crate::calls::call_many(&requests)
@@ -304,6 +335,56 @@ impl Round {
     }
 }
 
+/// Message bytes one round builds for its children (ADR 0040, section 4).
+const ROUND_BYTES: usize = 1024 * 1024;
+/// What reading one row costs the round's budget besides its JSON: at
+/// most about 1,000 rows a round.
+const ROW_COST: usize = 1024;
+/// The messages after one position, each with its JSON size.
+struct Slice {
+    first: Option<u64>,
+    items: Vec<Item>,
+    sizes: Vec<usize>,
+    recover: bool,
+    read: usize,
+}
+impl Slice {
+    fn read<S: Store>(
+        core: &Core<S>,
+        epochs: &[Epoch],
+        from: u64,
+        rows: usize,
+    ) -> Result<Self, String> {
+        let mut s = Slice {
+            first: None,
+            items: vec![],
+            sizes: vec![],
+            recover: false,
+            read: 0,
+        };
+        for m in core.rows(from, rows, 512 * 1024)? {
+            let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
+                return Ok(Slice { recover: true, ..s });
+            };
+            s.first.get_or_insert(m.position.n);
+            let item = Item {
+                epoch: Some(Epoch {
+                    e: m.position.e,
+                    base: boundary.base,
+                }),
+                at: m.at,
+                id: m.id,
+                body: m.body,
+            };
+            let size = item.json().len();
+            // Every row costs, an empty one too: its read, its item and its JSON.
+            s.read += ROW_COST + size;
+            s.sizes.push(size);
+            s.items.push(item);
+        }
+        Ok(s)
+    }
+}
 fn acknowledgment(body: &[u8], epoch: u64, head: u64) -> Option<(Position, bool)> {
     let j = crate::json::parse_unique(std::str::from_utf8(body).ok()?)?;
     let p = Position {

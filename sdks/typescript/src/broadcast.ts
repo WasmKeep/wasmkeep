@@ -9,7 +9,8 @@ import type { ActorDefinition, ActorRequest, ActorResponse } from "./index";
 import { Reader, Writer, header } from "./wire";
 export { Client } from "./broadcast-client";
 export * from "./broadcast-core";
-const PREFIX = "/wasmkeep-room/v1/", enc = new TextEncoder(), dec = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+import { decode } from "./room-utf8";
+const PREFIX = "/wasmkeep-room/v1/";
 function number(r: Reader): bigint {
     const n = r.u64();
     if (n === undefined)
@@ -32,7 +33,7 @@ function text(r: Reader): string {
     const b = r.bytes();
     if (b === undefined)
         throw Error("invalid room text");
-    return dec.decode(b);
+    return decode(b, { fatal: true });
 }
 function end(r: Reader) {
     if (!r.isEmpty())
@@ -61,7 +62,7 @@ function serve(core: Core, op: string, body: Uint8Array): Uint8Array {
     else if (op === "history") {
         const after = flag(r) ? position(r) : undefined, limit = count(r, 2000), last = flag(r) ? count(r, 2000) : undefined;
         end(r);
-        const h = core.history(after, limit, last);
+        const { history: h, raw } = core.page(after, limit, last, true);
         put(w, h.head);
         w.u64(h.lost ? 1 : 0);
         if (h.lost)
@@ -70,13 +71,13 @@ function serve(core: Core, op: string, body: Uint8Array): Uint8Array {
         if (h.reset)
             put(w, h.reset);
         w.u64(h.more ? 1 : 0).u64(h.messages.length);
-        for (const m of h.messages) {
+        h.messages.forEach((m, i) => {
             put(w, m.position);
             w.u64(m.at).u64(m.id === undefined ? 0 : 1);
             if (m.id !== undefined)
-                w.bytes(enc.encode(m.id));
-            w.bytes(enc.encode(m.body));
-        }
+                w.bytes(raw[i].id!);
+            w.bytes(raw[i].body);
+        });
     }
     else
         throw Error("invalid room operation");

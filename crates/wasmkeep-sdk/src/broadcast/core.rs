@@ -4,7 +4,7 @@ use crate::{Value, storage};
 /// must not return success until uploaded. An alarm is an absolute millisecond.
 pub trait Store {
     fn exec(&mut self, sql: &str, params: &[Value], durable: bool) -> Result<(), String>;
-    fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>, String>;
+    fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String>;
     fn alarm(&mut self, at: u64) -> Result<(), String>;
     fn flush(&mut self) -> Result<(), String>;
 }
@@ -20,8 +20,8 @@ impl Store for Host {
         .map(|_| ())
         .map_err(|e| e.to_string())
     }
-    fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>, String> {
-        storage::query(sql, &[])
+    fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
+        storage::query(sql, params)
             .map(|r| r.values)
             .map_err(|e| e.to_string())
     }
@@ -55,26 +55,69 @@ impl<S: Store> Core<S> {
         self.db.exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_history (n INTEGER PRIMARY KEY,e INTEGER NOT NULL,at INTEGER NOT NULL,id TEXT UNIQUE,body TEXT NOT NULL)", &[], false)?;
         self.db.exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_epochs (e INTEGER PRIMARY KEY,base INTEGER NOT NULL)", &[], false)
     }
+    /// The whole window, oldest first: tests only, never a per-event path.
+    #[cfg(test)]
     pub(super) fn messages(&self) -> Result<Vec<Message>, String> {
         self.db
-            .query("SELECT n,e,at,id,body FROM wasmkeep_room_history ORDER BY n")?
-            .into_iter()
+            .query(
+                "SELECT n,e,at,id,body FROM wasmkeep_room_history ORDER BY n",
+                &[],
+            )?
+            .iter()
+            .map(|r| row(r))
+            .collect()
+    }
+    fn end(&self, newest: bool) -> Result<Option<Position>, String> {
+        let order = if newest { "DESC" } else { "ASC" };
+        self.db
+            .query(
+                &format!("SELECT n,e FROM wasmkeep_room_history ORDER BY n {order} LIMIT 1"),
+                &[],
+            )?
+            .first()
             .map(|r| {
-                Ok(Message {
-                    position: Position {
-                        n: integer(&r[0])?,
-                        e: integer(&r[1])?,
-                    },
-                    at: integer(&r[2])?,
-                    id: r[3].as_str().map(str::to_owned),
-                    body: r[4].as_str().ok_or("invalid room row")?.into(),
+                Ok(Position {
+                    n: integer(&r[0])?,
+                    e: integer(&r[1])?,
                 })
             })
-            .collect()
+            .transpose()
+    }
+    /// The highest number in the window, if any.
+    pub(super) fn last(&self) -> Result<Option<u64>, String> {
+        Ok(self.end(true)?.map(|p| p.n))
+    }
+    /// Up to `count` rows from number `from` on, at most one page past
+    /// `bytes` of bodies: what one push needs, never the whole window.
+    pub(super) fn rows(
+        &self,
+        mut from: u64,
+        count: usize,
+        bytes: usize,
+    ) -> Result<Vec<Message>, String> {
+        let mut out = Vec::new();
+        let mut seen = 0;
+        while out.len() < count && seen <= bytes {
+            let page = PAGE.min(count - out.len());
+            let rows = self.db.query(
+                "SELECT n,e,at,id,body FROM wasmkeep_room_history WHERE n >= ?1 ORDER BY n LIMIT ?2",
+                &[int(from)?, int(page as u64)?],
+            )?;
+            for r in &rows {
+                let m = row(r)?;
+                seen += m.body.len();
+                from = m.position.n.saturating_add(1);
+                out.push(m);
+            }
+            if rows.len() < page {
+                break;
+            }
+        }
+        Ok(out)
     }
     pub(super) fn epochs(&self) -> Result<Vec<Epoch>, String> {
         self.db
-            .query("SELECT e,base FROM wasmkeep_room_epochs ORDER BY e")?
+            .query("SELECT e,base FROM wasmkeep_room_epochs ORDER BY e", &[])?
             .iter()
             .map(|r| {
                 Ok(Epoch {
@@ -95,7 +138,7 @@ impl<S: Store> Core<S> {
             .checked_add(1)
             .filter(|e| *e <= i64::MAX as u64)
             .ok_or("epoch exhausted")?;
-        let base = self.messages()?.last().map_or(0, |m| m.position.n);
+        let base = self.last()?.unwrap_or(0);
         self.db.exec("BEGIN", &[], false)?;
         let result = (|| {
             self.db.exec(
@@ -130,21 +173,28 @@ impl<S: Store> Core<S> {
         }
         let at = int(now)?;
         let epoch = self.wake()?;
-        let mut rows = self.messages()?;
-        let mut n = rows.last().map_or(epoch.base, |m| m.position.n);
+        let mut n = self.last()?.unwrap_or(epoch.base);
         let mut positions = Vec::new();
         self.db.exec("BEGIN", &[], false)?;
         let result = (|| {
             for m in input {
-                if let Some(old) = rows.iter().find(|r| m.id.is_some() && r.id == m.id) {
-                    positions.push(old.position);
-                    continue;
+                if let Some(id) = &m.id {
+                    let old = self.db.query(
+                        "SELECT n,e FROM wasmkeep_room_history WHERE id=?1",
+                        &[id.clone().into()],
+                    )?;
+                    if let Some(r) = old.first() {
+                        positions.push(Position {
+                            n: integer(&r[0])?,
+                            e: integer(&r[1])?,
+                        });
+                        continue;
+                    }
                 }
                 n = n
                     .checked_add(1)
                     .filter(|n| *n <= i64::MAX as u64)
                     .ok_or("number exhausted")?;
-                let p = Position { e: epoch.e, n };
                 self.db.exec(
                     "INSERT INTO wasmkeep_room_history(n,e,at,id,body) VALUES(?1,?2,?3,?4,?5)",
                     &[
@@ -156,27 +206,9 @@ impl<S: Store> Core<S> {
                     ],
                     false,
                 )?;
-                rows.push(Message {
-                    position: p,
-                    at: now,
-                    id: m.id.clone(),
-                    body: m.body.clone(),
-                });
-                positions.push(p);
+                positions.push(Position { e: epoch.e, n });
             }
-            let mut bytes: usize = rows.iter().map(|r| r.body.len()).sum();
-            let mut drop = 0;
-            while rows.len() - drop > 2000 || bytes > 8 * 1024 * 1024 {
-                bytes -= rows[drop].body.len();
-                drop += 1;
-            }
-            if drop > 0 {
-                self.db.exec(
-                    "DELETE FROM wasmkeep_room_history WHERE n <= ?1",
-                    &[int(rows[drop - 1].position.n)?],
-                    false,
-                )?;
-            }
+            self.db.exec(TRIM, &[], false)?;
             self.db.exec("COMMIT", &[], false)
         })();
         if result.is_err() {
@@ -220,11 +252,11 @@ impl<S: Store> Core<S> {
             return Err("invalid history request".into());
         }
         let epoch = self.wake()?;
-        let rows = self.messages()?;
         let epochs = self.epochs()?;
+        let first = self.end(false)?;
         let head = Position {
             e: epoch.e,
-            n: rows.last().map_or(epoch.base, |m| m.position.n),
+            n: self.last()?.unwrap_or(epoch.base),
         };
         let mut h = History {
             head,
@@ -233,7 +265,7 @@ impl<S: Store> Core<S> {
             messages: vec![],
             more: false,
         };
-        let mut start = rows.len();
+        let mut from = None;
         if let Some(p) = after {
             if p.e > epoch.e || p.e == 0 || (p.e == epoch.e && p.n > head.n) {
                 return Err("invalid position".into());
@@ -252,36 +284,73 @@ impl<S: Store> Core<S> {
                 h.lost = Some(b);
                 n = b.base;
             }
-            if (p.e < oldest && !rows.iter().any(|m| m.position == p))
-                || rows
-                    .first()
-                    .is_some_and(|m| n.saturating_add(1) < m.position.n)
-            {
-                h.reset = Some(rows.first().map_or(head, |m| m.position));
-                start = 0;
+            let kept = || -> Result<bool, String> {
+                Ok(!self
+                    .db
+                    .query(
+                        "SELECT 1 FROM wasmkeep_room_history WHERE n=?1 AND e=?2",
+                        &[int(p.n)?, int(p.e)?],
+                    )?
+                    .is_empty())
+            };
+            if (p.e < oldest && !kept()?) || first.is_some_and(|f| n.saturating_add(1) < f.n) {
+                h.reset = Some(first.unwrap_or(head));
+                from = first.map(|f| f.n);
             } else {
-                start = rows
-                    .iter()
-                    .position(|m| m.position.n > n)
-                    .unwrap_or(rows.len());
+                from = Some(n.saturating_add(1));
             }
-        } else if let Some(last) = last {
-            start = rows.len().saturating_sub(last);
+        } else if let Some(last) = last.filter(|l| *l > 0) {
+            let r = self.db.query(
+                "SELECT n FROM wasmkeep_room_history ORDER BY n DESC LIMIT 1 OFFSET ?1",
+                &[int(last as u64 - 1)?],
+            )?;
+            from = match r.first() {
+                Some(r) => Some(integer(&r[0])?),
+                None => first.map(|f| f.n),
+            };
         }
         // Fixed v1 response fields, including optional lost/reset positions.
         let mut bytes =
             48 + usize::from(h.lost.is_some()) * 16 + usize::from(h.reset.is_some()) * 16;
-        for row in &rows[start..] {
-            let encoded = 36 + row.body.len() + row.id.as_ref().map_or(0, |id| 4 + id.len());
-            if h.messages.len() == limit || bytes + encoded > 262144 {
-                h.more = true;
+        while let Some(start) = from {
+            let rows = self.db.query(
+                "SELECT n,e,at,id,body FROM wasmkeep_room_history WHERE n >= ?1 ORDER BY n LIMIT ?2",
+                &[int(start)?, int(PAGE as u64)?],
+            )?;
+            from = None;
+            for r in &rows {
+                let row = row(r)?;
+                let encoded = 36 + row.body.len() + row.id.as_ref().map_or(0, |id| 4 + id.len());
+                if h.messages.len() == limit || bytes + encoded > 262144 {
+                    h.more = true;
+                    break;
+                }
+                bytes += encoded;
+                from = Some(row.position.n.saturating_add(1));
+                h.messages.push(row);
+            }
+            if rows.len() < PAGE || h.more {
                 break;
             }
-            bytes += encoded;
-            h.messages.push(row.clone());
         }
         Ok(h)
     }
+}
+/// Rows a bounded read takes at a time.
+const PAGE: usize = 32;
+/// The window: the newest 2,000 rows within 8 MiB of bodies; every older
+/// row goes, in one statement SQLite runs.
+const TRIM: &str = "DELETE FROM wasmkeep_room_history WHERE n <= (SELECT n FROM (SELECT n, row_number() OVER w AS k, sum(length(CAST(body AS BLOB))) OVER w AS tail FROM wasmkeep_room_history WINDOW w AS (ORDER BY n DESC ROWS UNBOUNDED PRECEDING)) WHERE k > 2000 OR tail > 8388608 ORDER BY n DESC LIMIT 1)";
+fn row(r: &[Value]) -> Result<Message, String> {
+    Ok(Message {
+        position: Position {
+            n: integer(&r[0])?,
+            e: integer(&r[1])?,
+        },
+        at: integer(&r[2])?,
+        id: r[3].as_str().map(str::to_owned),
+        body: r[4].as_str().ok_or("invalid room row")?.into(),
+    })
 }
 fn integer(v: &Value) -> Result<u64, String> {
     v.as_i64()

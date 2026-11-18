@@ -27,6 +27,7 @@
 import "./text";
 import "./console";
 import { explainMissing } from "./engines";
+import { describeError } from "./errors";
 import * as wkStorage from "wasmkeep:actor/storage@0.2.0";
 import * as wkAlarms from "wasmkeep:actor/alarms@0.2.0";
 import * as wkSockets from "wasmkeep:actor/websockets@0.2.0";
@@ -264,7 +265,7 @@ export function defineActor(definition: ActorDefinition): ActorDefinition {
 /** The component exports for `definition`. Called by the build's generated
  * entry module; not needed in actor code. */
 export function exportsFor(definition: ActorDefinition) {
-  const failed = (e: unknown) => explainMissing(e instanceof Error ? e.message : String(e));
+  const failed = (e: unknown) => explainMissing(describeError(e));
   return {
     // A thrown string is the WIT `result` error (shown in the host's logs).
     onInit(): void {
@@ -291,10 +292,18 @@ export function exportsFor(definition: ActorDefinition) {
       if (accepted === false) throw "refused";
     },
     onWebsocketMessage(conn: bigint, msg: { tag: "text"; val: string } | { tag: "binary"; val: Uint8Array }): void {
-      definition.websocket?.message?.(conn, msg.val);
+      try {
+        definition.websocket?.message?.(conn, msg.val);
+      } catch (e) {
+        throw Error(failed(e));
+      }
     },
     onWebsocketClose(conn: bigint, code: number, reason: string): void {
-      definition.websocket?.close?.(conn, code, reason);
+      try {
+        definition.websocket?.close?.(conn, code, reason);
+      } catch (e) {
+        throw Error(failed(e));
+      }
     },
     incomingHandler: {
       handle(request: IncomingRequest, out: ResponseOutparam): void {
@@ -303,7 +312,10 @@ export function exportsFor(definition: ActorDefinition) {
         try {
           response = definition.fetch ? definition.fetch(req) : { status: 404, body: "no fetch handler\n" };
         } catch (e) {
-          response = { status: 500, body: `${failed(e)}\n` };
+          // The details (a thrown value's fields, a host error's) go to the
+          // log only: a 500 body says nothing a caller should not see.
+          console.error(failed(e));
+          response = { status: 500, body: "actor error\n" };
         }
         respond(out, response);
       },

@@ -29,6 +29,7 @@ import "./text";
 import "./console";
 import type { ResponseOutparam, IncomingRequest } from "wasi:http/types@0.2.12";
 import { explainMissing } from "./engines";
+import { describeError } from "./errors";
 import { respond, toRequest } from "./handler";
 import type { ActorRequest, ActorResponse } from "./request";
 
@@ -75,7 +76,7 @@ export function frontExportsFor(definition: FrontDefinition) {
         try {
           response = definition.fetch(toRequest(request));
         } catch (e) {
-          console.error(explainMissing(e instanceof Error ? e.message : String(e)));
+          console.error(explainMissing(describeError(e)));
           response = { status: 500, body: "internal error\n" };
         }
         respond(out, response);

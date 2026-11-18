@@ -2,6 +2,7 @@ import * as storage from "wasmkeep:actor/storage@0.2.0";
 import * as host from "wasmkeep:actor/websockets@0.2.0";
 import { trySend } from "./sockets";
 import { Edge, type Push } from "./room-edge";
+import { decode, fits } from "./room-utf8";
 import type { ActorDefinition } from "./index";
 interface Config {
     room: string;
@@ -72,14 +73,15 @@ export function defineEdge(): ActorDefinition {
                 return { status: 403 };
             let p: Push;
             try {
-                p = JSON.parse(req.text(1024 * 1024) ?? "null");
+                const body = req.bytes(1024 * 1024);
+                p = JSON.parse(body === undefined ? "null" : decode(body, { stripBOM: true }));
             }
             catch {
                 return { status: 400 };
             }
             if (!p || (p.recover !== undefined && typeof p.recover !== "boolean") || ![p.e, p.b, p.first, p.head].every(n => Number.isSafeInteger(n) && n >= 0) || !Array.isArray(p.messages) || p.messages.length > 512 || p.first === 0 || p.b > p.head || (p.messages.length && p.first + p.messages.length - 1 > p.head))
                 return { status: 400 };
-            if (p.messages.some((m, i) => !m || !Number.isSafeInteger(m.a) || m.a < 0 || typeof m.d !== "string" || new TextEncoder().encode(m.d).length > 65536 || (m.i !== undefined && (typeof m.i !== "string" || new TextEncoder().encode(m.i).length > 64)) || ((m.e !== undefined || m.b !== undefined) && (!Number.isSafeInteger(m.e) || !Number.isSafeInteger(m.b) || m.e! < 0 || m.e! > p.e || m.b! < 0 || m.b! >= p.first + i))))
+            if (p.messages.some((m, i) => !m || !Number.isSafeInteger(m.a) || m.a < 0 || typeof m.d !== "string" || !fits(m.d, 65536) || (m.i !== undefined && (typeof m.i !== "string" || !fits(m.i, 64))) || ((m.e !== undefined || m.b !== undefined) && (!Number.isSafeInteger(m.e) || !Number.isSafeInteger(m.b) || m.e! < 0 || m.e! > p.e || m.b! < 0 || m.b! >= p.first + i))))
                 return { status: 400 };
             if (!edge.head) {
                 edge.head = { e: p.e, n: p.head };

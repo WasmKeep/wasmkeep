@@ -76,36 +76,44 @@ export class ScaleHost {
         if (r.status !== 200)
             throw Error(`scale ${c.kind} answered ${r.status}`);
     }
-    private finish(state: ScaleState, now: number) {
+    /** One durable step of the pending operation, or of a new one the
+     * counts call for: never more per event, so publishes, pokes and
+     * history wait behind at most one step's calls and save (ADR 0040,
+     * section 7). False when there is nothing to do. */
+    private advance(state: ScaleState, now: number): boolean {
+        // A step that fails (or the edge ceiling) leaves its operation for
+        // the alarm 2 s later; with nothing to do the round's alarm stands.
+        const before = alarms.getAlarm();
         alarms.setAlarm(BigInt(now + 2000));
-        this.scaling.begin(state, now);
-        while (state.op)
-            this.scaling.step(state, now);
-        alarms.setAlarm(BigInt(now + 20));
+        if (!this.scaling.begin(state, now)) {
+            if (before == null)
+                alarms.clearAlarm();
+            else
+                alarms.setAlarm(before);
+            return false;
+        }
+        this.scaling.step(state, now);
+        return true;
     }
     run(round: Round, core: Core, now: number) {
         this.init();
-        const e = core.wake(), n = core.messages().at(-1)?.position.n ?? e.base;
+        const e = core.wake(), n = core.last() ?? e.base;
         if (e.e > 9007199254740991n || n > 9007199254740991n)
             throw Error('invalid browser integer');
         this.head = { e: Number(e.e), n: Number(n) };
         const state = this.scaling.state();
-        let operations = 0;
-        if (!state.children.length) {
-            this.finish(state, now);
-            operations++;
-        }
+        let stepped = false;
+        // A group without children boots first, so this round reaches its edge.
+        if (!state.children.length)
+            stepped = this.advance(state, now);
         round.sync(state.children, state.relays);
         round.run(core, now);
         for (const c of state.children)
             c.sockets = round.count(c.name);
-        if (state.op) {
-            this.finish(state, now);
-            operations++;
-        }
-        while (operations < 4 && decide(state.children, this.options.capacity ?? 500, now, state.split, state.merge, this.options.hysteresisMs ?? 60000)) {
-            this.finish(state, now);
-            operations++;
-        }
+        if (!stepped)
+            stepped = this.advance(state, now);
+        // The alarm the round set stands unless scaling has more to do.
+        if (stepped)
+            alarms.setAlarm(BigInt(state.op ? now : now + 20));
     }
 }

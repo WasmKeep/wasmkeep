@@ -34,3 +34,24 @@ export class CallError extends Error {
     return isCallErrorKind(this.kind) ? this.kind : undefined;
   }
 }
+
+/** What `e` says, for a log line or a 500 body: an Error's name and
+ * message, any other thrown value as JSON, and the WIT error value jco
+ * attaches as `payload` (whose own message is only "[object Object] (see
+ * error.payload)"), so that a host error never shows as `[object Object]`. */
+export function describeError(e: unknown): string {
+  const json = (v: unknown) => {
+    try {
+      return JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x)) ?? String(v);
+    } catch {
+      return String(v);
+    }
+  };
+  const payload = typeof e === "object" && e !== null ? (e as { payload?: unknown }).payload : undefined;
+  let text: string;
+  if (e instanceof Error) {
+    const message = payload === undefined ? e.message : e.message.replace(/\[object Object\]( \(see error\.payload\))?/, "").trim();
+    text = message ? `${e.name}: ${message}` : e.name;
+  } else text = typeof e === "object" && e !== null ? json(e) : String(e);
+  return payload === undefined ? text : `${text} ${json(payload)}`;
+}

@@ -235,7 +235,10 @@ async fn room_scaling_split_reconnect_and_merge() {
             }
         }
     }
-    tokio::time::sleep(Duration::from_millis(1100).saturating_sub(split_at.elapsed())).await;
+    // The split's last step (which starts the minute, here a second) runs
+    // a few events after the test saw it: one durable step per event. The
+    // publish's round must come after that second for the merge to start.
+    tokio::time::sleep(Duration::from_millis(1300).saturating_sub(split_at.elapsed())).await;
     assert_eq!(get(addr, "/publish").await.0, 200);
     while !consume(frame(&mut sockets[0]).await, &mut last[0]) {}
     for _ in 0..100 {
