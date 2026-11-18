@@ -20,7 +20,7 @@ fn low_descriptor_limit_warns_and_continues_startup() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("reading not-loaded.wasm"), "{stderr}");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("degraded"),
+        stderr.contains("degraded"),
         "stdout: {} stderr: {stderr}",
         String::from_utf8_lossy(&output.stdout)
     );

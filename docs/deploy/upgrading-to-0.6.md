@@ -29,6 +29,21 @@ actors: take the older node out, or upgrade it.
 PROCESS table); `wasmkeep cluster drain --process ID` drains every node id
 a process runs.
 
+## Load-balancer health checks
+
+Before enabling the second app, update the load balancer's probes.
+Health checks on the public port must send one of the app's configured
+hostnames, for example `Host: shop.example.com`, with
+`GET /_wasmkeep/ready`. This checks that app, so probe each app separately
+if the balancer tracks their readiness independently. An unknown host
+returns 421; a missing Host returns 421 on HTTP/1.0 or 400 on HTTP/1.1.
+The metrics port (`[listen].metrics` / `--metrics-listen`) serves
+`/metrics` only: `/_wasmkeep/ready` there returns 404, not readiness.
+The public port's `/_wasmkeep/health` works without an app hostname but
+checks process liveness only; it is not a readiness substitute.
+
+See the [front-door examples](front-door.md).
+
 ## Rolling back
 
 Drain the shared process's other apps (`wasmkeep cluster drain` of their

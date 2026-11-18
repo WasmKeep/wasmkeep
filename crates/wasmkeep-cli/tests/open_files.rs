@@ -202,8 +202,8 @@ fn a_low_open_files_limit_caps_residents_instead_of_failing() {
             .args(["--listen", "127.0.0.1:0", "--idle-timeout-secs", "600"])
             // Warnings, and the line naming the address.
             .env("RUST_LOG", QUIET_BUT_LISTENING)
-            .stdout(std::fs::File::create(&log).unwrap())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .stdout(Stdio::null())
             .spawn()
             .unwrap(),
     );
@@ -356,9 +356,9 @@ fn an_eight_instance_cli_node_can_run_an_actor_call() {
             .args(["--listen", "127.0.0.1:0", "--max-instances", "8"])
             .env("RUST_LOG", QUIET_BUT_LISTENING)
             // Kept: it once never answered within 60 s under full-suite
-            // load, with nothing to say why. The log goes to stdout.
-            .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
-            .stderr(std::fs::File::create(dir.path().join("serve.err")).unwrap())
+            // load, with nothing to say why. The log goes to stderr.
+            .stderr(std::fs::File::create(dir.path().join("serve.log")).unwrap())
+            .stdout(std::fs::File::create(dir.path().join("serve.out")).unwrap())
             .spawn()
             .unwrap(),
     );
@@ -408,8 +408,8 @@ fn a_256_open_files_limit_still_serves_an_actor() {
             .arg("--cache-dir")
             .arg(dir.path().join("cache"))
             .env("RUST_LOG", QUIET_BUT_LISTENING)
-            .stdout(std::fs::File::create(&log).unwrap())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .stdout(Stdio::null())
             .spawn()
             .unwrap(),
     );

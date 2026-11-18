@@ -9,6 +9,12 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- Every command now writes its logs to stderr, `wasmkeep serve` included;
+  stdout carries only a command's own output, so `--json` stays JSON when the
+  bucket client retries. A service that collected a node's logs by
+  redirecting stdout alone now needs stderr too (systemd's journal takes
+  both).
+
 - **Placement at wake-up** ([ADR 0041](docs/adr/0041-placement-at-wake-up.md)):
   a node about to wake an actor nobody holds sends that one event to a
   clearly lighter node of the app (a resident fill of at least 20%, more

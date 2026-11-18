@@ -57,9 +57,9 @@ fn sigterm_shuts_down_gracefully() {
         // Bound by the server, read from its log (support/mod.rs).
         .args(["--listen", "127.0.0.1:0"])
         .env("RUST_LOG", "info")
-        // The CLI logs to stdout.
-        .stdout(std::fs::File::create(&log).unwrap())
-        .stderr(Stdio::null())
+        // The CLI logs to stderr.
+        .stderr(std::fs::File::create(&log).unwrap())
+        .stdout(Stdio::null())
         .spawn()
         .unwrap();
     let addr = support::listening_on(&mut child, &log, Duration::from_secs(120));

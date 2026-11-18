@@ -643,7 +643,7 @@ struct ServeArgs {
     /// Serve the apps a node file lists (`wasmkeep-node.toml`, ADR 0038):
     /// the listeners, the node id and every per-app setting come from the
     /// file, so their flags are refused beside it. Relative paths in it are
-    /// read from its directory. Needs --bucket; one `[[app]]` for now.
+    /// read from its directory. Needs --bucket; one or more `[[app]]` entries.
     #[arg(long, value_name = "FILE", requires = "bucket", conflicts_with_all = [
         "app", "actors", "component", "node_id", "advertise", "listen", "cluster_listen",
         "cluster_advertise", "metrics_listen", "max_sockets_per_node", "max_sockets_per_app",
@@ -1379,10 +1379,12 @@ fn quiet_broken_pipes() {
 
 fn main() -> anyhow::Result<()> {
     quiet_broken_pipes();
-    // The log goes to stdout: plain text when that is a file or a pipe.
+    // All commands reserve stdout for their output (including JSON).
+    // Logs go to stderr, with plain text when it is a file or a pipe.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_ansi(log_colours(
-            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
             std::env::var_os("NO_COLOR"),
         ))
         .with_env_filter(

@@ -54,9 +54,9 @@ fn thp_enabled(extra: &[&str]) -> Option<String> {
             .args(["--listen", "127.0.0.1:0"])
             .args(extra)
             .env("RUST_LOG", "info")
-            // The log goes to stdout.
-            .stdout(std::fs::File::create(&log).unwrap())
-            .stderr(Stdio::null())
+            // The log goes to stderr.
+            .stderr(std::fs::File::create(&log).unwrap())
+            .stdout(Stdio::null())
             .spawn()
             .unwrap(),
     );

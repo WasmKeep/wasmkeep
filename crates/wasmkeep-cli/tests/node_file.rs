@@ -82,3 +82,15 @@ fn a_field_this_version_cannot_honour_is_refused_before_anything_starts() {
     let err = refused(&format!("{one}min-resident = 10\n"));
     assert!(err.contains("min-resident is not available"), "{err}");
 }
+
+#[test]
+fn serve_help_describes_several_apps() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+        .args(["serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(help.contains("one or more"), "{help}");
+    assert!(!help.contains("for now"), "{help}");
+}

@@ -159,8 +159,8 @@ fn rules_and_config_travel_with_deploys() {
     let log = dir.path().join("node.log");
     let node = serve(&url, &dir.path().join("node"), &[])
         .env("RUST_LOG", "wasmkeep_server=info,wasmkeep=info")
-        // The log goes to stdout.
-        .stdout(std::fs::File::create(&log).unwrap())
+        // The log goes to stderr.
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
     let mut node = Killed(node);
@@ -390,7 +390,7 @@ fn a_deploy_from_the_file_is_the_file() {
     // A node serves the file's rules: d internal, c open.
     let log = dir.path().join("file-node.log");
     let node = serve(&url, &dir.path().join("node"), &[])
-        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
     let mut node = Killed(node);
@@ -465,7 +465,7 @@ fn nodes_start_before_the_first_deploy_and_deploys_say_what_they_did() {
     let log = dir.path().join("node.log");
     let node = serve(&url, &dir.path().join("node"), &[])
         .env("RUST_LOG", "wasmkeep_server=info,wasmkeep=info")
-        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
     let mut node = Killed(node);

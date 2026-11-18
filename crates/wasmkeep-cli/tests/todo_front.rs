@@ -102,9 +102,9 @@ fn start_front(front: PathBuf, tokens: Option<&str>) -> Server {
         // be another test's by then (support/mod.rs).
         .args(["--listen", "127.0.0.1:0"])
         .env("RUST_LOG", "info")
-        // The CLI logs to stdout.
-        .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
-        .stderr(Stdio::null());
+        // The CLI logs to stderr.
+        .stderr(std::fs::File::create(dir.path().join("serve.log")).unwrap())
+        .stdout(Stdio::null());
     if let Some(tokens) = tokens {
         let env = dir.path().join("front.env");
         std::fs::write(&env, format!("TOKENS={tokens}\n")).unwrap();

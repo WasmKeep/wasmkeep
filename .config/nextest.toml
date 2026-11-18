@@ -30,6 +30,14 @@ filter = 'binary(soak) | binary(failover)'
 slow-timeout = { period = "300s" }
 
 [[profile.default.overrides]]
+# scripts/check.sh --s3 uses the default profile. Diagnose does 1,001
+# writes and deletes plus conditional-write retries on a real bucket;
+# the fleet pass took about 230 s. Keep those checks, allow up to 600 s,
+# and still terminate a hung test.
+filter = 'binary(=cluster_diagnose)'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+[[profile.default.overrides]]
 # The open-file tests run a node under a hard 1,024-descriptor limit and
 # churn 2,000 actors through residency with sockets open (ADR 0037 leaves
 # about 96 resident at that limit); a slower runner, such as macOS CI,
