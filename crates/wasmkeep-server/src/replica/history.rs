@@ -758,17 +758,101 @@ async fn list_objects_with_limit(
 
 /// Bounded read with typed missing/stale errors for replanning. A lying body
 /// cannot allocate past the cap, even if its metadata understates its length.
+///
+/// With `listed`, the read is conditional on the listed ETag. Some buckets
+/// report a different ETag in LIST than in GET for the same bytes (OVHcloud,
+/// for objects made by a server-side copy: a SHA-256-like tag listed, the
+/// MD5 on GET, and a 412 to If-Match with the listed one). Refusing those
+/// would make every copied object unreadable, so a 412 or a different GET
+/// ETag is not taken as a change on its own: the object is read once more
+/// without the condition and accepted only when it is proven to be the
+/// listed object. Its size and its last-modified time (to the second)
+/// equal the listing's, its body is a valid LTX file with its checksum, and
+/// a new listing of its key, made after the read, still reports the listed
+/// ETag. Anything else is [`Error::Stale`], as before. Only LTX history
+/// objects are read with a listing, hence the LTX check.
 pub async fn get(
     store: &Arc<dyn ObjectStore>,
     path: &StorePath,
     listed: Option<&ObjectMeta>,
     cap: u64,
 ) -> Result<bytes::Bytes, Error> {
+    match get_once(store, path, listed, cap, true).await {
+        Err(Error::Stale(_)) if listed.is_some_and(|meta| meta.e_tag.is_some()) => {
+            let Some(listed) = listed else {
+                return Err(Error::Stale(path.to_string()));
+            };
+            let bytes = get_once(store, path, Some(listed), cap, false).await?;
+            prove_listed(store, path, listed, &bytes).await?;
+            tracing::debug!(object = %path, "listed and read ETags differ; identity proven by size, time, LTX checksum and a new listing");
+            Ok(bytes)
+        }
+        other => other,
+    }
+}
+
+/// The fallback's proof, after the unconditional read checked size and time.
+async fn prove_listed(
+    store: &Arc<dyn ObjectStore>,
+    path: &StorePath,
+    listed: &ObjectMeta,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let stale = || Error::Stale(path.to_string());
+    match ltx::visit(bytes, |_| Ok::<_, ()>(()), |_, _| Ok(())) {
+        Ok((header, _)) if !header.no_checksum() => {}
+        _ => return Err(stale()),
+    }
+    // Listed again, after the read: a replacement since the first listing
+    // shows a new listed ETag (or none). The offset is just before the key,
+    // so this is one page on S3, not the whole directory.
+    let full = path.as_ref();
+    let (parent, _) = full.rsplit_once('/').unwrap_or(("", full));
+    let parent = StorePath::parse(parent).map_err(|e| Error::Bucket(e.to_string()))?;
+    let parent = (!parent.as_ref().is_empty()).then_some(parent);
+    let before = full
+        .char_indices()
+        .last()
+        .and_then(|(at, _)| StorePath::parse(&full[..at]).ok());
+    let mut stream = match &before {
+        Some(offset) => store.list_with_offset(parent.as_ref(), offset),
+        None => store.list(parent.as_ref()),
+    };
+    loop {
+        let next = tokio::time::timeout(super::READ_IDLE, stream.next())
+            .await
+            .map_err(|_| Error::Bucket("listing to confirm an object stalled".into()))?;
+        match next {
+            Some(Ok(meta)) if meta.location == *path => {
+                return if meta.e_tag == listed.e_tag && meta.size == listed.size {
+                    Ok(())
+                } else {
+                    Err(stale())
+                };
+            }
+            Some(Ok(meta)) if meta.location.as_ref() > full => return Err(stale()),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(Error::Bucket(e.to_string())),
+            None => return Err(stale()),
+        }
+    }
+}
+
+/// One bounded read. `strict`: conditional on the listed ETag, which the
+/// response must carry too. Otherwise unconditional, with the listed size,
+/// version and last-modified second still required.
+async fn get_once(
+    store: &Arc<dyn ObjectStore>,
+    path: &StorePath,
+    listed: Option<&ObjectMeta>,
+    cap: u64,
+    strict: bool,
+) -> Result<bytes::Bytes, Error> {
     let mut last = String::new();
     for _ in 0..super::READ_ATTEMPTS {
         let read = async {
             let options = object_store::GetOptions {
-                if_match: listed.and_then(|m| m.e_tag.clone()),
+                if_match: listed.filter(|_| strict).and_then(|m| m.e_tag.clone()),
                 version: listed.and_then(|m| m.version.clone()),
                 ..Default::default()
             };
@@ -784,10 +868,13 @@ pub async fn get(
             let size = got.meta.size;
             if listed.is_some_and(|meta| {
                 meta.size != size
-                    || meta
-                        .e_tag
-                        .as_ref()
-                        .is_some_and(|tag| got.meta.e_tag.as_ref() != Some(tag))
+                    || (strict
+                        && meta
+                            .e_tag
+                            .as_ref()
+                            .is_some_and(|tag| got.meta.e_tag.as_ref() != Some(tag)))
+                    || (!strict
+                        && meta.last_modified.timestamp() != got.meta.last_modified.timestamp())
                     || meta
                         .version
                         .as_ref()

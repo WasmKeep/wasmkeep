@@ -9,6 +9,19 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **History copied inside the bucket reads again.** Some S3-compatible
+  providers report another ETag in a listing than on a read of the same
+  object made by a server-side copy (such as the copy `cluster migrate`
+  makes), and refuse a read conditional on the listed one. `actor
+  export`, `actor history --deep`, `actor sql`, `feed` and `backup create`
+  refused every such object with "history listing went stale". A refused
+  read is now made once more without the condition and accepted only when
+  the object is proven to be the listed one: same size, same
+  last-modified second, a valid LTX file with its checksum, and the same
+  listed ETag in a new listing taken after the read. A replacement
+  between the listing and the read is still refused. Nodes were not
+  affected: their restore does not compare ETags.
+
 - **An answer for a request that may have run says so.** A host answer
   whose request was handed to the owner or the guest and whose own answer
   was lost or withheld now carries `x-wasmkeep-outcome: unknown` and no
