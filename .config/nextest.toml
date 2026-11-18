@@ -38,6 +38,15 @@ filter = 'binary(open_files)'
 slow-timeout = { period = "120s", terminate-after = 4 }
 
 [[profile.default.overrides]]
+# This single-client test cold-compiles five StarlingMonkey components,
+# each embedding the JS engine, before serving requests. The languages job
+# exceeded the default two minutes; allow startup on slower CI runners,
+# but still terminate a hung test after five minutes. The separate
+# room_cluster_300_clients proof keeps its existing coverage and timeout.
+filter = 'binary(=big_room) & test(=typescript_big_room_starlingmonkey)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
 # `wasmkeep new`: each test builds a generated project from cold (a fresh
 # target directory, release builds with LTO), then serves it.
 filter = 'binary(new_project)'
