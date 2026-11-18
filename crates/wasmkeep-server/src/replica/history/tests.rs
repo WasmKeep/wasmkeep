@@ -473,3 +473,225 @@ async fn shared_listing_returns_more_than_ten_thousand_objects() {
     }
     assert_eq!(list_objects(&store, "large").await.unwrap().len(), 10_001);
 }
+
+/// A bucket whose LIST reports another ETag than GET for the same bytes, and
+/// answers 412 to If-Match with the listed one, as OVHcloud does for objects
+/// made by a server-side copy. `replace` rewrites an object before the first
+/// GET; `later_get` makes GET report a last-modified one second later.
+#[derive(Debug)]
+struct CopiedTags {
+    inner: Arc<dyn ObjectStore>,
+    replace: std::sync::Mutex<Option<(StorePath, Vec<u8>)>>,
+    later_get: bool,
+    gets: std::sync::atomic::AtomicUsize,
+}
+impl CopiedTags {
+    fn new(inner: &Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            replace: std::sync::Mutex::new(None),
+            later_get: false,
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+impl std::fmt::Display for CopiedTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CopiedTags")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for CopiedTags {
+    async fn put_opts(
+        &self,
+        _: &StorePath,
+        _: PutPayload,
+        _: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        panic!("reader wrote to bucket")
+    }
+    async fn put_multipart_opts(
+        &self,
+        _: &StorePath,
+        _: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        panic!("reader wrote multipart")
+    }
+    async fn get_opts(
+        &self,
+        path: &StorePath,
+        mut options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let replace = self.replace.lock().unwrap().take();
+        if let Some((key, bytes)) = replace {
+            self.inner.put(&key, PutPayload::from(bytes)).await?;
+        }
+        if let Some(tag) = options.if_match.take() {
+            // The listed tag never matches on GET; the GET tag would.
+            let now = self.inner.head(path).await?;
+            if now.e_tag.as_deref() != Some(tag.as_str()) {
+                return Err(object_store::Error::Precondition {
+                    path: path.to_string(),
+                    source: "listed ETag".into(),
+                });
+            }
+        }
+        let mut result = self.inner.get_opts(path, options).await?;
+        if self.later_get {
+            result.meta.last_modified += std::time::Duration::from_secs(1);
+        }
+        Ok(result)
+    }
+    fn delete_stream(
+        &self,
+        _: futures_util::stream::BoxStream<'static, object_store::Result<StorePath>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<StorePath>> {
+        panic!("reader deleted bucket data")
+    }
+    fn list(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner
+            .list(prefix)
+            .map_ok(|mut meta| {
+                meta.e_tag = meta.e_tag.map(|tag| format!("listed-{tag}"));
+                meta
+            })
+            .boxed()
+    }
+    async fn list_with_delimiter(
+        &self,
+        _: Option<&StorePath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        panic!("unexpected listing")
+    }
+    async fn copy_opts(
+        &self,
+        _: &StorePath,
+        _: &StorePath,
+        _: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        panic!("reader copied bucket data")
+    }
+}
+
+#[tokio::test]
+async fn copied_objects_listed_with_another_etag_are_read_when_proven() {
+    let mut f = Fixture::new().await;
+    f.increment(1, 2, 1, 200).await;
+    f.increment(1, 3, 1, 300).await;
+    let store = Arc::new(CopiedTags::new(&f.store));
+    f.store = store.clone();
+    let (result, n) = f.read(Point::Head).await;
+    assert_eq!(n, 3);
+    assert_eq!(result.position, id(1, 3));
+    assert_eq!(result.attempts, 1, "no replanning for a proven object");
+    let dir = tempfile::tempdir().unwrap();
+    let (export, _) = export_from_listing(
+        &f.store,
+        &format!("{}/", f.root.bucket_key(Family::History, "c/a%25%20b")),
+        list_objects(
+            &f.store,
+            &format!("{}/", f.root.bucket_key(Family::History, "c/a%25%20b")),
+        )
+        .await
+        .unwrap(),
+        &dir.path().join("feed.db"),
+        1 << 20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(export.attempts, 1);
+}
+
+#[tokio::test]
+async fn a_real_change_is_still_refused_when_listed_and_read_etags_differ() {
+    // Same size, new bytes between LIST and GET: the new listing differs.
+    let mut f = Fixture::new().await;
+    let key = f.key(&snapshot_key(id(1, 1)));
+    let newer = f.db.snapshot().unwrap().to_ltx(1, 1, 900).unwrap();
+    assert_eq!(f.store.head(&key).await.unwrap().size, newer.len() as u64);
+    let store = Arc::new(CopiedTags::new(&f.store));
+    *store.replace.lock().unwrap() = Some((key.clone(), newer));
+    f.store = store.clone();
+    let (result, _) = f.read(Point::Head).await;
+    assert_eq!(result.timestamp_ms, 900, "the replacement is what was read");
+    assert_eq!(result.attempts, 2, "the first listing was refused");
+
+    // A different size.
+    let f = Fixture::new().await;
+    let store: Arc<dyn ObjectStore> = Arc::new(CopiedTags::new(&f.store));
+    let listed = list_objects(
+        &store,
+        &format!("{}/", f.root.bucket_key(Family::History, "c/a%25%20b")),
+    )
+    .await
+    .unwrap();
+    let meta = listed.values().next().unwrap().clone();
+    f.store
+        .put(&key, PutPayload::from(vec![0u8; 7]))
+        .await
+        .unwrap();
+    let got = get(&store, &key, Some(&meta), 1 << 20).await;
+    assert!(matches!(got, Err(Error::Stale(_))), "{got:?}");
+
+    // A newer last-modified time, same bytes.
+    let f = Fixture::new().await;
+    let mut later = CopiedTags::new(&f.store);
+    later.later_get = true;
+    let store: Arc<dyn ObjectStore> = Arc::new(later);
+    let listed = list_objects(
+        &store,
+        &format!("{}/", f.root.bucket_key(Family::History, "c/a%25%20b")),
+    )
+    .await
+    .unwrap();
+    let meta = listed.values().next().unwrap().clone();
+    let got = get(&store, &key, Some(&meta), 1 << 20).await;
+    assert!(matches!(got, Err(Error::Stale(_))), "{got:?}");
+
+    // Bytes that are not a valid LTX file (or fail its checksum).
+    let f = Fixture::new().await;
+    let mut bytes = f
+        .store
+        .get(&key)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    f.store.put(&key, PutPayload::from(bytes)).await.unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(CopiedTags::new(&f.store));
+    let listed = list_objects(
+        &store,
+        &format!("{}/", f.root.bucket_key(Family::History, "c/a%25%20b")),
+    )
+    .await
+    .unwrap();
+    let meta = listed.values().next().unwrap().clone();
+    let got = get(&store, &key, Some(&meta), 1 << 20).await;
+    assert!(matches!(got, Err(Error::Stale(_))), "{got:?}");
+}
+
+#[tokio::test]
+async fn matching_etags_still_refuse_a_replacement_between_list_and_get() {
+    let mut f = Fixture::new().await;
+    let key = f.key(&snapshot_key(id(1, 1)));
+    let listed = list_objects(
+        &f.store,
+        &format!("{}/", f.root.bucket_key(Family::History, "c/a%25%20b")),
+    )
+    .await
+    .unwrap();
+    let meta = listed.values().next().unwrap().clone();
+    let newer = f.db.snapshot().unwrap().to_ltx(1, 1, 900).unwrap();
+    f.store.put(&key, PutPayload::from(newer)).await.unwrap();
+    let got = get(&f.store, &key, Some(&meta), 1 << 20).await;
+    assert!(matches!(got, Err(Error::Stale(_))), "{got:?}");
+}
