@@ -3,7 +3,22 @@
 0.6.0 lets one process serve several apps behind its three ports, with
 the [node file](../reference/node-file.md). Nothing changes for a node
 that keeps serving one app: `serve --app` and its flags, its ports,
-routes, exit codes and metrics stay as they were.
+routes, exit codes and metrics stay as they were. Other changes of
+0.6.0 that every node sees are under [Other changes](#other-changes).
+
+Use the 0.6.0 CLI during the upgrade. Each feature below waits for a
+capability word that 0.6.0 nodes announce in their heartbeat; a live node
+without it blocks the feature, and nothing is forced:
+
+| Word | Needed for |
+| --- | --- |
+| `multi-app` | a process of several apps (stage 2 below) |
+| `assets` | a version with [static assets](../static-assets.md) |
+| `blobs` | a version that imports `wasmkeep:actor/blobs` ([files](../files.md)) |
+| `place` | being a target of [placement at wake-up](#placement-at-wake-up) |
+
+The package stays `wasmkeep:actor@0.2.0`: `blobs` is an added interface,
+and a component that does not import it links on any node.
 
 ## Two stages
 
@@ -104,3 +119,22 @@ Also new on the public port: `/_wasmkeep/blobs/v1/` answers node links.
 Uploads are node links in 0.6.0, 16 MiB at most on a bucket
 ([why](../files.md#links)). Back up apps that use files with the 0.6.0
 CLI ([files and assets](backup-and-restore.md#files-and-assets)).
+
+## Other changes
+
+- **Logs go to stderr.** Every command, `wasmkeep serve` included,
+  writes its logs to stderr; stdout carries only a command's own output.
+  A service that collected a node's logs by redirecting stdout alone
+  needs stderr too (systemd's journal takes both).
+- **`x-wasmkeep-outcome: unknown`.** A host answer for a request that
+  may have run (a forward whose answer was lost, an answer withheld
+  during a rolling upgrade) carries this header, no `Retry-After`, and a
+  body ending `the request may have run`. Clients and proxies that retry
+  on a 503 should not retry such an answer blindly unless the request is
+  idempotent.
+- **Ready waits for the tombstone check.** `/_wasmkeep/ready` answers 503
+  until the node has checked whether its app was deleted (the reason joins
+  `wasmkeep_not_ready`), so a probe may fail for a moment longer after a
+  start. Allow for it in the load balancer's grace period.
+- **Hibernation fix.** An actor's state is dropped before the actor
+  leaves the registry; nothing to do.
