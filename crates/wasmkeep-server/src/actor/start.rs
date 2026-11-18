@@ -168,6 +168,9 @@ impl ActorService {
         // front's short-lived instances (ADR 0023): past it, the least
         // recently active idle actor hibernates to make room.
         let mut mailbox = config.mailbox;
+        // An event finding its actor's earlier resources still closing
+        // waits for them up to its own wall budget, then answers 503.
+        mailbox.release_wait = config.wall_per_event;
         let pool = usize::try_from(runtime.max_instances()).unwrap_or(usize::MAX);
         let front = config
             .max_front_requests

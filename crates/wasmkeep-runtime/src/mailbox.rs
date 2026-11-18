@@ -85,6 +85,11 @@ pub struct MailboxConfig {
     /// and the least recently active idle actor is asked to hibernate.
     /// A retry can enter only after the old actor's resources have closed.
     pub max_resident: usize,
+    /// How long an event may wait for resources an earlier state of its
+    /// actor left behind (work still holding its [`Residency`]) to close
+    /// before it fails with [`MailboxError::Capacity`]. A new state is
+    /// never built beside them. Default: none, the event fails at once.
+    pub release_wait: Duration,
 }
 
 impl Default for MailboxConfig {
@@ -93,6 +98,7 @@ impl Default for MailboxConfig {
             queue_capacity: 1024,
             idle_timeout: Duration::from_secs(30),
             max_resident: usize::MAX,
+            release_wait: Duration::ZERO,
         }
     }
 }
@@ -222,11 +228,14 @@ impl<S: Send + 'static> Mailboxes<S> {
     /// state is dropped only once the step's future resolves.
     ///
     /// - The step runs with the actor still registered, before the check
-    ///   that nothing is queued, so no second state is built beside it.
+    ///   that nothing is queued, so no second state is built beside it;
+    ///   the state is dropped before the actor leaves the registry too.
     /// - An event that arrives during the step wins: the step's future is
     ///   dropped (it must be cancel-safe), the event runs on the same state
     ///   and the idle wait starts over. The check is made again after any
-    ///   step, so an event queued as it ends also keeps the state.
+    ///   step, so an event queued as it ends also keeps the state. One
+    ///   queued while the state is being dropped (still registered) runs
+    ///   on a new state, built once the old one is gone.
     /// - During a stop no event can arrive ([`Self::close`]), and
     ///   [`StepOutcome::Keep`] is not honoured. A stop that begins during
     ///   another cause's step drops that step's future and runs the step
@@ -349,6 +358,20 @@ impl<S: Send + 'static> Mailboxes<S> {
     #[doc(hidden)]
     pub fn tries(&self) -> usize {
         self.inner.tries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many registered actors are marked as on their way out, for
+    /// tests.
+    #[doc(hidden)]
+    pub fn leaving(&self) -> usize {
+        lock(&self.inner)
+            .values()
+            .filter(|e| {
+                e.activity
+                    .evicting
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .count()
     }
 
     /// Draws this set's residents from `pool` too (ADR 0038, section 8),
@@ -862,12 +885,33 @@ async fn run_actor<S: Send + 'static>(
                     }
                     Stepped::Done(Ok(_)) => {}
                 }
+                // Nothing queued: the state goes (hibernation), with the
+                // actor still registered, so an event arriving meanwhile
+                // queues here instead of building a second state beside
+                // this one; it then runs on a new state, built after this
+                // one is gone. (A queued event keeps the state.)
+                // Counted as on its way out meanwhile, so an admission does
+                // not evict another actor for the slot this one returns; a
+                // mark an eviction set during the step is kept. A panic in
+                // the drop is contained, so the actor still leaves the
+                // registry (or serves what was queued) as below.
+                let leaving = (rx.is_empty() && state.is_some()).then(|| {
+                    let was = own
+                        .activity
+                        .evicting
+                        .swap(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut gone = state.take();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drop(gone.take());
+                    }));
+                    was
+                });
                 // Deregister under the lock that `enqueue` sends under, and
                 // only if nothing was queued meanwhile; otherwise keep going.
                 let mut actors = lock(&inner);
                 if rx.is_empty() {
-                    // (A queued event keeps it resident; `last` was set to
-                    // busy by the eviction and is refreshed below.)
+                    // (`last` was set to busy by the eviction and is
+                    // refreshed below.)
                     if actors
                         .get(&address)
                         .is_some_and(|e| e.tx.same_channel(&own.tx))
@@ -875,16 +919,21 @@ async fn run_actor<S: Send + 'static>(
                         actors.remove(&address);
                     }
                     drop(actors);
-                    drop(state.take()); // hibernation
                     drop(running);
                     return;
                 }
                 // A job raced the hibernation before we acquired the
-                // registry lock. An eviction stays pending while the biased
+                // registry lock (on the state, or on none if it was already
+                // dropped). An eviction stays pending while the biased
                 // receive branch drains those accepted events; an idle
                 // timeout simply starts over.
                 if evicted {
                     own.activity.evict.notify_one();
+                }
+                if let Some(was) = leaving {
+                    own.activity
+                        .evicting
+                        .store(was, std::sync::atomic::Ordering::SeqCst);
                 }
                 continue 'events;
             }
@@ -896,7 +945,19 @@ async fn run_actor<S: Send + 'static>(
 
         if state.is_none() {
             // A panicking event may have left work holding the old state's
-            // resources. Never build a second state under that same slot.
+            // resources. Never build a second state under that same slot:
+            // wait for them a while (`release_wait`), then refuse.
+            if !task_residency.is_exclusive() {
+                let deadline = tokio::time::Instant::now() + inner.config.release_wait;
+                // A clone's release is not signalled (only the last one's):
+                // checked every few milliseconds, on this rare path only.
+                while !task_residency.is_exclusive() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep_until(
+                        deadline.min(tokio::time::Instant::now() + Duration::from_millis(5)),
+                    )
+                    .await;
+                }
+            }
             if !task_residency.is_exclusive() {
                 job(Err(MailboxError::Capacity(address.clone()))).await;
                 own.activity
