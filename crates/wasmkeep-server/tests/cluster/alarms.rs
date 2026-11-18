@@ -782,10 +782,8 @@ async fn an_entry_for_an_actor_the_bucket_never_had_stays_without_creating_it() 
     // longer than one sweep), then for its lease to be let go.
     let started = std::time::Instant::now();
     loop {
-        if let Some((holder, _)) = owner_record(&shared, name).await {
-            if holder.is_none() {
-                break;
-            }
+        if let Some((None, _)) = owner_record(&shared, name).await {
+            break;
         }
         assert!(
             started.elapsed() < Duration::from_secs(15),
