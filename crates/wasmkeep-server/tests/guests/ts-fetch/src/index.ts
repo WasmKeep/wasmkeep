@@ -9,6 +9,9 @@
 // GET /fetch-all?u=I&u=... (each I percent-encoded `N URL`) sends those
 // requests with `http.fetchAll`, and answers one line each, as /fetch
 // words it; with seq=1, one `http.fetch` after the other instead.
+//
+// GET /count answers how many times it ran in this instance; GET /large
+// answers 16 MiB, for a caller that leaves after the head.
 
 import { defineActor, http } from "@wasmkeep/sdk";
 
@@ -34,10 +37,13 @@ function line(r: http.FetchResult): string {
   return r.ok ? `${r.response.status}:${r.response.text()}` : `error: ${r.error.message}`;
 }
 
+let count = 0;
 export default defineActor({
   fetch(req) {
     const path = req.path.split("?")[0];
     if (req.method !== "GET") return { status: 404, body: "GET only\n" };
+    if (path === "/count") return String(++count);
+    if (path === "/large") return new Uint8Array(16 * 1024 * 1024);
     if (path === "/fetch") {
       const send = Number(params(req.path, "send")[0] ?? "0");
       const r = request(send, params(req.path, "url")[0] ?? "");

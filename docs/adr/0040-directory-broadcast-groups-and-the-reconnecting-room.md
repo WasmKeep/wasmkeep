@@ -245,6 +245,23 @@ On its alarm the room runs one **round**: a `call-many` to its children
 One request to a child stays under 1 MiB, so 16 of them fit the batch's
 16 MiB.
 
+**Per-event bound (amended 2026-11-18).** No room event's work grows with
+the room's state. Publish reads the head and an `id` by index and trims the
+window with one statement SQLite runs; history reads the page it answers
+in 32-row pages; a round reads the messages after each distinct child
+position once (at most 513 rows, one page past 512 KiB) and builds at most
+1 MiB of messages for all its children together, at least one slice: the
+other lagging children keep their positions and are pushed by the alarm
+20 ms later. Sizes come from SQLite (`length(CAST(body AS BLOB))`) or
+from the JSON text, never from re-encoding text in the guest. On QuickJS,
+which has no native UTF-8 codec, the room, edge and relay classes convert
+bulk text through SQLite (`CAST`), which runs natively; the SDK's
+`TextEncoder`/`TextDecoder` have native fast paths for the rest. Before
+this, publish, history and each round read the whole window, and a push
+was re-serialized after each message it took: a room that had once filled
+its window could exceed the default 50 ms budget on every event, each
+trap discarding the instance and bumping the epoch.
+
 When every lagging socket in an edge's answer is stalled, repeated unchanged
 answers back off the retry alarm from 20 ms by doubling, capped at the
 45-second keepalive interval. New positions, changing stalled counts, or
@@ -380,8 +397,10 @@ with a **scale pass**:
 - **Never both within a minute**: no merge within 60 s of a split, no
   split within 60 s of a merge, group-wide. An edge that fills during
   that minute refuses with `full` and its clients retry.
-- One operation at a time, at most four per event; the alarm continues
-  the rest. `range` and `init` answer the edge's socket count, and an
+- One operation at a time, and one durable step of it per event (amended
+  2026-11-18; it was four whole operations): the alarm, set to now, runs
+  the next step, so publishes, pokes and history wait behind at most one
+  step's calls and durable save, never a scale pass of several operations. `range` and `init` answer the edge's socket count, and an
   edge touched by an operation is not judged again before its next
   push answer.
 
@@ -478,6 +497,17 @@ not the calls or the bucket, to be what limits a round.
   page of front code; the protocol is the same in every app.
 - The room stays one sequencer: publish rate is one actor's, whatever
   the number of clients.
+- Node memory grows with the sockets a node holds, its own and those it
+  relays for another node: each costs its connection's buffers and up to
+  4 MiB of queued frames (256 frames), and there is no node-wide cap on
+  queued bytes, so a reconnect storm of slow clients can raise a node's
+  peak far above its steady use.
+- A front on QuickJS turns a full 256 KiB history page from the room's
+  binary answer into JSON and bytes in the guest, without native UTF-8:
+  the tightest per-event cost left on a room's path.
+- `call-many` has no deadline of its own: a round waits for its slowest
+  child up to the event's call deadline, and the room's other events wait
+  behind it. Suspects bound that to one slow round per failing child.
 - A split disconnects about half of one edge's clients for a moment;
   they resume by number. Growth is paid in short reconnects.
 - A join costs four events (front, directory, room poke, edge open);

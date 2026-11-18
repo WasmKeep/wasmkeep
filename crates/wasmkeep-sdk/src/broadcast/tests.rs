@@ -79,6 +79,9 @@ struct Db {
     alarm: Option<u64>,
     flushes: usize,
     flush_error: Option<String>,
+    /// Queries run and rows they returned.
+    read: std::cell::Cell<usize>,
+    rows: std::cell::Cell<usize>,
 }
 impl Db {
     fn new() -> Self {
@@ -87,6 +90,8 @@ impl Db {
             alarm: None,
             flushes: 0,
             flush_error: None,
+            read: Default::default(),
+            rows: Default::default(),
         }
     }
 }
@@ -97,11 +102,12 @@ impl Store for Db {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-    fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+    fn query(&self, sql: &str, p: &[Value]) -> Result<Vec<Vec<Value>>, String> {
+        self.read.set(self.read.get() + 1);
         let mut stmt = self.conn.prepare(sql).unwrap();
         let n = stmt.column_count();
-        let rows = stmt
-            .query_map([], |r| {
+        let rows: Vec<Vec<Value>> = stmt
+            .query_map(rusqlite::params_from_iter(p.iter().map(param)), |r| {
                 Ok((0..n)
                     .map(|i| match r.get_ref(i).unwrap() {
                         rusqlite::types::ValueRef::Integer(v) => Value::Integer(v),
@@ -113,8 +119,11 @@ impl Store for Db {
                     })
                     .collect())
             })
-            .unwrap();
-        Ok(rows.map(Result::unwrap).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        self.rows.set(self.rows.get() + rows.len());
+        Ok(rows)
     }
     fn alarm(&mut self, at: u64) -> Result<(), String> {
         self.alarm = Some(at);
@@ -261,4 +270,90 @@ fn unicode_room_wire_vectors_for_typescript_front() {
     assert_eq!(messages[0].id.as_deref(), Some("x"));
     assert_eq!(messages[1].id.as_deref(), Some("\u{feff}x"));
     assert_eq!(messages[1].body, "\u{feff}body");
+}
+/// A full window and full history pages cost each event what it answers,
+/// not the window (TypeScript has the same test).
+#[test]
+fn per_event_reads_are_bounded_by_the_answer() {
+    let mut room = Core::new(Db::new(), false);
+    room.init().unwrap();
+    room.wake().unwrap();
+    room.db.exec("BEGIN", &[], false).unwrap();
+    for n in 1..=2000u64 {
+        room.db
+            .exec(
+                "INSERT INTO wasmkeep_room_history(n,e,at,id,body) VALUES(?1,1,0,?2,?3)",
+                &[
+                    Value::Integer(n as i64),
+                    format!("id{n}").into(),
+                    "x".repeat(1024).into(),
+                ],
+                false,
+            )
+            .unwrap();
+    }
+    room.db.exec("COMMIT", &[], false).unwrap();
+    room.db.rows.set(0);
+    assert_eq!(
+        room.publish(&[message("new", Some("fresh"))], 1).unwrap(),
+        vec![Position { e: 1, n: 2001 }]
+    );
+    assert_eq!(
+        room.publish(&[message("again", Some("id1500"))], 2)
+            .unwrap(),
+        vec![Position { e: 1, n: 1500 }]
+    );
+    assert!(
+        room.db.rows.get() <= 8,
+        "publish read {} rows",
+        room.db.rows.get()
+    );
+    let count = room
+        .db
+        .query("SELECT count(*), min(n) FROM wasmkeep_room_history", &[])
+        .unwrap();
+    assert_eq!(count[0][0].as_i64(), Some(2000));
+    assert_eq!(count[0][1].as_i64(), Some(2));
+    room.db.rows.set(0);
+    let h = room
+        .history(Some(Position { e: 1, n: 0 }), 2000, None)
+        .unwrap();
+    assert!(h.more && h.reset.is_some() && h.messages.len() > 200 && h.messages.len() < 260);
+    assert!(
+        room.db.rows.get() <= h.messages.len() + 80,
+        "history read {}",
+        room.db.rows.get()
+    );
+    room.db.rows.set(0);
+    let last = room.history(None, 2000, Some(3)).unwrap();
+    assert_eq!(
+        last.messages
+            .iter()
+            .map(|m| m.position.n)
+            .collect::<Vec<_>>(),
+        vec![1999, 2000, 2001]
+    );
+    assert!(room.db.rows.get() <= 80);
+    room.db.rows.set(0);
+    let slice = room.rows(1000, 513, 512 * 1024).unwrap();
+    assert!(slice.len() > 500 && slice.len() <= 513, "{}", slice.len());
+    assert!(room.db.rows.get() <= 513 + 32);
+    // The byte window: 8 MiB of bodies, oldest first.
+    let big: Vec<_> = (0..4).map(|_| message(&"z".repeat(65536), None)).collect();
+    for _ in 0..33 {
+        room.publish(&big, 3).unwrap();
+    }
+    let bytes = room
+        .db
+        .query(
+            "SELECT sum(length(CAST(body AS BLOB))) FROM wasmkeep_room_history",
+            &[],
+        )
+        .unwrap()[0][0]
+        .as_i64()
+        .unwrap();
+    assert!(
+        bytes <= 8 * 1024 * 1024 && bytes > 8 * 1024 * 1024 - 65536,
+        "{bytes}"
+    );
 }

@@ -11,7 +11,7 @@ pub struct Item {
     pub body: String,
 }
 impl Item {
-    fn json(&self) -> String {
+    pub(super) fn json(&self) -> String {
         let mut s = format!("{{\"a\":{},\"d\":", self.at);
         json::write_str(&mut s, &self.body);
         if let Some(id) = &self.id {

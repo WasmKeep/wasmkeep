@@ -485,6 +485,58 @@ async fn typescript(lang: &str, file: &str) {
     }
 }
 
+/// A caller that leaves while the actor writes its answer closes the
+/// response stream: the actor must not trap on that (a trap discards the
+/// instance), so its in-memory count survives.
+async fn caller_leaves(file: &str) {
+    let Some(wasm) = prebuilt("ts-fetch", file) else {
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let addr = start(data.path(), &wasm, EgressPolicy::default()).await;
+    let get = |path: &'static str| async move {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(
+            format!("GET /actor/t/a{path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let out = String::from_utf8_lossy(&out).into_owned();
+        // The body, plain or as one chunk.
+        let body = out.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+        body.lines()
+            .nth(usize::from(out.to_ascii_lowercase().contains("chunked")))
+            .unwrap_or(body)
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(get("/count").await, "1");
+    for _ in 0..3 {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /actor/t/a/large HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 256];
+        let n = s.read(&mut head).await.unwrap();
+        assert!(head[..n].starts_with(b"HTTP/1.1 200"));
+        drop(s);
+    }
+    assert_eq!(get("/count").await, "2", "the instance was discarded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typescript_caller_leaves_quickjs() {
+    caller_leaves("ts_fetch.wasm").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typescript_caller_leaves_starlingmonkey() {
+    caller_leaves("ts_fetch-starlingmonkey.wasm").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn typescript_quickjs() {
     typescript("typescript (QuickJS)", "ts_fetch.wasm").await;

@@ -905,46 +905,49 @@ impl Scaling<ScaleHost> {
         let e = core.wake()?;
         self.io.head = Position {
             e: e.e,
-            n: core.messages()?.last().map_or(e.base, |m| m.position.n),
+            n: core.last()?.unwrap_or(e.base),
         };
         let mut s = self.state()?;
-        let mut operations = 0;
+        let mut stepped = false;
+        // A group without children boots first, so this round reaches its edge.
         if s.children.is_empty() {
-            self.finish(&mut s, now)?;
-            operations += 1;
+            stepped = self.advance(&mut s, now)?;
         }
         round.sync_relays(&s.children, &s.relays);
         round.run(core, now)?;
         for c in &mut s.children {
             c.sockets = round.count(&c.name);
         }
-        if s.op.is_some() {
-            self.finish(&mut s, now)?;
-            operations += 1;
+        if !stepped {
+            stepped = self.advance(&mut s, now)?;
         }
-        while operations < 4
-            && decision(
-                &s.children,
-                self.capacity,
-                now,
-                s.split,
-                s.merge,
-                self.hysteresis,
-            )
-            .is_some()
-        {
-            self.finish(&mut s, now)?;
-            operations += 1;
+        // The alarm the round set stands unless scaling has more to do.
+        if stepped {
+            crate::alarms::set_alarm(if s.op.is_some() {
+                now
+            } else {
+                now.saturating_add(20)
+            });
         }
         Ok(())
     }
-    fn finish(&mut self, s: &mut ScaleState, now: u64) -> Result<(), String> {
+    /// One durable step of the pending operation, or of a new one the
+    /// counts call for: never more per event, so publishes, pokes and
+    /// history wait behind at most one step's calls and save (ADR 0040,
+    /// section 7). False when there is nothing to do.
+    fn advance(&mut self, s: &mut ScaleState, now: u64) -> Result<bool, String> {
+        // A failed step (or the edge ceiling) leaves its operation for the
+        // alarm 2 s later; with nothing to do the round's alarm stands.
+        let before = crate::alarms::get_alarm();
         crate::alarms::set_alarm(now.saturating_add(2000));
-        self.begin(s, now)?;
-        while s.op.is_some() {
-            self.step(s, now)?;
+        if !self.begin(s, now)? {
+            match before {
+                Some(at) => crate::alarms::set_alarm(at),
+                None => crate::alarms::clear_alarm(),
+            }
+            return Ok(false);
         }
-        crate::alarms::set_alarm(now.saturating_add(20));
-        Ok(())
+        self.step(s, now)?;
+        Ok(true)
     }
 }

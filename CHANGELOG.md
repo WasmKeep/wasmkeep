@@ -9,6 +9,18 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **A room never wedges at the default CPU budget.** Every per-event path
+  of the room is bounded whatever the room went through: publish and
+  history no longer load the whole 2,000-message window, a round reads
+  each distinct child position once and builds at most 1 MiB per round
+  (continuing 20 ms later), and a scale pass runs one durable step per
+  event instead of up to four whole operations. In both SDKs. On QuickJS
+  the room, edge and relay convert bulk UTF-8 through SQLite, and the
+  SDK's `TextEncoder`/`TextDecoder` gain native fast paths. A
+  response whose caller left mid-body no longer traps the actor (which
+  discarded its instance), and host errors print their fields instead of
+  `[object Object]`. Rust's `broadcast::Store::query` takes parameters.
+
 - **Bounded big-room fan-out.** Rust and TypeScript edges share serialized
   frames by cursor, serving caught-up sockets first and building at most
   16 frames / 1 MiB per event. Stalled-only retry alarms back off to the

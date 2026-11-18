@@ -5,6 +5,15 @@ import * as actors from "wasmkeep:actor/actors@0.2.0";
 import * as alarms from "wasmkeep:actor/alarms@0.2.0";
 import type { Core, Position } from "./broadcast-core";
 import type { Push } from "./room-edge";
+import { encode } from "./room-utf8";
+/** Message bytes one round builds for its children (ADR 0040, section 4). */
+const ROUND_BYTES = 1024 * 1024;
+interface Slice {
+    first?: number;
+    messages: Push["messages"];
+    sizes?: number[];
+    recover: boolean;
+}
 const number = (v: bigint) => {
     const n = Number(v);
     if (!Number.isSafeInteger(n) || n < 0 || BigInt(n) !== v)
@@ -47,17 +56,53 @@ export class Round {
             c.sockets = undefined;
         if (!core.beforePush(BigInt(now)))
             return;
-        const epoch = core.wake(), rows = core.messages(), epochs = core.epochs(), head = rows.at(-1)?.position.n ?? epoch.base;
-        const due = this.children.filter(c => c.suspect.due <= now && !this.relays.some(r => r.edges.includes(c.address) && (this.suspects.get(r.name)?.due ?? 0) > now)), enc = new TextEncoder();
-        const requests: [
+        const epoch = core.wake(), epochs = core.epochs(), head = core.last() ?? epoch.base;
+        const due = this.children.filter(c => c.suspect.due <= now && !this.relays.some(r => r.edges.includes(c.address) && (this.suspects.get(r.name)?.due ?? 0) > now));
+        // Slices by start: children at one position share one read and one encoding.
+        const slices = new Map<string, Slice>();
+        let read = 0;
+        const slice = (from: bigint, b: number): Slice | undefined => {
+            const key = `${from}.${b}`;
+            let s = slices.get(key);
+            if (s)
+                return s;
+            // Reads stop with the budget too: a deferred child costs nothing.
+            if (read >= ROUND_BYTES)
+                return;
+            s = { messages: [], recover: false };
+            for (const m of core.rows(from, 513, 512 * 1024)) {
+                const boundary = epochs.find(e => e.e === m.position.e);
+                if (!boundary) {
+                    s = { messages: [], recover: true };
+                    break;
+                }
+                const item = { e: number(m.position.e), b: number(boundary.base), a: number(m.at), i: m.id, d: m.body };
+                // JSON escapes are ASCII: the UTF-8 size is the text's length plus each string's non-ASCII surplus.
+                const bytes = JSON.stringify(item).length + (m.bodyBytes - m.body.length) + (m.id === undefined ? 0 : m.idBytes - m.id.length);
+                if (!s.messages.length)
+                    s.first = number(m.position.n);
+                s.messages.push(item);
+                s.sizes ??= [];
+                s.sizes.push(bytes);
+                read += m.bodyBytes;
+            }
+            slices.set(key, s);
+            return s;
+        };
+        // One round builds at most ROUND_BYTES of messages (one slice at
+        // least): the rest keep their positions and go on 20 ms later.
+        let budget = ROUND_BYTES, deferred = false;
+        const sent: Child[] = [], pushes: Push[] = [], requests: [
             string,
             actors.Request
-        ][] = due.map(c => {
+        ][] = [];
+        for (const c of due) {
             let body: string, op: string;
             if (!c.initialized) {
                 const a = actors.selfAddress();
                 op = "init";
                 body = JSON.stringify({ room: `${a.tenant}/${a.class}/${a.name}`, lo: "0000000000000000", state: "active" });
+                pushes.push(JSON.parse(body));
             }
             else {
                 op = "push";
@@ -65,26 +110,34 @@ export class Round {
                 if (c.position) {
                     p.b = number(epochs.filter(e => e.e > c.position!.e).reduce((b, e) => b < e.base ? b : e.base, epoch.base));
                     const n = epochs.filter(e => e.e > c.position!.e).reduce((n, e) => n < e.base ? n : e.base, c.position.n);
-                    for (const m of rows.filter(m => m.position.n > n)) {
-                        const boundary = epochs.find(e => e.e === m.position.e);
-                        if (!boundary) {
-                            p.recover = true;
-                            p.messages = [];
-                            break;
+                    const s = n < head ? slice(n + 1n, p.b) : undefined;
+                    if (n < head && !s) {
+                        deferred = true;
+                        continue;
+                    }
+                    if (s?.recover)
+                        p.recover = true;
+                    else if (s?.messages.length) {
+                        // The old cut: at most 512 messages and 512 KiB of JSON per request.
+                        const fixed = JSON.stringify({ ...p, first: s.first, messages: [] }).length;
+                        let k = 0, total = fixed;
+                        while (k < s.messages.length && k < 512 && total + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
+                            total += s.sizes![k] + (k++ ? 1 : 0);
+                        if (k && total - fixed > budget && budget < ROUND_BYTES) {
+                            deferred = true;
+                            continue;
                         }
-                        if (!p.messages.length)
-                            p.first = number(m.position.n);
-                        p.messages.push({ e: number(m.position.e), b: number(boundary.base), a: number(m.at), i: m.id, d: m.body });
-                        if (p.messages.length > 512 || enc.encode(JSON.stringify(p)).length > 512 * 1024) {
-                            p.messages.pop();
-                            break;
-                        }
+                        budget -= total - fixed;
+                        p.first = s.first!;
+                        p.messages = s.messages.slice(0, k);
                     }
                 }
+                pushes.push(p);
                 body = JSON.stringify(p);
             }
-            return [c.address, { method: "POST", path: `/wasmkeep-edge/v1/${op}`, headers: [], body: enc.encode(body) }];
-        });
+            sent.push(c);
+            requests.push([c.address, { method: "POST", path: `/wasmkeep-edge/v1/${op}`, headers: [], body: this.relays.length ? new Uint8Array() : encode(body) }]);
+        }
         let next = Infinity;
         const skipped = new Set<number>();
         let results: ReturnType<typeof calls.callMany>;
@@ -92,8 +145,8 @@ export class Round {
             results = calls.callMany(requests);
         else {
             results = requests.map(() => ({ tag: 'err', val: { tag: 'timeout' } }));
-            const groups = this.relays.map(r => ({ relay: r, indices: due.map((c, i) => r.edges.includes(c.address) ? i : -1).filter(i => i >= 0) })).filter(g => g.indices.length);
-            const replies = calls.callMany(groups.map(g => [g.relay.name, { method: 'POST', path: '/wasmkeep-relay/v1/push', headers: [], body: enc.encode(JSON.stringify(packRelay(g.indices.map(i => ({ edge: due[i].address, push: JSON.parse(new TextDecoder().decode(requests[i][1].body)) }))))) }]));
+            const groups = this.relays.map(r => ({ relay: r, indices: sent.map((c, i) => r.edges.includes(c.address) ? i : -1).filter(i => i >= 0) })).filter(g => g.indices.length);
+            const replies = calls.callMany(groups.map(g => [g.relay.name, { method: 'POST', path: '/wasmkeep-relay/v1/push', headers: [], body: encode(JSON.stringify(packRelay(g.indices.map(i => ({ edge: sent[i].address, push: pushes[i] }))))) }]));
             groups.forEach((g, i) => {
                 const suspect = this.suspects.get(g.relay.name) ?? new Suspect();
                 this.suspects.set(g.relay.name, suspect);
@@ -105,7 +158,7 @@ export class Round {
                     if (!Array.isArray(answers) || answers.length !== g.indices.length)
                         throw Error('invalid relay reply');
                     suspect.success();
-                    g.indices.forEach((index, j) => { results[index] = { tag: 'ok', val: { status: answers[j] === null ? 503 : 200, headers: [], body: enc.encode(JSON.stringify(answers[j])) } }; });
+                    g.indices.forEach((index, j) => { results[index] = { tag: 'ok', val: { status: answers[j] === null ? 503 : 200, headers: [], body: new TextEncoder().encode(JSON.stringify(answers[j])) } }; });
                 }
                 catch {
                     suspect.fail(now);
@@ -113,7 +166,9 @@ export class Round {
                 }
             });
         }
-        due.forEach((c, i) => {
+        if (deferred)
+            next = now + 20;
+        sent.forEach((c, i) => {
             if (skipped.has(i))
                 return; // Relay failure belongs to the relay, not its edges.
             try {

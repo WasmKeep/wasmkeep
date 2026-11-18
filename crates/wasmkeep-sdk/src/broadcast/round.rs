@@ -108,11 +108,17 @@ impl Round {
             return Ok(());
         }
         let epoch = core.wake()?;
-        let rows = core.messages()?;
         let epochs = core.epochs()?;
-        let head = rows.last().map_or(epoch.base, |m| m.position.n);
+        let head = core.last()?.unwrap_or(epoch.base);
         let mut indices = vec![];
         let mut requests = vec![];
+        // Slices by start: children at one position share one read and one
+        // encoding. One round builds at most ROUND_BYTES of messages (one
+        // slice at least); the rest keep their positions for 20 ms later.
+        let mut slices: std::collections::BTreeMap<(u64, u64), Slice> = Default::default();
+        let mut read = 0usize;
+        let mut budget = ROUND_BYTES;
+        let mut deferred = false;
         for (index, child) in self.children.iter().enumerate() {
             if child.suspect.due > now
                 || self.relays.iter().any(|r| {
@@ -153,29 +159,38 @@ impl Round {
                     head,
                     messages: vec![],
                 };
-                if let Some(n) = n {
-                    for m in rows.iter().filter(|m| m.position.n > n) {
-                        let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
-                            push.recover = true;
-                            push.messages.clear();
-                            break;
-                        };
-                        if push.messages.is_empty() {
-                            push.first = m.position.n;
+                if let Some(n) = n.filter(|n| *n < head) {
+                    let key = (n, push.base);
+                    if let std::collections::btree_map::Entry::Vacant(e) = slices.entry(key) {
+                        if read >= ROUND_BYTES {
+                            deferred = true;
+                            continue;
                         }
-                        push.messages.push(Item {
-                            epoch: Some(Epoch {
-                                e: m.position.e,
-                                base: boundary.base,
-                            }),
-                            at: m.at,
-                            id: m.id.clone(),
-                            body: m.body.clone(),
-                        });
-                        if push.messages.len() > 512 || push.encode().len() > 512 * 1024 {
-                            push.messages.pop();
-                            break;
+                        let slice = Slice::read(core, &epochs, n + 1)?;
+                        read += slice.read;
+                        e.insert(slice);
+                    }
+                    let slice = &slices[&key];
+                    if slice.recover {
+                        push.recover = true;
+                    } else if let Some(&first) = slice.first.as_ref() {
+                        // The cut: at most 512 messages and 512 KiB of JSON per request.
+                        push.first = first;
+                        let fixed = push.encode().len();
+                        let (mut k, mut total) = (0, fixed);
+                        while k < slice.items.len()
+                            && k < 512
+                            && total + slice.sizes[k] + usize::from(k > 0) <= 512 * 1024
+                        {
+                            total += slice.sizes[k] + usize::from(k > 0);
+                            k += 1;
                         }
+                        if k > 0 && total - fixed > budget && budget < ROUND_BYTES {
+                            deferred = true;
+                            continue;
+                        }
+                        budget = budget.saturating_sub(total - fixed);
+                        push.messages = slice.items[..k].to_vec();
                     }
                 }
                 let body = push.encode();
@@ -193,7 +208,7 @@ impl Round {
                 },
             ));
         }
-        let mut next = None;
+        let mut next = deferred.then(|| now.saturating_add(20));
         let mut skip = std::collections::BTreeSet::new();
         let results = if self.relays.is_empty() {
             crate::calls::call_many(&requests)
@@ -304,6 +319,46 @@ impl Round {
     }
 }
 
+/// Message bytes one round builds for its children (ADR 0040, section 4).
+const ROUND_BYTES: usize = 1024 * 1024;
+/// The messages after one position, each with its JSON size.
+struct Slice {
+    first: Option<u64>,
+    items: Vec<Item>,
+    sizes: Vec<usize>,
+    recover: bool,
+    read: usize,
+}
+impl Slice {
+    fn read<S: Store>(core: &Core<S>, epochs: &[Epoch], from: u64) -> Result<Self, String> {
+        let mut s = Slice {
+            first: None,
+            items: vec![],
+            sizes: vec![],
+            recover: false,
+            read: 0,
+        };
+        for m in core.rows(from, 513, 512 * 1024)? {
+            s.read += m.body.len();
+            let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
+                return Ok(Slice { recover: true, ..s });
+            };
+            s.first.get_or_insert(m.position.n);
+            let item = Item {
+                epoch: Some(Epoch {
+                    e: m.position.e,
+                    base: boundary.base,
+                }),
+                at: m.at,
+                id: m.id,
+                body: m.body,
+            };
+            s.sizes.push(item.json().len());
+            s.items.push(item);
+        }
+        Ok(s)
+    }
+}
 fn acknowledgment(body: &[u8], epoch: u64, head: u64) -> Option<(Position, bool)> {
     let j = crate::json::parse_unique(std::str::from_utf8(body).ok()?)?;
     let p = Position {

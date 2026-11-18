@@ -10,6 +10,25 @@ class Utf8Encoder {
   readonly encoding = "utf-8";
 
   encode(input = ""): Uint8Array {
+    // Fast paths, for the interpreter's sake (about 4x): ASCII copies code
+    // units; other well-formed text is turned into one byte per unit by
+    // the engine's own `encodeURIComponent` (which refuses lone
+    // surrogates: those take the general path, as U+FFFD).
+    if (input.length >= 64) {
+      let bin: string | undefined = input;
+      if (/[^\x00-\x7f]/.test(input)) {
+        try {
+          bin = unescape(encodeURIComponent(input));
+        } catch {
+          bin = undefined;
+        }
+      }
+      if (bin !== undefined) {
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      }
+    }
     // At most 3 bytes per UTF-16 code unit (a surrogate pair is 2 units, 4 bytes).
     const out = new Uint8Array(input.length * 3);
     let n = 0;
@@ -68,6 +87,19 @@ class Utf8Decoder {
           ? new Uint8Array(input)
           : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
     let i = !this.ignoreBOM && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf ? 3 : 0;
+    // Fast path (about 8x on ASCII, 2.5x otherwise): bytes to a binary
+    // string natively, then the engine's own UTF-8 decoding, which throws
+    // on any invalid sequence; those take the general path below.
+    if (b.length - i >= 64) {
+      let bin = "";
+      for (let at = i; at < b.length; at += 8192) bin += String.fromCharCode.apply(null, b.subarray(at, Math.min(at + 8192, b.length)) as unknown as number[]);
+      if (!/[\x80-\xff]/.test(bin)) return bin;
+      try {
+        return decodeURIComponent(escape(bin));
+      } catch {
+        // invalid UTF-8: the WHATWG decoder below decides.
+      }
+    }
     let s = "";
     const codes: number[] = [];
     const flush = () => {

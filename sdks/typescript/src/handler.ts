@@ -15,6 +15,7 @@ import { poll, type Pollable } from "wasi:io/poll@0.2.12";
 import { Body, incomingSource, type BodySource } from "./body";
 import type { ActorRequest, ActorResponse } from "./request";
 import { HeaderList, fieldsToPairs, responsePairs } from "./headers";
+import { writeBody } from "./response-body";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -80,10 +81,5 @@ export function respond(out: ResponseOutparam, response: ActorResponse): void {
   outgoing.setStatusCode(r.status ?? 200);
   const outBody = outgoing.body();
   ResponseOutparam.set(out, { tag: "ok", val: outgoing });
-  const stream = outBody.write();
-  for (let at = 0; at < body.length; at += 4096) {
-    stream.blockingWriteAndFlush(body.subarray(at, at + 4096));
-  }
-  (stream as unknown as Disposable)[Symbol.dispose]?.();
-  OutgoingBody.finish(outBody, undefined);
+  writeBody(outBody.write(), body, () => OutgoingBody.finish(outBody, undefined));
 }
