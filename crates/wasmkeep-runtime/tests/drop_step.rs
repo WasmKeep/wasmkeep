@@ -262,12 +262,29 @@ async fn one_state_at_a_time_with_concurrent_submitters_and_a_gated_step() {
             f.gate.add_permits(1 << 16);
         })
     };
+    // Every 100 events the submitters pause together until the actor has
+    // hibernated, so it is rebuilt with all four racing again: that it
+    // hibernates does not hang on the timing of the run.
+    let pause = Arc::new(tokio::sync::Barrier::new(4));
     let mut tasks = Vec::new();
     for t in 0..4_u64 {
-        let (f, a) = (Arc::clone(&f), a.clone());
+        let (f, a, pause) = (Arc::clone(&f), a.clone(), Arc::clone(&pause));
         tasks.push(tokio::spawn(async move {
             for i in 0..500_u64 {
                 f.mailboxes.submit(&a, increment).await.unwrap();
+                if i % 100 == 99 {
+                    if pause.wait().await.is_leader() {
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while f.mailboxes.contains(&a) {
+                            assert!(
+                                tokio::time::Instant::now() < deadline,
+                                "the actor never hibernated while idle"
+                            );
+                            tokio::time::sleep(Duration::from_micros(200)).await;
+                        }
+                    }
+                    pause.wait().await;
+                }
                 if (i + t) % 3 == 0 {
                     tokio::time::sleep(Duration::from_micros(500 + (i % 4) * 300)).await;
                 }
@@ -472,92 +489,348 @@ async fn a_panicking_step_drops_the_state_and_the_actor_recovers() {
     assert_eq!(f.created.load(Ordering::SeqCst), 2);
 }
 
-/// A state whose drop takes time (a store flushing, a database closing),
-/// for the window between an actor leaving the registry and its state
-/// being gone.
-struct SlowDrop {
-    live: Arc<AtomicUsize>,
-    dropping: Arc<AtomicBool>,
-    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+/// What the `Held` states of one test share: counts, a drop that can be
+/// held (a store flushing, a database closing) or made to panic once, and
+/// a step that can be held for one name.
+struct Hooks {
+    live: AtomicUsize,
+    most: AtomicUsize,
+    created: AtomicUsize,
+    /// Drops begun.
+    dropping: AtomicUsize,
+    /// The name whose drops wait for `release`.
+    hold_drop: Mutex<Option<String>>,
+    released: Mutex<bool>,
+    release: std::sync::Condvar,
+    /// The next drop panics.
+    panic_drop: AtomicBool,
+    /// The name whose steps wait for a `step_gate` permit.
+    hold_step: Mutex<Option<String>>,
+    step_gate: Semaphore,
+    steps: AtomicUsize,
+    /// Residency clones kept beyond their state (a database still closing
+    /// on a blocking thread), when `keep` is set.
+    keep: AtomicBool,
+    kept: Mutex<Vec<wasmkeep_runtime::Residency>>,
 }
 
-impl Drop for SlowDrop {
-    fn drop(&mut self) {
-        self.dropping.store(true, Ordering::SeqCst);
-        let (lock, cvar) = &*self.release;
-        let released = lock.lock().unwrap();
-        let _released = cvar
-            .wait_timeout_while(released, Duration::from_secs(5), |r| !*r)
-            .unwrap();
-        self.live.fetch_sub(1, Ordering::SeqCst);
+impl Hooks {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            most: AtomicUsize::new(0),
+            created: AtomicUsize::new(0),
+            dropping: AtomicUsize::new(0),
+            hold_drop: Mutex::new(None),
+            released: Mutex::new(false),
+            release: std::sync::Condvar::new(),
+            panic_drop: AtomicBool::new(false),
+            hold_step: Mutex::new(None),
+            step_gate: Semaphore::new(0),
+            steps: AtomicUsize::new(0),
+            keep: AtomicBool::new(false),
+            kept: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn hold_drops_of(&self, name: &str) {
+        *self.released.lock().unwrap() = false;
+        *self.hold_drop.lock().unwrap() = Some(name.to_owned());
+    }
+
+    fn release_drops(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+
+    fn created(&self) -> usize {
+        self.created.load(Ordering::SeqCst)
+    }
+
+    fn most(&self) -> usize {
+        self.most.load(Ordering::SeqCst)
     }
 }
 
-fn ready(_state: &mut SlowDrop, _cause: DropCause) -> BoxFuture<'_, StepOutcome> {
-    Box::pin(async { StepOutcome::Ready })
+struct Held {
+    name: String,
+    hooks: Arc<Hooks>,
 }
 
-fn noop(_state: &mut SlowDrop) -> BoxFuture<'_, ()> {
-    Box::pin(async {})
+impl Drop for Held {
+    fn drop(&mut self) {
+        let h = &self.hooks;
+        h.dropping.fetch_add(1, Ordering::SeqCst);
+        let held = h.hold_drop.lock().unwrap().as_deref() == Some(self.name.as_str());
+        if held {
+            let released = h.released.lock().unwrap();
+            let _released = h
+                .release
+                .wait_timeout_while(released, Duration::from_secs(5), |r| !*r)
+                .unwrap();
+        }
+        h.live.fetch_sub(1, Ordering::SeqCst);
+        if h.panic_drop.swap(false, Ordering::SeqCst) {
+            panic!("the state panicked as it dropped");
+        }
+    }
 }
 
-/// An event arriving while a hibernating state is still being dropped
-/// must wait for that drop: the actor stays registered until its state is
-/// gone, so the event never builds a second state beside it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_event_during_the_drop_waits_for_the_state_to_be_gone() {
-    let live = Arc::new(AtomicUsize::new(0));
-    let most = Arc::new(AtomicUsize::new(0));
-    let created = Arc::new(AtomicUsize::new(0));
-    let dropping = Arc::new(AtomicBool::new(false));
-    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-    let (l, m, c, d, r) = (
-        Arc::clone(&live),
-        Arc::clone(&most),
-        Arc::clone(&created),
-        Arc::clone(&dropping),
-        Arc::clone(&release),
-    );
-    let mailboxes = Mailboxes::new_with_step(
-        idle(Duration::from_secs(600)),
-        move |_address, _residency| {
-            let (l, m, c, d, r) = (
-                Arc::clone(&l),
-                Arc::clone(&m),
-                Arc::clone(&c),
-                Arc::clone(&d),
-                Arc::clone(&r),
-            );
+fn held_step(state: &mut Held, _cause: DropCause) -> BoxFuture<'_, StepOutcome> {
+    Box::pin(async move {
+        let h = Arc::clone(&state.hooks);
+        h.steps.fetch_add(1, Ordering::SeqCst);
+        let held = h.hold_step.lock().unwrap().as_deref() == Some(state.name.as_str());
+        if held {
+            h.step_gate.acquire().await.unwrap().forget();
+        }
+        StepOutcome::Ready
+    })
+}
+
+fn held(config: MailboxConfig, hooks: &Arc<Hooks>) -> Mailboxes<Held> {
+    let h = Arc::clone(hooks);
+    Mailboxes::new_with_step(
+        config,
+        move |address: ActorAddress, residency: wasmkeep_runtime::Residency| {
+            let h = Arc::clone(&h);
             async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                m.fetch_max(l.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
-                Ok::<_, BoxError>(SlowDrop {
-                    live: l,
-                    dropping: d,
-                    release: r,
+                h.created.fetch_add(1, Ordering::SeqCst);
+                let now = h.live.fetch_add(1, Ordering::SeqCst) + 1;
+                h.most.fetch_max(now, Ordering::SeqCst);
+                if h.keep.load(Ordering::SeqCst) {
+                    h.kept.lock().unwrap().push(residency.clone());
+                }
+                Ok::<_, BoxError>(Held {
+                    name: address.name().to_owned(),
+                    hooks: h,
                 })
             }
         },
-        ready,
-    );
-    let a = addr("a");
-    mailboxes.submit(&a, noop).await.unwrap();
-    mailboxes.hibernate(&a);
-    while !dropping.load(Ordering::SeqCst) {
+        held_step,
+    )
+}
+
+fn noop(_state: &mut Held) -> BoxFuture<'_, ()> {
+    Box::pin(async {})
+}
+
+fn panics(_state: &mut Held) -> BoxFuture<'_, ()> {
+    Box::pin(async { panic!("the event panicked") })
+}
+
+/// Waits (at most five seconds) for `done`.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    // The old state is mid-drop: queue the next event now.
-    let next = tokio::spawn(mailboxes.submit(&a, noop));
-    // Give a wrongly admitted second actor time to build its state.
+}
+
+/// Queues an event for `a` while its state is held in its drop, and gives
+/// a wrongly admitted second actor time to build a state beside it.
+async fn an_event_during_the_drop(
+    mailboxes: &Mailboxes<Held>,
+    hooks: &Hooks,
+    a: &ActorAddress,
+) -> tokio::task::JoinHandle<Result<(), MailboxError>> {
+    until("the state starts dropping", || {
+        hooks.dropping.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let next = tokio::spawn(mailboxes.submit(a, noop));
     for _ in 0..200 {
-        if created.load(Ordering::SeqCst) > 1 {
+        if hooks.created() > 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    *release.0.lock().unwrap() = true;
-    release.1.notify_all();
+    hooks.release_drops();
+    next
+}
+
+/// An event arriving while a hibernating state is still being dropped
+/// waits for that drop: the actor stays registered until its state is
+/// gone, so the event never builds a second state beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_during_the_drop_waits_for_the_state_to_be_gone() {
+    let hooks = Hooks::new();
+    let mailboxes = held(idle(Duration::from_secs(600)), &hooks);
+    let a = addr("a");
+    mailboxes.submit(&a, noop).await.unwrap();
+    hooks.hold_drops_of("a");
+    mailboxes.hibernate(&a);
+    let next = an_event_during_the_drop(&mailboxes, &hooks, &a).await;
     next.await.unwrap().unwrap();
-    assert_eq!(most.load(Ordering::SeqCst), 1, "two states at once");
-    assert_eq!(created.load(Ordering::SeqCst), 2);
+    assert_eq!(hooks.most(), 1, "two states at once");
+    assert_eq!(hooks.created(), 2);
+    assert_eq!(mailboxes.leaving(), 0);
+}
+
+/// The same after an idle timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_during_an_idle_drop_waits_for_the_state_to_be_gone() {
+    let hooks = Hooks::new();
+    let mailboxes = held(idle(Duration::from_millis(50)), &hooks);
+    let a = addr("a");
+    hooks.hold_drops_of("a");
+    mailboxes.submit(&a, noop).await.unwrap();
+    let next = an_event_during_the_drop(&mailboxes, &hooks, &a).await;
+    next.await.unwrap().unwrap();
+    assert_eq!(hooks.most(), 1, "two states at once");
+    assert_eq!(hooks.created(), 2);
+    // An idle timeout's mark is cleared by the event that kept the actor.
+    assert_eq!(mailboxes.leaving(), 0);
+}
+
+/// The same after a capacity eviction: the eviction stays pending, so the
+/// actor leaves after the event and the waiting name gets its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_during_an_eviction_drop_waits_for_the_state_to_be_gone() {
+    let hooks = Hooks::new();
+    let mailboxes = held(
+        MailboxConfig {
+            max_resident: 1,
+            idle_timeout: Duration::from_secs(600),
+            ..MailboxConfig::default()
+        },
+        &hooks,
+    );
+    let a = addr("a");
+    mailboxes.submit(&a, noop).await.unwrap();
+    hooks.hold_drops_of("a");
+    let b = tokio::spawn(mailboxes.submit_wait(&addr("b"), Duration::from_secs(5), noop));
+    let next = an_event_during_the_drop(&mailboxes, &hooks, &a).await;
+    next.await.unwrap().unwrap();
+    b.await.unwrap().unwrap();
+    assert_eq!(hooks.most(), 1, "two states at once");
+    assert_eq!(hooks.created(), 3);
+    assert!(!mailboxes.contains(&a));
+}
+
+/// An actor whose idle drop is also asked to make room keeps that mark when
+/// an event races its drop: it still leaves after the event, so the slot
+/// counts as on its way back and no other actor is evicted for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_eviction_mark_set_during_an_idle_step_survives_a_raced_event() {
+    let hooks = Hooks::new();
+    let mailboxes = held(
+        MailboxConfig {
+            max_resident: 2,
+            idle_timeout: Duration::from_millis(100),
+            ..MailboxConfig::default()
+        },
+        &hooks,
+    );
+    let (a, b) = (addr("a"), addr("b"));
+    *hooks.hold_step.lock().unwrap() = Some("a".to_owned());
+    mailboxes.submit(&a, noop).await.unwrap();
+    // b stays busy, so a is the only actor eviction can ask.
+    let (go, wait) = tokio::sync::oneshot::channel::<()>();
+    let wait = Arc::new(Mutex::new(Some(wait)));
+    let busy = {
+        let wait = Arc::clone(&wait);
+        mailboxes.submit(&b, move |_state: &mut Held| -> BoxFuture<'_, ()> {
+            let wait = wait.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                let _ = wait.await;
+            })
+        })
+    };
+    let busy = tokio::spawn(busy);
+    // a's idle step runs (held); a new name at the cap asks a to go.
+    until("a's idle step", || hooks.steps.load(Ordering::SeqCst) > 0).await;
+    let r = mailboxes.submit(&addr("c"), noop).await;
+    assert!(matches!(r, Err(MailboxError::Capacity(_))), "{r:?}");
+    assert_eq!(mailboxes.leaving(), 1);
+    // The step lets go; an event races the drop.
+    hooks.hold_drops_of("a");
+    hooks.step_gate.add_permits(1);
+    let next = an_event_during_the_drop(&mailboxes, &hooks, &a).await;
+    next.await.unwrap().unwrap();
+    assert_eq!(mailboxes.leaving(), 1, "a's eviction mark was lost");
+    assert_eq!(hooks.most(), 2);
+    hooks.step_gate.add_permits(1 << 10);
+    go.send(()).unwrap();
+    busy.await.unwrap().unwrap();
+    mailboxes.close();
+    assert!(mailboxes.drained(Duration::from_secs(5)).await);
+}
+
+/// A panic in the state's drop is contained: an event queued during it is
+/// served, and the actor leaves the registry, its slot not counted twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_drop_is_contained() {
+    let hooks = Hooks::new();
+    let mailboxes = held(idle(Duration::from_secs(600)), &hooks);
+    let a = addr("a");
+    mailboxes.submit(&a, noop).await.unwrap();
+    hooks.panic_drop.store(true, Ordering::SeqCst);
+    hooks.hold_drops_of("a");
+    mailboxes.hibernate(&a);
+    let next = an_event_during_the_drop(&mailboxes, &hooks, &a).await;
+    next.await.unwrap().unwrap();
+    assert_eq!(hooks.most(), 1, "two states at once");
+    assert_eq!(mailboxes.leaving(), 0);
+    // Without an event: the actor leaves the registry all the same.
+    hooks.panic_drop.store(true, Ordering::SeqCst);
+    mailboxes.hibernate(&a);
+    until("a leaves the registry", || mailboxes.resident() == 0).await;
+    assert_eq!(mailboxes.leaving(), 0);
+    assert!(mailboxes.drained(Duration::from_secs(1)).await);
+    mailboxes.submit(&a, noop).await.unwrap();
+    assert_eq!(hooks.created(), 3);
+}
+
+/// An event finding resources of its actor's earlier state still open (a
+/// database closing on a blocking thread after a panic) waits for them, up
+/// to `release_wait`, instead of failing at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_waits_for_an_earlier_states_resources() {
+    let hooks = Hooks::new();
+    let mailboxes = held(
+        MailboxConfig {
+            release_wait: Duration::from_secs(5),
+            ..idle(Duration::from_secs(600))
+        },
+        &hooks,
+    );
+    let a = addr("a");
+    hooks.keep.store(true, Ordering::SeqCst);
+    mailboxes.submit(&a, noop).await.unwrap();
+    hooks.keep.store(false, Ordering::SeqCst);
+    let r = mailboxes.submit(&a, panics).await;
+    assert!(matches!(r, Err(MailboxError::Gone(_))), "{r:?}");
+    let next = tokio::spawn(mailboxes.submit(&a, noop));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!next.is_finished(), "answered before the resources closed");
+    hooks.kept.lock().unwrap().clear();
+    next.await.unwrap().unwrap();
+    assert_eq!(hooks.created(), 2);
+    assert_eq!(hooks.most(), 1);
+}
+
+/// That wait is bounded: past `release_wait` the event fails `Capacity`,
+/// and no state is built beside the resources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wait_for_an_earlier_states_resources_is_bounded() {
+    let hooks = Hooks::new();
+    let mailboxes = held(
+        MailboxConfig {
+            release_wait: Duration::from_millis(100),
+            ..idle(Duration::from_secs(600))
+        },
+        &hooks,
+    );
+    let a = addr("a");
+    hooks.keep.store(true, Ordering::SeqCst);
+    mailboxes.submit(&a, noop).await.unwrap();
+    hooks.keep.store(false, Ordering::SeqCst);
+    let _ = mailboxes.submit(&a, panics).await;
+    let started = tokio::time::Instant::now();
+    let r = mailboxes.submit(&a, noop).await;
+    assert!(matches!(r, Err(MailboxError::Capacity(_))), "{r:?}");
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(hooks.created(), 1);
 }
