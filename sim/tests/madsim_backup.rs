@@ -242,15 +242,23 @@ fn seeds() -> u64 {
 fn concurrent_archive_reader() {
     let mut runs = 0;
     let mut retries = 0;
+    let mut retry_free = 0;
     for seed in 0..seeds() {
         let r = run(seed, Unsafe::None);
         assert_eq!(r.failure, None, "seed {seed}");
         assert!(
-            r.pages > 0 && r.gets > 0 && !r.runs.is_empty() && r.retries > 0,
-            "vacuous seed {seed}: runs={} retries={}",
-            r.runs.len(),
-            r.retries
+            r.pages > 0 && r.gets > 0 && !r.runs.is_empty(),
+            "vacuous seed {seed}: runs={}",
+            r.runs.len()
         );
+        // A retry needs the collector to delete an object between this
+        // reader's LIST and its GET: a schedule can miss that window
+        // (seed 1299: 91 consistent runs, 20 objects collected, none in
+        // the window). About one seed in 2,000 does, so the coverage
+        // requirement is a fraction, not every seed.
+        if r.retries == 0 {
+            retry_free += 1;
+        }
         assert!(
             r.runs.iter().any(|(_, _, _, acked)| !acked.is_empty()),
             "no listing-time acknowledgements for seed {seed}"
@@ -262,6 +270,22 @@ fn concurrent_archive_reader() {
         }
     }
     assert!(runs > 0 && retries > 0, "runs={runs} retries={retries}");
+    assert!(
+        retry_free <= (seeds() / 100).max(1),
+        "{retry_free} of {} seeds never retried",
+        seeds()
+    );
+}
+#[test]
+fn seed_1299_backs_up_consistently() {
+    // Found at 2,000 seeds: nothing is collected between a LIST and its
+    // GET, so no retry runs; every backup is still consistent.
+    let r = run(1299, Unsafe::None);
+    assert_eq!(r.failure, None);
+    assert!(r.runs.iter().any(|(_, _, _, acked)| !acked.is_empty()));
+    for (manifest, expected, owners, acked) in &r.runs {
+        oracle_history(manifest, &r.destination, expected, owners, acked).unwrap();
+    }
 }
 #[test]
 fn unsafe_readers_fail_for_the_expected_reason() {
