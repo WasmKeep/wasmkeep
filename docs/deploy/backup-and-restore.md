@@ -76,13 +76,28 @@ actor records span ordered 1 MiB fragments. The loader streams fragments to a
 private temporary file, without concatenating them in memory, and parses one
 bounded actor at a time. Limits are 8 MiB serialized metadata per actor,
 64 MiB per metadata object and accounted resident index, and 1 GiB of actor
-metadata spool per run (incarnation markers are capped at 64 KiB each). Listing indexes and create use the same bounded policy;
+metadata spool per run (incarnation markers are capped at 64 KiB each). Other listing indexes retain their separate budgets;
 exceeding a budget is an explicit error, not a truncated backup. These are
 metadata budgets, not an RSS limit: JSON trees and allocator overhead add
 memory, and LTX bodies/database replay have the separate 2 GiB database cap.
 Temporary manifest files are removed on success or error. Split large runs by
 app if a run budget is exceeded; oversized individual histories need a future
 streaming history format.
+
+Actor history grouping for `backup create` (also used when checking restore
+membership) allows **32 MiB (33,554,432 bytes) per actor** of retained listing
+allocations: full key, ETag and version string capacities, plus metadata vector
+slots including spare capacity. It does not count object bodies. A test covers
+73,126 objects: 72,000 writes (20/s for the default one-hour retention), snapshots
+every 64 segments, and an initial snapshot. Longer keys or provider metadata
+consume more of the same byte budget; there is no fixed object-count limit.
+The grouper accumulates one actor plus one lookahead object. Conversion to the
+caller's ordered map adds tail keys and tree allocations; backup can hold up to
+16 yielded actor groups during concurrent copying. The 32 MiB is therefore not
+a whole-command RSS cap. An oversized actor fails explicitly with its prefix,
+total listed object count and limit. Reduce its write rate or configured history
+retention, let collection run, then retry; splitting by app cannot fix a single
+oversized actor. Changing retention reduces the available recovery window.
 
 `started` binds the run ID, source and expected app incarnations. Each app
 record references that run and the started digest and binds actor membership

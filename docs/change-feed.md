@@ -23,6 +23,22 @@ reported on stderr. `--classes carts,orders` limits classes; `--max-bytes N`
 limits the size of an actor read. Repeat the command with a scheduler, without
 overlapping invocations: the state directory is locked during a poll.
 
+The shared backup/feed history grouper allows **32 MiB (33,554,432 bytes) per
+actor** of retained listing allocations: full key, ETag and version string
+capacities and metadata vector slots (including spare capacity). Object bodies
+are separate. Tests cover 15,000 objects and 73,126 objects: 20 writes/s for the
+default one-hour retention, plus snapshots every 64 segments and an initial
+snapshot. Long keys or provider metadata reach the byte bound sooner; it is not
+a fixed object-count limit. Grouping accumulates one actor plus one lookahead
+object; conversion to the consumer's ordered map adds tail keys and tree
+allocations, and the feed can retain up to 16 yielded groups during concurrent
+processing, so this is not a process RSS cap. An oversized actor is reported
+with its prefix, total object count, limit and recovery instructions, left
+unadvanced, and other actors can proceed. Reduce its write rate or configured
+history retention, let collection run, then retry. Shorter retention reduces the
+recovery window. `actor export` and `actor history` use a separate listing path;
+the inspector retains its separate 10,000-object listing cap.
+
 The interval is a cost and lag choice. Each poll lists the app's history once:
 with K objects and 1,000 objects per page, that is approximately ceil(K/1,000)
 LIST requests, plus retries. For 100,000 actors with 20 objects each, that is

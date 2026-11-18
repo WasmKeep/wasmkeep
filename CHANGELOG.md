@@ -9,6 +9,12 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Busy actors fit backup/feed listings.** History grouping now accounts for
+  retained metadata and string capacities with a 32 MiB per-actor budget,
+  replacing the 8 MiB budget's fixed 1,024-byte surcharge per object. Tests
+  cover 15,000 and 73,126 objects. Refusals name the actor, total object count,
+  limit and recovery steps; the inspector's separate limit is unchanged.
+
 - **History copied inside the bucket reads again.** Some S3-compatible
   providers report another ETag in a listing than on a read of the same
   object made by a server-side copy (such as the copy `cluster migrate`
