@@ -124,29 +124,44 @@ test("clock: keepalive, timeout, moved jitter, stable reset, cancellation", asyn
     assert.equal(clock.tasks.size, 0);
     assert.equal(sockets.length, 3);
 });
-test("HTTP Retry-After, pagination, held frames and cancellation", async () => {
-    const clock = new FakeClock(), ws = new FakeSocket(), queries: string[] = [];
-    const seen: number[] = [];
-    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", last: { e: 1, n: 0 }, clock, random: () => .5, socket: () => ws, onMessage: p => { seen.push(p.n); }, fetch: (async (url: unknown) => {
-            queries.push(String(url));
-            if (queries.length === 1)
-                return new Response(null, { status: 429, headers: { "Retry-After": "2" } });
-            return new Response(JSON.stringify({ head: { e: 1, n: 2 }, messages: [{ position: { e: 1, n: queries.length - 1 }, at: 0, body: "x" }], more: queries.length === 2 }));
-        }) as typeof fetch });
-    c.connect();
-    ws.frame({ t: "behind", e: 1, n: 2 });
-    ws.frame({ t: "m", e: 1, b: 0, n: 3, m: [{ a: 0, d: "live" }] });
-    await settle();
-    clock.tick(2249);
-    await settle();
-    assert.equal(queries.length, 1);
-    clock.tick(1);
-    await settle();
-    assert.deepEqual(seen, [1, 2, 3]);
-    assert(queries[2].endsWith("after=1.1"));
-    c.close();
-    assert.equal(clock.tasks.size, 0);
-});
+for (const jsonTurns of [0, 30])
+    test(`HTTP Retry-After, pagination, held frames and cancellation (${jsonTurns} JSON turns)`, async () => {
+        const clock = new FakeClock(), ws = new FakeSocket(), queries: string[] = [];
+        const seen: number[] = [];
+        let delivered!: () => void;
+        const delivery = new Promise<void>(resolve => { delivered = resolve; });
+        const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", last: { e: 1, n: 0 }, clock, random: () => .5, socket: () => ws, onMessage: p => { seen.push(p.n); if (p.n === 3) delivered(); }, fetch: (async (url: unknown) => {
+                queries.push(String(url));
+                if (queries.length === 1)
+                    return new Response(null, { status: 429, headers: { "Retry-After": "2" } });
+                const response = new Response(JSON.stringify({ head: { e: 1, n: 2 }, messages: [{ position: { e: 1, n: queries.length - 1 }, at: 0, body: "x" }], more: queries.length === 2 }));
+                const json = response.json.bind(response);
+                response.json = async () => { for (let i = 0; i < jsonTurns; i++) await Promise.resolve(); return json(); };
+                return response;
+            }) as typeof fetch });
+        c.connect();
+        ws.frame({ t: "behind", e: 1, n: 2 });
+        ws.frame({ t: "m", e: 1, b: 0, n: 3, m: [{ a: 0, d: "live" }] });
+        await settle();
+        clock.tick(2249);
+        await settle();
+        assert.equal(queries.length, 1);
+        clock.tick(1);
+        // JSON decoding and pagination can take any number of promise turns.
+        // Completion is the held live frame reaching the application.
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([delivery, new Promise<never>((_, reject) => {
+                timeout = setTimeout(() => reject(Error("held frame was not delivered")), 5000);
+            })]);
+        } finally {
+            clearTimeout(timeout);
+            c.close();
+        }
+        assert.deepEqual(seen, [1, 2, 3]);
+        assert(queries[2].endsWith("after=1.1"));
+        assert.equal(clock.tasks.size, 0);
+    });
 test("history is authoritative when a current-epoch ready precedes retained rows", async () => {
     const seen: number[] = [];
     const r = new Receiver({ onMessage: p => { seen.push(p.n); }, history: async () => ({ head: { e: 2, n: 2 }, messages: [{ position: { e: 1, n: 1 }, body: "old", at: 0 }, { position: { e: 2, n: 2 }, body: "new", at: 0 }], more: false }) }, { e: 2, n: 0 });

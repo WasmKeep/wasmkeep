@@ -873,6 +873,9 @@ struct Flaky {
     /// Heartbeats (`nodes/`) are written without the capability word
     /// `handoff`, as a node of an older version writes them (ADR 0027).
     no_handoff_word: Arc<AtomicBool>,
+    /// Hold only the advertised load constant while leases keep renewing.
+    /// Placement tests use this to separate observed from live capacity.
+    frozen_node_load: std::sync::Mutex<Option<String>>,
     /// Fail this many segment (`/wal/`) uploads.
     fail_wal: Arc<std::sync::atomic::AtomicU32>,
     /// Delay segment uploads by this many ms (applied before writing).
@@ -973,6 +976,7 @@ impl Flaky {
     fn new(inner: Arc<dyn ObjectStore>, down: Arc<AtomicBool>) -> Self {
         Self {
             no_handoff_word: Arc::default(),
+            frozen_node_load: std::sync::Mutex::default(),
             lease_gets: Arc::default(),
             hold_lease_get_at: Arc::default(),
             lease_held: Arc::default(),
@@ -1086,6 +1090,28 @@ impl ObjectStore for Flaky {
                 })
                 .collect();
             object_store::PutPayload::from(words.join("\n"))
+        } else {
+            payload
+        };
+        let payload = if location.as_ref().starts_with("nodes/") {
+            let frozen = self.frozen_node_load.lock().unwrap();
+            if let Some(load) = frozen.as_ref() {
+                let body = String::from_utf8(bytes::Bytes::from(payload).to_vec()).unwrap();
+                object_store::PutPayload::from(
+                    body.split('\n')
+                        .map(|line| {
+                            if line.starts_with("load ") {
+                                load.as_str()
+                            } else {
+                                line
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            } else {
+                payload
+            }
         } else {
             payload
         };
