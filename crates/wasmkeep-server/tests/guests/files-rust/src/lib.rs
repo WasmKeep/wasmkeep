@@ -126,7 +126,15 @@ fn route(
     if let Some(key) = path.strip_prefix("/stream/") {
         if method == "POST" {
             let n: usize = query(q, "n").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let bytes: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            // `i % 251`, made by copying one period: cheap enough for the
+            // event's CPU budget on a slow machine (computing each byte of
+            // 16 MiB is not).
+            let period: Vec<u8> = (0..251u8).collect();
+            let mut bytes = Vec::with_capacity(n);
+            while bytes.len() < n {
+                let take = (n - bytes.len()).min(period.len());
+                bytes.extend_from_slice(&period[..take]);
+            }
             let mut w = match blobs::open_write(key, &PutOptions::new()) {
                 Ok(w) => w,
                 Err(e) => return text(Err(e)),
@@ -142,18 +150,43 @@ fn route(
         };
         return match blobs::open_read(key, range) {
             Ok(Some((_, mut r))) => {
-                let mut all = Vec::new();
-                if let Err(e) = r.read_to_end(&mut all) {
-                    return (500, format!("err:read:{e}").into_bytes());
+                // Read and added up a buffer at a time, never all of it
+                // held: within the event's CPU budget on a slow machine.
+                let mut buf = vec![0u8; 65_536];
+                let (mut read, mut sum) = (0usize, 0u64);
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(k) => {
+                            read += k;
+                            sum += byte_sum(&buf[..k]);
+                        }
+                        Err(e) => return (500, format!("err:read:{e}").into_bytes()),
+                    }
                 }
-                let sum: u64 = all.iter().map(|&b| u64::from(b)).sum();
-                (200, format!("read={} sum={sum}", all.len()).into_bytes())
+                (200, format!("read={read} sum={sum}").into_bytes())
             }
             Ok(None) => (404, b"none".to_vec()),
             Err(e) => text(Err(e)),
         };
     }
     (404, b"no route".to_vec())
+}
+
+/// The bytes of `b` added up, eight at a time: cheap enough for the
+/// event's CPU budget over 16 MiB on a slow machine.
+fn byte_sum(b: &[u8]) -> u64 {
+    const BYTES: u64 = 0x00ff_00ff_00ff_00ff;
+    const PAIRS: u64 = 0x0000_ffff_0000_ffff;
+    let mut words = b.chunks_exact(8);
+    let mut sum = 0u64;
+    for w in &mut words {
+        let w = u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+        let pairs = (w & BYTES) + ((w >> 8) & BYTES);
+        let quads = (pairs & PAIRS) + ((pairs >> 16) & PAIRS);
+        sum += (quads & 0xffff_ffff) + (quads >> 32);
+    }
+    sum + words.remainder().iter().map(|&x| u64::from(x)).sum::<u64>()
 }
 
 impl http::Guest for Files {
