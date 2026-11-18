@@ -19,7 +19,9 @@ The text under a version's heading is its GitHub release text
   SDK's `TextEncoder`/`TextDecoder` gain native fast paths. A
   response whose caller left mid-body no longer traps the actor (which
   discarded its instance), and host errors print their fields instead of
-  `[object Object]`. Rust's `broadcast::Store::query` takes parameters.
+  `[object Object]` in the log. A TypeScript actor's uncaught error now
+  answers a generic `500 actor error` body; its details go to the log
+  only. Rust's `broadcast::Store::query` takes parameters.
 
 - **Bounded big-room fan-out.** Rust and TypeScript edges share serialized
   frames by cursor, serving caught-up sockets first and building at most

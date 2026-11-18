@@ -249,10 +249,14 @@ One request to a child stays under 1 MiB, so 16 of them fit the batch's
 the room's state. Publish reads the head and an `id` by index and trims the
 window with one statement SQLite runs; history reads the page it answers
 in 32-row pages; a round reads the messages after each distinct child
-position once (at most 513 rows, one page past 512 KiB) and builds at most
-1 MiB of messages for all its children together, at least one slice: the
-other lagging children keep their positions and are pushed by the alarm
-20 ms later. Sizes come from SQLite (`length(CAST(body AS BLOB))`) or
+position once and builds at most 1 MiB for all its children together, at
+least one slice. Each row read is charged its JSON plus 1 KiB, an empty
+one too, so a round reads about 1,000 rows at most whatever the bodies;
+the other lagging children keep their positions and are pushed by the
+alarm 20 ms later, the next round starting at the first child deferred,
+so under sustained publishing every child takes its turn. A child left
+below the window gets a push past its position: its edge announces
+`behind`. Sizes come from SQLite (`length(CAST(body AS BLOB))`) or
 from the JSON text, never from re-encoding text in the guest. On QuickJS,
 which has no native UTF-8 codec, the room, edge and relay classes convert
 bulk text through SQLite (`CAST`), which runs natively; the SDK's

@@ -7,8 +7,10 @@ pub use wasip2::http::types::{
 
 use std::io::{Read as _, Write as _};
 
-/// Sends a complete response with one body. Errors writing the body are
-/// ignored: the client has gone away and there is nobody left to tell.
+/// Sends a complete response with one body. A caller that left (the
+/// stream's `closed`) ends the write quietly; any other failure writing or
+/// finishing the body is the actor's and is logged (there is no answer
+/// left to carry it).
 pub fn respond(out: ResponseOutparam, status: u16, content_type: &str, body: &[u8]) {
     let headers = Fields::new();
     let _ = headers.set("content-type", &[content_type.as_bytes().to_vec()]);
@@ -18,11 +20,7 @@ pub fn respond(out: ResponseOutparam, status: u16, content_type: &str, body: &[u
         return;
     };
     ResponseOutparam::set(out, Ok(response));
-    if let Ok(mut stream) = outgoing.write() {
-        let _ = stream.write_all(body);
-        let _ = stream.flush();
-    }
-    let _ = OutgoingBody::finish(outgoing, None);
+    write_body(outgoing, body);
 }
 
 /// Sends `response` (status, headers, body) as the answer: an actor's
@@ -39,11 +37,38 @@ pub fn respond_with(out: ResponseOutparam, response: &crate::actors::Response) {
         return;
     };
     ResponseOutparam::set(out, Ok(outgoing_response));
+    write_body(outgoing, &response.body);
+}
+
+/// Writes a handed-over response's body and finishes it. The stream's
+/// `closed` is the caller leaving: nothing to tell anyone. Another failure
+/// (a body that does not match its content-length, say) is logged, after
+/// the stream is released, as the TypeScript SDK throws it.
+fn write_body(outgoing: OutgoingBody, body: &[u8]) {
+    let mut left = false;
     if let Ok(mut stream) = outgoing.write() {
-        let _ = stream.write_all(&response.body);
-        let _ = stream.flush();
+        // wasip2's `Write` reports the stream's `closed` as a zero-length
+        // write (or an unexpected end): the caller left.
+        if let Err(e) = stream
+            .write_all(body)
+            .and_then(|()| std::io::Write::flush(&mut stream))
+        {
+            left = matches!(
+                e.kind(),
+                std::io::ErrorKind::WriteZero | std::io::ErrorKind::UnexpectedEof
+            );
+            drop(stream);
+            if !left {
+                eprintln!("response body not written: {e}");
+                return;
+            }
+        }
     }
-    let _ = OutgoingBody::finish(outgoing, None);
+    if let Err(e) = OutgoingBody::finish(outgoing, None)
+        && !left
+    {
+        eprintln!("response body not finished: {e:?}");
+    }
 }
 
 /// Sends a complete response with the given headers, every pair as given

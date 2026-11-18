@@ -148,3 +148,87 @@ test("the SQLite UTF-8 path answers exactly what TextEncoder and TextDecoder do"
         db.close();
     }
 });
+/** Edges answering what they got: a push past their position plus one is a
+ * hole, after which the edge holds the push's last number (and tells its
+ * sockets they are behind). */
+function edges(_names: string[], at: Map<string, number>, pushed: Map<string, number>, holes: Set<string>) {
+    return (address: string, p: any) => {
+        if (p.messages?.length) {
+            pushed.set(address, (pushed.get(address) ?? 0) + 1);
+            if (p.first > at.get(address)! + 1)
+                holes.add(address);
+            at.set(address, p.first + p.messages.length - 1);
+        }
+        return { e: 1, n: at.get(address), lagging: 0 };
+    };
+}
+test("sustained 256 KiB batches never starve a child: every child advances, one that falls out of the window is told", () => {
+    db.install(":memory:");
+    const core = new Core(db, alarms);
+    core.init();
+    core.wake();
+    const names = ["edge/a", "edge/b", "edge/c", "edge/d"];
+    const at = new Map(names.map(n => [n, 0])), pushed = new Map<string, number>(), holes = new Set<string>();
+    const answer = edges(names, at, pushed, holes);
+    install((address, r) => ({ status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify(answer(address, JSON.parse(new TextDecoder().decode(r.body))))) }));
+    const round = new Round(names);
+    round.run(core, 0);
+    round.run(core, 20);
+    let now = 40;
+    for (let i = 0; i < 60; i++) {
+        core.publish(Array.from({ length: 4 }, () => ({ body: "z".repeat(65536) })), BigInt(now));
+        round.run(core, now);
+        now += 20;
+    }
+    const head = Number(core.last());
+    for (const n of names) {
+        // 1 MiB a round serves about four 256 KiB slices: each child at least every fourth round.
+        assert((pushed.get(n) ?? 0) >= 15, `${n} pushed ${pushed.get(n) ?? 0} times in 60 rounds: ${[...pushed]}`);
+        assert(head - at.get(n)! <= 128, `${n} at ${at.get(n)} of ${head}`);
+    }
+    db.close();
+});
+test("a child left behind the window gets a push past its position (the edge's behind)", () => {
+    db.install(":memory:");
+    const core = new Core(db, alarms);
+    core.init();
+    core.wake();
+    fill(100, 10, 1000);
+    const at = new Map([["edge/old", 5]]), pushed = new Map<string, number>(), holes = new Set<string>();
+    const answer = edges(["edge/old"], at, pushed, holes);
+    install((address, r) => ({ status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify(answer(address, JSON.parse(new TextDecoder().decode(r.body))))) }));
+    const round = new Round(["edge/old"]);
+    round.run(core, 0);
+    round.run(core, 20);
+    round.run(core, 40);
+    assert(holes.has("edge/old"));
+    assert.equal(at.get("edge/old"), 1099);
+    db.close();
+});
+test("a round reads a bounded number of rows whatever the children's positions, empty bodies included", () => {
+    db.install(":memory:");
+    const c = counting(), core = new Core(c.store, alarms);
+    core.init();
+    core.wake();
+    db.exec("BEGIN", []);
+    for (let n = 1; n <= 2000; n++)
+        db.exec("INSERT INTO wasmkeep_room_history(n,e,at,id,body) VALUES(?1,1,0,?2,'')", [{ tag: "integer", val: BigInt(n) }, { tag: "text", val: "i".repeat(60) + String(n).padStart(4, "0") }]);
+    db.exec("COMMIT", []);
+    const children = Array.from({ length: 256 }, (_, i) => ({ name: `edge/r.e${i}` }));
+    const relays = Array.from({ length: 16 }, (_, r) => ({ name: `relay/r.r${r}`, edges: children.slice(r * 16, r * 16 + 16).map(c => c.name) }));
+    // Each child stays at its own position: 256 distinct slices every round.
+    const position = (name: string) => Number(name.split(".e")[1]) * 7;
+    install((_address, r) => {
+        const pack = JSON.parse(new TextDecoder().decode(r.body));
+        return { status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify(pack.children.map((ch: any) => ({ e: 1, n: position(ch.edge), lagging: 0 })))) };
+    });
+    const round = new Round([]);
+    round.sync(children, relays);
+    round.run(core, 0); // header only: the positions
+    for (let i = 1; i <= 3; i++) {
+        c.reset();
+        round.run(core, i * 20);
+        assert(c.seen.rows <= 1100, `round ${i} read ${c.seen.rows} rows`);
+    }
+    db.close();
+});

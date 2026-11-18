@@ -8,6 +8,10 @@ import type { Push } from "./room-edge";
 import { encode } from "./room-utf8";
 /** Message bytes one round builds for its children (ADR 0040, section 4). */
 const ROUND_BYTES = 1024 * 1024;
+/** What reading one row costs the round's budget besides its JSON: at
+ * most about 1,000 rows a round, which an interpreter turns into items and
+ * JSON well inside the default budget. */
+const ROW_COST = 1024;
 interface Slice {
     first?: number;
     messages: Push["messages"];
@@ -32,32 +36,51 @@ interface Child {
 export class Round {
     private children: Child[];
     private relays: Relay[] = [];
+    /** The child the last round deferred first: the next round starts there. */
+    private resume?: string;
     private suspects = new Map<string, Suspect>();
     constructor(addresses: string[]) {
         if (addresses.length > 16)
             throw Error("at most 16 fixed edges");
         this.children = addresses.map(address => ({ address, initialized: false, suspect: new Suspect() }));
+        this.byAddress = new Map(this.children.map(c => [c.address, c]));
     }
     sync(children: {
         name: string;
     }[], relays: Relay[] = []) {
+        // Maps, not nested scans: a room has up to 256 children every round.
         this.relays = relays;
+        this.relayOf = new Map(relays.flatMap(r => r.edges.map(e => [e, r] as const)));
+        const relayNames = new Set(relays.map(r => r.name));
         for (const name of this.suspects.keys())
-            if (!relays.some(r => r.name === name))
+            if (!relayNames.has(name))
                 this.suspects.delete(name);
-        this.children = this.children.filter(c => children.some(n => n.name === c.address));
+        const names = new Set(children.map(c => c.name));
+        this.children = this.children.filter(c => names.has(c.address));
+        const have = new Set(this.children.map(c => c.address));
         for (const c of children)
-            if (!this.children.some(n => n.address === c.name))
+            if (!have.has(c.name))
                 this.children.push({ address: c.name, initialized: true, suspect: new Suspect() });
+        this.byAddress = new Map(this.children.map(c => [c.address, c]));
     }
-    count(name: string) { return this.children.find(c => c.address === name)?.sockets; }
+    private relayOf = new Map<string, Relay>();
+    private byAddress = new Map<string, Child>();
+    count(name: string) { return this.byAddress.get(name)?.sockets; }
     run(core: Core, now: number) {
         for (const c of this.children)
             c.sockets = undefined;
         if (!core.beforePush(BigInt(now)))
             return;
         const epoch = core.wake(), epochs = core.epochs(), head = core.last() ?? epoch.base;
-        const due = this.children.filter(c => c.suspect.due <= now && !this.relays.some(r => r.edges.includes(c.address) && (this.suspects.get(r.name)?.due ?? 0) > now));
+        const ready = this.children.filter(c => {
+            const r = this.relayOf.get(c.address);
+            return c.suspect.due <= now && !(r && (this.suspects.get(r.name)?.due ?? 0) > now);
+        });
+        // A continuation starts at the child the last round deferred first,
+        // so under sustained publishing every child takes its turn.
+        const from = Math.max(0, ready.findIndex(c => c.address === this.resume));
+        const due = [...ready.slice(from), ...ready.slice(0, from)];
+        this.resume = undefined;
         // Slices by start: children at one position share one read and one encoding.
         const slices = new Map<string, Slice>();
         let read = 0;
@@ -67,10 +90,12 @@ export class Round {
             if (s)
                 return s;
             // Reads stop with the budget too: a deferred child costs nothing.
-            if (read >= ROUND_BYTES)
+            if (read >= ROUND_BYTES || budget <= 0)
                 return;
             s = { messages: [], recover: false };
-            for (const m of core.rows(from, 513, 512 * 1024)) {
+            // Never more rows than the budget has left (one at least).
+            const rows = Math.max(1, Math.min(513, Math.floor((ROUND_BYTES - read) / ROW_COST)));
+            for (const m of core.rows(from, rows, 512 * 1024)) {
                 const boundary = epochs.find(e => e.e === m.position.e);
                 if (!boundary) {
                     s = { messages: [], recover: true };
@@ -84,7 +109,8 @@ export class Round {
                 s.messages.push(item);
                 s.sizes ??= [];
                 s.sizes.push(bytes);
-                read += m.bodyBytes;
+                // Every row costs, an empty one too: its lift, its item and its JSON.
+                read += ROW_COST + bytes;
             }
             slices.set(key, s);
             return s;
@@ -92,6 +118,10 @@ export class Round {
         // One round builds at most ROUND_BYTES of messages (one slice at
         // least): the rest keep their positions and go on 20 ms later.
         let budget = ROUND_BYTES, deferred = false;
+        const defer = (c: Child) => {
+            deferred = true;
+            this.resume ??= c.address;
+        };
         const sent: Child[] = [], pushes: Push[] = [], requests: [
             string,
             actors.Request
@@ -112,7 +142,7 @@ export class Round {
                     const n = epochs.filter(e => e.e > c.position!.e).reduce((n, e) => n < e.base ? n : e.base, c.position.n);
                     const s = n < head ? slice(n + 1n, p.b) : undefined;
                     if (n < head && !s) {
-                        deferred = true;
+                        defer(c);
                         continue;
                     }
                     if (s?.recover)
@@ -124,7 +154,7 @@ export class Round {
                         while (k < s.messages.length && k < 512 && total + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
                             total += s.sizes![k] + (k++ ? 1 : 0);
                         if (k && total - fixed > budget && budget < ROUND_BYTES) {
-                            deferred = true;
+                            defer(c);
                             continue;
                         }
                         budget -= total - fixed;
@@ -145,7 +175,13 @@ export class Round {
             results = calls.callMany(requests);
         else {
             results = requests.map(() => ({ tag: 'err', val: { tag: 'timeout' } }));
-            const groups = this.relays.map(r => ({ relay: r, indices: sent.map((c, i) => r.edges.includes(c.address) ? i : -1).filter(i => i >= 0) })).filter(g => g.indices.length);
+            const byRelay = new Map<Relay, number[]>();
+            sent.forEach((c, i) => {
+                const r = this.relayOf.get(c.address);
+                if (r)
+                    byRelay.set(r, [...(byRelay.get(r) ?? []), i]);
+            });
+            const groups = [...byRelay].map(([relay, indices]) => ({ relay, indices }));
             const replies = calls.callMany(groups.map(g => [g.relay.name, { method: 'POST', path: '/wasmkeep-relay/v1/push', headers: [], body: encode(JSON.stringify(packRelay(g.indices.map(i => ({ edge: sent[i].address, push: pushes[i] }))))) }]));
             groups.forEach((g, i) => {
                 const suspect = this.suspects.get(g.relay.name) ?? new Suspect();

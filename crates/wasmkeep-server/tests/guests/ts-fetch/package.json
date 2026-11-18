@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "wasmkeep-ts build src/index.ts -o ts_fetch.wasm",
-    "build:starlingmonkey": "wasmkeep-ts build src/index.ts -o ts_fetch-starlingmonkey.wasm --engine starlingmonkey"
+    "build": "wasmkeep-ts build src/index.ts -o ts_fetch.wasm && wasmkeep-ts build src/stub-edge.ts -o stub_edge.wasm",
+    "build:starlingmonkey": "wasmkeep-ts build src/index.ts -o ts_fetch-starlingmonkey.wasm --engine starlingmonkey && wasmkeep-ts build src/stub-edge.ts -o stub_edge-starlingmonkey.wasm --engine starlingmonkey"
   },
   "dependencies": {
     "@wasmkeep/sdk": "file:../../../../../sdks/typescript"

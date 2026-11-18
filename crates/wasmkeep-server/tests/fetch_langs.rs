@@ -525,6 +525,18 @@ async fn caller_leaves(file: &str) {
         drop(s);
     }
     assert_eq!(get("/count").await, "2", "the instance was discarded");
+    // A thrown value's fields go to the log, never into the answer.
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /actor/t/a/throw HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 500"), "{out}");
+    assert!(
+        !out.contains("secret-token") && !out.contains("refused"),
+        "{out}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

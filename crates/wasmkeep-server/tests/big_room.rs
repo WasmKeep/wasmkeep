@@ -159,21 +159,37 @@ async fn node(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<(), wasmkeep_server::Error>>,
 )> {
+    node_with(suffix, data, None).await
+}
+
+/// [`node`], with another component as the edge class.
+async fn node_with(
+    suffix: &str,
+    data: &std::path::Path,
+    edge: Option<PathBuf>,
+) -> Option<(
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), wasmkeep_server::Error>>,
+)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ts-big-room");
-    let paths: Vec<_> = ["front", "room", "edge", "relay", "directory"]
+    let mut paths: Vec<_> = ["front", "room", "edge", "relay", "directory"]
         .iter()
         .map(|c| root.join(format!("{c}{suffix}.wasm")))
         .collect();
+    if let Some(edge) = edge {
+        paths[2] = edge;
+    }
     if paths.iter().any(|p| !p.exists()) {
         assert!(
             std::env::var("WASMKEEP_REQUIRE_LANGS").is_err(),
-            "build examples/ts-big-room first"
+            "build examples/ts-big-room and tests/guests/ts-fetch first"
         );
-        eprintln!("skipped: build examples/ts-big-room ({suffix})");
+        eprintln!("skipped: build examples/ts-big-room and tests/guests/ts-fetch ({suffix})");
         return None;
     }
     let config = RuntimeConfig {
-        max_instances: 64,
+        max_instances: 512,
         ..RuntimeConfig::default()
     };
     assert_eq!(config.cpu_budget, Duration::from_millis(50));
@@ -272,6 +288,11 @@ fn room_db(data: &std::path::Path) -> PathBuf {
 /// Rewrites the stopped room's scale row: its edge, then 199 more, and
 /// relays of 16 edges each.
 fn seed_topology(data: &std::path::Path) {
+    seed_edges(data, 200, "f");
+}
+
+/// [`seed_topology`] with `count` edges named `edge/lobby.<tag><i>`.
+fn seed_edges(data: &std::path::Path, count: u64, tag: &str) {
     let db = rusqlite::Connection::open(room_db(data)).unwrap();
     let raw: String = db
         .query_row("SELECT data FROM wasmkeep_room_scale WHERE id=1", [], |r| {
@@ -280,17 +301,17 @@ fn seed_topology(data: &std::path::Path) {
         .unwrap();
     let mut state: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let first = state["children"][0]["name"].as_str().unwrap().to_owned();
-    let step = u64::MAX / 200;
-    let children: Vec<_> = (0..200u64)
+    let step = u64::MAX / count;
+    let children: Vec<_> = (0..count)
         .map(|i| {
-            let name = if i == 0 {
+            let name = if i == 0 && tag == "f" {
                 first.clone()
             } else {
-                format!("edge/lobby.f{i}")
+                format!("edge/lobby.{tag}{i}")
             };
             let mut c =
                 serde_json::json!({ "name": name, "lo": { "$u64": (i * step).to_string() } });
-            if i < 199 {
+            if i + 1 < count {
                 c["hi"] = serde_json::json!({ "$u64": ((i + 1) * step).to_string() });
             }
             c
@@ -442,4 +463,53 @@ async fn typescript_big_room_full_window_at_default_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typescript_big_room_full_window_at_default_budget_starlingmonkey() {
     heavy("-starlingmonkey").await;
+}
+
+/// A round's reads are charged per row, not per body byte: 2,000 messages
+/// with one-character texts and 256 children that never move, each at its
+/// own position (so every round meets 256 distinct slices), at the default
+/// budget. A trapped room event shows as a new epoch.
+async fn distinct_positions(suffix: &str) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wasmkeep=info")
+        .with_test_writer()
+        .try_init();
+    let stub = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/guests/ts-fetch/stub_edge{suffix}.wasm"));
+    let data = tempfile::tempdir().unwrap();
+    let Some((addr, stop, server)) = node_with(suffix, data.path(), Some(stub.clone())).await
+    else {
+        return;
+    };
+    for batch in 0..2000 / 8 {
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            tasks.push(tokio::spawn(async move {
+                publish(addr, &format!("{:036}", batch * 8 + i), "x").await
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap().unwrap().0, 1);
+        }
+    }
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    seed_edges(data.path(), 256, "s");
+    let (addr, stop, server) = node_with(suffix, data.path(), Some(stub)).await.unwrap();
+    assert_eq!(publish(addr, "cold", "x").await.unwrap(), (2, 2001));
+    // About a hundred rounds over 256 lagging children.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let stats = http(addr, "GET", "/stats?name=alice", "").await;
+    assert!(stats.contains("\"edges\":256"), "{stats}");
+    assert_eq!(publish(addr, "after", "x").await.unwrap(), (2, 2002));
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typescript_big_room_distinct_positions_at_default_budget() {
+    distinct_positions("").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typescript_big_room_distinct_positions_at_default_budget_starlingmonkey() {
+    distinct_positions("-starlingmonkey").await;
 }

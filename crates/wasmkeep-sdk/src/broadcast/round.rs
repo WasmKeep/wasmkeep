@@ -6,6 +6,8 @@ pub struct Round {
     children: Vec<Child>,
     relays: Vec<Relay>,
     relay_suspects: std::collections::BTreeMap<String, Suspect>,
+    /// The child the last round deferred first: the next round starts there.
+    resume: Option<String>,
 }
 #[derive(Debug)]
 struct Child {
@@ -87,6 +89,7 @@ impl Round {
         Ok(Self {
             relays: vec![],
             relay_suspects: Default::default(),
+            resume: None,
             children: addresses
                 .iter()
                 .map(|address| Child {
@@ -119,7 +122,16 @@ impl Round {
         let mut read = 0usize;
         let mut budget = ROUND_BYTES;
         let mut deferred = false;
-        for (index, child) in self.children.iter().enumerate() {
+        // A continuation starts at the child the last round deferred first,
+        // so under sustained publishing every child takes its turn.
+        let start = self
+            .resume
+            .take()
+            .and_then(|a| self.children.iter().position(|c| c.address == a))
+            .unwrap_or(0);
+        let order: Vec<usize> = (start..self.children.len()).chain(0..start).collect();
+        for index in order {
+            let child = &self.children[index];
             if child.suspect.due > now
                 || self.relays.iter().any(|r| {
                     r.edges.contains(&child.address)
@@ -162,11 +174,14 @@ impl Round {
                 if let Some(n) = n.filter(|n| *n < head) {
                     let key = (n, push.base);
                     if let std::collections::btree_map::Entry::Vacant(e) = slices.entry(key) {
-                        if read >= ROUND_BYTES {
+                        if read >= ROUND_BYTES || budget == 0 {
                             deferred = true;
+                            self.resume.get_or_insert_with(|| child.address.clone());
                             continue;
                         }
-                        let slice = Slice::read(core, &epochs, n + 1)?;
+                        // Never more rows than the budget has left (one at least).
+                        let rows = ((ROUND_BYTES - read) / ROW_COST).clamp(1, 513);
+                        let slice = Slice::read(core, &epochs, n + 1, rows)?;
                         read += slice.read;
                         e.insert(slice);
                     }
@@ -187,6 +202,7 @@ impl Round {
                         }
                         if k > 0 && total - fixed > budget && budget < ROUND_BYTES {
                             deferred = true;
+                            self.resume.get_or_insert_with(|| child.address.clone());
                             continue;
                         }
                         budget = budget.saturating_sub(total - fixed);
@@ -321,6 +337,9 @@ impl Round {
 
 /// Message bytes one round builds for its children (ADR 0040, section 4).
 const ROUND_BYTES: usize = 1024 * 1024;
+/// What reading one row costs the round's budget besides its JSON: at
+/// most about 1,000 rows a round.
+const ROW_COST: usize = 1024;
 /// The messages after one position, each with its JSON size.
 struct Slice {
     first: Option<u64>,
@@ -330,7 +349,12 @@ struct Slice {
     read: usize,
 }
 impl Slice {
-    fn read<S: Store>(core: &Core<S>, epochs: &[Epoch], from: u64) -> Result<Self, String> {
+    fn read<S: Store>(
+        core: &Core<S>,
+        epochs: &[Epoch],
+        from: u64,
+        rows: usize,
+    ) -> Result<Self, String> {
         let mut s = Slice {
             first: None,
             items: vec![],
@@ -338,8 +362,7 @@ impl Slice {
             recover: false,
             read: 0,
         };
-        for m in core.rows(from, 513, 512 * 1024)? {
-            s.read += m.body.len();
+        for m in core.rows(from, rows, 512 * 1024)? {
             let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
                 return Ok(Slice { recover: true, ..s });
             };
@@ -353,7 +376,10 @@ impl Slice {
                 id: m.id,
                 body: m.body,
             };
-            s.sizes.push(item.json().len());
+            let size = item.json().len();
+            // Every row costs, an empty one too: its read, its item and its JSON.
+            s.read += ROW_COST + size;
+            s.sizes.push(size);
             s.items.push(item);
         }
         Ok(s)

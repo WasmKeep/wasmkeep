@@ -2,3 +2,5 @@ node_modules/
 ts_fetch.wasm
 ts_fetch-starlingmonkey.wasm
 .wasmkeep-actor.js
+stub_edge.wasm
+stub_edge-starlingmonkey.wasm

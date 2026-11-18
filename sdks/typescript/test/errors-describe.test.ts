@@ -17,7 +17,7 @@ test("a WIT error value shows its fields, not [object Object]", () => {
     assert.equal(describeError("refused"), "refused");
 });
 import { writeBody } from "../src/response-body";
-test("a response stream the caller closed ends the write quietly", () => {
+test("a response stream the caller closed ends the write quietly; other failures are thrown", () => {
     let writes = 0, finished = false;
     const logged: string[] = [], error = console.error;
     console.error = (m: string) => { logged.push(m); };
@@ -25,7 +25,13 @@ test("a response stream the caller closed ends the write quietly", () => {
         writeBody({ blockingWriteAndFlush() { if (++writes === 2) throw new ComponentError({ tag: "closed" }); } }, new Uint8Array(20000), () => { finished = true; });
         assert.equal(writes, 2);
         assert.equal(finished, true);
-        writeBody({ blockingWriteAndFlush() { } }, new Uint8Array(10), () => { throw new ComponentError({ tag: "closed" }); });
+        writeBody({ blockingWriteAndFlush() { throw new ComponentError({ tag: "closed" }); } }, new Uint8Array(10), () => { throw new ComponentError({ tag: "closed" }); });
+        // Not a departure: thrown, after the stream is released.
+        let released = false;
+        const stream = { blockingWriteAndFlush() { throw new ComponentError({ tag: "last-operation-failed", val: {} }); }, [Symbol.dispose]() { released = true; } };
+        assert.throws(() => writeBody(stream, new Uint8Array(10), () => { }), ComponentError);
+        assert(released);
+        assert.throws(() => writeBody({ blockingWriteAndFlush() { } }, new Uint8Array(10), () => { throw new ComponentError({ tag: "HTTP-response-body-size", val: 10n }); }), ComponentError);
     }
     finally {
         console.error = error;

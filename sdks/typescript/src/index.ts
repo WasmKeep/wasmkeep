@@ -312,7 +312,10 @@ export function exportsFor(definition: ActorDefinition) {
         try {
           response = definition.fetch ? definition.fetch(req) : { status: 404, body: "no fetch handler\n" };
         } catch (e) {
-          response = { status: 500, body: `${failed(e)}\n` };
+          // The details (a thrown value's fields, a host error's) go to the
+          // log only: a 500 body says nothing a caller should not see.
+          console.error(failed(e));
+          response = { status: 500, body: "actor error\n" };
         }
         respond(out, response);
       },

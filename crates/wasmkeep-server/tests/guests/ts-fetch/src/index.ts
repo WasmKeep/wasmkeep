@@ -11,7 +11,8 @@
 // words it; with seq=1, one `http.fetch` after the other instead.
 //
 // GET /count answers how many times it ran in this instance; GET /large
-// answers 16 MiB, for a caller that leaves after the head.
+// answers 16 MiB, for a caller that leaves after the head. GET /throw
+// throws an object with a secret field, which no answer may show.
 
 import { defineActor, http } from "@wasmkeep/sdk";
 
@@ -44,6 +45,7 @@ export default defineActor({
     if (req.method !== "GET") return { status: 404, body: "GET only\n" };
     if (path === "/count") return String(++count);
     if (path === "/large") return new Uint8Array(16 * 1024 * 1024);
+    if (path === "/throw") throw { message: "refused", token: "secret-token-1234" };
     if (path === "/fetch") {
       const send = Number(params(req.path, "send")[0] ?? "0");
       const r = request(send, params(req.path, "url")[0] ?? "");
