@@ -53,6 +53,11 @@ Known limits:
   acknowledges 2.4 to 4.3 of 10 messages/s
   ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)). The
   room's node keeps the memory it took, and its edges stay on one node.
+- **On StarlingMonkey, a big room can run out of guest memory on a
+  starved CPU.** With one core for the node, the room actor's heap grows
+  until SpiderMonkey's garbage collector cannot allocate, and the room's
+  instance is discarded; with two cores, or on QuickJS, the same test
+  passes. Build big rooms for QuickJS (the default engine) for now.
 - **Batched plain writes lose more than the healthy bound.** 14.3 per
   node kill in the soak, inside the stalled-bucket bound (about 31) but
   above the healthy one (about 8, ADR 0034). Use durable writes for data
