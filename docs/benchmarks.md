@@ -996,6 +996,102 @@ and
   takeover within half a second. Each mode ran once, so these differences
   are not shown to be more than the run-to-run noise.
 
+### Two hours on 0.6.0, two apps per process
+
+**Measured on `14f7ea2`.** The same three OVH VPS and bucket, the same
+cadence (two hours, 7,203 s, 39 kills each), one strict run and one
+batched run as above, but every node serving **two apps in one process**
+([ADR 0038](adr/0038-several-apps-per-process.md)).
+
+| | Strict | Batched |
+| --- | --- | --- |
+| Acknowledged durable writes lost | **0** | **0** |
+| Values handed out twice | **0** | **0** |
+| Durable writes acknowledged | 464,219 | 470,272 |
+| Durable write, as a client sees it (p50 / p99 / max) | 61.3 ms / 993 ms / 14.17 s | 63.5 ms / 869 ms / 11.59 s |
+| Writes that returned an error | 17,078 | 16,292 |
+| Restarted node ready | 0.22 s at most | 0.45 s at most |
+| Plain writes acknowledged | 263,182 | 1,340,782 |
+| Plain increments lost (values handed out again) | 1 (1) | 558 (558) |
+| Plain increments lost per kill | 0.03 | 14.3 |
+
+From
+[`…-14f7ea2-soak-ovh-bhs-3vps-2h-strict-two-apps.csv`](../bench/results/2026-11-18-14f7ea2-soak-ovh-bhs-3vps-2h-strict-two-apps.csv)
+and
+[`…-14f7ea2-soak-ovh-bhs-3vps-2h-batched-two-apps.csv`](../bench/results/2026-11-18-14f7ea2-soak-ovh-bhs-3vps-2h-batched-two-apps.csv).
+
+#### How to read it
+
+- **Durable writes are never lost, with two apps per process.** No
+  acknowledged durable write was lost or handed out twice in either run:
+  0 of 464,219 strict, 0 of 470,272 batched.
+- **Not recorded in these runs: takeovers, alarms and takeover reads.**
+  Their rows (`failover_*`, `alarms_*`, `takeover_reads_*`,
+  `probe_attempts`) are 0 in both files, so these runs say nothing about
+  how fast actors were writable again or whether alarms fired; the
+  one-app runs above do.
+- **Batched plain writes lost about 14 per kill, above the healthy-bucket
+  bound and inside the stalled-bucket one.** The batched run lost 558 of
+  1,340,782 acknowledged plain increments over 39 kills: 14.3 per kill.
+  The bounds below are derived from the same file and the documented
+  defaults, not measured rows. The run acknowledged 186 plain writes a
+  second across the cluster, so about 62 a second on the node that was
+  killed (a third). With a healthy bucket, a node's death loses about two
+  upload round trips plus one event (`2r + e`,
+  [ADR 0034](adr/0034-batched-plain-writes.md), section 3): with `r` the
+  durable write's median, 63.5 ms (one PUT), that is about 127 ms of
+  writes, **about 8 per kill**. With a stalled bucket it may lose up to
+  `--max-unsent-age` (500 ms by default) plus one event: **about 31 per
+  kill**. 14.3 is inside the second and almost twice the first, so on
+  average these kills lost more than a healthy bucket explains; what held
+  the uploads back is not measured here. The count is over all actors and
+  kills, so it is evidence about the bound, not a proof of it. The
+  one-app run of `57b76c2` above lost about 20 per kill against the same
+  kind of bounds.
+- **Strict plain writes lost 1 of 263,182.** A plain write is answered
+  before its upload, so a node's death may lose one even in strict mode.
+  The batched run acknowledged about five times as many plain writes in
+  the same two hours.
+- **Not compared with the one-app runs.** Two apps per process change the
+  load on each node, so the durable medians (61 to 64 ms here, 77 to 79 ms
+  on `57b76c2`) are not a before and after of one change.
+
+### A node coming back, with and without placement
+
+**Measured on `14f7ea2`.** Placement at wake-up
+([ADR 0041](adr/0041-placement-at-wake-up.md)) sends an actor nobody holds
+to a lighter node when it wakes. Three OVH VPS behind a load balancer that
+hashes the actor's path, one node taken down and brought back while
+clients write, once with placement on (the default) and once with
+`--no-placement`; one run each.
+
+| | Placement on | Placement off |
+| --- | --- | --- |
+| Acknowledged writes lost | **0** | **0** |
+| Values acknowledged twice | **0** | **0** |
+| Actors that flapped between nodes | **0** | **0** |
+| Writes acknowledged | 33,477 | 29,130 |
+| HTTP 5xx answers | 84 | 78 |
+| Node down until ready again | 101.7 s | 111.4 s |
+| Ready until the returned node held 80 % of its share | **9.3 s** | **18.4 s** |
+| Actors placed on the returned node | 35 | 0 |
+| p99 latency before / while down / after | 635 / 1,250 / 631 ms | 669 / 1,390 / 723 ms |
+| Slowest request | 4.39 s | 5.64 s |
+
+From
+[`…-14f7ea2-placement-return-hash-lb-ovh-bhs-3vps.csv`](../bench/results/2026-11-18-14f7ea2-placement-return-hash-lb-ovh-bhs-3vps.csv)
+(the 80 % row is `fill_80pct_after_ready`).
+
+- **The returning node took its share in half the time.** 9.3 s with
+  placement against 18.4 s without: 35 actors that woke elsewhere were
+  sent to it, where without placement it got only what the balancer sent.
+- **Nothing lost, nothing flapped.** No acknowledged write was lost or
+  acknowledged twice, and no actor moved back and forth, with a hashing
+  balancer: the condition ADR 0041 set for keeping placement on by
+  default. It stays on by default.
+- One run per side: the 5xx counts (84 and 78) and the latency rows are
+  not shown to differ beyond run-to-run noise.
+
 ### Bucket requests at rest
 
 **Measured on 0.4.1.** The same three VPS and bucket, on `0bf0547`
@@ -1020,14 +1116,118 @@ floor under the bill before
 any traffic in that version and scenario; a bucket that does not bill
 requests charges nothing for it.
 
-**Modeled for 0.4.2, not remeasured here.** The
+**Modeled since 0.4.2.** The
 [documented cadence](cluster.md#what-an-idle-cluster-asks-of-the-bucket)
 for an idle three-node, one-app cluster implies approximately 0.333 PUT,
 0.1 LIST and 2.333 GET per node-second, excluding the optional idle-expiry
-scan. These are derived rates, not observations from the CSV above.
-The roughly thirteenfold reduction in LIST cadence is a model comparison,
-not a new measurement obtained by dividing the old result. A measurement
-of the released binary is still needed to validate these cost inputs.
+scan. These are derived rates, not observations.
+
+**Measured on 0.6.0: GETs run above the model.** Three nodes on `14f7ea2`
+with a bucket on loopback, ten minutes (600 s) at rest, once with one app
+per process and once with two, read from `wasmkeep_bucket_requests_total`
+on each node
+([`…-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv`](../bench/results/2026-11-18-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv)).
+Per node and second, nodes a / b / c:
+
+| | One app | Two apps | Model, one app |
+| --- | --- | --- | --- |
+| PUT | 0.333 / 0.333 / 0.333 | 0.667 / 0.667 / 0.667 | 0.333 |
+| LIST | 0.133 / 0.117 / 0.117 | 0.250 / 0.233 / 0.233 | about 0.1 |
+| GET | 3.300 / 3.088 / 3.307 | 8.543 / 8.242 / 8.382 | 2.333 |
+| GET answered not found | 1.978 / 1.805 / 1.982 | 3.903 / 3.665 / 3.773 | |
+| DELETE | 0 | 0 | 0 |
+
+- **PUTs match the model**: the node lease, one per heartbeat period,
+  one per app.
+- **LISTs are close**: 0.12 to 0.13 against about 0.1.
+- **GETs are above it**: 3.1 to 3.3 per node and second against 2.333,
+  about 40 % more. The file has a separate row for GETs answered not
+  found and does not say whether the GET row includes them; if it does
+  not, the excess is larger still. The documented cadence does not yet
+  account for the difference, so its GET figure is a floor, not the
+  rate: at the measured rate three idle nodes ask for about 25 million
+  GETs in a 30-day month, not 18 million.
+- **A second app costs more than the first.** PUTs and LISTs double;
+  GETs grow about 2.6 times (8.4 against 3.2 on average).
+- The bucket was on loopback, so these are request counts, which the
+  periods in the code set, not latencies; a remote bucket was not
+  measured on this build.
+
+## The change feed at 100,000 actors
+
+How long one poll of [the change feed](change-feed.md)
+([ADR 0039](adr/0039-the-change-feed.md)) takes on a large app. From
+[`bench/results/2026-11-18-14f7ea2-feed-100k-actors-ovh-bucket.csv`](../bench/results/2026-11-18-14f7ea2-feed-100k-actors-ovh-bucket.csv)
+(commit `14f7ea2`), run from one OVH VPS-2 in Beauharnois (4 vCPU) against
+the OVHcloud bucket next to it: an app of 100,000 actors holding 200,000
+history objects (two per actor), polled three times.
+
+| Poll | Time | Memory peak | Actors left for the next poll |
+| --- | --- | --- | --- |
+| First (every actor new to the feed) | 541 s (9.0 min) | 530 MB | 0 |
+| At rest (nothing changed) | **51.4 s** | 57.6 MB | |
+| After 1 % of the actors changed (1,000) | 79.9 s | 80.1 MB | 0 |
+
+### How to read it
+
+- **A poll at rest is the listing.** With nothing to write, the poll
+  lists the app's history once (200 pages of 1,000 keys here) and compares
+  every head with the one it recorded: 51.4 s. A thousand changed actors
+  add 28.5 s.
+- **At 20 history objects per actor it would take about 8.6 minutes.**
+  The listing grows with the objects, not the actors: 2,000,000 objects
+  are 2,000 pages, ten times this run, so a poll at rest would take about
+  514 s, if it stays linear (an estimate from this row, not measured).
+  That is longer than the one-minute interval
+  [the guide](change-feed.md) uses for its cost example: on an app that
+  size, a poll does not finish before the next is due.
+- **A known limit.** The poll lists the app with one listing, one page
+  after another; listing in parallel is the follow-up. Until then, a large
+  app needs a longer interval.
+- The first poll writes every actor's state once and holds more in
+  memory (530 MB at its peak); later polls hold about a tenth of that.
+
+## A restore drill against a real bucket
+
+How long [the automated restore drill](deploy/backup-and-restore.md#automated-fixture-drill)
+takes against a real bucket: a backup of a small fixture app made while it
+takes writes, verified, restored into an empty prefix, and a node started
+on the copy. From
+[`…-14f7ea2-restore-drill-ovh-bucket-debug-build.csv`](../bench/results/2026-11-18-14f7ea2-restore-drill-ovh-bucket-debug-build.csv)
+and
+[`…-14f7ea2-restore-drill-ovh-bucket-release-build.csv`](../bench/results/2026-11-18-14f7ea2-restore-drill-ovh-bucket-release-build.csv)
+(commit `14f7ea2`, the OVHcloud bucket), once with each build.
+
+| Step | Debug build | Release build |
+| --- | --- | --- |
+| `backup create` | 3.37 s | 1.88 s |
+| `backup verify` | 1.46 s | 1.23 s |
+| `backup restore` | **85.4 s** | **93.7 s** |
+| Restored node started, until it answered | 17.6 s | 18.4 s |
+| Files backup created / restored | 2.52 s / 84.9 s | 1.34 s / 84.4 s |
+| Writes acknowledged during the backup / during the drill | 16 / 369 | 11 / 505 |
+| Actors checked against the acknowledged floor | 4 of 4 | 4 of 4 |
+| Bucket errors on the restored node | 0 | 0 |
+
+### How to read it
+
+- **A restore is mostly two fixed waits.** `backup restore` waits 40 s
+  after the restore fence and the latest heartbeat before writing history,
+  and, on an ordinary exit, settles 40 s before releasing its lock, so a
+  late request cannot remove a later fence
+  ([backup and restore](deploy/backup-and-restore.md)). That is up to
+  80 s of the 85 to 94 s; the copy itself is the rest. The drill's second
+  restore, of files and assets, took about as long (84 to 85 s).
+- **The build does not matter here.** The release build restored slower
+  (93.7 s) than the debug build (85.4 s), one run each: the waits and the
+  bucket set the time, not the code.
+- **Starting on the copy took about 18 s** (17.6 and 18.4 s). The drill
+  does not split it; a node replacing a lease the copy says is `live`
+  waits about 15 s for the start check
+  ([what a restore brings back](deploy/backup-and-restore.md)).
+- Every acknowledged write the drill checked was in the restored copy, and
+  the restored node's bucket requests had no errors (2 conditional PUTs
+  answered `precondition`, 28 GETs answered not found).
 
 ## The allocator: system against mimalloc
 
@@ -1110,6 +1310,39 @@ OVHcloud Object Storage, 587 ms from a desktop to R2
 Failover is set by the node lease timings (15 to about 21 s after the
 node's last heartbeat) plus a restore; see
 [Running a cluster](cluster.md#how-it-works).
+
+## 0.6.0 against v0.5.1
+
+The [regression check](#regression-check-on-pull-requests) run by hand
+on one OVH VPS-2 (4 vCPU, Haswell): `14f7ea2` against the `v0.5.1` tag,
+three interleaved rounds of the `instantiate`, `http` and `actors`
+suites. From
+[`bench/results/2026-11-18-14f7ea2-bench-ab-v0.5.1-3rounds.csv`](../bench/results/2026-11-18-14f7ea2-bench-ab-v0.5.1-3rounds.csv):
+the median over the rounds of each round's ratio, as a change in time
+(positive: `14f7ea2` takes longer).
+
+| Benchmark | Change |
+| --- | --- |
+| `actor/create` (first request to a new actor) | −1.9 % |
+| `actor/wake` (wake a hibernated actor) | +5.5 % |
+| `actor/warm` (request to a resident actor) | +8.6 % |
+| `hello/instantiate` | +5.7 % |
+| `hello/request/wasmkeep` | +4.7 % |
+| `hello/request/raw-hyper` (plain hyper, no WasmKeep code) | −4.0 % |
+| `instantiate/store+instance` | +1.4 % |
+| `instantiate/store+instance+call` | +0.2 % |
+
+### How to read it
+
+- **No regression past the check's threshold.** Every row is within
+  ±9 %, far from the 20 % the check fails on.
+- **The control moved 4 %.** Plain hyper, which runs no WasmKeep code,
+  came out 4.0 % faster, so the machine drifted by about that much between
+  sides. Most rows are within a few percent of it.
+- **The largest change is a request to a resident actor, +8.6 %**, then
+  the hello component's instantiation (+5.7 %) and a wake (+5.5 %). Three
+  rounds on a shared VPS catch large regressions, not changes of this
+  size; they are worth watching, not shown to be real.
 
 ## One big room
 
@@ -1370,6 +1603,49 @@ partial file on completion. Keep raw runs in scratch storage. Publish only
 reviewed, redacted evidence under `bench/results/`, named
 `<date>-<commit>-room-group-<label>.json`, following the publication-path rules
 below. R7 commits no measurements; R8 owns real-bucket capacity claims.
+
+## A big room on three nodes (preview)
+
+One [ts-big-room](../examples/ts-big-room/README.md) lobby on 0.6.0
+(`cac4826`) at the default 50 ms CPU budget, on three 4-vCPU nodes with a
+real bucket, two apps per process. Six generators of the
+[harness](#reconnecting-room-harness), two per node, each joined clients
+over 600 s, held 900 s (with 17 stalled readers for 60 s), then left. Six
+closed-loop publishers offered 10 messages/s of 256 bytes in total. The
+steps ran back to back on one room, 10,000 first, so later steps carry the
+earlier history. Every generator was valid at every step.
+[Results](../bench/results/2026-11-19-cac4826-room-group-ovh-bhs-3vps-r4-default-budget.json).
+
+During the 900 s hold:
+
+| Clients | Ready | Delivery p50 | Delivery p99 | Publishes acknowledged/s | Unacknowledged after 30 s (run) | Incomplete clients | Traps | Room node memory |
+|---|---|---|---|---|---|---|---|---|
+| 10,000 | 9,934 | 2.1-2.3 s | 10.2-15.4 s | 2.35 | 161 | 0 | 12, room actor | 1.75-2.44 GB |
+| 6,000 | 6,000 | 1.7-1.8 s | 10.7-11.2 s | 2.63 | 40 | 0 | 0 | 2.25-2.56 GB |
+| 4,500 | 4,500 | 1.3 s | 5.0-5.6 s | 4.25 | 61 | 0 | 0 | 2.39-2.50 GB |
+| 3,000 | 2,977 | 0.9-1.0 s | 8.0-11.7 s | 3.78 | 11 | 1 | 4, front | 2.39-2.46 GB |
+
+Ranges are across the six generators. The other two nodes stayed under
+310 MB.
+
+### How to read it
+
+- **Big rooms are a preview in 0.6.0, with no supported client count.**
+  No step met the targets set before the run: a delivery p99 of 1 s and
+  all 10 messages/s acknowledged.
+- **The room no longer wedges at the default budget.** One client at
+  3,000 ended without every message; none did at the larger steps.
+- **The publish path is the limit, not the sockets or the edges.** A
+  publish took 1 to 2.3 s to be acknowledged; the publishers wait for each
+  acknowledgement, so the rate and delivery latency follow it.
+- **The room's node kept its memory** after the 10,000 step and never gave
+  it back.
+- After the 10,000 step's leave, the room served nothing for 60 s at 2,000
+  clients, then served again.
+- Not measured: a killed edge node, a fresh room per step, bucket requests.
+
+These are the first items of `0.7.0` in the [roadmap](../ROADMAP.md).
+
 
 ## Reproduce
 

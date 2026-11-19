@@ -1,0 +1,12 @@
+date,commit,host,cpu,cores,rustc,bench,median_ns,median_low_ns,median_high_ns,mean_ns,unit,thp
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/actors",100000,,,,"count","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/history_objects",200000,,,,"count","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/first_poll",541114000000,,,,"ns","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/first_poll_memory_peak",529845452,,,,"bytes","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/first_poll_actors_left",0,,,,"count","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/rest_poll",51374000000,,,,"ns","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/rest_poll_memory_peak",57566822,,,,"bytes","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/changed_1pct_actors",1000,,,,"count","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/changed_1pct_poll",79897000000,,,,"ns","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/changed_1pct_poll_memory_peak",80111206,,,,"bytes","always"
+"2026-11-18","14f7ea2","ovh-vps-2-bhs","Intel Core Processor (Haswell, no TSX)","4","1.99.1","feed/changed_1pct_actors_left",0,,,,"count","always"
