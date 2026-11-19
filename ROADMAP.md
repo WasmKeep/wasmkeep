@@ -302,10 +302,10 @@ Started alongside M3; what is left of it is under [Now](#now) and
 - In `0.6.0`, the change feed to Parquet
   ([ADR 0039](docs/adr/0039-the-change-feed.md),
   [guide](docs/change-feed.md)).
-- In `0.6.0`, a room past one actor: a directory, a broadcast group,
-  edges and relays
+- In `0.6.0`, a room past one actor, as a preview: a directory, a
+  broadcast group, edges and relays
   ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md),
-  [measured](docs/benchmarks.md)).
+  [measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)).
 - In `0.6.0`, placement at wake-up, on by default
   ([ADR 0041](docs/adr/0041-placement-at-wake-up.md),
   [measured](docs/benchmarks.md#a-node-coming-back-with-and-without-placement)).

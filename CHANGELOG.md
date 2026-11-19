@@ -16,7 +16,7 @@ One process serves several apps behind its three ports (a node file);
 actors and the front keep files; an app deploys static assets; an
 operator streams an app's actors to Parquet with the change feed, and
 inspects a bucket from a local page; a room scales past one actor with a
-directory, a broadcast group and edge actors; a node places a wake-up on
+directory, a broadcast group and edge actors (a preview); a node places a wake-up on
 a lighter node. Rust gets typed clients, and a React quickstart ties a
 TypeScript actor to a Vite page. Still a **pre-alpha pre-release**.
 
@@ -42,7 +42,12 @@ benchmark moved more than 9% against 0.5.1.
 
 Known limits:
 
-<!-- big room: filled after B1 r4 -->
+- **Big rooms are a preview, with no supported client count.** On three
+  nodes, 3,000 to 10,000 clients stay connected and the room no longer
+  wedges, but the room's publish path holds delivery p99 at 5 to 15 s and
+  acknowledges 2.4 to 4.3 of 10 messages/s
+  ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)). The
+  room's node keeps the memory it took, and its edges stay on one node.
 - **Batched plain writes lose more than the healthy bound.** 14.3 per
   node kill in the soak, inside the stalled-bucket bound (about 31) but
   above the healthy one (about 8, ADR 0034). Use durable writes for data
@@ -54,7 +59,6 @@ Known limits:
   make sure no old holder still writes.
 - **Idle nodes send more GETs than modeled**: about 3.2 a second per
   node instead of 2.3.
-- A room's edges stay on one node; spreading them is later.
 
 
 - **`app delete` writes the tombstone at once.** To refuse an app that
