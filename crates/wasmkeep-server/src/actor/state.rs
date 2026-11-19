@@ -225,6 +225,15 @@ impl Drop for ActorState {
 }
 
 impl ActorState {
+    /// A guest event's mailbox job is starting, before ownership, restore
+    /// and guest preparation. Internal maintenance jobs are not events.
+    pub(super) fn record_mailbox_wait(&self, waited: Duration) {
+        crate::metrics::METRICS
+            .mailbox_wait_seconds
+            .get_in(&self.app_labels, &[("class", self.address.class())])
+            .observe(waited);
+    }
+
     /// The mailbox's step before this state is dropped (ADR 0034, section
     /// 6): waits for the hold to reach its barrier, by the site's deadline.
     /// A strict hold is there at once, so this is ready at once and the

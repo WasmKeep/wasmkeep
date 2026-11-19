@@ -1127,3 +1127,58 @@ async fn a_held_callee_answers_its_caller_and_holds_its_next_event() {
         started.elapsed()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timing_start_rule_wait_with_held_upload() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        c.max_unsent_age = Duration::from_millis(100);
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.hold_wal_puts.send_replace(true);
+    assert_eq!(
+        send(p.a.addr, "POST", "/actor/t/x/plain", "").await.status,
+        200
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while p.flaky.held_wal_puts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        send(p.a.addr, "POST", "/actor/t/x/plain", "").await.status,
+        200
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // This event answers, then its boundary finds the old uncaptured write.
+    assert_eq!(
+        send(p.a.addr, "GET", "/actor/t/x/plain", "").await.status,
+        200
+    );
+    let next = send(p.a.addr, "GET", "/actor/t/x/plain", "");
+    tokio::pin!(next);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut next)
+            .await
+            .is_err()
+    );
+    p.flaky.hold_wal_puts.send_replace(false);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .status,
+        200
+    );
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    let series = "wasmkeep_event_start_rule_wait_seconds_sum{tenant=\"default\",app=\"default\",class=\"t\"} ";
+    let sum: f64 = page
+        .lines()
+        .find_map(|line| line.strip_prefix(series))
+        .unwrap_or_else(|| panic!("missing start-rule timing: {page}"))
+        .parse()
+        .unwrap();
+    assert!(sum >= 0.1, "held upload wait: {sum}");
+}

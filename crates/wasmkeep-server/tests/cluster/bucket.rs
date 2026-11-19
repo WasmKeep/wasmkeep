@@ -904,13 +904,15 @@ async fn readiness_follows_the_bucket_and_metrics_count_events() {
     assert_eq!(value("wasmkeep_hibernations_total"), 0, "{page}");
     assert_eq!(value("wasmkeep_instantiate_seconds_count"), 1, "{page}");
     assert_eq!(value("wasmkeep_durable_write_seconds_count"), 3, "{page}");
-    assert_eq!(
-        value(
-            "wasmkeep_event_duration_seconds_count{tenant=\"default\",app=\"default\",class=\"t\"}"
-        ),
-        5,
-        "{page}"
-    );
+    for (kind, count) in [("fetch", 4), ("other", 1)] {
+        assert_eq!(
+            value(&format!(
+                "wasmkeep_event_duration_seconds_count{{tenant=\"default\",app=\"default\",class=\"t\",kind=\"{kind}\"}}"
+            )),
+            count,
+            "{page}"
+        );
+    }
     // Every bucket request is counted, failures apart from the rest.
     let bucket = |operation: &str, status: &str| {
         let series = format!(

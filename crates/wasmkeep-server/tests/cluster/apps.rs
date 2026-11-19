@@ -523,7 +523,7 @@ async fn the_metrics_page_names_the_nodes_app_and_version() {
     );
     assert!(
         page.contains(
-            "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"t\"} "
+            "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"t\",kind=\"fetch\"} "
         ),
         "{page}"
     );

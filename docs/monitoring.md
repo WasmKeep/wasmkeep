@@ -167,7 +167,9 @@ its first request.
 | `wasmkeep_classes` | gauge | Classes served. |
 | `wasmkeep_ready`, `wasmkeep_not_ready{reason}` | gauges | 1 when `/_wasmkeep/ready` answers 200. `wasmkeep_not_ready` has a series for every reason in the table above and the others a node gives (the cluster secret, the node lease, the disk, the deployed version, the app's secrets), always on the page: 1 for the reason the node is not ready, 0 for the others. Count not-ready nodes with `count(wasmkeep_not_ready == 1)`. |
 | `wasmkeep_events_total{tenant,app,class,kind,outcome}` | counter | Events run; `kind` is `request`, `alarm`, `websocket` or `init`, `outcome` is `ok` or `failed` (trapped, cut, or a handler that returned an error). |
-| `wasmkeep_event_duration_seconds{tenant,app,class}` | histogram | Slow handlers and hot classes. |
+| `wasmkeep_mailbox_wait_seconds{tenant,app,class}` | histogram | Time from the accepted enqueue attempt to the start of a guest-event mailbox job; excludes capacity-admission retries. |
+| `wasmkeep_event_duration_seconds{tenant,app,class,kind}` | histogram | Guest event execution, including awaited host calls: `fetch` (HTTP and actor calls), `alarm`, `websocket` (open/message/close), or `other` (initialization). Excludes post-event replication. |
+| `wasmkeep_event_start_rule_wait_seconds{tenant,app,class}` | histogram | A batched event's boundary holding back the next event: capture, upload-budget wait and the event-start rule's upload wait. Recorded once per completed boundary, including failed ones; absent for strict holds. |
 | `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit) or `lease` (this node lost the actor mid-event). |
 | `wasmkeep_cpu_budget_exceeded_total` | counter | Guest calls stopped for using their CPU budget. |
 | `wasmkeep_instantiate_seconds` | histogram | Creating an actor's instance: the wake cost. |
@@ -238,6 +240,58 @@ per process for now: join on `wasmkeep_info`), traps by reason
 `wasmkeep_cpu_budget_exceeded_total` cover them for now) and parked
 WebSockets (sockets are not parked yet; `wasmkeep_websockets_open` counts
 them).
+
+### Attributing a slow publish
+
+Read the three timing histograms for the room's `tenant`, `app` and
+`class`, then compare event duration by `kind`. They never label an actor
+name. They use the existing seconds buckets (100 µs through 30 s, plus
+`+Inf`); `_count` counts observations and `_sum` is their total seconds.
+
+- High `wasmkeep_mailbox_wait_seconds` means events cannot get their
+  mailbox turn. It covers accepted HTTP/call, alarm and WebSocket jobs,
+  including jobs later abandoned or refused by ownership checks. It ends
+  when the job takes the actor state, before ownership, restore and guest
+  preparation; creating the mailbox's initial state is included. Admission
+  retries before the successful enqueue are excluded, as are jobs that
+  never start. Internal maintenance jobs do not create observations, but
+  can delay queued events.
+- High `wasmkeep_event_duration_seconds{kind="alarm"}` can explain
+  publishes waiting behind a room's fan-out round. High `kind="fetch"`
+  points to its HTTP/call handlers. This is wall time, including database,
+  outbound calls and guest `flush` waits, not CPU time. `websocket` groups
+  open, message and close callbacks; `other` currently covers initialization.
+  The `kind` label is new in 0.7.0; aggregate over it for the previous
+  per-class view. `wasmkeep_events_total` keeps its existing kind names.
+- High `wasmkeep_event_start_rule_wait_seconds` points to the batched
+  boundary, including upload-budget pressure and waiting for an upload.
+  [ADR 0034 section 3](adr/0034-batched-plain-writes.md#3-when-an-event-may-start-and-the-loss-bound)
+  applies this rule **after the previous event's answer**, inside its
+  mailbox job. The observation includes boundary/capture work even when
+  no upload wait is needed, and excludes periodic snapshots. Strict holds
+  do not create this timer or a series. Use `wasmkeep_batched_waits_total`
+  for the reason (`age`, `bytes`, `budget`).
+
+These are attribution signals, not three additive parts of an individual
+acknowledgement. A boundary hold overlaps the mailbox wait of every event
+queued behind it, and can also run with no event queued. Do not subtract
+histogram quantiles or add their sums to estimate request latency. An HTTP
+or actor-call answer can arrive before its guest event finishes; ownership,
+restore, networking and post-event strict replication are not guest event
+time. A slow publish with high queue wait but short fetch duration is
+waiting behind other work; the alarm and start-rule histograms distinguish
+long handlers from batched replication backpressure. Class histograms
+aggregate all rooms in that class.
+
+For example, compare p99 event duration by kind over five minutes:
+
+```promql
+histogram_quantile(0.99,
+  sum by (tenant, app, class, kind, le) (
+    rate(wasmkeep_event_duration_seconds_bucket[5m])
+  )
+)
+```
 
 ### Bucket requests
 
@@ -318,7 +372,8 @@ an event that gives the hold up.
 ### Grafana dashboard
 
 [`deploy/grafana/wasmkeep.json`](../deploy/grafana/wasmkeep.json) shows
-every metric above except `wasmkeep_classes`, the guest log counters
+every metric above except `wasmkeep_classes`, the timing histograms
+`wasmkeep_mailbox_wait_seconds` and `wasmkeep_event_start_rule_wait_seconds`, the guest log counters
 (`wasmkeep_guest_log_lines_total`, `wasmkeep_guest_log_dropped_total`),
 the history collection counters (`wasmkeep_history_collected_total`,
 `wasmkeep_history_collect_failures_total`),

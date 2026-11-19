@@ -289,9 +289,13 @@ pub(crate) struct Metrics {
     /// Events run, by class, kind (`request`, `alarm`, `websocket`, `init`)
     /// and outcome (`ok`, `failed`); rendered with the node's tenant and app.
     pub(crate) events: Family<AtomicU64>,
-    /// How long events ran, by class; rendered with the node's tenant and
-    /// app.
+    /// How long guest events ran, by class and duration kind (fetch,
+    /// alarm, websocket, other), with tenant and app.
     pub(crate) event_seconds: Family<Histogram>,
+    /// Accepted guest-event jobs waiting for their mailbox turn, by class.
+    pub(crate) mailbox_wait_seconds: Family<Histogram>,
+    /// Batched event boundaries gating the next guest event, by class.
+    pub(crate) event_start_rule_wait_seconds: Family<Histogram>,
     /// Events stopped by the host, by reason (`wall`, `lease`, `replica`).
     pub(crate) cuts: Family<AtomicU64>,
     /// Instantiating an actor's component (wake or first request).
@@ -663,9 +667,15 @@ pub(crate) fn record_event(
         app,
         &[("class", class), ("kind", kind), ("outcome", outcome)],
     ));
+    let duration_kind = match kind {
+        "request" => "fetch",
+        "alarm" => "alarm",
+        "websocket" => "websocket",
+        _ => "other",
+    };
     METRICS
         .event_seconds
-        .get_in(app, &[("class", class)])
+        .get_in(app, &[("class", class), ("kind", duration_kind)])
         .observe(elapsed);
 }
 
@@ -1116,11 +1126,26 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         &mut out,
         "wasmkeep_event_duration_seconds",
         "histogram",
-        "How long events ran, by tenant, app and class.",
+        "How long guest events ran, by tenant, app, class and kind (fetch, alarm, websocket, other).",
     );
     m.event_seconds.each(|labels, h| {
         h.render(&mut out, "wasmkeep_event_duration_seconds", labels);
     });
+    for (name, help, durations) in [
+        (
+            "wasmkeep_mailbox_wait_seconds",
+            "Time from accepted enqueue attempt to mailbox job start, by tenant, app and class.",
+            &m.mailbox_wait_seconds,
+        ),
+        (
+            "wasmkeep_event_start_rule_wait_seconds",
+            "Batched boundary time gating the next event (capture, budget and upload wait), by tenant, app and class.",
+            &m.event_start_rule_wait_seconds,
+        ),
+    ] {
+        head(&mut out, name, "histogram", help);
+        durations.each(|labels, h| h.render(&mut out, name, labels));
+    }
     family(
         &mut out,
         "wasmkeep_event_cuts_total",
@@ -1794,8 +1819,8 @@ mod tests {
             for line in [
                 "\nwasmkeep_events_total{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"request\",outcome=\"ok\"} 2\n",
                 "\nwasmkeep_events_total{tenant=\"acme\",app=\"blog\",class=\"c\",kind=\"request\",outcome=\"ok\"} 3\n",
-                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"c\"} 2\n",
-                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"blog\",class=\"c\"} 3\n",
+                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"fetch\"} 2\n",
+                "\nwasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"blog\",class=\"c\",kind=\"fetch\"} 3\n",
             ] {
                 assert!(page.contains(line), "no {line} in\n{page}");
             }
@@ -1927,15 +1952,15 @@ mod tests {
         let page = render_for(Gauges::default(), &shop());
         for line in [
             "wasmkeep_events_total{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"request\",outcome=\"ok\"} 1\n",
-            "wasmkeep_event_duration_seconds_bucket{tenant=\"acme\",app=\"shop\",class=\"c\",le=\"0.005\"} 1\n",
-            "wasmkeep_event_duration_seconds_bucket{tenant=\"acme\",app=\"shop\",class=\"c\",le=\"+Inf\"} 1\n",
-            "wasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"c\"} 1\n",
+            "wasmkeep_event_duration_seconds_bucket{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"fetch\",le=\"0.005\"} 1\n",
+            "wasmkeep_event_duration_seconds_bucket{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"fetch\",le=\"+Inf\"} 1\n",
+            "wasmkeep_event_duration_seconds_count{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"fetch\"} 1\n",
         ] {
             assert!(page.contains(line), "no {line} in\n{page}");
         }
         assert!(
             page.contains(
-                "\nwasmkeep_event_duration_seconds_sum{tenant=\"acme\",app=\"shop\",class=\"c\"} "
+                "\nwasmkeep_event_duration_seconds_sum{tenant=\"acme\",app=\"shop\",class=\"c\",kind=\"fetch\"} "
             ),
             "{page}"
         );
