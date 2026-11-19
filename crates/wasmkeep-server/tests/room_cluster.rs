@@ -83,6 +83,11 @@ async fn node(
             cluster.heartbeat = Duration::from_millis(200);
             cluster.alarm_sweep = Duration::from_millis(200);
             cluster.failover_wait = Some(Duration::ZERO);
+            // The test places edges itself (prewarmed on the nodes it names,
+            // below). Placement at wake-up (ADR 0041, newer than this test)
+            // may send an edge that wakes again on a loaded runner to a
+            // lighter node, and the sockets then miss a node.
+            cluster.placement = false;
             config.cluster = Some(cluster);
             let service = ActorService::new(
                 runtime,
