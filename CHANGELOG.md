@@ -34,7 +34,28 @@ Upgrade node by node, with the 0.6.0 CLI: nodes announce `multi-app`,
 for every live node to have its word. Mixed versions and the order of
 the two stages are in [upgrading to 0.6.0](docs/deploy/upgrading-to-0.6.md).
 
-<!-- benchmark numbers and known limits: filled after the benchmark pass -->
+Measured on three OVH nodes and a real bucket
+([benchmarks](docs/benchmarks.md)): no durable write lost in two 2-hour
+soaks with node kills (464,219 strict, 470,272 batched); a returning node
+takes its share in 9.3 s with placement on against 18.4 s off; no
+benchmark moved more than 9% against 0.5.1.
+
+Known limits:
+
+<!-- big room: filled after B1 r4 -->
+- **Batched plain writes lose more than the healthy bound.** 14.3 per
+  node kill in the soak, inside the stalled-bucket bound (about 31) but
+  above the healthy one (about 8, ADR 0034). Use durable writes for data
+  that must survive a kill.
+- **The change feed lists the whole history each poll.** 51 s at rest
+  for 100,000 actors with 2 objects each; minutes with long histories.
+  Parallel listing and compacting idle histories come later.
+- **A restore takes about 90 s**, most of it two fixed 40 s waits that
+  make sure no old holder still writes.
+- **Idle nodes send more GETs than modeled**: about 3.2 a second per
+  node instead of 2.3.
+- A room's edges stay on one node; spreading them is later.
+
 
 - **`app delete` writes the tombstone at once.** To refuse an app that
   does not exist, it listed every key of the app before writing the

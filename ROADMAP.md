@@ -6,81 +6,46 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2` and `0.5.0`, are pre-releases for trying it,
+`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1` and `0.6.0`, are pre-releases for trying it,
 side projects and staging.
 
 ## Now
 
-`0.5.1`: **small gaps left by 0.5.0.** Activation deadlines, lossless
-headers, and stable IDs with resumable status.
+`0.6.0`: **several apps, files, analytics and larger rooms.** Several
+trusted apps per process, files and static assets, the change feed, a
+room past one actor, placement at wake-up, an inspector and typed Rust
+clients. What each brings is under [Built](#built); what was measured,
+and the limits found, are in the [changelog](CHANGELOG.md) and
+[benchmarks](docs/benchmarks.md).
 
 ## Next
 
-`0.6.0`: **several apps, files, analytics and larger rooms.** Put
-trusted apps on the same nodes, then build on that multi-app runtime, in
-this order.
+`0.7.0`: **the limits 0.6.0 measured.** Features first, then the
+numbers, in this order.
 
-1. **Several apps per process** (L): one supervisor owns the node's
-   three ports and routes by app, with an operator-managed hostname
-   table ([ADR 0038](docs/adr/0038-several-apps-per-process.md),
-   accepted; built, see [the node file](docs/reference/node-file.md)).
-   Per-app limits and accounting; an app leaves a node
-   by its node file and a restart, and cluster-wide app suspension is
-   not part of 0.6.0. This is for
-   one owner's apps and trusted tenants, not hostile-tenant isolation
-   ([security](docs/security.md)). The website moves onto the fleet
-   after this is demonstrated, as the first deploy of its kind.
-2. **A framework quickstart** (M): one framework example with
-   reconnect and recovery, and task-shaped inspection and recovery
-   guides. Moved from 0.5.0.
-3. **Files and static assets** (L)
-   ([ADR 0030](docs/adr/0030-files-and-static-assets.md)): app-scoped
-   files, direct browser uploads and downloads, and static assets
-   shipped with `wasmkeep deploy`. Paths without a file pass to the
-   front, a single-page app's `index.html`, or a 404 page. Routing
-   and redirects stay in front code. File deletion, backup and
-   restoration are part of the feature.
-4. **A change feed** (L): resumable changes to actors' databases,
-   ordered within each actor, with explicit schema, retention,
-   deletion and restore behavior. Start with Parquet output and a
-   DuckDB guide. PostgreSQL is the next sink, or the first if a
-   concrete user needs it; all sinks are not a release requirement.
-5. **One directory for the scaling patterns** (L): start with
-   broadcast groups and fan-out trees whose layers grow and shrink
-   within configured limits. Measure them against the big-room
-   baseline, including slow clients, reconnects and failed nodes.
-   Aggregation trees and sharding with resharding will reuse this
-   directory, rather than each inventing another one.
-6. **Rebalancing, first at wake-up** (M): place an actor on a node
-   with room, accounting for app limits and sockets. Nodes that join
-   or return fill as actors sleep and wake. Running actors stay
-   where they are unless an operator moves them or drains a node
-   ([ADR 0041](docs/adr/0041-placement-at-wake-up.md), accepted; built,
-   on by default, see [how it scales](docs/failover-and-scaling.md#placement-at-wake-up);
-   the release's benchmark confirms the default with a hashing balancer).
-7. **Inspection and application clients** (M): an authenticated,
-   read-only inspector, typed Rust clients alongside TypeScript,
-   and a complete framework example with reconnect and recovery.
-   Extend "Designing for hot actors" with the measured scaling
-   patterns.
-
-An actor still runs on one node at a time. A hot application's work
-is split among actors by an explicit pattern, not by making one
-actor execute on several nodes.
-
-Before release: demonstrate app separation, three-port routing and
-bounded overload, file lifecycle and restoration, feed
-resume and gap detection, a measured large logical room, and useful
-wake-up placement. Publish throughput, latency, memory, file
-descriptors and failure behavior with the workload and limits.
+1. **A faster room publish** (M): a publish took about 2.3 s to be
+   acknowledged with thousands of clients, which caps a room's message
+   rate and delivery latency; the sockets and edges were not the limit.
+2. **A room's edges on several nodes** (M): today a room's tree stays
+   on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
+3. **Node memory after a big room** (S/M): memory taken by a room of
+   thousands of sockets is not given back once they leave.
+4. **A faster change feed** (M): list an app's history in parallel,
+   and compact idle actors' histories, so a poll of a large app takes
+   seconds rather than minutes ([measured](docs/benchmarks.md#the-change-feed-at-100000-actors)).
+5. **Shorter restores** (S): most of a restore's 90 s are two fixed
+   40 s waits ([backup and restore](docs/deploy/backup-and-restore.md)).
+6. **Fewer requests from an idle node** (S): idle nodes send about 40%
+   more GETs than modeled
+   ([measured](docs/benchmarks.md#bucket-requests-at-rest)).
 
 ## After that
 
 Not before the releases above.
 
 - **Operating without the author**: mixed versions during an upgrade
-  (today every node is upgraded together, `0.4.0` to `0.4.1` and
-  `0.4.1` to `0.4.2` aside, [how](docs/cluster.md#upgrading-wasmkeep));
+  (today every node is upgraded together, `0.4.0` to `0.4.1`,
+  `0.4.1` to `0.4.2` and `0.5.x` to `0.6.0` aside, [how](docs/cluster.md#upgrading-wasmkeep));
   verify a bucket; traces; a write acknowledged once another node holds
   it, if measuring shows it is worth its design; asynchronous handlers once WebAssembly's
   next system interface (WASI 0.3) is ready in Wasmtime and the SDK tools,
@@ -109,7 +74,7 @@ Not before the releases above.
 
 ## Later, on demand
 
-These do not block `0.5.0` or `0.6.0`. Each needs a concrete workload
+These do not block `0.7.0`. Each needs a concrete workload
 or an explicit owner decision.
 
 - **The rest of the scaling family**: aggregation trees (M/L), and
@@ -327,6 +292,25 @@ Started alongside M3; what is left of it is under [Now](#now) and
   [upgrading](docs/deploy/upgrading-to-0.5.md)).
 - In `0.5.0`, typed TypeScript actor clients and structured errors
   ([guide](docs/typed-clients.md)).
+- In `0.6.0`, several apps per process behind one node's three ports
+  ([ADR 0038](docs/adr/0038-several-apps-per-process.md),
+  [the node file](docs/reference/node-file.md)), for one owner's apps
+  and trusted tenants.
+- In `0.6.0`, files and static assets
+  ([ADR 0030](docs/adr/0030-files-and-static-assets.md),
+  [files](docs/files.md), [static assets](docs/static-assets.md)).
+- In `0.6.0`, the change feed to Parquet
+  ([ADR 0039](docs/adr/0039-the-change-feed.md),
+  [guide](docs/change-feed.md)).
+- In `0.6.0`, a room past one actor: a directory, a broadcast group,
+  edges and relays
+  ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md),
+  [measured](docs/benchmarks.md)).
+- In `0.6.0`, placement at wake-up, on by default
+  ([ADR 0041](docs/adr/0041-placement-at-wake-up.md),
+  [measured](docs/benchmarks.md#a-node-coming-back-with-and-without-placement)).
+- In `0.6.0`, a read-only [inspector](docs/inspector.md), typed Rust
+  clients ([guide](docs/typed-clients.md)) and a React quickstart.
 
 ## Stretch goal: the benchmark showdown
 
