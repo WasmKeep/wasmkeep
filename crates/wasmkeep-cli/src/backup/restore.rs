@@ -166,7 +166,7 @@ fn actor_name<'a>(prefix: &'a str, root: &str) -> anyhow::Result<&'a str> {
 
 // History/owner keys were already escaped once by object_store. Preserve
 // their exact bytes on write; decode that layer only to recover an address.
-pub(super) fn object_segment(encoded: &str) -> anyhow::Result<String> {
+pub(crate) fn object_segment(encoded: &str) -> anyhow::Result<String> {
     let bytes = encoded.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;

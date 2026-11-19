@@ -90,6 +90,7 @@ pub struct Verify {
 mod files;
 mod prune;
 mod restore;
+pub(crate) use restore::object_segment;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DeployChoice {

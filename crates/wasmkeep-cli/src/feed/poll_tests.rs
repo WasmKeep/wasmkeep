@@ -1258,3 +1258,63 @@ async fn views_name_the_same_paths_through_a_link_to_the_output() {
         std::fs::read_to_string(out.join("views.duckdb.sql")).unwrap()
     );
 }
+
+/// Actor names that `encode_segment` escapes reach the feed under their
+/// own names: a node writes `bg:lobby` as `bg%3Alobby` through
+/// `Path::from`, so the bucket lists `bg%253Alobby`.
+#[tokio::test]
+async fn escaped_actor_names_keep_their_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = wasmkeep_storage::Storage::new(
+        wasmkeep_storage::StorageConfig::new(dir.path()),
+        wasmkeep_storage::StateDir {
+            dir: "actors".into(),
+            scratch: "scratch".into(),
+            tenant: "t".into(),
+        },
+    );
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let names = ["bg:lobby", "directory/bg:lobby", "room 1", "a%b", "Room~1"];
+    for (i, name) in names.iter().enumerate() {
+        let mut db = storage.open("c", name).unwrap();
+        db.exec("CREATE TABLE items(value)", &[]).unwrap();
+        db.exec(
+            "INSERT INTO items VALUES(?)",
+            &[SqlValue::Integer(i64::try_from(i).unwrap())],
+        )
+        .unwrap();
+        db.start_capture().unwrap();
+        let bytes = db.snapshot().unwrap().to_ltx(1, 1, 100).unwrap();
+        store
+            .put(
+                &Key::from(format!(
+                    "state/t/a/actors/c/{}/{}",
+                    encode_segment(name),
+                    snapshot_key(SegmentId {
+                        generation: 1,
+                        txid: 1
+                    })
+                )),
+                bytes.into(),
+            )
+            .await
+            .unwrap();
+    }
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(
+        poll(&args(out.path(), state.path()), &store, "")
+            .await
+            .unwrap(),
+        0
+    );
+    let got: BTreeSet<String> = files(&out.path().join("_wk_states"))
+        .keys()
+        .flat_map(|p| rows(p))
+        .map(|r| match &r["_wk_name"] {
+            Field::Str(name) => name.clone(),
+            other => panic!("unexpected name field {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, names.iter().map(|n| (*n).to_owned()).collect());
+}

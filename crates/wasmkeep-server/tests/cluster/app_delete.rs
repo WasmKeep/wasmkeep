@@ -402,3 +402,119 @@ async fn a_tombstone_refuses_every_node_link() {
     assert!(done.contains("--resume "), "{done}");
     assert!(done.contains("in 60 min"), "{done}");
 }
+
+/// Actor names that `encode_segment` escapes (`:`, a space, `%`, `/`,
+/// uppercase, `~`), as the directory and broadcast-group actors of big
+/// rooms have: written as `bg%3Alobby`, a node's key goes through
+/// `Path::from`, which escapes the `%` again, so the bucket holds
+/// `bg%253Alobby`. Hand-made keys use that same spelling; two actors are
+/// written by a node to show it is the one nodes use.
+async fn escaped_actors(store: &Arc<dyn ObjectStore>) {
+    use object_store::ObjectStoreExt as _;
+    for (class, name) in [
+        ("directory", "bg:lobby"),
+        ("t", "directory/bg:lobby"),
+        ("t", "room 1"),
+        ("t", "a%b"),
+    ] {
+        let encoded = wasmkeep_storage::encode_segment(name);
+        for key in [
+            format!(
+                "state/{TENANT}/{APP}/actors/{class}/{encoded}/snapshot/0000000000000001-0000000000000001.ltx"
+            ),
+            format!("state/{TENANT}/{APP}/owners/{class}/{encoded}"),
+        ] {
+            store
+                .put(&object_store::path::Path::from(key), b"x".to_vec().into())
+                .await
+                .unwrap();
+        }
+    }
+    assert_listed(
+        store,
+        &[
+            "/actors/directory/bg%253Alobby/",
+            "/owners/directory/bg%253Alobby",
+            "/actors/t/directory%252Fbg%253Alobby/",
+            "/actors/t/room%25201/",
+            "/actors/t/a%2525b/",
+        ],
+    )
+    .await;
+}
+
+/// Asserts the app's listing has a key containing each of `spelled`.
+async fn assert_listed(store: &Arc<dyn ObjectStore>, spelled: &[&str]) {
+    let listed = app_ref(store).app_keys().await.unwrap();
+    for spelled in spelled {
+        assert!(
+            listed.iter().any(|k| k.contains(spelled)),
+            "no key with {spelled} in {listed:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_an_app_removes_actors_whose_names_are_escaped() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let a = app_node("a", dir.path(), &store).await.unwrap();
+    settle().await;
+    for name in ["bg:lobby", "Room~1"] {
+        assert_eq!(read(a.addr, name).await, "0");
+        write(a.addr, name, 2).await;
+    }
+    escaped_actors(&store).await;
+    assert_listed(
+        &store,
+        &["/actors/t/bg%253Alobby/", "/actors/t/%2552oom%257E1/"],
+    )
+    .await;
+
+    let done = delete(&store).await.unwrap();
+    assert!(done.starts_with("Deleted default/shop"), "{done}");
+    let app = app_ref(&store);
+    assert_eq!(app.app_keys().await.unwrap(), Vec::<String>::new());
+    assert!(app.tombstone().await.unwrap().is_some());
+}
+
+/// A bucket a delete gave up on (its tombstone written, the escaped keys
+/// left): `--resume` removes them, with no migration of the keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn resuming_an_app_delete_removes_escaped_keys_left_behind() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store).await.unwrap();
+    escaped_actors(&store).await;
+    let app = app_ref(&store);
+    let id = wasmkeep_cluster::control::new_request_id();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    assert!(
+        app.write_tombstone(&format!(
+            "wasmkeep-app-deleted 1\nby test\nat {at}\nid {id}\n"
+        ))
+        .await
+        .unwrap()
+    );
+
+    let done = wasmkeep_server::apps::delete_app(
+        Arc::clone(&store),
+        "",
+        TENANT,
+        APP,
+        &DeleteApp {
+            resume: Some(id.clone()),
+            ..ask()
+        },
+        &mut |_| {},
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+    )
+    .await
+    .unwrap();
+    assert!(done.starts_with("Deleted default/shop"), "{done}");
+    assert_eq!(app.app_keys().await.unwrap(), Vec::<String>::new());
+}

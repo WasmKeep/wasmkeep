@@ -603,8 +603,8 @@ impl AppRef {
         }
     }
 
-    /// Every key of the app but its tombstone, relative to the bucket
-    /// prefix: under `state/<t>/<a>/` (histories, ownership records, the
+    /// Every key of the app but its tombstone, as listed (full locations in
+    /// the store's encoding, for [`Self::delete_keys`]): under `state/<t>/<a>/` (histories, ownership records, the
     /// alarm index, requests) and `apps/<t>/<a>/` (every version, the
     /// deploy history, the sealed secrets).
     ///
@@ -638,14 +638,22 @@ impl AppRef {
 
     /// Deletes `keys` (from [`Self::app_keys`]), at most 16 at a time.
     ///
+    /// The keys are listed locations, already in the store's encoding: an
+    /// escaped actor name (`bg%3Alobby`) is listed as `bg%253Alobby`. Each
+    /// is parsed as is, never through `StorePath::from`, which would escape
+    /// its `%` once more and address a key that does not exist (a delete
+    /// of it succeeds, and the key stays).
+    ///
     /// # Errors
-    /// The bucket did not answer for one of them.
+    /// A key is not a listed location, or the bucket did not answer for
+    /// one of them.
     pub async fn delete_keys(&self, keys: &[String]) -> Result<(), DeployError> {
         self.check_not_restoring().await?;
         use futures_util::StreamExt as _;
         let results: Vec<Result<(), DeployError>> = futures_util::stream::iter(keys)
             .map(|k| async move {
-                match self.store.delete(&StorePath::from(k.as_str())).await {
+                let location = StorePath::parse(k).map_err(bucket)?;
+                match self.store.delete(&location).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
                     Err(e) => Err(bucket(e)),
                 }
