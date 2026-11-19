@@ -241,6 +241,8 @@ Use `RoomClient` or implement all of the ADR's client rules:
 The [reconnecting-room harness](benchmarks.md#reconnecting-room-harness)
 records delivery and reconnect latency, recovery and topology on a deployed
 cluster. Its small smoke check is correctness evidence only. The real-bucket
-10,000-client growth, shrink, node-loss and slow-client benchmark is R8 and
-has not been measured by R7. The older single-actor room trial above is a
+growth and slow-client benchmark at 3,000 to 10,000 clients is
+[measured](benchmarks.md#a-big-room-on-three-nodes-preview): the pattern is a
+preview in 0.6.0, with delivery p99 of 5 to 15 s and no supported client
+count yet; node loss is not measured. The older single-actor room trial above is a
 separate workload, not evidence for this pattern's capacity.

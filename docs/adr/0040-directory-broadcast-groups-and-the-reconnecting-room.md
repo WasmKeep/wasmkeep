@@ -3,8 +3,12 @@
 - Status: accepted, as built (2026-11-17), slices R1 to R7: the directory,
   room core, edges, browser client, scaling, one relay layer, the large-room
   example, the 300-client cluster proof and the remote benchmark harness.
-  R8, the 10,000-client benchmark, is still to run and decides the optional
-  host "send to all my sockets" call.
+  R8, the 10,000-client benchmark, ran on 2026-11-19 at 3,000 to 10,000
+  clients ([results](../benchmarks.md#a-big-room-on-three-nodes-preview)):
+  the room holds its sockets without wedging, but its publish path keeps
+  delivery p99 at 5 to 15 s, so the room ships as a preview in 0.6.0. The
+  publish path comes before the optional host "send to all my sockets"
+  call, which stays deferred.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"

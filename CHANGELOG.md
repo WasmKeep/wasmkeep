@@ -9,6 +9,65 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+## 0.6.0
+
+**Several apps in one process, files, static assets and larger rooms.**
+One process serves several apps behind its three ports (a node file);
+actors and the front keep files; an app deploys static assets; an
+operator streams an app's actors to Parquet with the change feed, and
+inspects a bucket from a local page; a room scales past one actor with a
+directory, a broadcast group and edge actors (a preview); a node places a wake-up on
+a lighter node. Rust gets typed clients, and a React quickstart ties a
+TypeScript actor to a Vite page. Still a **pre-alpha pre-release**.
+
+What changes in behaviour: every command logs to stderr; a host answer
+for a request that may have run carries `x-wasmkeep-outcome: unknown`;
+`/_wasmkeep/ready` waits for the app's tombstone check; a hibernating
+actor's state is dropped before it leaves the registry, so an event in
+that window no longer builds a second live state. The package stays
+`wasmkeep:actor@0.2.0`: `blobs` is an added interface, and a component
+built without files imports nothing new and links as before. **Do not
+downgrade a node below 0.6.0 once an app imports `blobs`.**
+
+Upgrade node by node, with the 0.6.0 CLI: nodes announce `multi-app`,
+`assets`, `blobs` and `place` in their heartbeat, and each feature waits
+for every live node to have its word. Mixed versions and the order of
+the two stages are in [upgrading to 0.6.0](docs/deploy/upgrading-to-0.6.md).
+
+Measured on three OVH nodes and a real bucket
+([benchmarks](docs/benchmarks.md)): no durable write lost in two 2-hour
+soaks with node kills (464,219 strict, 470,272 batched); a returning node
+takes its share in 9.3 s with placement on against 18.4 s off; no
+benchmark moved more than 9% against 0.5.1.
+
+Known limits:
+
+- **Big rooms are a preview, with no supported client count.** On three
+  nodes, 3,000 to 10,000 clients stay connected and the room no longer
+  wedges, but the room's publish path holds delivery p99 at 5 to 15 s and
+  acknowledges 2.4 to 4.3 of 10 messages/s
+  ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)). The
+  room's node keeps the memory it took, and its edges stay on one node.
+- **Batched plain writes lose more than the healthy bound.** 14.3 per
+  node kill in the soak, inside the stalled-bucket bound (about 31) but
+  above the healthy one (about 8, ADR 0034). Use durable writes for data
+  that must survive a kill.
+- **The change feed lists the whole history each poll.** 51 s at rest
+  for 100,000 actors with 2 objects each; minutes with long histories.
+  Parallel listing and compacting idle histories come later.
+- **A restore takes about 90 s**, most of it two fixed 40 s waits that
+  make sure no old holder still writes.
+- **Idle nodes send more GETs than modeled**: about 3.2 a second per
+  node instead of 2.3.
+
+- **`app delete` removes actors whose names are escaped.** An actor name
+  with `:`, a space, `%`, `/`, an uppercase letter or `~` (big rooms'
+  directory and broadcast-group actors) is stored escaped twice; the
+  delete escaped each listed key once more, deleted nothing and gave up
+  with "objects keep appearing". It now deletes exactly what it lists,
+  so `--resume` clears what an earlier delete left. `wasmkeep feed`
+  exported none of those actors and now does.
+
 - **`app delete` writes the tombstone at once.** To refuse an app that
   does not exist, it listed every key of the app before writing the
   tombstone: on a real bucket, an app with about 950,000 history objects
@@ -181,6 +240,23 @@ The text under a version's heading is its GitHub release text
 
 - Actor-requested WebSocket closes preserve their code and reason even when the
   data queue is full; queued frames are discarded and their byte budget released.
+
+- **Files for actors and the front (ADR 0030, `blobs`):** the interface
+  `wasmkeep:actor/blobs` (head, get, put, delete, list, ranged reads,
+  streamed writes, download and upload links), in each caller's own
+  namespace on the app's bucket or the node's disk. `wasmkeep_sdk::blobs`
+  in Rust, `@wasmkeep/sdk/blobs` in TypeScript (buffered calls and links).
+  Whole-file calls and bucket uploads are 16 MiB at most; streams are
+  bounded by `--max-blob-bytes`. Nodes announce `blobs`; a version that
+  imports it is refused while a live node lacks it. See [files](docs/files.md).
+
+- **A hibernating actor never has two live states.** The state was
+  dropped after the actor left the registry, so an event in that window
+  spawned a second actor and state while the first was still dropping.
+  It is now dropped with the actor still registered; an event meanwhile
+  queues and runs on a fresh state, an eviction mark raised during the
+  drop is kept, a panicking drop is contained, and an event waits (up to
+  the event's wall budget) for the earlier state's resources.
 
 - **Several apps per process (ADR 0038):** `wasmkeep serve --node-file
   wasmkeep-node.toml` serves several apps behind one public, one cluster
