@@ -557,6 +557,14 @@ impl ActorState {
         // A clean stop's deadline bounds every wait here: past it the
         // step before the drop gives up, counting what is left (section 10).
         let stop = self.stop_deadline();
+        // This boundary gates the next guest event, after this one's
+        // answer and event-duration observation. Include capture/budget
+        // waits as well as the event-start rule's upload wait, but not a
+        // periodic snapshot. Strict holds never construct this timer.
+        let timing = crate::metrics::METRICS
+            .event_start_rule_wait_seconds
+            .get_in(&self.app_labels, &[("class", self.address.class())]);
+        let started = std::time::Instant::now();
         let mut db = self.db_at();
         let done = async {
             mark(&slot, &mut db).await?;
@@ -564,6 +572,7 @@ impl ActorState {
             hold_at_event_end(&slot, &mut db, &completion, max_unsent, stop).await
         }
         .await;
+        timing.observe(started.elapsed());
         if let Err(e) = done {
             self.abandon(&e);
             return;

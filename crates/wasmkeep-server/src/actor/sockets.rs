@@ -337,7 +337,8 @@ impl ServiceInner {
         });
         let result = self
             .mailboxes
-            .submit_wait(&address, self.wall, move |s: &mut ActorState| {
+            .submit_wait_timed(&address, self.wall, move |s: &mut ActorState, waited| {
+                s.record_mailbox_wait(waited);
                 Box::pin(s.ws_open(id, path, opener))
             })
             .await;
@@ -534,7 +535,8 @@ impl ServiceInner {
             // One event per message, in order; waiting on it is the backpressure.
             let delivered = self
                 .mailboxes
-                .submit_wait(&address, self.wall, move |s: &mut ActorState| {
+                .submit_wait_timed(&address, self.wall, move |s: &mut ActorState, waited| {
+                    s.record_mailbox_wait(waited);
                     Box::pin(s.ws_message(id, msg))
                 })
                 .await;
@@ -577,9 +579,14 @@ impl ServiceInner {
             let reason = reason.clone();
             match self
                 .mailboxes
-                .submit_wait(address, ADMISSION_WAIT, move |s: &mut ActorState| {
-                    Box::pin(s.ws_close(id, code, reason))
-                })
+                .submit_wait_timed(
+                    address,
+                    ADMISSION_WAIT,
+                    move |s: &mut ActorState, waited| {
+                        s.record_mailbox_wait(waited);
+                        Box::pin(s.ws_close(id, code, reason))
+                    },
+                )
                 .await
             {
                 Ok(()) => break,

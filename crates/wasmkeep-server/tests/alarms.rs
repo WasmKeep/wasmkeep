@@ -451,3 +451,17 @@ async fn a_flush_without_a_bucket_syncs_plain_writes_locally() {
     assert_eq!(call_at(addr, "POST", "/actor/t/x/flush").await.1, "ok:4");
     assert_eq!(wasmkeep_storage::faults::local_syncs(), before + 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timing_alarm_event_has_its_own_kind() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    ok(addr, "POST", "/alarm?in=50").await;
+    wait_fired(addr, 1).await;
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    assert!(page.contains("wasmkeep_event_duration_seconds_count{tenant=\"default\",app=\"default\",class=\"t\",kind=\"alarm\"} 1\n"), "missing alarm duration: {page}");
+    assert!(
+        page.contains("class=\"t\",kind=\"fetch\"}"),
+        "missing fetch duration: {page}"
+    );
+}

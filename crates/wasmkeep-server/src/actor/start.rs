@@ -469,10 +469,11 @@ impl ActorService {
                 inner.alarms.complete(address, delivery);
                 return;
             }
-            let event = inner.mailboxes.submit_wait(
+            let event = inner.mailboxes.submit_wait_timed(
                 &address,
                 ADMISSION_WAIT,
-                move |state: &mut ActorState| {
+                move |state: &mut ActorState, waited| {
+                    state.record_mailbox_wait(waited);
                     Box::pin(async move {
                         state.alarm(delivery.hint).await;
                         // Set when another node turned out to own it.

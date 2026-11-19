@@ -424,6 +424,47 @@ impl<S: Send + 'static> Mailboxes<S> {
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut S) -> BoxFuture<'a, T> + Send + 'static,
     {
+        self.submit_wait_inner(address, limit, job, None)
+    }
+
+    /// Like [`Self::submit_wait`], passing the time since the accepted
+    /// enqueue attempt to `job` when it starts. Capacity retries are not
+    /// included; creating the mailbox's state is. Failed admission or state
+    /// creation never invokes `job`. Untimed submissions allocate no queue timer.
+    pub fn submit_wait_timed<T, F>(
+        &self,
+        address: &ActorAddress,
+        limit: Duration,
+        job: F,
+    ) -> impl Future<Output = Result<T, MailboxError>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut S, Duration) -> BoxFuture<'a, T> + Send + 'static,
+    {
+        let queued = Arc::new(Mutex::new(std::time::Instant::now()));
+        let started = Arc::clone(&queued);
+        self.submit_wait_inner(
+            address,
+            limit,
+            move |state| {
+                let elapsed = started.lock().unwrap_or_else(|p| p.into_inner()).elapsed();
+                job(state, elapsed)
+            },
+            Some(queued),
+        )
+    }
+
+    fn submit_wait_inner<T, F>(
+        &self,
+        address: &ActorAddress,
+        limit: Duration,
+        job: F,
+        queued: Option<Arc<Mutex<std::time::Instant>>>,
+    ) -> impl Future<Output = Result<T, MailboxError>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut S) -> BoxFuture<'a, T> + Send + 'static,
+    {
         let (reply, answer) = oneshot::channel();
         let job: Job<S> = Box::new(move |state| {
             Box::pin(async move {
@@ -445,7 +486,13 @@ impl<S: Send + 'static> Mailboxes<S> {
         // any event on the node) evict only while fewer slots are on their
         // way back than callers are waiting for.
         let mut demand = Some(Waiting::new(Arc::clone(&self.inner)));
-        let first = self.enqueue(&address, job, true);
+        let enqueue = move |mailboxes: &Self, address: &ActorAddress, job| {
+            if let Some(queued) = &queued {
+                *queued.lock().unwrap_or_else(|p| p.into_inner()) = std::time::Instant::now();
+            }
+            mailboxes.enqueue(address, job, true)
+        };
+        let first = enqueue(self, &address, job);
         async move {
             let mut attempt = first;
             loop {
@@ -467,7 +514,7 @@ impl<S: Send + 'static> Mailboxes<S> {
                             Arc::clone(&mailboxes.inner.capacity_changed).notified_owned(),
                         );
                         changed.as_mut().enable();
-                        attempt = mailboxes.enqueue(&address, job, true);
+                        attempt = enqueue(&mailboxes, &address, job);
                     }
                     Err((error, _)) => return Err(error),
                 }

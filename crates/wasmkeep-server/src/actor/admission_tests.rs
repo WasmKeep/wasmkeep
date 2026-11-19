@@ -956,3 +956,86 @@ async fn activation_deadline_drains_write_before_releasing_hold() {
     .await
     .unwrap();
 }
+
+/// A call queued behind a held job exposes its queue delay, without actor names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timing_mailbox_wait_behind_slow_event() {
+    let data = tempfile::tempdir().unwrap();
+    let service = call_service(data.path(), 16, &[]);
+    let callee = ActorAddress::new("default", "test", "callee").unwrap();
+    let (started, running) = oneshot::channel();
+    let (release, released) = oneshot::channel::<()>();
+    let blocker = service.inner.mailboxes.submit(&callee, move |_| {
+        Box::pin(async move {
+            started.send(()).unwrap();
+            released.await.unwrap();
+        })
+    });
+    within(running).await.unwrap();
+    let call = call_from(&service, "default", "callee");
+    tokio::pin!(call);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut call)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    assert_eq!(within(call).await.unwrap().status, 200);
+    within(blocker).await.unwrap();
+    let page = crate::metrics::render(crate::metrics::Gauges::default());
+    let series =
+        "wasmkeep_mailbox_wait_seconds_sum{tenant=\"default\",app=\"default\",class=\"test\"} ";
+    let sum: f64 = page
+        .lines()
+        .find_map(|line| line.strip_prefix(series))
+        .unwrap_or_else(|| panic!("missing mailbox timing: {page}"))
+        .parse()
+        .unwrap();
+    assert!(sum >= 0.1, "queue delay: {sum}");
+    assert!(!page.contains("callee"), "actor names must not be labels");
+    assert!(
+        !page.contains("wasmkeep_event_start_rule_wait_seconds_count{"),
+        "strict actors must not record start-rule waits"
+    );
+}
+
+/// The clock starts again on the accepted attempt, not at capacity admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timing_mailbox_wait_excludes_capacity_admission() {
+    let mailboxes = Mailboxes::new(
+        MailboxConfig {
+            max_resident: 1,
+            ..MailboxConfig::default()
+        },
+        |_| async { Ok::<_, BoxError>(()) },
+    );
+    let (release, released) = oneshot::channel::<()>();
+    let (entered, running) = oneshot::channel();
+    let blocker = mailboxes.submit(&address("busy"), move |_| {
+        Box::pin(async move {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+        })
+    });
+    within(running).await.unwrap();
+    let started = std::time::Instant::now();
+    let next =
+        mailboxes.submit_wait_timed(&address("next"), Duration::from_secs(5), |_, waited| {
+            Box::pin(async move { waited })
+        });
+    tokio::pin!(next);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut next)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let waited = within(next).await.unwrap();
+    assert!(
+        started.elapsed().saturating_sub(waited) >= Duration::from_millis(100),
+        "capacity wait leaked into mailbox time: {waited:?}"
+    );
+    within(blocker).await.unwrap();
+    mailboxes.close();
+    assert!(mailboxes.drained(Duration::from_secs(5)).await);
+}

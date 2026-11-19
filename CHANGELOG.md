@@ -9,6 +9,15 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Where an actor's time goes.** Three histograms per app and class:
+  `wasmkeep_mailbox_wait_seconds` (queued to started),
+  `wasmkeep_event_start_rule_wait_seconds` (a batched actor's event
+  waiting on the previous event's upload, ADR 0034) and
+  `wasmkeep_event_duration_seconds`, which gains a `kind` label (`fetch`,
+  `alarm`, `websocket`, `other`): a query on it without `kind` sums them
+  as before. [Monitoring](docs/monitoring.md) says how to read a slow
+  answer from them.
+
 ## 0.6.0
 
 **Several apps in one process, files, static assets and larger rooms.**

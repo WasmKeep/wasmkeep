@@ -261,10 +261,11 @@ impl ServiceInner {
                 };
             }
             let (response_tx, response_rx) = oneshot::channel();
-            let event = self.mailboxes.submit_wait(
+            let event = self.mailboxes.submit_wait_timed(
                 &target,
                 ADMISSION_WAIT,
-                move |state: &mut ActorState| {
+                move |state: &mut ActorState, waited| {
+                    state.record_mailbox_wait(waited);
                     Box::pin(
                         async move { state.owned_request(req, response_tx, chain, false).await },
                     )
