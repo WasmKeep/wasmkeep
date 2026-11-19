@@ -258,6 +258,9 @@ async fn client(
                 }
             }
         }
+        // Not ready until this client is connected again: the growth loop
+        // waits for every client to hold a socket, not for one it held.
+        p.ready.store(0, Ordering::SeqCst);
         p.reconnects.fetch_add(1, Ordering::SeqCst);
         // Deterministic per-client full jitter, bounded to avoid a retry herd.
         attempts = attempts.saturating_add(1);
@@ -353,7 +356,7 @@ async fn exercise(count: usize) {
         }
     }
     let deadline = Instant::now() + Duration::from_secs(40);
-    loop {
+    let map = loop {
         let head = publish(a.addr, room, false).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
         let (s, map) = get(a.addr, &format!("/r6/map?room={room}")).await;
@@ -363,19 +366,20 @@ async fn exercise(count: usize) {
                 p.ready.load(Ordering::SeqCst) == 1 && p.last.load(Ordering::SeqCst) >= head
             })
         {
-            break;
+            break map;
         }
         assert!(Instant::now() < deadline, "growth: {s} {map}");
-    }
+    };
     assert!(
         clients
             .iter()
             .any(|(p, _, _)| p.moved.load(Ordering::SeqCst) > 0),
         "split must close 4801"
     );
+    let spread = [&a, &b, &c].map(|n| (n.service.websockets(), n.service.resident()));
     assert!(
-        a.service.websockets() > 0 && b.service.websockets() > 0 && c.service.websockets() > 0,
-        "sockets must span three actual nodes"
+        spread.iter().all(|(sockets, _)| *sockets > 0),
+        "sockets must span three actual nodes: edges {map}, (sockets, resident) on a, b, c {spread:?}"
     );
     // The last of the 300 clients joins with a constrained receive window,
     // then stops reading. Other clients drain continuously.
