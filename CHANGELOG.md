@@ -60,6 +60,13 @@ Known limits:
 - **Idle nodes send more GETs than modeled**: about 3.2 a second per
   node instead of 2.3.
 
+- **`app delete` removes actors whose names are escaped.** An actor name
+  with `:`, a space, `%`, `/`, an uppercase letter or `~` (big rooms'
+  directory and broadcast-group actors) is stored escaped twice; the
+  delete escaped each listed key once more, deleted nothing and gave up
+  with "objects keep appearing". It now deletes exactly what it lists,
+  so `--resume` clears what an earlier delete left. `wasmkeep feed`
+  exported none of those actors and now does.
 
 - **`app delete` writes the tombstone at once.** To refuse an app that
   does not exist, it listed every key of the app before writing the
