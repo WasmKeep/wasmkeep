@@ -10,6 +10,7 @@
  "publishers": 6,
  "publishers_closed_loop": true,
  "profile": "per generator: 50 clients, join to N/6 over 600 s, hold 900 s (17 stalled readers at 700 s for 60 s), leave to N/30 over 300 s, hold 60 s",
+ "note": "steps ran back to back on one room (history kept), 10,000 first; later steps are not on a fresh room",
  "not_shown": "a killed edge node, grown and shrunk edges beyond the schedule, bucket requests, host send-to-all",
  "cells": [
   {
@@ -21,6 +22,9 @@
     "network": 2137
    },
    "unacknowledged_after_30s": 161,
+   "incomplete_clients": 0,
+   "repeats": 523,
+   "void_numbers": 0,
    "phases": {
     "1-join": {
      "seconds": 600,
@@ -134,6 +138,9 @@
     "network": 2471
    },
    "unacknowledged_after_30s": 40,
+   "incomplete_clients": 0,
+   "repeats": 0,
+   "void_numbers": 0,
    "phases": {
     "1-join": {
      "seconds": 600,
@@ -256,6 +263,9 @@
     "network": 2177
    },
    "unacknowledged_after_30s": 61,
+   "incomplete_clients": 0,
+   "repeats": 62,
+   "void_numbers": 0,
    "phases": {
     "1-join": {
      "seconds": 600,
@@ -378,6 +388,9 @@
     "network": 2206
    },
    "unacknowledged_after_30s": 11,
+   "incomplete_clients": 1,
+   "repeats": 174,
+   "void_numbers": 0,
    "phases": {
     "1-join": {
      "seconds": 600,
@@ -488,7 +501,7 @@
     "a": "254-296 MB",
     "b": "275-310 MB",
     "c_room": "2.39-2.46 GB",
-    "traps": "0"
+    "traps": "4 front CPU-budget traps (front requests) on node b, 01:58-02:01; 0 room or edge traps"
    }
   }
  ]
