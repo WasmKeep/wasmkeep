@@ -8,7 +8,7 @@
 # Needs wasm-tools and curl. The adapter is downloaded once from crates.io
 # into target/wasi-adapter/.
 set -euo pipefail
-ADAPTER_VERSION=50.0.1   # = the wasmtime pin in Cargo.toml
+ADAPTER_VERSION=50.0.1   # the guest-side WASI 0.1 adapter; the host pin in Cargo.toml may be a later patch
 root="$(cd "$(dirname "$0")/.." && pwd)"
 dir="$root/target/wasi-adapter/$ADAPTER_VERSION"
 adapter="$dir/wasi_snapshot_preview1.reactor.wasm"
