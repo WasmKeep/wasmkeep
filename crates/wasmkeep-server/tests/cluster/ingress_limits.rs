@@ -437,8 +437,9 @@ async fn review_used_internal_signature_is_refused_before_body_read() {
     );
 }
 
+/// Reads of keys ending with the suffix fail as a bucket outage does.
 #[derive(Debug)]
-struct ManifestOutage(Arc<dyn ObjectStore>, &'static str);
+pub(super) struct ManifestOutage(pub(super) Arc<dyn ObjectStore>, pub(super) &'static str);
 impl std::fmt::Display for ManifestOutage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "manifest-outage")

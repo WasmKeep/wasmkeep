@@ -1343,10 +1343,13 @@ wasmkeep app delete --app acme/legacy --bucket s3://acme-wasmkeep/prod
 ([ADR 0028](adr/0028-actors-that-end.md), section 5.)
 
 1. **The tombstone first**: `apps/<tenant>/<app>/deleted`, written once,
-   holding who and when. From then `deploy` (and `--rollback`), `secrets
+   holding who and when, as soon as the command has checked that the app
+   exists and no restore holds it (a few reads, whatever the app's size). From then `deploy` (and `--rollback`), `secrets
    set`, `actor move` and `actor delete` refuse the app, and a node
-   refuses to start serving it. A node serving it sees the tombstone at
-   its next version check (3 s): it stops taking events, closes the app's
+   refuses to start serving it. A node serving it reads the tombstone's
+   key every 3 s, also while it backs off from a deploy it could not
+   apply, and so sees it within about 3 s of the bucket answering it: it
+   stops taking events, closes the app's
    WebSockets with **1001 "app deleted"**, stops its alarms, releases its
    actors and its node lease, removes its local files of the app, and
    `serve` exits with an error. No node acquires an actor of an app with a

@@ -388,7 +388,9 @@ wasmkeep app delete --app acme/legacy --bucket s3://b/p
    `If-None-Match: *`, holding who and when. From then, `deploy` refuses
    the app, a node refuses to start serving it, and a running node that
    sees it at its next version check (3 s) stops taking events for it,
-   closes its sockets with 1001 and stops its alarms. No node brings
+   closes its sockets with 1001 and stops its alarms. (Amendment of
+   2026-11-19: the tombstone is also read every 3 s while a node backs
+   off from failed deploy checks, a backoff that reaches 5 minutes.) No node brings
    the app back: actors are never acquired under an app with a tombstone.
 2. **Then the data**, once no live node of the app heartbeats (the
    command waits, or refuses; `--force` after `cluster fence`): every key

@@ -636,6 +636,32 @@ impl AppRef {
         Ok(out)
     }
 
+    /// Whether the app has any key but its tombstone, under either of the
+    /// prefixes [`Self::app_keys`] lists: the first page of each listing
+    /// at most, never the whole app (an app with a long history has
+    /// hundreds of thousands of keys, minutes of listing).
+    ///
+    /// # Errors
+    /// The bucket did not answer.
+    pub async fn has_keys(&self) -> Result<bool, DeployError> {
+        use futures_util::TryStreamExt as _;
+        let tombstone = self.path(TOMBSTONE);
+        for base in [
+            format!("{}state/{}/{}/", self.prefix, self.tenant, self.app),
+            self.base.clone(),
+        ] {
+            let mut listed = self
+                .store
+                .list(Some(&StorePath::from(base.trim_end_matches('/'))));
+            while let Some(meta) = listed.try_next().await.map_err(bucket)? {
+                if meta.location != tombstone {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Deletes `keys` (from [`Self::app_keys`]), at most 16 at a time.
     ///
     /// The keys are listed locations, already in the store's encoding: an
@@ -1692,10 +1718,17 @@ impl AppRef {
         // After a failure (a version this node cannot build, a bucket
         // outage), wait longer each time, wake-ups included: refused
         // actors would otherwise have it download and recompile in a loop.
+        // The tombstone is still checked every `every` meanwhile (a few
+        // small reads): a deleted app stops being served within a period
+        // or two, not at the end of a backoff that reaches minutes.
         let mut backoff: Option<Duration> = None;
         loop {
             match backoff {
-                Some(wait) => tokio::time::sleep(wait).await,
+                Some(wait) => {
+                    if !self.wait_watching_tombstone(&service, wait, every).await {
+                        return;
+                    }
+                }
                 None => tokio::select! {
                     () = tokio::time::sleep(every) => {}
                     () = wake.notified() => {}
@@ -1727,6 +1760,33 @@ impl AppRef {
                     tracing::warn!(error = %e, retry_in_s = wait.as_secs(), "checking for a new deploy failed");
                     backoff = Some(wait);
                 }
+            }
+        }
+    }
+
+    /// Waits `wait` (a deploy check's backoff), checking every `every`
+    /// whether the app is still this node's ([`Self::still_ours`]):
+    /// `false` once it is not, and this node stopped serving it. A check
+    /// that fails (the bucket unreachable) is left to the next one.
+    async fn wait_watching_tombstone(
+        &self,
+        service: &ActorService,
+        wait: Duration,
+        every: Duration,
+    ) -> bool {
+        let until = tokio::time::Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            tokio::time::sleep(left.min(every)).await;
+            if left <= every {
+                return true;
+            }
+            if matches!(self.still_ours(service.local_app_dir()).await, Ok(false)) {
+                service.stop_for_deleted_app().await;
+                return false;
             }
         }
     }

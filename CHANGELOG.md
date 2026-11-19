@@ -9,6 +9,22 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **`app delete` writes the tombstone at once.** To refuse an app that
+  does not exist, it listed every key of the app before writing the
+  tombstone: on a real bucket, an app with about 950,000 history objects
+  kept being served for 7 minutes after the command started, and the
+  tombstone's `at` (taken before that listing) read 7 minutes earlier
+  than its write. It now reads one listing page, and `at` is taken just
+  before the write. The nodes themselves stopped within 3 s of the write.
+
+- **A deleted app stops being served within seconds even while its node
+  backs off.** A node checked for the app's tombstone only at its deploy
+  checks, and after a failed deploy check (a version it cannot read, a
+  bucket error) those back off, doubling up to 5 minutes: an `app delete`
+  made then took effect only at the end of that wait. The tombstone is
+  now checked every period (3 s) during the backoff too, with one app per
+  process or several.
+
 - **`actor restore` no longer reports a done restore as dropped.** The
   command read the outcomes, then the request: a node ending the request
   between the two (outcome written, then request deleted) made it exit 1

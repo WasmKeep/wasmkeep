@@ -518,3 +518,208 @@ async fn resuming_an_app_delete_removes_escaped_keys_left_behind() {
     assert!(done.starts_with("Deleted default/shop"), "{done}");
     assert_eq!(app.app_keys().await.unwrap(), Vec::<String>::new());
 }
+
+/// Counts the listed keys read before the tombstone is written.
+#[derive(Debug)]
+struct ListedBeforeTombstone {
+    inner: Arc<dyn ObjectStore>,
+    listed: Arc<AtomicUsize>,
+    at_tombstone: std::sync::Mutex<Option<usize>>,
+}
+
+impl std::fmt::Display for ListedBeforeTombstone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "listed-before-tombstone")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ListedBeforeTombstone {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        b: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if p.as_ref().ends_with("/deleted") {
+            self.at_tombstone
+                .lock()
+                .unwrap()
+                .get_or_insert(self.listed.load(Ordering::SeqCst));
+        }
+        self.inner.put_opts(p, b, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        use futures_util::StreamExt as _;
+        let listed = Arc::clone(&self.listed);
+        self.inner
+            .list(p)
+            .inspect(move |_| {
+                listed.fetch_add(1, Ordering::SeqCst);
+            })
+            .boxed()
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &object_store::path::Path,
+        b: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(a, b, o).await
+    }
+}
+
+/// The tombstone is written before the app's keys are listed, not after:
+/// an app with a long history has hundreds of thousands of keys, and
+/// listing them all first held the tombstone back for minutes on a real
+/// bucket, its nodes serving the app meanwhile. Its `at` is when it was
+/// written.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tombstone_is_written_before_the_apps_keys_are_listed() {
+    use object_store::ObjectStoreExt as _;
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&inner).await.unwrap();
+    // A long history: 3,000 objects under the app's state prefix.
+    for i in 0..3_000 {
+        inner
+            .put(
+                &format!("state/{TENANT}/{APP}/actors/t/x/wal/{i:016}.ltx").into(),
+                b"x".to_vec().into(),
+            )
+            .await
+            .unwrap();
+    }
+    let store = Arc::new(ListedBeforeTombstone {
+        inner: Arc::clone(&inner),
+        listed: Arc::new(AtomicUsize::new(0)),
+        at_tombstone: std::sync::Mutex::new(None),
+    });
+    let before = now_ms();
+    let done = wasmkeep_server::apps::delete_app(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        "",
+        TENANT,
+        APP,
+        &ask(),
+        &mut |_| {},
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+    )
+    .await
+    .unwrap();
+    assert!(done.starts_with("Deleted"), "{done}");
+    let listed = store
+        .at_tombstone
+        .lock()
+        .unwrap()
+        .expect("no tombstone written");
+    assert!(
+        listed <= 10,
+        "{listed} keys listed before the tombstone was written"
+    );
+    let body = app_ref(&inner).tombstone().await.unwrap().unwrap();
+    let at: u64 = body
+        .lines()
+        .find_map(|l| l.strip_prefix("at "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        at >= before,
+        "the tombstone's `at` is before the command ran"
+    );
+}
+
+/// The store nodes read through: the manifest of the version
+/// [`break_deploys`] names never answers, as in a bucket outage of that
+/// key alone.
+pub(super) fn outage_of_the_next_manifest(store: &Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+    Arc::new(super::ingress_limits::ManifestOutage(
+        Arc::clone(store),
+        "/future/manifest",
+    ))
+}
+
+/// Puts a `current` naming a version whose manifest a node reading through
+/// [`outage_of_the_next_manifest`] cannot read: every deploy check of that
+/// node fails from then with a bucket error (it stays ready, serving the
+/// version it has), and its follower backs off, doubling its wait.
+pub(super) async fn break_deploys(store: &Arc<dyn ObjectStore>, tenant: &str, app: &str) {
+    use object_store::ObjectStoreExt as _;
+    let app_ref = AppRef::new(Arc::clone(store), "", tenant, app);
+    let current = app_ref.current().await.unwrap().unwrap();
+    store
+        .put(
+            &format!("apps/{tenant}/{app}/current").into(),
+            format!("future {} 3\n", current.seq + 1)
+                .into_bytes()
+                .into(),
+        )
+        .await
+        .unwrap();
+}
+
+/// How long a broken deploy's backoff is let grow, following every 200 ms:
+/// failed checks near 0.2, 0.4, 0.8, 1.6, 3.2 and 6.4 s, the next one due
+/// near 12.8 s.
+pub(super) const BACKOFF_GROWN: Duration = Duration::from_secs(7);
+
+/// What "a few periods" allows, following every 200 ms.
+pub(super) const A_FEW_PERIODS: Duration = Duration::from_secs(2);
+
+/// ADR 0028, section 5: the tombstone is checked every period even while
+/// the node backs off from a deploy it cannot apply (a backoff that grows
+/// to 300 s): the node stops serving the app within a few periods, not at
+/// its next full deploy check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_is_seen_within_a_few_periods_while_deploys_fail() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _follows) = app_node_following("a", dir.path(), &outage_of_the_next_manifest(&store))
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(read(a.addr, "x").await, "0");
+    break_deploys(&store, TENANT, APP).await;
+    tokio::time::sleep(BACKOFF_GROWN).await;
+    // It keeps serving the version it has.
+    assert_eq!(read(a.addr, "x").await, "0");
+    assert!(app_ref(&store).write_tombstone("test").await.unwrap());
+    tokio::time::timeout(A_FEW_PERIODS, a.service.app_deleted())
+        .await
+        .expect("the node did not stop within a few periods of the tombstone");
+    let r = send(a.addr, "GET", "/actor/t/x/durable", "").await;
+    assert_eq!(r.status, 503, "{}", r.body);
+}

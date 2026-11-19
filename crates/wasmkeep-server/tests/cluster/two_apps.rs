@@ -600,6 +600,71 @@ async fn one_apps_tombstone_stops_that_runtime_only() {
     assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
 }
 
+/// ADR 0028, section 5, with several apps: while one app's follower backs
+/// off from a deploy it cannot apply, its tombstone is still checked every
+/// period, so that runtime stops within a few periods; the other app goes
+/// on serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_apps_tombstone_is_seen_within_a_few_periods_while_its_deploys_fail() {
+    use super::app_delete::{
+        A_FEW_PERIODS, BACKOFF_GROWN, break_deploys, outage_of_the_next_manifest,
+    };
+    if !over_tls() {
+        return;
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    for app in ["shop", "blog"] {
+        AppRef::new(Arc::clone(&store), "", "default", app)
+            .deploy(
+                &deploy_runtime(),
+                vec![("t".to_owned(), test_actor_wasm().to_vec())],
+            )
+            .await
+            .unwrap();
+    }
+    let d = tempfile::tempdir().unwrap();
+    let p = process(
+        &outage_of_the_next_manifest(&store),
+        d.path(),
+        &[
+            Def {
+                deployed: true,
+                ..def("shop-1", "default", "shop", &["shop.test"])
+            },
+            Def {
+                deployed: true,
+                ..def("blog-1", "default", "blog", &["blog.test"])
+            },
+        ],
+    )
+    .await;
+    for host in ["shop.test", "blog.test"] {
+        let r = to_reachable(p.public, host, "POST", "/actor/t/x/durable").await;
+        assert_eq!((r.status, r.body.trim()), (200, "1"), "{host}: {}", r.body);
+    }
+    break_deploys(&store, "default", "shop").await;
+    tokio::time::sleep(BACKOFF_GROWN).await;
+    let r = to_reachable(p.public, "shop.test", "POST", "/actor/t/x/durable").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    let shop = p.service("shop-1").expect("shop's runtime");
+    assert!(
+        AppRef::new(Arc::clone(&store), "", "default", "shop")
+            .write_tombstone("test")
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(A_FEW_PERIODS, shop.app_deleted())
+        .await
+        .expect("shop's runtime did not stop within a few periods of its tombstone");
+    eventually("shop's hosts answer 503 without Retry-After", async || {
+        let r = to(p.public, "shop.test", "GET", "/actor/t/x/durable", "").await;
+        r.status == 503 && r.retry_after.is_none()
+    })
+    .await;
+    let r = to_reachable(p.public, "blog.test", "POST", "/actor/t/x/durable").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+}
+
 /// ADR 0038, section 10: a live node without `multi-app` (an older binary
 /// started after the second app was enabled) makes every runtime of a
 /// process serving several apps not ready; actors keep being served.
