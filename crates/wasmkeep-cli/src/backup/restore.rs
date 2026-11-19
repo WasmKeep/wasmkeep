@@ -1,9 +1,9 @@
 //! Whole-app restore. The journal is the start fence; its phase and generation
 //! floors survive failures. The separate exclusive lock is released by CAS;
 //! after a killed CLI the operator waits for pending requests and clears it.
-//! Neither wait is fixed: the quiet wait counts from the app's node leases
-//! (`restore_fence::quiet_until_ms`), the lock is held only while a request
-//! of this command may still land (`restore_fence::release_at_ms`).
+//! Neither wait is fixed: the quiet wait counts from the bucket's stamps of
+//! the app's node leases (`restore_fence::quiet_wait_ms`); the lock is held
+//! only while a request of this command may still land (`restore_fence::release_at_ms`).
 use super::*;
 use object_store::ObjectStoreExt;
 use std::time::Duration;
@@ -147,38 +147,64 @@ async fn nodes(args: &Restore, store: &Store, prefix: &str) -> anyhow::Result<()
     Ok(())
 }
 
-/// Whether the nodes listing proves that no node of the app can act on it
-/// unseen (`restore_fence::quiet_until_ms`), and whether the app has a node
-/// object at all. Fails closed: an object under `nodes/` that does not decode,
-/// or a node of the app without a node lease or the `restore` capability,
-/// makes the listing incomplete.
-async fn nodes_listing(store: &Store, prefix: &str, served: &str) -> anyhow::Result<(bool, bool)> {
-    use wasmkeep_cluster::membership::{Directory as _, NODES_PREFIX, NodeInfo};
-    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
-        Arc::clone(store),
-        if prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{prefix}/")
-        },
-    );
-    let mut complete = true;
-    let mut any = false;
-    for (key, body) in bucket.list(NODES_PREFIX).await? {
-        let Some(node) = NodeInfo::decode(&body) else {
-            complete = false;
-            continue;
+/// The node lease objects a restore's quiet wait looks at, from one listing
+/// of `nodes/` made after the restore fence landed.
+#[derive(Debug, PartialEq, Eq)]
+struct AppNodes {
+    /// The listing proves that no node of the app can act on it unseen
+    /// (`restore_fence::quiet_wait_ms`). Fails closed: an object under
+    /// `nodes/` that does not decode or names no app, or a node of the app
+    /// without a node lease or the `restore` capability, makes it incomplete.
+    complete: bool,
+    /// The newest `Last-Modified` (the bucket's clock) among the app's node
+    /// objects and any object whose app is unknown.
+    newest_ms: Option<u64>,
+    /// Those objects, each with its version and stamp: a node that writes
+    /// its lease again changes them.
+    seen: BTreeMap<String, (Option<String>, i64)>,
+}
+
+async fn app_nodes(store: &Store, prefix: &str, served: &str) -> anyhow::Result<AppNodes> {
+    use wasmkeep_cluster::membership::{NODES_PREFIX, NodeInfo, serves};
+    let root = key(prefix, NODES_PREFIX);
+    let mut nodes = AppNodes {
+        complete: true,
+        newest_ms: None,
+        seen: BTreeMap::new(),
+    };
+    for (id, meta) in list_bounded(store, &root).await? {
+        let body = read(store, meta.location.as_ref(), META_MAX).await?;
+        let node = NodeInfo::decode(&body).filter(|node| node.id == id);
+        let relevant = match &node {
+            // Its app is unknown: it may be this one.
+            None => {
+                nodes.complete = false;
+                true
+            }
+            Some(node) if node.app.is_empty() => {
+                nodes.complete = false;
+                true
+            }
+            Some(node) if serves(node, served) => {
+                nodes.complete &= node.lease.is_some() && node.can_restore;
+                true
+            }
+            Some(_) => false,
         };
-        if key != format!("{NODES_PREFIX}{}", node.id) {
-            complete = false;
-            continue;
-        }
-        if node.app == served {
-            any = true;
-            complete &= node.lease.is_some() && node.can_restore;
+        if relevant {
+            let stored = meta.last_modified.timestamp_millis();
+            let stored_ms = u64::try_from(stored).unwrap_or(0);
+            nodes.newest_ms = Some(nodes.newest_ms.map_or(stored_ms, |n| n.max(stored_ms)));
+            nodes.seen.insert(id, (meta.e_tag.clone(), stored));
         }
     }
-    Ok((complete, any))
+    Ok(nodes)
+}
+
+/// The `Last-Modified` of `path`, in ms on the bucket's clock.
+async fn stored_ms(store: &Store, path: &str) -> anyhow::Result<u64> {
+    let meta = store.head(&Key::parse(path)?).await?;
+    Ok(u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0))
 }
 
 fn actor_name<'a>(prefix: &'a str, root: &str) -> anyhow::Result<&'a str> {
@@ -659,16 +685,36 @@ pub(super) async fn execute_settled(
         replace_conditional(target, &key(&base, "restored"), text(&journal, "nonce")?.as_bytes().to_vec()).await?;
         nodes(args, target, tp).await?;
         // The quiet wait (ADR 0033): until no write an old holder of the app
-        // sent can still land. Listed after the fence landed.
-        let last = apps::fence_app_nodes(target, tp, &args.app.0, &args.app.1, &mut |_| {}).await?;
-        let (complete, any) = nodes_listing(target, tp, &name).await?;
-        let quiet = wasmkeep_cluster::restore_fence::quiet_until_ms(
-            number(&journal, "started_ms")?, any.then_some(last), complete && !args.force, late_ms);
-        let now = now_ms()?;
-        if now < quiet {
-            println!("Waiting {} s for writes of the app's earlier nodes that may still land.", (quiet - now).div_ceil(1000));
-            tokio::time::sleep(Duration::from_millis(quiet - now)).await;
+        // sent can still land. Every time is a bucket stamp, never a node's
+        // clock against this one's. Expired live leases are fenced first, so
+        // the listing after it carries the fence's stamp.
+        apps::fence_app_nodes(target, tp, &args.app.0, &args.app.1, &mut |_| {}).await?;
+        // The bucket's clock: `restored` was written just above, so its stamp
+        // plus the time since this read is at most the bucket's now.
+        let probe = stored_ms(target, &key(&base, "restored")).await?;
+        let probed = tokio::time::Instant::now();
+        let fence_stored = stored_ms(target, &fence).await?;
+        let mut listed = app_nodes(target, tp, &name).await?;
+        let mut settled = false;
+        for _ in 0..wasmkeep_cluster::restore_fence::QUIET_ROUNDS {
+            let bucket_now = probe.saturating_add(u64::try_from(probed.elapsed().as_millis())?);
+            let wait = wasmkeep_cluster::restore_fence::quiet_wait_ms(
+                listed.complete && !args.force, listed.newest_ms, fence_stored, bucket_now, late_ms);
+            if wait > 0 {
+                println!("Waiting {} s for writes of the app's earlier nodes that may still land.", wait.div_ceil(1000));
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+            // A node that wrote its lease since is still acting: wait again
+            // from that write.
+            let again = app_nodes(target, tp, &name).await?;
+            if again.seen == listed.seen {
+                settled = true;
+                break;
+            }
+            listed = again;
         }
+        ensure!(settled, "a node of {name} still writes its node lease ({}); stop it before restoring",
+            listed.seen.keys().cloned().collect::<Vec<_>>().join(", "));
         nodes(args, target, tp).await?;
 
         if journal["phase"] == "prepare" {

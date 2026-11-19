@@ -25,15 +25,20 @@ The text under a version's heading is its GitHub release text
   LIST costs remain approximately the same; the first poll stays sequential.
   See [the feed guide](docs/change-feed.md).
 - **Shorter restores.** `backup restore` no longer waits two fixed 40 s
-  periods. The quiet wait before it writes state now counts from the last
-  write of the app's node leases: none when the app has no node lease under
-  the prefix, and up to 40 s after a node that stopped just now. It falls back
-  to 40 s after the fence when the nodes listing proves nothing (an unreadable
-  heartbeat, an old node, `--force`). The restore lock is released at once when
-  every write to the target and archive got an answer. It is held 40 s after
-  one that did not, counting the S3 client's own retries. `--abort` keeps its
-  fixed waits.
-  `docs/deploy/backup-and-restore.md` says what each wait guards against.
+  periods. The quiet wait before it writes state is measured on the
+  bucket's clock (`Last-Modified`), never a node's or the operator's. It
+  waits 41 s after the bucket stored the newest write of the app's node
+  lease objects (a renewal, release or fence), lists them again, and waits
+  again if one changed, refusing after three rounds. It does not wait at all
+  when the app has no node lease under the prefix. When the nodes listing
+  proves nothing (an unreadable heartbeat, one naming no app, an old node,
+  `--force`), it also waits 41 s after the fence was stored. The restore lock
+  is released at once when every write to the target and archive got an
+  answer. It is held 40 s after one that did not, counting the S3 client's
+  own retries. `--abort` keeps its fixed waits.
+  `docs/deploy/backup-and-restore.md` says what each wait guards against,
+  and where the 40 s bound is an assumption the bucket client does not
+  enforce.
 
 ## 0.6.0
 

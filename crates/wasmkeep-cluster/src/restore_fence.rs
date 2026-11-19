@@ -12,41 +12,59 @@ pub fn marker_matches(remote: Option<&[u8]>, local: Option<&[u8]>) -> bool {
     remote.is_none_or(|marker| local == Some(marker))
 }
 
-/// When a whole-app restore may start writing the app's state, in ms on the
-/// restoring CLI's clock: its quiet wait (ADR 0033, section 6).
+/// The resolution of a bucket's `Last-Modified` (S3 keeps whole seconds): a
+/// stamp may be this much earlier than the write it dates.
+pub const STAMP_RESOLUTION_MS: u64 = 1_000;
+
+/// How many times a restore waits for the app's node leases to stop
+/// changing before it refuses (a node of the app still writes its lease).
+pub const QUIET_ROUNDS: usize = 3;
+
+/// How long a whole-app restore still waits before it writes the app's
+/// state: its quiet wait (ADR 0033, section 6). Every time is on the
+/// bucket's clock, its `Last-Modified` stamps; no node's clock is compared
+/// with the operator's.
 ///
-/// - `fence_ms`: when the restore fence (`apps/<t>/<a>/restoring`) was
-///   first written.
-/// - `last_node_ms`: the latest `written_at` among the app's node leases,
-///   listed after the fence landed (a `released` or `fenced` lease keeps the
-///   one of its last live write), or `None` if the app has no node object.
-/// - `listing_complete`: every object under `nodes/` decoded, and every
-///   node of the app writes a node lease and honours restore fences. Such a
-///   node acquires only after its lease's first live write landed and a
-///   check sent after it found no fence (ADR 0020, ADR 0028 section 5), so
-///   a node that never reads the fence was in that listing.
-/// - `late_ms`: how long after a node lease's last live write one of that
-///   node's requests may still land: the lease stops the node by
-///   `written_at + ttl - safety` on its own clock, and a request it sent
-///   then lands within the bucket client's request timeout or never.
+/// - `listing_complete`: every object under `nodes/` decoded, names its
+///   app, and every node of the app writes a node lease and honours restore
+///   fences. Such a node acquires only after its lease's first live write
+///   landed and a check sent after it found no fence (ADR 0020, ADR 0028
+///   section 5), so a node that never reads the fence was in the listing,
+///   which is made after the fence landed.
+/// - `newest_lease_stored_ms`: the newest `Last-Modified` among the node
+///   lease objects of the app in that listing, or `None` if it has none.
+///   A node acts at most `ttl - safety` after the last of its lease writes
+///   that landed (its validity counts from that write's send, on its own
+///   clock's rate), whether the object then says `live`, `released` or
+///   `fenced`.
+/// - `fence_stored_ms`: the restore fence's `Last-Modified`.
+/// - `bucket_now_ms`: a lower bound of the bucket's clock now (a stamp read
+///   earlier, plus the time elapsed since on the restoring process).
+/// - `late_ms`: how long after its lease's last landed write a node's
+///   request may still land (`LATE_WRITES`): an assumption, which the
+///   bucket client does not enforce for every request (see `LATE_WRITES`).
 ///
 /// A complete listing with no node of the app has nothing to wait for. A
-/// complete listing with nodes waits `late_ms` after the last of their
-/// writes. Otherwise (`--force`, an unreadable or old-format heartbeat) the
-/// fence's time also counts, as before 0.7.0: a node that started unseen
-/// has shown its heartbeat by then, and the check after the wait refuses it.
-pub fn quiet_until_ms(
-    fence_ms: u64,
-    last_node_ms: Option<u64>,
+/// complete listing with nodes waits until `late_ms` after the newest of
+/// their lease writes. Otherwise (`--force`, a heartbeat this version cannot
+/// read, one naming no app, an old node) the fence's stamp also counts, as
+/// before 0.7.0: a node that started unseen shows its heartbeat by then, and
+/// the check after the wait refuses it.
+pub fn quiet_wait_ms(
     listing_complete: bool,
+    newest_lease_stored_ms: Option<u64>,
+    fence_stored_ms: u64,
+    bucket_now_ms: u64,
     late_ms: u64,
 ) -> u64 {
-    let from = match (listing_complete, last_node_ms) {
-        (true, None) => return fence_ms,
-        (true, Some(last)) => last,
-        (false, last) => last.unwrap_or(0).max(fence_ms),
+    let from = match (listing_complete, newest_lease_stored_ms) {
+        (true, None) => return 0,
+        (true, Some(stored)) => stored,
+        (false, stored) => stored.unwrap_or(0).max(fence_stored_ms),
     };
-    from.saturating_add(late_ms)
+    from.saturating_add(STAMP_RESOLUTION_MS)
+        .saturating_add(late_ms)
+        .saturating_sub(bucket_now_ms)
 }
 
 /// When a restore may release its exclusive lock (`restore-lock`), in ms on
@@ -70,14 +88,24 @@ mod tests {
     #[test]
     fn quiet_waits_only_for_writes_that_may_still_land() {
         // No node of the app, and the listing proves it: no wait at all.
-        assert_eq!(quiet_until_ms(1_000, None, true, 40_000), 1_000);
-        // A stopped node: its last live write plus the late bound, not the fence.
-        assert_eq!(quiet_until_ms(90_000, Some(10_000), true, 40_000), 50_000);
-        assert_eq!(quiet_until_ms(1_000, Some(10_000), true, 40_000), 50_000);
+        assert_eq!(quiet_wait_ms(true, None, 1_000, 5_000, 40_000), 0);
+        // A node's last lease write stored at 10 s: until 51 s on the
+        // bucket's clock (a whole-second stamp may be a second early).
+        assert_eq!(
+            quiet_wait_ms(true, Some(10_000), 90_000, 30_000, 40_000),
+            21_000
+        );
+        assert_eq!(quiet_wait_ms(true, Some(10_000), 1_000, 60_000, 40_000), 0);
         // An incomplete listing counts the fence too.
-        assert_eq!(quiet_until_ms(1_000, None, false, 40_000), 41_000);
-        assert_eq!(quiet_until_ms(1_000, Some(10_000), false, 40_000), 50_000);
-        assert_eq!(quiet_until_ms(20_000, Some(10_000), false, 40_000), 60_000);
+        assert_eq!(quiet_wait_ms(false, None, 1_000, 1_000, 40_000), 41_000);
+        assert_eq!(
+            quiet_wait_ms(false, Some(10_000), 1_000, 10_000, 40_000),
+            41_000
+        );
+        assert_eq!(
+            quiet_wait_ms(false, Some(10_000), 20_000, 20_000, 40_000),
+            41_000
+        );
     }
 
     #[test]

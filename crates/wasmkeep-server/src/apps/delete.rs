@@ -33,8 +33,14 @@ pub struct DeleteApp {
     pub late: Duration,
 }
 
-/// [`DeleteApp::late`] for `wasmkeep app delete`: as long as a bucket
-/// client waits for a write (30 s) plus a lease's ttl with the defaults.
+/// [`DeleteApp::late`] for `wasmkeep app delete`, and the bound `backup
+/// restore` waits after a node lease's last stored write: a bucket client's
+/// request timeout (30 s) plus a lease's ttl with the defaults. An
+/// assumption, not enforced for every request a node sends: a segment upload
+/// is bounded by its own deadline, each attempt by the client's 30 s request
+/// timeout, but other writes only by the client, whose default retries
+/// (`object_store`, not configured by `wasmkeep serve`) may resend a write
+/// answered 5xx, 429 or 408 up to 3 minutes later.
 pub const LATE_WRITES: Duration = Duration::from_secs(40);
 
 macro_rules! ensure {

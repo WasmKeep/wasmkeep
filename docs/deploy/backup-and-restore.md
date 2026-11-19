@@ -281,8 +281,11 @@ leave a write that may still land, and no longer.
 **The quiet wait**, before the restore removes or writes any state. It guards
 against a write that an old holder of the app sent before it stopped, such as
 an upload in flight on a node that crashed or froze, landing after the restore
-cleared or copied the state. The command lists `nodes/` after writing the
-restore fence and reads the node lease of each of the app's nodes:
+cleared or copied the state. The command first fences every expired `live`
+lease of the app, then lists `nodes/` and reads the node lease of each of the
+app's nodes. It measures every time on the bucket's clock, from the
+`Last-Modified` stamps of these objects and of its own `restored` marker,
+never from a node's clock or the operator's:
 
 - **No node of the app has a node lease here** (a restore into a fresh prefix,
   as the drill does): no wait. A node acquires an actor only after its node
@@ -291,18 +294,35 @@ restore fence and reads the node lease of each of the app's nodes:
   any lapse of its lease. A node that never saw the fence is therefore in that
   listing.
 - **A node of the app stopped, crashed or was fenced**: the command waits
-  until 40 seconds (`LATE_WRITES`) after the last `live` write of its node
-  lease, as that node's clock wrote it. The lease stops the node acting by
-  `written_at + ttl - safety` on its own clock (8 seconds with the defaults,
-  9 seconds within the tolerated 1 second of clock skew), and a request it sent
-  by then lands within the bucket client's 30 second request timeout or never:
-  39 seconds at most. A frozen node that wakes later finds its lease expired on
-  its own clock and writes nothing. A node that stopped long ago has nothing
-  left to wait for.
+  until 41 seconds after the bucket stored the newest write of its node lease
+  object, whether that write was the node's last `live` renewal, its release,
+  or a fence. That is `LATE_WRITES` (40 seconds), plus one second because S3
+  stamps whole seconds. A node acts at most `ttl - safety` (8 seconds) after
+  the last of its lease writes that landed, since its validity counts from that
+  write's send on its own clock. This assumes only that clocks run at the same
+  rate, not that they agree. A frozen node that wakes later finds its lease
+  expired on its own clock and writes nothing. A node whose lease was stored
+  long ago has nothing left to wait for.
 - **The listing proves nothing**: an object under `nodes/` this version cannot
-  read, a node of the app without a node lease or the `restore` capability,
-  or `--force`. The command then also waits 40 seconds after the restore fence,
-  as before 0.7.0, and checks the nodes again.
+  read, a heartbeat that names no app (the oldest format), a node of the app
+  without a node lease or the `restore` capability, or `--force`. The command
+  then also waits 41 seconds after the bucket stored the restore fence, as
+  before 0.7.0, and checks the nodes again.
+
+After the wait the command lists `nodes/` again. If one of those objects
+changed (a node of the app wrote its lease meanwhile, so it is still acting),
+it waits again from that write. After three such rounds it refuses, leaving
+the fence for a retry once that node is stopped.
+
+`LATE_WRITES` assumes that a node's request lands within about 30 seconds of
+its lease's end. That assumption predates this command and is not enforced
+for every request. A segment upload ends within its own deadline (four
+5-second idles plus a second per megabyte), but each attempt is one request to
+the bucket's S3 client, with that client's 30-second request timeout. Other
+writes are bounded only by the client, which `wasmkeep serve` builds with
+`object_store`'s default retries (up to 10 within 3 minutes) on a 5xx, 429 or
+408 answer. A request retried that late could land after the wait. `app
+delete --recreate` and the abort path's fixed waits rely on the same bound.
 
 **The settle before the lock's release**, after `restoring` is removed or the
 restore failed. It guards against a request of this restore that got no
@@ -317,8 +337,8 @@ ended. A restore that ends this way says so on stderr.
 
 A restore into an empty root of a stopped cluster therefore runs for as long
 as its copy and verification take.
-A restore right after the app's nodes stopped still waits up to 40 seconds
-after their last write. `--abort` keeps its two fixed 40 second waits, below.
+A restore right after the app's nodes stopped still waits up to 41 seconds
+after the bucket stored their last lease write. `--abort` keeps its two fixed 40 second waits, below.
 
 In place, a verified backup of the old state is made first; `--force` may
 accept failed actors only in this undo backup. All successfully copied actors
