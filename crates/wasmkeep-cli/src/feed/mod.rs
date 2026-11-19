@@ -715,10 +715,18 @@ async fn read_changed(
         .strip_prefix(history_prefix)
         .context("actor outside app")?
         .trim_end_matches('/');
+    // `encoded` is as listed, in the store's encoding (and kept so in the
+    // recorded heads, which follow the listing's order): a node wrote
+    // `bg%3Alobby` through `Path::from`, which escaped its `%` again, so
+    // the bucket lists `bg%253Alobby`. The history reader takes the prefix
+    // as written, and the actor's name is under both layers.
     let (class, encoded) = relative.split_once('/').context("invalid actor prefix")?;
     if !args.classes.is_empty() && !args.classes.iter().any(|c| c == class) {
         return Ok(None);
     }
+    let written = crate::backup::object_segment(encoded)?;
+    let name = || decode_segment(&written).context("invalid encoded actor name");
+    let actor_prefix = format!("{history_prefix}{class}/{written}/");
     let new_incarnation = old
         .as_ref()
         .map_or(app_changed, |o| o.incarnation != incarnation);
@@ -745,7 +753,7 @@ async fn read_changed(
                     actor: writer::ActorTable {
                         tenant: tenant.clone(),
                         app: app.clone(),
-                        name: decode_segment(encoded).context("invalid encoded actor name")?,
+                        name: name()?,
                         seq: 0,
                         generation: saved.position.generation,
                         txid: saved.position.txid,
@@ -788,7 +796,7 @@ async fn read_changed(
         new_incarnation,
         &objects,
     );
-    let name = decode_segment(encoded).context("invalid encoded actor name")?;
+    let name = name()?;
     let connection =
         Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.pragma_update(None, "trusted_schema", false)?;
