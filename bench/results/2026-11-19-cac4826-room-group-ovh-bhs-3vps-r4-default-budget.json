@@ -1,0 +1,495 @@
+{
+ "schema": "room-group-summary-1",
+ "date": "2026-11-19",
+ "commit": "cac4826",
+ "binary": "0.5.1+cac48263bb50",
+ "hardware": "three VPS (4 vCPU Haswell, 7.7 GB) in one region, each running one node with two apps and two generators aimed at the other two nodes",
+ "cpu_budget_ms": 50,
+ "payload_bytes": 256,
+ "publish_rate_total_per_s": 10,
+ "publishers": 6,
+ "publishers_closed_loop": true,
+ "profile": "per generator: 50 clients, join to N/6 over 600 s, hold 900 s (17 stalled readers at 700 s for 60 s), leave to N/30 over 300 s, hold 60 s",
+ "not_shown": "a killed edge node, grown and shrunk edges beyond the schedule, bucket requests, host send-to-all",
+ "cells": [
+  {
+   "clients": 10000,
+   "generators": 6,
+   "generators_valid": true,
+   "publish_failures_by_status": {
+    "503": 3987,
+    "network": 2137
+   },
+   "unacknowledged_after_30s": 161,
+   "phases": {
+    "1-join": {
+     "seconds": 600,
+     "ready_at_end": 9846,
+     "delivery_p50_ms_range": [
+      2063,
+      3326
+     ],
+     "delivery_p95_ms_range": [
+      7984,
+      17522
+     ],
+     "delivery_p99_ms_range": [
+      16839,
+      20546
+     ],
+     "published_ok_per_s": 0.36,
+     "delivered_per_client_per_s": 0.16,
+     "reconnect_attempts": 14944,
+     "close_4801": 7601,
+     "close_4802": 0,
+     "publish_failed": 2864,
+     "publish_unacknowledged": 88,
+     "repeats": 140,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "2-hold": {
+     "seconds": 900,
+     "ready_at_end": 9934,
+     "delivery_p50_ms_range": [
+      2084,
+      2256
+     ],
+     "delivery_p95_ms_range": [
+      5923,
+      6608
+     ],
+     "delivery_p99_ms_range": [
+      10238,
+      15396
+     ],
+     "published_ok_per_s": 2.35,
+     "delivered_per_client_per_s": 2.36,
+     "reconnect_attempts": 23101,
+     "close_4801": 867,
+     "close_4802": 0,
+     "publish_failed": 1485,
+     "publish_unacknowledged": 8,
+     "repeats": 383,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "3-leave": {
+     "seconds": 300,
+     "ready_at_end": 1922,
+     "delivery_p50_ms_range": [
+      2147,
+      3823
+     ],
+     "delivery_p95_ms_range": [
+      8645,
+      29988
+     ],
+     "delivery_p99_ms_range": [
+      8732,
+      40019
+     ],
+     "published_ok_per_s": 0.24,
+     "delivered_per_client_per_s": 1.19,
+     "reconnect_attempts": 91702,
+     "close_4801": 2448,
+     "close_4802": 0,
+     "publish_failed": 1452,
+     "publish_unacknowledged": 47,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "4-hold": {
+     "seconds": 60,
+     "ready_at_end": 1886,
+     "delivery_p50_ms_range": null,
+     "delivery_p95_ms_range": null,
+     "delivery_p99_ms_range": null,
+     "published_ok_per_s": 0.0,
+     "delivered_per_client_per_s": 0.0,
+     "reconnect_attempts": 899,
+     "close_4801": 826,
+     "close_4802": 0,
+     "publish_failed": 277,
+     "publish_unacknowledged": 12,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    }
+   },
+   "nodes": {
+    "a": "163-301 MB",
+    "b": "177-309 MB",
+    "c_room": "214 MB to 1.74 GB (join), 1.75-2.44 GB (hold), 2.35-2.47 GB (after)",
+    "traps": "12 CPU-budget traps of the room actor (on-alarm), node c, during the hold; 0 edge traps"
+   }
+  },
+  {
+   "clients": 6000,
+   "generators": 6,
+   "generators_valid": true,
+   "publish_failures_by_status": {
+    "503": 962,
+    "network": 2471
+   },
+   "unacknowledged_after_30s": 40,
+   "phases": {
+    "1-join": {
+     "seconds": 600,
+     "ready_at_end": 5981,
+     "delivery_p50_ms_range": [
+      1345,
+      1577
+     ],
+     "delivery_p95_ms_range": [
+      8560,
+      10761
+     ],
+     "delivery_p99_ms_range": [
+      14943,
+      19164
+     ],
+     "published_ok_per_s": 2.13,
+     "delivered_per_client_per_s": 1.11,
+     "reconnect_attempts": 5239,
+     "close_4801": 3884,
+     "close_4802": 0,
+     "publish_failed": 1393,
+     "publish_unacknowledged": 18,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "2-hold": {
+     "seconds": 900,
+     "ready_at_end": 6000,
+     "delivery_p50_ms_range": [
+      1708,
+      1795
+     ],
+     "delivery_p95_ms_range": [
+      6608,
+      7227
+     ],
+     "delivery_p99_ms_range": [
+      10654,
+      11198
+     ],
+     "published_ok_per_s": 2.63,
+     "delivered_per_client_per_s": 2.62,
+     "reconnect_attempts": 9524,
+     "close_4801": 0,
+     "close_4802": 0,
+     "publish_failed": 1368,
+     "publish_unacknowledged": 0,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "3-leave": {
+     "seconds": 300,
+     "ready_at_end": 1186,
+     "delivery_p50_ms_range": [
+      1059,
+      1124
+     ],
+     "delivery_p95_ms_range": [
+      3496,
+      3939
+     ],
+     "delivery_p99_ms_range": [
+      6164,
+      7446
+     ],
+     "published_ok_per_s": 3.2,
+     "delivered_per_client_per_s": 11.56,
+     "reconnect_attempts": 1611,
+     "close_4801": 1627,
+     "close_4802": 0,
+     "publish_failed": 535,
+     "publish_unacknowledged": 16,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "4-hold": {
+     "seconds": 60,
+     "ready_at_end": 1153,
+     "delivery_p50_ms_range": [
+      868,
+      1725
+     ],
+     "delivery_p95_ms_range": [
+      3293,
+      7672
+     ],
+     "delivery_p99_ms_range": [
+      6288,
+      8732
+     ],
+     "published_ok_per_s": 2.34,
+     "delivered_per_client_per_s": 2.42,
+     "reconnect_attempts": 404,
+     "close_4801": 392,
+     "close_4802": 0,
+     "publish_failed": 129,
+     "publish_unacknowledged": 2,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    }
+   },
+   "nodes": {
+    "a": "253-286 MB",
+    "b": "273-292 MB",
+    "c_room": "2.25-2.56 GB",
+    "traps": "0"
+   }
+  },
+  {
+   "clients": 4500,
+   "generators": 6,
+   "generators_valid": true,
+   "publish_failures_by_status": {
+    "503": 995,
+    "network": 2177
+   },
+   "unacknowledged_after_30s": 61,
+   "phases": {
+    "1-join": {
+     "seconds": 600,
+     "ready_at_end": 4479,
+     "delivery_p50_ms_range": [
+      1561,
+      1742
+     ],
+     "delivery_p95_ms_range": [
+      9177,
+      13000
+     ],
+     "delivery_p99_ms_range": [
+      15396,
+      26349
+     ],
+     "published_ok_per_s": 1.32,
+     "delivered_per_client_per_s": 0.77,
+     "reconnect_attempts": 4198,
+     "close_4801": 3748,
+     "close_4802": 0,
+     "publish_failed": 1632,
+     "publish_unacknowledged": 39,
+     "repeats": 59,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "2-hold": {
+     "seconds": 900,
+     "ready_at_end": 4500,
+     "delivery_p50_ms_range": [
+      1292,
+      1332
+     ],
+     "delivery_p95_ms_range": [
+      3602,
+      3748
+     ],
+     "delivery_p99_ms_range": [
+      5001,
+      5580
+     ],
+     "published_ok_per_s": 4.25,
+     "delivered_per_client_per_s": 4.25,
+     "reconnect_attempts": 102,
+     "close_4801": 0,
+     "close_4802": 0,
+     "publish_failed": 691,
+     "publish_unacknowledged": 0,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "3-leave": {
+     "seconds": 300,
+     "ready_at_end": 879,
+     "delivery_p50_ms_range": [
+      1358,
+      1500
+     ],
+     "delivery_p95_ms_range": [
+      4265,
+      7826
+     ],
+     "delivery_p99_ms_range": [
+      8645,
+      24092
+     ],
+     "published_ok_per_s": 1.79,
+     "delivered_per_client_per_s": 6.97,
+     "reconnect_attempts": 1819,
+     "close_4801": 1822,
+     "close_4802": 0,
+     "publish_failed": 701,
+     "publish_unacknowledged": 18,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "4-hold": {
+     "seconds": 62,
+     "ready_at_end": 798,
+     "delivery_p50_ms_range": [
+      1113,
+      1531
+     ],
+     "delivery_p95_ms_range": [
+      8144,
+      29988
+     ],
+     "delivery_p99_ms_range": [
+      8144,
+      29988
+     ],
+     "published_ok_per_s": 1.62,
+     "delivered_per_client_per_s": 1.8,
+     "reconnect_attempts": 238,
+     "close_4801": 226,
+     "close_4802": 0,
+     "publish_failed": 134,
+     "publish_unacknowledged": 1,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    }
+   },
+   "nodes": {
+    "a": "254-273 MB",
+    "b": "274-294 MB",
+    "c_room": "2.39-2.50 GB",
+    "traps": "0"
+   }
+  },
+  {
+   "clients": 3000,
+   "generators": 6,
+   "generators_valid": true,
+   "publish_failures_by_status": {
+    "503": 439,
+    "network": 2206
+   },
+   "unacknowledged_after_30s": 11,
+   "phases": {
+    "1-join": {
+     "seconds": 600,
+     "ready_at_end": 2999,
+     "delivery_p50_ms_range": [
+      638,
+      770
+     ],
+     "delivery_p95_ms_range": [
+      5001,
+      5257
+     ],
+     "delivery_p99_ms_range": [
+      8144,
+      11087
+     ],
+     "published_ok_per_s": 3.69,
+     "delivered_per_client_per_s": 2.35,
+     "reconnect_attempts": 1813,
+     "close_4801": 1781,
+     "close_4802": 0,
+     "publish_failed": 779,
+     "publish_unacknowledged": 0,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "2-hold": {
+     "seconds": 900,
+     "ready_at_end": 2977,
+     "delivery_p50_ms_range": [
+      931,
+      1018
+     ],
+     "delivery_p95_ms_range": [
+      4351,
+      5257
+     ],
+     "delivery_p99_ms_range": [
+      7984,
+      11652
+     ],
+     "published_ok_per_s": 3.78,
+     "delivered_per_client_per_s": 3.82,
+     "reconnect_attempts": 24195,
+     "close_4801": 222,
+     "close_4802": 0,
+     "publish_failed": 1200,
+     "publish_unacknowledged": 5,
+     "repeats": 154,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "3-leave": {
+     "seconds": 300,
+     "ready_at_end": 378,
+     "delivery_p50_ms_range": [
+      726,
+      931
+     ],
+     "delivery_p95_ms_range": [
+      8645,
+      10341
+     ],
+     "delivery_p99_ms_range": [
+      12247,
+      16021
+     ],
+     "published_ok_per_s": 2.39,
+     "delivered_per_client_per_s": 13.13,
+     "reconnect_attempts": 4559,
+     "close_4801": 859,
+     "close_4802": 0,
+     "publish_failed": 582,
+     "publish_unacknowledged": 6,
+     "repeats": 20,
+     "void_numbers": 0,
+     "resets": 0
+    },
+    "4-hold": {
+     "seconds": 60,
+     "ready_at_end": 564,
+     "delivery_p50_ms_range": [
+      143,
+      818
+     ],
+     "delivery_p95_ms_range": [
+      7085,
+      8907
+     ],
+     "delivery_p99_ms_range": [
+      13938,
+      25574
+     ],
+     "published_ok_per_s": 5.34,
+     "delivered_per_client_per_s": 5.17,
+     "reconnect_attempts": 988,
+     "close_4801": 151,
+     "close_4802": 0,
+     "publish_failed": 84,
+     "publish_unacknowledged": 0,
+     "repeats": 0,
+     "void_numbers": 0,
+     "resets": 0
+    }
+   },
+   "nodes": {
+    "a": "254-296 MB",
+    "b": "275-310 MB",
+    "c_room": "2.39-2.46 GB",
+    "traps": "0"
+   }
+  }
+ ]
+}
