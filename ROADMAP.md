@@ -28,14 +28,16 @@ numbers, in this order.
    rate and delivery latency; the sockets and edges were not the limit.
 2. **A room's edges on several nodes** (M): today a room's tree stays
    on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
-3. **Node memory after a big room** (S/M): memory taken by a room of
+3. **A StarlingMonkey room on a starved CPU** (S/M): find why the
+   room's heap outgrows its collector on one core, and fix it.
+4. **Node memory after a big room** (S/M): memory taken by a room of
    thousands of sockets is not given back once they leave.
-4. **A faster change feed** (M): list an app's history in parallel,
+5. **A faster change feed** (M): list an app's history in parallel,
    and compact idle actors' histories, so a poll of a large app takes
    seconds rather than minutes ([measured](docs/benchmarks.md#the-change-feed-at-100000-actors)).
-5. **Shorter restores** (S): most of a restore's 90 s are two fixed
+6. **Shorter restores** (S): most of a restore's 90 s are two fixed
    40 s waits ([backup and restore](docs/deploy/backup-and-restore.md)).
-6. **Fewer requests from an idle node** (S): idle nodes send about 40%
+7. **Fewer requests from an idle node** (S): idle nodes send about 40%
    more GETs than modeled
    ([measured](docs/benchmarks.md#bucket-requests-at-rest)).
 
