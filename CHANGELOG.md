@@ -40,6 +40,11 @@ soaks with node kills (464,219 strict, 470,272 batched); a returning node
 takes its share in 9.3 s with placement on against 18.4 s off; no
 benchmark moved more than 9% against 0.5.1.
 
+Wasmtime moves to 50.0.2, which fixes eight advisories published on
+2026-11-19 (RUSTSEC-2026-0566 to 0573), among them a guest able to abort
+the host process through a stale GC heap pointer, and unbounded host
+memory from empty writes to an output or HTTP/2 body stream.
+
 Known limits:
 
 - **Big rooms are a preview, with no supported client count.** On three
