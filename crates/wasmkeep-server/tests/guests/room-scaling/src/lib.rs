@@ -40,7 +40,20 @@ impl Actor for Guest {
                 _ => 5,
             },
         )?
-        .with_hysteresis(1000);
+        // R6 (room_cluster) prewarms its edges by name on the nodes it
+        // names: e1, e3, e5, e7, the names four boots and splits get from
+        // the room's counter. A merge also takes a number, so every later
+        // edge gets a name nobody prewarmed and wakes on the room's node.
+        // With 1 s, a slow runner merges a fresh split back while its
+        // clients are still reconnecting (the new edge under 30 % of its
+        // capacity a second later), and the sockets miss a node. R6 is about
+        // spreading and failover, not merging: the default minute. R4/R5
+        // (room_scaling) prove merges with 1 s.
+        .with_hysteresis(if matches!(a.name.as_str(), "big" | "small") {
+            60_000
+        } else {
+            1000
+        });
         ROUND.with_borrow_mut(|r| handler::scaling(&mut scale, r))
     }
     fn on_websocket_open(id: u64, path: String) -> Result<(), String> {
