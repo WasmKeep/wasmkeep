@@ -1,6 +1,7 @@
 //! ADR 0039: one read-only poll with durable, resumable batches.
 //! Kinds describe replacement labels, incarnations and retained ancestry.
 mod compact;
+mod listing;
 mod views;
 pub mod writer;
 
@@ -45,6 +46,9 @@ pub struct Args {
     classes: Vec<String>,
     #[arg(long, default_value_t = 2 << 30)]
     max_bytes: u64,
+    /// Concurrent history LIST ranges after the first poll (1-64); 1 is sequential.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=64))]
+    list_concurrency: u16,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -287,7 +291,10 @@ async fn poll_inner(
         let mut statement = scan.prepare("SELECT class || '/' || name || '/', class, generation, txid, identity, label, kind, incarnation FROM heads ORDER BY class || '/' || name || '/'")?;
         let mut rows = statement.query([])?;
         let saved = next_saved(&mut rows)?;
-        let groups = crate::actor_groups::actor_groups_with_errors(store, &history_prefix);
+        let concurrency = usize::from(args.list_concurrency);
+        let boundaries = listing::boundaries(&scan, &history_prefix, concurrency)?;
+        let groups =
+            listing::groups(store, &history_prefix, boundaries, concurrency, &scratch).await?;
         futures_util::pin_mut!(groups);
         {
             let history_prefix = history_prefix.as_str();

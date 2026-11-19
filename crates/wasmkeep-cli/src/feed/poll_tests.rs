@@ -63,6 +63,7 @@ fn args(out: &Path, state: &Path) -> Args {
         state: state.into(),
         classes: vec![],
         max_bytes: 2 << 20,
+        list_concurrency: 16,
     }
 }
 fn files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -1308,6 +1309,14 @@ async fn escaped_actor_names_keep_their_names() {
             .unwrap(),
         0
     );
+    let before = files(out.path());
+    assert_eq!(
+        poll(&args(out.path(), state.path()), &store, "")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(files(out.path()), before);
     let got: BTreeSet<String> = files(&out.path().join("_wk_states"))
         .keys()
         .flat_map(|p| rows(p))

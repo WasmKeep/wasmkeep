@@ -20,8 +20,9 @@ into two new directories; an existing output cannot be adopted.
 The command exits 0 when all changed actors were written, or 2 when some were
 left for another poll (also while the app is restoring or deleted). Errors are
 reported on stderr. `--classes carts,orders` limits classes; `--max-bytes N`
-limits the size of an actor read. Repeat the command with a scheduler, without
-overlapping invocations: the state directory is locked during a poll.
+limits the size of an actor read. `--list-concurrency N` (default 16,
+range 1–64) bounds concurrent history listings; use 1 for the sequential path.
+Repeat the command with a scheduler, without overlapping invocations: the state directory is locked during a poll.
 
 The shared backup/feed history grouper allows **32 MiB (33,554,432 bytes) per
 actor** of retained listing allocations: full key, ETag and version string
@@ -39,17 +40,38 @@ history retention, let collection run, then retry. Shorter retention reduces the
 recovery window. `actor export` and `actor history` use a separate listing path;
 the inspector retains its separate 10,000-object listing cap.
 
-The interval is a cost and lag choice. Each poll lists the app's history once:
-with K objects and 1,000 objects per page, that is approximately ceil(K/1,000)
-LIST requests, plus retries. For 100,000 actors with 20 objects each, that is
-2,000 pages per poll, about 86.4 million LISTs in 30 days at one poll per minute.
-Changed actors also cost a full restore; unchanged actors need no history GETs.
-There are four marker GETs per poll. Lag includes the scheduling interval,
-listing and restore time. Measured at 100,000 actors with 2 history objects
-each, a poll at rest takes about 51 s, and the listing grows with history: at 20
-objects per actor, expect minutes per poll
-([benchmarks](benchmarks.md#the-change-feed-at-100000-actors)), so poll a large
-app less often.
+The interval is a cost and lag choice. Each poll still reads the whole app's
+history: with K objects and 1,000 objects per page, approximately ceil(K/1,000)
+LIST requests, plus retries. Parallelism reduces elapsed listing time, not
+that request cost. Range boundaries can add partial/overlapping pages (usually
+up to two extra pages per range). Names such as `a-` before `a/` can add
+further overlap because store offsets strip trailing slashes; overlapping
+keys are discarded locally. For 100,000 actors with 20 objects each,
+the baseline remains 2,000 pages per poll, about 86.4 million LISTs in 30 days
+at one poll per minute. Changed actors also cost a full restore; unchanged
+actors need no history GETs. There are four marker GETs per poll. These LIST
+costs assume server-side offsets, as in regular S3. A backend that filters
+offsets locally can re-list earlier ranges; use concurrency 1 there.
+
+After the first poll, saved heads divide the key space into up to
+`--list-concurrency` ordered ranges, with roughly equal numbers of known
+actors (at least 500 known actors per range, so small feeds stay sequential).
+New actors in the gaps and beyond the previous endpoints are included.
+Ranges list concurrently into temporary metadata files under the state
+directory's scratch directory, then replay in bucket order into the existing
+bounded actor grouper. This uses temporary disk proportional to the whole
+listing, plus one provider page per active range in memory; it does not keep
+all actor groups in RAM. The files are removed after consumption or error,
+and scratch recovery removes leftovers after a crash. Allow disk space for
+the serialized keys and metadata as well as restored actors.
+
+The first poll has no saved heads and lists sequentially. Uneven history
+sizes or many new actors in one range can limit later speedups. The previous
+sequential implementation measured 51.4 s at rest for 100,000 actors with two
+objects each ([benchmarks](benchmarks.md#the-change-feed-at-100000-actors)).
+The parallel implementation targets under 10 s for that workload; a new
+real-bucket measurement is still required. Lag includes the scheduling
+interval, listing, local metadata I/O and restore time.
 
 ## Load the generated views
 

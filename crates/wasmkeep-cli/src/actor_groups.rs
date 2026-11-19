@@ -5,7 +5,7 @@ use object_store::{ObjectMeta, ObjectStore, path::Path as Key};
 use std::{collections::BTreeMap, sync::Arc};
 type Store = Arc<dyn ObjectStore>;
 pub(crate) type ActorGroup = (String, BTreeMap<String, ObjectMeta>);
-type FallibleActorGroup = (String, anyhow::Result<BTreeMap<String, ObjectMeta>>);
+pub(crate) type FallibleActorGroup = (String, anyhow::Result<BTreeMap<String, ObjectMeta>>);
 // Requested allocations, not process RSS: allocator bookkeeping, the provider's
 // current page, and the caller's BTreeMap/restore data are separate.
 const LISTING_MAX: usize = 32 << 20;
@@ -52,7 +52,7 @@ pub(crate) fn actor_groups_with_errors(
     group_listing(list.boxed(), prefix.to_owned())
 }
 
-fn group_listing(
+pub(crate) fn group_listing(
     list: futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>>,
     prefix: String,
 ) -> futures_util::stream::BoxStream<'static, anyhow::Result<FallibleActorGroup>> {

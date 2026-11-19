@@ -18,6 +18,13 @@ The text under a version's heading is its GitHub release text
   as before. [Monitoring](docs/monitoring.md) says how to read a slow
   answer from them.
 
+- **Parallel change-feed listing.** `wasmkeep feed --list-concurrency N`
+  (default 16) lists ordered ranges concurrently after the first poll,
+  using saved heads to balance the ranges and temporary disk to bound
+  memory. Actor/object order and the per-actor listing budget are unchanged.
+  LIST costs remain approximately the same; the first poll stays sequential.
+  See [the feed guide](docs/change-feed.md).
+
 ## 0.6.0
 
 **Several apps in one process, files, static assets and larger rooms.**
