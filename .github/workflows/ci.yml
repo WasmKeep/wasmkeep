@@ -56,7 +56,10 @@ jobs:
   # Every other job needs this one and runs unless it answered the literal
   # "false". `!cancelled()` is what makes them run when this job fails:
   # without a status function they would be skipped, and a skipped job
-  # counts as passed. A push to main always runs everything.
+  # counts as passed. The test jobs (three platforms), the S3 lease job and
+  # the languages job run only on
+  # the nightly schedule and on a dispatch (`gh workflow run ci.yml`), never
+  # on a pull request or a push: a push to main shows them as skipped.
   #
   # A run started for a draft runs the job "draft" first and nothing else,
   # unless the pull request is no longer a draft by then: this job, "docs
@@ -239,8 +242,9 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
-      # A pull request leaves out part of the cluster suite's TLS copy
-      # (.config/nextest.toml, profile `pr`); a push to main runs all of it.
+      # Nightly and dispatched runs (the only ones this job has) run all of
+      # the cluster suite's TLS copy; the `pr` profile (.config/nextest.toml)
+      # is for a pull request run by hand.
       - run: cargo nextest run --workspace --locked --no-tests=pass ${{ github.event_name == 'pull_request' && '--profile pr' || '' }}
 
   test-linux-arm:
@@ -265,8 +269,9 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
-      # A pull request leaves out part of the cluster suite's TLS copy
-      # (.config/nextest.toml, profile `pr`); a push to main runs all of it.
+      # Nightly and dispatched runs (the only ones this job has) run all of
+      # the cluster suite's TLS copy; the `pr` profile (.config/nextest.toml)
+      # is for a pull request run by hand.
       - run: cargo nextest run --workspace --locked --no-tests=pass ${{ github.event_name == 'pull_request' && '--profile pr' || '' }}
 
   # Not on pull requests or pushes: macOS is no release target and has no
