@@ -112,10 +112,13 @@ pub async fn delete_app(
             args.resume.is_none(),
             "delete tombstone disappeared; nothing filed"
         );
+        // A first page of listing, not the whole app: the tombstone goes
+        // out at once, and its `at` is when it was written.
         ensure!(
-            !app.app_keys().await?.is_empty(),
+            app.has_keys().await?,
             "no such app: nothing of {shown} is in the bucket"
         );
+        since_ms = now();
         let body = format!(
             "wasmkeep-app-deleted 1\nby {}\nat {}\nid {}\n",
             args.who,
