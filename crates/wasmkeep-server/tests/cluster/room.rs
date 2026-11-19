@@ -21,6 +21,13 @@ async fn room_reconnect_announces_unsent_numbers_void() {
         |c| {
             c.batched.insert("t".into());
             c.max_unsent_age = Duration::from_secs(5);
+            // No alarm sweep on a. The room's push alarm runs after uploads
+            // are held, and its index entry is retired only once the segment
+            // that cleared it lands. A sweep (from 1.2 s past the entry, 3.6 s
+            // as anyone's) delivers it as a stale hint, and clearing that
+            // flushes to a barrier first: the room waits out an upload budget
+            // (21 s), and a publish queued behind it times out.
+            c.cluster.as_mut().unwrap().alarm_sweep = Duration::from_secs(60);
         },
     )
     .await;
