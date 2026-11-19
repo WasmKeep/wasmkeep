@@ -153,6 +153,12 @@ if $full || $rust; then
   step tests
   if $full; then
     cargo nextest run --workspace --locked
+    # The TypeScript room and edge tests at the default CPU budget are
+    # ignored in plain runs (on a slow CI runner they measure the runner):
+    # run them here, on this machine. The StarlingMonkey distinct-positions
+    # variant stays out, a 0.6.0 known limit (CHANGELOG).
+    cargo nextest run -p wasmkeep-server --test big_room --test room_edge --locked --run-ignored only \
+      -E 'test(/default_budget/) - test(=typescript_big_room_distinct_positions_at_default_budget_starlingmonkey)'
   else
     # The cluster suite over TLS repeats the cluster suite on another
     # transport: --full only.

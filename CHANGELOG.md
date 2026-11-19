@@ -53,6 +53,9 @@ Known limits:
   acknowledges 2.4 to 4.3 of 10 messages/s
   ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)). The
   room's node keeps the memory it took, and its edges stay on one node.
+  The preview at the default 50 ms budget assumes a reasonably fast CPU:
+  on a slow shared runner the room's front went over its budget and
+  answered 500.
 - **On StarlingMonkey, a big room can run out of guest memory on a
   starved CPU.** With one core for the node, the room actor's heap grows
   until SpiderMonkey's garbage collector cannot allocate, and the room's
