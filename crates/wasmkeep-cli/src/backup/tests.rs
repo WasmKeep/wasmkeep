@@ -2400,7 +2400,13 @@ async fn review7_nonzero_late_wait_and_two_restores() {
     restore::execute(&restore_args(&id, false), &f.dest, "", &target, "", late)
         .await
         .unwrap();
-    assert!(start.elapsed() >= late * 2 - std::time::Duration::from_secs(1));
+    // No node of the app ever wrote here and every write was answered:
+    // neither the quiet wait nor the lock's settle has anything to wait for.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
     let old = optional(&target, "apps/acme/shop/restored").await.unwrap();
     restore::execute(&restore_args(&id, true), &f.dest, "", &target, "", late)
         .await
@@ -2409,6 +2415,165 @@ async fn review7_nonzero_late_wait_and_two_restores() {
         old,
         optional(&target, "apps/acme/shop/restored").await.unwrap()
     );
+}
+
+/// A heartbeat of `acme/shop`'s node `id`, in `state`, last written live at
+/// `written_at_ms`.
+fn app_node_lease(
+    id: &str,
+    state: wasmkeep_cluster::node_lease::NodeState,
+    written_at_ms: u64,
+) -> Vec<u8> {
+    use wasmkeep_cluster::membership::NodeInfo;
+    let info = NodeInfo {
+        id: id.into(),
+        address: "http://n:8080".into(),
+        version: "0.0.0".into(),
+        written_at_ms,
+        app: "acme/shop".into(),
+        cluster_address: None,
+        tls_pins: Vec::new(),
+        drain: None,
+        reads_secrets: true,
+        can_take: true,
+        can_front: true,
+        can_handoff: true,
+        can_end: true,
+        can_flush: true,
+        can_rate_limits: true,
+        can_assets: true,
+        can_blobs: true,
+        can_restore: true,
+        can_actor_restore: true,
+        instance: None,
+        lease: None,
+        load: None,
+        can_recorded_head: true,
+        can_multi_app: true,
+        can_place: false,
+        process: None,
+    };
+    wasmkeep_cluster::node_lease::NodeLeaseObject {
+        state,
+        instance: Some("i1".into()),
+        written_at_ms,
+    }
+    .encode_with(&info.payload())
+}
+
+#[tokio::test(start_paused = true)]
+async fn restore_waits_for_a_stopped_nodes_last_write_not_for_the_fence() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let late = wasmkeep_server::apps::LATE_WRITES;
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    // A node of the app stopped moments ago: a write it sent may still land.
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    let now = u64::try_from(super::now_ms().unwrap()).unwrap();
+    put(
+        &target,
+        "nodes/n1",
+        app_node_lease("n1", NodeState::Released, now),
+        false,
+    )
+    .await
+    .unwrap();
+    let start = tokio::time::Instant::now();
+    restore::execute(&restore_args(&id, false), &f.dest, "", &target, "", late)
+        .await
+        .unwrap();
+    let waited = start.elapsed();
+    assert!(
+        waited >= late - std::time::Duration::from_secs(1) && waited < late * 2,
+        "{waited:?}"
+    );
+    // Stopped long ago (its last write is older than the bound): no wait.
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    let old = now - u64::try_from(late.as_millis()).unwrap() - 1_000;
+    put(
+        &target,
+        "nodes/n1",
+        app_node_lease("n1", NodeState::Fenced, old),
+        false,
+    )
+    .await
+    .unwrap();
+    let start = tokio::time::Instant::now();
+    restore::execute(&restore_args(&id, false), &f.dest, "", &target, "", late)
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    // A heartbeat this version cannot read proves nothing: the fence's time
+    // counts again, as before 0.7.0.
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    put(&target, "nodes/n2", b"wasmkeep-node 9\n".to_vec(), false)
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    restore::execute(&restore_args(&id, false), &f.dest, "", &target, "", late)
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() >= late - std::time::Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_answered_only_after_it_landed_keeps_the_lock_although_the_restore_succeeded() {
+    let late = wasmkeep_server::apps::LATE_WRITES;
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let run = async |fail: usize| {
+        let empty: Store = Arc::new(object_store::memory::InMemory::new());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Every mutation lands; the answer to mutation `fail` is lost.
+        let target: Store = Arc::new(FailMutation {
+            inner: empty.clone(),
+            count: count.clone(),
+            fail,
+            lost: true,
+            stray: false,
+        });
+        let start = tokio::time::Instant::now();
+        let result =
+            restore::execute(&restore_args(&id, false), &f.dest, "", &target, "", late).await;
+        let lock = optional(&empty, "apps/acme/shop/restore-lock")
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            result,
+            start.elapsed(),
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            lock,
+        )
+    };
+    let (result, waited, total, _) = run(usize::MAX).await;
+    result.unwrap();
+    assert!(waited < std::time::Duration::from_secs(1), "{waited:?}");
+    assert!(total > 10, "{total}");
+    let mut recovered = 0;
+    // Mutation 0 is the lock's own write and the last its release: neither
+    // has a lock to hold afterwards. Every one in between does.
+    for fail in 1..total - 1 {
+        let (result, waited, _, lock) = run(fail).await;
+        assert!(
+            waited >= late - std::time::Duration::from_secs(1),
+            "mutation {fail}: {waited:?} ({result:?})"
+        );
+        assert!(lock.starts_with(b"unlocked "), "mutation {fail}");
+        // Recovered: a create that finds the same bytes is not an error.
+        if result.is_ok() {
+            recovered += 1;
+        }
+    }
+    assert!(recovered > 0, "no restore recovered from a lost answer");
 }
 
 #[tokio::test]
@@ -3506,6 +3671,20 @@ async fn stable_id_backup_restore_timeout_finish_recreate_resume() {
     let f = Fixture::new().await;
     let run = f.create().await;
     let target: Store = Arc::new(object_store::memory::InMemory::new());
+    // A node of the app stopped just now: the quiet wait holds the restore
+    // past the timeout below.
+    put(
+        &target,
+        "nodes/n1",
+        app_node_lease(
+            "n1",
+            wasmkeep_cluster::node_lease::NodeState::Released,
+            u64::try_from(super::now_ms().unwrap()).unwrap(),
+        ),
+        false,
+    )
+    .await
+    .unwrap();
     let mut args = restore_args(&run, false);
     assert!(
         tokio::time::timeout(

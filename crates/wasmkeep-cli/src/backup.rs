@@ -275,6 +275,31 @@ fn configured(
     file: Option<&std::path::Path>,
     source_bucket: Option<&str>,
 ) -> anyhow::Result<(Store, String, String)> {
+    configured_settled(url, file, source_bucket, None)
+}
+
+/// Every HTTP attempt of a store, recorded in a [`wasmkeep_server::settle::Settle`]:
+/// the store's own retries can hide an attempt without an answer behind a
+/// call that succeeds.
+#[derive(Debug)]
+struct Observed(Arc<wasmkeep_server::settle::Settle>);
+impl object_store::client::HttpConnector for Observed {
+    fn connect(
+        &self,
+        options: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        let inner = object_store::client::ReqwestConnector::default().connect(options)?;
+        Ok(wasmkeep_server::settle::observe(inner, Arc::clone(&self.0)))
+    }
+}
+
+/// [`configured`], with every mutating HTTP attempt recorded in `settle`.
+fn configured_settled(
+    url: &str,
+    file: Option<&std::path::Path>,
+    source_bucket: Option<&str>,
+    settle: Option<Arc<wasmkeep_server::settle::Settle>>,
+) -> anyhow::Result<(Store, String, String)> {
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey as C};
     let (bucket, prefix) = crate::parse_bucket(url)?;
     ensure!(
@@ -356,6 +381,9 @@ fn configured(
         "S3 endpoint must be an origin without path or credentials"
     );
     let endpoint = endpoint_identity(&endpoint)?;
+    if let Some(settle) = settle {
+        builder = builder.with_http_connector(Observed(settle));
+    }
     let store = builder.with_bucket_name(bucket).build()?;
     Ok((Arc::new(store), prefix.to_owned(), endpoint))
 }
@@ -417,19 +445,25 @@ pub fn run(command: &Command) -> anyhow::Result<()> {
                 prune::execute(&store, &prefix, args.keep_runs, now_ms()?).await
             }
             Command::Restore(args) => {
-                let (archive, ap, ae) = configured(&args.from, None, None)?;
-                let (target, tp, te) = configured(&args.bucket, None, None)?;
+                // The archive's writes too (the undo run, its label): the
+                // lock is held while any write of this restore may land.
+                let settle = wasmkeep_server::settle::Settle::new();
+                let (archive, ap, ae) =
+                    configured_settled(&args.from, None, None, Some(Arc::clone(&settle)))?;
+                let (target, tp, te) =
+                    configured_settled(&args.bucket, None, None, Some(Arc::clone(&settle)))?;
                 disjoint(
                     (&ae, crate::parse_bucket(&args.from)?.0, &ap),
                     (&te, crate::parse_bucket(&args.bucket)?.0, &tp),
                 )?;
-                restore::execute(
+                restore::execute_settled(
                     args,
                     &archive,
                     &ap,
                     &target,
                     &tp,
                     wasmkeep_server::apps::LATE_WRITES,
+                    settle,
                 )
                 .await
             }

@@ -1,6 +1,9 @@
 //! Whole-app restore. The journal is the start fence; its phase and generation
 //! floors survive failures. The separate exclusive lock is released by CAS;
 //! after a killed CLI the operator waits for pending requests and clears it.
+//! Neither wait is fixed: the quiet wait counts from the app's node leases
+//! (`restore_fence::quiet_until_ms`), the lock is held only while a request
+//! of this command may still land (`restore_fence::release_at_ms`).
 use super::*;
 use object_store::ObjectStoreExt;
 use std::time::Duration;
@@ -142,6 +145,40 @@ async fn nodes(args: &Restore, store: &Store, prefix: &str) -> anyhow::Result<()
         "app has a tombstone; restore refused"
     );
     Ok(())
+}
+
+/// Whether the nodes listing proves that no node of the app can act on it
+/// unseen (`restore_fence::quiet_until_ms`), and whether the app has a node
+/// object at all. Fails closed: an object under `nodes/` that does not decode,
+/// or a node of the app without a node lease or the `restore` capability,
+/// makes the listing incomplete.
+async fn nodes_listing(store: &Store, prefix: &str, served: &str) -> anyhow::Result<(bool, bool)> {
+    use wasmkeep_cluster::membership::{Directory as _, NODES_PREFIX, NodeInfo};
+    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+        Arc::clone(store),
+        if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        },
+    );
+    let mut complete = true;
+    let mut any = false;
+    for (key, body) in bucket.list(NODES_PREFIX).await? {
+        let Some(node) = NodeInfo::decode(&body) else {
+            complete = false;
+            continue;
+        };
+        if key != format!("{NODES_PREFIX}{}", node.id) {
+            complete = false;
+            continue;
+        }
+        if node.app == served {
+            any = true;
+            complete &= node.lease.is_some() && node.can_restore;
+        }
+    }
+    Ok((complete, any))
 }
 
 fn actor_name<'a>(prefix: &'a str, root: &str) -> anyhow::Result<&'a str> {
@@ -323,6 +360,33 @@ pub(super) async fn execute(
     tp: &str,
     late: Duration,
 ) -> anyhow::Result<()> {
+    execute_settled(
+        args,
+        archive,
+        ap,
+        target,
+        tp,
+        late,
+        wasmkeep_server::settle::Settle::new(),
+    )
+    .await
+}
+
+/// [`execute`], recording this command's writes in `settle`, which the
+/// caller may also feed from the target's HTTP client
+/// (`wasmkeep_server::settle::observe`): every attempt, retries included.
+pub(super) async fn execute_settled(
+    args: &Restore,
+    archive: &Store,
+    ap: &str,
+    target: &Store,
+    tp: &str,
+    late: Duration,
+    settle: Arc<wasmkeep_server::settle::Settle>,
+) -> anyhow::Result<()> {
+    let target = &wasmkeep_server::settle::tracked(Arc::clone(target), Arc::clone(&settle));
+    let archive = &wasmkeep_server::settle::tracked(Arc::clone(archive), Arc::clone(&settle));
+    let late_ms = u64::try_from(late.as_millis())?;
     let name = format!("{}/{}", args.app.0, args.app.1);
     ensure!(
         name != "default/default",
@@ -594,11 +658,17 @@ pub(super) async fn execute(
         // retries. It is written before any state is removed or copied.
         replace_conditional(target, &key(&base, "restored"), text(&journal, "nonce")?.as_bytes().to_vec()).await?;
         nodes(args, target, tp).await?;
+        // The quiet wait (ADR 0033): until no write an old holder of the app
+        // sent can still land. Listed after the fence landed.
         let last = apps::fence_app_nodes(target, tp, &args.app.0, &args.app.1, &mut |_| {}).await?;
-        let quiet = number(&journal, "started_ms")?.max(last)
-            .saturating_add(u64::try_from(late.as_millis())?);
+        let (complete, any) = nodes_listing(target, tp, &name).await?;
+        let quiet = wasmkeep_cluster::restore_fence::quiet_until_ms(
+            number(&journal, "started_ms")?, any.then_some(last), complete && !args.force, late_ms);
         let now = now_ms()?;
-        if now < quiet { tokio::time::sleep(Duration::from_millis(quiet - now)).await; }
+        if now < quiet {
+            println!("Waiting {} s for writes of the app's earlier nodes that may still land.", (quiet - now).div_ceil(1000));
+            tokio::time::sleep(Duration::from_millis(quiet - now)).await;
+        }
         nodes(args, target, tp).await?;
 
         if journal["phase"] == "prepare" {
@@ -769,11 +839,19 @@ pub(super) async fn execute(
         println!("Start: wasmkeep serve --app {name} --bucket {}", args.bucket);
         Ok(())
     }.await;
-    // A prior timed-out write/delete may still land. Keep the exclusive
-    // lock across its deadline, including after removing the start fence.
-    // This also prevents a late fence deletion from opening the next restore.
-    if !late.is_zero() {
-        tokio::time::sleep(late).await;
+    // A timed-out write/delete of this command may still land. Keep the
+    // exclusive lock across its deadline, including after removing the start
+    // fence, so a late fence deletion cannot open the next restore. A command
+    // whose every write was answered has nothing left in flight.
+    let now = settle.now_ms();
+    let release =
+        wasmkeep_cluster::restore_fence::release_at_ms(now, settle.unsettled_ms(), late_ms);
+    if release > now {
+        eprintln!(
+            "A write of this restore got no answer: holding the restore lock {} s in case it lands late.",
+            (release - now).div_ceil(1000)
+        );
+        tokio::time::sleep(Duration::from_millis(release - now)).await;
     }
     let unlock = target
         .put_opts(

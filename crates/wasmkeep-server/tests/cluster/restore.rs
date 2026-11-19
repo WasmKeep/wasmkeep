@@ -1371,3 +1371,123 @@ async fn actor_restore_twice_around_a_durable_delete_always_publishes_before_end
         0
     );
 }
+
+/// The quiet wait of a whole-app restore counts from the last write of the
+/// app's stopped node (its node lease), not from the restore fence: a restore
+/// right after the node stopped waits until that write plus the late bound,
+/// and one after the bound passed does not wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_quiet_wait_counts_from_a_stopped_nodes_last_write() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store).await.unwrap();
+    let archive: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let (node, follow) = app_node_following("stopped", dir.path(), &store)
+        .await
+        .unwrap();
+    assert_eq!(read(node.addr, "kept").await, "0");
+    assert_eq!(
+        send(node.addr, "POST", "/actor/t/kept/durable", "")
+            .await
+            .body
+            .trim(),
+        "1"
+    );
+    let run = archive_command(
+        &[
+            "create",
+            "--bucket",
+            "s3://live",
+            "--to",
+            "s3://archive",
+            "--app",
+            "default/shop",
+        ],
+        &store,
+        &archive,
+    )
+    .await
+    .unwrap();
+    follow.abort();
+    drop(node);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !wasmkeep_server::apps::live_nodes(store.clone(), "", "default", "shop")
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let bucket =
+        wasmkeep_cluster::object_store::ObjectStoreBucket::new(store.clone(), String::new());
+    let written = wasmkeep_cluster::membership::all_heartbeats(&bucket)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.app == "default/shop")
+        .map(|n| n.written_at_ms)
+        .max()
+        .expect("the stopped node's lease");
+    let restore = [
+        "restore",
+        "--from",
+        "s3://archive",
+        "--bucket",
+        "s3://live",
+        "--app",
+        "default/shop",
+        "--in-place",
+        "--run",
+        run.as_str(),
+    ];
+    let late = Duration::from_secs(3);
+    archive_command_late(&restore, &archive, &store, late).await;
+    let now = || {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    assert!(
+        now() >= written + 3_000,
+        "restored {} ms after the node's last write",
+        now() - written
+    );
+    // Once the bound has passed, a restore has nothing to wait for.
+    let start = std::time::Instant::now();
+    archive_command_late(&restore, &archive, &store, late).await;
+    assert!(start.elapsed() < late, "{:?}", start.elapsed());
+    let (restarted, follow) = app_node_following("stopped", dir.path(), &store)
+        .await
+        .unwrap();
+    assert_eq!(
+        read(restarted.addr, "kept").await,
+        "1",
+        "archived actor lost"
+    );
+    follow.abort();
+}
+
+async fn archive_command_late(
+    args: &[&str],
+    source: &Arc<dyn ObjectStore>,
+    target: &Arc<dyn ObjectStore>,
+    late: Duration,
+) {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: wasmkeep_cli::backup::Command,
+    }
+    let cli = Cli::parse_from(std::iter::once("backup").chain(args.iter().copied()));
+    wasmkeep_cli::backup::execute_with_stores(&cli.command, source, "", target, "", late)
+        .await
+        .unwrap();
+}

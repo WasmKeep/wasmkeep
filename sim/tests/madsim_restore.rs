@@ -144,17 +144,35 @@ fn restore_fence_precedes_nodes_listing_and_opens_last() {
     }
 }
 
-// The timed model uses shared bucket state and two concurrent restore tasks.
-// Faults are retries of failed PUTs; late uploads model an already sent request.
+// The timed model: shared bucket state, an old holder of the app that pauses
+// with an upload in flight and resumes after the restore started, and two
+// restores in a row. Its waits are the CLI's own decisions
+// (`quiet_until_ms`, `release_at_ms`), the holder's validity its node lease's
+// (`written_at + ttl - safety` on its own clock).
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc, time::Duration};
+use wasmkeep_cluster::lease::LeaseConfig;
 use wasmkeep_cluster::replication::{Listing, SegmentId, plan_restore, snapshot_key};
+use wasmkeep_cluster::restore_fence::{quiet_until_ms, release_at_ms};
 use wasmkeep_sim::rng::Rng;
+
+/// `LATE_WRITES`: a bucket client's request timeout (30 s) plus a lease's ttl.
+const LATE: u64 = 40_000;
+/// How long a request may take before the client gives up (and it may land).
+const REQUEST: u64 = 30_000;
+/// The second restore's copy: long enough for a late request to land in it.
+const COPY: u64 = 45_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mutation {
     None,
-    NoQuiet,
+    /// The quiet wait ignores the app's node leases (counts from nothing).
+    PrematureQuiet,
+    /// An upload lands after the bucket client's request timeout.
     BeyondDeadline,
+    /// The paused holder writes on resuming without asking its lease.
+    ResumedWrites,
+    /// The lock is released at once although a request got no answer.
+    PrematureRelease,
     NoMarker,
     NoLock,
 }
@@ -167,41 +185,76 @@ enum Violation {
 }
 #[derive(Default)]
 struct Bucket {
-    fence: bool,
+    fence: Option<u64>,
     lock: bool,
     marker: u64,
     keys: BTreeSet<String>,
+    /// The old holder's node lease: `written_at` of its last live write.
+    heartbeat: Option<u64>,
+    cleared: bool,
     active: usize,
     overlap: bool,
-    rejected: usize,
+    violation: Option<Violation>,
     retries: usize,
 }
-async fn operation(
+async fn until(t: u64) {
+    let n = clock();
+    if t > n {
+        madsim::time::sleep(Duration::from_millis(t - n)).await;
+    }
+}
+thread_local!(static START: RefCell<Option<madsim::time::Instant>> = const { RefCell::new(None) });
+fn clock() -> u64 {
+    START.with(|s| {
+        let start = *s
+            .borrow_mut()
+            .get_or_insert_with(madsim::time::Instant::now);
+        u64::try_from(start.elapsed().as_millis()).unwrap()
+    })
+}
+/// One restore: lock, fence and marker, quiet wait, clear, copy, open, settle.
+/// `unknown`: the fence deletion's first attempt gets no answer and lands
+/// `unknown` ms after the client gave up. Returns its time under the lock.
+#[allow(clippy::too_many_arguments)]
+async fn restore(
     bucket: Rc<RefCell<Bucket>>,
     id: u64,
-    delay: u64,
+    start: u64,
+    copy: u64,
     faults: u64,
+    unknown: Option<u64>,
     mutation: Mutation,
-) -> bool {
-    madsim::time::sleep(Duration::from_secs(delay)).await;
+) -> u64 {
+    until(start).await;
+    loop {
+        {
+            let mut b = bucket.borrow_mut();
+            if !b.lock || mutation == Mutation::NoLock {
+                b.lock = true;
+                b.active += 1;
+                b.overlap |= b.active > 1;
+                b.fence = Some(id);
+                if mutation != Mutation::NoMarker {
+                    b.marker += 1;
+                }
+                break;
+            }
+        }
+        madsim::time::sleep(Duration::from_millis(500)).await;
+    }
+    let locked = clock();
+    // Listed after the fence landed; the listing is complete in this model.
+    let last = if mutation == Mutation::PrematureQuiet {
+        None
+    } else {
+        bucket.borrow().heartbeat
+    };
+    until(quiet_until_ms(locked, last, true, LATE)).await;
     {
         let mut b = bucket.borrow_mut();
-        if b.lock && mutation != Mutation::NoLock {
-            b.rejected += 1;
-            return false;
-        }
-        b.lock = true;
-        b.active += 1;
-        b.overlap |= b.active > 1;
-        b.fence = true;
-        if mutation != Mutation::NoMarker {
-            b.marker += 1;
-        }
+        b.keys.clear();
+        b.cleared = true;
     }
-    if mutation != Mutation::NoQuiet {
-        madsim::time::sleep(Duration::from_secs(40)).await;
-    }
-    bucket.borrow_mut().keys.clear();
     for _ in 0..faults {
         bucket.borrow_mut().retries += 1;
         madsim::time::sleep(Duration::from_secs(1)).await;
@@ -210,100 +263,212 @@ async fn operation(
         generation: id,
         txid: 1,
     }));
-    // Hold through completion, allowing the competing operation and start task
-    // to run even in the no-quiet mutant.
-    madsim::time::sleep(Duration::from_secs(40)).await;
+    madsim::time::sleep(Duration::from_millis(copy)).await;
+    // Opening: the fence must still be this restore's own.
+    let mut unsettled = None;
+    {
+        let mut b = bucket.borrow_mut();
+        if b.fence != Some(id) {
+            b.violation.get_or_insert(Violation::PartialState);
+        }
+    }
+    if let Some(lands) = unknown {
+        // The first attempt: sent, no answer until the client gives up.
+        madsim::time::sleep(Duration::from_millis(REQUEST)).await;
+        let ended = clock();
+        unsettled = Some(ended);
+        let late = bucket.clone();
+        madsim::task::spawn_local(async move {
+            madsim::time::sleep(Duration::from_millis(lands)).await;
+            late.borrow_mut().fence = None;
+        });
+    }
+    // The retry (or the only attempt) is answered.
+    bucket.borrow_mut().fence = None;
+    let release = if mutation == Mutation::PrematureRelease {
+        clock()
+    } else {
+        release_at_ms(clock(), unsettled, LATE)
+    };
+    until(release).await;
     let mut b = bucket.borrow_mut();
-    b.fence = false;
     b.active -= 1;
     b.lock = false;
-    true
+    clock() - locked
 }
-fn timed(seed: u64, mutation: Mutation) -> Result<(), Violation> {
+/// The old holder: one live write of its node lease, an upload sent while
+/// valid that lands late, then a pause until after the restore started. On
+/// resuming it asks its lease (its own clock) before writing.
+async fn old_holder(bucket: Rc<RefCell<Bucket>>, rng: &mut Rng, resume: u64, mutation: Mutation) {
+    let lease = LeaseConfig::default_safe();
+    let skew = rng.below(2 * lease.max_skew_ms() + 1);
+    // Its clock reads `real + skew - max_skew`.
+    let own = move |real: u64| (real + skew).saturating_sub(lease.max_skew_ms());
+    let written_at = own(1_000);
+    bucket.borrow_mut().heartbeat = Some(written_at);
+    let valid = move |real: u64| own(real) < written_at + lease.ttl_ms() - lease.safety_ms();
+    let send = 5_000 + rng.below(4_000);
+    let deadline = if mutation == Mutation::BeyondDeadline {
+        LATE + 1_000 + rng.below(20_000)
+    } else {
+        20_000 + rng.below(REQUEST - 20_000)
+    };
+    until(send).await;
+    assert!(valid(clock()), "the model sends only while valid");
+    let late = bucket.clone();
+    madsim::task::spawn_local(async move {
+        madsim::time::sleep(Duration::from_millis(deadline)).await;
+        let mut b = late.borrow_mut();
+        if b.cleared {
+            b.violation.get_or_insert(Violation::LateHistory);
+        }
+        b.keys.insert(snapshot_key(SegmentId {
+            generation: 7,
+            txid: 3,
+        }));
+    });
+    // Paused (a stopped process, a long GC, a frozen VM) until `resume`.
+    until(resume).await;
+    if valid(clock()) || mutation == Mutation::ResumedWrites {
+        let mut b = bucket.borrow_mut();
+        if b.cleared {
+            b.violation.get_or_insert(Violation::LateHistory);
+        }
+        b.keys.insert(snapshot_key(SegmentId {
+            generation: 7,
+            txid: 4,
+        }));
+    }
+}
+/// `holder`: the app had a node that stopped moments before the restore.
+/// `unknown`: the first restore's fence deletion got no answer.
+fn timed(seed: u64, holder: bool, unknown: bool, mutation: Mutation) -> Result<u64, Violation> {
     let rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
     rt.block_on(async move {
+        START.with(|s| *s.borrow_mut() = Some(madsim::time::Instant::now()));
         let bucket = Rc::new(RefCell::new(Bucket::default()));
         let mut rng = Rng::new(seed);
-        // The healthy request deadline is strictly below the quiet window.
-        // Only a deadline mutant can upload after it (with randomized lateness).
-        let late = if mutation == Mutation::BeyondDeadline {
-            42 + rng.below(30)
-        } else {
-            2 + rng.below(35)
-        };
-        let pending = bucket.clone();
-        let upload = madsim::task::spawn_local(async move {
-            madsim::time::sleep(Duration::from_secs(late)).await;
-            pending.borrow_mut().keys.insert(snapshot_key(SegmentId {
-                generation: 99,
-                txid: 1,
-            }));
+        let first_at = 15_000 + rng.below(5_000);
+        let second_at = first_at + 1_000 + rng.below(19_000);
+        let resume = first_at + 30_000 + rng.below(30_000);
+        let lands = 1_000 + rng.below(LATE - 2_000);
+        let (faults1, faults2) = (1 + rng.below(3), rng.below(3));
+        let local = bucket.borrow().marker; // a node prepared before either restore
+        let holder_task = holder.then(|| {
+            let b = bucket.clone();
+            let mut r = Rng::new(seed ^ 0x5eed);
+            madsim::task::spawn_local(async move { old_holder(b, &mut r, resume, mutation).await })
         });
-        let local = bucket.borrow().marker; // node prepared before either restore
-        let first =
-            madsim::task::spawn_local(operation(bucket.clone(), 1, 0, 1 + rng.below(3), mutation));
-        let second = madsim::task::spawn_local(operation(
+        let first = madsim::task::spawn_local(restore(
             bucket.clone(),
-            2,
-            1 + rng.below(20),
-            rng.below(3),
+            1,
+            first_at,
+            0,
+            faults1,
+            unknown.then_some(lands),
             mutation,
         ));
-        // A live-node start obtains its lease, then uses the server's decision.
-        // A refused start releases the lease. Check again after restore below.
-        madsim::time::sleep(Duration::from_secs(25)).await;
+        let second = madsim::task::spawn_local(restore(
+            bucket.clone(),
+            2,
+            second_at,
+            COPY,
+            faults2,
+            None,
+            mutation,
+        ));
+        // A node start in the middle of the first restore is refused.
+        until(first_at + 1).await;
         let during = {
             let b = bucket.borrow();
-            start_allowed(false, b.fence)
+            start_allowed(false, b.fence.is_some())
                 && marker_matches(Some(&b.marker.to_le_bytes()), Some(&local.to_le_bytes()))
         };
         assert!(!during, "node served while fenced, seed {seed}");
-        let results = (first.await.unwrap(), second.await.unwrap());
-        upload.await.unwrap();
+        let held = first.await.unwrap();
+        second.await.unwrap();
+        if let Some(task) = holder_task {
+            task.await.unwrap();
+        }
+        // Let every late request land.
+        madsim::time::sleep(Duration::from_millis(2 * LATE)).await;
         let b = bucket.borrow();
         if b.overlap {
             return Err(Violation::ConcurrentWriter);
         }
-        assert_eq!(
-            results,
-            (true, false),
-            "competing operation was not rejected"
-        );
-        assert_eq!(b.rejected, 1);
+        if let Some(v) = b.violation {
+            return Err(v);
+        }
         assert!(b.retries > 0, "fault injection was not exercised");
         let plan = plan_restore(&Listing::from_keys(b.keys.iter().map(String::as_str))).unwrap();
         if plan.head()
             != (SegmentId {
-                generation: 1,
+                generation: 2,
                 txid: 1,
             })
         {
             return Err(Violation::LateHistory);
         }
-        if start_allowed(false, b.fence)
+        if start_allowed(false, b.fence.is_some())
             && marker_matches(Some(&b.marker.to_le_bytes()), Some(&local.to_le_bytes()))
         {
             return Err(Violation::StaleDisk);
         }
-        Ok(())
+        Ok(held)
     })
 }
 #[test]
-fn seeded_late_uploads_two_restores_and_operator_start_gaps() {
-    let seeds = std::env::var("WASMKEEP_SIM_SEEDS")
+fn seeded_paused_old_holder_and_unanswered_requests_across_two_restores() {
+    let seeds: u64 = std::env::var("WASMKEEP_SIM_SEEDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
     for seed in 0..seeds {
-        assert_eq!(timed(seed, Mutation::None), Ok(()), "seed {seed}");
-        for (mutation, reason) in [
-            (Mutation::NoQuiet, Violation::LateHistory),
-            (Mutation::BeyondDeadline, Violation::LateHistory),
-            (Mutation::NoMarker, Violation::StaleDisk),
-            (Mutation::NoLock, Violation::ConcurrentWriter),
+        let mut rng = Rng::new(seed.wrapping_mul(0x9e37_79b9));
+        let (holder, unknown) = (rng.chance(50), rng.chance(50));
+        let held = timed(seed, holder, unknown, Mutation::None)
+            .unwrap_or_else(|v| panic!("seed {seed} ({holder}, {unknown}): {v:?}"));
+        // With nothing that may still land, the restore waits for nothing:
+        // its time under the lock is its own work (the injected faults).
+        if !holder && !unknown {
+            assert!(held < 5_000, "seed {seed}: held {held} ms");
+        }
+        if unknown {
+            assert!(
+                held >= REQUEST + LATE,
+                "seed {seed}: released after {held} ms"
+            );
+        }
+        for (mutation, holder, unknown, reason) in [
+            (
+                Mutation::PrematureQuiet,
+                true,
+                unknown,
+                Violation::LateHistory,
+            ),
+            (
+                Mutation::BeyondDeadline,
+                true,
+                unknown,
+                Violation::LateHistory,
+            ),
+            (
+                Mutation::ResumedWrites,
+                true,
+                unknown,
+                Violation::LateHistory,
+            ),
+            (
+                Mutation::PrematureRelease,
+                holder,
+                true,
+                Violation::PartialState,
+            ),
+            (Mutation::NoMarker, holder, unknown, Violation::StaleDisk),
+            (Mutation::NoLock, true, unknown, Violation::ConcurrentWriter),
         ] {
             assert_eq!(
-                timed(seed, mutation),
+                timed(seed, holder, unknown, mutation),
                 Err(reason),
                 "{mutation:?} must fail for {reason:?}, seed {seed}"
             );
