@@ -25,6 +25,11 @@ async fn request(addr: SocketAddr, path: &str) -> String {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn room_edge_slow_socket_and_restart() {
+    // Warnings name the cause of a red (an actor's trap, a retried alarm).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wasmkeep_server=warn,wasmkeep_runtime=warn")
+        .with_test_writer()
+        .try_init();
     let wasm = guests::build_guest("../wasmkeep-sdk/tests/room-edge-guest", "room_edge_guest");
     let runtime = Runtime::new(&RuntimeConfig {
         max_instances: 8,
@@ -33,24 +38,32 @@ async fn room_edge_slow_socket_and_restart() {
     .unwrap();
     let component = guests::compile(&runtime, &wasm);
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ActorConfig::new(dir.path());
-    config.mailbox.idle_timeout = Duration::from_millis(300);
-    let svc = ActorService::new(
-        runtime,
-        config,
-        vec![
-            ("t".into(), component.clone(), wasm.clone()),
-            ("pusher".into(), component.clone(), wasm.clone()),
-            ("edge".into(), component, wasm),
-        ],
-    )
-    .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(wasmkeep_server::serve(listener, svc.clone(), async {
-        let _ = stopped.await;
-    }));
+    // One node on `dir` whose actors hibernate after `idle`.
+    let node = |idle: Duration| {
+        let mut config = ActorConfig::new(dir.path());
+        config.mailbox.idle_timeout = idle;
+        let svc = ActorService::new(
+            runtime.clone(),
+            config,
+            vec![
+                ("t".into(), component.clone(), wasm.clone()),
+                ("pusher".into(), component.clone(), wasm.clone()),
+                ("edge".into(), component.clone(), wasm.clone()),
+            ],
+        )
+        .unwrap();
+        async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (stop, stopped) = oneshot::channel::<()>();
+            let server = tokio::spawn(wasmkeep_server::serve(listener, svc.clone(), async {
+                let _ = stopped.await;
+            }));
+            (svc, addr, stop, server)
+        }
+    };
+    // A short idle timeout, for the cold wake below.
+    let (svc, addr, stop, server) = node(Duration::from_millis(300)).await;
     let warm = request(addr, "/actor/t/driver/r3-start").await;
     assert!(warm.starts_with("HTTP/1.1 200"), "{warm}");
     let (mut ws, _) = tokio_tungstenite::connect_async(format!(
@@ -74,6 +87,15 @@ async fn room_edge_slow_socket_and_restart() {
     .expect("actors did not hibernate");
     ws.close(None).await.unwrap();
     drop(ws);
+    // The rest restarts the node on the same data, with an idle timeout no
+    // stall of a loaded runner reaches: an actor that hibernated mid-stream
+    // would forget its cursors, and the edge would rightly skip what its
+    // sockets missed (ADR 0040, "After a hibernation"). Every skip, repeat or
+    // reorder below is then a delivery fault.
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    drop(svc);
+    let (_svc, addr, stop, server) = node(Duration::from_secs(60)).await;
     let warm = request(addr, "/actor/t/driver/r3-start").await;
     assert!(warm.starts_with("HTTP/1.1 200"), "{warm}");
     let (mut one, _) = tokio_tungstenite::connect_async(format!(
