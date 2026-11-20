@@ -186,7 +186,7 @@ test("wake: the pusher clocks itself while behind, says idle at the head, and on
             const p = JSON.parse(req.text());
             if (p.messages.length)
                 acked = p.first + p.messages.length - 1;
-            return { body: JSON.stringify({ e: p.e, n: acked, lagging }) };
+            return { body: JSON.stringify({ e: p.e, n: acked, lagging, sockets: 0 }) };
         } });
     w.add("room/r", define());
     w.add("pusher/r", definePusher({ edges: ["edge/f"] }));
@@ -215,7 +215,7 @@ test("wake: the pusher clocks itself while behind, says idle at the head, and on
     fire();
     assert.equal(acked, 3);
     fire(); // the safety round finds nothing new: no alarm is left
-    assert.equal(alarms.pending, undefined, "a quiet room keeps no alarm");
+    assert.equal(alarms.pending, undefined, "a quiet room without sockets keeps no alarm");
     publish();
     assert.equal(pokes(), 3);
 });
@@ -246,4 +246,42 @@ test("a failed scale step never stalls delivery: the pusher still says idle, a p
     assert(alarms.pending! <= BigInt(Date.now() + 20));
     w.alarm("pusher/r");
     assert.equal(acked, 1, "the message reached the edge while the step keeps failing");
+});
+for (const sockets of [1, 0])
+test(`a quiet room ${sockets ? "with" : "without"} sockets: ${sockets ? "an idle alarm delivers a publish whose poke was lost" : "no alarm is left"}`, () => {
+    db.install(":memory:");
+    alarms.clearAlarm();
+    const w = new World();
+    let acked = 0;
+    w.add("edge/f", { fetch(req) {
+            if (req.path.endsWith("/init"))
+                return { body: "{}" };
+            const p = JSON.parse(req.text());
+            if (p.messages.length)
+                acked = p.first + p.messages.length - 1;
+            return { body: JSON.stringify({ e: p.e, n: acked, lagging: 0, sockets }) };
+        } });
+    w.add("room/r", define());
+    const pusher = definePusher({ edges: ["edge/f"] });
+    w.add("pusher/r", pusher);
+    w.add("probe/p", { fetch: () => ({ status: 200 }) });
+    const publish = () => w.as("probe/p", () => new Client("room/r").publish([{ body: "m" }]));
+    publish();
+    for (let i = 0; i < 8 && alarms.pending !== undefined && alarms.pending <= BigInt(Date.now() + 5000); i++)
+        w.alarm("pusher/r");
+    assert.equal(acked, 1);
+    if (!sockets) {
+        assert.equal(alarms.pending, undefined, "an empty group keeps no alarm");
+        return;
+    }
+    // Quiet: the safety round found nothing new; one idle alarm stays, at most 60 s out.
+    assert(alarms.pending !== undefined && alarms.pending <= BigInt(Date.now() + 60000), "an idle alarm while sockets are held");
+    // The pusher cannot be reached: the poke fails (three tries) and is lost.
+    w.add("pusher/r", { fetch: () => { throw { payload: { tag: "failed", val: "node down" } }; } });
+    publish();
+    assert.equal(w.log.filter(l => l === "pusher/r/wasmkeep-pusher/v1/poke").length, 1 + 3, "a failed poke is tried three times");
+    // Nothing else ever comes: the idle alarm, on the pusher's next node, delivers it.
+    w.add("pusher/r", pusher);
+    w.alarm("pusher/r");
+    assert.equal(acked, 2, "the acknowledged publish reached the edge with no later publish");
 });

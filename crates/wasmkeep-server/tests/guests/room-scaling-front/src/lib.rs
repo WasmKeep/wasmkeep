@@ -96,7 +96,7 @@ wasmkeep_sdk::export_front!(Front);
 // R6-only test routes: production clients use the TypeScript example's front.
 fn r6(path: &str, out: http::ResponseOutparam) {
     let name = query(path, "room").unwrap_or("big");
-    assert!(matches!(name, "big" | "small" | "legacy"));
+    assert!(matches!(name, "big" | "small" | "legacy" | "quiet"));
     let room = Client::new(format!("room/{name}"));
     let directory = format!("directory/bg:{name}");
     let endpoint = path.split('?').next().unwrap();

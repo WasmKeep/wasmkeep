@@ -120,6 +120,7 @@ impl Round {
         let mut slices: std::collections::BTreeMap<Option<(u64, u64)>, Option<Slice>> =
             Default::default();
         let mut read = 0usize;
+        let mut pulls = 0usize;
         let mut budget = ROUND_BYTES;
         let mut deferred = false;
         let mut retry = 20;
@@ -174,12 +175,15 @@ impl Round {
                             recover: false,
                             messages: vec![],
                         }))
-                    } else if key.is_some() && (read >= ROUND_BYTES || budget == 0) {
+                    } else if (key.is_some() && (read >= ROUND_BYTES || budget == 0))
+                        || pulls >= MAX_PULLS
+                    {
                         // Reads stop with the budget too: a deferred child costs nothing.
                         deferred = true;
                         self.resume.get_or_insert_with(|| child.address.clone());
                         continue;
                     } else {
+                        pulls += 1;
                         let budget = if key.is_some() { ROUND_BYTES - read } else { 0 };
                         match source.pull(child.position, budget, false, now) {
                             Ok(pull) => {
@@ -364,7 +368,15 @@ impl Round {
         if let Some(at) = next {
             crate::alarms::set_alarm(at);
         }
-        Ok(RoundResult { next, delivered })
+        let occupied = self
+            .children
+            .iter()
+            .any(|c| c.sockets.is_none_or(|n| n > 0));
+        Ok(RoundResult {
+            next,
+            delivered,
+            occupied,
+        })
     }
 }
 
@@ -397,7 +409,13 @@ pub struct RoundResult {
     pub next: Option<u64>,
     /// The lowest head a pushed child was given: where an idle pull claims to be.
     pub delivered: Option<Position>,
+    /// Some child holds sockets, or did not say: an idle pusher keeps an alarm.
+    pub occupied: bool,
 }
+/// Distinct positions one round pulls at most: the rest are deferred to
+/// the next round, so laggards at many positions never make one round a
+/// long chain of synchronous calls to the room.
+pub const MAX_PULLS: usize = 16;
 
 /// Message bytes one round builds for its children (ADR 0040, section 4).
 const ROUND_BYTES: usize = 1024 * 1024;

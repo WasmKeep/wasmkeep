@@ -5,7 +5,7 @@
 import * as alarms from "wasmkeep:actor/alarms@0.2.0";
 import * as actors from "wasmkeep:actor/actors@0.2.0";
 import { call } from "./call";
-import { Round, type Source } from "./broadcast-round";
+import { Round, type RoundResult, type Source } from "./broadcast-round";
 import { ScaleHost, type ScaleOptions } from "./broadcast-scaling";
 import { errorMessage, type Position, type Pull } from "./broadcast-core";
 import type { ActorDefinition, ActorRequest, ActorResponse } from "./index";
@@ -87,30 +87,41 @@ export interface PusherOptions {
     edges?: string[];
     /** the scaled group (R4/R5). */
     scaling?: ScaleOptions;
+    /** The longest an idle pusher with sockets waits for its next round
+     * (`IDLE_ROUND`, 60 s); tests shorten it. */
+    idleMs?: number;
 }
+/** A pusher that went idle after delivering something new keeps one alarm
+ * this much later: a poke lost while it could not be reached (its node
+ * died between a publish and its round) is caught up then. */
+export const SAFETY_ROUND = 5000;
+/** While its group holds sockets, an idle pusher always keeps one durable
+ * alarm at most this far out: an acknowledged publish whose poke was lost
+ * (a node death, a failed call) is delivered by then even if nothing
+ * else ever comes. An empty group keeps none (ADR 0040, section 13). */
+export const IDLE_ROUND = 60000;
 /** After a round whose next alarm is not 20 ms away, the pusher tells the
  * room it stops clocking itself: the room then asks publishers' fronts to
  * poke it. A head that moved meanwhile keeps the 20 ms clock instead. */
-/** A pusher that went idle after delivering something new keeps one alarm
- * this much later: a poke lost while it could not be reached (its node
- * died between a publish and its round) is caught up then. An idle round
- * that finds nothing new sets none, so a quiet room keeps no alarm. */
-export const SAFETY_ROUND = 5000;
-function idle(source: Source, at: Position | undefined, next: number | undefined, now: number, safe: { head?: Position }) {
+function idle(source: Source, result: RoundResult, now: number, safe: { head?: Position }, idleMs: number) {
+    const { delivered: at, next, occupied } = result;
     if (next !== undefined && next <= now + 20)
         return;
     const later = (t: number) => next === undefined || next > t;
+    const keep = (delay: number) => {
+        if (later(now + delay))
+            alarms.setAlarm(BigInt(now + delay));
+    };
     try {
         const h = source.pull(at, 0, true, now);
-        if (at && (h.e !== at.e || h.head !== at.n)) {
-            if (later(now + 20))
-                alarms.setAlarm(BigInt(now + 20));
-        }
+        if (at && (h.e !== at.e || h.head !== at.n))
+            keep(20);
         else if (at && (safe.head?.e !== at.e || safe.head?.n !== at.n)) {
             safe.head = at;
-            if (later(now + SAFETY_ROUND))
-                alarms.setAlarm(BigInt(now + SAFETY_ROUND));
+            keep(Math.min(SAFETY_ROUND, idleMs));
         }
+        else if (occupied)
+            keep(idleMs);
     }
     catch {
         // The room is unreachable: it cannot ask for a poke, so keep a clock.
@@ -143,7 +154,7 @@ export function definePusher(options: PusherOptions = {}): ActorDefinition {
             if (s && !s.migrate(room(), now))
                 return;
             const result = s ? s.run(round, room(), now) : round.run(room(), now);
-            idle(room(), result.delivered, result.next, now, safe);
+            idle(room(), result, now, safe, options.idleMs ?? IDLE_ROUND);
         },
         fetch(req: ActorRequest): ActorResponse {
             if (!header(req.headers, "x-wasmkeep-caller"))

@@ -7,6 +7,8 @@ use wasmkeep_sdk::{
     http,
 };
 thread_local! {static ROUND:std::cell::RefCell<Round>=std::cell::RefCell::new(Round::default());}
+/// The quiet room's idle alarm (room_cluster).
+const QUIET_IDLE_MS: u64 = 3000;
 struct Guest;
 impl Actor for Guest {
     fn on_init() -> Result<(), String> {
@@ -59,6 +61,10 @@ impl Actor for Guest {
         } else {
             1000
         });
+        // room_cluster: a quiet room whose idle alarm is short enough to test.
+        if a.name == "quiet" {
+            pusher::handler::idle_period(QUIET_IDLE_MS);
+        }
         ROUND.with_borrow_mut(|r| pusher::handler::scaling(&mut scale, r))
     }
     fn on_websocket_open(id: u64, path: String) -> Result<(), String> {

@@ -73,8 +73,13 @@ export class Client {
         end(r);
         // ADR 0040, section 13: the pusher went idle and asks for a poke. A
         // failed poke is ignored: the room keeps asking until the pusher pulls.
-        if (poke)
-            call(this.pusher, "POST", POKE, [], new Writer().u64(1).finish());
+        // Tried up to three times: the pusher's idle alarm (at most 60 s)
+        // covers a poke that still fails.
+        for (let attempt = 0; poke && attempt < 3; attempt++) {
+            const r = call(this.pusher, "POST", POKE, [], new Writer().u64(1).finish());
+            if (!("error" in r) && r.reply.status === 200)
+                break;
+        }
         return out;
     }
     history(after?: Position, limit = 2000, last?: number): History {

@@ -361,10 +361,18 @@ impl Client {
         end(&r)?;
         // ADR 0040, section 13: the pusher went idle and asks for a poke. A
         // failed poke is ignored: the room keeps asking until the pusher pulls.
+        // Tried up to three times: the pusher's idle alarm (at most 60 s)
+        // covers a poke that still fails.
         if poke {
             let mut w = Writer::default();
             w.u64(1);
-            let _ = wire::call(&self.pusher, "POST", POKE.into(), vec![], w.finish());
+            let body = w.finish();
+            for _ in 0..3 {
+                let r = wire::call(&self.pusher, "POST", POKE.into(), vec![], body.clone());
+                if r.is_ok_and(|r| r.status == 200) {
+                    break;
+                }
+            }
         }
         Ok(result)
     }

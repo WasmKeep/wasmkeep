@@ -18,6 +18,8 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message;
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_server::{ActorConfig, ActorService, App, ClusterConfig, HttpComponent, LeaseConfig};
+#[path = "support/fuel.rs"]
+mod fuel;
 #[path = "support/guests.rs"]
 mod guests;
 struct Node {
@@ -59,8 +61,11 @@ async fn node(
         rt.block_on(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            // Fuel per event (independent of CPU speed): the pusher tests
+            // bound every room event, the 513-row pull included.
             let runtime = Runtime::new(&RuntimeConfig {
                 max_instances: 16,
+                measure_fuel: true,
                 ..RuntimeConfig::default()
             })
             .unwrap();
@@ -199,6 +204,20 @@ fn apply(f: &str, last: &mut u64, allow_repeat: bool) -> bool {
     }
     false
 }
+/// Why an actor may have started cold (a new room epoch): instances that
+/// left memory, and leases lost or fenced, from the process's metrics.
+fn restarts() -> String {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    page.lines()
+        .filter(|l| {
+            !l.starts_with('#')
+                && (l.starts_with("wasmkeep_hibernations_total")
+                    || l.contains("lease_lost")
+                    || l.contains("fenced"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 #[derive(Default)]
 struct Progress {
     last: AtomicU64,
@@ -304,9 +323,13 @@ async fn caught_up(
         .iter()
         .any(|(p, _, _)| p.last.load(Ordering::SeqCst) < head)
     {
+        // A client stops on an epoch it did not expect: say whether an
+        // event trapped on its CPU budget (a room restart) or not.
         assert!(
             clients.iter().all(|(_, _, t)| !t.is_finished()),
-            "client task failed"
+            "client task failed; CPU-budget traps so far: {}; {}",
+            wasmkeep_runtime::cpu_budget_exceeded_total(),
+            restarts()
         );
         assert!(
             Instant::now() < deadline,
@@ -630,6 +653,9 @@ async fn room_cluster_pusher_node_dies_mid_round() {
         let _ = stop.send(());
         task.await.unwrap();
     }
+    // No event trapped and every room event (pulls, publishes, history)
+    // stayed under the fuel the 50 ms budget is calibrated for.
+    fuel::assert_ceiling(500_000_000);
 }
 /// A room event that traps discards the instance: the next operation opens
 /// an epoch, the pusher's pulls carry it, and the clients go on in order
@@ -720,4 +746,58 @@ async fn room_cluster_publish_acknowledged_while_a_round_is_held_by_a_slow_edge(
         "the round was not held: the test proves nothing"
     );
     task.abort();
+}
+/// A quiet room loses its pusher's node; one publish comes during the
+/// takeover and nothing after it. Its poke fails, yet the message is
+/// delivered: an idle pusher whose group holds sockets keeps a durable
+/// alarm (3 s for this room, 60 s by default), which the sweep delivers on
+/// a live node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_quiet_room_delivers_a_publish_made_during_the_pusher_takeover() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = node("a", store.clone(), wasm.clone(), front.clone()).await;
+    let mut b = node("b", store.clone(), wasm.clone(), front.clone()).await;
+    let _c = node("c", store.clone(), wasm, front).await;
+    let room = "quiet";
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    get(a.addr, "/r6/map?room=quiet").await;
+    assert_eq!(get(a.addr, "/r6/warm?room=quiet&edge=1").await.0, 200);
+    assert_eq!(get(a.addr, "/r6/history?room=quiet&n=0").await.0, 200);
+    assert_eq!(get(b.addr, "/r6/warm-pusher?room=quiet").await.0, 200);
+    let mut clients = vec![];
+    for i in 0..2 {
+        let p = Arc::new(Progress::default());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(client(
+            a.addr,
+            room,
+            format!("quiet{i}"),
+            p.clone(),
+            stopped,
+        ));
+        clients.push((p, stop, task));
+    }
+    let mut head = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while clients.iter().any(|(p, _, _)| {
+        p.ready.load(Ordering::SeqCst) == 0 || p.last.load(Ordering::SeqCst) < head.max(1)
+    }) {
+        assert!(Instant::now() < deadline, "joins");
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    caught_up(&clients, head).await;
+    // Quiet past the safety round: only the idle alarm stands.
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+    b.kill();
+    // One publish during the takeover, then nothing.
+    let head = publish(a.addr, room, false).await;
+    caught_up(&clients, head).await;
+    for (p, stop, task) in clients {
+        assert_eq!(p.last.load(Ordering::SeqCst), head);
+        let _ = stop.send(());
+        task.await.unwrap();
+    }
 }

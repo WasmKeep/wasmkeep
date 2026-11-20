@@ -4,7 +4,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { Core, type Pull, type Store } from "../src/broadcast-core";
-import { define } from "../src/broadcast";
+import { define, serve as roomServe } from "../src/broadcast";
+import { Round } from "../src/broadcast-round";
+import * as alarms from "./room-alarms-stub";
 import { Pulled } from "../src/broadcast-pusher";
 import { Client } from "../src/broadcast-client";
 import * as db from "./directory-storage-stub";
@@ -151,5 +153,35 @@ test("a pull reads what it answers, never the window, whatever the position", ()
     assert.throws(() => core.pull({ e: 1n, n: 0n }, (1 << 20) + 1, false, 0), /invalid pull budget/);
     assert.throws(() => core.pull({ e: 1n, n: 2001n }, 0, false, 0), /invalid position/);
     assert.throws(() => core.pull({ e: 2n, n: 0n }, 0, false, 0), /invalid position/);
+    db.close();
+});
+test("a round pulls at most 16 distinct positions and defers the other children", () => {
+    db.install(":memory:");
+    alarms.clearAlarm();
+    const core = new Core(db);
+    core.init();
+    for (let i = 0; i < 40; i++)
+        core.publish([{ body: `m${i}` }], 0n);
+    const serve = (path: string, body: Uint8Array) => ({ status: 200, headers: [] as [string, string][], body: roomServe(core, path.slice("/wasmkeep-room/v1/".length), body, "tenant/pusher/r", "tenant/pusher/r") });
+    let pulls = 0;
+    // Each child stays at its own position: 40 distinct pulls wanted every round.
+    install((a, r) => {
+        if (a === "room/r") {
+            pulls++;
+            return serve(r.path, r.body);
+        }
+        const p = JSON.parse(new TextDecoder().decode(r.body));
+        return { status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify({ e: p.e, n: Number(a.split(".e")[1]), lagging: 0, sockets: 1 })) };
+    });
+    const round = new Round([]);
+    round.sync(Array.from({ length: 40 }, (_, i) => ({ name: `edge/r.e${i}` })));
+    const source = new Pulled("room/r");
+    round.run(source, 0); // header only: the positions
+    for (let t = 20; t <= 60; t += 20) {
+        pulls = 0;
+        const r = round.run(source, t);
+        assert(pulls <= 16, `round at ${t} pulled ${pulls} times`);
+        assert.equal(r.next, t + 20, "the deferred children go on 20 ms later");
+    }
     db.close();
 });

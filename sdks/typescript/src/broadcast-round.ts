@@ -27,7 +27,13 @@ export interface RoundResult {
     next?: number;
     /** The lowest head a pushed child was given: where an idle pull claims to be. */
     delivered?: Position;
+    /** Some child holds sockets, or did not say: an idle pusher keeps an alarm. */
+    occupied?: boolean;
 }
+/** Distinct positions one round pulls at most: the rest are deferred to
+ * the next round, so laggards at many positions never make one round a
+ * long chain of synchronous calls to the room. */
+export const MAX_PULLS = 16;
 interface Slice {
     header: Pull;
     first?: number;
@@ -102,7 +108,7 @@ export class Round {
         this.resume = undefined;
         // Pulls by position: children at one position share one pull and one encoding.
         const slices = new Map<string, Slice | undefined>();
-        let read = 0, retry = 20, delivered: Position | undefined, current: Pull | undefined;
+        let read = 0, pulls = 0, retry = 20, delivered: Position | undefined, current: Pull | undefined;
         const slice = (position: Position | undefined): Slice | undefined => {
             const key = position ? `${position.e}.${position.n}` : "";
             if (slices.has(key))
@@ -113,6 +119,9 @@ export class Round {
             // Reads stop with the budget too: a deferred child costs nothing.
             if (position && (read >= ROUND_BYTES || budget <= 0))
                 return;
+            if (pulls >= MAX_PULLS)
+                return;
+            pulls++;
             let pull: Pull;
             try {
                 pull = source.pull(position, position ? ROUND_BYTES - read : 0, false, now);
@@ -273,6 +282,7 @@ export class Round {
                 next = Math.min(next, c.suspect.due);
         if (next !== Infinity)
             alarms.setAlarm(BigInt(next));
-        return { next: next === Infinity ? undefined : next, delivered };
+        const occupied = this.children.some(c => c.sockets === undefined || c.sockets > 0);
+        return { next: next === Infinity ? undefined : next, delivered, occupied };
     }
 }

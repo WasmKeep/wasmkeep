@@ -117,39 +117,44 @@ impl Source for Pulled {
 /// poke it. A head that moved meanwhile keeps the 20 ms clock instead.
 /// A pusher that went idle after delivering something new keeps one alarm
 /// this much later: a poke lost while it could not be reached (its node
-/// died between a publish and its round) is caught up then. An idle round
-/// that finds nothing new sets none, so a quiet room keeps no alarm.
+/// died between a publish and its round) is caught up then.
 pub const SAFETY_ROUND: u64 = 5000;
+/// While its group holds sockets, an idle pusher always keeps one durable
+/// alarm at most this far out: an acknowledged publish whose poke was lost
+/// (a node death, a failed call) is delivered by then even if nothing
+/// else ever comes. An empty group keeps none (ADR 0040, section 13).
+pub const IDLE_ROUND: u64 = 60_000;
 thread_local! {
     static SAFE: std::cell::Cell<Option<Position>> = const { std::cell::Cell::new(None) };
+    static IDLE_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(IDLE_ROUND) };
 }
 pub(super) fn idle(source: &mut impl Source, result: RoundResult, now: u64) {
     if result.next.is_some_and(|at| at <= now.saturating_add(20)) {
         return;
     }
-    let later = |at: u64| result.next.is_none_or(|n| n > at);
+    let keep = |delay: u64| {
+        let at = now.saturating_add(delay);
+        if result.next.is_none_or(|n| n > at) {
+            crate::alarms::set_alarm(at);
+        }
+    };
+    let idle_ms = IDLE_MS.get();
     match source.pull(result.delivered, 0, true, now) {
         Ok(h) => {
             if result
                 .delivered
                 .is_some_and(|d| d.e != h.e || d.n != h.head)
             {
-                if later(now.saturating_add(20)) {
-                    crate::alarms::set_alarm(now.saturating_add(20));
-                }
+                keep(20);
             } else if result.delivered.is_some() && SAFE.get() != result.delivered {
                 SAFE.set(result.delivered);
-                if later(now.saturating_add(SAFETY_ROUND)) {
-                    crate::alarms::set_alarm(now.saturating_add(SAFETY_ROUND));
-                }
+                keep(SAFETY_ROUND.min(idle_ms));
+            } else if result.occupied {
+                keep(idle_ms);
             }
         }
         // The room is unreachable: it cannot ask for a poke, so keep a clock.
-        Err(_) => {
-            if later(now.saturating_add(1000)) {
-                crate::alarms::set_alarm(now.saturating_add(1000));
-            }
-        }
+        Err(_) => keep(1000),
     }
 }
 #[cfg(feature = "actor")]
@@ -160,6 +165,11 @@ pub mod handler {
     thread_local! {
         static LAST_ROUND: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
         static ROOM_CLASS: std::cell::RefCell<String> = std::cell::RefCell::new("room".into());
+    }
+    /// The longest an idle pusher with sockets waits for its next round
+    /// ([`IDLE_ROUND`], 60 s); tests shorten it.
+    pub fn idle_period(ms: u64) {
+        IDLE_MS.set(ms);
     }
     /// The room's class, `room` by default: the pusher `pusher/lobby` pulls
     /// from `<class>/lobby`.

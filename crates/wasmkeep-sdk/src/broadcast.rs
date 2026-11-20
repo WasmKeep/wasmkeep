@@ -59,7 +59,7 @@ pub use edge_actor::EdgeActor;
 #[cfg(feature = "actor")]
 mod round;
 #[cfg(feature = "actor")]
-pub use round::{Round, RoundResult, Source};
+pub use round::{MAX_PULLS, Round, RoundResult, Source};
 #[cfg(feature = "actor")]
 pub mod pusher;
 #[cfg(feature = "actor")]

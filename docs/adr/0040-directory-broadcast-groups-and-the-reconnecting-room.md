@@ -588,7 +588,10 @@ is left of the round's 1 MiB. Pulls in one round can see different heads
 or epochs (a publish, or a room restart, between them): each child's push
 is that child's pull's header, and its acknowledgment is checked against
 that header. A pull that fails defers the children that needed it, as the
-budget does, 20 ms later.
+budget does, 20 ms later. A round pulls at most 16 distinct positions;
+children at further positions are deferred to the next round, so many
+laggards never make one round a long chain of synchronous calls to the
+room.
 
 **Waking the pusher.**
 
@@ -608,15 +611,22 @@ budget does, 20 ms later.
   (`Client.publish` in both SDKs) pokes the pusher only then, with a
   publish poke, which brings the pusher's alarm to 20 ms from now when it
   is later or unset. An idle pusher's mailbox is empty, so the poke
-  returns at once; a failed poke is ignored, and the flag stays set until
-  the pusher's next pull, so the next publish pokes again.
-- A poke can be lost for good: the pusher's node dies after its idle
-  pull, publishes then poke an address that answers nothing until the
-  takeover, and a quiet room sends no later publish. So a pusher that goes
-  idle after delivering something new keeps **one safety round** 5 s
-  later, a durable alarm the sweep delivers on a live node; an idle round
-  that finds nothing new sets none, so a quiet room still keeps no alarm
-  (one extra alarm per burst of publishes, not a heartbeat).
+  returns at once. A failed poke is tried up to three times, then
+  ignored; the flag stays set until the pusher's next pull, so the next
+  publish pokes again.
+- **The delivery guarantee.** A poke can be lost for good: the pusher's
+  node dies after its idle pull, a publish then pokes an address that
+  answers nothing until the takeover, and a quiet room sends no later
+  publish. In 0.6.0 the room's own durable alarm, set in the publish
+  event, guaranteed the push. So, while its group holds sockets (or a
+  child did not say how many), an idle pusher **always keeps one durable
+  alarm**, at most 60 s out, which the sweep delivers on a live node
+  after a takeover: an acknowledged publish reaches the edges within that
+  time even if nothing else ever comes. After delivering something new it
+  keeps it 5 s out instead, so a recent burst recovers sooner. An empty
+  group keeps none. This is the heartbeat the Alternatives below set
+  aside, bounded to rooms with clients: one alarm write and one
+  header-only round a minute per idle room.
 - A scale step that fails (a directory or edge unreachable, the edge
   ceiling) is retried 2 s later as before, but no longer fails the
   pusher's event: the round's result and the idle pull stand, so
@@ -648,7 +658,9 @@ each accepted from the current controller only and idempotent:
 operation row (if one was under way), the directory map's ownership and
 every edge's `room`. Nothing moves until the new pusher asks; deploy all
 five classes together (the 0.7.0 front reads the publish answer's new
-field and the 0.6.0 front would refuse it).
+field and the 0.6.0 front would refuse it: the publish is numbered, but
+the 0.6.0 front answers an error, and a retry without an `id` numbers it
+again).
 
 1. The pusher's first alarm finds no scale state of its own and calls the
    room's `adopt(read)`: the room's legacy rows, as they are (each SDK

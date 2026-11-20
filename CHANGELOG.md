@@ -44,8 +44,12 @@ The text under a version's heading is its GitHub release text
   and never calls the pusher. The pusher clocks itself every 20 ms while
   a child is behind; when it goes idle it tells the room in its last
   pull, and the publish answer then asks the front to poke it
-  (`Client.publish` does, in both SDKs). A join pokes the pusher, not
-  the room. A round still waits for its slowest child, but only the
+  (`Client.publish` does, trying a failed poke up to three times). While
+  its group holds sockets, an idle pusher always keeps one durable alarm
+  at most 60 s out, so an acknowledged publish whose poke was lost (its
+  node died, the call failed) is still delivered; an empty group keeps
+  none. A round pulls at most 16 distinct positions and defers the rest.
+  A join pokes the pusher, not the room. A round still waits for its slowest child, but only the
   pusher waits: publishes and history are answered meanwhile. Edges gain
   `handover`, directories `transfer`; the wire `Writer` of the
   TypeScript SDK writes into one buffer. TypeScript: `broadcast.define()`
@@ -63,7 +67,8 @@ The text under a version's heading is its GitHub release text
   **Upgrading a room deployed with 0.6.0.** Deploy the five classes
   together (the `pusher` class `internal`, from the same SDK version as
   the room and the front: a 0.6.0 front refuses the publish answer's new
-  field). The room keeps its history and numbers. On its first alarm the
+  field: the publish is numbered but the 0.6.0 front answers an error, and
+  a retry without an `id` publishes it twice). The room keeps its history and numbers. On its first alarm the
   pusher reads the room's scale rows (`adopt`), saves them as its own,
   then has the room hand the directory map and every edge over to it
   (16 edges per alarm) and retire its rows; a pending split or merge
