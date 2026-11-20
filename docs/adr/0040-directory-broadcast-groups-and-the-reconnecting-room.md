@@ -9,6 +9,11 @@
   delivery p99 at 5 to 15 s, so the room ships as a preview in 0.6.0. The
   publish path comes before the optional host "send to all my sockets"
   call, which stays deferred.
+- Amended 2026-11-20 (0.7.0, stage 1 of the publish path): the room's
+  rounds, children, relays and scaling move to a fifth class, the
+  **pusher**, which pulls from the room ([section 13](#13-the-pusher-amended-2026-11-20)).
+  Sections 3, 4, 7, 9 and 10 still describe what is done; section 13 says
+  which class now does it.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -498,6 +503,197 @@ nothing in Rust, whose `websockets::send` already tells them apart. The
 one host change this record allows is a `send to all my sockets` call,
 and only if the 10,000-client benchmark shows the edge's send loop,
 not the calls or the bucket, to be what limits a round.
+
+### 13. The pusher (amended 2026-11-20)
+
+**Why.** A round waits for its fan-out through relays to edges
+(section 8: it takes the slowest edge), so its length grows with the
+clients and the tree, and publishes, pokes and history queue behind it
+in the room's one mailbox: the sequencer spends its time waiting on
+delivery, and the room's own rounds, not its publishes, set the
+publish latency of a big room.
+
+**Five classes.** The app deploys a **pusher** beside the directory, the
+room, the edge and the relay, `internal` like them. It is addressed from
+the room's name: the room `room/lobby` has the pusher `pusher/lobby`
+(the class names are options in both SDKs; `room` and `pusher` by
+default). The pusher takes everything that delivers:
+
+- the round alarm (section 4), with the children's positions, suspects,
+  lag retries and the resume point;
+- the relay layer (section 8);
+- scaling (section 7) and its durable state: the scale row, the
+  operation row, the child counter, the minute rule's times, the refusal
+  count; the directory map's owner is the pusher;
+- `poke`, and the topology part of `stats` (section 10).
+
+The room keeps publish (numbers, epochs, the window), `history`, and a new
+read-only `pull`. It sets no alarm and holds no per-child state, in memory
+or in SQLite.
+
+```text
+publishers ──HTTP──▶ front ──call──▶ room                (publish: numbers)
+                       └──call──▶ pusher                 (poke, only when the room asks)
+pusher ──call──▶ room                                    (pull: messages after a position)
+pusher ──call-many──▶ [relays] ──call-many──▶ edges ──▶ sockets
+pusher ──call──▶ directory                               (split, merge)
+```
+
+**Calls still go one way** (section 1): front to room, front to pusher,
+pusher to room, pusher to relays, edges and directory. The room never
+calls the pusher, so a pusher waiting on a pull never meets itself; the
+pusher's call to the room is a short read the room answers from SQLite.
+No WIT change, no host change.
+
+**The pull contract.** `pull(after, budget, idle)` on the room's path
+prefix, framed with the `wire` module like `history`, accepted from the
+room's pusher only (`403` otherwise: an idle claim from anyone else
+would silence the wake):
+
+| Field | Meaning |
+|---|---|
+| `after` | optional `(e, n)`: a child's acknowledged position. Absent: the header alone, for a child whose position is unknown. |
+| `budget` | what is left of the round's 1 MiB, at most 1 MiB: it buys rows at 1 KiB each (at least one); `0` asks for the header alone. |
+| `idle` | the pusher is about to stop clocking itself (below). |
+
+The answer is the push header a child at `after` needs, then the messages:
+`(e, b, first, head)`, a `recover` flag, and up to 513 messages, each
+`(n, e, b, at, id?, body)` with its own epoch and that epoch's base. `e`
+and `head` are the room's; `b` is the lowest base of the epochs after
+`after.e` (the current epoch's base without `after`); `first` is the first
+number carried, or `head + 1` when none is. A position above a later
+epoch's base starts at that base (the numbers are void); a position below
+the window starts at the window's first message, so `first > after.n + 1`
+and the edge announces `behind` (section 5); a row whose epoch boundary
+left the 64 kept gives `recover` and no messages. The bound is the round's
+(section 4): each row is charged its body and id bytes plus 1 KiB,
+at most 512 KiB of bodies and 513 rows, at least one row when `budget` is
+not zero, whatever the window holds; the room reads only those rows.
+(The budget counts rows, not bytes: the 512 KiB cap bounds the bytes,
+and the pusher charges what it builds against the round's 1 MiB.)
+Body bytes come from SQLite (`CAST`), never re-encoded in the room.
+
+`pull` is read-only but for three things, each as `history` already does
+or the room did before the split: the first operation after a cold start
+seals an epoch durably (section 3); with `confirm`, the pull flushes first
+and answers `503 not durable: still uploading` until the upload is in,
+so the pusher retries 50 ms later and no number is ever pushed and then
+lost; and the idle flag below, which lives in memory.
+
+**A round over pulls.** The round is section 4's, unchanged in its cuts,
+budget and resume point. It pulls once per distinct child position
+(children at one position share the pull, as they shared a slice), plus
+one header-only pull when a child has no position, each pull taking what
+is left of the round's 1 MiB. Pulls in one round can see different heads
+or epochs (a publish, or a room restart, between them): each child's push
+is that child's pull's header, and its acknowledgment is checked against
+that header. A pull that fails defers the children that needed it, as the
+budget does, 20 ms later.
+
+**Waking the pusher.**
+
+- While some child's acknowledged position is below the head, or a child
+  is lagging, the pusher sets its alarm 20 ms later, as rounds do today.
+- When its next alarm would be later than 20 ms (none, a stalled reader's
+  backoff, a suspect's wait), the pusher ends the round with an **idle
+  pull**: `after` at the head it delivered, `budget` 0, `idle` set. The
+  room records the flag only if that position is its head; the answer's
+  head tells the pusher whether a publish came meanwhile, and then it
+  clocks itself 20 ms later instead.
+- Any other pull clears the flag. A cold room starts with the flag set,
+  and a flag older than 60 s without a pull (longer than an event's wall,
+  30 s by default) counts as set, so a pusher that lost its alarm is woken
+  by the next publish.
+- The publish answer carries one more field, `poke`: the flag. The front
+  (`Client.publish` in both SDKs) pokes the pusher only then, with a
+  publish poke, which brings the pusher's alarm to 20 ms from now when it
+  is later or unset. An idle pusher's mailbox is empty, so the poke
+  returns at once; a failed poke is ignored, and the flag stays set until
+  the pusher's next pull, so the next publish pokes again.
+- A poke can be lost for good: the pusher's node dies after its idle
+  pull, publishes then poke an address that answers nothing until the
+  takeover, and a quiet room sends no later publish. So a pusher that goes
+  idle after delivering something new keeps **one safety round** 5 s
+  later, a durable alarm the sweep delivers on a live node; an idle round
+  that finds nothing new sets none, so a quiet room still keeps no alarm
+  (one extra alarm per burst of publishes, not a heartbeat).
+- A scale step that fails (a directory or edge unreachable, the edge
+  ceiling) is retried 2 s later as before, but no longer fails the
+  pusher's event: the round's result and the idle pull stand, so
+  publishes still poke it and delivery does not wait on the step.
+- A join's poke (section 7) now goes to the pusher, keeps its old rule
+  (an alarm now if none is set and the last round is more than 1 s old)
+  and still answers at once.
+
+**Stage 1 still blocks.** A round still waits for its slowest child,
+`call-many` being synchronous, and the pusher's other events (pokes) wait
+behind it. Publishes, history pages and pulls do not: they are the room's,
+and the room's events are now its own. A slow edge delays delivery, never
+an acknowledgment. Not in this stage: a round that does not wait, and
+several pushers per room.
+
+**Authority.** The pusher is now the controller every edge and the map
+know. A new edge's configuration names the pusher in `room` (the field
+keeps its name: it is the address whose `init`, `range`, `drain`, `end`
+and direct pushes the edge accepts), and the pusher creates the directory
+map, so it is the map's owner. Two operations make that transferable,
+each accepted from the current controller only and idempotent:
+
+- edge `handover {"room": <new controller>}`: rewrites the configuration's
+  `room` durably; already naming it, or no configuration, answers `200`;
+- directory `transfer(owner)`: one durable transaction, the map's version
+  unchanged; already owned by `owner` answers `200`.
+
+**Moving a room deployed under 0.6.0.** Its room holds the scale row, the
+operation row (if one was under way), the directory map's ownership and
+every edge's `room`. Nothing moves until the new pusher asks; deploy all
+five classes together (the 0.7.0 front reads the publish answer's new
+field and the 0.6.0 front would refuse it).
+
+1. The pusher's first alarm finds no scale state of its own and calls the
+   room's `adopt(read)`: the room's legacy rows, as they are (each SDK
+   reads its own format). With none, the pusher starts a new group, as a
+   0.6.0 room did. With some, it saves them durably as its own state with
+   a migration row, operation included.
+2. Each following alarm runs one `adopt(handover)` step: the room, the
+   one that edges and the map still accept, calls the directory's
+   `transfer` to the pusher, then `handover` on up to 16 of the adopted
+   children per step (16 steps at most for 256 edges). This is the only
+   time a room calls anyone, and only on its pusher's request: a call
+   down from the pusher through the room to edges and the directory,
+   which call nobody, so no chain comes back.
+3. `adopt(retire)`: the room deletes its legacy rows durably, then the
+   pusher deletes its migration row. A pending operation then resumes in
+   the pusher from its recorded step (section 7).
+
+Until the last step the pusher runs no round and no scale pass; clients
+stay connected and receive the backlog once it is done, a few alarms
+later. Every step can be repeated after an unknown outcome. A 0.6.0 room
+may still have an alarm set: it fires once and does nothing. The room
+also still answers a 0.6.0 front's poke, with nothing. A fixed-edge room
+(R3's `edges`, a test configuration) keeps no list the room could hand
+over: its edges' rows name the room, and are recreated.
+
+**Wire details.** The pusher's one path is `poke` under the prefix
+`wasmkeep-pusher/v1`
+(an empty body for a join, `u64` 1 for a publish). `adopt` takes a kind
+(0 read, 1 hand over: the directory's address or empty, then up to 16
+edges, 2 retire). A step that continues at once sets the alarm 1 ms
+after its event's time, not at it: the host clears, after `on-alarm`, an
+alarm still at the delivered time, so a punctual delivery would stall
+the operation (this was already so for the room's scale steps). Inside
+`on-alarm`, `get-alarm` answers the alarm being delivered: the pusher's
+idle decision reads the round's own next alarm instead.
+
+**What a pusher cold start rebuilds.** Its scale state is durable, so a
+pusher that wakes, moves or loses its node keeps its children, relays
+and pending operation; the directory and the edges were changed only
+by its own recorded steps. What it loses is memory: positions,
+suspects and lag retries. Its first round is header-only, and the
+answers rebuild the positions, as a 0.6.0 room's cold start did.
+
+**Stats.** The pusher answers the topology (the example's `stats` route);
+the room's head and window come from `history`.
 
 ## Consequences
 
