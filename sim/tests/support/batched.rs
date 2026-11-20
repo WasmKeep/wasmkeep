@@ -90,6 +90,9 @@ pub(crate) enum Switch {
     /// A periodic snapshot is labelled at the head its upload lands at,
     /// not the acknowledged head its copy was taken at.
     SnapshotLabelAtLanding,
+    /// A reset does not wait for a periodic snapshot uploading on its node,
+    /// this hold's or one a given-up hold left: it lands after the erasure.
+    ResetSkipsSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,6 +118,9 @@ pub(crate) enum Violation {
     /// An index entry at a time named by no state, left after a delivery
     /// from the index (a sweep) of that time.
     OrphanLeft,
+    /// A periodic snapshot of rows a reset on its node erased, created in
+    /// the bucket after that reset: deleted data left behind.
+    ErasedLeft,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -160,10 +166,16 @@ enum Stage {
 struct SnapshotUpload {
     actor: usize,
     hold: u64,
+    // The node whose task uploads it: the one whose record later holds of
+    // the actor there consult.
+    node: usize,
+    started: u64,
     at: SegmentId,
     db: Db,
     path: BTreeSet<SegmentId>,
     due: u64,
+    // Encoded and its request sent: no longer cancelled by its hold's end.
+    requested: bool,
     put: bool,
     created: bool,
     done: bool,
@@ -238,6 +250,8 @@ struct Actor {
     acknowledged_positions: BTreeSet<SegmentId>,
     snapshot_paths: BTreeMap<SegmentId, BTreeSet<SegmentId>>,
     position_paths: BTreeMap<SegmentId, BTreeSet<SegmentId>>,
+    // Acknowledged resets: the node and the tick.
+    reset_nodes: Vec<(usize, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +307,9 @@ pub(crate) struct Counts {
     pub(crate) captures_beside_snapshot: u64,
     pub(crate) restores_beside_snapshot: u64,
     pub(crate) snapshot_collections: u64,
+    pub(crate) snapshots_cancelled: u64,
+    pub(crate) resets_after_given_up_snapshot: u64,
+    pub(crate) snapshots_after_foreign_reset: u64,
 }
 
 impl Counts {
@@ -356,6 +373,9 @@ impl Counts {
         self.captures_beside_snapshot += other.captures_beside_snapshot;
         self.restores_beside_snapshot += other.restores_beside_snapshot;
         self.snapshot_collections += other.snapshot_collections;
+        self.snapshots_cancelled += other.snapshots_cancelled;
+        self.resets_after_given_up_snapshot += other.resets_after_given_up_snapshot;
+        self.snapshots_after_foreign_reset += other.snapshots_after_foreign_reset;
     }
 }
 
@@ -1081,6 +1101,14 @@ impl World {
         let Some(h) = self.actors[actor].hold.take() else {
             return;
         };
+        // A hold that ends without its barrier cancels its upload: one not
+        // requested yet never is (`PeriodicFlights::cancel`).
+        for u in &mut self.snapshot_uploads {
+            if u.actor == actor && u.hold == h.generation && !u.requested && !u.done {
+                u.done = true;
+                self.outcome.counts.snapshots_cancelled += 1;
+            }
+        }
         // A node dying mid-upload: its snapshot PUT may never complete
         // (and a lease cut leaves it running, to land late).
         for u in &mut self.snapshot_uploads {
@@ -1320,7 +1348,29 @@ impl World {
         };
         self.snapshot_uploads
             .iter()
-            .any(|u| u.actor == actor && u.hold == h.generation && !u.done)
+            .any(|u| u.actor == actor && u.node == h.node && !u.done)
+    }
+
+    /// What a reset waits for first: the node's periodic snapshot of the
+    /// actor uploading, whichever hold left it.
+    fn snapshot_blocks_reset(&self, actor: usize) -> bool {
+        self.rule != Switch::ResetSkipsSnapshot && self.snapshot_uploading(actor)
+    }
+
+    /// A reset is starting: counted when an upload a given-up hold left on
+    /// this node is still under way (what the waits are for).
+    fn note_reset_beside_snapshot(&mut self, actor: usize) {
+        let Some(h) = &self.actors[actor].hold else {
+            return;
+        };
+        let (generation, node) = (h.generation, h.node);
+        if self
+            .snapshot_uploads
+            .iter()
+            .any(|u| u.actor == actor && u.node == node && u.hold != generation && !u.done)
+        {
+            self.outcome.counts.resets_after_given_up_snapshot += 1;
+        }
     }
 
     /// Collection after a snapshot at `at` by the owner of `generation`
@@ -1352,7 +1402,7 @@ impl World {
         } else {
             h.acknowledged.clone()
         };
-        let (at, generation) = (h.head, h.generation);
+        let (at, generation, node) = (h.head, h.generation, h.node);
         if !h.pending.is_empty() {
             self.outcome.counts.snapshots_over_pending += 1;
         }
@@ -1367,10 +1417,13 @@ impl World {
         self.snapshot_uploads.push(SnapshotUpload {
             actor,
             hold: generation,
+            node,
+            started: self.now,
             at,
             db,
             path,
             due,
+            requested: false,
             put: false,
             created: false,
             done: false,
@@ -1398,6 +1451,12 @@ impl World {
                 .as_ref()
                 .is_some_and(|h| h.generation == u.hold);
             let u = &mut self.snapshot_uploads[i];
+            if !u.requested {
+                // Encoded; its request goes out and lands some ticks later.
+                u.requested = true;
+                u.due = self.now + 1 + self.snapshot_rng.below(20);
+                continue;
+            }
             if !u.put {
                 u.put = true;
                 if !valid {
@@ -1427,6 +1486,15 @@ impl World {
                 if u.created {
                     self.outcome.counts.snapshots_created += 1;
                     self.outcome.counts.snapshots += 1;
+                    let (node, started) = (u.node, u.started);
+                    let a = &self.actors[u.actor];
+                    let erased = u.db.rows.iter().any(|r| a.deleted.contains(r));
+                    let after = |&(n, t): &(usize, u64)| t >= started && n == node;
+                    if erased && a.reset_nodes.iter().any(after) {
+                        self.outcome.violations.insert(Violation::ErasedLeft);
+                    } else if erased && a.reset_nodes.iter().any(|&(_, t)| t >= started) {
+                        self.outcome.counts.snapshots_after_foreign_reset += 1;
+                    }
                 }
                 self.check();
                 continue;
@@ -1495,14 +1563,16 @@ impl World {
         {
             return;
         }
-        // `ship_reset` ends a periodic snapshot's upload first.
+        // `ship_reset` ends a periodic snapshot's upload first, this hold's
+        // or one an earlier hold on this node left.
+        self.note_reset_beside_snapshot(actor);
         for _ in 0..100 {
-            if !self.snapshot_uploading(actor) {
+            if !self.snapshot_blocks_reset(actor) {
                 break;
             }
             self.advance(1).await;
         }
-        if self.snapshot_uploading(actor) {
+        if self.snapshot_blocks_reset(actor) {
             return;
         }
         if let Some((i, reset_id)) = self.start_reset(actor) {
@@ -1594,6 +1664,9 @@ impl World {
                 .deleted
                 .extend(self.uploads[i].object.after.erased.iter().copied());
             self.actors[actor].reset_acks.insert(reset_id);
+            if let Some(node) = self.actors[actor].hold.as_ref().map(|h| h.node) {
+                self.actors[actor].reset_nodes.push((node, self.now));
+            }
             self.outcome.counts.resets += 1;
             self.snapshot(actor);
         }
@@ -1739,7 +1812,14 @@ impl World {
                 }
             }
             Operation::ResetBarrier => {
-                if self.idle(actor)
+                let drained = self.actors[actor]
+                    .hold
+                    .as_ref()
+                    .is_some_and(|h| h.pending.is_empty() && h.flights.is_empty());
+                if drained && !self.snapshot_blocks_reset(actor) {
+                    self.note_reset_beside_snapshot(actor);
+                }
+                if (drained && !self.snapshot_blocks_reset(actor))
                     || matches!(self.rule, Switch::ResetCaptured | Switch::ResetInFlight)
                 {
                     self.start_reset(actor)
@@ -1823,6 +1903,11 @@ impl World {
                             generation: old.generation,
                             operation,
                         });
+                }
+                // Periodic snapshots start on their own stream, at an idle
+                // uploader, as `pump` starts them (ADR 0034, section 7).
+                if self.snapshot_rng.below(8) == 0 {
+                    self.start_snapshot(actor);
                 }
                 // Operation choices and bucket faults use the workload stream;
                 // node crashes/cuts use advance's independent fault stream.
@@ -2499,6 +2584,29 @@ pub(crate) fn safe(batching: bool) {
     } else {
         assert_eq!(totals.batched, 0, "strict captured several events");
         assert_eq!(totals.crash_pending, 0, "strict ran ahead of its upload");
+    }
+    if batching {
+        for (name, value) in [
+            ("snapshots started", totals.snapshots_started),
+            (
+                "snapshots over pending commits",
+                totals.snapshots_over_pending,
+            ),
+            ("snapshots created", totals.snapshots_created),
+            ("snapshots cancelled", totals.snapshots_cancelled),
+            ("snapshots landed after their hold", totals.snapshots_late),
+            (
+                "segments beside a snapshot",
+                totals.captures_beside_snapshot,
+            ),
+        ] {
+            assert!(value >= count, "{name}: {value} < {count}; {totals:?}");
+        }
+        // Holds here rarely live long enough for an acknowledged landing.
+        assert!(
+            totals.snapshot_collections * 5 >= count,
+            "collections after a snapshot: {totals:?}"
+        );
     }
     eprintln!("batched model: {count} seeds, batching={batching}: {totals:?}");
 }
@@ -3301,11 +3409,31 @@ pub(crate) fn simulate_snapshots(seed: u64, rule: Switch) -> Outcome {
                 let ticks = w.snapshot_rng.below(6);
                 w.advance(ticks).await;
                 let kind = w.snapshot_rng.below(4) as usize;
-                match w.snapshot_rng.below(5) {
+                match w.snapshot_rng.below(6) {
                     0 | 1 => w.crash_node(a),
                     2 => w.cut_node(a),
                     3 => w.handover(a, kind).await,
-                    _ => w.reset(a).await,
+                    4 => w.reset(a).await,
+                    _ => {
+                        // Fable's interleaving: the hold is given up with its
+                        // upload's request out, the actor is held again on
+                        // the same node and deleted while it is under way.
+                        for _ in 0..40 {
+                            if w.snapshot_uploads
+                                .iter()
+                                .all(|u| u.actor != a || u.done || u.requested)
+                            {
+                                break;
+                            }
+                            w.advance(1).await;
+                        }
+                        if let Some(node) = w.actors[a].hold.as_ref().map(|h| h.node) {
+                            w.outcome.counts.failed_hold_dropped += 1;
+                            w.drop_hold(a, false);
+                            w.acquire_at(a, Some(node));
+                            w.reset(a).await;
+                        }
+                    }
                 }
                 if w.actors[a].hold.is_none() {
                     w.acquire(a);
@@ -3349,6 +3477,10 @@ pub(crate) fn snapshots_safe() {
         ("segments beside one", totals.captures_beside_snapshot),
         ("restores beside one", totals.restores_beside_snapshot),
         ("collections after one", totals.snapshot_collections),
+        (
+            "resets after a given-up hold's",
+            totals.resets_after_given_up_snapshot,
+        ),
         ("durable", totals.durable),
         ("resets", totals.resets),
     ] {

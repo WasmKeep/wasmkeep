@@ -439,6 +439,10 @@ pub(crate) struct Cluster {
     /// Actors' waits after a periodic snapshot that failed: here, so they
     /// outlive an actor's time in memory.
     pub(crate) snapshot_waits: Arc<crate::replica::SnapshotWaits>,
+    /// Batched holds' periodic snapshots uploading, by actor: here, so a
+    /// later hold of the same actor (after one given up) waits for one
+    /// its predecessor left before a reset (ADR 0034, section 7).
+    pub(crate) periodic_flights: Arc<crate::replica::PeriodicFlights>,
     /// A clean stop's deadline, once one began (ADR 0034, section 10):
     /// batched holds' events are cut there, and their uploads stop waiting.
     stop_by: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
@@ -811,6 +815,7 @@ impl Cluster {
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,
             snapshot_waits: Arc::default(),
+            periodic_flights: Arc::default(),
             stop_by: tokio::sync::watch::Sender::new(None),
             heartbeat_ok_ms: std::sync::atomic::AtomicU64::new(0),
             heartbeat_every: config.heartbeat,

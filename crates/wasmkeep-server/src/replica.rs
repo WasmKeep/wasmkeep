@@ -570,6 +570,107 @@ fn periodic_snapshot_bound(idle: std::time::Duration, bytes: usize) -> std::time
         .min(idle.saturating_mul(PERIODIC_SNAPSHOT_IDLES))
 }
 
+/// A node's periodic snapshots of batched holds uploading off the mailbox,
+/// by actor ([`Cluster::periodic_flights`]). An upload outlives the hold
+/// that started it when that hold ends without its barrier (given up,
+/// failed, a stop past its deadline): the actor's next hold on this node
+/// finds it here, and its resets and barriers wait for it as for its own
+/// (ADR 0034, section 7). A hold that ends without its barrier cancels it:
+/// an upload whose request has not started then never sends it; one whose
+/// request is under way cannot be recalled, and is waited for until its
+/// one attempt ends.
+#[derive(Debug, Default)]
+pub(crate) struct PeriodicFlights(std::sync::Mutex<PeriodicFlightsInner>);
+
+#[derive(Debug, Default)]
+struct PeriodicFlightsInner {
+    next: u64,
+    flights: std::collections::HashMap<ActorAddress, PeriodicFlight>,
+}
+
+#[derive(Debug)]
+struct PeriodicFlight {
+    id: u64,
+    settled: watch::Receiver<Option<PeriodicOutcome>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PeriodicFlights {
+    fn inner(&self) -> std::sync::MutexGuard<'_, PeriodicFlightsInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records `address`'s upload; `None` if one is recorded already.
+    fn start(
+        &self,
+        address: &ActorAddress,
+        settled: watch::Receiver<Option<PeriodicOutcome>>,
+    ) -> Option<(u64, Arc<std::sync::atomic::AtomicBool>)> {
+        let mut inner = self.inner();
+        if inner.flights.contains_key(address) {
+            return None;
+        }
+        inner.next = inner.next.wrapping_add(1);
+        let (id, cancelled) = (inner.next, Arc::default());
+        inner.flights.insert(
+            address.clone(),
+            PeriodicFlight {
+                id,
+                settled,
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+        Some((id, cancelled))
+    }
+
+    /// The upload `id` of `address` ended.
+    fn end(&self, address: &ActorAddress, id: u64) {
+        let mut inner = self.inner();
+        if inner.flights.get(address).is_some_and(|f| f.id == id) {
+            inner.flights.remove(address);
+        }
+    }
+
+    /// Whether `address` has an upload recorded.
+    pub(crate) fn uploading(&self, address: &ActorAddress) -> bool {
+        self.inner().flights.contains_key(address)
+    }
+
+    /// A wait for `address`'s upload to end; `None` if none is recorded.
+    fn settled(
+        &self,
+        address: &ActorAddress,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + use<>> {
+        let mut settled = self.inner().flights.get(address)?.settled.clone();
+        Some(async move {
+            let _ = settled.wait_for(Option::is_some).await;
+        })
+    }
+
+    /// `address`'s hold ended without its barrier: its upload sends no
+    /// request it has not started. It stays recorded until it ends.
+    pub(crate) fn cancel(&self, address: &ActorAddress) {
+        if let Some(f) = self.inner().flights.get(address) {
+            f.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Ends an upload's record in [`PeriodicFlights`] however its task ends.
+struct FlightRecord {
+    flights: Arc<PeriodicFlights>,
+    address: ActorAddress,
+    id: u64,
+}
+
+impl Drop for FlightRecord {
+    fn drop(&mut self) {
+        self.flights.end(&self.address, self.id);
+    }
+}
+
 /// How a batched hold's periodic snapshot's upload ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeriodicOutcome {
@@ -600,6 +701,8 @@ pub(crate) struct PeriodicSnapshot {
     all: Changes,
     collector: Collector,
     outcome: watch::Sender<Option<PeriodicOutcome>>,
+    record: FlightRecord,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeriodicSnapshot {
@@ -625,6 +728,8 @@ impl PeriodicSnapshot {
             position,
             all,
             outcome,
+            record,
+            cancelled,
             ..
         } = self;
         let encoded = tokio::task::spawn_blocking(move || {
@@ -632,6 +737,10 @@ impl PeriodicSnapshot {
         })
         .await;
         let result = match encoded {
+            // Its hold ended without its barrier before the request: none.
+            Ok(Ok(_)) if cancelled.load(std::sync::atomic::Ordering::SeqCst) => {
+                PeriodicOutcome::Failed
+            }
             Ok(Ok(bytes)) => {
                 let bound = periodic_snapshot_bound(target.upload_idle, bytes.len());
                 match target.put_once(&snapshot_key(position), bytes, bound).await {
@@ -656,6 +765,7 @@ impl PeriodicSnapshot {
             crate::metrics::inc(&crate::metrics::METRICS.snapshot_upload_failures);
         }
         outcome.send_replace(Some(result));
+        drop(record);
         result
     }
 }
@@ -764,6 +874,8 @@ pub(crate) struct Replica {
     /// (ADR 0038, section 8).
     app: Arc<str>,
     snapshot_waits: Arc<SnapshotWaits>,
+    /// The node's periodic snapshots uploading ([`PeriodicFlights`]).
+    periodic_flights: Arc<PeriodicFlights>,
     /// Periodic snapshots that failed since the last snapshot taken.
     snapshot_failures: u32,
     /// After a periodic snapshot failed, none is tried again before
@@ -1042,6 +1154,7 @@ impl Replica {
             address: address.clone(),
             app: Arc::from(cluster.serves()),
             snapshot_waits: Arc::clone(&cluster.snapshot_waits),
+            periodic_flights: Arc::clone(&cluster.periodic_flights),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
             snapshot_retry_after: tokio::time::Instant::now(),
@@ -1503,14 +1616,20 @@ impl Replica {
                 "replication stopped: {reason}"
             )));
         }
-        if self.batched.periodic.is_some() {
+        if self.batched.periodic.is_some() || self.periodic_flights.uploading(&self.address) {
             return Err(ReplicaError::Local(
                 "a periodic snapshot is uploading".into(),
             ));
         }
         self.refuse_unless_at_head(&all, SnapshotKind::Periodic)?;
-        self.snapshot_failed();
         let (outcome, settled) = watch::channel(None);
+        let Some((id, cancelled)) = self.periodic_flights.start(&self.address, settled.clone())
+        else {
+            return Err(ReplicaError::Local(
+                "a periodic snapshot is uploading".into(),
+            ));
+        };
+        self.snapshot_failed();
         self.batched.periodic = Some(PeriodicUpload {
             segments: self.since_snapshot,
             bytes: self.batched.bytes_since_snapshot,
@@ -1522,6 +1641,12 @@ impl Replica {
             all,
             collector: self.collector(),
             outcome,
+            record: FlightRecord {
+                flights: Arc::clone(&self.periodic_flights),
+                address: self.address.clone(),
+                id,
+            },
+            cancelled,
         })
     }
 
@@ -1560,15 +1685,13 @@ impl Replica {
         }
     }
 
-    /// A wait for the periodic snapshot uploading now to end, held without
-    /// the replica; `None` if none is. Cancel-safe.
+    /// A wait for the actor's periodic snapshot uploading now to end, this
+    /// hold's or one an earlier hold on this node left ([`PeriodicFlights`]),
+    /// held without the replica; `None` if none is. Cancel-safe.
     pub(crate) fn periodic_upload_settled(
         &self,
     ) -> Option<impl std::future::Future<Output = ()> + Send + use<>> {
-        let mut settled = self.batched.periodic.as_ref()?.settled.clone();
-        Some(async move {
-            let _ = settled.wait_for(Option::is_some).await;
-        })
+        self.periodic_flights.settled(&self.address)
     }
 
     /// Waits, holding the replica, for a periodic snapshot's upload to end
@@ -2678,6 +2801,7 @@ mod tests {
             address: ActorAddress::new("t", "c", "a").unwrap(),
             app: Arc::from("t/default"),
             snapshot_waits: Arc::default(),
+            periodic_flights: Arc::default(),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
             snapshot_retry_after: tokio::time::Instant::now(),

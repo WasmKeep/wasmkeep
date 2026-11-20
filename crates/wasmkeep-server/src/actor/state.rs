@@ -315,7 +315,17 @@ impl ActorState {
     /// Ends the hold, if any, now ([`Held::drop_now`]).
     pub(super) fn drop_hold(&mut self, reason: Dropped) {
         if let Some(hold) = self.held.take() {
+            self.cancel_periodic_upload();
             hold.drop_now(reason);
+        }
+    }
+
+    /// The hold ends without its barrier: a periodic snapshot it left
+    /// uploading sends no request it has not started, and the next hold's
+    /// resets still wait for it (ADR 0034, section 7).
+    pub(super) fn cancel_periodic_upload(&self) {
+        if let Some(cluster) = &self.cluster {
+            cluster.periodic_flights.cancel(&self.address);
         }
     }
 

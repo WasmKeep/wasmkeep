@@ -19,7 +19,8 @@ The text under a version's heading is its GitHub release text
   run on a task of their own. A restore still sees either the previous
   snapshot and every segment after it, or the new one; collection waits
   for the new one to be acknowledged; barriers, resets and deletes wait
-  for an upload under way. Strict classes are unchanged. The mailbox's
+  for an upload under way, including one a hold given up on the same
+  node left behind. Strict classes are unchanged. The mailbox's
   host work for it is `wasmkeep_mailbox_host_work_seconds{work="snapshot_copy"}`,
   the copy alone (it was `snapshot_in_gap`, the whole snapshot, earlier
   in this release). See ADR 0034, section 7, and

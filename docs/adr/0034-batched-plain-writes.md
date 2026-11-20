@@ -635,10 +635,18 @@ for good. So:
     barrier, and no reset or delete erases, with one in flight. A flush to
     the acknowledged head that leaves the hold as it is (an alarm's R2
     judgement, a stale hint's clear, section 9) does not wait for it. A
-    hold that ends without its barrier (a crash, a failed replica, a
-    stop past its deadline) can leave one in flight: if it lands later it
-    is whole and on the chain, and unacknowledged (the hold is gone), so
-    no collection follows it;
+    hold that ends without its barrier (a failed replica, a stop past its
+    deadline) cancels it: if its request has not gone out it never does;
+    one already under way cannot be recalled and runs to the end of its
+    one attempt. The node keeps the upload's record by actor, not in the
+    hold, so the actor's next hold on the node waits for it as for its
+    own before a reset, a delete or a barrier: a snapshot of erased data
+    never lands after the erasure on that node. If it lands it is whole
+    and on the chain, and unacknowledged (its hold is gone), so no
+    collection follows it. A crash ends the upload with the process; one
+    whose request is under way when its node loses the lease can still
+    land after another node, holding the actor next, deleted it (as a
+    periodic attempt given up always could);
   - its counts start again from its position once it landed: the
     segments acknowledged since stay counted.
 - **A snapshot is due by segments or by bytes**: 64 acknowledged

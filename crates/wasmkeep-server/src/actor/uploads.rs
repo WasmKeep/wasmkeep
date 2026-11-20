@@ -784,6 +784,7 @@ impl ActorState {
     pub(super) fn give_up_at_stop(&mut self) {
         let unmarked = self.unmarked_commits();
         if let Some(hold) = self.held.take() {
+            self.cancel_periodic_upload();
             hold.drop_now_with(Dropped::Stop, u64::from(unmarked != Some(false)));
         }
     }

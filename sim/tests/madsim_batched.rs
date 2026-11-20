@@ -175,3 +175,16 @@ fn a_snapshot_labelled_where_its_upload_lands_is_caught() {
 fn a_staged_snapshot_over_uncaptured_commits_is_caught() {
     batched::snapshots_caught(Switch::SnapshotUncaptured, Violation::NotOwnerPrefix);
 }
+
+/// Fable's interleaving: a periodic snapshot's upload outlives its hold
+/// (given up), the actor's next hold on the node deletes it, and the
+/// upload lands after the erasure. Caught in the random workload and in
+/// the staged one when the reset does not wait.
+#[test]
+fn a_reset_that_does_not_wait_for_a_snapshot_upload_is_caught() {
+    caught(Switch::ResetSkipsSnapshot, Violation::ErasedLeft);
+}
+#[test]
+fn a_staged_reset_that_does_not_wait_for_a_snapshot_upload_is_caught() {
+    batched::snapshots_caught(Switch::ResetSkipsSnapshot, Violation::ErasedLeft);
+}

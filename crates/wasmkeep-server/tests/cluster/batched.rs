@@ -1124,6 +1124,70 @@ async fn a_delete_waits_for_a_periodic_snapshot_uploading() {
     );
 }
 
+/// A periodic snapshot's upload that outlives its hold on this node (the
+/// replica failed and the actor was given up) still holds back a delete of
+/// the actor under its next hold: the delete waits for it, so it cannot
+/// land after the erasure and leave the deleted data in the bucket (ADR
+/// 0034, section 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_after_a_given_up_hold_waits_for_its_snapshot_upload() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        if let Some(cluster) = c.cluster.as_mut() {
+            cluster.history_retention = Duration::ZERO;
+        }
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.hold_snapshot_puts.store(true, Ordering::SeqCst);
+    let mut n = 1;
+    while p.flaky.snapshot_puts_held.load(Ordering::SeqCst) == 0 {
+        assert!(n < 100, "no periodic snapshot after {n} writes");
+        n += 1;
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, n.to_string().as_str()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The next segment fails: the actor is given up, its upload held.
+    p.flaky.fail_wal.store(3, Ordering::SeqCst);
+    let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    eventually("every attempt used", async || {
+        p.flaky.fail_wal.load(Ordering::SeqCst) == 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Restored under a new hold, then deleted, and its history erased.
+    let r = send(p.a.addr, "POST", "/actor/t/x/delete-durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "deleted"), "{}", r.body);
+    let txid = |k: &String| {
+        let name = k.rsplit('/').next().unwrap();
+        u64::from_str_radix(&name[..16], 16).unwrap()
+    };
+    let erased = async || {
+        let keys = snapshot_keys(&p).await;
+        let newest = keys.iter().map(txid).max().unwrap();
+        (keys.iter().all(|k| txid(k) == newest), keys)
+    };
+    let started = std::time::Instant::now();
+    while !erased().await.0 {
+        assert!(started.elapsed() < Duration::from_secs(15), "never erased");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The upload the given-up hold left, released now: had the delete not
+    // waited for it, it lands below the erasure.
+    p.flaky.hold_snapshot_puts.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let (only_newest, keys) = erased().await;
+    assert!(only_newest, "a snapshot below the delete is left: {keys:?}");
+    let r = b_answers(&p, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "0", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
 /// A delete at a batched hold's barrier retires the entry its state named:
 /// the reset is acknowledged, nothing is in flight, so no state can name
 /// it again (ADR 0034, section 9; ADR 0028).
