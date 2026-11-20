@@ -497,16 +497,11 @@ async fn room_cluster_300_clients() {
 
 // ADR 0040, section 13: the pusher, in its own class, on a real cluster.
 
+/// Every `(e, n)` one socket was handed, in order.
+type Seen = Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
 /// One socket that never reconnects: every `(e, n)` it was handed, repeats
 /// in the same epoch dropped (the client's rule 1).
-fn listener(
-    addr: SocketAddr,
-    room: &'static str,
-    id: &str,
-) -> (
-    Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
-    tokio::task::JoinHandle<()>,
-) {
+fn listener(addr: SocketAddr, room: &'static str, id: &str) -> (Seen, tokio::task::JoinHandle<()>) {
     let seen = Arc::new(std::sync::Mutex::new(vec![]));
     let url = format!("ws://{addr}/r6/join?room={room}&c={id}&n=0");
     let out = seen.clone();
@@ -550,7 +545,7 @@ fn listener(
     });
     (seen, task)
 }
-async fn heard(seen: &[Arc<std::sync::Mutex<Vec<(u64, u64)>>>], head: u64, within: Duration) {
+async fn heard(seen: &[Seen], head: u64, within: Duration) {
     let deadline = Instant::now() + within;
     while seen
         .iter()
