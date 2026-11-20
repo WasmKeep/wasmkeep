@@ -12,11 +12,19 @@ export type Frame = {
 } | {
     t: "ready";
     e: number;
+    /** Set when an edge woken from hibernation announces where its stream
+     * starts to a socket already open: the epoch's base, as in an `m` frame. */
+    b?: number;
     n: number | null;
 } | {
-    t: "behind" | "pong";
+    t: "behind";
     e: number;
     n: number;
+} | {
+    /** `n: null`: the edge knows no head yet (a keepalive only). */
+    t: "pong";
+    e: number;
+    n: number | null;
 };
 export interface ReceiverOptions {
     history(after?: Position, signal?: AbortSignal): Promise<History>;
@@ -36,7 +44,8 @@ function validateFrame(f: any): asserts f is Frame {
             !integer(f.n + f.m.length - 1) || f.m.some((m: any) => !m || !integer(m.a) || typeof m.d !== "string" || (m.i !== undefined && typeof m.i !== "string")))
             throw Error("invalid message frame");
     }
-    else if (!["ready", "behind", "pong"].includes(f.t) || !(integer(f.n) || (f.t === "ready" && f.n === null)))
+    else if (!["ready", "behind", "pong"].includes(f.t) || !(integer(f.n) || (f.t !== "behind" && f.n === null)) ||
+        (f.t === "ready" && f.b !== undefined && (!integer(f.b) || f.n === null)))
         throw Error("invalid control frame");
 }
 function validateHistory(h: any): asserts h is History {
@@ -163,6 +172,26 @@ export class Receiver {
         signal.throwIfAborted();
         if (f.t === "ready" && !this.last && f.n !== null) {
             this.last = { e: f.e, n: f.n };
+            return;
+        }
+        // A pong with no head (an edge woken with no push yet) is a keepalive.
+        if (f.t === "pong" && f.n === null)
+            return;
+        // A woken edge announces where its stream starts (ADR 0040, section 5):
+        // the next epoch's base applies as in rule 2, and only a position past
+        // the client's own is a gap.
+        if (f.t === "ready" && f.b !== undefined && f.n !== null && this.last) {
+            if (f.e === this.last.e + 1) {
+                if (f.b < this.last.n) {
+                    this.options.onLost?.(f.b + 1, this.last.n);
+                    this.last = { e: f.e, n: f.b };
+                }
+                else
+                    this.last = { e: f.e, n: this.last.n };
+            }
+            if (f.e !== this.last.e || f.n > this.last.n)
+                await this.recover(signal);
+            signal.throwIfAborted();
             return;
         }
         if (f.t !== "m") {

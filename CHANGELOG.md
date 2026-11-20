@@ -9,6 +9,22 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **An edge woken from hibernation delivers its first push to the sockets
+  it kept, and answers every ping** (ADR 0040, sections 5 and 6). The edge
+  used to place those sockets at the push's `head` before applying it, so
+  the messages of that push never reached them and nothing told them so:
+  in a quiet room a client stayed stale until the next publish, and a
+  ping got no `pong` until a push came. Both SDKs' edges now place them at
+  `first - 1` and first send each a `ready` with the push's base,
+  `{"t":"ready","e":E,"b":B,"n":first - 1}`; a `ping` before any push gets
+  `{"t":"pong","e":0,"n":null}`. `RoomClient` fetches history after such a
+  `ready` only when its position is past the client's own, applying `b`
+  as for a frame of the next epoch, and takes a `pong` with no head as a
+  keepalive. An older client fetches whenever the announced `n` differs
+  from its own (one request), and rejects a headless `pong` and
+  reconnects. Shared Rust/TypeScript vectors (`wake-vectors.txt`) cover
+  the wake.
+
 - The QuickJS distinct-positions room budget test runs in `check.sh --full`
   again rather than in CI: its fuel is bounded, but its real 50 ms CPU budget
   still trapped once on a slow CI runner. The big-room fuel tests get the

@@ -271,3 +271,135 @@ fn distinct_cursor_budget_prioritizes_caught_up() {
     assert_eq!(ack.lagging, 0);
     assert_eq!(io.frames.len(), 5);
 }
+/// Records which socket each frame went to.
+#[derive(Default)]
+struct Wire {
+    sockets: Vec<u64>,
+    sent: Vec<(u64, String)>,
+    blocked: bool,
+    closed: Vec<(u64, u16)>,
+}
+impl SocketIo for Wire {
+    fn send(&mut self, id: u64, text: &str) -> SendResult {
+        self.sent.push((id, text.into()));
+        if self.blocked {
+            SendResult::Backpressure
+        } else {
+            SendResult::Ok
+        }
+    }
+    fn close(&mut self, id: u64, code: u16) {
+        self.closed.push((id, code));
+    }
+}
+/// A frame in the vectors' notation (wake-vectors.txt).
+fn notation(id: u64, frame: &str) -> String {
+    let j = crate::json::parse(frame).unwrap();
+    let t = super::edge::string(&j, "t").unwrap();
+    let n = |k: &str| match j.get(k) {
+        Some(crate::json::Json::Null) | None => "null".to_string(),
+        Some(_) => super::edge::number(&j, k).unwrap().to_string(),
+    };
+    match t {
+        "ready" if j.get("b").is_some() => format!("{id} ready {} {} {}", n("e"), n("b"), n("n")),
+        "ready" | "behind" => format!("{id} {t} {} {}", n("e"), n("n")),
+        "pong" if n("n") == "null" => format!("{id} pong null"),
+        "pong" => format!("{id} pong {} {}", n("e"), n("n")),
+        "m" => {
+            let Some(crate::json::Json::Array(m)) = j.get("m") else {
+                panic!("{frame}")
+            };
+            format!("{id} m {} {} {} {}", n("e"), n("b"), n("n"), m.len())
+        }
+        _ => panic!("{frame}"),
+    }
+}
+#[test]
+fn shared_wake_vectors() {
+    let text = include_str!("wake-vectors.txt");
+    let mut count = 0;
+    for scenario in text.split("\n\n") {
+        let scenario: Vec<&str> = scenario
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect();
+        if scenario.is_empty() {
+            continue;
+        }
+        count += 1;
+        let mut edge = Edge::default();
+        let mut wire = Wire::default();
+        let mut expected: Vec<String> = vec![];
+        let check = |wire: &mut Wire, expected: &mut Vec<String>, event: &str| {
+            let got: Vec<String> = wire
+                .sent
+                .drain(..)
+                .map(|(id, f)| notation(id, &f))
+                .collect();
+            assert_eq!(got, *expected, "after {event} in:\n{}", scenario.join("\n"));
+            expected.clear();
+        };
+        let mut event = String::new();
+        for line in &scenario {
+            let words: Vec<&str> = line.split(' ').collect();
+            if words[0].bytes().all(|b| b.is_ascii_digit()) {
+                expected.push((*line).into());
+                continue;
+            }
+            if !event.is_empty() {
+                check(&mut wire, &mut expected, &event);
+            }
+            event = (*line).into();
+            let num = |i: usize| words[i].parse::<u64>().unwrap();
+            match words[0] {
+                "sockets" => {
+                    wire.sockets = words[1].split(',').map(|s| s.parse().unwrap()).collect();
+                }
+                "open" => {
+                    let id = num(1);
+                    wire.sockets.push(id);
+                    let p = (words.len() == 4).then(|| Position {
+                        e: num(2),
+                        n: num(3),
+                    });
+                    assert!(edge.open(id, p, &mut wire));
+                }
+                "ping" => edge.ping(num(1), &mut wire),
+                "push" => {
+                    let p = Push {
+                        recover: false,
+                        e: num(1),
+                        base: num(2),
+                        first: num(3),
+                        head: num(4),
+                        messages: (0..num(5))
+                            .map(|_| Item {
+                                epoch: None,
+                                at: 0,
+                                id: None,
+                                body: "x".into(),
+                            })
+                            .collect(),
+                    };
+                    let ids = wire.sockets.clone();
+                    edge.receive(&p, &ids, &mut wire);
+                }
+                other => panic!("unknown event {other}"),
+            }
+        }
+        check(&mut wire, &mut expected, &event);
+    }
+    assert_eq!(count, 6);
+}
+#[test]
+fn wake_announcement_backpressure_closes_slow() {
+    let mut edge = Edge::default();
+    let mut wire = Wire {
+        blocked: true,
+        ..Wire::default()
+    };
+    let ack = edge.receive(&push(5), &[1], &mut wire);
+    assert_eq!(wire.closed, vec![(1, 4802)]);
+    assert_eq!(ack.sockets, 0);
+    assert_eq!(ack.slow, 1);
+}

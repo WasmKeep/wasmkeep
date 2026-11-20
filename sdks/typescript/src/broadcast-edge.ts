@@ -103,12 +103,7 @@ export function defineEdge(): ActorDefinition {
                 return { status: 400 };
             if (p.messages.some((m, i) => !m || !Number.isSafeInteger(m.a) || m.a < 0 || typeof m.d !== "string" || !fits(m.d, 65536) || (m.i !== undefined && (typeof m.i !== "string" || !fits(m.i, 64))) || ((m.e !== undefined || m.b !== undefined) && (!Number.isSafeInteger(m.e) || !Number.isSafeInteger(m.b) || m.e! < 0 || m.e! > p.e || m.b! < 0 || m.b! >= p.first + i))))
                 return { status: 400 };
-            if (!edge.head) {
-                edge.head = { e: p.e, n: p.head };
-                edge.floor = p.head;
-            }
-            edge.adopt(Array.from(host.connections()));
-            const ack = edge.push(p);
+            const ack = edge.receive(p, Array.from(host.connections()));
             const result = { ...ack, opens, refusals: { unknown, moved, full } };
             opens = unknown = moved = full = 0;
             return { status: 200, body: JSON.stringify(result) };

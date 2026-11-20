@@ -1,0 +1,64 @@
+# Shared Rust/TypeScript vectors for an edge that wakes from hibernation
+# holding sockets but no cursors (ADR 0040, section 5). Scenarios are
+# separated by blank lines; each starts on a fresh edge with no head.
+#   sockets IDS            host sockets that outlived the hibernation
+#   open ID [E N]          a client joins, with its position if it has one
+#   ping ID                that client's ping
+#   push E B FIRST HEAD K  a push of K messages numbered from FIRST
+# Each event is followed by every frame it sent, in order, one per line:
+#   ID ready E N | ID ready E B N | ID ready E null | ID m E B N COUNT
+#   ID behind E N | ID pong E N | ID pong null
+# An event followed by no frame line sent nothing.
+
+# A push that carries messages: the sockets start before it, so its
+# messages go out, after the position they start from.
+sockets 1,2
+push 1 0 374 375 2
+1 ready 1 0 373
+2 ready 1 0 373
+1 m 1 0 374 2
+2 m 1 0 374 2
+ping 1
+1 pong 1 375
+
+# A header-only push ahead of the sockets (the edge had sent 373, the push
+# says 375): nothing to send, but each socket learns where it stands.
+sockets 1
+push 1 0 376 375 0
+1 ready 1 0 375
+push 1 0 376 376 1
+1 m 1 0 376 1
+
+# The first push after a wake that also bumped the epoch.
+sockets 1
+push 2 373 374 374 1
+1 ready 2 373 373
+1 m 2 373 374 1
+
+# A ping before any push: a pong with no head.
+sockets 1
+ping 1
+1 pong null
+push 1 0 5 5 1
+1 ready 1 0 4
+1 m 1 0 5 1
+
+# A client that joined the woken edge before its first push already got a
+# ready with no position; the push announces only to the older sockets.
+sockets 1
+open 2 1 3
+2 ready 0 null
+push 1 0 5 5 1
+1 ready 1 0 4
+1 m 1 0 5 1
+2 behind 1 5
+
+# The second push is not a wake: no announcement.
+sockets 1
+push 1 0 5 5 1
+1 ready 1 0 4
+1 m 1 0 5 1
+sockets 1,2
+push 1 0 6 6 1
+1 m 1 0 6 1
+2 m 1 0 6 1

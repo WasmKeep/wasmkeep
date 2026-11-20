@@ -73,12 +73,41 @@ export class Edge {
                 if (!this.cursors.has(id))
                     this.cursors.set(id, { n: this.head.n, lagging: false });
     }
+    /** Always answered: a pong needs no head (`n: null` before the first push). */
     ping(id: bigint) {
-        if (this.head)
-            this.send(id, { t: "pong", ...this.head });
+        this.send(id, this.head ? { t: "pong", ...this.head } : { t: "pong", e: 0, n: null });
         this.deliver(id);
     }
     private send(id: bigint, frame: unknown) { return this.io.send(id, JSON.stringify(frame)); }
+    /** A push from the room or a relay; `ids` the host's sockets.
+     *
+     * The first push after a wake from hibernation (no head, sockets with no
+     * cursor) places those sockets at `first - 1`, so the messages it carries
+     * go out, and first tells each of them that position with a `ready`
+     * carrying `b`: a client whose own position is lower fetches the rest
+     * over HTTP, one that missed nothing makes no request (ADR 0040, section 5). */
+    receive(p: Push, ids: bigint[]) {
+        if (this.head)
+            this.adopt(ids);
+        else {
+            const n = Math.max(0, p.first - 1);
+            const ready = JSON.stringify({ t: "ready", e: p.e, b: p.b, n });
+            for (const id of ids) {
+                if (this.cursors.has(id))
+                    continue;
+                const result = this.io.send(id, ready);
+                if (result === "ok")
+                    this.cursors.set(id, { n, lagging: false });
+                // Like a `behind` that cannot be queued: the client would
+                // never learn where it stands.
+                else if (result === "backpressure") {
+                    this.io.close(id, 4802);
+                    this.slow++;
+                }
+            }
+        }
+        return this.push(p);
+    }
     push(p: Push) {
         if (this.head && p.e < this.head.e)
             return this.answer();

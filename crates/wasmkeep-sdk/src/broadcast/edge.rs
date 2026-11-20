@@ -283,14 +283,60 @@ impl Edge {
             }
         }
     }
+    /// Always answered: a pong needs no head (`n: null` before the first push).
     pub fn ping(&mut self, id: u64, io: &mut impl SocketIo) {
-        if let Some(h) = self.head {
-            let _ = io.send(
-                id,
-                &format!("{{\"t\":\"pong\",\"e\":{},\"n\":{}}}", h.e, h.n),
-            );
-        }
+        let _ = io.send(
+            id,
+            &match self.head {
+                Some(h) => format!("{{\"t\":\"pong\",\"e\":{},\"n\":{}}}", h.e, h.n),
+                None => "{\"t\":\"pong\",\"e\":0,\"n\":null}".into(),
+            },
+        );
         self.deliver(id, io);
+    }
+    /// A push from the room or a relay, `ids` the host's sockets.
+    ///
+    /// The first push after a wake from hibernation (no head, sockets with
+    /// no cursor) places those sockets at `first - 1`, so the messages it
+    /// carries go out, and first tells each of them that position with a
+    /// `ready` carrying `b`: a client whose own position is lower fetches
+    /// the rest over HTTP, one that missed nothing makes no request
+    /// (ADR 0040, section 5).
+    pub fn receive(&mut self, p: &Push, ids: &[u64], io: &mut impl SocketIo) -> Ack {
+        if self.head.is_some() {
+            self.adopt(ids);
+        } else {
+            let n = p.first.saturating_sub(1);
+            let ready = format!(
+                "{{\"t\":\"ready\",\"e\":{},\"b\":{},\"n\":{n}}}",
+                p.e, p.base
+            );
+            for id in ids {
+                if self.cursors.contains_key(id) {
+                    continue;
+                }
+                match io.send(*id, &ready) {
+                    SendResult::Ok => {
+                        self.cursors.insert(
+                            *id,
+                            Cursor {
+                                n,
+                                lagging: false,
+                                stalled: false,
+                            },
+                        );
+                    }
+                    // Like a `behind` that cannot be queued: the client
+                    // would never learn where it stands.
+                    SendResult::Backpressure => {
+                        io.close(*id, 4802);
+                        self.slow += 1;
+                    }
+                    SendResult::Gone => {}
+                }
+            }
+        }
+        self.push(p, io)
     }
     pub fn push(&mut self, p: &Push, io: &mut impl SocketIo) -> Ack {
         if self.head.is_some_and(|h| p.e < h.e) {
