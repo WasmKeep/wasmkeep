@@ -961,7 +961,9 @@ impl Scaling<ScaleHost> {
         // The alarm the round set stands unless scaling has more to do.
         if stepped {
             let at = if s.op.is_some() {
-                // now + 1, not now: an alarm left at the delivered time is cleared after on-alarm.
+                // now + 1, not now: a host before 0.7.0 clears an alarm left at
+                // the delivered time after on-alarm (ADR 0009, amendment of
+                // 2026-11-20). Kept while the SDK supports such hosts.
                 now.saturating_add(1)
             } else {
                 now.saturating_add(20)
@@ -972,7 +974,8 @@ impl Scaling<ScaleHost> {
                 ..result
             });
         }
-        // Not get_alarm(): inside on-alarm it answers the alarm being delivered.
+        // Not get_alarm(): inside on-alarm a host before 0.7.0 answers the
+        // alarm being delivered (none since, until the handler sets one).
         Ok(result)
     }
     /// Section 13: a 0.6.0 room's scale rows move to this pusher, one step
@@ -1058,6 +1061,9 @@ impl Scaling<ScaleHost> {
     fn advance(&mut self, s: &mut ScaleState, now: u64) -> Result<bool, String> {
         // A failed step (or the edge ceiling) leaves its operation for the
         // alarm 2 s later; with nothing to do the round's alarm stands.
+        // Right on either host: before 0.7.0 `before` may be the delivered
+        // time, which that host clears after on-alarm; since, it is none
+        // or the round's own alarm.
         let before = crate::alarms::get_alarm();
         crate::alarms::set_alarm(now.saturating_add(2000));
         if !self.begin(s, now)? {

@@ -6,6 +6,7 @@
 - Amended 2026-11-14 (0.4.2): a sweep with nothing due waits until the earliest entry it listed is the sweep's, at most six sweep periods (60 s), and a change in the view of the nodes wakes it. See "Amendment of 2026-11-14" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): in a batched class an entry is named at each event but PUT once per segment, before its upload; entries are retired only after that segment's acknowledgement; the fence is judged on the acknowledged head.
 - Amended 2026-11-19 (0.7.0): an event's end leaves a delivery in flight for the same time alone, a covered or dropped delivery is delivered again, a local redelivery of a time the hold already ran skips the stale-hint clear, and that clear's DELETEs run off the mailbox. See "Amendment of 2026-11-19" below.
+- Amended 2026-11-20 (0.7.0): what `on-alarm` sets or clears is its new alarm, the delivered time included; only an alarm it left untouched is cleared after delivery, and inside `on-alarm` `get-alarm` answers none until the handler touches the alarm. See "Amendment of 2026-11-20" below.
 - Date: 2026-11-03
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
@@ -156,7 +157,8 @@ pending alarms that any node can read cheaply, and every node sweeps it.
   is removed. For an actor deleted since, the wake-up restores its empty
   database only to read it; the actor is not run.
 - An alarm set by a plain `exec` event is as durable as that event's writes.
-- During retries `get-alarm` returns the next attempt's time.
+- During retries `get-alarm` returns the next attempt's time (outside
+  `on-alarm`; inside it, see the amendment of 2026-11-20).
 - Single-node servers keep their behaviour, except that retries are now
   committed (and so survive restarts).
 
@@ -331,8 +333,10 @@ Pure decisions in `alarm_index`, used by the timer (`alarm.rs`) and by
   different tasks, so the run may have ended before the commit, or without
   running `on-alarm` (another owner, a failure); nothing else would arm the
   committed alarm, and a single node has no sweep. A run that ran the
-  round moves or clears the alarm itself, which replaces the registration,
-  so its completion changes nothing.
+  round and moved or cleared the alarm replaced the registration, so its
+  completion changes nothing; one that set the delivered time again
+  (amendment of 2026-11-20) left its own commit covered, and is delivered
+  again by this rule.
 - **A delivery the mailbox dropped is delivered again**, with the
   admission backoff (100 ms doubling to 5 s): the actor failed to start, or
   the event stopped before answering. Before, it was forgotten until the
@@ -423,3 +427,96 @@ room before; it should be near zero after ([monitoring](../monitoring.md#alarm-d
   forgetting a covered delivery, forgetting a dropped one (the committed
   alarm unarmed), and the belt skipping deliveries from the index (an
   orphan left).
+
+## Amendment of 2026-11-20: the handler's own alarm
+
+During `on-alarm` the host could not tell "the handler set the alarm to
+the delivered time again" from "the handler left it alone". After a
+successful run it cleared an alarm still at the delivered time, so a
+handler that re-armed for exactly that time (a punctual "continue now",
+the next step of a long operation) lost its alarm and stalled until
+something else woke the actor. And `get-alarm` inside `on-alarm`
+answered the alarm being delivered until the handler set another time,
+so an alarm about to be consumed looked like one that would stand, and a
+handler that saved `get-alarm` and put it back set the delivered time
+again. Guests worked around both: re-arm 1 ms later,
+never read `get-alarm` inside `on-alarm`.
+
+### The rule
+
+- **What the handler sets or clears is its new alarm.** A `set-alarm`
+  (any time, the delivered time included) or `clear-alarm` during
+  `on-alarm` marks the alarm as touched. After a successful run, only an
+  untouched alarm still at the delivered time is cleared; a touched one
+  stands. Re-armed for the delivered time, the actor runs again at once.
+- **`get-alarm` inside `on-alarm`** answers none while the handler has not
+  touched the alarm, and then what it set (none after a clear). The alarm
+  being delivered is consumed: after a successful run it is gone, so none
+  is what the handler's code will see once it returns, and a guest that
+  saves `get-alarm` and restores it later restores "no alarm", not the
+  delivered time (which would now be kept and loop). The delivered time
+  is no longer readable there; a handler that needs it records it when
+  it sets the alarm. None is also returned though a failed run is retried:
+  the retry is the host's (section 3), not an alarm the handler owns.
+- **The mark is a row, not a flag.** `set-alarm` and `clear-alarm` join
+  the guest's open transaction, and so does the mark (`alarm_touched` in
+  `_wasmkeep_meta`): a set rolled back by the handler, or by the host when
+  the handler returns with a transaction open, never happened, and the
+  alarm is untouched (an in-memory flag would keep the delivered time and
+  redeliver it forever). The host reads and removes the mark after
+  `end_event`, in both the success and the failure arms, and removes one
+  left behind (a crash right after the handler, or an `exec-durable`
+  upload during it that a new owner restores) before the next handler
+  runs; if that removal fails, the handler does not run and the alarm is
+  retried with backoff (a leftover mark would make an untouched run keep
+  the delivered time and run again at once). It is set only by the handler's own calls: not by `on-init`
+  running in the same event, nor by later events on the instance.
+- **The failure arm is unchanged.** Whatever a failed run left due before
+  the retry time, the delivered time set again included, moves to the
+  retry time; a later time or a clear stands.
+
+### What still holds
+
+- The alarm row stays in place while the handler runs; only the guest's
+  view of it changes. An upload in the middle of the handler still
+  carries the delivered alarm, so a crash then still redelivers it.
+- A kept same-time alarm composes with the amendment of 2026-11-19: the
+  event's end syncs the timer with the time of the delivery in flight,
+  which covers it (`delivery_covers`); that delivery's completion then
+  delivers it again (`deliver_again`). In the other order the sync finds
+  nothing in flight and registers anew. The timer and its rules are
+  unchanged. The belt does not apply: the redelivery's time is committed,
+  so it has no stale hint.
+- The index sees an unchanged time: no PUT, no DELETE, the named entry
+  stands. R1 to R4 and the fence are untouched.
+- During a rolling upgrade the behaviour follows the node that runs the
+  event: a node before 0.7.0 ignores the `alarm_touched` row (it clears
+  an alarm still at the delivered time, and answers it from `get-alarm`),
+  and a newer node removes a row such a node never wrote before its next
+  handler. Guests that must run on both keep re-arming 1 ms later.
+
+### Tests
+
+- `tests/alarms.rs`: a handler that sets the delivered time again is
+  delivered again (twice, then stops); `get-alarm` in `on-alarm` answers
+  none, then the handler's own new time; an untouched alarm is cleared
+  and reads none; set then cleared in `on-alarm` stays cleared; a set
+  inside a transaction rolled back, or left open, leaves the alarm
+  untouched (cleared, run once); a handler that saves and restores
+  `get-alarm` runs once. Before the change only the first failed on its
+  outcome (one run, then it stalled); the next four failed only on what
+  `get-alarm` answered before the handler touched the alarm (the
+  delivered time, none expected). Their alarm outcomes were already
+  right, and they guard them. A mark that cannot be removed before the
+  handler keeps the handler from running
+  (`a_touch_mark_that_cannot_be_removed_keeps_the_handler_from_running`,
+  the mark's removals failed by fault injection; before, a third run
+  followed at once). The restore test passed before; it fails (the actor runs
+  again) when an untouched `get-alarm` answers the delivered time, and
+  the open-transaction case fails when the mark is read before
+  `end_event` (both checked by mutation).
+- `sim/tests/madsim_alarm_index.rs`: the delivery model's round now also
+  sets the delivered time again (one round in eight), and a committed
+  alarm a round left must be armed once every result is in. At 200 seeds
+  no violation; a completion that forgets a delivery covered by its own
+  round's re-arm is caught (`forgetting_a_delivery_that_rearmed_its_own_time_is_caught`).

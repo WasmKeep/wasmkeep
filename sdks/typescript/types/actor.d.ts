@@ -65,6 +65,10 @@ declare module 'wasmkeep:actor/actor@0.2.0' {
   export function onInit(): void;
   /**
   * Runs when the pending alarm is due. An error or trap schedules a retry.
+  * The delivered alarm is consumed: once `on-alarm` succeeds it is
+  * cleared, unless the handler set or cleared the alarm itself. What the
+  * handler set stands, even the delivered time again (it runs again at
+  * once); a `set-alarm` rolled back with its transaction does not count.
   */
   export function onAlarm(): void;
   /**

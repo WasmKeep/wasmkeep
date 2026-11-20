@@ -2657,7 +2657,9 @@ pub(crate) fn caught_in_scenario(rule: Switch, expected: Violation, scenario: us
 // admission, dropped before it answers, or deferred (it runs and registers
 // nothing, as for another owner) at random; results reach the timer up to
 // three ticks late, racing the next events' syncs. A delivery whose time
-// is committed runs the round (moves the alarm on); one whose time is not
+// is committed runs the round (moves the alarm on, clears it, or, since
+// the amendment of 2026-11-20, sets it to the delivered time again: a
+// punctual "continue now" the host keeps); one whose time is not
 // clears the stale hint at the barrier (`cleanup`, that one time), unless
 // the belt skips it. Holds end at random (crashes, cuts); a new hold
 // registers its restored alarm, as a restore does. At the end, with
@@ -2677,6 +2679,9 @@ pub(crate) enum DeliveryRule {
     DropForgotten,
     /// The belt also skips stale hints a sweep delivers.
     BeltOnSweep,
+    /// A completion forgets a delivery covered by its own run's commit,
+    /// which set the alarm to the delivered time again.
+    CompleteForgetsRearm,
 }
 
 #[derive(Clone, Copy)]
@@ -2693,6 +2698,8 @@ struct Reg {
     second: bool,
     /// Drops redelivered in a row.
     drops: u32,
+    /// Covered by its own run's commit, which set the delivered time again.
+    rearm: bool,
 }
 
 /// The server's `MAX_DROPPED_REDELIVERIES`: past it a dropped delivery's
@@ -2734,6 +2741,7 @@ struct Local {
 #[derive(Debug, Default)]
 pub(crate) struct DeliveryCounts {
     pub(crate) rounds: u64,
+    pub(crate) rearmed: u64,
     pub(crate) covered: u64,
     pub(crate) delivered_again: u64,
     pub(crate) dropped: u64,
@@ -2750,6 +2758,7 @@ pub(crate) struct DeliveryCounts {
 impl DeliveryCounts {
     fn add(&mut self, o: &Self) {
         self.rounds += o.rounds;
+        self.rearmed += o.rearmed;
         self.covered += o.covered;
         self.delivered_again += o.delivered_again;
         self.dropped += o.dropped;
@@ -2786,6 +2795,7 @@ impl Deliveries {
             refusals: 0,
             second: false,
             drops: 0,
+            rearm: false,
         });
     }
 
@@ -2848,7 +2858,9 @@ impl Deliveries {
     }
 
     fn complete(&mut self, now: u64, r: Reg) {
-        let covered = r.covered && self.rule != DeliveryRule::CompleteForgets;
+        let covered = r.covered
+            && self.rule != DeliveryRule::CompleteForgets
+            && !(self.rule == DeliveryRule::CompleteForgetsRearm && r.rearm);
         if alarm_index::deliver_again(covered) {
             self.counts.delivered_again += 1;
             self.set(now, r.hint, false);
@@ -2976,16 +2988,35 @@ impl World {
         if let Some(at) = committed {
             d.local.delivered = Some(at);
             d.counts.rounds += 1;
-            let next = if self.rng.below(4) == 0 {
-                None
-            } else {
-                let others: Vec<_> = TIMES.iter().copied().filter(|t| *t != at).collect();
-                Some(others[self.rng.below(others.len() as u64) as usize])
+            // The handler clears the alarm, moves it, or sets the delivered
+            // time again (a punctual "continue now"), which the host keeps
+            // (ADR 0009, amendment of 2026-11-20): the event's sync is then
+            // covered by this delivery, delivered again on its completion.
+            let next = match self.rng.below(8) {
+                0 | 1 => None,
+                2 => Some(at),
+                _ => {
+                    let others: Vec<_> = TIMES.iter().copied().filter(|t| *t != at).collect();
+                    Some(others[self.rng.below(others.len() as u64) as usize])
+                }
             };
             if !self.admitted_event(actor, next).await {
                 return;
             }
-            d.sync(self.now, self.committed(actor));
+            let committed = self.committed(actor);
+            d.sync(self.now, committed);
+            // A committed alarm the round left must be armed once every
+            // result is in, as an event's is.
+            d.local.synced_by_event = committed.is_some();
+            if next == Some(at) && committed == Some(at) {
+                d.counts.rearmed += 1;
+                if let Some(r) = d.local.reg.as_mut()
+                    && r.covered
+                    && !r.waiting
+                {
+                    r.rearm = true;
+                }
+            }
         } else {
             d.local.reg = None;
         }
@@ -3225,6 +3256,7 @@ pub(crate) fn deliveries_safe() {
     }
     for (name, value) in [
         ("rounds", totals.rounds),
+        ("rearmed", totals.rearmed),
         ("covered syncs", totals.covered),
         ("delivered again", totals.delivered_again),
         ("dropped", totals.dropped),

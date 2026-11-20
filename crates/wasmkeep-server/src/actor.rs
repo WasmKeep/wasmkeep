@@ -494,6 +494,14 @@ impl std::fmt::Debug for ActorService {
 /// (the retry backoff is computed from it, so it survives hibernation and
 /// moves); setting or clearing an alarm resets it.
 pub(crate) const ALARM_FAILURES_KEY: &str = "alarm_failures";
+/// Meta key, present while the running `on-alarm` has set or cleared the
+/// alarm (ADR 0009, amendment of 2026-11-20): what it holds then is the
+/// handler's own, kept even at the delivered time. A row of the database,
+/// not a flag in memory, so it is rolled back with the write that made it
+/// (a `set-alarm` inside a transaction the handler rolls back, or leaves
+/// open, never happened). Removed after the event, and before the next
+/// `on-alarm` (one a crash or a mid-event upload left behind).
+pub(crate) const ALARM_TOUCHED_KEY: &str = "alarm_touched";
 /// Meta key: the exact alarm index entry listed for this actor (empty:
 /// none; [`alarm_index::to_meta`]), so whichever node owns it next keeps it
 /// while the alarm stands and removes exactly it when the alarm changes.
@@ -990,6 +998,10 @@ struct ActorHost {
     delete_retry: bool,
     /// Where the actor's files are, for `delete-self-durable`.
     deleter: Option<(Storage, ActorAddress)>,
+    /// While `on-alarm` runs: `set-alarm` and `clear-alarm` record that the
+    /// handler touched the alarm (`ALARM_TOUCHED_KEY`), and `get-alarm`
+    /// answers none until it has (the delivered alarm is consumed).
+    delivering_alarm: bool,
     call: Option<CallContext>,
     sockets: Arc<Sockets>,
     /// Replication, so `exec-durable` can wait for the bucket.

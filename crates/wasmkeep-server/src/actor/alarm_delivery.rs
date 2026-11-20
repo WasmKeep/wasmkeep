@@ -212,6 +212,28 @@ impl ActorState {
             self.timing.delivered(Delivered::Deferred);
             return;
         };
+        // A touch marker left behind (a crash after the handler, a removal
+        // that failed, or one an upload in the middle of an event carried
+        // to the bucket) is removed first: this run starts untouched. If it
+        // cannot be, the handler does not run (an untouched run would keep
+        // the delivered time and run again at once); the alarm is retried.
+        let unmarked = with_db(&mut live.store, |db| {
+            if db.meta(ALARM_TOUCHED_KEY)?.is_some() {
+                db.delete_meta(ALARM_TOUCHED_KEY)?;
+            }
+            Ok::<_, wasmkeep_storage::SqlError>(())
+        })
+        .await;
+        if !matches!(unmarked, Ok(Ok(()))) {
+            self.timing.delivered(Delivered::Deferred);
+            self.finish(false, false).await;
+            self.retry_alarm().await;
+            return;
+        }
+        let Some(live) = self.live.as_mut() else {
+            self.timing.delivered(Delivered::Deferred);
+            return;
+        };
         // Read before the handler runs: a handler that sets an alarm resets
         // the count, and that must not cancel the backoff of its own failure.
         let failures = with_db(&mut live.store, |db| db.meta(ALARM_FAILURES_KEY))
@@ -225,12 +247,16 @@ impl ActorState {
         self.timing.delivered(Delivered::Ran);
         self.delivered_alarm = Some((generation, at));
         live.start_event("alarm");
+        // Only the handler's own calls count as touching the alarm (not
+        // `on-init`'s, nor a later event's on this instance).
+        live.store.data_mut().delivering_alarm = true;
         let run = limit(
             self.limits.wall,
             self.held.as_ref(),
             live.core.call_on_alarm(&mut live.store),
         )
         .await;
+        live.store.data_mut().delivering_alarm = false;
         let trapped = !matches!(run, Ok(Ok(_)));
         // A handler that returned an error failed too (it is retried).
         live.record_event(
@@ -242,8 +268,14 @@ impl ActorState {
             Ok(Ok(Ok(()))) => {
                 let cleared = with_db(&mut live.store, move |db| {
                     db.end_event()?;
-                    // A handler that scheduled a new alarm keeps it.
-                    if db.alarm()? == Some(at) {
+                    // What a handler set or cleared is its new alarm, the
+                    // delivered time included (a punctual "continue now").
+                    // Only an untouched alarm, still at the delivered time,
+                    // is consumed. The marker is read after `end_event`: a
+                    // touch rolled back with its transaction never happened.
+                    if db.meta(ALARM_TOUCHED_KEY)?.is_some() {
+                        db.delete_meta(ALARM_TOUCHED_KEY)?;
+                    } else if db.alarm()? == Some(at) {
                         db.clear_alarm()?;
                     }
                     db.set_meta(ALARM_FAILURES_KEY, "0")
@@ -274,6 +306,11 @@ impl ActorState {
                 let retry = retry_at(&self.limits, failures);
                 let moved = with_db(&mut live.store, move |db| {
                     db.end_event()?;
+                    // A failed run's touch changes nothing below: whatever
+                    // it left due before the retry time waits until then.
+                    if db.meta(ALARM_TOUCHED_KEY)?.is_some() {
+                        db.delete_meta(ALARM_TOUCHED_KEY)?;
+                    }
                     // Whatever the handler left due before the retry time
                     // (the same alarm, or one it set for now) waits until
                     // then; one it set later, or a clear, stands. The count

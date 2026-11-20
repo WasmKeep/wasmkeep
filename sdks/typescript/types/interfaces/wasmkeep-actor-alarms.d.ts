@@ -6,7 +6,9 @@ declare module 'wasmkeep:actor/alarms@0.2.0' {
    */
   export function setAlarm(at: bigint): void;
   /**
-   * The pending alarm time, if any.
+   * The pending alarm time, if any. Inside `on-alarm` the alarm being
+   * delivered is consumed: none until the handler calls `set-alarm` or
+   * `clear-alarm`, then what it set (none after a clear).
    */
   export function getAlarm(): bigint | undefined;
   /**

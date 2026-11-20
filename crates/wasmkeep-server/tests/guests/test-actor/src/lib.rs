@@ -12,6 +12,15 @@
 //!   answers `ok` or `err:KIND`; `?retry=1` calls it twice and answers
 //!   `first=ok|err second=ok|err`)
 //! - `POST /delete-on-alarm`: the next `on-alarm` run calls `delete-self`
+//! - `POST /on-alarm?do=D[&at=T][&n=K]`: what each successful `on-alarm`
+//!   run does with the alarm after counting itself (K times, default 1):
+//!   `again` sets it to T (the delivered time, when the test set the alarm
+//!   with `?at=T`), `set` to an hour from now, `clear` sets T then clears,
+//!   `rollback` sets T inside BEGIN ... ROLLBACK, `open` sets T inside a
+//!   transaction it leaves open, `restore` saves `get-alarm`, sets two
+//!   seconds out and puts the saved value back (clearing for none), and
+//!   `look` only reads it. Each records `get-alarm` before and after;
+//!   `GET /observed` answers `BEFORE AFTER` (a time or `none`)
 //! - `POST /call?to=CLASS/NAME&path=P` (P percent-encoded): `actors.call`
 //!   with GET P; answers `STATUS:BODY` or the call error (`&times=N`: the
 //!   same call N times in a row, answers joined by ` | `)
@@ -86,6 +95,45 @@ fn set(key: &str, value: i64) {
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         &params![key, value],
     );
+}
+
+/// `get-alarm` as a stored value: -1 for none.
+fn alarm_value() -> i64 {
+    alarms::get_alarm().map_or(-1, |at| i64::try_from(at).unwrap_or(i64::MAX))
+}
+
+/// The `POST /on-alarm` modes, inside `on-alarm` (`at`: the time given).
+fn on_alarm_does(mode: i64, at: u64) {
+    set("observed_before", alarm_value());
+    match mode {
+        1 => alarms::set_alarm(at),
+        2 => alarms::set_alarm(now_ms() + 3_600_000),
+        3 => {
+            alarms::set_alarm(at);
+            alarms::clear_alarm();
+        }
+        4 => {
+            let _ = storage::exec("BEGIN", &[]);
+            alarms::set_alarm(at);
+            let _ = storage::exec("ROLLBACK", &[]);
+        }
+        5 => {
+            set("observed_after", alarm_value());
+            let _ = storage::exec("BEGIN", &[]);
+            alarms::set_alarm(at);
+            return; // the host rolls the open transaction back
+        }
+        6 => {
+            let before = alarms::get_alarm();
+            alarms::set_alarm(now_ms() + 2_000);
+            match before {
+                Some(before) => alarms::set_alarm(before),
+                None => alarms::clear_alarm(),
+            }
+        }
+        _ => {}
+    }
+    set("observed_after", alarm_value());
 }
 
 fn count(table: &str) -> i64 {
@@ -163,6 +211,14 @@ impl Actor for TestActor {
             return Err("failing on purpose".into());
         }
         storage::exec("INSERT INTO fired VALUES (?1)", &params![now]).map_err(|e| e.to_string())?;
+        let left = get("on_alarm_left");
+        if left > 0 {
+            set("on_alarm_left", left - 1);
+            on_alarm_does(
+                get("on_alarm_do"),
+                u64::try_from(get("on_alarm_at")).unwrap_or(0),
+            );
+        }
         if count("fired") < get("repeat") {
             alarms::set_alarm(now_ms() + 20);
         }
@@ -337,6 +393,35 @@ impl http::Guest for TestActor {
                     if dns.is_ok() { "open" } else { "closed" },
                     if dir.is_ok() { "open" } else { "closed" },
                     if file.is_ok() { "open" } else { "closed" },
+                )
+            }
+            (Method::Post, "/on-alarm") => {
+                let mode = match query_param(&full, "do").as_deref() {
+                    Some("again") => 1,
+                    Some("set") => 2,
+                    Some("clear") => 3,
+                    Some("rollback") => 4,
+                    Some("open") => 5,
+                    Some("restore") => 6,
+                    _ => 0,
+                };
+                set("on_alarm_do", mode);
+                set("on_alarm_at", num("at"));
+                set("on_alarm_left", num("n").max(1));
+                "ok".to_owned()
+            }
+            (Method::Get, "/observed") => {
+                let show = |v: i64| {
+                    if v < 0 {
+                        "none".to_owned()
+                    } else {
+                        v.to_string()
+                    }
+                };
+                format!(
+                    "{} {}",
+                    show(get("observed_before")),
+                    show(get("observed_after"))
                 )
             }
             (Method::Post, "/resched-fail") => {
@@ -740,7 +825,11 @@ impl http::Guest for TestActor {
                     &[],
                 );
                 let word = |ok: bool| if ok { "ok" } else { "err" };
-                format!("durable={} plain={}", word(durable.is_ok()), word(plain.is_ok()))
+                format!(
+                    "durable={} plain={}",
+                    word(durable.is_ok()),
+                    word(plain.is_ok())
+                )
             }
             (Method::Post, "/delete-durable") if query_param(&full, "alarm").is_some() => {
                 alarms::set_alarm(now_ms() + u64::try_from(num("alarm")).unwrap_or(0));

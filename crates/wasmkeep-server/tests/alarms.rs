@@ -513,3 +513,135 @@ async fn events_that_end_while_a_delivery_is_queued_do_not_queue_more() {
         "{page}"
     );
 }
+
+fn epoch_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// Sets the alarm 100 ms out, at an absolute time, with `on-alarm` doing
+/// `what` with it (`POST /on-alarm`) `n` times; returns that time.
+async fn alarm_doing(addr: SocketAddr, what: &str, n: u32) -> u64 {
+    let at = epoch_ms() + 100;
+    ok(addr, "POST", &format!("/on-alarm?do={what}&at={at}&n={n}")).await;
+    ok(addr, "POST", &format!("/alarm?at={at}")).await;
+    at
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_that_sets_the_delivered_time_again_is_delivered_again() {
+    // A punctual "continue now": `on-alarm` sets the alarm to the time it
+    // was delivered for. That is its new alarm, delivered again, not one
+    // the host clears as consumed (before, the actor stalled after one run).
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    alarm_doing(addr, "again", 2).await;
+    wait_fired(addr, 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(number(addr, "/fired").await, 3);
+    assert_eq!(number(addr, "/attempts").await, 3);
+    assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_alarm_in_on_alarm_answers_the_handlers_own_setting() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    let at = alarm_doing(addr, "set", 1).await;
+    wait_fired(addr, 1).await;
+    let pending = call(addr, "GET", "/alarm").await.1;
+    let next: u64 = pending.parse().unwrap_or_else(|_| panic!("{pending:?}"));
+    assert!(next > at + 3_000_000, "{next}");
+    // Before the handler touched it: none (the delivered alarm is consumed),
+    // not the time being delivered; after: the handler's own new time.
+    assert_eq!(
+        call(addr, "GET", "/observed").await.1,
+        format!("none {next}")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untouched_alarm_is_cleared_after_on_alarm() {
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    alarm_doing(addr, "look", 1).await;
+    wait_fired(addr, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(number(addr, "/attempts").await, 1);
+    assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
+    assert_eq!(call(addr, "GET", "/observed").await.1, "none none");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alarm_cleared_in_on_alarm_stays_cleared() {
+    // Set to the delivered time, then cleared: the clear is the handler's
+    // last word.
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    alarm_doing(addr, "clear", 1).await;
+    wait_fired(addr, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(number(addr, "/attempts").await, 1);
+    assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
+    assert_eq!(call(addr, "GET", "/observed").await.1, "none none");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rolled_back_set_in_on_alarm_leaves_the_alarm_untouched() {
+    // The delivered time set inside a transaction that is rolled back
+    // (explicitly, or left open and rolled back by the host) never
+    // happened: the alarm is untouched and cleared, not delivered again.
+    for what in ["rollback", "open"] {
+        let data = tempfile::tempdir().unwrap();
+        let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+        alarm_doing(addr, what, 1).await;
+        wait_fired(addr, 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(number(addr, "/attempts").await, 1, "{what}");
+        assert_eq!(call(addr, "GET", "/alarm").await.1, "none", "{what}");
+        assert_eq!(
+            call(addr, "GET", "/observed").await.1,
+            "none none",
+            "{what}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_that_saves_and_restores_the_alarm_runs_once() {
+    // `get-alarm`, a provisional alarm, then the saved value put back
+    // (clearing for none), as the room's scale step does: the restore is a
+    // clear, not the delivered time set again.
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    alarm_doing(addr, "restore", 1).await;
+    wait_fired(addr, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(number(addr, "/attempts").await, 1);
+    assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_touch_mark_that_cannot_be_removed_keeps_the_handler_from_running() {
+    // The first run sets the delivered time again, and removing its mark
+    // after the run fails: the mark is left, and the alarm is retried. The
+    // retry cannot remove the leftover mark either, so it must not run the
+    // handler: with the mark still there, a run that leaves the alarm
+    // alone would look as if it had kept the delivered time, and run once
+    // more at once. Retried again, the mark goes and the handler's run is
+    // its last.
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    wasmkeep_storage::faults::fail_next("delete_meta:alarm_touched");
+    wasmkeep_storage::faults::fail_next("delete_meta:alarm_touched");
+    alarm_doing(addr, "again", 1).await;
+    wait_fired(addr, 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(number(addr, "/attempts").await, 2);
+    assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
+}
