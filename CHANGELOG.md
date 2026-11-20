@@ -32,6 +32,46 @@ The text under a version's heading is its GitHub release text
   included. Equal fuel with more CPU time on one node points at the machine;
   more fuel, at bigger requests. Runtime embedders get the meter of a front
   store from `Runtime::new_metered_async_store_with_budget`.
+- **The room's delivery moves to a pusher** (stage 1,
+  [ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#13-the-pusher-amended-2026-11-20),
+  section 13). A busy room spent most of its mailbox time waiting on its
+  own delivery rounds, and publishes queued behind them. A fifth class,
+  the **pusher** (`pusher/<room name>`), now runs the rounds, the
+  children's positions and suspects, the relay layer, scaling and its
+  durable state; it pulls from the room with a new read-only `pull`
+  (the push header and up to 513 messages, bounded as a round was).
+  The room keeps numbers, epochs, the window and history, sets no alarm
+  and never calls the pusher. The pusher clocks itself every 20 ms while
+  a child is behind; when it goes idle it tells the room in its last
+  pull, and the publish answer then asks the front to poke it
+  (`Client.publish` does, in both SDKs). A join pokes the pusher, not
+  the room. A round still waits for its slowest child, but only the
+  pusher waits: publishes and history are answered meanwhile. Edges gain
+  `handover`, directories `transfer`; the wire `Writer` of the
+  TypeScript SDK writes into one buffer. TypeScript: `broadcast.define()`
+  takes only `confirm` (and `pusher`, its class), and
+  `broadcast.definePusher({ scaling | edges, room })` is the new class.
+  Rust: `broadcast::pusher::handler::{round, scaling, handle}` replace
+  `handler::{round, scaling, poke}` of the room. Both SDKs: `Core` takes
+  no alarm (TypeScript `new Core(store, confirm)`; Rust's `Store` loses
+  `alarm`), `beforePush`/`before_push` give way to `pull`, `Round.run`
+  takes a `Source` (the pusher's `Pulled`, or a `Core`), and TypeScript
+  exports `broadcast.serve` (the room's operations, for tests). A scale step continues
+  1 ms after its event rather than at its own time, which a punctual
+  alarm delivery could clear and stall.
+
+  **Upgrading a room deployed with 0.6.0.** Deploy the five classes
+  together (the `pusher` class `internal`, from the same SDK version as
+  the room and the front: a 0.6.0 front refuses the publish answer's new
+  field). The room keeps its history and numbers. On its first alarm the
+  pusher reads the room's scale rows (`adopt`), saves them as its own,
+  then has the room hand the directory map and every edge over to it
+  (16 edges per alarm) and retire its rows; a pending split or merge
+  resumes in the pusher. Clients stay connected and receive the backlog
+  once the move is done, a few alarms later; nothing is renumbered. A
+  room's leftover 0.6.0 alarm fires once and does nothing. Fixed-edge
+  rooms (`edges`, a test configuration) are not moved: recreate their
+  edges.
 
 - **Guest event work.** `wasmkeep_event_fuel{tenant,app,class,kind}` reports
   Wasmtime work units per actor event, independently of CPU speed, alongside
