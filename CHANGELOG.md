@@ -25,6 +25,13 @@ The text under a version's heading is its GitHub release text
   the copy alone (it was `snapshot_in_gap`, the whole snapshot, earlier
   in this release). See ADR 0034, section 7, and
   [monitoring](docs/monitoring.md).
+- **Front request work.** `wasmkeep_front_cpu_seconds{tenant,app}` and
+  `wasmkeep_front_fuel{tenant,app}` report the guest CPU time each front
+  request was charged against `--front-cpu-budget-ms`, and its Wasmtime
+  fuel, from instantiation to the instance's end, trapped requests
+  included. Equal fuel with more CPU time on one node points at the machine;
+  more fuel, at bigger requests. Runtime embedders get the meter of a front
+  store from `Runtime::new_metered_async_store_with_budget`.
 
 - **Guest event work.** `wasmkeep_event_fuel{tenant,app,class,kind}` reports
   Wasmtime work units per actor event, independently of CPU speed, alongside

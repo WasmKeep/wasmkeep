@@ -198,6 +198,8 @@ its first request.
 | `wasmkeep_asset_fetches_total{tenant,app,outcome}` | counter | Content downloads: `ok`, `digest_mismatch`, `unavailable`. Digest mismatches require repairing the deploy's objects; unavailable contents return 503 with `Retry-After: 1`. |
 | `wasmkeep_front_requests_total{tenant,app,outcome}` | counter | Requests the front ([ADR 0023](adr/0023-the-front.md)) received, by `outcome`: `ok` (it answered), `handoff` (it handed a WebSocket to an actor, [ADR 0027](adr/0027-sockets-through-the-front.md): its instance stopped and the host opened the socket, whatever the open's outcome), `busy` (every front slot was taken, or, briefly, the instance pool had none free: 503 with `Retry-After: 1`, and the front did not run), `unconfigured` (a value the front requires is not set, from the deploy's `--front-requires`, or the node cannot open the app's secrets: 503 with `Retry-After: 1`, the front did not run, and the missing names are in the node's log only), `cpu_budget` (past `--front-cpu-budget-ms`, 500), `wall` (past its 30 s wall, 500) `guest_error` (it trapped, answered nothing, or answered with a `1xx` status, all 500) and `client_gone` (the client left before the end of its answer, which stopped the instance). A request is counted when its instance ends: one stopped while its response was streaming counts as `cpu_budget`, `wall` or `guest_error`, not `ok`, though the client already had a 200. A client with its whole answer (its declared length, its trailers, or an answer without a body: `HEAD`, 204, 304) is not gone: the instance runs on, up to its wall, and counts when it ends. `busy` rising: raise `--max-front-requests`, or find what keeps front requests waiting (their calls). |
 | `wasmkeep_front_request_seconds{tenant,app}` | histogram | How long front requests took, to the response's last byte. |
+| `wasmkeep_front_cpu_seconds{tenant,app}` | histogram | Guest CPU time each front request was charged against `--front-cpu-budget-ms`, from its instantiation to its instance's end (a request whose client left first is not observed). A request stopped on its budget is charged about the budget. Compare with `wasmkeep_front_fuel` to tell a slower or busier machine (same fuel, more CPU) from more guest work (more fuel). |
+| `wasmkeep_front_fuel{tenant,app}` | histogram | Wasmtime fuel units each front request consumed, instantiation included, when `RuntimeConfig::measure_fuel` is on. Like [`wasmkeep_event_fuel`](#event-work-fuel), it excludes host work and can undercount a trapped request. |
 | `wasmkeep_front_slots_in_use` | gauge | Front requests running now, out of `--max-front-requests`. |
 | `wasmkeep_front_calls_total{tenant,app,outcome}` | counter | `actors.call` from the front, by `outcome`: `ok` (the callee answered, whatever its status), `busy` (a quarter of the front's slots already waited on that actor: `failed("front busy: ...")`), `timeout` (5 s of the front's wall were left, or the actors' call limit passed) and `failed` (every other error: an invalid address, a callee that failed or was overloaded, a body too large). A call to another node is also counted in `wasmkeep_forwards_total{kind="call"}`. |
 | `wasmkeep_alarm_admission_retries_total` | counter | Alarm deliveries rescheduled because resident capacity or an actor queue was full; no actor labels. |
@@ -598,8 +600,10 @@ Every store starts with `u64::MAX` fuel, replenished before each actor event
 no fuel limit or fuel-driven yielding policy. Even at a trillion units per
 second an event would need over 200 days to exhaust that allowance; the
 existing CPU and wall limits remain in force. The epoch ticker, CPU clocks,
-budget checks and yield behavior are unchanged. New front stores also get
-fuel but fronts are not actor classes and do not populate this histogram.
+budget checks and yield behavior are unchanged. Fronts are not actor
+classes and do not populate this histogram: each front request's fuel, from
+its instantiation on, goes to `wasmkeep_front_fuel`, beside its CPU time in
+`wasmkeep_front_cpu_seconds`.
 
 Fuel is read after the event, including guest post-return. Failed events
 can be undercounted: Wasmtime can keep unflushed fuel in a register when an

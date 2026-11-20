@@ -917,7 +917,7 @@ impl HttpComponent {
         slot: Slot,
         version: Arc<FrontVersion>,
     ) -> wasmtime::Result<(Response<HyperOutgoingBody>, Running)> {
-        let mut store = self.runtime.new_async_store_with_budget(
+        let (mut store, meter) = self.runtime.new_metered_async_store_with_budget(
             self.host(actors, Arc::clone(&version.env)),
             self.cpu_budget,
         );
@@ -946,11 +946,11 @@ impl HttpComponent {
         let wall = self.wall;
         let task = tokio::task::spawn(async move {
             let _slot = slot;
-            let run = async move {
+            let run = async {
                 let proxy = pre.instantiate_async(&mut store).await?;
                 proxy
                     .wasi_http_incoming_handler()
-                    .call_handle(store, req, out)
+                    .call_handle(&mut store, req, out)
                     .await
             };
             // Past the wall the instance is dropped, which also ends a
@@ -958,6 +958,10 @@ impl HttpComponent {
             let result = tokio::time::timeout(wall, run)
                 .await
                 .unwrap_or_else(|_| Err(WallExceeded(wall).into()));
+            // Its guest work, instantiation included, whatever its end
+            // (not when the client left first: the task is aborted then).
+            crate::metrics::front_request_work(&app, meter.used(), meter.fuel_used(&store));
+            drop(store);
             if was_sent.await.is_ok() && !counts.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 match &result {
                     Ok(()) => outcome(&app, "ok"),

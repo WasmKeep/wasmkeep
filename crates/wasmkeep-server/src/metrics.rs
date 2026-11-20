@@ -511,6 +511,11 @@ pub(crate) struct Metrics {
     /// How long front requests took, to the response's last byte; rendered
     /// with the node's tenant and app.
     pub(crate) front_request_seconds: Family<Histogram>,
+    /// Guest CPU time each front request was charged against its budget,
+    /// instantiation included; rendered with the node's tenant and app.
+    pub(crate) front_cpu_seconds: Family<Histogram>,
+    /// Wasmtime fuel each front request consumed, when measured.
+    pub(crate) front_fuel: Family<EventFuel>,
     /// Front requests running now (a gauge).
     pub(crate) front_slots_in_use: AtomicU64,
     /// `actors.call` from the front, by outcome (`ok`, `busy`, `timeout`,
@@ -708,6 +713,15 @@ pub(crate) fn front_request_took(app: &str, elapsed: std::time::Duration) {
         .front_request_seconds
         .get_in(app, &[])
         .observe(elapsed);
+}
+
+/// The guest work of one front request of `app`, from instantiation to the
+/// instance's end: its CPU time and, when measured, its fuel.
+pub(crate) fn front_request_work(app: &str, cpu: std::time::Duration, fuel: Option<u64>) {
+    METRICS.front_cpu_seconds.get_in(app, &[]).observe(cpu);
+    if let Some(fuel) = fuel {
+        METRICS.front_fuel.get_in(app, &[]).0.observe(fuel);
+    }
 }
 
 /// One `actors.call` from the front of `app`, ended with `outcome`
@@ -1717,6 +1731,25 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
             h.render(&mut out, "wasmkeep_front_request_seconds", labels);
         }
     });
+    head(
+        &mut out,
+        "wasmkeep_front_cpu_seconds",
+        "histogram",
+        "Guest CPU time each front request was charged against its budget, instantiation included, by tenant and app.",
+    );
+    m.front_cpu_seconds.each(|labels, h| {
+        if h.count.load(Ordering::Relaxed) > 0 {
+            h.render(&mut out, "wasmkeep_front_cpu_seconds", labels);
+        }
+    });
+    head(
+        &mut out,
+        "wasmkeep_front_fuel",
+        "histogram",
+        "Wasmtime fuel units each front request consumed, instantiation included; excludes host work.",
+    );
+    m.front_fuel
+        .each(|labels, h| h.0.render_labels(&mut out, "wasmkeep_front_fuel", labels));
     head(
         &mut out,
         "wasmkeep_front_slots_in_use",

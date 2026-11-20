@@ -124,9 +124,19 @@ impl Runtime {
     /// budget instead of the runtime's: for instances that run under
     /// another limit than actors (a front's request).
     pub fn new_async_store_with_budget<T: 'static>(&self, data: T, budget: Duration) -> Store<T> {
+        self.new_metered_async_store_with_budget(data, budget).0
+    }
+
+    /// Like [`new_async_store_with_budget`](Self::new_async_store_with_budget),
+    /// with the store's CPU meter, to read what the event used.
+    pub fn new_metered_async_store_with_budget<T: 'static>(
+        &self,
+        data: T,
+        budget: Duration,
+    ) -> (Store<T>, CpuMeter) {
         let mut store = self.fuel_store(data);
-        let _meter = cpu::install(&mut store, budget, self.epoch_tick, Execution::Async);
-        store
+        let meter = cpu::install(&mut store, budget, self.epoch_tick, Execution::Async);
+        (store, meter)
     }
 
     /// The CPU budget stores get by default.
