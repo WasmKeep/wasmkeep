@@ -24,6 +24,21 @@ The text under a version's heading is its GitHub release text
   memory. Actor/object order and the per-actor listing budget are unchanged.
   LIST costs remain approximately the same; the first poll stays sequential.
   See [the feed guide](docs/change-feed.md).
+- **Shorter restores.** `backup restore` no longer waits two fixed 40 s
+  periods. The quiet wait before it writes state is measured on the
+  bucket's clock (`Last-Modified`), never a node's or the operator's. It
+  waits 41 s after the bucket stored the newest write of the app's node
+  lease objects (a renewal, release or fence), lists them again, and waits
+  again if one changed, refusing after three rounds. It does not wait at all
+  when the app has no node lease under the prefix. When the nodes listing
+  proves nothing (an unreadable heartbeat, one naming no app, an old node,
+  `--force`), it also waits 41 s after the fence was stored. The restore lock
+  is released at once when every write to the target and archive got an
+  answer. It is held 40 s after one that did not, counting the S3 client's
+  own retries. `--abort` keeps its fixed waits.
+  `docs/deploy/backup-and-restore.md` says what each wait guards against,
+  and where the 40 s bound is an assumption the bucket client does not
+  enforce.
 
 ## 0.6.0
 

@@ -757,11 +757,20 @@ have no tombstone. Then, in this order:
 **In place** (`--in-place`): the app's state is replaced under the same
 prefix, while the cluster's other apps run.
 
-1. The app's nodes must be stopped: no node lease of the app `live`, and
-   `LATE_WRITES` (40 s) passed since the last one was written or fenced,
-   exactly the conditions `app delete` waits for and the same fencing
-   (`cluster fence`, or `--force` after it). An upload held by a dead
-   node lands within that window or never.
+1. The app's nodes must be stopped: no node lease of the app `live`
+   (`cluster fence`, or `--force` after it; the command fences an expired
+   `live` lease itself). Since 0.7.0 it then waits until `LATE_WRITES`
+   (40 s), plus a second for whole-second stamps, after the bucket stored
+   the newest write of the app's node lease objects (a renewal, release or
+   fence), measured on the bucket's `Last-Modified` clock, not a node's or
+   the operator's. It lists them again after the wait and waits again if one
+   changed, refusing after three rounds. With no node lease of the app under
+   the prefix, it does not wait at all. When the listing proves nothing (an
+   unreadable heartbeat, one naming no app, a node without a node lease or
+   the `restore` capability, or `--force`), it also waits that long after
+   the fence was stored. An upload held by a dead node is assumed to land
+   within that window or never; `docs/deploy/backup-and-restore.md` says
+   where the bucket client does not enforce it.
 2. **The state being replaced is backed up first**, by an ordinary
    `backup create` run into the same destination, marked
    `before-restore`. The command goes on only if that run completed with

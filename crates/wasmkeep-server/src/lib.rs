@@ -31,6 +31,7 @@ mod rate_limit;
 mod replica;
 pub mod secret_store;
 pub mod secrets;
+pub mod settle;
 mod shares;
 mod socket_limits;
 mod supervisor;

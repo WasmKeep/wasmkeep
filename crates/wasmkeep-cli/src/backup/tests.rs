@@ -2400,7 +2400,13 @@ async fn review7_nonzero_late_wait_and_two_restores() {
     restore::execute(&restore_args(&id, false), &f.dest, "", &target, "", late)
         .await
         .unwrap();
-    assert!(start.elapsed() >= late * 2 - std::time::Duration::from_secs(1));
+    // No node of the app ever wrote here and every write was answered:
+    // neither the quiet wait nor the lock's settle has anything to wait for.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
     let old = optional(&target, "apps/acme/shop/restored").await.unwrap();
     restore::execute(&restore_args(&id, true), &f.dest, "", &target, "", late)
         .await
@@ -2409,6 +2415,388 @@ async fn review7_nonzero_late_wait_and_two_restores() {
         old,
         optional(&target, "apps/acme/shop/restored").await.unwrap()
     );
+}
+
+/// A heartbeat of `acme/shop`'s node `id`, in `state`, last written live at
+/// `written_at_ms`.
+fn app_node_lease(
+    id: &str,
+    state: wasmkeep_cluster::node_lease::NodeState,
+    written_at_ms: u64,
+) -> Vec<u8> {
+    node_lease_of("acme/shop", id, state, written_at_ms)
+}
+
+/// [`app_node_lease`] for a node of `app` (empty: one naming no app).
+fn node_lease_of(
+    app: &str,
+    id: &str,
+    state: wasmkeep_cluster::node_lease::NodeState,
+    written_at_ms: u64,
+) -> Vec<u8> {
+    use wasmkeep_cluster::membership::NodeInfo;
+    let info = NodeInfo {
+        id: id.into(),
+        address: "http://n:8080".into(),
+        version: "0.0.0".into(),
+        written_at_ms,
+        app: app.into(),
+        cluster_address: None,
+        tls_pins: Vec::new(),
+        drain: None,
+        reads_secrets: true,
+        can_take: true,
+        can_front: true,
+        can_handoff: true,
+        can_end: true,
+        can_flush: true,
+        can_rate_limits: true,
+        can_assets: true,
+        can_blobs: true,
+        can_restore: true,
+        can_actor_restore: true,
+        instance: None,
+        lease: None,
+        load: None,
+        can_recorded_head: true,
+        can_multi_app: true,
+        can_place: false,
+        process: None,
+    };
+    wasmkeep_cluster::node_lease::NodeLeaseObject {
+        state,
+        instance: Some("i1".into()),
+        written_at_ms,
+    }
+    .encode_with(&info.payload())
+}
+
+/// A store whose listing stamps each `nodes/` object with the time it was
+/// written on the test's (paused) clock, `age` earlier: the bucket's clock
+/// moves with the test's, and a heartbeat may be one it stored long ago.
+#[derive(Debug)]
+struct AgedNodes {
+    inner: Store,
+    age: chrono::Duration,
+    start: tokio::time::Instant,
+    wall: chrono::DateTime<chrono::Utc>,
+    writes: std::sync::Mutex<BTreeMap<String, tokio::time::Instant>>,
+}
+impl AgedNodes {
+    fn store(age: chrono::Duration) -> Store {
+        Arc::new(Self {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            age,
+            start: tokio::time::Instant::now(),
+            wall: chrono::Utc::now(),
+            writes: Default::default(),
+        })
+    }
+}
+impl std::fmt::Display for AgedNodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("aged heartbeats")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for AgedNodes {
+    async fn put_opts(
+        &self,
+        key: &Key,
+        payload: object_store::PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let result = self.inner.put_opts(key, payload, opts).await;
+        if result.is_ok() && key.as_ref().starts_with("nodes/") {
+            self.writes
+                .lock()
+                .unwrap()
+                .insert(key.as_ref().to_owned(), tokio::time::Instant::now());
+        }
+        result
+    }
+    async fn put_multipart_opts(
+        &self,
+        key: &Key,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(key, opts).await
+    }
+    async fn get_opts(
+        &self,
+        key: &Key,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(key, opts).await
+    }
+    fn list(
+        &self,
+        prefix: Option<&Key>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let stamps: BTreeMap<String, chrono::DateTime<chrono::Utc>> = self
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, at)| {
+                let since = chrono::Duration::from_std(*at - self.start).unwrap();
+                (k.clone(), self.wall + since - self.age)
+            })
+            .collect();
+        self.inner
+            .list(prefix)
+            .map(move |meta| {
+                meta.map(|mut meta| {
+                    if let Some(at) = stamps.get(meta.location.as_ref()) {
+                        meta.last_modified = *at;
+                    }
+                    meta
+                })
+            })
+            .boxed()
+    }
+    fn delete_stream(
+        &self,
+        keys: futures_util::stream::BoxStream<'static, object_store::Result<Key>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Key>> {
+        self.inner.delete_stream(keys)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &Key,
+        to: &Key,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Restores `id` into `target` and returns how long it took.
+async fn timed_restore(f: &Fixture, id: &str, target: &Store) -> std::time::Duration {
+    let start = tokio::time::Instant::now();
+    restore::execute(
+        &restore_args(id, false),
+        &f.dest,
+        "",
+        target,
+        "",
+        wasmkeep_server::apps::LATE_WRITES,
+    )
+    .await
+    .unwrap();
+    start.elapsed()
+}
+
+#[tokio::test(start_paused = true)]
+async fn restore_waits_for_a_stopped_nodes_last_write_not_for_the_fence() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let late = wasmkeep_server::apps::LATE_WRITES;
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let now = u64::try_from(super::now_ms().unwrap()).unwrap();
+    // A node of the app stopped moments ago: a write it sent may still land.
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    put(
+        &target,
+        "nodes/n1",
+        app_node_lease("n1", NodeState::Released, now),
+        false,
+    )
+    .await
+    .unwrap();
+    let waited = timed_restore(&f, &id, &target).await;
+    assert!(
+        waited >= late - std::time::Duration::from_secs(1) && waited < late * 2,
+        "{waited:?}"
+    );
+    // The bucket stored its last write long ago: no wait, whatever the
+    // node's clock wrote in it.
+    let target = AgedNodes::store(chrono::Duration::hours(1));
+    put(
+        &target,
+        "nodes/n1",
+        app_node_lease("n1", NodeState::Fenced, now),
+        false,
+    )
+    .await
+    .unwrap();
+    let waited = timed_restore(&f, &id, &target).await;
+    assert!(waited < std::time::Duration::from_secs(1), "{waited:?}");
+    // A heartbeat this version cannot read proves nothing: the fence's time
+    // counts again, as before 0.7.0.
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    put(&target, "nodes/n2", b"wasmkeep-node 9\n".to_vec(), false)
+        .await
+        .unwrap();
+    let waited = timed_restore(&f, &id, &target).await;
+    assert!(
+        waited >= late - std::time::Duration::from_secs(1),
+        "{waited:?}"
+    );
+}
+
+/// The node's clock is 45 s behind the operator's: the `written_at` it
+/// wrote looks older than the bound, but the bucket stored the write just
+/// now. The quiet wait is measured on the bucket's clock.
+#[tokio::test(start_paused = true)]
+async fn restore_measures_a_stopped_nodes_lease_on_the_buckets_clock() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let late = wasmkeep_server::apps::LATE_WRITES;
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let behind = u64::try_from(super::now_ms().unwrap()).unwrap() - 45_000;
+    for state in [NodeState::Released, NodeState::Fenced, NodeState::Live] {
+        let target: Store = Arc::new(object_store::memory::InMemory::new());
+        put(
+            &target,
+            "nodes/n1",
+            app_node_lease("n1", state, behind),
+            false,
+        )
+        .await
+        .unwrap();
+        let waited = timed_restore(&f, &id, &target).await;
+        assert!(
+            waited >= late - std::time::Duration::from_secs(1),
+            "{state:?}: {waited:?}"
+        );
+    }
+}
+
+/// A heartbeat that names no app (format 1 serves `<tenant>/default`) cannot
+/// show which app it serves: the listing proves nothing.
+#[tokio::test(start_paused = true)]
+async fn a_heartbeat_naming_no_app_makes_the_listing_prove_nothing() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let late = wasmkeep_server::apps::LATE_WRITES;
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let target = AgedNodes::store(chrono::Duration::hours(1));
+    let now = u64::try_from(super::now_ms().unwrap()).unwrap();
+    put(
+        &target,
+        "nodes/n1",
+        node_lease_of("", "n1", NodeState::Released, now - 3_600_000),
+        false,
+    )
+    .await
+    .unwrap();
+    let waited = timed_restore(&f, &id, &target).await;
+    assert!(
+        waited >= late - std::time::Duration::from_secs(1),
+        "{waited:?}"
+    );
+}
+
+/// A node of the app that keeps writing its lease through the quiet wait
+/// (here unconditionally, over the restore's fence) is still acting: the
+/// restore waits again from its newest write, then refuses.
+#[tokio::test(start_paused = true)]
+async fn a_node_still_writing_its_lease_through_the_quiet_wait_is_refused() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let target = AgedNodes::store(chrono::Duration::zero());
+    // Its clock is a minute behind: by the operator's it looks stale.
+    let behind = || u64::try_from(super::now_ms().unwrap()).unwrap() - 60_000;
+    put(
+        &target,
+        "nodes/n1",
+        app_node_lease("n1", NodeState::Live, behind()),
+        false,
+    )
+    .await
+    .unwrap();
+    let writer = {
+        let target = target.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                put(
+                    &target,
+                    "nodes/n1",
+                    app_node_lease("n1", NodeState::Live, behind()),
+                    true,
+                )
+                .await
+                .unwrap();
+            }
+        })
+    };
+    let result = restore::execute(
+        &restore_args(&id, false),
+        &f.dest,
+        "",
+        &target,
+        "",
+        wasmkeep_server::apps::LATE_WRITES,
+    )
+    .await;
+    writer.abort();
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("still writes its node lease"), "{err}");
+    assert!(
+        list_bounded(&target, "state/").await.unwrap().is_empty(),
+        "state written while a node acts"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_answered_only_after_it_landed_keeps_the_lock_although_the_restore_succeeded() {
+    let late = wasmkeep_server::apps::LATE_WRITES;
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let run = async |fail: usize| {
+        let empty: Store = Arc::new(object_store::memory::InMemory::new());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Every mutation lands; the answer to mutation `fail` is lost.
+        let target: Store = Arc::new(FailMutation {
+            inner: empty.clone(),
+            count: count.clone(),
+            fail,
+            lost: true,
+            stray: false,
+        });
+        let start = tokio::time::Instant::now();
+        let result =
+            restore::execute(&restore_args(&id, false), &f.dest, "", &target, "", late).await;
+        let lock = optional(&empty, "apps/acme/shop/restore-lock")
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            result,
+            start.elapsed(),
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            lock,
+        )
+    };
+    let (result, waited, total, _) = run(usize::MAX).await;
+    result.unwrap();
+    assert!(waited < std::time::Duration::from_secs(1), "{waited:?}");
+    assert!(total > 10, "{total}");
+    let mut recovered = 0;
+    // Mutation 0 is the lock's own write and the last its release: neither
+    // has a lock to hold afterwards. Every one in between does.
+    for fail in 1..total - 1 {
+        let (result, waited, _, lock) = run(fail).await;
+        assert!(
+            waited >= late - std::time::Duration::from_secs(1),
+            "mutation {fail}: {waited:?} ({result:?})"
+        );
+        assert!(lock.starts_with(b"unlocked "), "mutation {fail}");
+        // Recovered: a create that finds the same bytes is not an error.
+        if result.is_ok() {
+            recovered += 1;
+        }
+    }
+    assert!(recovered > 0, "no restore recovered from a lost answer");
 }
 
 #[tokio::test]
@@ -3506,6 +3894,20 @@ async fn stable_id_backup_restore_timeout_finish_recreate_resume() {
     let f = Fixture::new().await;
     let run = f.create().await;
     let target: Store = Arc::new(object_store::memory::InMemory::new());
+    // A node of the app stopped just now: the quiet wait holds the restore
+    // past the timeout below.
+    put(
+        &target,
+        "nodes/n1",
+        app_node_lease(
+            "n1",
+            wasmkeep_cluster::node_lease::NodeState::Released,
+            u64::try_from(super::now_ms().unwrap()).unwrap(),
+        ),
+        false,
+    )
+    .await
+    .unwrap();
     let mut args = restore_args(&run, false);
     assert!(
         tokio::time::timeout(

@@ -268,10 +268,77 @@ undo run, again requiring `--force`).
 The command creates `apps/<tenant>/<app>/restoring` before changing state.
 Nodes refuse it on start and stop at their next deploy check. A unique
 `restored` marker invalidates their old local files, including actors absent
-from the backup. Expired node leases are fenced; the command waits 40 seconds
-after the restore fence and the latest heartbeat or lease fence before writing
-history. It rebuilds generation floors and the alarm index, then installs
-versions and current pointers, and removes `restoring` last.
+from the backup. Expired node leases are fenced. Before writing history the
+command waits only for writes an old holder of the app may still land (the
+quiet wait, below). It rebuilds generation floors and the alarm index, then
+installs versions and current pointers, and removes `restoring` last.
+
+### What the restore waits for
+
+Neither wait is a fixed time. Each lasts as long as the cluster's own records
+leave a write that may still land, and no longer.
+
+**The quiet wait**, before the restore removes or writes any state. It guards
+against a write that an old holder of the app sent before it stopped, such as
+an upload in flight on a node that crashed or froze, landing after the restore
+cleared or copied the state. The command first fences every expired `live`
+lease of the app, then lists `nodes/` and reads the node lease of each of the
+app's nodes. It measures every time on the bucket's clock, from the
+`Last-Modified` stamps of these objects and of its own `restored` marker,
+never from a node's clock or the operator's:
+
+- **No node of the app has a node lease here** (a restore into a fresh prefix,
+  as the drill does): no wait. A node acquires an actor only after its node
+  lease's first `live` write landed and a check sent after that write found no
+  `restoring` fence (ADR 0020, ADR 0028 section 5), and it checks again after
+  any lapse of its lease. A node that never saw the fence is therefore in that
+  listing.
+- **A node of the app stopped, crashed or was fenced**: the command waits
+  until 41 seconds after the bucket stored the newest write of its node lease
+  object, whether that write was the node's last `live` renewal, its release,
+  or a fence. That is `LATE_WRITES` (40 seconds), plus one second because S3
+  stamps whole seconds. A node acts at most `ttl - safety` (8 seconds) after
+  the last of its lease writes that landed, since its validity counts from that
+  write's send on its own clock. This assumes only that clocks run at the same
+  rate, not that they agree. A frozen node that wakes later finds its lease
+  expired on its own clock and writes nothing. A node whose lease was stored
+  long ago has nothing left to wait for.
+- **The listing proves nothing**: an object under `nodes/` this version cannot
+  read, a heartbeat that names no app (the oldest format), a node of the app
+  without a node lease or the `restore` capability, or `--force`. The command
+  then also waits 41 seconds after the bucket stored the restore fence, as
+  before 0.7.0, and checks the nodes again.
+
+After the wait the command lists `nodes/` again. If one of those objects
+changed (a node of the app wrote its lease meanwhile, so it is still acting),
+it waits again from that write. After three such rounds it refuses, leaving
+the fence for a retry once that node is stopped.
+
+`LATE_WRITES` assumes that a node's request lands within about 30 seconds of
+its lease's end. That assumption predates this command and is not enforced
+for every request. A segment upload ends within its own deadline (four
+5-second idles plus a second per megabyte), but each attempt is one request to
+the bucket's S3 client, with that client's 30-second request timeout. Other
+writes are bounded only by the client, which `wasmkeep serve` builds with
+`object_store`'s default retries (up to 10 within 3 minutes) on a 5xx, 429 or
+408 answer. A request retried that late could land after the wait. `app
+delete --recreate` and the abort path's fixed waits rely on the same bound.
+
+**The settle before the lock's release**, after `restoring` is removed or the
+restore failed. It guards against a request of this restore that got no
+answer (a timeout, a connection error, a 5xx, 408 or 429 status, or a request
+cut short) landing later. A late deletion of `restoring`, for example, could
+otherwise remove the fence of the next restore. The command records every
+mutating HTTP attempt to the target and archive buckets, including the retries
+the S3 client makes on its own. An answered request was applied or refused, so
+it cannot land later. If every one was answered, the lock is released at once.
+Otherwise the lock is held until 40 seconds after the last unanswered request
+ended. A restore that ends this way says so on stderr.
+
+A restore into an empty root of a stopped cluster therefore runs for as long
+as its copy and verification take.
+A restore right after the app's nodes stopped still waits up to 41 seconds
+after the bucket stored their last lease write. `--abort` keeps its two fixed 40 second waits, below.
 
 In place, a verified backup of the old state is made first; `--force` may
 accept failed actors only in this undo backup. All successfully copied actors
@@ -291,10 +358,11 @@ if `latest` moved. A process killed while holding
 `apps/<tenant>/<app>/restore-lock` requires an operator to confirm that the
 old restore process is stopped, wait at least 40 seconds for its outstanding
 requests, delete **only that lock**, and rerun. An unlocked lock record is
-reused conditionally. Ordinary exits settle pending requests for 40 seconds
-before releasing the lock, so a late deletion cannot remove a later restore
-fence. If `restoring` is already absent, the restore finished; clear an orphaned
-lock without repeating the restore.
+reused conditionally. Ordinary exits hold the lock for 40 seconds after a
+request that got no answer, and release it at once when every request was
+answered (above), so a late deletion cannot remove a later restore fence. If
+`restoring` is already absent, the restore finished; clear an orphaned lock
+without repeating the restore.
 Do not remove `restoring` to expose incomplete state. The journal remains
 through interrupted clearing and copying. Serialize restore, app deletion,
 deploy, secrets updates and archive maintenance; concurrent operator mutations
