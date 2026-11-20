@@ -22,8 +22,8 @@ pub use config::RuntimeConfig;
 pub use cpu::{CpuBudgetExceeded, CpuMeter, cpu_budget_exceeded_total};
 pub use error::Error;
 pub use mailbox::{
-    BoxError, BoxFuture, DropCause, MailboxConfig, MailboxError, Mailboxes, ResidentShare,
-    StepOutcome,
+    BoxError, BoxFuture, DropCause, JobTiming, MailboxConfig, MailboxError, Mailboxes,
+    ResidentShare, StepOutcome,
 };
 pub use pool::ResidentPool;
 pub use residency::{Residency, Retained};

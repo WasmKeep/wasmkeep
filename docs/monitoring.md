@@ -168,6 +168,8 @@ its first request.
 | `wasmkeep_ready`, `wasmkeep_not_ready{reason}` | gauges | 1 when `/_wasmkeep/ready` answers 200. `wasmkeep_not_ready` has a series for every reason in the table above and the others a node gives (the cluster secret, the node lease, the disk, the deployed version, the app's secrets), always on the page: 1 for the reason the node is not ready, 0 for the others. Count not-ready nodes with `count(wasmkeep_not_ready == 1)`. |
 | `wasmkeep_events_total{tenant,app,class,kind,outcome}` | counter | Events run; `kind` is `request`, `alarm`, `websocket` or `init`, `outcome` is `ok` or `failed` (trapped, cut, or a handler that returned an error). |
 | `wasmkeep_mailbox_wait_seconds{tenant,app,class}` | histogram | Time from the accepted enqueue attempt to the start of a guest-event mailbox job; excludes capacity-admission retries. |
+| `wasmkeep_mailbox_host_work_seconds{tenant,app,class,work}` | histogram | Exclusive host work inside the mailbox, including jobs with no guest event; fixed `work` categories below. |
+| `wasmkeep_alarm_stale_hints_total{tenant,app,class}` | counter | Stale alarm hint clear attempts (including failures or deferred clears), not the number of index objects deleted. |
 | `wasmkeep_event_duration_seconds{tenant,app,class,kind}` | histogram | Guest event execution, including awaited host calls: `fetch` (HTTP and actor calls), `alarm`, `websocket` (open/message/close), or `other` (initialization). Excludes post-event replication. |
 | `wasmkeep_event_start_rule_wait_seconds{tenant,app,class}` | histogram | A batched event's boundary holding back the next event: capture, upload-budget wait and the event-start rule's upload wait. Recorded once per completed boundary, including failed ones; absent for strict holds. |
 | `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit) or `lease` (this node lost the actor mid-event). |
@@ -272,6 +274,52 @@ name. They use the existing seconds buckets (100 µs through 30 s, plus
   do not create this timer or a series. Use `wasmkeep_batched_waits_total`
   for the reason (`age`, `bytes`, `budget`).
 
+A mailbox can be busy even when guest events occupy little of its time.
+`wasmkeep_mailbox_host_work_seconds` accounts for that time, including
+maintenance jobs that never enter a guest. Its bounded `work` values are:
+
+- `stale_alarm_hint`: clearing a nonempty stale alarm hint, including its
+  barrier wait, fencing, bucket LIST and DELETEs. Compare its rate with
+  `wasmkeep_alarm_stale_hints_total` to distinguish frequent stale deliveries
+  from slow clears. A moved alarm can leave an old index hint to clear later.
+- `complete_uploads`: the resident-only upload completion job's pump/capture.
+- `snapshot_in_gap`: a periodic batched snapshot and its barrier wait.
+- `flush_to_barrier`: a barrier flush outside another named host operation.
+- `hibernate`: the pre-drop step for idle, eviction and shutdown, including
+  time spent in a step interrupted by a newly queued job.
+- `restore`: mailbox state creation, cold ownership acquisition/bucket restore
+  and cold instance preparation before the first event. Failed state creation
+  and waiting for an old state's resources to close are included.
+- `other`: each executed job's remaining wall time after subtracting recorded
+  guest events and named host work. This includes admission/ownership probes,
+  alarm indexing, strict replication, batched event-start boundary work,
+  moves/drains, operator deletes/restores, idle expiry and blob-sweep judgments.
+
+Nested operations belong to the outer named operation: a stale-hint clear's
+flush is not also recorded as `flush_to_barrier`. Initialization guest events
+are subtracted from `restore` and remain guest `kind="other"`. Completed jobs'
+guest and host sums therefore partition their elapsed time; pre-drop steps
+add mailbox occupancy separately. Queue/admission waits, idle time and
+background uploads outside the mailbox are excluded. A host panic's unrecorded
+event time falls into the enclosing host category, or `other` if there is none;
+normal guest traps retain their event timing.
+No actor names are labels, so these are app/class aggregates, not individual
+actor utilization. Observations arrive when each operation finishes; a scrape
+in the middle of a job can temporarily see only part of its attribution.
+
+For the class's occupied mailbox seconds per second, compare:
+
+```promql
+sum by (tenant, app, class, work) (
+  rate(wasmkeep_mailbox_host_work_seconds_sum[5m])
+)
+```
+
+with `sum by (tenant, app, class, kind)
+(rate(wasmkeep_event_duration_seconds_sum[5m]))`. These rates can exceed one
+when several actors in a class run concurrently. Do not add the start-rule
+histogram to them: it overlaps `other` (or a containing host operation).
+
 These are attribution signals, not three additive parts of an individual
 acknowledgement. A boundary hold overlaps the mailbox wait of every event
 queued behind it, and can also run with no event queued. Do not subtract
@@ -373,7 +421,9 @@ an event that gives the hold up.
 
 [`deploy/grafana/wasmkeep.json`](../deploy/grafana/wasmkeep.json) shows
 every metric above except `wasmkeep_classes`, the timing histograms
-`wasmkeep_mailbox_wait_seconds` and `wasmkeep_event_start_rule_wait_seconds`, the guest log counters
+`wasmkeep_mailbox_wait_seconds`, `wasmkeep_event_start_rule_wait_seconds` and
+`wasmkeep_mailbox_host_work_seconds`, the stale-hint counter
+`wasmkeep_alarm_stale_hints_total`, the guest log counters
 (`wasmkeep_guest_log_lines_total`, `wasmkeep_guest_log_dropped_total`),
 the history collection counters (`wasmkeep_history_collected_total`,
 `wasmkeep_history_collect_failures_total`),

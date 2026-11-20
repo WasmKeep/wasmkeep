@@ -334,6 +334,21 @@ async fn a_stale_index_entry_is_removed_when_it_comes_due() {
     }
     let left = alarm_index(&store, <[String]>::is_empty).await;
     assert!(left.is_empty(), "the stale entry is gone: {left:?}");
+    let page = wasmkeep_server::metrics::render(Default::default());
+    assert!(
+        page.lines().any(
+            |l| l.starts_with("wasmkeep_mailbox_host_work_seconds_count{")
+                && l.contains("work=\"stale_alarm_hint\"")
+                && !l.ends_with(" 0")
+        ),
+        "{page}"
+    );
+    assert!(
+        page.lines()
+            .any(|l| l.starts_with("wasmkeep_alarm_stale_hints_total{") && !l.ends_with(" 0")),
+        "{page}"
+    );
+
     let r = send(a.addr, "GET", "/actor/t/x/attempts", "").await;
     assert_eq!(r.body.trim(), "0", "and no handler ran for it");
 }

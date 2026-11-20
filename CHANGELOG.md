@@ -17,6 +17,9 @@ The text under a version's heading is its GitHub release text
   `alarm`, `websocket`, `other`): a query on it without `kind` sums them
   as before. [Monitoring](docs/monitoring.md) says how to read a slow
   answer from them.
+  `wasmkeep_mailbox_host_work_seconds{tenant,app,class,work}` now accounts
+  for host work and jobs without guest events; `wasmkeep_alarm_stale_hints_total`
+  counts stale alarm hint clear attempts per app and class.
 
 - **Parallel change-feed listing.** `wasmkeep feed --list-concurrency N`
   (default 16) lists ordered ranges concurrently after the first poll,

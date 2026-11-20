@@ -61,6 +61,7 @@ pub(super) struct EventLimits {
 
 /// Per-actor state owned by its mailbox task.
 pub(super) struct ActorState {
+    pub(super) timing: Arc<super::timing::Timing>,
     /// Moves under way on this node (ADR 0017), shared with the service:
     /// while one is set for this actor, events go to its target instead of
     /// being run or claimed here, whatever state they find (a stub
@@ -126,6 +127,7 @@ pub(super) type ResidentDb = wasmkeep_runtime::Retained<ActorDb>;
 pub(super) type SharedReplica = Arc<tokio::sync::Mutex<Replica>>;
 
 pub(super) struct Live {
+    timing: Arc<super::timing::Timing>,
     pub(super) store: Store<ActorHost>,
     pub(super) meter: CpuMeter,
     pub(super) core: ActorCore,
@@ -151,7 +153,9 @@ impl Live {
             return;
         };
         let outcome = if failed { "failed" } else { "ok" };
-        crate::metrics::record_event(app, class, kind, outcome, started.elapsed());
+        let elapsed = started.elapsed();
+        self.timing.guest(elapsed);
+        crate::metrics::record_event(app, class, kind, outcome, elapsed);
     }
 }
 
@@ -245,6 +249,7 @@ impl ActorState {
     /// (counted `app_deleted` once a hold can have anything pending).
     pub(super) fn before_drop(&mut self, cause: DropCause) -> BoxFuture<'_, StepOutcome> {
         Box::pin(async move {
+            let _timed = self.timing.work(super::timing::Work::Hibernate);
             self.stepped = false;
             if self.batched_replica().is_none() {
                 return StepOutcome::Ready;
@@ -516,6 +521,7 @@ impl ActorState {
                 until_ms: *until,
             });
         }
+        let _timed = self.timing.work(super::timing::Work::Restore);
         // Whatever ran before may be stale now: close it all. The database
         // is rebuilt from the bucket unless it is already current.
         self.drop_hold(Dropped::Lapse);
@@ -1375,6 +1381,10 @@ impl ActorState {
     /// (`admit`, or `refresh_class` for alarms): never a newer one, whose
     /// rules the event did not check.
     pub(super) async fn prepare(&mut self) -> Result<Result<(), String>, String> {
+        let _timed = self
+            .live
+            .is_none()
+            .then(|| self.timing.work(super::timing::Work::Restore));
         self.stepped = false;
         self.switch_writes().await?;
         if self.live.is_none() {
@@ -1485,6 +1495,7 @@ impl ActorState {
             let core = ActorCore::new(&mut store, &instance).map_err(|e| format!("{e:#}"))?;
             let proxy = Proxy::new(&mut store, &instance).map_err(|e| format!("{e:#}"))?;
             self.live = Some(Live {
+                timing: Arc::clone(&self.timing),
                 store,
                 meter,
                 core,
