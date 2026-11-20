@@ -555,8 +555,10 @@ async fn positions(suffix: &str, tag: &str, count: u64) {
         fuel::assert_class_ceiling("pusher", "alarm", 250_000_000);
     }
 }
-/// Bounded in fuel at half the budget, so it runs in plain runs and CI.
+/// Bounded in fuel at half the budget, but its real 50 ms CPU budget can
+/// still be exceeded on a slow shared runner (seen once in CI).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "speed-sensitive: a slow CI runner's CPU can exceed the real 50 ms budget though fuel is bounded; scripts/check.sh --full runs it"]
 async fn typescript_big_room_distinct_positions_at_default_budget() {
     distinct_positions("").await;
 }

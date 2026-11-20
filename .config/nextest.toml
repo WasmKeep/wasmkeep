@@ -27,7 +27,7 @@ filter = 'binary(cluster) | binary(cluster_over_tls) | binary(revocation) | bina
 test-group = 'cluster'
 
 [[profile.default.overrides]]
-filter = '(binary(big_room) | binary(room_edge)) & test(/default_budget/)'
+filter = '(binary(big_room) | binary(room_edge)) & (test(/default_budget/) | test(/_fuel/))'
 test-group = 'big-room'
 slow-timeout = { period = "60s", terminate-after = 4 }
 

@@ -9,6 +9,11 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- The QuickJS distinct-positions room budget test runs in `check.sh --full`
+  again rather than in CI: its fuel is bounded, but its real 50 ms CPU budget
+  still trapped once on a slow CI runner. The big-room fuel tests get the
+  big-room group's four-minute limit.
+
 - **`describeError` is exported from `@wasmkeep/sdk/front`**, and the big-room
   example's front logs with it: a WIT error now logs its payload instead of
   `Error: [object Object] (see error.payload)`.
