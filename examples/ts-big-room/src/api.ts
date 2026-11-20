@@ -6,7 +6,7 @@ export function api(room: {
   /** The page as JSON bytes, at most `limit` rows. */
   history(after: Position | undefined, limit: number): Uint8Array;
   stats(): unknown;
-}) {
+}, describe: (e: unknown) => string = String) {
   const json = (value: unknown) => ({ status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(value, (_k, v) => typeof v === 'bigint' ? Number(v) : v) });
   const position = (e: string | null, n: string | null): Position | undefined => {
     if (e === null && n === null) return;
@@ -45,7 +45,7 @@ export function api(room: {
       return json(room.publish([{body: `${name}: ${m.text}`, id: `${name}:${m.id}`} ]));
     } catch (e) {
       if (e instanceof Error && e.message === 'invalid position') return {status:400};
-      console.error(String(e));
+      console.error(describe(e));
       return {status:503,headers:{'retry-after':'1'},body:'Room unavailable; retry shortly.'};
     }
   };

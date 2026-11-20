@@ -9,6 +9,10 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **`describeError` is exported from `@wasmkeep/sdk/front`**, and the big-room
+  example's front logs with it: a WIT error now logs its payload instead of
+  `Error: [object Object] (see error.payload)`.
+
 - **A pusher round is bounded in work, not only in bytes.** A round over
   many children lagging at distinct positions read and pushed about 1,000
   rows (the 1 MiB budget at 1 KiB a row), which took about 455 M fuel on

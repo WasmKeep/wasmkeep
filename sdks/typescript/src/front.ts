@@ -87,3 +87,7 @@ export function frontExportsFor(definition: FrontDefinition) {
 
 /** HTTP publish and history helpers for internal rooms. */
 export * as broadcast from "./broadcast-client";
+
+/** A readable description of a thrown value: an `Error`'s name and
+ * message, and a WIT error's payload instead of `[object Object]`. */
+export { describeError } from "./errors";
