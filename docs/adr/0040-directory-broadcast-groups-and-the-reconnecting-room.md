@@ -422,9 +422,12 @@ drains or the edge moved).
    there is a gap. A `ready` with `b` (amended 2026-11-20) first applies
    `b` as rule 2 does when its epoch is `last.e + 1`; it is a gap only
    if its epoch then differs from `last.e` or its `n` is above `last.n`.
-   An older client takes any `n` that differs as a gap, which costs one
-   request. A `pong` with `n: null` is a keepalive only; an older client
-   rejects it as invalid and reconnects.
+   It does not change the connection's state. An older client ignores
+   `b` and takes the `ready` as a gap whenever its `e` or `n` differs from
+   `last`: since the room bumps its epoch when it wakes, that is one
+   request per older client after each wake of the room. A `pong` with
+   `n: null` is a keepalive only; an older client rejects it as invalid
+   and reconnects.
    Hold live frames, `GET <front>/history?after=<e>.<n>` until `more` is
    false, apply `lost` and `reset` as answered (`onReset`: the app
    reloads what it shows by its own means), then apply the held frames

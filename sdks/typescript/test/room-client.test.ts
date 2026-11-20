@@ -435,3 +435,19 @@ test("a pong with no head is a keepalive only", async () => {
         assert(error instanceof Error && /invalid/.test(error.message));
     }
 });
+test("a woken edge's announcement on an open connection is not a new ready", async () => {
+    const clock = new FakeClock(), ws = new FakeSocket(), states: string[] = [], urls: string[] = [];
+    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", clock, random: () => .5, socket: () => ws, onState: s => { states.push(s); },
+        fetch: (async (url: string) => { urls.push(url); return new Response(JSON.stringify({ head: { e: 1, n: 2 }, messages: [], more: false })); }) as typeof fetch });
+    c.connect();
+    ws.onopen?.();
+    ws.frame({ t: "ready", e: 1, n: 2 });
+    await settle();
+    ws.frame({ t: "ready", e: 1, b: 0, n: 2 });
+    ws.frame({ t: "pong", e: 0, n: null });
+    await settle();
+    assert.deepEqual(states, ["connecting", "ready"]);
+    assert.deepEqual(urls, []);
+    assert(!ws.closed);
+    c.close();
+});

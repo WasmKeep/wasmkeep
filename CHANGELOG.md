@@ -20,9 +20,10 @@ The text under a version's heading is its GitHub release text
   `{"t":"pong","e":0,"n":null}`. `RoomClient` fetches history after such a
   `ready` only when its position is past the client's own, applying `b`
   as for a frame of the next epoch, and takes a `pong` with no head as a
-  keepalive. An older client fetches whenever the announced `n` differs
-  from its own (one request), and rejects a headless `pong` and
-  reconnects. Shared Rust/TypeScript vectors (`wake-vectors.txt`) cover
+  keepalive; neither changes its state from `ready`. An older client
+  fetches whenever the announced `e` or `n` differs from its own, which
+  after a wake of the room (it bumps the epoch) is one request each, and
+  rejects a headless `pong` and reconnects. Shared Rust/TypeScript vectors (`wake-vectors.txt`) cover
   the wake.
 
 - The QuickJS distinct-positions room budget test runs in `check.sh --full`

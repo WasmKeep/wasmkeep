@@ -345,7 +345,9 @@ export class RoomClient {
                     const frame = JSON.parse(event.data) as Frame;
                     validateFrame(frame);
                     const work = this.receiver.receive(frame);
-                    if (frame.t === "ready") {
+                    // A `ready` with `b` is a woken edge's announcement on
+                    // this connection, not a new one.
+                    if (frame.t === "ready" && frame.b === undefined) {
                         this.options.onState?.("ready");
                         this.cancel(this.stable);
                         // Rule 5: `k` returns to 0 once the connection has
