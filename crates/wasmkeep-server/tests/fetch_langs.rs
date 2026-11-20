@@ -11,14 +11,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_server::{ActorConfig, ActorService, EgressPolicy};
 
@@ -298,27 +298,37 @@ async fn fetch_from_guest(addr: SocketAddr, url: &str, send: usize) -> String {
     body.strip_suffix('\n').unwrap_or(body).to_owned()
 }
 
-/// An address where connections are refused, and the socket that keeps it
-/// so: bound, so no other server can take the port, but never listening, so
-/// a connection is refused rather than queued. (Binding a listener and
-/// dropping it frees the port for the next server that asks for one.)
-fn refusing() -> (TcpSocket, SocketAddr) {
-    let socket = TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = socket.local_addr().unwrap();
-    (socket, addr)
-}
+/// An address where connections are refused, on every platform: a port no
+/// server is handed. Every test server binds port 0, and the kernel hands
+/// out only ports of its ephemeral range (32768 and up on Linux, 49152 and
+/// up on macOS), so nothing at all is bound to loopback port 2, and a
+/// connection there is refused at once. Port 2 is not one of the Fetch
+/// standard's bad ports, so egress lets the request through to be refused.
+///
+/// Not a port held by a socket bound but never listening: Linux refuses a
+/// connection to it, but macOS drops the attempt and it times out. Nor a
+/// listener bound and dropped: that frees its port for the next server
+/// that asks for one, in this or another test process.
+const REFUSING: SocketAddr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 2));
 
 #[tokio::test]
 async fn a_refusing_address_stays_refused_while_other_servers_start() {
-    let (_keep, addr) = refusing();
-    // Another test's server, in this or another process, may be handed any
-    // free port; tokio binds with SO_REUSEADDR.
-    if let Ok(other) = TcpListener::bind(addr).await {
-        tokio::spawn(async move { while other.accept().await.is_ok() {} });
+    assert!(EgressPolicy::default().permits_port(REFUSING.port()));
+    // Servers starting, as other tests start theirs: none is handed it.
+    let mut others = Vec::new();
+    for _ in 0..256 {
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert_ne!(other.local_addr().unwrap().port(), REFUSING.port());
+        others.push(other);
     }
-    let err = TcpStream::connect(addr).await.unwrap_err();
+    let started = Instant::now();
+    let err = TcpStream::connect(REFUSING).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "refused at once, not timed out: {:?}",
+        started.elapsed()
+    );
 }
 
 /// The answers to the same requests, as one guest gives them.
@@ -327,16 +337,22 @@ async fn answers(wasm: &[u8]) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     let local = EgressPolicy::allowing(vec!["127.0.0.1".parse().unwrap()]);
     let addr = start(dir.path(), wasm, local).await;
-    let (_closed, closed) = refusing();
     let mut out = vec![
         fetch_from_guest(addr, &format!("http://{server}/ok"), 0).await,
         fetch_from_guest(addr, &format!("http://{server}/echo"), 5000).await,
         fetch_from_guest(addr, &format!("http://{server}/big"), 0).await,
         fetch_from_guest(addr, &format!("http://{server}/short"), 0).await,
-        // Nothing listens there.
-        fetch_from_guest(addr, &format!("http://{closed}/ok"), 0).await,
-        fetch_from_guest(addr, "ftp://example.com/", 0).await,
     ];
+    // Nothing listens there: refused, well before the connect timeout.
+    let started = Instant::now();
+    out.push(fetch_from_guest(addr, &format!("http://{REFUSING}/ok"), 0).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "refused, not timed out: {:?} {:?}",
+        started.elapsed(),
+        out[4]
+    );
+    out.push(fetch_from_guest(addr, "ftp://example.com/", 0).await);
     // Loopback is not public: refused by the default egress rules.
     let dir = tempfile::tempdir().unwrap();
     let strict = start(dir.path(), wasm, EgressPolicy::default()).await;
@@ -383,7 +399,7 @@ async fn check_batches(lang: &str, wasm: &[u8]) {
     let dir = tempfile::tempdir().unwrap();
     let local = EgressPolicy::allowing(vec!["127.0.0.1".parse().unwrap()]);
     let addr = start(dir.path(), wasm, local).await;
-    let (_closed, closed) = refusing();
+    let closed = REFUSING;
     let batch = vec![
         (0, format!("http://{server}/ok")),
         (5000, format!("http://{server}/echo")),
