@@ -158,6 +158,12 @@ export function serve(core: Core, op: string, body: Uint8Array, caller: string, 
             w.bytes(raw[i].body);
         });
     }
+    else if (op === "history-json") {
+        // The browser's page, JSON the front forwards unread (ADR 0040, section 3).
+        const after = flag(r) ? position(r) : undefined, limit = count(r, 2000);
+        end(r);
+        return core.pageJSON(after, limit);
+    }
     else
         throw Error("invalid room operation");
     return w.finish();

@@ -44,7 +44,10 @@ the room actor can run out of guest memory when its node is short of CPU
 
 The front accepts `GET /join`, `POST /publish`, `GET /history` and `GET /stats`,
 with `?name=<chosen name>`. Publish takes `{ "text": "hello", "id": "retry-id" }`;
-history accepts `after=<epoch>.<number>`. Stats reports the head (from the room)
+history accepts `after=<epoch>.<number>` and `limit` (1 to 256, the default),
+and answers the JSON the room renders, at most 256 messages and about 64 KiB
+of bodies a page; the browser client halves `limit` after a 5xx and keeps its
+socket. Stats reports the head (from the room)
 and persisted edge/relay counts (from the pusher); it does not claim to expose
 the full ADR's runtime metrics.
 The browser counters show delivered messages, repeated items discarded,

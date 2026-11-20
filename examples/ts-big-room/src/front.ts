@@ -5,10 +5,10 @@ const room = new broadcast.Client('room/lobby');
 const handle = api({
   join: (name, after) => broadcast.join('room/lobby', 'directory/bg:lobby', name, after),
   publish: messages => room.publish(messages),
-  // 256 messages a page: a front on QuickJS converts each page in the guest
-  // (no native UTF-8), so smaller pages keep it well inside its CPU budget;
-  // the client asks again while `more`.
-  history: after => broadcast.historyJSON(room.history(after, 256)),
+  // The room renders the page's JSON (at most 256 messages and about
+  // 64 KiB of bodies); the front forwards it unread, so its cost does not
+  // grow with the page. The client asks again while `more`.
+  history: (after, limit) => room.historyJSON(after, limit),
   stats: () => ({ head: broadcast.historyJSON(room.history()).head,
     ...JSON.parse(actors.call('pusher/lobby', {path:'/stats'}).text()) }),
 });

@@ -230,6 +230,17 @@ pub(super) fn serve<S: Store>(
                 w.bytes(m.body.as_bytes());
             }
         }
+        // The browser's page, JSON the front forwards unread (ADR 0040, section 3).
+        "history-json" => {
+            let after = if optional(&mut r)? {
+                Some(position(&mut r)?)
+            } else {
+                None
+            };
+            let limit = count(&mut r, 2000)?;
+            end(&r)?;
+            return core.history_json(after, limit);
+        }
         _ => return Err(bad()),
     }
     Ok(w.finish())
@@ -430,6 +441,20 @@ impl Client {
             more,
             messages,
         })
+    }
+    /// The browser's history page as JSON bytes, for a front to answer
+    /// unread: the room renders it (what the TypeScript SDK's
+    /// `JSON.stringify(historyJSON(...))` makes, byte for byte), at most
+    /// 256 rows and about 64 KiB of bodies, at least one row, `more` when
+    /// cut. A room of an earlier release answers 400.
+    pub fn history_json(&self, after: Option<Position>, limit: usize) -> Result<Vec<u8>, String> {
+        let mut w = Writer::default();
+        w.u64(u64::from(after.is_some()));
+        if let Some(p) = after {
+            put(&mut w, p);
+        }
+        w.u64(limit as u64);
+        self.call("history-json", w.finish())
     }
 }
 #[cfg(feature = "actor")]

@@ -120,3 +120,76 @@ test("four retained 64-KiB messages recover across pages after 64 cold wakes", a
     assert.deepEqual(receiver.last, { e: 65, n: 4 });
     db.close();
 });
+/** Every code point class JSON escapes differently, as bodies and ids. */
+const tricky = (): string[] => {
+    const out: string[] = [];
+    for (let c = 0; c < 0x100; c += 16)
+        out.push(Array.from({ length: 16 }, (_, i) => String.fromCharCode(c + i)).join(""));
+    out.push('"\\/', "  ", "﻿body", "\u{1F600}\u{10FFFF}", "€".repeat(100), "");
+    return out;
+};
+const browserPage = (r: Core, after?: { e: bigint; n: bigint }, limit = 256) => JSON.stringify(historyJSON(r.history(after, limit)));
+test("history-json is the browser's JSON byte for byte: escapes, ids, lost and reset", () => {
+    db.install(":memory:");
+    let r = room();
+    r.init();
+    const bodies = tricky();
+    r.publish(bodies.map((body, i) => ({ body, id: i % 3 && body ? body.slice(0, 16) : undefined })), 1700000000000n);
+    const dec = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    for (const after of [undefined, { e: 1n, n: 0n }, { e: 1n, n: 5n }])
+        assert.equal(dec.decode(r.pageJSON(after)), browserPage(r, after));
+    // A crash voids numbers (lost), then the window moves past the cursor (reset).
+    db.exec("DELETE FROM wasmkeep_room_history WHERE n > 20", []);
+    r = room();
+    r.publish([{ body: "after the crash" }], 1n);
+    const lost = dec.decode(r.pageJSON({ e: 1n, n: 22n }));
+    assert(lost.includes('"lost":{"e":2,"base":20}'), lost);
+    assert.equal(lost, browserPage(r, { e: 1n, n: 22n }));
+    for (let i = 0; i < 2000; i++)
+        r.publish([{ body: "x" }], 2n);
+    const reset = dec.decode(r.pageJSON({ e: 1n, n: 1n }));
+    assert(reset.includes('"reset":'), reset.slice(0, 200));
+    assert.equal(reset, browserPage(r, { e: 1n, n: 1n }));
+    // The head only: no position.
+    assert.equal(dec.decode(r.pageJSON()), browserPage(r));
+    db.close();
+});
+test("history-json pages: 256 rows, 64 KiB of bodies, at least one row, then more", () => {
+    db.install(":memory:");
+    const r = room();
+    r.init();
+    for (let i = 0; i < 300; i++)
+        r.publish([{ body: "y".repeat(193) }], 0n);
+    const page = (after: bigint, limit = 256) => JSON.parse(new TextDecoder().decode(r.pageJSON({ e: 1n, n: after }, limit)));
+    let p = page(0n);
+    assert.equal(p.messages.length, 256);
+    assert.equal(p.more, true);
+    assert.equal(page(0n, 2000).messages.length, 256, "at most 256 rows whatever the limit");
+    assert.equal(page(0n, 32).messages.length, 32);
+    p = page(256n);
+    assert.equal(p.messages.length, 44);
+    assert.equal(p.more, false);
+    // 4 KiB bodies: 16 fit in 64 KiB.
+    r.publish(Array.from({ length: 40 }, () => ({ body: "z".repeat(4096) })), 0n);
+    p = page(300n);
+    assert.equal(p.messages.length, 16);
+    assert.equal(p.more, true);
+    // A body of 64 KiB, then one with an id: one row each, at least.
+    r.publish([{ body: "w".repeat(65536) }], 0n);
+    r.publish([{ body: "v".repeat(65536), id: "big" }], 0n);
+    p = page(340n);
+    assert.deepEqual([p.messages.length, p.more, p.messages[0].body.length], [1, true, 65536]);
+    p = page(341n);
+    assert.deepEqual([p.messages.length, p.more, p.messages[0].id], [1, false, "big"]);
+    assert.throws(() => r.pageJSON({ e: 1n, n: 0n }, 0));
+    db.close();
+});
+test("history-json refuses a number a browser cannot read exactly", () => {
+    db.install(":memory:");
+    const r = room();
+    r.init();
+    r.publish([{ body: "late" }], 9007199254740992n);
+    assert.throws(() => r.pageJSON({ e: 1n, n: 0n }), (e: unknown) => /invalid browser integer/.test(String(e)));
+    assert.throws(() => historyJSON(r.history({ e: 1n, n: 0n })), (e: unknown) => /invalid browser integer/.test(String(e)));
+    db.close();
+});

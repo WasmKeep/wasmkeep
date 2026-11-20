@@ -344,7 +344,11 @@ requests to the client's `publish` and `history` methods. The internal
 `/wasmkeep-room/v1/` protocol uses the SDK's binary framing; positions retain
 all 63 SQLite integer bits. History returns `lost`, `reset`, `more`, the head,
 and messages with their individual positions. Continue a paginated read from
-the last returned message's position.
+the last returned message's position. For a browser, `Client::history_json`
+answers the page as the browser's JSON, rendered by the room in SQLite (the
+same bytes as the TypeScript front's `JSON.stringify(historyJSON(...))`),
+for the front to return unread: at most 256 messages and about 64 KiB of
+bodies, at least one message, `more` when cut.
 
 Deploy the room with batched writes. The first operation after each cold
 start, including history, records one durable epoch boundary so a reconnect

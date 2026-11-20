@@ -161,14 +161,16 @@ async fn node(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<(), wasmkeep_server::Error>>,
 )> {
-    node_with(suffix, data, None).await
+    node_with(suffix, data, None, None).await
 }
 
-/// [`node`], with another component as the edge class.
+/// [`node`], with another component as the edge class, and another CPU
+/// budget for the front.
 async fn node_with(
     suffix: &str,
     data: &std::path::Path,
     edge: Option<PathBuf>,
+    front_budget: Option<Duration>,
 ) -> Option<(
     std::net::SocketAddr,
     tokio::sync::oneshot::Sender<()>,
@@ -197,11 +199,14 @@ async fn node_with(
     };
     assert_eq!(config.cpu_budget, Duration::from_millis(50));
     let rt = Runtime::new(&config).unwrap();
-    let front = HttpComponent::new(
+    let mut front = HttpComponent::new(
         rt.clone(),
         &guests::compile(&rt, &std::fs::read(&paths[0]).unwrap()),
     )
     .unwrap();
+    if let Some(budget) = front_budget {
+        front = front.with_cpu_budget(budget);
+    }
     let mut cfg = ActorConfig::new(data);
     let mut classes = vec![];
     for (class, path) in ["room", "pusher", "edge", "relay", "directory"]
@@ -236,9 +241,29 @@ async fn http(addr: std::net::SocketAddr, method: &str, path: &str, body: &str) 
     );
     let mut s = TcpStream::connect(addr).await.unwrap();
     s.write_all(raw.as_bytes()).await.unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).await.unwrap();
-    out
+    let mut out = vec![];
+    s.read_to_end(&mut out).await.unwrap();
+    // A chunked body is joined first: a chunk may end inside a character.
+    let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8(out[..at].to_vec()).unwrap();
+    let mut body = out[at..].to_vec();
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        let (mut joined, mut rest) = (vec![], &body[..]);
+        loop {
+            let end = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&rest[..end]).unwrap(), 16).unwrap();
+            if n == 0 {
+                break;
+            }
+            joined.extend_from_slice(&rest[end + 2..end + 2 + n]);
+            rest = &rest[end + 4 + n..];
+        }
+        body = joined;
+    }
+    head + &String::from_utf8(body).unwrap()
 }
 
 /// `(e, n)` of a publish answer, or the whole answer if it is not a 200.
@@ -483,7 +508,7 @@ async fn distinct_positions(suffix: &str) {
     let stub = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(format!("tests/guests/ts-fetch/stub_edge{suffix}.wasm"));
     let data = tempfile::tempdir().unwrap();
-    let Some((addr, stop, server)) = node_with(suffix, data.path(), Some(stub.clone())).await
+    let Some((addr, stop, server)) = node_with(suffix, data.path(), Some(stub.clone()), None).await
     else {
         return;
     };
@@ -501,7 +526,9 @@ async fn distinct_positions(suffix: &str) {
     let _ = stop.send(());
     server.await.unwrap().unwrap();
     seed_edges(data.path(), 256, "s");
-    let (addr, stop, server) = node_with(suffix, data.path(), Some(stub)).await.unwrap();
+    let (addr, stop, server) = node_with(suffix, data.path(), Some(stub), None)
+        .await
+        .unwrap();
     assert_eq!(publish(addr, "cold", "x").await.unwrap(), (2, 2001));
     // About a hundred rounds over 256 lagging children.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -521,4 +548,124 @@ async fn typescript_big_room_distinct_positions_at_default_budget() {
 #[ignore = "0.6.0 known limit: on a starved CPU the StarlingMonkey room runs out of guest memory (CHANGELOG); run with --run-ignored on two free cores"]
 async fn typescript_big_room_distinct_positions_at_default_budget_starlingmonkey() {
     distinct_positions("-starlingmonkey").await;
+}
+
+/// The front's fuel so far: the sum and count of `wasmkeep_front_fuel`.
+fn front_fuel() -> (u64, u64) {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    let total = |name: &str| {
+        page.lines()
+            .filter(|l| l.starts_with(name))
+            .map(|l| l.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap() as u64)
+            .sum::<u64>()
+    };
+    (
+        total("wasmkeep_front_fuel_sum{"),
+        total("wasmkeep_front_fuel_count{"),
+    )
+}
+
+/// One front request and the fuel it took: the front records its fuel once
+/// its instance ends, which may come just after the answer's last byte.
+async fn measured(addr: std::net::SocketAddr, path: &str) -> (String, u64) {
+    let (sum, count) = front_fuel();
+    let out = http(addr, "GET", path, "").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (after, n) = front_fuel();
+        if n > count {
+            assert_eq!(n, count + 1, "one front request at a time");
+            return (out, after - sum);
+        }
+        assert!(std::time::Instant::now() < deadline, "no front fuel sample");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Every page of the window, from its start, while `more`: the pages'
+/// rows and the most fuel one request took.
+async fn walk(addr: std::net::SocketAddr) -> (Vec<usize>, u64) {
+    let (mut rows, mut most) = (vec![], 0);
+    let mut after = "1.0".to_owned();
+    loop {
+        let (out, fuel) = measured(addr, &format!("/history?name=alice&after={after}")).await;
+        assert!(
+            out.starts_with("HTTP/1.1 200"),
+            "{}",
+            &out[..out.len().min(300)]
+        );
+        let page: serde_json::Value =
+            serde_json::from_str(out.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let messages = page["messages"].as_array().unwrap();
+        eprintln!("history page: {} rows, {fuel} fuel", messages.len());
+        rows.push(messages.len());
+        most = most.max(fuel);
+        if !page["more"].as_bool().unwrap() {
+            return (rows, most);
+        }
+        let last = &messages.last().unwrap()["position"];
+        after = format!("{}.{}", last["e"], last["n"]);
+    }
+}
+
+/// Publishes `count` messages of `text` under ids `<tag><i>`, 8 at a time.
+async fn fill(addr: std::net::SocketAddr, tag: &str, count: u64, text: &str) {
+    for batch in 0..count / 8 {
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let (id, text) = (format!("{tag}{}", batch * 8 + i), text.to_owned());
+            tasks.push(tokio::spawn(async move { publish(addr, &id, &text).await }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap().unwrap().0, 1, "a room event trapped");
+        }
+    }
+}
+
+/// A front's history request forwards the page the room rendered: its fuel
+/// does not grow with the page. A full window of 2,000 small messages,
+/// then one of 2,000 messages and about 8 MiB, every page walked. The front
+/// gets a long CPU budget so that a costly page is measured rather than cut
+/// at 50 ms; the room keeps the default.
+async fn history_fuel(suffix: &str) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wasmkeep=info")
+        .with_test_writer()
+        .try_init();
+    let data = tempfile::tempdir().unwrap();
+    let Some((addr, stop, server)) =
+        node_with(suffix, data.path(), None, Some(Duration::from_secs(10))).await
+    else {
+        return;
+    };
+    // 200-byte bodies ("alice: " and 193 more), as a load test sends.
+    fill(addr, "s", 2000, &"y".repeat(193)).await;
+    let (rows, small) = walk(addr).await;
+    assert_eq!(rows.iter().sum::<usize>(), 2000, "{rows:?}");
+    assert_eq!(rows[0], 256, "{rows:?}");
+    // 4,193-byte bodies (2,000 characters, 1,093 of them 3 bytes long, and
+    // quotes to escape): 2,000 of them are just under 8 MiB, the window.
+    let text = format!("{}{}z", "\u{20ac}".repeat(1093), "z\"".repeat(453));
+    assert_eq!(text.chars().count(), 2000);
+    fill(addr, "b", 2000, &text).await;
+    let (rows, big) = walk(addr).await;
+    assert_eq!(rows.iter().sum::<usize>(), 2000, "{rows:?}");
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    eprintln!("most front fuel per history page: {small} (200 B), {big} (4 KiB)");
+    for (what, fuel) in [("200-byte", small), ("4 KiB", big)] {
+        assert!(
+            fuel < 100_000_000,
+            "a front history page of {what} messages took {fuel} fuel"
+        );
+    }
+    fuel::assert_ceiling(500_000_000);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typescript_big_room_history_page_fuel() {
+    history_fuel("").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typescript_big_room_history_page_fuel_starlingmonkey() {
+    history_fuel("-starlingmonkey").await;
 }

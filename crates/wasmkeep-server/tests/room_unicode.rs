@@ -14,26 +14,27 @@ async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
     s.write_all(format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes())
         .await
         .unwrap();
-    let mut raw = String::new();
-    s.read_to_string(&mut raw).await.unwrap();
-    let (h, b) = raw.split_once("\r\n\r\n").unwrap();
+    let mut raw = vec![];
+    s.read_to_end(&mut raw).await.unwrap();
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let h = String::from_utf8(raw[..at].to_vec()).unwrap();
     let status = h.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let mut body = String::new();
+    let mut body = raw[at + 4..].to_vec();
+    // Joined before decoding: a chunk may end inside a character.
     if h.to_lowercase().contains("transfer-encoding: chunked") {
-        let mut rest = b;
+        let (mut joined, mut rest) = (vec![], &body[..]);
         loop {
-            let (n, tail) = rest.split_once("\r\n").unwrap();
-            let n = usize::from_str_radix(n, 16).unwrap();
+            let end = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&rest[..end]).unwrap(), 16).unwrap();
             if n == 0 {
                 break;
             }
-            body.push_str(&tail[..n]);
-            rest = &tail[n + 2..];
+            joined.extend_from_slice(&rest[end + 2..end + 2 + n]);
+            rest = &rest[end + 4 + n..];
         }
-    } else {
-        body = b.into();
+        body = joined;
     }
-    (status, body)
+    (status, String::from_utf8(body).unwrap())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -91,6 +92,18 @@ async fn unicode_through_typescript_front_and_both_rooms() {
         assert_eq!(history["messages"][0]["id"], "x");
         assert_eq!(history["messages"][1]["id"], "\u{feff}x");
         assert_eq!(history["messages"][1]["body"], "\u{feff}body");
+        // The room's own JSON is what the front made of the binary page,
+        // byte for byte, whatever the text holds.
+        let (_, converted) = get(addr, "/history-old").await;
+        assert_eq!(body, converted);
+        let (status, out) = get(addr, "/publish-tricky").await;
+        assert_eq!(status, 200, "{out}");
+        let (status, body) = get(addr, "/history").await;
+        assert_eq!(status, 200, "{body}");
+        let (_, converted) = get(addr, "/history-old").await;
+        assert_eq!(body, converted);
+        assert!(body.contains(r#""body":"\u0000\u0001"#), "{body}");
+        assert!(body.contains("\u{2028}\u{2029}") && body.contains("\u{1f600}"));
         let _ = stop.send(());
         server.await.unwrap().unwrap();
     }

@@ -59,7 +59,7 @@ test("Rust room wire vectors preserve distinct BOM IDs and body through TypeScri
             poked++;
             return { status: 200, headers: [], body: new Uint8Array() };
         }
-        const i = req.path.endsWith("publish") ? 0 : 2;
+        const i = req.path.endsWith("publish") ? 0 : req.path.endsWith("history-json") ? 4 : 2;
         assert.deepEqual(req.body, vectors[i]);
         return { status: 200, headers: [], body: vectors[i + 1] };
     });
@@ -68,4 +68,29 @@ test("Rust room wire vectors preserve distinct BOM IDs and body through TypeScri
     assert.equal(poked, 1);
     const h = historyJSON(c.history({ e: 1n, n: 0n }));
     assert.deepEqual(h.messages.map(m => [m.id, m.body]), [["x", "plain"], ["\uFEFFx", "\uFEFFbody"]]);
+    // The room's own JSON is what this front made of the binary page, byte for byte.
+    const json = c.historyJSON({ e: 1n, n: 0n });
+    assert.deepEqual(json, vectors[5]);
+    assert.deepEqual(json, new TextEncoder().encode(JSON.stringify(h)));
+});
+import { JSON_PAGE } from "../src/broadcast-core";
+test("the TypeScript and Rust rooms render history-json with one statement", () => {
+    const rust = readFileSync("../../crates/wasmkeep-sdk/src/broadcast/core.rs", "utf8");
+    assert(rust.includes(`const JSON_PAGE: &str = r#"${JSON_PAGE}"#;`));
+});
+test("history-json falls back to the binary page on a room without it", () => {
+    const vectors = readFileSync("../../crates/wasmkeep-sdk/src/broadcast/unicode-vectors.txt", "utf8").trim().split("\n").map(s => Uint8Array.from(s.match(/../g)!, h => parseInt(h, 16)));
+    for (const old of ["invalid room operation", "invalid room protocol"]) {
+        const paths: string[] = [];
+        host((_address, req) => {
+            paths.push(req.path);
+            if (req.path.endsWith("history-json"))
+                return { status: 400, headers: [], body: new TextEncoder().encode(old) };
+            return { status: 200, headers: [], body: vectors[3] };
+        });
+        assert.deepEqual(new Client("room/old").historyJSON({ e: 1n, n: 0n }), vectors[5]);
+        assert.deepEqual(paths, ["/wasmkeep-room/v1/history-json", "/wasmkeep-room/v1/history"]);
+    }
+    host(() => ({ status: 400, headers: [], body: new TextEncoder().encode("invalid position") }));
+    assert.throws(() => new Client("room/old").historyJSON({ e: 9n, n: 0n }));
 });
