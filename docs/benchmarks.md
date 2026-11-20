@@ -1041,7 +1041,7 @@ and
   [ADR 0034](adr/0034-batched-plain-writes.md), section 3): with `r` the
   durable write's median, 63.5 ms (one PUT), that is about 127 ms of
   writes, **about 8 per kill**. With a stalled bucket it may lose up to
-  `--max-unsent-age` (500 ms by default) plus one event: **about 31 per
+  `--max-unsent-age` (500 ms by default) plus two events: **about 31 per
   kill**. 14.3 is inside the second and almost twice the first, so on
   average these kills lost more than a healthy bucket explains; what held
   the uploads back is not measured here. The count is over all actors and

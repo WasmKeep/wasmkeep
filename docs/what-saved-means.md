@@ -251,7 +251,7 @@ What each call means in a batched class:
   out again. A node's death loses the segment in flight plus the
   commits not yet captured: about two upload round trips plus one event
   with a healthy bucket, up to `--max-unsent-age` (500 ms by default) plus
-  one event after a bucket stalls. In the soak's 2 h and 39 kills, 785 of
+  two events after a bucket stalls. In the soak's 2 h and 39 kills, 785 of
   1,237,008 acknowledged plain writes were lost in aggregate (evidence, not
   a proof of that bound), and no durable write
   ([strict](../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-strict-57b76c2.csv) and [batched](../bench/results/2026-11-16-57b76c2-soak-ovh-bhs-3vps-2h-batched-57b76c2-batched.csv)). `--max-unsent-age` is

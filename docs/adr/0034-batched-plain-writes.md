@@ -367,7 +367,11 @@ trip at the time and `e` the longest event:
   (section 4);
 - at worst, under a bucket that stalls, the writes committed from
   about `r` before the stall began (the segment then in flight) to
-  `--max-unsent-age + e` after it, since no event starts after that;
+  `--max-unsent-age + 2e` after it: rule 1 counts from the oldest
+  uncaptured commit, and one event can run between the stalled
+  segment's capture and that commit, so no event starts after
+  `--max-unsent-age + e` from it (amended 2026-11-20, from the batched
+  model's back-to-back workload);
 - in bytes, at most one segment in flight (the cap, or one event larger
   than it, which its actor waits for) plus the cap and one event
   uncaptured.
@@ -986,7 +990,7 @@ a measurement of it.
 | Room of 1,000 sockets | 326 to 327 a second on moto, measured | the broadcast is the limit: without a bucket it fell behind at 1,000 a second (measured), so no better than that |
 | App-level batching, 1,000 msg/s into 1,000 sockets | 36 ms p50, 66 ms p99, measured (`batch-` mode) | not needed for throughput; still for one frame per socket per batch |
 | Plain write's answer | after the commit | unchanged |
-| Lost at a node's death, per busy actor | the one event uploading | about the last one or two round trips of writes; `2r + e` with long events; at worst `--max-unsent-age` plus one event and one round trip of them (section 3), derived |
+| Lost at a node's death, per busy actor | the one event uploading | about the last one or two round trips of writes; `2r + e` with long events; at worst `--max-unsent-age` plus two events and one round trip of them (section 3), derived |
 | Replayed after the last snapshot | 64 segments of one event each | 64 segments, or 64 MiB, whichever comes first |
 | A strict class | | as 0.4.2 but for the three exceptions of section 1 |
 

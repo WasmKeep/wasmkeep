@@ -310,7 +310,7 @@ Each actor's database follows it from node to node (ADR 0007):
   the default) the upload follows behind the actor's next
   events, one segment in flight at a time, and a node's death loses the
   segment in flight and what was committed behind it: about two upload round trips plus one event with a healthy bucket,
-  up to `--max-unsent-age` (500 ms by default) plus one event after a
+  up to `--max-unsent-age` (500 ms by default) plus two events after a
   bucket stalls; durable writes are never lost
   ([measured](failover-and-scaling.md#what-callers-get-meanwhile)). A drain, a move, a hibernation, parking
   and a clean stop flush first and lose nothing with a healthy bucket. A

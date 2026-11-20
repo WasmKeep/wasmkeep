@@ -262,7 +262,7 @@ Each actor owns one SQLite database. Nothing else can read or write it.
   trip ([ADR 0034](adr/0034-batched-plain-writes.md)). It loses more when
   its node dies: the segment in flight and the commits not yet uploaded (about two
   upload round trips plus one event with a healthy bucket, up to
-  `--max-unsent-age` plus one event after a stall), never a durable write
+  `--max-unsent-age` plus two events after a stall), never a durable write
   ([measured](failover-and-scaling.md#what-callers-get-meanwhile)); later events may have read and answered from them.
   `exec-durable` and `flush` keep their guarantee and cost up to one more
   round trip; their `internal` starting `not durable: still uploading`
