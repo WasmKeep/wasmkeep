@@ -296,6 +296,9 @@ pub(crate) struct Metrics {
     pub(crate) mailbox_wait_seconds: Family<Histogram>,
     pub(crate) mailbox_host_work_seconds: Family<Histogram>,
     pub(crate) alarm_stale_hints: Family<AtomicU64>,
+    /// Alarm deliveries an actor's mailbox ran, by class and outcome
+    /// (`ran`, `stale`, `deferred`), with tenant and app.
+    pub(crate) alarm_deliveries: Family<AtomicU64>,
     /// Batched event boundaries gating the next guest event, by class.
     pub(crate) event_start_rule_wait_seconds: Family<Histogram>,
     /// Events stopped by the host, by reason (`wall`, `lease`, `replica`).
@@ -354,6 +357,9 @@ pub(crate) struct Metrics {
     pub(crate) releases_after_lapse: AtomicU64,
     /// Alarm deliveries rescheduled after mailbox capacity or queue refusal.
     pub(crate) alarm_admission_retries: AtomicU64,
+    /// Alarm deliveries the mailbox dropped (the actor failed to start, or
+    /// the event stopped before answering), rescheduled with backoff.
+    pub(crate) alarm_dropped_deliveries: AtomicU64,
     /// Requests to the bucket, by operation (`get`, `head`, `put`, `delete`,
     /// `list`, `copy`, `rename`, `multipart`) and status (`ok`,
     /// `not_found`, `precondition`, `error`).
@@ -1139,6 +1145,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "Stale alarm hint clear attempts, by tenant, app and class.",
         &m.alarm_stale_hints,
     );
+    family(
+        &mut out,
+        "wasmkeep_alarm_deliveries_total",
+        "Alarm deliveries run in actor mailboxes, by tenant, app, class and outcome (ran, stale, deferred).",
+        &m.alarm_deliveries,
+    );
     for (name, help, durations) in [
         (
             "wasmkeep_mailbox_host_work_seconds",
@@ -1286,6 +1298,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "wasmkeep_alarm_admission_retries_total",
         "Alarm deliveries rescheduled after mailbox admission refusal.",
         m.alarm_admission_retries.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_alarm_dropped_deliveries_total",
+        "Alarm deliveries the mailbox dropped before they answered, rescheduled with backoff.",
+        m.alarm_dropped_deliveries.load(Ordering::Relaxed),
     );
     family(
         &mut out,

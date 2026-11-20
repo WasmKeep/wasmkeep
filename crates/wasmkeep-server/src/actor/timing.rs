@@ -28,9 +28,25 @@ const NAMES: [&str; 7] = [
     "other",
 ];
 
+/// How an alarm delivery the mailbox ran ended
+/// (`wasmkeep_alarm_deliveries_total`).
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(super) enum Delivered {
+    /// `on-alarm` ran for the committed alarm.
+    Ran,
+    /// Its hint no longer matched the committed alarm: a stale hint.
+    Stale,
+    /// Not run now: another owner, a hand-off, the bucket, a missing
+    /// value, an actor not ready, no state, a class no longer served.
+    Deferred,
+}
+const DELIVERED: [&str; 3] = ["ran", "stale", "deferred"];
+
 pub(super) struct Timing {
     histograms: [Arc<Histogram>; 7],
     stale_hints: Arc<AtomicU64>,
+    deliveries: [Arc<AtomicU64>; 3],
     guest: AtomicU64,
     host: AtomicU64,
     depth: AtomicUsize,
@@ -44,6 +60,11 @@ impl Timing {
                     .get_in(app, &[("class", class), ("work", work)])
             }),
             stale_hints: METRICS.alarm_stale_hints.get_in(app, &[("class", class)]),
+            deliveries: DELIVERED.map(|outcome| {
+                METRICS
+                    .alarm_deliveries
+                    .get_in(app, &[("class", class), ("outcome", outcome)])
+            }),
             guest: AtomicU64::new(0),
             host: AtomicU64::new(0),
             depth: AtomicUsize::new(0),
@@ -70,6 +91,9 @@ impl Timing {
     }
     pub(super) fn stale_hint(&self) {
         self.stale_hints.fetch_add(1, Relaxed);
+    }
+    pub(super) fn delivered(&self, outcome: Delivered) {
+        self.deliveries[outcome as usize].fetch_add(1, Relaxed);
     }
     pub(super) fn guest(&self, elapsed: Duration) {
         self.guest.fetch_add(nanos(elapsed), Relaxed);
