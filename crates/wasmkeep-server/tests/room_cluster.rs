@@ -902,13 +902,69 @@ impl ObjectStore for HoldPusherSegments {
 async fn room_cluster_batched_pusher_crash_keeps_its_operation_and_delivers() {
     batched_pusher_crash(4).await;
 }
-/// The same with six clients: the split begins at four sockets, so a later
-/// join may go to the new edge while the split is held at its `range` step.
-/// Under load such a client once never became ready within 90 s.
+/// The same with six clients: the split begins at four sockets, and
+/// `batched4` and `batched5` (points in the new edge's half) join once the
+/// directory names the new edge, while the split is held at its `range`
+/// step. They join then, not all six at once: until `range` closes the
+/// upper half's sockets on the first edge (4801), that edge may hold five
+/// (capacity 5) and refuses a sixth client of its own half with `full`
+/// (ADR 0040, section 7) for as long as the split is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known failing: a client on a new edge mid-split never becomes ready; under investigation"]
 async fn room_cluster_batched_pusher_crash_with_a_join_on_the_new_edge() {
     batched_pusher_crash(6).await;
+}
+type Clients = [(
+    Arc<Progress>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+)];
+/// Every client holds a socket and has caught up, within `secs`; publishes
+/// meanwhile, so `head` moves.
+async fn joined(
+    addr: SocketAddr,
+    room: &'static str,
+    clients: &Clients,
+    head: &mut u64,
+    secs: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while clients.iter().any(|(p, _, _)| {
+        p.ready.load(Ordering::SeqCst) == 0 || p.last.load(Ordering::SeqCst) < (*head).max(1)
+    }) {
+        let (_, op) = get(addr, &format!("/r6/op?room={room}")).await;
+        let (_, map) = get(addr, &format!("/r6/map?room={room}")).await;
+        assert!(
+            Instant::now() < deadline,
+            "joins (ready, last, reconnects) at {head}, op {op:?}, map {map:?}: {:?}",
+            clients
+                .iter()
+                .map(|(p, _, _)| (
+                    p.ready.load(Ordering::SeqCst),
+                    p.last.load(Ordering::SeqCst),
+                    p.reconnects.load(Ordering::SeqCst)
+                ))
+                .collect::<Vec<_>>()
+        );
+        *head = publish(addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+/// The pending split's directory step lands: the map names two edges.
+async fn split_named(addr: SocketAddr, room: &'static str, head: &mut u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, op) = get(addr, &format!("/r6/op?room={room}")).await;
+        let (_, map) = get(addr, &format!("/r6/map?room={room}")).await;
+        if !op.is_empty() && map.split(',').count() == 2 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no split reached the directory: op {op:?}, map {map:?}"
+        );
+        *head = publish(addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 async fn batched_pusher_crash(count: usize) {
     let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
@@ -936,7 +992,7 @@ async fn batched_pusher_crash(count: usize) {
     let (status, body) = get(a.addr, "/r6/refuse-range?room=quiet&edge=1&on=1").await;
     assert_eq!(status, 200, "{body}");
     let mut clients = vec![];
-    for i in 0..count {
+    let join = |i: usize| {
         let p = Arc::new(Progress::default());
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(client(
@@ -946,29 +1002,15 @@ async fn batched_pusher_crash(count: usize) {
             p.clone(),
             stopped,
         ));
-        clients.push((p, stop, task));
+        (p, stop, task)
+    };
+    for i in 0..count.min(4) {
+        clients.push(join(i));
     }
     // Every socket joined and caught up first: a join refused while the
     // group is cold backs off, up to 30 s on a loaded runner.
     let mut head = 0;
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while clients.iter().any(|(p, _, _)| {
-        p.ready.load(Ordering::SeqCst) == 0 || p.last.load(Ordering::SeqCst) < head.max(1)
-    }) {
-        assert!(
-            Instant::now() < deadline,
-            "joins: {:?}",
-            clients
-                .iter()
-                .map(|(p, _, _)| (
-                    p.ready.load(Ordering::SeqCst),
-                    p.last.load(Ordering::SeqCst)
-                ))
-                .collect::<Vec<_>>()
-        );
-        head = publish(a.addr, room, false).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    joined(a.addr, room, &clients, &mut head, 90).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     let op = loop {
         assert!(Instant::now() < deadline, "no scale operation began");
@@ -980,6 +1022,13 @@ async fn batched_pusher_crash(count: usize) {
             break op;
         }
     };
+    if count > 4 {
+        split_named(a.addr, room, &mut head).await;
+        for i in 4..count {
+            clients.push(join(i));
+        }
+        joined(a.addr, room, &clients, &mut head, 45).await;
+    }
     caught_up(&clients, head).await;
     // From now on the pusher's segments stay in flight: a publish's round
     // still delivers, then its unsent writes age and its events stop.
@@ -1039,6 +1088,77 @@ async fn batched_pusher_crash(count: usize) {
     map.sort_unstable();
     assert_eq!(children, map.join(","));
     assert_eq!(children.split(',').count(), 2, "{children}");
+    for (_, stop, task) in clients {
+        let _ = stop.send(());
+        task.await.unwrap();
+    }
+}
+
+/// ADR 0040, section 7: a split whose `range` step the old edge refuses
+/// stays pending, and a client the directory sends to the new edge meanwhile
+/// still becomes ready and gets every message. Nothing holds the pusher's
+/// segments. Four clients start the split (80 % of 5); `batched4` and
+/// `batched5`, whose points are in the new edge's half, join only once the
+/// directory names that edge (why not all six at once: the six-client
+/// batched-pusher case).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_join_during_a_stuck_split_becomes_ready() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = node_with("a", shared.clone(), wasm.clone(), front.clone(), true).await;
+    let b = node_with("b", shared.clone(), wasm.clone(), front.clone(), true).await;
+    let _c = node_with("c", shared.clone(), wasm, front, true).await;
+    let room = "quiet";
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    get(a.addr, "/r6/map?room=quiet").await;
+    assert_eq!(get(a.addr, "/r6/warm?room=quiet&edge=1").await.0, 200);
+    assert_eq!(get(a.addr, "/r6/history?room=quiet&n=0").await.0, 200);
+    assert_eq!(get(b.addr, "/r6/warm-pusher?room=quiet").await.0, 200);
+    let (status, body) = get(a.addr, "/r6/refuse-range?room=quiet&edge=1&on=1").await;
+    assert_eq!(status, 200, "{body}");
+    let mut clients = vec![];
+    let join = |i: usize| {
+        let p = Arc::new(Progress::default());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(client(
+            a.addr,
+            room,
+            format!("batched{i}"),
+            p.clone(),
+            stopped,
+        ));
+        (p, stop, task)
+    };
+    for i in 0..4 {
+        clients.push(join(i));
+    }
+    let mut head = 0;
+    joined(a.addr, room, &clients, &mut head, 90).await;
+    // The split begins and its directory step lands: the map names e3.
+    split_named(a.addr, room, &mut head).await;
+    for i in 4..6 {
+        clients.push(join(i));
+    }
+    joined(a.addr, room, &clients, &mut head, 45).await;
+    // The split is still the pending one: the joins above came during it.
+    let (status, op) = get(a.addr, "/r6/op?room=quiet").await;
+    assert_eq!(status, 200, "{op}");
+    assert!(
+        !op.is_empty(),
+        "the split completed: the test proves nothing"
+    );
+    head = publish(a.addr, room, false).await;
+    caught_up(&clients, head).await;
+    let (status, body) = get(a.addr, "/r6/refuse-range?room=quiet&edge=1&on=0").await;
+    assert_eq!(status, 200, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !get(a.addr, "/r6/op?room=quiet").await.1.is_empty() {
+        assert!(Instant::now() < deadline, "the operation did not complete");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    head = publish(a.addr, room, false).await;
+    caught_up(&clients, head).await;
     for (_, stop, task) in clients {
         let _ = stop.send(());
         task.await.unwrap();
