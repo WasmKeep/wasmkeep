@@ -1,4 +1,4 @@
-import { actors, broadcast, defineFront } from '@wasmkeep/sdk/front';
+import { actors, broadcast, defineFront, describeError } from '@wasmkeep/sdk/front';
 import { api } from './api';
 import { page, browser } from './assets';
 const room = new broadcast.Client('room/lobby');
@@ -11,7 +11,7 @@ const handle = api({
   history: (after, limit) => room.historyJSON(after, limit),
   stats: () => ({ head: broadcast.historyJSON(room.history()).head,
     ...JSON.parse(actors.call('pusher/lobby', {path:'/stats'}).text()) }),
-});
+}, describeError);
 export default defineFront({ fetch(req) {
   if (req.method === 'GET' && req.path === '/') return {headers:{'content-type':'text/html; charset=utf-8'},body:page};
   if (req.method === 'GET' && req.path === '/client.js') return {headers:{'content-type':'text/javascript; charset=utf-8'},body:browser};
