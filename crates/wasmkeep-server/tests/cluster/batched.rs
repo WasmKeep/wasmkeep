@@ -959,6 +959,171 @@ async fn a_busy_batched_actor_takes_periodic_snapshots() {
     );
 }
 
+/// The actor's snapshot keys in the bucket now.
+async fn snapshot_keys(p: &Pair) -> Vec<String> {
+    let store: Arc<dyn ObjectStore> = p.flaky.clone();
+    bucket_keys(&store)
+        .await
+        .into_iter()
+        .filter(|k| k.contains("/snapshot/"))
+        .collect()
+}
+
+/// A batched hold's periodic snapshot leaves the mailbox once copied: while
+/// its upload is held in the bucket, events are answered at once, plain
+/// and durable (their segments go up and are acknowledged beside it), and
+/// nothing is collected. Once it lands, the history below it is collected
+/// and the next owner restores every write (ADR 0034, section 7). Before,
+/// the upload ran in the mailbox gap and held every event behind it for
+/// its whole attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_are_answered_while_a_periodic_snapshot_uploads() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        if let Some(cluster) = c.cluster.as_mut() {
+            cluster.history_retention = Duration::ZERO;
+        }
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.hold_snapshot_puts.store(true, Ordering::SeqCst);
+    let held = &p.flaky.snapshot_puts_held;
+    let mut n = 1;
+    // Far under a periodic snapshot's own bound (6 s for this database).
+    let bound = Duration::from_millis(1_500);
+    let timed = |path: &'static str| async move {
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(15), send(p.a.addr, "POST", path, ""))
+            .await
+            .expect("answered within 15 s");
+        (r, started.elapsed())
+    };
+    while held.load(Ordering::SeqCst) == 0 {
+        assert!(n < 100, "no periodic snapshot after {n} writes");
+        n += 1;
+        let (r, took) = timed("/actor/t/x/plain").await;
+        assert_eq!((r.status, r.body.trim()), (200, n.to_string().as_str()));
+        assert!(took < bound, "write {n} took {took:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before = snapshot_keys(&p).await;
+    // The snapshot's upload is held: the next events are not.
+    for _ in 0..3 {
+        n += 1;
+        let (r, took) = timed("/actor/t/x/plain").await;
+        assert_eq!((r.status, r.body.trim()), (200, n.to_string().as_str()));
+        assert!(took < bound, "write {n} behind the snapshot took {took:?}");
+    }
+    let (r, took) = timed("/actor/t/x/durable").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
+    assert!(
+        took < bound,
+        "a durable write behind the snapshot took {took:?}"
+    );
+    let (_, segments) = history(&p).await;
+    assert_eq!(snapshot_keys(&p).await, before, "nothing landed while held");
+    assert!(
+        segments >= 64,
+        "nothing collected before it landed: {segments}"
+    );
+    p.flaky.hold_snapshot_puts.store(false, Ordering::SeqCst);
+    // It lands, acknowledged beside the segments of the writes that go on,
+    // and what it makes unnecessary is collected.
+    let started = std::time::Instant::now();
+    loop {
+        n += 1;
+        let (r, took) = timed("/actor/t/x/plain").await;
+        assert_eq!((r.status, r.body.trim()), (200, n.to_string().as_str()));
+        assert!(
+            took < bound,
+            "write {n} as the snapshot lands took {took:?}"
+        );
+        let (snapshots, segments) = (snapshot_keys(&p).await, history(&p).await.1);
+        if snapshots.iter().any(|k| !before.contains(k)) && segments < 64 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{snapshots:?}, {segments} segments"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Durable, and with it every plain write before it.
+    let (r, _) = timed("/actor/t/x/durable").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    let r = b_answers(&p, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, n.to_string().as_str(), Some("b")),
+        "{}",
+        r.body
+    );
+    let r = poll_get(p.b.addr, "/actor/t/x/durable").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+}
+
+/// A delete waits for a periodic snapshot still uploading before its
+/// reset, so the snapshot (of the data the delete erases) cannot land after
+/// the erasure: once the erasure ran, no snapshot below the reset is left,
+/// and the next owner finds the actor empty (ADR 0034, section 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_waits_for_a_periodic_snapshot_uploading() {
+    let p = batched_pair(Duration::from_secs(30), |c| {
+        if let Some(cluster) = c.cluster.as_mut() {
+            cluster.history_retention = Duration::ZERO;
+        }
+    })
+    .await;
+    warmed(&p).await;
+    p.flaky.hold_snapshot_puts.store(true, Ordering::SeqCst);
+    let mut n = 1;
+    while p.flaky.snapshot_puts_held.load(Ordering::SeqCst) == 0 {
+        assert!(n < 100, "no periodic snapshot after {n} writes");
+        n += 1;
+        let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, n.to_string().as_str()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let gate = Arc::clone(&p.flaky.hold_snapshot_puts);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        gate.store(false, Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let r = send(p.a.addr, "POST", "/actor/t/x/delete-durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "deleted"), "{}", r.body);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "the reset did not wait for the snapshot: {:?}",
+        started.elapsed()
+    );
+    release.await.unwrap();
+    // The erasure leaves no snapshot below the newest one.
+    let txid = |k: &String| {
+        let name = k.rsplit('/').next().unwrap();
+        u64::from_str_radix(&name[..16], 16).unwrap()
+    };
+    let started = std::time::Instant::now();
+    loop {
+        let keys = snapshot_keys(&p).await;
+        let newest = keys.iter().map(txid).max().unwrap();
+        if keys.iter().all(|k| txid(k) == newest) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "left after the erasure: {keys:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let r = b_answers(&p, "/actor/t/x/plain").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "0", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
 /// A delete at a batched hold's barrier retires the entry its state named:
 /// the reset is acknowledged, nothing is in flight, so no state can name
 /// it again (ADR 0034, section 9; ADR 0028).

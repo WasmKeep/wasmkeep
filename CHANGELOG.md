@@ -9,6 +9,22 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Periodic snapshots of batched classes leave the mailbox.** A batched
+  hold took its periodic snapshot inside the mailbox gap after an event:
+  a flush to the barrier, the copy, then the upload, with every event
+  queued behind two bucket round trips (and the upload's whole attempt,
+  up to 10 s, on a slow bucket). Now the database is copied at the first
+  gap with nothing in flight, at the acknowledged head, leaving later
+  commits in the WAL (no flush), and the encoding, upload and collection
+  run on a task of their own. A restore still sees either the previous
+  snapshot and every segment after it, or the new one; collection waits
+  for the new one to be acknowledged; barriers, resets and deletes wait
+  for an upload under way. Strict classes are unchanged. The mailbox's
+  host work for it is `wasmkeep_mailbox_host_work_seconds{work="snapshot_copy"}`,
+  the copy alone (it was `snapshot_in_gap`, the whole snapshot, earlier
+  in this release). See ADR 0034, section 7, and
+  [monitoring](docs/monitoring.md).
+
 - **Guest event work.** `wasmkeep_event_fuel{tenant,app,class,kind}` reports
   Wasmtime work units per actor event, independently of CPU speed, alongside
   event duration. Fuel is a meter with an effectively unlimited allowance,

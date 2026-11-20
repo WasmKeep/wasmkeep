@@ -13,6 +13,11 @@
 //! the state through the mailbox, or not at all (then the next boundary,
 //! flush or step before a drop applies it).
 //!
+//! A periodic snapshot (section 7) starts at the same point: when one is
+//! due and the uploader is idle, the database at the captured position
+//! (the acknowledged head) is copied in the gap, and its encoding, upload
+//! and collection run on a task of their own while events go on.
+//!
 //! Strict classes never come here.
 
 use std::sync::LazyLock;
@@ -144,6 +149,95 @@ impl DbAt<'_> {
 pub(super) struct Completion {
     pub(super) service: Option<std::sync::Weak<ServiceInner>>,
     pub(super) address: ActorAddress,
+    /// What a periodic snapshot started at this gap needs; `None`: none
+    /// starts here.
+    pub(super) snapshots: Option<Snapshots>,
+}
+
+/// What a periodic snapshot started in a mailbox gap needs: the actor's
+/// timing (its copy is `work="snapshot_copy"`), and where its collection
+/// goes once it landed. Holds no state of the actor.
+#[derive(Clone)]
+pub(super) struct Snapshots {
+    timing: Arc<super::timing::Timing>,
+    address: ActorAddress,
+    collecting: Arc<Collection>,
+    /// The history retention of a cluster node; `None`: no collection.
+    retention: Option<Duration>,
+}
+
+/// Starts a periodic snapshot at an idle uploader (ADR 0034, section 7):
+/// copies the database at the captured position, which with nothing in
+/// flight is the acknowledged head, labels it there, and hands its
+/// encoding and upload to a task of its own, which asks for collection
+/// below that head once the snapshot is acknowledged. Commits after the
+/// head (marked or not) stay in the WAL for the segments that follow.
+/// `Err`: the snapshot was refused, and replication stopped.
+async fn start_snapshot(
+    replica: &mut crate::replica::Replica,
+    db: &mut DbAt<'_>,
+    snapshots: &Snapshots,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    // Not now when batched capture is off (a job after a barrier ended
+    // it): the next event enables it again.
+    let copied = db
+        .run(|db| {
+            db.batched_capture_enabled()
+                .then(|| db.snapshot_at_captured())
+        })
+        .await
+        .map(Option::flatten);
+    snapshots
+        .timing
+        .apart(super::timing::Work::SnapshotCopy, started.elapsed());
+    let all = match copied {
+        Ok(Some(Ok(all))) => all,
+        Ok(None) => return Ok(()),
+        other => {
+            let error = match other {
+                Ok(Some(Err(e))) => e.to_string(),
+                Err(e) => e,
+                _ => String::new(),
+            };
+            tracing::warn!(app = %crate::logging::app(&snapshots.address), actor = %crate::logging::actor(&snapshots.address), %error, "a periodic snapshot could not be copied");
+            replica.periodic_try_failed();
+            return Ok(());
+        }
+    };
+    let job = match replica.start_periodic_snapshot(all).await {
+        Ok(job) => job,
+        Err(crate::replica::ReplicaError::Refused(e)) => {
+            return Err(format!(
+                "{REPLICATION_STOPPED}: periodic snapshot refused: {e}"
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(app = %crate::logging::app(&snapshots.address), actor = %crate::logging::actor(&snapshots.address), error = %e, "a periodic snapshot could not start");
+            return Ok(());
+        }
+    };
+    let snapshots = snapshots.clone();
+    tokio::spawn(async move {
+        let (position, collector) = (job.position(), job.collector());
+        // Collection only once it is created and acknowledged, and below
+        // the head it is labelled at, not the head it lands at.
+        if job.run().await == crate::replica::PeriodicOutcome::Created
+            && let Some(retention) = snapshots.retention
+        {
+            spawn_collection(
+                snapshots.address,
+                snapshots.collecting,
+                CollectRequest {
+                    collector,
+                    snapshot: position,
+                    retention,
+                    erase: false,
+                },
+            );
+        }
+    });
+    Ok(())
 }
 
 impl Completion {
@@ -264,6 +358,15 @@ pub(super) async fn pump(
     }
     if !replica.uploader_idle() {
         return Ok(true);
+    }
+    // A gap with nothing in flight: where a periodic snapshot starts, if
+    // one is due. Never inside a flush or a clean stop (they pass a
+    // deadline), nor at a barrier (no completion).
+    if deadline.is_none()
+        && let Some(snapshots) = completion.and_then(|c| c.snapshots.as_ref())
+        && replica.batched_snapshot_due()
+    {
+        start_snapshot(&mut replica, db, snapshots).await?;
     }
     let plan = db
         .run(|db| {
@@ -461,6 +564,15 @@ pub(super) async fn flush_through(
     }
 }
 
+/// Whether a barrier waits for a periodic snapshot uploading.
+#[derive(Clone, Copy)]
+enum Snapshot {
+    /// It ends first: the caller ends the hold, switches modes or resets.
+    Settled,
+    /// It may go on: the caller only judges the acknowledged head.
+    MayUpload,
+}
+
 /// Flushes the hold to its barrier (ADR 0034, section 6): nothing
 /// uncaptured, nothing in flight. `Some(Flushed)` there; `Some(GaveUp)` if
 /// replication stopped; `None` if `deadline` passed first. Cancel-safe.
@@ -469,6 +581,7 @@ async fn to_barrier(
     db: &mut DbAt<'_>,
     completion: Option<&Completion>,
     deadline: Option<tokio::time::Instant>,
+    snapshot: Snapshot,
 ) -> Option<Barrier> {
     if mark(slot, db).await.is_err() {
         return Some(Barrier::GaveUp(Dropped::Failure));
@@ -486,7 +599,26 @@ async fn to_barrier(
         if done {
             match db.run(|db| db.has_pending_boundaries()).await {
                 Ok(Some(true)) => continue,
-                Ok(_) => return Some(Barrier::Flushed),
+                Ok(_) => {
+                    // A periodic snapshot still uploading ends first (one
+                    // short attempt), where the caller ends the hold,
+                    // switches modes or resets (ADR 0034, section 7).
+                    let settled = match snapshot {
+                        Snapshot::Settled => slot.lock().await.periodic_upload_settled(),
+                        Snapshot::MayUpload => None,
+                    };
+                    if let Some(settled) = settled {
+                        match deadline {
+                            Some(at) => tokio::select! {
+                                () = settled => {}
+                                () = tokio::time::sleep_until(at) => return None,
+                            },
+                            None => settled.await,
+                        }
+                        slot.lock().await.settle_periodic();
+                    }
+                    return Some(Barrier::Flushed);
+                }
                 Err(_) => return Some(Barrier::GaveUp(Dropped::Failure)),
             }
         }
@@ -514,6 +646,12 @@ impl ActorState {
         Completion {
             service: self.service.get().cloned(),
             address: self.address.clone(),
+            snapshots: Some(Snapshots {
+                timing: Arc::clone(&self.timing),
+                address: self.address.clone(),
+                collecting: Arc::clone(&self.collecting),
+                retention: self.cluster.as_ref().map(|c| c.history_retention),
+            }),
         }
     }
 
@@ -560,8 +698,10 @@ impl ActorState {
         let stop = self.stop_deadline();
         // This boundary gates the next guest event, after this one's
         // answer and event-duration observation. Include capture/budget
-        // waits as well as the event-start rule's upload wait, but not a
-        // periodic snapshot. Strict holds never construct this timer.
+        // waits as well as the event-start rule's upload wait, and the
+        // copy of a periodic snapshot started here, but never its upload,
+        // which runs off the mailbox. Strict holds never construct this
+        // timer.
         let timing = crate::metrics::METRICS
             .event_start_rule_wait_seconds
             .get_in(&self.app_labels, &[("class", self.address.class())]);
@@ -576,80 +716,34 @@ impl ActorState {
         timing.observe(started.elapsed());
         if let Err(e) = done {
             self.abandon(&e);
-            return;
-        }
-        if stop.is_some() {
-            return;
-        }
-        // A periodic snapshot is asked for only here, in the mailbox gap
-        // after an event, and taken only at the acknowledged head (ADR
-        // 0034, section 7): a flush to the barrier first, with one upload
-        // budget; past it the snapshot waits for a later gap. Events queue
-        // behind it meanwhile, as behind a strict periodic snapshot.
-        if slot.lock().await.batched_snapshot_due() {
-            self.snapshot_in_gap(slot).await;
         }
     }
 
-    /// The periodic snapshot of a batched hold, at a `Flushed` barrier.
-    async fn snapshot_in_gap(&mut self, slot: SharedReplica) {
-        let _timed = self.timing.work(super::timing::Work::SnapshotInGap);
-        let deadline = self.upload_deadline().await;
-        match self.flush_to_barrier(Some(deadline)).await {
-            Some(Barrier::Flushed) => {}
-            Some(Barrier::GaveUp(_)) => {
-                self.abandon("replication stopped before a periodic snapshot");
-                return;
-            }
-            None => return,
-        }
-        let taken = self.db_at().run(ActorDb::snapshot).await;
-        let all = match taken {
-            Ok(Some(Ok(all))) => all,
-            Ok(Some(Err(wasmkeep_storage::wal::CaptureError::Pending(_)))) => {
-                self.abandon("changes appeared during a snapshot");
-                return;
-            }
-            other => {
-                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?other, "periodic snapshot failed");
-                return;
-            }
-        };
-        let mut replica = slot.lock().await;
-        match replica
-            .ship_snapshot(&all, crate::replica::SnapshotKind::Periodic)
-            .await
-        {
-            Ok(true) => {
-                if let Some(cluster) = &self.cluster {
-                    spawn_collection(
-                        self.address.clone(),
-                        Arc::clone(&self.collecting),
-                        CollectRequest {
-                            collector: replica.collector(),
-                            snapshot: replica.head(),
-                            retention: cluster.history_retention,
-                            erase: false,
-                        },
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(crate::replica::ReplicaError::Refused(e)) => {
-                drop(replica);
-                self.abandon(&format!("periodic snapshot refused: {e}"));
-            }
-            Err(e) => {
-                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "periodic snapshot failed");
-            }
-        }
-    }
-
-    /// Flushes the hold to its barrier by `deadline` (ADR 0034, section 6).
-    /// A strict hold is there at once; so is one with nothing restored.
+    /// Flushes the hold to its barrier by `deadline` (ADR 0034, section 6),
+    /// a periodic snapshot uploading included: what a hold's end, a mode
+    /// switch, a delete or a restore of one actor waits for. A strict hold
+    /// is there at once; so is one with nothing restored.
     pub(super) async fn flush_to_barrier(
         &mut self,
         deadline: Option<tokio::time::Instant>,
+    ) -> Option<Barrier> {
+        self.flush_to(deadline, Snapshot::Settled).await
+    }
+
+    /// [`Self::flush_to_barrier`] for a judgement on the acknowledged head
+    /// that leaves the hold as it is (an alarm's R2, a stale hint's
+    /// clear): a periodic snapshot may go on uploading meanwhile.
+    pub(super) async fn flush_to_acknowledged_head(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<Barrier> {
+        self.flush_to(deadline, Snapshot::MayUpload).await
+    }
+
+    async fn flush_to(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+        snapshot: Snapshot,
     ) -> Option<Barrier> {
         let _timed = self.timing.work(super::timing::Work::FlushToBarrier);
         let hold = self.held.as_ref()?;
@@ -671,7 +765,7 @@ impl ActorState {
             // No completion jobs: the step before a drop applies them
             // itself, and a job it posted would cut it short (the mailbox
             // serves a job that arrives during the step first).
-            to_barrier(&slot, &mut self.db_at(), None, deadline).await
+            to_barrier(&slot, &mut self.db_at(), None, deadline, snapshot).await
         };
         match deadline {
             Some(at) => tokio::time::timeout_at(at, flushed).await.unwrap_or(None),

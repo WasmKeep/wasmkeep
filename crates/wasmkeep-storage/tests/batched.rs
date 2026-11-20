@@ -1096,3 +1096,116 @@ fn the_next_segment_is_full_at_the_configured_cap_and_unmarked_commits_show() {
     drop(hold);
     drop(db);
 }
+
+/// A batched hold's periodic snapshot is the database at the captured
+/// position, taken while later commits wait in the WAL, marked or not
+/// (ADR 0034, section 7): restored, it holds exactly the captured
+/// checksum, and the segments captured after it chain onto it. Through
+/// growth, shrinking (VACUUM), rewrites, rolled-back spills and
+/// checkpoints at the captured position.
+#[test]
+fn property_snapshot_at_captured_leaves_out_uncaptured_commits_and_chains() {
+    for initial_seed in 1..=24 {
+        let mut seed = initial_seed;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let (conn, mut c) = raw(&path);
+        conn.execute_batch("PRAGMA cache_size=5").unwrap();
+        // Snapshots taken so far, each with the segments captured after it.
+        let mut restores: Vec<(Restorer, u64)> = Vec::new();
+        let mut snapshots = 0;
+        for event in 0..30 {
+            if event % 7 == 6 {
+                conn.execute_batch("DELETE FROM t WHERE id % 2 = 0; VACUUM")
+                    .unwrap();
+            } else {
+                conn.execute_batch("BEGIN").unwrap();
+                let id = (next(&mut seed) % 16) as i64;
+                let len = 100 + (next(&mut seed) % 20000) as usize;
+                let data: Vec<u8> = (0..len).map(|_| next(&mut seed) as u8).collect();
+                conn.execute(
+                    "INSERT OR REPLACE INTO t VALUES (?1, ?2)",
+                    rusqlite::params![id, data],
+                )
+                .unwrap();
+                conn.execute_batch("COMMIT").unwrap();
+                conn.execute_batch("BEGIN; UPDATE t SET v=zeroblob(40000); ROLLBACK")
+                    .unwrap();
+            }
+            // Some events stay unmarked, so uncaptured commits of both
+            // kinds sit behind the captured position.
+            if !next(&mut seed).is_multiple_of(3) {
+                c.mark_boundary().unwrap();
+            }
+            if next(&mut seed).is_multiple_of(2)
+                && let Some(captured) = c.capture_bounded(estimated_segment_bytes(4096, 6)).unwrap()
+            {
+                for (r, txid) in &mut restores {
+                    apply(r, &captured.changes, txid);
+                    assert_eq!(r.checksum(), c.checksum(), "seed {initial_seed}");
+                }
+            }
+            if next(&mut seed).is_multiple_of(4) {
+                let snapshot = c.snapshot_at_captured().unwrap();
+                assert_eq!(snapshot.post_apply, c.checksum());
+                assert_eq!(snapshot.commit, c.pages());
+                let at = dir.path().join(format!("snapshot-{snapshots}.db"));
+                snapshots += 1;
+                let mut r = Restorer::create(&at, 1 << 30).unwrap();
+                r.apply(&snapshot.to_ltx(1, 1, 0).unwrap()).unwrap();
+                assert_eq!(r.checksum(), c.checksum(), "seed {initial_seed}");
+                restores.push((r, 1));
+            }
+            // A checkpoint, only with nothing uncaptured: as in batched mode.
+            if !c.has_uncaptured_commits().unwrap() && next(&mut seed).is_multiple_of(3) {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+                c.wal_truncated();
+            }
+        }
+        // Everything captured: every snapshot's chain reaches the database.
+        c.mark_boundary().unwrap();
+        while let Some(captured) = c.capture_bounded(DEFAULT_SEGMENT_BYTES).unwrap() {
+            for (r, txid) in &mut restores {
+                apply(r, &captured.changes, txid);
+            }
+        }
+        assert!(snapshots > 0, "seed {initial_seed} took no snapshot");
+        for (r, _) in restores {
+            assert_eq!(r.finish().unwrap(), c.checksum(), "seed {initial_seed}");
+        }
+    }
+}
+
+/// The guard of `WalCapture::snapshot_at_captured`: a main file that
+/// holds a commit the capture never saw (a checkpoint behind its back) is
+/// refused, never labelled at the captured position.
+#[test]
+fn snapshot_at_captured_refuses_a_main_file_ahead_of_the_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let (conn, mut c) = raw(&dir.path().join("a.db"));
+    conn.execute_batch("CREATE TABLE u(v); INSERT INTO u VALUES ('one')")
+        .unwrap();
+    c.mark_boundary().unwrap();
+    c.capture_bounded(DEFAULT_SEGMENT_BYTES).unwrap().unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    c.wal_truncated();
+    conn.execute("INSERT INTO t VALUES (1, 'captured')", [])
+        .unwrap();
+    c.mark_boundary().unwrap();
+    c.capture_bounded(DEFAULT_SEGMENT_BYTES).unwrap().unwrap();
+    assert!(c.snapshot_at_captured().is_ok());
+    // A page of `u`, which no captured frame since the checkpoint holds.
+    conn.execute("UPDATE u SET v = 'not captured'", []).unwrap();
+    assert!(
+        c.snapshot_at_captured().is_ok(),
+        "uncaptured, in the WAL only"
+    );
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    assert!(matches!(
+        c.snapshot_at_captured(),
+        Err(CaptureError::Lost(_))
+    ));
+}

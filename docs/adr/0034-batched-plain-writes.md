@@ -600,11 +600,47 @@ for good. So:
   position on an empty bucket and keeps today's rule. The guard runs
   before `snapshot_failed()` (`replica.rs:1065`): a refusal is a bug
   caught, not a failed attempt to back off from.
-- **`snapshot_due` is asked only inside a barrier.** When a periodic
-  snapshot is due, the actor's next mailbox gap runs a flush and then
-  the snapshot, under today's bounds (one short attempt, the retry waits
-  of `PERIODIC_SNAPSHOT_IDLES`). Events queue behind it meanwhile, as
-  they queue behind a periodic snapshot today.
+- **A periodic snapshot is copied at an idle uploader and uploaded off
+  the mailbox** (amended 2026-11-20; it was a flush to the barrier and
+  the whole snapshot inside the mailbox gap, which queued every event
+  behind two bucket round trips, the snapshot's one among them). When
+  one is due, the first mailbox gap with nothing in flight (an event's
+  end or a completion job, never a flush or a stop) copies the database
+  **at the captured position**, which with nothing in flight is the
+  acknowledged head: the main file and the captured part of the WAL
+  (`ActorDb::snapshot_at_captured`). Commits after it, marked or not,
+  stay in the WAL for the next segment, so no flush is needed: in
+  batched mode the main file never holds an uncaptured commit (every
+  checkpoint of the mode refuses one), and the copy checks each page
+  against the capture's checksums and their sum against the captured
+  checksum. `ship_snapshot`'s guard runs on it as before, then the
+  encoding, the upload (today's bounds: one short attempt, the retry
+  waits of `PERIODIC_SNAPSHOT_IDLES`) and the collection after it run
+  on a task of their own while events, captures and segments go on.
+  Its rules:
+  - it is labelled at the head it was copied at, and collection after
+    it names that position, not the head at landing;
+  - its conditional create is its only publication: a restore lists it
+    once it is whole, and until then plans from the previous snapshot
+    and the segments after it, which collection keeps (it deletes only
+    below a snapshot that is listed);
+  - collection runs only once its upload is acknowledged (completed while
+    the lease was valid, ADR 0012);
+  - a crash mid-upload leaves no object, or a whole one, at a position
+    on the chain, and the previous snapshot with every segment after it;
+  - one at a time per hold; a `Flushed` barrier that ends the hold or
+    changes it (hibernation, a hand-over, a mode switch, a clean stop
+    within its deadline, a delete, a restore of one actor), a reset and
+    every other snapshot wait for it to end first, so no hold ends at its
+    barrier, and no reset or delete erases, with one in flight. A flush to
+    the acknowledged head that leaves the hold as it is (an alarm's R2
+    judgement, a stale hint's clear, section 9) does not wait for it. A
+    hold that ends without its barrier (a crash, a failed replica, a
+    stop past its deadline) can leave one in flight: if it lands later it
+    is whole and on the chain, and unacknowledged (the hold is gone), so
+    no collection follows it;
+  - its counts start again from its position once it landed: the
+    segments acknowledged since stay counted.
 - **A snapshot is due by segments or by bytes**: 64 acknowledged
   segments since the last, as today, or 64 MiB of acknowledged
   segments, whichever comes first, so the restore below stays bounded

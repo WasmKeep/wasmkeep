@@ -138,9 +138,40 @@ fn slow_healthy_handover_requires_both_windows() {
     batched::caught_in_scenario(Switch::ReleaseWithoutBarrier, Violation::CleanLoss, 30);
 }
 
-/// ADR 0034, section 7: a periodic snapshot in a gap flushes to the
-/// barrier first; one taken over uncaptured commits is caught.
+/// ADR 0034, section 7: a periodic snapshot holds the database at its
+/// label, the acknowledged head; one that takes in uncaptured commits is
+/// caught.
 #[test]
 fn snapshot_over_uncaptured_commits_is_caught() {
     caught(Switch::SnapshotUncaptured, Violation::NotOwnerPrefix);
+}
+
+/// ADR 0034, section 7, as amended: a periodic snapshot is copied at an
+/// idle uploader (the acknowledged head, uncaptured commits left out) and
+/// uploads off the mailbox. Through crashes mid-upload, lease cuts,
+/// hand-overs and resets, every restore reads a whole snapshot at its
+/// label and every acknowledged durable write.
+#[test]
+fn snapshots_uploading_off_the_mailbox_keep_every_restore_whole() {
+    batched::snapshots_safe();
+}
+#[test]
+fn a_snapshot_published_before_its_upload_landed_is_caught() {
+    batched::snapshots_caught(Switch::SnapshotPublishedEarly, Violation::NotOwnerPrefix);
+}
+#[test]
+fn collecting_before_the_snapshot_is_acknowledged_is_caught() {
+    batched::snapshots_caught(Switch::SnapshotCollectEarly, Violation::MissingLink);
+}
+#[test]
+fn collecting_before_the_snapshot_is_acknowledged_loses_durable_writes() {
+    batched::snapshots_caught(Switch::SnapshotCollectEarly, Violation::DurableLost);
+}
+#[test]
+fn a_snapshot_labelled_where_its_upload_lands_is_caught() {
+    batched::snapshots_caught(Switch::SnapshotLabelAtLanding, Violation::NotOwnerPrefix);
+}
+#[test]
+fn a_staged_snapshot_over_uncaptured_commits_is_caught() {
+    batched::snapshots_caught(Switch::SnapshotUncaptured, Violation::NotOwnerPrefix);
 }
