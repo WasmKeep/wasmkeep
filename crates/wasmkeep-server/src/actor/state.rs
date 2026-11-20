@@ -146,7 +146,7 @@ impl Live {
     /// still open (one that ended without being recorded) is dropped, never
     /// recorded later with a stale start.
     pub(super) fn start_event(&mut self, kind: &'static str) {
-        self.meter.reset();
+        self.meter.reset_event(&mut self.store);
         self.event = Some((std::time::Instant::now(), kind));
     }
 
@@ -161,6 +161,9 @@ impl Live {
         let elapsed = started.elapsed();
         self.timing.guest(elapsed);
         crate::metrics::record_event(app, class, kind, outcome, elapsed);
+        if let Some(fuel) = self.meter.fuel_used(&self.store) {
+            crate::metrics::record_event_fuel(app, class, kind, fuel);
+        }
     }
 }
 

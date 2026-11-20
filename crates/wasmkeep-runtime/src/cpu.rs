@@ -136,18 +136,42 @@ pub(crate) enum Execution {
 
 /// Handle to a store's CPU meter, for stores reused across events.
 #[derive(Debug, Clone)]
-pub struct CpuMeter(Arc<Mutex<Meter>>);
+pub struct CpuMeter {
+    meter: Arc<Mutex<Meter>>,
+    fuel_enabled: bool,
+}
 
 impl CpuMeter {
     /// Starts a new event: the full budget is available again.
     pub fn reset(&self) {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).reset();
+        self.meter.lock().unwrap_or_else(|p| p.into_inner()).reset();
+    }
+
+    /// Starts a new event, resetting CPU accounting and the optional fuel meter.
+    pub fn reset_event<T>(&self, store: &mut Store<T>) {
+        self.reset();
+        if self.fuel_enabled {
+            // Enabled on this store: setting fuel cannot fail.
+            let _ = store.set_fuel(u64::MAX);
+        }
+    }
+
+    /// Fuel consumed since reset_event, or None when disabled. Read after
+    /// the guest call and post-return. Counts Wasmtime work units, not native
+    /// instructions or host work; suitable for per-event test assertions.
+    /// Traps can leave unflushed accounting in Wasmtime, so failed events
+    /// may be undercounted.
+    pub fn fuel_used<T>(&self, store: &Store<T>) -> Option<u64> {
+        if !self.fuel_enabled {
+            return None;
+        }
+        store.get_fuel().ok().map(|remaining| u64::MAX - remaining)
     }
 
     /// Guest CPU time used since the last reset. Exact while the guest is
     /// not running, or when called from the thread running it.
     pub fn used(&self) -> Duration {
-        self.0
+        self.meter
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .total(Instant::now(), thread_cpu)
@@ -162,7 +186,10 @@ pub(crate) fn install<T: 'static>(
     execution: Execution,
 ) -> CpuMeter {
     let meter = Arc::new(Mutex::new(Meter::new(tick)));
-    let handle = CpuMeter(Arc::clone(&meter));
+    let handle = CpuMeter {
+        meter: Arc::clone(&meter),
+        fuel_enabled: store.get_fuel().is_ok(),
+    };
 
     let hook_meter = Arc::clone(&meter);
     store.call_hook(move |_, hook| {

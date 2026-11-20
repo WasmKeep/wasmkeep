@@ -9,6 +9,16 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Guest event work.** `wasmkeep_event_fuel{tenant,app,class,kind}` reports
+  Wasmtime work units per actor event, independently of CPU speed, alongside
+  event duration. Fuel is a meter with an effectively unlimited allowance,
+  reset per event; CPU-budget enforcement is unchanged. Runtime embedders
+  can control instrumentation with `RuntimeConfig::measure_fuel` and read
+  event work through `CpuMeter::fuel_used`. Counts exclude host work and can
+  undercount trapped events; see [monitoring](docs/monitoring.md#event-work-fuel).
+  Room tests now assert calibrated per-event fuel ceilings too; their
+  speed-sensitive ignores remain while they retain the 50 ms CPU limit.
+
 - **One delivery per alarm round.** An event that ended while its actor's
   alarm delivery waited in the mailbox queued another delivery of the same
   round; every one after the first found the alarm moved and cleared it as

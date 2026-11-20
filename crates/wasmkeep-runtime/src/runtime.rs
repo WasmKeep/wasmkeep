@@ -22,6 +22,7 @@ pub struct Runtime {
     max_instances: u32,
     cpu_budget: Duration,
     epoch_tick: Duration,
+    measure_fuel: bool,
     _ticker: Arc<Ticker>,
 }
 
@@ -53,6 +54,7 @@ impl Runtime {
         let mut cfg = Config::new();
         cfg.wasm_component_model(true)
             .epoch_interruption(true)
+            .consume_fuel(config.measure_fuel)
             .allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
 
         let engine = Engine::new(&cfg).map_err(Error::engine_config)?;
@@ -63,6 +65,7 @@ impl Runtime {
             max_instances: config.max_instances,
             cpu_budget: config.cpu_budget,
             epoch_tick: config.epoch_tick,
+            measure_fuel: config.measure_fuel,
             _ticker: Arc::new(ticker),
         })
     }
@@ -72,7 +75,9 @@ impl Runtime {
         self.max_instances
     }
 
-    /// The underlying engine, for building linkers and stores.
+    /// The underlying engine, for compilation and building linkers.
+    /// Use this runtime's store constructors to install CPU accounting and
+    /// the effectively unlimited fuel allowance.
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -119,7 +124,7 @@ impl Runtime {
     /// budget instead of the runtime's: for instances that run under
     /// another limit than actors (a front's request).
     pub fn new_async_store_with_budget<T: 'static>(&self, data: T, budget: Duration) -> Store<T> {
-        let mut store = Store::new(&self.engine, data);
+        let mut store = self.fuel_store(data);
         let _meter = cpu::install(&mut store, budget, self.epoch_tick, Execution::Async);
         store
     }
@@ -130,10 +135,10 @@ impl Runtime {
     }
 
     /// Like [`new_async_store`](Self::new_async_store), for a store reused
-    /// across events (an actor's): call [`CpuMeter::reset`] at the start of
+    /// across events (an actor's): call [`CpuMeter::reset_event`] at the start of
     /// each event so every event gets the full budget.
     pub fn new_metered_async_store<T: 'static>(&self, data: T) -> (Store<T>, CpuMeter) {
-        let mut store = Store::new(&self.engine, data);
+        let mut store = self.fuel_store(data);
         let meter = cpu::install(
             &mut store,
             self.cpu_budget,
@@ -143,8 +148,19 @@ impl Runtime {
         (store, meter)
     }
 
-    fn store<T: 'static>(&self, data: T, execution: Execution) -> Store<T> {
+    // u64::MAX per event is effectively unlimited: even 10^12 units/second
+    // would take over 200 days to exhaust. Existing CPU and wall budgets
+    // stop runaway events; no fuel-driven yields or fuel limits are installed.
+    fn fuel_store<T: 'static>(&self, data: T) -> Store<T> {
         let mut store = Store::new(&self.engine, data);
+        if self.measure_fuel {
+            let _ = store.set_fuel(u64::MAX); // Enabled by this runtime.
+        }
+        store
+    }
+
+    fn store<T: 'static>(&self, data: T, execution: Execution) -> Store<T> {
+        let mut store = self.fuel_store(data);
         let _meter = cpu::install(&mut store, self.cpu_budget, self.epoch_tick, execution);
         store
     }

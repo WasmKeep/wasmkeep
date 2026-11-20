@@ -172,6 +172,7 @@ its first request.
 | `wasmkeep_alarm_stale_hints_total{tenant,app,class}` | counter | Stale alarm hint clear attempts (including failures or deferred clears), not the number of index objects deleted. |
 | `wasmkeep_alarm_deliveries_total{tenant,app,class,outcome}` | counter | Alarm deliveries an actor's mailbox ran, by how they ended: `ran` (`on-alarm` ran for the committed alarm), `stale` (the delivery's time no longer matched the committed alarm: cleared or moved since), `duplicate` (a stale time this actor's hold had already run, met again from the node's timer after a move: not cleared, its entry was retired when the alarm moved), `deferred` (not run now: another node owns the actor, a draining node handed it off, the bucket was unavailable, a required value is missing, the actor was not ready or its class is no longer served). `stale` over `ran` is how many extra deliveries each alarm round costs; see [alarm deliveries](#alarm-deliveries). |
 | `wasmkeep_alarm_dropped_deliveries_total` | counter | Alarm deliveries the mailbox dropped before they answered (the actor failed to start, or the event stopped), rescheduled with the admission backoff (at most six in a row; then left to the next event or the sweep). |
+| `wasmkeep_event_fuel{tenant,app,class,kind}` | histogram | Wasmtime fuel units consumed by each actor event, with the same kinds as event duration. Excludes host work. See [event work](#event-work-fuel). |
 | `wasmkeep_event_duration_seconds{tenant,app,class,kind}` | histogram | Guest event execution, including awaited host calls: `fetch` (HTTP and actor calls), `alarm`, `websocket` (open/message/close), or `other` (initialization). Excludes post-event replication. |
 | `wasmkeep_event_start_rule_wait_seconds{tenant,app,class}` | histogram | A batched event's boundary holding back the next event: capture, upload-budget wait and the event-start rule's upload wait. Recorded once per completed boundary, including failed ones; absent for strict holds. |
 | `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit) or `lease` (this node lost the actor mid-event). |
@@ -573,3 +574,123 @@ existing quotas. Rising `quota` means configured allowances were spent.
 Inspect the edge and the policy before raising limits. Budgets and
 counters reset on restart; quotas are per node, not a cluster-wide total.
 Clients receiving 429 should respect `Retry-After`.
+
+## Event work (fuel)
+
+`wasmkeep_event_fuel` measures guest work independently of CPU speed and
+scheduling. It uses [Wasmtime's fuel model](https://docs.wasmtime.dev/examples-interrupting-wasm.html)
+and version 50.0.2's default fuel costs, not native CPU
+instructions: most Wasm operators cost one unit, some cost zero, and bulk
+operations have their own costs. Compare the same component and Wasmtime
+version; rebuilding a language runtime or changing guest inputs, clock-based
+branches or garbage collection can change the work. SQL, network, storage
+and other host work consume no guest fuel. Compare fuel with event duration
+to distinguish more guest work from slower host operations.
+
+Every store starts with `u64::MAX` fuel, replenished before each actor event
+(including initialization, fetch, alarms and WebSocket callbacks). There is
+no fuel limit or fuel-driven yielding policy. Even at a trillion units per
+second an event would need over 200 days to exhaust that allowance; the
+existing CPU and wall limits remain in force. The epoch ticker, CPU clocks,
+budget checks and yield behavior are unchanged. New front stores also get
+fuel but fronts are not actor classes and do not populate this histogram.
+
+Fuel is read after the event, including guest post-return. Failed events
+can be undercounted: Wasmtime can keep unflushed fuel in a register when an
+epoch check or another instruction traps. Do not use this histogram for
+billing or interpret a low sample as proof that a failed event did little
+work. The CPU-budget trap counter remains authoritative for budget failures.
+
+Mean work per event by class and kind:
+
+```promql
+sum by (tenant, app, class, kind) (rate(wasmkeep_event_fuel_sum[5m]))
+/
+sum by (tenant, app, class, kind) (rate(wasmkeep_event_fuel_count[5m]))
+```
+
+`RuntimeConfig::measure_fuel` controls engine instrumentation (on by default).
+`CpuMeter::reset_event(&mut store)` starts a fresh event and
+`CpuMeter::fuel_used(&store)` reads its work for tests (`None` when disabled).
+The component cache distinguishes instrumented engines from uninstrumented
+ones; enabling metering requires compiling their components again.
+
+### Meter overhead and room ceilings
+
+The local counter measurement used the existing `actors` Criterion bench,
+`actor/warm --quick`, on an AMD Ryzen 9 7950X, with the entire process
+pinned to core 0 and four Tokio workers. Three pairs alternated fuel off/on and on/off in the same
+binary, without a burner or another test running. The
+[raw measurements](../bench/results/2026-11-20-37aa6f2-event-fuel.csv) identify
+an uncommitted event-fuel worktree based on `37aa6f2`, not a released version.
+Median paired overhead was **1.22% in event duration** (pair range
+0.98–1.24%) and **1.07% in HTTP time** (0.84–1.14%). Mean event duration was
+about 32.55 microseconds off and 32.95 microseconds on. This small counter
+is not a guarantee for compute-heavy guests or embedded JavaScript engines;
+measure those separately. The measured result is below the 5% threshold
+for making instrumentation opt-in.
+
+Reproduce a pair with no other heavy workload running:
+
+```bash
+env -u WASMKEEP_BENCH_FUEL WASMKEEP_BENCH_REPORT_EVENT_TIME=1 taskset -c 0 cargo bench \
+  -p wasmkeep-server --bench actors --locked -- actor/warm --quick
+WASMKEEP_BENCH_FUEL=1 WASMKEEP_BENCH_REPORT_EVENT_TIME=1 taskset -c 0 cargo bench \
+  -p wasmkeep-server --bench actors --locked -- actor/warm --quick
+```
+
+The bench explicitly enables fuel only with `WASMKEEP_BENCH_FUEL`; ordinary
+runtime construction still defaults to metering on. Its optional report
+prints the fetch event duration sum/count, separately from HTTP time.
+
+Room tests compare each series' finite fuel bucket with its total count:
+**every event**, including initialization, must fit the ceiling; a small
+average cannot hide one expensive event. They also require zero CPU-budget
+traps. Nextest isolates processes, so the process-wide metrics belong to
+that test. Build `examples/ts-big-room` and
+`crates/wasmkeep-server/tests/guests/ts-fetch` with `npm ci`, `npm run build`
+and `npm run build:starlingmonkey` first. Use `WASMKEEP_REQUIRE_LANGS=1`
+when calibrating so missing components fail instead of skipping.
+
+The `fuel calibration` lines printed with `--success-output immediate`
+show the smallest bucket containing every event of each class/kind.
+Choose a ceiling at least twice the largest observed bucket, rerun with
+`taskset -c 0`, then with a burner pinned to that same core (one test and
+one burner only; stop the burner by its PID). Recalibrate after changing
+the component, its embedded language runtime, or Wasmtime. These bounds
+are regression checks for this workload, not universal instruction limits.
+
+| Workload | Observed upper bucket (unpinned) | Ceiling per event |
+| --- | ---: | ---: |
+| QuickJS full window (diagnostic 5 s CPU budget) | 100,000,000 | 500,000,000 |
+| QuickJS distinct positions | 250,000,000 | 500,000,000 |
+| StarlingMonkey full window | 250,000,000 | 500,000,000 |
+| QuickJS 500-socket fanout | 100,000,000 | 250,000,000 |
+| StarlingMonkey 500-socket fanout | 250,000,000 | 500,000,000 |
+| Rust 500-socket fanout | 5,000,000 | 10,000,000 |
+
+Fuel does not remove the original 50 ms CPU limit from these tests. The
+QuickJS full-window workload failed with a front CPU-budget trap both
+unpinned and pinned to core 0; QuickJS distinct positions passed alone but
+timed out at 240 seconds with the same-core burner. Their failures are not
+fuel exhaustion. Successful local runs of the other workloads cannot
+establish that a fixed CPU-time limit will pass on every slower runner.
+The speed-sensitive ignores remain, along with the separate known-limit
+StarlingMonkey distinct-positions ignore. `scripts/check.sh --full` still
+selects the speed-sensitive tests; normal CI runs the deterministic runtime
+fuel/reset/cache checks instead. Returning the room workloads to normal CI
+requires separating their work ceilings from the test-only time limits.
+
+The three fanout variants passed pinned to core 0 both alone and with a
+90%-duty burner on that core; StarlingMonkey full window passed beside a
+continuous burner. The fanout burner was duty-cycled because this local
+workstation schedules Node builders as `SCHED_IDLE`: a continuous burner
+starved the build before the guest ran. That aborted build is not evidence
+of a runtime failure. Both burners were terminated by their recorded PIDs.
+
+QuickJS full-window calibration alone temporarily raised both the front
+and actor CPU budgets to 5 seconds: it completed below 100 million fuel
+per actor event. Its final test source was restored to the default 50 ms.
+The 500-million ceiling shares the full-window test helper with
+StarlingMonkey and provides at least 5x headroom for this diagnostic run.
+This measures work; it is not a successful default-budget test.

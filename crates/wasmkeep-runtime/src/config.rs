@@ -22,6 +22,9 @@ pub struct RuntimeConfig {
     /// How often the epoch advances; the CPU budget is enforced with this
     /// granularity. Must be non-zero.
     pub epoch_tick: Duration,
+    /// Meter Wasmtime fuel (work units, never an execution limit).
+    /// Counts depend on the component and Wasmtime version, not CPU speed.
+    pub measure_fuel: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -32,6 +35,7 @@ impl Default for RuntimeConfig {
             max_memory_bytes: 128 * 1024 * 1024,
             cpu_budget: Duration::from_millis(50),
             epoch_tick: Duration::from_millis(1),
+            measure_fuel: true,
         }
     }
 }
