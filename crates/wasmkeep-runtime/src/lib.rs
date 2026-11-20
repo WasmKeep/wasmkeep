@@ -12,6 +12,7 @@ mod config;
 mod cpu;
 mod error;
 mod mailbox;
+mod memory;
 mod pool;
 mod residency;
 mod runtime;
@@ -24,6 +25,9 @@ pub use error::Error;
 pub use mailbox::{
     BoxError, BoxFuture, DropCause, JobTiming, MailboxConfig, MailboxError, Mailboxes,
     ResidentShare, StepOutcome,
+};
+pub use memory::{
+    AllocatorTrim, configure_malloc_arena_max, default_malloc_arena_max, trim_system_allocator,
 };
 pub use pool::ResidentPool;
 pub use residency::{Residency, Retained};

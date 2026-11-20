@@ -39,6 +39,11 @@ use wasmkeep_server::{ActorConfig, ActorService, App, ClusterConfig, HttpCompone
     about = "Self-hosted actor platform for Wasm components"
 )]
 struct Cli {
+    /// glibc arena cap before threads start; 0 preserves glibc/environment defaults.
+    /// Default: available cores clamped to 2..8. No-op outside Linux/glibc.
+    #[arg(long, global = true, default_value_t = wasmkeep_runtime::default_malloc_arena_max(), value_parser = clap::value_parser!(i32).range(0..))]
+    malloc_arena_max: i32,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -621,6 +626,11 @@ struct ServeArgs {
     /// Seconds an idle actor stays in memory before hibernating.
     #[arg(long, default_value_t = 30)]
     idle_timeout_secs: u64,
+
+    /// On Linux/glibc, sample actors + sockets every N seconds; trim at half
+    /// the peak or zero, with a 60s minimum cooldown. 0 disables checks.
+    #[arg(long, default_value_t = 60)]
+    idle_memory_trim_secs: u64,
 
     /// Address to listen on. Defaults to localhost; put a reverse proxy in
     /// front for public traffic.
@@ -1378,6 +1388,9 @@ fn quiet_broken_pipes() {
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    // Configure before logging, runtimes or any worker threads are started.
+    let arena_configured = wasmkeep_runtime::configure_malloc_arena_max(cli.malloc_arena_max);
     quiet_broken_pipes();
     // All commands reserve stdout for their output (including JSON).
     // Logs go to stderr, with plain text when it is a file or a pipe.
@@ -1392,7 +1405,9 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    if cfg!(all(target_os = "linux", target_env = "gnu")) && !arena_configured {
+        anyhow::bail!("glibc rejected --malloc-arena-max {}", cli.malloc_arena_max);
+    }
     match cli.command {
         Command::Inspect(args) => inspect::run(args),
         Command::Assets(AssetsCommand::Collect(args)) => assets_collect(args),
@@ -1893,6 +1908,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             }
         }
         config.mailbox.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
+        config.idle_memory_trim = std::time::Duration::from_secs(args.idle_memory_trim_secs);
         config.mailbox.max_resident = resident_cap;
         config.socket_limits.per_actor = args.max_sockets_per_actor;
         config.socket_limits.per_app = args.max_sockets_per_app.unwrap_or(requested_sockets);

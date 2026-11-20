@@ -1,0 +1,5964 @@
+{
+  "schema": 1,
+  "source_commit": "7b0b54405236fc80d42533011a0e358f5dc61a75",
+  "date": "2026-11-20",
+  "scope": "Raw unpatched baseline and manual-trim diagnostic only; not evidence of patched RSS recovery. Fleet measurement pending.",
+  "host": {
+    "cpu": "AMD Ryzen 9 7950X",
+    "logical_cpus": 32,
+    "kernel": "Linux 7.3.4-1-cachyos x86_64",
+    "glibc": "2.44",
+    "node": "26.13.1",
+    "rustc": "1.99.1",
+    "allocator": "Rust System / glibc; no allocator feature or global override",
+    "wasmtime": "50.0.2",
+    "thp_enabled": false
+  },
+  "baseline_binary_sha256": "7bb153c217bf7b675ae3136ff36f79c9e8b0301879667dcf02ccca1ee473f818",
+  "settings": {
+    "clients_initial": 1,
+    "ramp": "join:999:30,hold:180,leave:1000:30",
+    "publishers": 1,
+    "aggregate_rate_per_second": 4,
+    "payload_bytes": 256,
+    "recovery_seconds": 300,
+    "max_instances": 1000,
+    "max_memory_bytes_per_linear_memory": 134217728,
+    "max_memories_per_component": 2,
+    "idle_timeout_seconds": 30,
+    "max_sockets_per_node": 50000,
+    "max_sockets_per_actor": 1000
+  },
+  "metric_note": "process_resident_memory_bytes is absent from this build; null throughout. RSS comes from proc status and smaps_rollup. mapping_rss_kib groups mappings by pathname and is not a live-allocation count.",
+  "baseline": {
+    "samples": [
+      {
+        "elapsed": 30.2,
+        "phase": "warmup",
+        "VmRSS": 33724,
+        "RssAnon": 7228,
+        "RssFile": 26496,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 27880,
+          "anonymous": 988,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 0.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 152,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 4,
+          "other_anonymous": 832,
+          "file_special": 27880
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 33724,
+          "Pss_Anon": 7228,
+          "Pss_File": 23738,
+          "Anonymous": 7228,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 7228
+      },
+      {
+        "elapsed": 35.2,
+        "phase": "warmup",
+        "VmRSS": 34068,
+        "RssAnon": 7316,
+        "RssFile": 26752,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 28136,
+          "anonymous": 1076,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 0.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 228,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 4,
+          "other_anonymous": 844,
+          "file_special": 28136
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 34068,
+          "Pss_Anon": 7316,
+          "Pss_File": 23994,
+          "Anonymous": 7316,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 7316
+      },
+      {
+        "elapsed": 35.23,
+        "phase": "c1-before",
+        "VmRSS": 34104,
+        "RssAnon": 7352,
+        "RssFile": 26752,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 28136,
+          "anonymous": 1112,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 0.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 264,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 4,
+          "other_anonymous": 844,
+          "file_special": 28136
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 34104,
+          "Pss_Anon": 7352,
+          "Pss_File": 23994,
+          "Anonymous": 7352,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 7352
+      },
+      {
+        "elapsed": 45.26,
+        "phase": "c1-load",
+        "VmRSS": 108116,
+        "RssAnon": 61552,
+        "RssFile": 46372,
+        "RssShmem": 192,
+        "Threads": 38,
+        "mapping_rss_kib": {
+          "file_or_special": 51680,
+          "anonymous": 51580,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 6.0,
+          "wasmkeep_socket_sessions": 315.0,
+          "wasmkeep_websockets_open": 315.0,
+          "wasmkeep_wakes_total": 6.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 350,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 48852,
+          "linear_pool": 5848,
+          "table_pool_region": 72,
+          "stack_sized_mappings": 648,
+          "other_anonymous": 1908,
+          "file_special": 45932
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 108116,
+          "Pss_Anon": 61552,
+          "Pss_File": 42274,
+          "Anonymous": 61552,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 61552
+      },
+      {
+        "elapsed": 55.3,
+        "phase": "c1-load",
+        "VmRSS": 167580,
+        "RssAnon": 119652,
+        "RssFile": 47608,
+        "RssShmem": 320,
+        "Threads": 42,
+        "mapping_rss_kib": {
+          "file_or_special": 55856,
+          "anonymous": 106868,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 10.0,
+          "wasmkeep_socket_sessions": 651.0,
+          "wasmkeep_websockets_open": 651.0,
+          "wasmkeep_wakes_total": 10.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 698,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 102772,
+          "linear_pool": 9924,
+          "table_pool_region": 120,
+          "stack_sized_mappings": 900,
+          "other_anonymous": 2948,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 167580,
+          "Pss_Anon": 119652,
+          "Pss_File": 42275,
+          "Anonymous": 119652,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 119652
+      },
+      {
+        "elapsed": 65.34,
+        "phase": "c1-load",
+        "VmRSS": 226172,
+        "RssAnon": 176456,
+        "RssFile": 49236,
+        "RssShmem": 480,
+        "Threads": 44,
+        "mapping_rss_kib": {
+          "file_or_special": 61784,
+          "anonymous": 160368,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 881.0,
+          "wasmkeep_websockets_open": 881.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 943,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 155928,
+          "linear_pool": 15856,
+          "table_pool_region": 192,
+          "stack_sized_mappings": 948,
+          "other_anonymous": 3008,
+          "file_special": 46220
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226172,
+          "Pss_Anon": 176456,
+          "Pss_File": 42343,
+          "Anonymous": 176456,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 176456
+      },
+      {
+        "elapsed": 75.37,
+        "phase": "c1-load",
+        "VmRSS": 236000,
+        "RssAnon": 187172,
+        "RssFile": 48348,
+        "RssShmem": 480,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 61076,
+          "anonymous": 170068,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 1063,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 165332,
+          "linear_pool": 15288,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1020,
+          "other_anonymous": 3104,
+          "file_special": 46220
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 236000,
+          "Pss_Anon": 187172,
+          "Pss_File": 42175,
+          "Anonymous": 187172,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 187172
+      },
+      {
+        "elapsed": 85.41,
+        "phase": "c1-load",
+        "VmRSS": 236924,
+        "RssAnon": 188348,
+        "RssFile": 48096,
+        "RssShmem": 480,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 61076,
+          "anonymous": 170992,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 1063,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 166096,
+          "linear_pool": 15448,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1020,
+          "other_anonymous": 3104,
+          "file_special": 46220
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 236924,
+          "Pss_Anon": 188348,
+          "Pss_File": 42155,
+          "Anonymous": 188348,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 188348
+      },
+      {
+        "elapsed": 95.45,
+        "phase": "c1-load",
+        "VmRSS": 237660,
+        "RssAnon": 189296,
+        "RssFile": 47884,
+        "RssShmem": 480,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 61076,
+          "anonymous": 171728,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 1063,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 166532,
+          "linear_pool": 15748,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1020,
+          "other_anonymous": 3104,
+          "file_special": 46220
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 237660,
+          "Pss_Anon": 189296,
+          "Pss_File": 42103,
+          "Anonymous": 189296,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 189296
+      },
+      {
+        "elapsed": 105.49,
+        "phase": "c1-load",
+        "VmRSS": 237476,
+        "RssAnon": 189292,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 172200,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 166816,
+          "linear_pool": 15324,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1020,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 237476,
+          "Pss_Anon": 189292,
+          "Pss_File": 41967,
+          "Anonymous": 189292,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 189292
+      },
+      {
+        "elapsed": 115.52,
+        "phase": "c1-load",
+        "VmRSS": 237988,
+        "RssAnon": 189804,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 172712,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 166868,
+          "linear_pool": 15772,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1032,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 237988,
+          "Pss_Anon": 189804,
+          "Pss_File": 41967,
+          "Anonymous": 189804,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 189804
+      },
+      {
+        "elapsed": 125.56,
+        "phase": "c1-load",
+        "VmRSS": 238432,
+        "RssAnon": 190248,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 173156,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 166984,
+          "linear_pool": 16100,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1032,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 238432,
+          "Pss_Anon": 190248,
+          "Pss_File": 41967,
+          "Anonymous": 190248,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 190248
+      },
+      {
+        "elapsed": 135.6,
+        "phase": "c1-load",
+        "VmRSS": 239108,
+        "RssAnon": 190924,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 173832,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1061,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 167332,
+          "linear_pool": 16396,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 239108,
+          "Pss_Anon": 190924,
+          "Pss_File": 41967,
+          "Anonymous": 190924,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 190924
+      },
+      {
+        "elapsed": 145.64,
+        "phase": "c1-load",
+        "VmRSS": 239856,
+        "RssAnon": 191672,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 174580,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 167540,
+          "linear_pool": 16936,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 239856,
+          "Pss_Anon": 191672,
+          "Pss_File": 41967,
+          "Anonymous": 191672,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 191672
+      },
+      {
+        "elapsed": 155.67,
+        "phase": "c1-load",
+        "VmRSS": 240188,
+        "RssAnon": 192004,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 174912,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 167580,
+          "linear_pool": 17228,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 240188,
+          "Pss_Anon": 192004,
+          "Pss_File": 41967,
+          "Anonymous": 192004,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 192004
+      },
+      {
+        "elapsed": 165.71,
+        "phase": "c1-load",
+        "VmRSS": 240580,
+        "RssAnon": 192396,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 175304,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 167624,
+          "linear_pool": 17576,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 240580,
+          "Pss_Anon": 192396,
+          "Pss_File": 41967,
+          "Anonymous": 192396,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 192396
+      },
+      {
+        "elapsed": 175.75,
+        "phase": "c1-load",
+        "VmRSS": 241124,
+        "RssAnon": 192940,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 175848,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 167676,
+          "linear_pool": 18068,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 241124,
+          "Pss_Anon": 192940,
+          "Pss_File": 41967,
+          "Anonymous": 192940,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 192940
+      },
+      {
+        "elapsed": 185.79,
+        "phase": "c1-load",
+        "VmRSS": 241624,
+        "RssAnon": 193440,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 176348,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 167876,
+          "linear_pool": 18368,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 241624,
+          "Pss_Anon": 193440,
+          "Pss_File": 41967,
+          "Anonymous": 193440,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 193440
+      },
+      {
+        "elapsed": 195.83,
+        "phase": "c1-load",
+        "VmRSS": 242068,
+        "RssAnon": 193884,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 176792,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168052,
+          "linear_pool": 18636,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 242068,
+          "Pss_Anon": 193884,
+          "Pss_File": 41967,
+          "Anonymous": 193884,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 193884
+      },
+      {
+        "elapsed": 205.87,
+        "phase": "c1-load",
+        "VmRSS": 242528,
+        "RssAnon": 194344,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 177252,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168176,
+          "linear_pool": 18972,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 242528,
+          "Pss_Anon": 194344,
+          "Pss_File": 41967,
+          "Anonymous": 194344,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 194344
+      },
+      {
+        "elapsed": 215.91,
+        "phase": "c1-load",
+        "VmRSS": 242852,
+        "RssAnon": 194668,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 177576,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168248,
+          "linear_pool": 19224,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 242852,
+          "Pss_Anon": 194668,
+          "Pss_File": 41967,
+          "Anonymous": 194668,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 194668
+      },
+      {
+        "elapsed": 225.94,
+        "phase": "c1-load",
+        "VmRSS": 243308,
+        "RssAnon": 195124,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 178032,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168460,
+          "linear_pool": 19468,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1064,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 243308,
+          "Pss_Anon": 195124,
+          "Pss_File": 41967,
+          "Anonymous": 195124,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 195124
+      },
+      {
+        "elapsed": 235.98,
+        "phase": "c1-load",
+        "VmRSS": 243824,
+        "RssAnon": 195640,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 178548,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168760,
+          "linear_pool": 19652,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1096,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 243824,
+          "Pss_Anon": 195640,
+          "Pss_File": 41967,
+          "Anonymous": 195640,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 195640
+      },
+      {
+        "elapsed": 246.02,
+        "phase": "c1-load",
+        "VmRSS": 244164,
+        "RssAnon": 195980,
+        "RssFile": 47736,
+        "RssShmem": 448,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 60420,
+          "anonymous": 178888,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 988.0,
+          "wasmkeep_websockets_open": 988.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1048,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168836,
+          "linear_pool": 19916,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1096,
+          "other_anonymous": 3104,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 244164,
+          "Pss_Anon": 195980,
+          "Pss_File": 41967,
+          "Anonymous": 195980,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 195980
+      },
+      {
+        "elapsed": 256.06,
+        "phase": "c1-load",
+        "VmRSS": 241168,
+        "RssAnon": 193548,
+        "RssFile": 47236,
+        "RssShmem": 384,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 58008,
+          "anonymous": 178304,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 616.0,
+          "wasmkeep_websockets_open": 616.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 4.0
+        },
+        "fds": 669,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 169348,
+          "linear_pool": 16348,
+          "table_pool_region": 144,
+          "stack_sized_mappings": 1128,
+          "other_anonymous": 3156,
+          "file_special": 46188
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 241168,
+          "Pss_Anon": 193548,
+          "Pss_File": 42163,
+          "Anonymous": 193548,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 193548
+      },
+      {
+        "elapsed": 266.1,
+        "phase": "c1-load",
+        "VmRSS": 235580,
+        "RssAnon": 189328,
+        "RssFile": 46028,
+        "RssShmem": 224,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 52788,
+          "anonymous": 177936,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 286.0,
+          "wasmkeep_websockets_open": 286.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 9.0
+        },
+        "fds": 324,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 9100,
+          "table_pool_region": 84,
+          "stack_sized_mappings": 1144,
+          "other_anonymous": 3156,
+          "file_special": 46028
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 235580,
+          "Pss_Anon": 189328,
+          "Pss_File": 42163,
+          "Anonymous": 189328,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 189328
+      },
+      {
+        "elapsed": 276.13,
+        "phase": "c1-load",
+        "VmRSS": 229668,
+        "RssAnon": 184440,
+        "RssFile": 45132,
+        "RssShmem": 96,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 48676,
+          "anonymous": 176136,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 13.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 3292,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45964
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 229668,
+          "Pss_Anon": 184440,
+          "Pss_File": 42227,
+          "Anonymous": 184440,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 184440
+      },
+      {
+        "elapsed": 276.17,
+        "phase": "c1-after",
+        "VmRSS": 229668,
+        "RssAnon": 184440,
+        "RssFile": 45132,
+        "RssShmem": 96,
+        "Threads": 47,
+        "mapping_rss_kib": {
+          "file_or_special": 48676,
+          "anonymous": 176136,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 13.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 3292,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45964
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 229668,
+          "Pss_Anon": 184440,
+          "Pss_File": 42227,
+          "Anonymous": 184440,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 184440
+      },
+      {
+        "elapsed": 306.2,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 336.24,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 366.28,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 396.31,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 426.35,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 456.38,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 486.42,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41664,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 516.46,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 546.5,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 576.2,
+        "phase": "c1-recovery",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 576.24,
+        "phase": "c1-plus5m",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 576.28,
+        "phase": "c2-before",
+        "VmRSS": 226244,
+        "RssAnon": 181760,
+        "RssFile": 44484,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45868,
+          "anonymous": 175520,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 171212,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1152,
+          "other_anonymous": 3156,
+          "file_special": 45868
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226244,
+          "Pss_Anon": 181760,
+          "Pss_File": 41663,
+          "Anonymous": 181760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 181760
+      },
+      {
+        "elapsed": 586.32,
+        "phase": "c2-load",
+        "VmRSS": 237276,
+        "RssAnon": 190424,
+        "RssFile": 46660,
+        "RssShmem": 192,
+        "Threads": 38,
+        "mapping_rss_kib": {
+          "file_or_special": 52000,
+          "anonymous": 178500,
+          "heap": 6776
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 6.0,
+          "wasmkeep_socket_sessions": 329.0,
+          "wasmkeep_websockets_open": 329.0,
+          "wasmkeep_wakes_total": 22.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 365,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 6776,
+          "secondary_arena_mappings": 173940,
+          "linear_pool": 5848,
+          "table_pool_region": 72,
+          "stack_sized_mappings": 1212,
+          "other_anonymous": 3176,
+          "file_special": 46252
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 237276,
+          "Pss_Anon": 190424,
+          "Pss_File": 42583,
+          "Anonymous": 190424,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 190424
+      },
+      {
+        "elapsed": 596.36,
+        "phase": "c2-load",
+        "VmRSS": 258768,
+        "RssAnon": 210564,
+        "RssFile": 47884,
+        "RssShmem": 320,
+        "Threads": 42,
+        "mapping_rss_kib": {
+          "file_or_special": 56176,
+          "anonymous": 194984,
+          "heap": 7608
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 10.0,
+          "wasmkeep_socket_sessions": 667.0,
+          "wasmkeep_websockets_open": 667.0,
+          "wasmkeep_wakes_total": 26.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 716,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 7608,
+          "secondary_arena_mappings": 190160,
+          "linear_pool": 9924,
+          "table_pool_region": 120,
+          "stack_sized_mappings": 1388,
+          "other_anonymous": 3188,
+          "file_special": 46380
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 258768,
+          "Pss_Anon": 210564,
+          "Pss_File": 42569,
+          "Anonymous": 210564,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 210564
+      },
+      {
+        "elapsed": 606.41,
+        "phase": "c2-load",
+        "VmRSS": 288372,
+        "RssAnon": 238816,
+        "RssFile": 49108,
+        "RssShmem": 448,
+        "Threads": 45,
+        "mapping_rss_kib": {
+          "file_or_special": 61060,
+          "anonymous": 219516,
+          "heap": 8524
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 943.0,
+          "wasmkeep_websockets_open": 943.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1003,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8524,
+          "secondary_arena_mappings": 214352,
+          "linear_pool": 14844,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1484,
+          "other_anonymous": 3208,
+          "file_special": 46508
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 288372,
+          "Pss_Anon": 238816,
+          "Pss_File": 42663,
+          "Anonymous": 238816,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 238816
+      },
+      {
+        "elapsed": 616.45,
+        "phase": "c2-load",
+        "VmRSS": 291092,
+        "RssAnon": 242368,
+        "RssFile": 48276,
+        "RssShmem": 448,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60352,
+          "anonymous": 222216,
+          "heap": 8524
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8524,
+          "secondary_arena_mappings": 216904,
+          "linear_pool": 14264,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1516,
+          "other_anonymous": 3208,
+          "file_special": 46508
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 291092,
+          "Pss_Anon": 242368,
+          "Pss_File": 42488,
+          "Anonymous": 242368,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 242368
+      },
+      {
+        "elapsed": 626.49,
+        "phase": "c2-load",
+        "VmRSS": 291696,
+        "RssAnon": 243140,
+        "RssFile": 48108,
+        "RssShmem": 448,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60352,
+          "anonymous": 222820,
+          "heap": 8524
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8524,
+          "secondary_arena_mappings": 217296,
+          "linear_pool": 14444,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1548,
+          "other_anonymous": 3208,
+          "file_special": 46508
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 291696,
+          "Pss_Anon": 243140,
+          "Pss_File": 42482,
+          "Anonymous": 243140,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 243140
+      },
+      {
+        "elapsed": 636.53,
+        "phase": "c2-load",
+        "VmRSS": 292188,
+        "RssAnon": 243824,
+        "RssFile": 47916,
+        "RssShmem": 448,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60352,
+          "anonymous": 223264,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1059,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 217476,
+          "linear_pool": 14708,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1548,
+          "other_anonymous": 3208,
+          "file_special": 46508
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 292188,
+          "Pss_Anon": 243824,
+          "Pss_File": 42419,
+          "Anonymous": 243824,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 243824
+      },
+      {
+        "elapsed": 646.57,
+        "phase": "c2-load",
+        "VmRSS": 291820,
+        "RssAnon": 243640,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 223552,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 217548,
+          "linear_pool": 14300,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 291820,
+          "Pss_Anon": 243640,
+          "Pss_File": 42283,
+          "Anonymous": 243640,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 243640
+      },
+      {
+        "elapsed": 656.62,
+        "phase": "c2-load",
+        "VmRSS": 292196,
+        "RssAnon": 244016,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 223928,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 217568,
+          "linear_pool": 14656,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 292196,
+          "Pss_Anon": 244016,
+          "Pss_File": 42285,
+          "Anonymous": 244016,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 244016
+      },
+      {
+        "elapsed": 666.66,
+        "phase": "c2-load",
+        "VmRSS": 292696,
+        "RssAnon": 244516,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 224428,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 217712,
+          "linear_pool": 15012,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 292696,
+          "Pss_Anon": 244516,
+          "Pss_File": 42287,
+          "Anonymous": 244516,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 244516
+      },
+      {
+        "elapsed": 676.7,
+        "phase": "c2-load",
+        "VmRSS": 293120,
+        "RssAnon": 244940,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 224852,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 217872,
+          "linear_pool": 15276,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 293120,
+          "Pss_Anon": 244940,
+          "Pss_File": 42287,
+          "Anonymous": 244940,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 244940
+      },
+      {
+        "elapsed": 686.74,
+        "phase": "c2-load",
+        "VmRSS": 293772,
+        "RssAnon": 245592,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 225504,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218036,
+          "linear_pool": 15764,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 293772,
+          "Pss_Anon": 245592,
+          "Pss_File": 42287,
+          "Anonymous": 245592,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 245592
+      },
+      {
+        "elapsed": 696.78,
+        "phase": "c2-load",
+        "VmRSS": 294084,
+        "RssAnon": 245904,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 225816,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218036,
+          "linear_pool": 16076,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 294084,
+          "Pss_Anon": 245904,
+          "Pss_File": 42284,
+          "Anonymous": 245904,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 245904
+      },
+      {
+        "elapsed": 706.82,
+        "phase": "c2-load",
+        "VmRSS": 294392,
+        "RssAnon": 246212,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 226124,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218052,
+          "linear_pool": 16368,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 294392,
+          "Pss_Anon": 246212,
+          "Pss_File": 42286,
+          "Anonymous": 246212,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 246212
+      },
+      {
+        "elapsed": 716.86,
+        "phase": "c2-load",
+        "VmRSS": 294844,
+        "RssAnon": 246664,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 226576,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218080,
+          "linear_pool": 16792,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 294844,
+          "Pss_Anon": 246664,
+          "Pss_File": 42286,
+          "Anonymous": 246664,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 246664
+      },
+      {
+        "elapsed": 726.9,
+        "phase": "c2-load",
+        "VmRSS": 295140,
+        "RssAnon": 246960,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 226872,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218092,
+          "linear_pool": 17076,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 295140,
+          "Pss_Anon": 246960,
+          "Pss_File": 42289,
+          "Anonymous": 246960,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 246960
+      },
+      {
+        "elapsed": 736.94,
+        "phase": "c2-load",
+        "VmRSS": 295420,
+        "RssAnon": 247240,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 227152,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218104,
+          "linear_pool": 17344,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 295420,
+          "Pss_Anon": 247240,
+          "Pss_File": 42290,
+          "Anonymous": 247240,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 247240
+      },
+      {
+        "elapsed": 746.98,
+        "phase": "c2-load",
+        "VmRSS": 295680,
+        "RssAnon": 247500,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 227412,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218104,
+          "linear_pool": 17604,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 295680,
+          "Pss_Anon": 247500,
+          "Pss_File": 42290,
+          "Anonymous": 247500,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 247500
+      },
+      {
+        "elapsed": 757.02,
+        "phase": "c2-load",
+        "VmRSS": 295960,
+        "RssAnon": 247780,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60404,
+          "anonymous": 227712,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1056,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218176,
+          "linear_pool": 18528,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 295960,
+          "Pss_Anon": 247780,
+          "Pss_File": 42290,
+          "Anonymous": 247780,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 247780
+      },
+      {
+        "elapsed": 767.06,
+        "phase": "c2-load",
+        "VmRSS": 296188,
+        "RssAnon": 248008,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 227920,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218176,
+          "linear_pool": 18040,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 296188,
+          "Pss_Anon": 248008,
+          "Pss_File": 42288,
+          "Anonymous": 248008,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 248008
+      },
+      {
+        "elapsed": 777.1,
+        "phase": "c2-load",
+        "VmRSS": 296424,
+        "RssAnon": 248244,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 228156,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1057,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218184,
+          "linear_pool": 18268,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 296424,
+          "Pss_Anon": 248244,
+          "Pss_File": 42290,
+          "Anonymous": 248244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 248244
+      },
+      {
+        "elapsed": 787.14,
+        "phase": "c2-load",
+        "VmRSS": 296628,
+        "RssAnon": 248448,
+        "RssFile": 47764,
+        "RssShmem": 416,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 59696,
+          "anonymous": 228360,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 13.0,
+          "wasmkeep_socket_sessions": 974.0,
+          "wasmkeep_websockets_open": 974.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 1031,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218184,
+          "linear_pool": 18472,
+          "table_pool_region": 156,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3208,
+          "file_special": 46476
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 296628,
+          "Pss_Anon": 248448,
+          "Pss_File": 42289,
+          "Anonymous": 248448,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 248448
+      },
+      {
+        "elapsed": 797.17,
+        "phase": "c2-load",
+        "VmRSS": 293688,
+        "RssAnon": 245744,
+        "RssFile": 47592,
+        "RssShmem": 352,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 57220,
+          "anonymous": 227172,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 610.0,
+          "wasmkeep_websockets_open": 610.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 20.0
+        },
+        "fds": 660,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218184,
+          "linear_pool": 14892,
+          "table_pool_region": 132,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46412
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 292964,
+          "Pss_Anon": 245400,
+          "Pss_File": 42421,
+          "Anonymous": 245400,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 245400
+      },
+      {
+        "elapsed": 807.21,
+        "phase": "c2-load",
+        "VmRSS": 287348,
+        "RssAnon": 240864,
+        "RssFile": 46260,
+        "RssShmem": 224,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 53044,
+          "anonymous": 225732,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 303.0,
+          "wasmkeep_websockets_open": 303.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 24.0
+        },
+        "fds": 341,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 9120,
+          "table_pool_region": 84,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46284
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 287348,
+          "Pss_Anon": 240864,
+          "Pss_File": 42421,
+          "Anonymous": 240864,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 240864
+      },
+      {
+        "elapsed": 817.25,
+        "phase": "c2-load",
+        "VmRSS": 281356,
+        "RssAnon": 235944,
+        "RssFile": 45316,
+        "RssShmem": 96,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 48868,
+          "anonymous": 223916,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 28.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 3304,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46156
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 281356,
+          "Pss_Anon": 235944,
+          "Pss_File": 42422,
+          "Anonymous": 235944,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 235944
+      },
+      {
+        "elapsed": 817.29,
+        "phase": "c2-after",
+        "VmRSS": 281356,
+        "RssAnon": 235944,
+        "RssFile": 45316,
+        "RssShmem": 96,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 48868,
+          "anonymous": 223916,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 28.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 3304,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46156
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 281356,
+          "Pss_Anon": 235944,
+          "Pss_File": 42422,
+          "Anonymous": 235944,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 235944
+      },
+      {
+        "elapsed": 847.33,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41861,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 877.36,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41862,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 907.4,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41862,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 937.44,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41862,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 967.47,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41861,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 997.51,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41862,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 1027.55,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41862,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 1057.59,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41862,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 1087.62,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41861,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 1117.33,
+        "phase": "c2-recovery",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41861,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 1117.36,
+        "phase": "c2-plus5m",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41861,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      },
+      {
+        "elapsed": 1117.52,
+        "phase": "post-denied-debugger-attempt",
+        "VmRSS": 277920,
+        "RssAnon": 233244,
+        "RssFile": 44676,
+        "RssShmem": 0,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46060,
+          "anonymous": 223288,
+          "heap": 8572
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 31.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8572,
+          "secondary_arena_mappings": 218516,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1560,
+          "other_anonymous": 3212,
+          "file_special": 46060
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 277920,
+          "Pss_Anon": 233244,
+          "Pss_File": 41861,
+          "Anonymous": 233244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 233244
+      }
+    ],
+    "harness": [
+      {
+        "duration_s": 240,
+        "peak_clients": 1000,
+        "joined_total": 1000,
+        "left_total": 1000,
+        "payload_bytes": 256,
+        "rate_per_s": 4,
+        "publishers": 1,
+        "counters": {
+          "deliveries": 839919,
+          "repeats": 0,
+          "discarded_catchup": 0,
+          "discarded_live": 0,
+          "history_requests": 0,
+          "gaps_recovered": 0,
+          "recovered_messages": 0,
+          "void_numbers": 0,
+          "resets": 0,
+          "reconnect_attempts": 1156,
+          "close_4801": 1213,
+          "close_4802": 0,
+          "errors": 0,
+          "publish_ok": 960,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "publish_retries": 0,
+          "forced_disconnects": 0,
+          "smoke_dropped_frames": 0,
+          "clients_joined": 1000,
+          "clients_left": 1000,
+          "stall_pauses": 0,
+          "stall_resumes": 0
+        },
+        "generator": {
+          "valid": true,
+          "saturation_judged": true,
+          "invalid_reasons": [],
+          "saturated_sample_share": 0.004149377593360996,
+          "peak_cpu_cores": 1.3887790327545155,
+          "peak_rss_bytes": 226000896,
+          "peak_loop_delay_p99_ms": 16.383999,
+          "peak_open_fds": 1027,
+          "open_file_soft_limit": 1048576,
+          "history_concurrency": 256,
+          "history_queue_wait": {
+            "count": 0,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null,
+            "max_ms": null
+          }
+        },
+        "incomplete_clients": [],
+        "unacknowledged_publishes": [],
+        "publish_failures_by_status": {}
+      },
+      {
+        "duration_s": 240,
+        "peak_clients": 1000,
+        "joined_total": 1000,
+        "left_total": 1000,
+        "payload_bytes": 256,
+        "rate_per_s": 4,
+        "publishers": 1,
+        "counters": {
+          "deliveries": 838504,
+          "repeats": 0,
+          "discarded_catchup": 0,
+          "discarded_live": 0,
+          "history_requests": 2,
+          "gaps_recovered": 0,
+          "recovered_messages": 0,
+          "void_numbers": 0,
+          "resets": 0,
+          "reconnect_attempts": 1055,
+          "close_4801": 1099,
+          "close_4802": 0,
+          "errors": 0,
+          "publish_ok": 959,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "publish_retries": 0,
+          "forced_disconnects": 0,
+          "smoke_dropped_frames": 0,
+          "clients_joined": 1000,
+          "clients_left": 1000,
+          "stall_pauses": 0,
+          "stall_resumes": 0
+        },
+        "generator": {
+          "valid": true,
+          "saturation_judged": true,
+          "invalid_reasons": [],
+          "saturated_sample_share": 0.004149377593360996,
+          "peak_cpu_cores": 1.2054649405125395,
+          "peak_rss_bytes": 220516352,
+          "peak_loop_delay_p99_ms": 65.568767,
+          "peak_open_fds": 1027,
+          "open_file_soft_limit": 1048576,
+          "history_concurrency": 256,
+          "history_queue_wait": {
+            "count": 0,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null,
+            "max_ms": null
+          }
+        },
+        "incomplete_clients": [],
+        "unacknowledged_publishes": [],
+        "publish_failures_by_status": {}
+      }
+    ]
+  },
+  "trim_diagnostic": {
+    "samples": [
+      {
+        "elapsed": 30.2,
+        "phase": "warmup",
+        "VmRSS": 33864,
+        "RssAnon": 7256,
+        "RssFile": 26596,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 28000,
+          "anonymous": 1008,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 0.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 4,
+          "other_anonymous": 836,
+          "file_special": 28000
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 33864,
+          "Pss_Anon": 7256,
+          "Pss_File": 23810,
+          "Anonymous": 7256,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 7256
+      },
+      {
+        "elapsed": 35.2,
+        "phase": "warmup",
+        "VmRSS": 34132,
+        "RssAnon": 7268,
+        "RssFile": 26852,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 28256,
+          "anonymous": 1020,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 0.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 4,
+          "other_anonymous": 848,
+          "file_special": 28256
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 34132,
+          "Pss_Anon": 7268,
+          "Pss_File": 24066,
+          "Anonymous": 7268,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 7268
+      },
+      {
+        "elapsed": 35.23,
+        "phase": "c1-before",
+        "VmRSS": 34132,
+        "RssAnon": 7268,
+        "RssFile": 26852,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 28256,
+          "anonymous": 1020,
+          "heap": 4856
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 0.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4856,
+          "secondary_arena_mappings": 168,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 4,
+          "other_anonymous": 848,
+          "file_special": 28256
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 34132,
+          "Pss_Anon": 7268,
+          "Pss_File": 24066,
+          "Anonymous": 7268,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 7268
+      },
+      {
+        "elapsed": 45.26,
+        "phase": "c1-load",
+        "VmRSS": 110148,
+        "RssAnon": 63464,
+        "RssFile": 46480,
+        "RssShmem": 204,
+        "Threads": 38,
+        "mapping_rss_kib": {
+          "file_or_special": 51800,
+          "anonymous": 51464,
+          "heap": 6884
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 6.0,
+          "wasmkeep_socket_sessions": 329.0,
+          "wasmkeep_websockets_open": 329.0,
+          "wasmkeep_wakes_total": 6.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 365,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 6884,
+          "secondary_arena_mappings": 48556,
+          "linear_pool": 5856,
+          "table_pool_region": 72,
+          "stack_sized_mappings": 684,
+          "other_anonymous": 2044,
+          "file_special": 46052
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 110148,
+          "Pss_Anon": 63464,
+          "Pss_File": 42338,
+          "Anonymous": 63464,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 63464
+      },
+      {
+        "elapsed": 55.29,
+        "phase": "c1-load",
+        "VmRSS": 163672,
+        "RssAnon": 115680,
+        "RssFile": 47660,
+        "RssShmem": 332,
+        "Threads": 42,
+        "mapping_rss_kib": {
+          "file_or_special": 55976,
+          "anonymous": 98920,
+          "heap": 8776
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 10.0,
+          "wasmkeep_socket_sessions": 663.0,
+          "wasmkeep_websockets_open": 663.0,
+          "wasmkeep_wakes_total": 10.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 710,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 8776,
+          "secondary_arena_mappings": 95404,
+          "linear_pool": 9940,
+          "table_pool_region": 120,
+          "stack_sized_mappings": 940,
+          "other_anonymous": 2312,
+          "file_special": 46180
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 163672,
+          "Pss_Anon": 115680,
+          "Pss_File": 42321,
+          "Anonymous": 115680,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 115680
+      },
+      {
+        "elapsed": 65.33,
+        "phase": "c1-load",
+        "VmRSS": 223992,
+        "RssAnon": 174260,
+        "RssFile": 49240,
+        "RssShmem": 492,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 61196,
+          "anonymous": 151644,
+          "heap": 11204
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 957.0,
+          "wasmkeep_websockets_open": 957.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 1019,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11204,
+          "secondary_arena_mappings": 147320,
+          "linear_pool": 15168,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1140,
+          "other_anonymous": 2692,
+          "file_special": 46340
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 224044,
+          "Pss_Anon": 174312,
+          "Pss_File": 42359,
+          "Anonymous": 174312,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 174312
+      },
+      {
+        "elapsed": 75.37,
+        "phase": "c1-load",
+        "VmRSS": 233160,
+        "RssAnon": 184244,
+        "RssFile": 48424,
+        "RssShmem": 492,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 61196,
+          "anonymous": 159656,
+          "heap": 12308
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 1063,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12308,
+          "secondary_arena_mappings": 154656,
+          "linear_pool": 15328,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1220,
+          "other_anonymous": 3128,
+          "file_special": 46340
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 233160,
+          "Pss_Anon": 184244,
+          "Pss_File": 42244,
+          "Anonymous": 184244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 184244
+      },
+      {
+        "elapsed": 85.4,
+        "phase": "c1-load",
+        "VmRSS": 233988,
+        "RssAnon": 185308,
+        "RssFile": 48188,
+        "RssShmem": 492,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 61196,
+          "anonymous": 160440,
+          "heap": 12352
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 1063,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12352,
+          "secondary_arena_mappings": 155276,
+          "linear_pool": 15492,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1220,
+          "other_anonymous": 3128,
+          "file_special": 46340
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 233988,
+          "Pss_Anon": 185308,
+          "Pss_File": 42224,
+          "Anonymous": 185308,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 185308
+      },
+      {
+        "elapsed": 95.44,
+        "phase": "c1-load",
+        "VmRSS": 234484,
+        "RssAnon": 186012,
+        "RssFile": 47980,
+        "RssShmem": 492,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 61196,
+          "anonymous": 160936,
+          "heap": 12352
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 0.0
+        },
+        "fds": 1062,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12352,
+          "secondary_arena_mappings": 155484,
+          "linear_pool": 15780,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1220,
+          "other_anonymous": 3128,
+          "file_special": 46340
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 234484,
+          "Pss_Anon": 186012,
+          "Pss_File": 42176,
+          "Anonymous": 186012,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 186012
+      },
+      {
+        "elapsed": 105.47,
+        "phase": "c1-load",
+        "VmRSS": 234628,
+        "RssAnon": 186332,
+        "RssFile": 47836,
+        "RssShmem": 460,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60540,
+          "anonymous": 161644,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 156028,
+          "linear_pool": 15320,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1232,
+          "other_anonymous": 3128,
+          "file_special": 46308
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 234628,
+          "Pss_Anon": 186332,
+          "Pss_File": 42040,
+          "Anonymous": 186332,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 186332
+      },
+      {
+        "elapsed": 115.51,
+        "phase": "c1-load",
+        "VmRSS": 235184,
+        "RssAnon": 186888,
+        "RssFile": 47836,
+        "RssShmem": 460,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60540,
+          "anonymous": 162196,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1060,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 156136,
+          "linear_pool": 15764,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1232,
+          "other_anonymous": 3128,
+          "file_special": 46308
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 235184,
+          "Pss_Anon": 186888,
+          "Pss_File": 42040,
+          "Anonymous": 186888,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 186888
+      },
+      {
+        "elapsed": 125.55,
+        "phase": "c1-load",
+        "VmRSS": 235676,
+        "RssAnon": 187380,
+        "RssFile": 47836,
+        "RssShmem": 460,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60540,
+          "anonymous": 162688,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 995.0,
+          "wasmkeep_websockets_open": 995.0,
+          "wasmkeep_wakes_total": 15.0,
+          "wasmkeep_hibernations_total": 1.0
+        },
+        "fds": 1055,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 156268,
+          "linear_pool": 16124,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1232,
+          "other_anonymous": 3128,
+          "file_special": 46308
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 235676,
+          "Pss_Anon": 187380,
+          "Pss_File": 42040,
+          "Anonymous": 187380,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 187380
+      },
+      {
+        "elapsed": 135.59,
+        "phase": "c1-load",
+        "VmRSS": 236424,
+        "RssAnon": 188692,
+        "RssFile": 47336,
+        "RssShmem": 396,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 58128,
+          "anonymous": 165848,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 642.0,
+          "wasmkeep_websockets_open": 642.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 4.0
+        },
+        "fds": 695,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 159480,
+          "linear_pool": 13652,
+          "table_pool_region": 144,
+          "stack_sized_mappings": 1256,
+          "other_anonymous": 3136,
+          "file_special": 46308
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 236424,
+          "Pss_Anon": 188692,
+          "Pss_File": 42236,
+          "Anonymous": 188692,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 188692
+      },
+      {
+        "elapsed": 145.62,
+        "phase": "c1-load",
+        "VmRSS": 234692,
+        "RssAnon": 188328,
+        "RssFile": 46128,
+        "RssShmem": 236,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 52908,
+          "anonymous": 169336,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 295.0,
+          "wasmkeep_websockets_open": 295.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 9.0
+        },
+        "fds": 333,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 163672,
+          "linear_pool": 7940,
+          "table_pool_region": 84,
+          "stack_sized_mappings": 1264,
+          "other_anonymous": 3136,
+          "file_special": 46148
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 234692,
+          "Pss_Anon": 188328,
+          "Pss_File": 42236,
+          "Anonymous": 188328,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 188328
+      },
+      {
+        "elapsed": 155.66,
+        "phase": "c1-load",
+        "VmRSS": 229860,
+        "RssAnon": 184584,
+        "RssFile": 45168,
+        "RssShmem": 108,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 48732,
+          "anonymous": 168680,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 13.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 163840,
+          "linear_pool": 3108,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1272,
+          "other_anonymous": 3136,
+          "file_special": 46020
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 229860,
+          "Pss_Anon": 184584,
+          "Pss_File": 42236,
+          "Anonymous": 184584,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 184584
+      },
+      {
+        "elapsed": 155.7,
+        "phase": "c1-after",
+        "VmRSS": 229860,
+        "RssAnon": 184584,
+        "RssFile": 45168,
+        "RssShmem": 108,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 48732,
+          "anonymous": 168680,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 13.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 163840,
+          "linear_pool": 3108,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1272,
+          "other_anonymous": 3136,
+          "file_special": 46020
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 229860,
+          "Pss_Anon": 184584,
+          "Pss_File": 42236,
+          "Anonymous": 184584,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 184584
+      },
+      {
+        "elapsed": 185.73,
+        "phase": "c1-recovery",
+        "VmRSS": 226620,
+        "RssAnon": 182088,
+        "RssFile": 44520,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45924,
+          "anonymous": 168248,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 163840,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1272,
+          "other_anonymous": 3136,
+          "file_special": 45924
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226620,
+          "Pss_Anon": 182088,
+          "Pss_File": 41672,
+          "Anonymous": 182088,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 182088
+      },
+      {
+        "elapsed": 185.77,
+        "phase": "c1-recovery-end",
+        "VmRSS": 226620,
+        "RssAnon": 182088,
+        "RssFile": 44520,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45924,
+          "anonymous": 168248,
+          "heap": 12448
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 12448,
+          "secondary_arena_mappings": 163840,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1272,
+          "other_anonymous": 3136,
+          "file_special": 45924
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 226620,
+          "Pss_Anon": 182088,
+          "Pss_File": 41672,
+          "Anonymous": 182088,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 182088
+      },
+      {
+        "elapsed": 185.91,
+        "phase": "c1-post-trim",
+        "VmRSS": 84012,
+        "RssAnon": 39448,
+        "RssFile": 44552,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45988,
+          "anonymous": 33976,
+          "heap": 4048
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4048,
+          "secondary_arena_mappings": 29568,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1272,
+          "other_anonymous": 3136,
+          "file_special": 45988
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 84012,
+          "Pss_Anon": 39448,
+          "Pss_File": 41680,
+          "Anonymous": 39448,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 39448
+      },
+      {
+        "elapsed": 185.94,
+        "phase": "c2-before",
+        "VmRSS": 84324,
+        "RssAnon": 39760,
+        "RssFile": 44552,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 45988,
+          "anonymous": 34288,
+          "heap": 4048
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 16.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4048,
+          "secondary_arena_mappings": 29880,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1272,
+          "other_anonymous": 3136,
+          "file_special": 45988
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 84324,
+          "Pss_Anon": 39760,
+          "Pss_File": 41680,
+          "Anonymous": 39760,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 39760
+      },
+      {
+        "elapsed": 195.97,
+        "phase": "c2-load",
+        "VmRSS": 106556,
+        "RssAnon": 60952,
+        "RssFile": 45496,
+        "RssShmem": 108,
+        "Threads": 36,
+        "mapping_rss_kib": {
+          "file_or_special": 49696,
+          "anonymous": 53520,
+          "heap": 4048
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 3.0,
+          "wasmkeep_socket_sessions": 150.0,
+          "wasmkeep_websockets_open": 150.0,
+          "wasmkeep_wakes_total": 19.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 176,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4048,
+          "secondary_arena_mappings": 48976,
+          "linear_pool": 3496,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1284,
+          "other_anonymous": 3148,
+          "file_special": 46276
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 107280,
+          "Pss_Anon": 61296,
+          "Pss_File": 42703,
+          "Anonymous": 61296,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 61296
+      },
+      {
+        "elapsed": 206.01,
+        "phase": "c2-load",
+        "VmRSS": 107472,
+        "RssAnon": 61912,
+        "RssFile": 45452,
+        "RssShmem": 108,
+        "Threads": 36,
+        "mapping_rss_kib": {
+          "file_or_special": 49696,
+          "anonymous": 54452,
+          "heap": 4048
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 3.0,
+          "wasmkeep_socket_sessions": 150.0,
+          "wasmkeep_websockets_open": 150.0,
+          "wasmkeep_wakes_total": 19.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 176,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 4048,
+          "secondary_arena_mappings": 49852,
+          "linear_pool": 3508,
+          "table_pool_region": 48,
+          "stack_sized_mappings": 1316,
+          "other_anonymous": 3148,
+          "file_special": 46276
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 107472,
+          "Pss_Anon": 61912,
+          "Pss_File": 42472,
+          "Anonymous": 61912,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 61912
+      },
+      {
+        "elapsed": 216.04,
+        "phase": "c2-load",
+        "VmRSS": 163252,
+        "RssAnon": 113936,
+        "RssFile": 48984,
+        "RssShmem": 332,
+        "Threads": 39,
+        "mapping_rss_kib": {
+          "file_or_special": 56296,
+          "anonymous": 99788,
+          "heap": 6684
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 10.0,
+          "wasmkeep_socket_sessions": 364.0,
+          "wasmkeep_websockets_open": 364.0,
+          "wasmkeep_wakes_total": 26.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 411,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 6684,
+          "secondary_arena_mappings": 94860,
+          "linear_pool": 9980,
+          "table_pool_region": 120,
+          "stack_sized_mappings": 1464,
+          "other_anonymous": 3160,
+          "file_special": 46500
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 163352,
+          "Pss_Anon": 114028,
+          "Pss_File": 42972,
+          "Anonymous": 114028,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 114028
+      },
+      {
+        "elapsed": 226.08,
+        "phase": "c2-load",
+        "VmRSS": 205348,
+        "RssAnon": 157640,
+        "RssFile": 47376,
+        "RssShmem": 332,
+        "Threads": 42,
+        "mapping_rss_kib": {
+          "file_or_special": 56296,
+          "anonymous": 140000,
+          "heap": 9052
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 10.0,
+          "wasmkeep_socket_sessions": 836.0,
+          "wasmkeep_websockets_open": 836.0,
+          "wasmkeep_wakes_total": 26.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 884,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 9052,
+          "secondary_arena_mappings": 134964,
+          "linear_pool": 10048,
+          "table_pool_region": 120,
+          "stack_sized_mappings": 1504,
+          "other_anonymous": 3160,
+          "file_special": 46500
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 205348,
+          "Pss_Anon": 157640,
+          "Pss_File": 42482,
+          "Anonymous": 157640,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 157640
+      },
+      {
+        "elapsed": 236.11,
+        "phase": "c2-load",
+        "VmRSS": 228388,
+        "RssAnon": 179288,
+        "RssFile": 48640,
+        "RssShmem": 460,
+        "Threads": 45,
+        "mapping_rss_kib": {
+          "file_or_special": 60472,
+          "anonymous": 157032,
+          "heap": 10884
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 906.0,
+          "wasmkeep_websockets_open": 906.0,
+          "wasmkeep_wakes_total": 30.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 966,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 10884,
+          "secondary_arena_mappings": 151504,
+          "linear_pool": 14460,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1568,
+          "other_anonymous": 3176,
+          "file_special": 46628
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 228388,
+          "Pss_Anon": 179288,
+          "Pss_File": 42590,
+          "Anonymous": 179288,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 179288
+      },
+      {
+        "elapsed": 246.15,
+        "phase": "c2-load",
+        "VmRSS": 238432,
+        "RssAnon": 189516,
+        "RssFile": 48424,
+        "RssShmem": 492,
+        "Threads": 45,
+        "mapping_rss_kib": {
+          "file_or_special": 61516,
+          "anonymous": 165948,
+          "heap": 10968
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 967.0,
+          "wasmkeep_websockets_open": 967.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1029,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 10968,
+          "secondary_arena_mappings": 159692,
+          "linear_pool": 16152,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1600,
+          "other_anonymous": 3180,
+          "file_special": 46660
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 238432,
+          "Pss_Anon": 189516,
+          "Pss_File": 42494,
+          "Anonymous": 189516,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 189516
+      },
+      {
+        "elapsed": 256.19,
+        "phase": "c2-load",
+        "VmRSS": 242128,
+        "RssAnon": 193388,
+        "RssFile": 48248,
+        "RssShmem": 492,
+        "Threads": 45,
+        "mapping_rss_kib": {
+          "file_or_special": 61516,
+          "anonymous": 169572,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 994.0,
+          "wasmkeep_websockets_open": 994.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1056,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 163044,
+          "linear_pool": 16424,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1600,
+          "other_anonymous": 3180,
+          "file_special": 46660
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 242128,
+          "Pss_Anon": 193388,
+          "Pss_File": 42450,
+          "Anonymous": 193388,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 193388
+      },
+      {
+        "elapsed": 266.23,
+        "phase": "c2-load",
+        "VmRSS": 243976,
+        "RssAnon": 195284,
+        "RssFile": 48200,
+        "RssShmem": 492,
+        "Threads": 45,
+        "mapping_rss_kib": {
+          "file_or_special": 61516,
+          "anonymous": 171420,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 1000.0,
+          "wasmkeep_websockets_open": 1000.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1063,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 164684,
+          "linear_pool": 16632,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1600,
+          "other_anonymous": 3180,
+          "file_special": 46660
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 243976,
+          "Pss_Anon": 195284,
+          "Pss_File": 42430,
+          "Anonymous": 195284,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 195284
+      },
+      {
+        "elapsed": 276.26,
+        "phase": "c2-load",
+        "VmRSS": 244396,
+        "RssAnon": 195704,
+        "RssFile": 48200,
+        "RssShmem": 492,
+        "Threads": 45,
+        "mapping_rss_kib": {
+          "file_or_special": 61516,
+          "anonymous": 171840,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 992.0,
+          "wasmkeep_websockets_open": 992.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 1055,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 165068,
+          "linear_pool": 16668,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1600,
+          "other_anonymous": 3180,
+          "file_special": 46660
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 244396,
+          "Pss_Anon": 195704,
+          "Pss_File": 42430,
+          "Anonymous": 195704,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 195704
+      },
+      {
+        "elapsed": 286.3,
+        "phase": "c2-load",
+        "VmRSS": 244936,
+        "RssAnon": 196244,
+        "RssFile": 48200,
+        "RssShmem": 492,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 61516,
+          "anonymous": 172380,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 657.0,
+          "wasmkeep_websockets_open": 657.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 16.0
+        },
+        "fds": 720,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 165168,
+          "linear_pool": 17100,
+          "table_pool_region": 180,
+          "stack_sized_mappings": 1600,
+          "other_anonymous": 3188,
+          "file_special": 46660
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 244936,
+          "Pss_Anon": 196244,
+          "Pss_File": 42432,
+          "Anonymous": 196244,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 196244
+      },
+      {
+        "elapsed": 296.34,
+        "phase": "c2-load",
+        "VmRSS": 244644,
+        "RssAnon": 196132,
+        "RssFile": 48052,
+        "RssShmem": 460,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 60860,
+          "anonymous": 172744,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 14.0,
+          "wasmkeep_socket_sessions": 323.0,
+          "wasmkeep_websockets_open": 323.0,
+          "wasmkeep_wakes_total": 31.0,
+          "wasmkeep_hibernations_total": 17.0
+        },
+        "fds": 383,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 165292,
+          "linear_pool": 16728,
+          "table_pool_region": 168,
+          "stack_sized_mappings": 1600,
+          "other_anonymous": 3188,
+          "file_special": 46628
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 244644,
+          "Pss_Anon": 196132,
+          "Pss_File": 42296,
+          "Anonymous": 196132,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 196132
+      },
+      {
+        "elapsed": 306.38,
+        "phase": "c2-load",
+        "VmRSS": 234332,
+        "RssAnon": 188856,
+        "RssFile": 45368,
+        "RssShmem": 108,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 48988,
+          "anonymous": 174304,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 32.0,
+          "wasmkeep_hibernations_total": 29.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 168772,
+          "linear_pool": 3384,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1632,
+          "other_anonymous": 3192,
+          "file_special": 46276
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 234332,
+          "Pss_Anon": 188856,
+          "Pss_File": 42428,
+          "Anonymous": 188856,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 188856
+      },
+      {
+        "elapsed": 306.42,
+        "phase": "c2-after",
+        "VmRSS": 234332,
+        "RssAnon": 188856,
+        "RssFile": 45368,
+        "RssShmem": 108,
+        "Threads": 46,
+        "mapping_rss_kib": {
+          "file_or_special": 48988,
+          "anonymous": 174304,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 15.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 32.0,
+          "wasmkeep_hibernations_total": 29.0
+        },
+        "fds": 25,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 168772,
+          "linear_pool": 3384,
+          "table_pool_region": 36,
+          "stack_sized_mappings": 1632,
+          "other_anonymous": 3192,
+          "file_special": 46276
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 234332,
+          "Pss_Anon": 188856,
+          "Pss_File": 42428,
+          "Anonymous": 188856,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 188856
+      },
+      {
+        "elapsed": 336.45,
+        "phase": "c2-recovery",
+        "VmRSS": 230816,
+        "RssAnon": 186060,
+        "RssFile": 44744,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46180,
+          "anonymous": 173596,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 32.0,
+          "wasmkeep_hibernations_total": 32.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 168772,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1632,
+          "other_anonymous": 3192,
+          "file_special": 46180
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 230816,
+          "Pss_Anon": 186060,
+          "Pss_File": 41872,
+          "Anonymous": 186060,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 186060
+      },
+      {
+        "elapsed": 336.49,
+        "phase": "c2-recovery-end",
+        "VmRSS": 230816,
+        "RssAnon": 186060,
+        "RssFile": 44744,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46180,
+          "anonymous": 173596,
+          "heap": 11040
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 32.0,
+          "wasmkeep_hibernations_total": 32.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 11040,
+          "secondary_arena_mappings": 168772,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1632,
+          "other_anonymous": 3192,
+          "file_special": 46180
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 230816,
+          "Pss_Anon": 186060,
+          "Pss_File": 41872,
+          "Anonymous": 186060,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 186060
+      },
+      {
+        "elapsed": 336.62,
+        "phase": "c2-post-trim",
+        "VmRSS": 91796,
+        "RssAnon": 47040,
+        "RssFile": 44744,
+        "RssShmem": 12,
+        "Threads": 35,
+        "mapping_rss_kib": {
+          "file_or_special": 46180,
+          "anonymous": 41620,
+          "heap": 3996
+        },
+        "metrics": {
+          "wasmkeep_actors_resident": 0.0,
+          "wasmkeep_socket_sessions": 0.0,
+          "wasmkeep_websockets_open": 0.0,
+          "wasmkeep_wakes_total": 32.0,
+          "wasmkeep_hibernations_total": 32.0
+        },
+        "fds": 16,
+        "process_resident_memory_bytes": null,
+        "attributed_rss_kib": {
+          "brk_heap": 3996,
+          "secondary_arena_mappings": 36796,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 1632,
+          "other_anonymous": 3192,
+          "file_special": 46180
+        },
+        "attributed_swap_kib": {
+          "brk_heap": 0,
+          "secondary_arena_mappings": 0,
+          "linear_pool": 0,
+          "table_pool_region": 0,
+          "stack_sized_mappings": 0,
+          "other_anonymous": 0,
+          "file_special": 0
+        },
+        "smaps_rollup_kib": {
+          "Rss": 91796,
+          "Pss_Anon": 47040,
+          "Pss_File": 41872,
+          "Anonymous": 47040,
+          "AnonHugePages": 0,
+          "Swap": 0
+        },
+        "anonymous_plus_swap_kib": 47040
+      }
+    ],
+    "harness": [
+      {
+        "duration_s": 120,
+        "peak_clients": 1000,
+        "joined_total": 1000,
+        "left_total": 1000,
+        "payload_bytes": 256,
+        "rate_per_s": 4,
+        "publishers": 1,
+        "counters": {
+          "deliveries": 359960,
+          "repeats": 0,
+          "discarded_catchup": 0,
+          "discarded_live": 0,
+          "history_requests": 0,
+          "gaps_recovered": 0,
+          "recovered_messages": 0,
+          "void_numbers": 0,
+          "resets": 0,
+          "reconnect_attempts": 1163,
+          "close_4801": 1205,
+          "close_4802": 0,
+          "errors": 0,
+          "publish_ok": 480,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "publish_retries": 0,
+          "forced_disconnects": 0,
+          "smoke_dropped_frames": 0,
+          "clients_joined": 1000,
+          "clients_left": 1000,
+          "stall_pauses": 0,
+          "stall_resumes": 0
+        },
+        "generator": {
+          "valid": true,
+          "saturation_judged": true,
+          "invalid_reasons": [],
+          "saturated_sample_share": 0.008264462809917356,
+          "peak_cpu_cores": 1.6351528745672945,
+          "peak_rss_bytes": 220258304,
+          "peak_loop_delay_p99_ms": 16.007167,
+          "peak_open_fds": 1026,
+          "open_file_soft_limit": 1048576,
+          "history_concurrency": 256,
+          "history_queue_wait": {
+            "count": 0,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null,
+            "max_ms": null
+          }
+        },
+        "incomplete_clients": [],
+        "unacknowledged_publishes": [],
+        "publish_failures_by_status": {}
+      },
+      {
+        "duration_s": 120,
+        "peak_clients": 1000,
+        "joined_total": 1000,
+        "left_total": 1000,
+        "payload_bytes": 256,
+        "rate_per_s": 4,
+        "publishers": 1,
+        "counters": {
+          "deliveries": 308307,
+          "repeats": 0,
+          "discarded_catchup": 4,
+          "discarded_live": 0,
+          "history_requests": 57,
+          "gaps_recovered": 55,
+          "recovered_messages": 1814,
+          "void_numbers": 0,
+          "resets": 0,
+          "reconnect_attempts": 5431,
+          "close_4801": 1083,
+          "close_4802": 0,
+          "errors": 0,
+          "publish_ok": 480,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "publish_retries": 0,
+          "forced_disconnects": 0,
+          "smoke_dropped_frames": 0,
+          "clients_joined": 1000,
+          "clients_left": 1000,
+          "stall_pauses": 0,
+          "stall_resumes": 0
+        },
+        "generator": {
+          "valid": true,
+          "saturation_judged": true,
+          "invalid_reasons": [],
+          "saturated_sample_share": 0.008333333333333333,
+          "peak_cpu_cores": 1.2439345978185874,
+          "peak_rss_bytes": 232910848,
+          "peak_loop_delay_p99_ms": 15.179775,
+          "peak_open_fds": 1026,
+          "open_file_soft_limit": 1048576,
+          "history_concurrency": 256,
+          "history_queue_wait": {
+            "count": 0,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null,
+            "max_ms": null
+          }
+        },
+        "incomplete_clients": [],
+        "unacknowledged_publishes": [],
+        "publish_failures_by_status": {}
+      }
+    ],
+    "settings_override": {
+      "ramp": "join:999:30,hold:60,leave:1000:30",
+      "recovery_seconds": 30,
+      "instrumentation": "A diagnostic-only preload constructor allowed the parent debugger; GDB called malloc_info, malloc_trim(0), malloc_info after each recovery. No allocator override or arena tunable."
+    },
+    "malloc_info": {
+      "c1-malloc-after": {
+        "arenas": 32,
+        "total:rest": 171443257,
+        "total:mmap": 450560,
+        "system:current": 179929088,
+        "system:max": 181215232,
+        "aspace:total": 179929088,
+        "aspace:mprotect": 179929088
+      },
+      "c1-malloc-before": {
+        "arenas": 32,
+        "total:rest": 172730697,
+        "total:mmap": 450560,
+        "system:current": 181215232,
+        "system:max": 181215232,
+        "aspace:total": 181215232,
+        "aspace:mprotect": 181215232
+      },
+      "c2-malloc-after": {
+        "arenas": 32,
+        "total:rest": 233194201,
+        "total:mmap": 450560,
+        "system:current": 242688000,
+        "system:max": 243974144,
+        "aspace:total": 242688000,
+        "aspace:mprotect": 242688000
+      },
+      "c2-malloc-before": {
+        "arenas": 32,
+        "total:rest": 233194201,
+        "total:mmap": 450560,
+        "system:current": 242688000,
+        "system:max": 243974144,
+        "aspace:total": 242688000,
+        "aspace:mprotect": 242688000
+      }
+    }
+  },
+  "attribution_method": "The original linear-memory reservation bounds identify pool mappings, including file-backed images. Secondary arena regions are 64 MiB-aligned writable anonymous mappings; 31 such regions plus brk match malloc_info reporting 32 arenas in the diagnostic. Stack-sized mappings include native and pool stacks; other anonymous and file/special mappings remain separate. Mapping RSS is not live malloc bytes. Snapshots and metrics are sequential, not atomic.",
+  "paging_note": "Patched workstation runs paged and were excluded; no measured patched RSS result is claimed."
+}

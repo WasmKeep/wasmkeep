@@ -35,6 +35,18 @@ The text under a version's heading is its GitHub release text
   undercount trapped events; see [monitoring](docs/monitoring.md#event-work-fuel).
   Room tests now assert calibrated per-event fuel ceilings too; their
   speed-sensitive ignores remain while they retain the 50 ms CPU limit.
+- **Allocator retention controls (Linux/glibc).** `serve --idle-memory-trim-secs`
+  defaults to 60 seconds (0 disables it). It samples resident actors plus
+  sockets in use and returns unused allocator pages when activity drops to
+  at most half the peak since the last trim, or reaches zero. Trims run off
+  the executor, are serialized across apps, and retain a minimum 60-second
+  cooldown; steady busy activity does not trigger them. The global CLI flag
+  `--malloc-arena-max N` caps arenas before worker threads start, defaulting
+  to available parallelism clamped to 2..8 (fallback 2); 0 preserves glibc's
+  default/environment policy. Both controls are no-ops elsewhere.
+  `wasmkeep_allocator_trim_seconds` and
+  `wasmkeep_allocator_trims_total{released="true|false"}` expose actual calls.
+  Fleet RSS measurement is pending; patched workstation runs paged.
 
 - **One delivery per alarm round.** An event that ended while its actor's
   alarm delivery waited in the mailbox queued another delivery of the same

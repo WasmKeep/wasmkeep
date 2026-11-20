@@ -336,6 +336,7 @@ async fn start_runtime(
         config.flag_access = Some(config.access.clone());
     }
     config.mailbox.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
+    config.idle_memory_trim = std::time::Duration::from_secs(args.idle_memory_trim_secs);
     // Residents from the process's pool, this app's floor kept; its own
     // cap at most the pool's limit.
     config.mailbox.max_resident = max_resident

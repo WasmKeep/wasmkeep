@@ -56,6 +56,7 @@ mod expiry;
 mod held;
 mod host;
 mod load;
+mod memory;
 mod moving;
 mod requests;
 mod restores;
@@ -134,6 +135,11 @@ pub struct ActorConfig {
     pub storage: StorageConfig,
     /// Queue size and hibernation timeout.
     pub mailbox: MailboxConfig,
+    /// On Linux/glibc, sample residents plus sockets at this interval and
+    /// trim on a drop to half the peak since the last trim, or zero. Zero
+    /// disables checks. Runs on a blocking worker; peak, serialization and
+    /// a minimum 60-second cooldown are shared across the process.
+    pub idle_memory_trim: Duration,
     /// Wall-clock limit per event, including time awaiting I/O.
     pub wall_per_event: Duration,
     /// First retry delay after a failed `on-alarm`; doubles per failure.
@@ -258,6 +264,7 @@ impl ActorConfig {
             app: crate::cluster::IMPLICIT_APP_NAME.into(),
             storage: StorageConfig::new(data_dir),
             mailbox: MailboxConfig::default(),
+            idle_memory_trim: Duration::from_secs(60),
             wall_per_event: Duration::from_secs(30),
             alarm_retry_initial: Duration::from_secs(1),
             alarm_retry_max: Duration::from_secs(300),

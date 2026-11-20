@@ -17,6 +17,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
+#[derive(Default)]
+struct AllocatorMetrics {
+    duration: Histogram,
+    trims: [AtomicU64; 2],
+}
+
+impl AllocatorMetrics {
+    fn record(&self, result: wasmkeep_runtime::AllocatorTrim) {
+        self.duration.observe(result.duration);
+        self.trims[usize::from(result.released)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String) {
+        out.push_str("# HELP wasmkeep_allocator_trim_seconds Time inside malloc_trim.\n# TYPE wasmkeep_allocator_trim_seconds histogram\n");
+        self.duration
+            .render(out, "wasmkeep_allocator_trim_seconds", "");
+        out.push_str("# HELP wasmkeep_allocator_trims_total Actual malloc_trim calls by release result.\n# TYPE wasmkeep_allocator_trims_total counter\n");
+        for (index, released) in [false, true].into_iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "wasmkeep_allocator_trims_total{{released=\"{released}\"}} {}",
+                self.trims[index].load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+static ALLOCATOR: LazyLock<AllocatorMetrics> = LazyLock::new(AllocatorMetrics::default);
+
+pub(crate) fn allocator_trim(result: wasmkeep_runtime::AllocatorTrim) {
+    ALLOCATOR.record(result);
+}
+
 static INGRESS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub(crate) fn ingress_admission(reason: Option<crate::rate_limit::Rejection>) {
     let index = match reason {
@@ -1055,6 +1088,7 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
     };
     let apps: Vec<String> = identities.iter().map(Identity::app_labels).collect();
     let mut out = String::new();
+    ALLOCATOR.render(&mut out);
     let head = |out: &mut String, name: &str, kind: &str, help: &str| {
         let _ = writeln!(out, "# HELP {name} {help}");
         let _ = writeln!(out, "# TYPE {name} {kind}");
@@ -1758,6 +1792,24 @@ mod tests {
 
     /// Each app's part of the process's shared budgets and what it uses,
     /// once per budget and app.
+    #[test]
+    fn allocator_metrics_count_actual_results_and_duration() {
+        let metrics = AllocatorMetrics::default();
+        for released in [false, true, true] {
+            metrics.record(wasmkeep_runtime::AllocatorTrim {
+                released,
+                duration: Duration::from_millis(10),
+            });
+        }
+        let mut out = String::new();
+        metrics.render(&mut out);
+        assert!(out.contains("wasmkeep_allocator_trims_total{released=\"false\"} 1\n"));
+        assert!(out.contains("wasmkeep_allocator_trims_total{released=\"true\"} 2\n"));
+        assert!(out.contains("wasmkeep_allocator_trim_seconds_count 3\n"));
+        assert!(out.contains("wasmkeep_allocator_trim_seconds_sum 0.03\n"));
+        assert!(out.contains("wasmkeep_allocator_trim_seconds_bucket{le=\"0.01\"} 3\n"));
+    }
+
     #[test]
     fn budget_shares_are_on_the_page_by_app() {
         let _shares = [
