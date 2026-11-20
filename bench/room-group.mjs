@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { publishWithRetry } from './room-publish.mjs';
+import { deliveryOrder, historyCoverage } from './room-order.mjs';
 // Remote ADR 0040 driver. No server lifecycle or benchmark result publication.
 import { parseArgs } from 'node:util';
 import { createRequire } from 'node:module';
@@ -92,7 +93,7 @@ class Histogram {
   add(ms) { const b = Math.ceil(Math.log(Math.max(1, ms)) / Math.log(1.01)); this.bins.set(b, (this.bins.get(b) ?? 0) + 1); this.count++; if (ms > this.max) this.max = ms; }
   summary() { const entries = [...this.bins].sort((a, b) => a[0] - b[0]); return Object.fromEntries([['count', this.count], ...[50, 95, 99].map(p => { let n = 0; const found = entries.find(([, k]) => (n += k) >= Math.ceil(this.count * p / 100)); return [`p${p}_ms`, found ? 1.01 ** found[0] : null]; }), ['max_ms', this.count ? this.max : null]]); }
 }
-const COUNTERS = ['deliveries', 'repeats', 'history_requests', 'gaps_recovered', 'recovered_messages', 'void_numbers', 'resets', 'reconnect_attempts', 'close_4801', 'close_4802', 'errors', 'publish_ok', 'publish_failed', 'publish_unacknowledged', 'publish_retries', 'forced_disconnects', 'smoke_dropped_frames', 'clients_joined', 'clients_left', 'stall_pauses', 'stall_resumes'];
+const COUNTERS = ['deliveries', 'repeats', 'discarded_catchup', 'discarded_live', 'history_requests', 'gaps_recovered', 'recovered_messages', 'void_numbers', 'resets', 'reconnect_attempts', 'close_4801', 'close_4802', 'errors', 'publish_ok', 'publish_failed', 'publish_unacknowledged', 'publish_retries', 'forced_disconnects', 'smoke_dropped_frames', 'clients_joined', 'clients_left', 'stall_pauses', 'stall_resumes'];
 const zero = () => Object.fromEntries(COUNTERS.map(k => [k, 0]));
 const counters = zero();
 const delivery = new Histogram(), reconnect = new Histogram(), historyWait = new Histogram();
@@ -182,6 +183,9 @@ class PausableSocket {
 }
 function addClient(stalledReader = false) {
   const i = clients.length, base = bases[i % bases.length], name = `b${run}-${i}`, recovered = new Set();
+  // `repeats` counts what the application was handed twice; the SDK's own
+  // discards (onRepeat) are split into catch-up overlaps and live re-sends.
+  const order = deliveryOrder(), coverage = historyCoverage();
   const c = { client: null, ready: false, active: true, stalledReader, stall: false, raw: null };
   let attempts = 0, down, dropped = false;
   const count = code => { if (!stopped) { if (code === 4801) bump('close_4801'); if (code === 4802) bump('close_4802'); } };
@@ -205,7 +209,7 @@ function addClient(stalledReader = false) {
         const response = await boundedFetch(url, init);
         if (!response.ok) return response;
         const h = await response.json();
-        recovered.clear();
+        recovered.clear(); coverage.page(h.messages);
         for (const m of h.messages) recovered.add(`${m.position.e}.${m.position.n}`);
         if (h.messages.length && new URL(url).searchParams.has('after')) bump('gaps_recovered');
         return { ok: true, status: response.status, json: async () => h };
@@ -213,6 +217,7 @@ function addClient(stalledReader = false) {
     },
     onMessage(p, body) {
       bump('deliveries');
+      if (order.message(p)) bump('repeats');
       if (recovered.delete(`${p.e}.${p.n}`)) bump('recovered_messages');
       // Timestamp originates on this load process, not a remote node's clock.
       // The stored body is the publisher's JSON, so the tag sits inside it.
@@ -223,8 +228,9 @@ function addClient(stalledReader = false) {
         if (!stalledReader) delivery.add(ms);
       }
     },
-    onRepeat() { bump('repeats'); }, onLost(a, b) { bump('void_numbers', b - a + 1); },
-    onReset() { bump('resets'); }, onError() { if (!stopped) bump('errors'); },
+    onRepeat(p) { bump(coverage.covers(p) ? 'discarded_catchup' : 'discarded_live'); },
+    onLost(a, b) { order.lost(a); bump('void_numbers', b - a + 1); },
+    onReset(p) { order.reset(p); bump('resets'); }, onError() { if (!stopped) bump('errors'); },
     onState(state) {
       const was = c.ready; c.ready = state === 'ready'; readyCount += Number(c.ready) - Number(was);
       if (state === 'connecting' && attempts++ > 0) bump('reconnect_attempts');
@@ -381,11 +387,11 @@ try {
   const max = f => samples.reduce((m, s) => Math.max(m, s.generator[f] ?? 0), 0);
   const generator = { valid: !reasons.length, saturation_judged: judged, invalid_reasons: reasons, saturated_sample_share: saturatedShare, peak_cpu_cores: max('cpu_cores'), peak_rss_bytes: peakRss, peak_loop_delay_p99_ms: max('loop_delay_p99_ms'), peak_open_fds: peakFds, open_file_soft_limit: fdLimit === Infinity ? 'unlimited' : fdLimit, history_concurrency: historyConcurrency, history_queue_wait: historyWait.summary() };
   const phaseSummary = Object.fromEntries(phases.map(p => [p.name, { start_s: p.start_s, end_s: p.end_s, ready_at_end: p.ready_at_end, active_at_end: p.active_at_end, counters: p.counters, delivery_latency: p.delivery.summary(), reconnect_latency: p.reconnect.summary() }]));
-  const result = { schema: 2, publish_failures_by_status: publishFailuresByStatus, unacknowledged_publishes: unacknowledged, acknowledged_positions: acknowledged, final_cursors: finalCursors, incomplete_clients: incomplete, date: new Date().toISOString(), commit, node: process.version, smoke: !!v.smoke, clients: initial, peak_clients: peak, joined_total: clients.length, left_total: counters.clients_left, targets: bases.length, payload_bytes: payloadBytes || null, ramp, duration_s: duration, rate_per_s: aggregateRate, publish_rate_per_publisher: perPublisherRate, publishers, ready_at_start: readyAtStart, ready_at_end: readyCount, active_at_end: activeCount, counters, delivery_latency: delivery.summary(), reconnect_latency: reconnect.summary(), phases: phaseSummary, stalled_readers: { count: stalledCount, stall_after_s: stallAfter, stall_for_s: stallFor, delivery_latency: stalledDelivery.summary(), reconnect_latency: stalledReconnect.summary(), catchup_after_resume: stalledCatchup.summary() }, topology, generator, samples };
+  const result = { schema: 3, publish_failures_by_status: publishFailuresByStatus, unacknowledged_publishes: unacknowledged, acknowledged_positions: acknowledged, final_cursors: finalCursors, incomplete_clients: incomplete, date: new Date().toISOString(), commit, node: process.version, smoke: !!v.smoke, clients: initial, peak_clients: peak, joined_total: clients.length, left_total: counters.clients_left, targets: bases.length, payload_bytes: payloadBytes || null, ramp, duration_s: duration, rate_per_s: aggregateRate, publish_rate_per_publisher: perPublisherRate, publishers, ready_at_start: readyAtStart, ready_at_end: readyCount, active_at_end: activeCount, counters, delivery_latency: delivery.summary(), reconnect_latency: reconnect.summary(), phases: phaseSummary, stalled_readers: { count: stalledCount, stall_after_s: stallAfter, stall_for_s: stallFor, delivery_latency: stalledDelivery.summary(), reconnect_latency: stalledReconnect.summary(), catchup_after_resume: stalledCatchup.summary() }, topology, generator, samples };
   await writeFile(`${v.out}.partial`, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
   await rename(`${v.out}.partial`, v.out);
   console.log(JSON.stringify({ counters, delivery_latency: result.delivery_latency, reconnect_latency: result.reconnect_latency, generator: { valid: generator.valid, invalid_reasons: reasons, peak_cpu_cores: generator.peak_cpu_cores, peak_rss_bytes: peakRss } }));
-  if (counters.publish_unacknowledged || counters.void_numbers || incomplete.length || !readyAtStart || (publishers && !counters.publish_ok) || (publishers && !delivery.count) || (!v.smoke && !generator.valid) || (v.smoke && (readyAtStart !== initial || counters.errors || counters.publish_failed))) process.exitCode = 1;
+  if (counters.publish_unacknowledged || counters.void_numbers || counters.repeats || incomplete.length || !readyAtStart || (publishers && !counters.publish_ok) || (publishers && !delivery.count) || (!v.smoke && !generator.valid) || (v.smoke && (readyAtStart !== initial || counters.errors || counters.publish_failed))) process.exitCode = 1;
 } finally {
   stopped = true; stop.abort(); loopDelay.disable(); for (const { client } of clients) client.close();
   await Promise.allSettled([...tasks, ...runTasks]);

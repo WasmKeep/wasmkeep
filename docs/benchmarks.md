@@ -1562,8 +1562,18 @@ reconnect attempts and times, 4801/4802 counts, publish failures and retries,
 and one-second topology samples (sampling can slip while endpoints time out).
 `gaps_recovered` counts nonempty history pages requested with an `after`
 position, not distinct outages; `recovered_messages` counts items applied
-from those pages. Reconnect latency runs from disconnect detection to the
-next ready frame, not to completion of history recovery. Delivery latency
+from those pages. `repeats` counts numbers the SDK handed the application
+(`onMessage`) at or below one it already had, without a void range or a
+reset in between: it must be 0, and a nonzero count fails the run. Delivery
+is at least once on the wire (ADR 0040, client rule 3), and the SDK discards
+what arrives twice; `discarded_catchup` counts its discards (`onRepeat`) of
+numbers at or below the highest one a history page of that client carried
+(the live frames held while a page was in flight, the rows a page repeated),
+which a stalled reader's
+catch-up produces under steady publishing. `discarded_live` counts any other
+discard, a live re-send with no history page involved. Before schema 3,
+`repeats` counted the SDK's discards. Reconnect latency runs from disconnect
+detection to the next ready frame, not to completion of history recovery. Delivery latency
 runs from the originating publisher's monotonic timestamp to each recipient,
 including HTTP replay; it needs no synchronized server clock. Percentiles
 are bounded-memory logarithmic histogram upper bounds within 1% or 1 ms;
@@ -1590,13 +1600,18 @@ The script starts a temporary loopback node without a bucket, runs 16 clients
 that grow to 24 and shrink to 18 over a short ramp, with one stalled reader,
 1,500-byte messages at four messages/s and forced reconnects, drops one
 received frame to exercise HTTP gap recovery, checks the
-delivery/reconnect/recovery/phase/topology/generator output, and removes its
+delivery/reconnect/recovery/phase/topology/generator output and that the
+application saw no repeat, and removes its
 data and results. A 4802 close is not required: a paused loopback socket does
 not fill its buffers in that time.
 Its total timeout is under 30 seconds. `WASMKEEP_BIN` selects a prebuilt CLI.
 Direct `--smoke` runs require loopback URLs, at most 32 clients in total, 15
 publishing seconds, five messages/s, two publishers, two stalled readers and
 64 KiB messages. Neither smoke is fleet evidence.
+`node --test bench/test/*.test.mjs` checks the harness itself against a
+mocked transport, including a stalled reader whose held live frame overlaps
+its history page (a discard, not a repeat); `./scripts/check.sh` runs it when
+the harness, its tests or the SDK's room client change.
 
 Output goes only to the explicitly supplied `--out`, written through a
 partial file on completion. Keep raw runs in scratch storage. Publish only
