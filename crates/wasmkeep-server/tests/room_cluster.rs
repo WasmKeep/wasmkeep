@@ -919,11 +919,13 @@ async fn room_cluster_batched_pusher_crash_keeps_its_operation_and_delivers() {
     assert_eq!(get(a.addr, "/r6/warm?room=quiet&edge=1").await.0, 200);
     assert_eq!(get(a.addr, "/r6/history?room=quiet&n=0").await.0, 200);
     assert_eq!(get(b.addr, "/r6/warm-pusher?room=quiet").await.0, 200);
-    // The split six sockets call for (capacity 5) sticks at its `range` step.
+    // The split four sockets call for (80 % of 5) sticks at its `range`
+    // step. Four, not more: a join after the split began may go to the new
+    // edge, a case this test is not about.
     let (status, body) = get(a.addr, "/r6/refuse-range?room=quiet&edge=1&on=1").await;
     assert_eq!(status, 200, "{body}");
     let mut clients = vec![];
-    for i in 0..6 {
+    for i in 0..4 {
         let p = Arc::new(Progress::default());
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(client(
