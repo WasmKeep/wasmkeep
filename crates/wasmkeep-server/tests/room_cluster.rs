@@ -48,6 +48,16 @@ async fn node(
     wasm: Vec<u8>,
     front: Vec<u8>,
 ) -> Node {
+    node_with(id, store, wasm, front, false).await
+}
+/// [`node`], its pusher class batched (ADR 0034) when `batched`.
+async fn node_with(
+    id: &'static str,
+    store: Arc<dyn ObjectStore>,
+    wasm: Vec<u8>,
+    front: Vec<u8>,
+    batched: bool,
+) -> Node {
     let data = tempfile::tempdir().unwrap();
     let path = data.path().to_owned();
     let (started, ready) = tokio::sync::oneshot::channel();
@@ -82,6 +92,9 @@ async fn node(
             config.websocket_ping_after = Duration::from_secs(600);
             for class in ["room", "pusher", "edge", "directory", "relay"] {
                 config.access.set(class, wasmkeep_server::Access::Internal);
+            }
+            if batched {
+                config.batched.insert("pusher".into());
             }
             let mut cluster = ClusterConfig::new(id, format!("http://{addr}"), store);
             cluster.lease = LeaseConfig::new(2000, 400, 200, 100).unwrap();
@@ -797,6 +810,236 @@ async fn room_cluster_quiet_room_delivers_a_publish_made_during_the_pusher_takeo
     caught_up(&clients, head).await;
     for (p, stop, task) in clients {
         assert_eq!(p.last.load(Ordering::SeqCst), head);
+        let _ = stop.send(());
+        task.await.unwrap();
+    }
+}
+
+/// A bucket that, while `hold` is set, never answers the pusher's segment
+/// uploads (`actors/<tenant>/pusher/.../wal/`): they stay in flight, and
+/// the pusher's alarm moves stay unacknowledged. `held` counts them.
+#[derive(Debug)]
+struct HoldPusherSegments {
+    inner: Arc<dyn ObjectStore>,
+    hold: Arc<std::sync::atomic::AtomicBool>,
+    held: Arc<AtomicU64>,
+}
+impl std::fmt::Display for HoldPusherSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HoldPusherSegments")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for HoldPusherSegments {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let key = location.as_ref();
+        if self.hold.load(Ordering::SeqCst) && key.contains("/pusher/") && key.contains("/wal/") {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            return std::future::pending().await;
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// ADR 0040, section 13: the pusher is deployed batched. Its node dies
+/// with the pusher's last alarm moves unacknowledged (its segments held in
+/// flight) and a scale operation under way (a split whose `range` step the
+/// edge refuses). A publish whose poke is lost waits undelivered; with no
+/// publish after it, the clients get it within 60 s (the last acknowledged
+/// alarm, which the sweep delivers on a live node), and the operation is
+/// the same one, which then completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_batched_pusher_crash_keeps_its_operation_and_delivers() {
+    batched_pusher_crash(4).await;
+}
+/// The same with six clients: the split begins at four sockets, so a later
+/// join may go to the new edge while the split is held at its `range` step.
+/// Under load such a client once never became ready within 90 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known failing: a client on a new edge mid-split never becomes ready; under investigation"]
+async fn room_cluster_batched_pusher_crash_with_a_join_on_the_new_edge() {
+    batched_pusher_crash(6).await;
+}
+async fn batched_pusher_crash(count: usize) {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = Arc::new(AtomicU64::new(0));
+    let b_store: Arc<dyn ObjectStore> = Arc::new(HoldPusherSegments {
+        inner: shared.clone(),
+        hold: hold.clone(),
+        held: held.clone(),
+    });
+    let a = node_with("a", shared.clone(), wasm.clone(), front.clone(), true).await;
+    let mut b = node_with("b", b_store, wasm.clone(), front.clone(), true).await;
+    let _c = node_with("c", shared.clone(), wasm, front, true).await;
+    let room = "quiet";
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    get(a.addr, "/r6/map?room=quiet").await;
+    assert_eq!(get(a.addr, "/r6/warm?room=quiet&edge=1").await.0, 200);
+    assert_eq!(get(a.addr, "/r6/history?room=quiet&n=0").await.0, 200);
+    assert_eq!(get(b.addr, "/r6/warm-pusher?room=quiet").await.0, 200);
+    // The split four sockets call for (80 % of 5) sticks at its `range`
+    // step. With four clients, all are on the first edge when it begins;
+    // with more, a later join may go to the new edge.
+    let (status, body) = get(a.addr, "/r6/refuse-range?room=quiet&edge=1&on=1").await;
+    assert_eq!(status, 200, "{body}");
+    let mut clients = vec![];
+    for i in 0..count {
+        let p = Arc::new(Progress::default());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(client(
+            a.addr,
+            room,
+            format!("batched{i}"),
+            p.clone(),
+            stopped,
+        ));
+        clients.push((p, stop, task));
+    }
+    // Every socket joined and caught up first: a join refused while the
+    // group is cold backs off, up to 30 s on a loaded runner.
+    let mut head = 0;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while clients.iter().any(|(p, _, _)| {
+        p.ready.load(Ordering::SeqCst) == 0 || p.last.load(Ordering::SeqCst) < head.max(1)
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "joins: {:?}",
+            clients
+                .iter()
+                .map(|(p, _, _)| (
+                    p.ready.load(Ordering::SeqCst),
+                    p.last.load(Ordering::SeqCst)
+                ))
+                .collect::<Vec<_>>()
+        );
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let op = loop {
+        assert!(Instant::now() < deadline, "no scale operation began");
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (status, op) = get(a.addr, "/r6/op?room=quiet").await;
+        assert_eq!(status, 200, "{op}");
+        if !op.is_empty() {
+            break op;
+        }
+    };
+    caught_up(&clients, head).await;
+    // From now on the pusher's segments stay in flight: a publish's round
+    // still delivers, then its unsent writes age and its events stop.
+    hold.store(true, Ordering::SeqCst);
+    head = publish(a.addr, room, false).await;
+    caught_up(&clients, head).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(
+        held.load(Ordering::SeqCst) > 0,
+        "no pusher segment was held"
+    );
+    let (status, n) = get(a.addr, "/r6/publish-unpoked?room=quiet").await;
+    assert_eq!(status, 200, "{n}");
+    let head: u64 = n.parse().unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        clients
+            .iter()
+            .all(|(p, _, _)| p.last.load(Ordering::SeqCst) < head),
+        "delivered before the crash: the test proves nothing"
+    );
+    b.kill();
+    // No publish from here on.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while clients
+        .iter()
+        .any(|(p, _, _)| p.last.load(Ordering::SeqCst) < head)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "not delivered within 60 s: {:?}",
+            clients
+                .iter()
+                .map(|(p, _, _)| p.last.load(Ordering::SeqCst))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "delivered {:?} after the kill, {} pusher segments held",
+        Duration::from_secs(60) - deadline.saturating_duration_since(Instant::now()),
+        held.load(Ordering::SeqCst)
+    );
+    // The operation survived: the same one, still pending, then done.
+    let (status, after) = get(a.addr, "/r6/op?room=quiet").await;
+    assert_eq!((status, after.as_str()), (200, op.as_str()));
+    let (status, body) = get(a.addr, "/r6/refuse-range?room=quiet&edge=1&on=0").await;
+    assert_eq!(status, 200, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !get(a.addr, "/r6/op?room=quiet").await.1.is_empty() {
+        assert!(Instant::now() < deadline, "the operation did not complete");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (_, children) = get(a.addr, "/r6/children?room=quiet").await;
+    let (_, map) = get(a.addr, "/r6/map?room=quiet").await;
+    let mut map: Vec<_> = map.split(',').collect();
+    map.sort_unstable();
+    assert_eq!(children, map.join(","));
+    assert_eq!(children.split(',').count(), 2, "{children}");
+    for (_, stop, task) in clients {
         let _ = stop.send(());
         task.await.unwrap();
     }

@@ -306,3 +306,89 @@ test("cancelled history cannot apply a late response or queued frames", async ()
     await r.receive({ t: "m", e: 1, b: 0, n: 2, m: [{ a: 0, d: "fresh" }] });
     assert.deepEqual(seen, [2]);
 });
+/** A page of `n` messages from `from`, `more` while below `head`. */
+const page = (from: number, n: number, head: number) => new Response(JSON.stringify({ head: { e: 1, n: head }, more: from + n - 1 < head,
+    messages: Array.from({ length: n }, (_, i) => ({ position: { e: 1, n: from + i }, at: 0, body: String(from + i) })) }));
+test("a 5xx history answer keeps the socket, halves the page and catches up", async () => {
+    const clock = new FakeClock(), ws = new FakeSocket(), queries: URL[] = [], seen: number[] = [], errors: unknown[] = [];
+    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history?name=a", last: { e: 1, n: 0 }, clock, random: () => .5, socket: () => ws,
+        onMessage: p => { seen.push(p.n); }, onError: e => { errors.push(e); },
+        fetch: (async (url: unknown) => {
+            const u = new URL(String(url));
+            queries.push(u);
+            // The front's CPU budget cuts a full page, a 502, a 503 (a takeover: same page), a 504.
+            if (queries.length <= 4)
+                return new Response("internal error\n", { status: [500, 502, 503, 504][queries.length - 1] });
+            const after = Number(u.searchParams.get("after")!.split(".")[1]), limit = Number(u.searchParams.get("limit") ?? 256);
+            return page(after + 1, Math.min(limit, 600 - after), 600);
+        }) as typeof fetch });
+    c.connect();
+    ws.onopen?.();
+    // 600 behind, and live messages keep coming while it backs off.
+    ws.frame({ t: "behind", e: 1, n: 600 });
+    // Response bodies are read on the event loop: let it turn between ticks.
+    const turn = async () => { await settle(); await new Promise(resolve => setTimeout(resolve, 0)); await settle(); };
+    for (let t = 0; t < 120 && seen.length < 604; t++) {
+        await turn();
+        if (t % 10 === 0 && t < 40)
+            ws.frame({ t: "m", e: 1, b: 0, n: 601 + t / 10, m: [{ a: 0, d: "live" }] });
+        clock.tick(500);
+    }
+    assert.deepEqual(errors.map(String), []);
+    assert.equal(ws.closed, false, "a 5xx never closes the socket");
+    assert.deepEqual(seen, Array.from({ length: 604 }, (_, i) => i + 1));
+    assert.deepEqual(queries.slice(0, 5).map(u => u.searchParams.get("limit")), [null, "128", "64", "64", "32"]);
+    assert(queries.every(u => u.searchParams.get("name") === "a"));
+    c.close();
+});
+test("a 4xx history answer still closes and reconnects", async () => {
+    const clock = new FakeClock(), sockets: FakeSocket[] = [], errors: unknown[] = [];
+    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", last: { e: 1, n: 0 }, clock, random: () => .5,
+        socket: () => { const s = new FakeSocket(); sockets.push(s); return s; }, onError: e => { errors.push(e); },
+        fetch: (async () => new Response(null, { status: 400 })) as typeof fetch });
+    c.connect();
+    sockets[0].frame({ t: "behind", e: 1, n: 2 });
+    await settle();
+    assert(sockets[0].closed);
+    assert(/history answered 400/.test(String(errors[0])));
+    c.close();
+});
+test("the reconnect attempt counter returns to 0 only once history caught up", async () => {
+    const clock = new FakeClock(), sockets: FakeSocket[] = [], urls: string[] = [];
+    let failing = true;
+    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", last: { e: 1, n: 0 }, clock, random: () => .5,
+        socket: url => { urls.push(url); const s = new FakeSocket(); sockets.push(s); return s; },
+        fetch: (async () => failing ? new Response(null, { status: 500 }) : page(1, 5, 5)) as typeof fetch });
+    c.connect();
+    // Two failed opens: attempt 2, the next delay 0.5 * 1000 ms.
+    sockets[0].onerror?.();
+    clock.tick(250);
+    sockets[1].onerror?.();
+    clock.tick(500);
+    assert.equal(sockets.length, 3);
+    sockets[2].onopen?.();
+    sockets[2].frame({ t: "ready", e: 1, n: 5 });
+    // Ready for 20 s, but history keeps failing: still attempt 2.
+    for (let i = 0; i < 20; i++) {
+        await settle();
+        clock.tick(1000);
+    }
+    assert.equal(sockets[2].closed, false);
+    sockets[2].onclose?.({ code: 1006 });
+    clock.tick(999);
+    assert.equal(sockets.length, 3, "attempt 2 waits 1 s");
+    clock.tick(1);
+    assert.equal(sockets.length, 4);
+    // Caught up, then ready for 10 s: back to attempt 0.
+    failing = false;
+    sockets[3].onopen?.();
+    sockets[3].frame({ t: "ready", e: 1, n: 5 });
+    for (let i = 0; i < 11; i++) {
+        await settle();
+        clock.tick(1000);
+    }
+    sockets[3].onclose?.({ code: 1006 });
+    clock.tick(250);
+    assert.equal(sockets.length, 5, "attempt 0 waits 250 ms");
+    c.close();
+});

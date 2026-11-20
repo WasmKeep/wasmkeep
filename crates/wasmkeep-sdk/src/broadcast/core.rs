@@ -306,6 +306,91 @@ impl<S: Store> Core<S> {
         limit: usize,
         last: Option<usize>,
     ) -> Result<History, String> {
+        let (mut h, mut from) = self.start(after, limit, last)?;
+        // Fixed v1 response fields, including optional lost/reset positions.
+        let mut bytes =
+            48 + usize::from(h.lost.is_some()) * 16 + usize::from(h.reset.is_some()) * 16;
+        while let Some(start) = from {
+            let rows = self.db.query(
+                "SELECT n,e,at,id,body FROM wasmkeep_room_history WHERE n >= ?1 ORDER BY n LIMIT ?2",
+                &[int(start)?, int(PAGE as u64)?],
+            )?;
+            from = None;
+            for r in &rows {
+                let row = row(r)?;
+                let encoded = 36 + row.body.len() + row.id.as_ref().map_or(0, |id| 4 + id.len());
+                if h.messages.len() == limit || bytes + encoded > 262144 {
+                    h.more = true;
+                    break;
+                }
+                bytes += encoded;
+                from = Some(row.position.n.saturating_add(1));
+                h.messages.push(row);
+            }
+            if rows.len() < PAGE || h.more {
+                break;
+            }
+        }
+        Ok(h)
+    }
+    /// The page `history(after, limit)` answers, as the browser's JSON
+    /// (what the TypeScript front's `JSON.stringify(historyJSON(...))`
+    /// makes, byte for byte), rendered by SQLite: at most 256
+    /// rows and 64 KiB of bodies, at least one row, `more` when
+    /// cut. Numbers above 2^53 - 1, which a browser cannot read exactly,
+    /// are refused.
+    pub fn history_json(
+        &mut self,
+        after: Option<Position>,
+        limit: usize,
+    ) -> Result<Vec<u8>, String> {
+        let (h, from) = self.start(after, limit, None)?;
+        let mut rows = vec![];
+        let mut more = false;
+        if let Some(from) = from {
+            let r = self.db.query(
+                JSON_PAGE,
+                &[
+                    int(from)?,
+                    int(limit.min(JSON_ROWS) as u64 + 1)?,
+                    int(JSON_BYTES)?,
+                ],
+            )?;
+            let r = r.first().ok_or("invalid room page")?;
+            more = integer(&r[1])? < integer(&r[2])?;
+            if !matches!(r[3], Value::Null) {
+                safe(integer(&r[3])?)?;
+            }
+            match &r[0] {
+                Value::Blob(b) => rows.clone_from(b),
+                Value::Null => {}
+                _ => return Err("invalid room page".into()),
+            }
+        }
+        let p = |v: Position| -> Result<String, String> {
+            Ok(format!(r#"{{"e":{},"n":{}}}"#, safe(v.e)?, safe(v.n)?))
+        };
+        let mut out = format!(r#"{{"head":{}"#, p(h.head)?);
+        if let Some(l) = h.lost {
+            out += &format!(r#","lost":{{"e":{},"base":{}}}"#, safe(l.e)?, safe(l.base)?);
+        }
+        if let Some(r) = h.reset {
+            out += &format!(r#","reset":{}"#, p(r)?);
+        }
+        out += &format!(r#","more":{more},"messages":["#);
+        let mut out = out.into_bytes();
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(b"]}");
+        Ok(out)
+    }
+    /// What a history page starts with: its head, `lost` and `reset`, and
+    /// the number its messages start from (none: the head only).
+    fn start(
+        &mut self,
+        after: Option<Position>,
+        limit: usize,
+        last: Option<usize>,
+    ) -> Result<(History, Option<u64>), String> {
         if limit == 0
             || limit > 2000
             || last.is_some_and(|n| n > 2000)
@@ -371,35 +456,30 @@ impl<S: Store> Core<S> {
                 None => first.map(|f| f.n),
             };
         }
-        // Fixed v1 response fields, including optional lost/reset positions.
-        let mut bytes =
-            48 + usize::from(h.lost.is_some()) * 16 + usize::from(h.reset.is_some()) * 16;
-        while let Some(start) = from {
-            let rows = self.db.query(
-                "SELECT n,e,at,id,body FROM wasmkeep_room_history WHERE n >= ?1 ORDER BY n LIMIT ?2",
-                &[int(start)?, int(PAGE as u64)?],
-            )?;
-            from = None;
-            for r in &rows {
-                let row = row(r)?;
-                let encoded = 36 + row.body.len() + row.id.as_ref().map_or(0, |id| 4 + id.len());
-                if h.messages.len() == limit || bytes + encoded > 262144 {
-                    h.more = true;
-                    break;
-                }
-                bytes += encoded;
-                from = Some(row.position.n.saturating_add(1));
-                h.messages.push(row);
-            }
-            if rows.len() < PAGE || h.more {
-                break;
-            }
-        }
-        Ok(h)
+        Ok((h, from))
     }
 }
 /// Rows a bounded read takes at a time.
 const PAGE: usize = 32;
+/// A browser history page (`history-json`): at most this many rows and
+/// this many bytes of bodies, and at least one row.
+const JSON_ROWS: usize = 256;
+const JSON_BYTES: u64 = 64 * 1024;
+/// One browser page's messages, rendered by SQLite: from `?1`, at most
+/// `?2 - 1` rows (`?2` rows are read to tell `more`), and past the first
+/// row at most `?3` bytes of bodies. Answers the messages as JSON (without
+/// the brackets), the rows kept, the rows read and the largest `at`.
+/// `json_quote` escapes as `JSON.stringify` does (the unicode vectors and
+/// the tests check it). The TypeScript room runs the same statement
+/// (sdks/typescript/src/broadcast-core.ts).
+const JSON_PAGE: &str = r#"WITH page AS (SELECT n,e,at,id,body,row_number() OVER w AS k,sum(length(CAST(body AS BLOB))) OVER w AS total FROM (SELECT n,e,at,id,body FROM wasmkeep_room_history WHERE n >= ?1 ORDER BY n LIMIT ?2) WINDOW w AS (ORDER BY n ROWS UNBOUNDED PRECEDING)), kept AS (SELECT * FROM page WHERE k < ?2 AND (k = 1 OR total <= ?3)) SELECT CAST(group_concat('{"position":{"e":'||e||',"n":'||n||'},"at":'||at||CASE WHEN id IS NULL THEN '' ELSE ',"id":'||json_quote(id) END||',"body":'||json_quote(body)||'}', ',' ORDER BY n) AS BLOB),(SELECT count(*) FROM kept),(SELECT count(*) FROM page),max(at) FROM kept"#;
+/// A JSON number a browser reads exactly: at most 2^53 - 1.
+fn safe(n: u64) -> Result<u64, String> {
+    if n > (1 << 53) - 1 {
+        return Err("invalid browser integer".into());
+    }
+    Ok(n)
+}
 /// The window: the newest 2,000 rows within 8 MiB of bodies; every older
 /// row goes, in one statement SQLite runs.
 const TRIM: &str = "DELETE FROM wasmkeep_room_history WHERE n <= (SELECT n FROM (SELECT n, row_number() OVER w AS k, sum(length(CAST(body AS BLOB))) OVER w AS tail FROM wasmkeep_room_history WINDOW w AS (ORDER BY n DESC ROWS UNBOUNDED PRECEDING)) WHERE k > 2000 OR tail > 8388608 ORDER BY n DESC LIMIT 1)";

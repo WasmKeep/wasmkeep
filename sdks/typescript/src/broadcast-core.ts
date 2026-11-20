@@ -52,6 +52,24 @@ const str = (v: Value) => {
 const H = "wasmkeep_room_history";
 /** Rows a bounded read takes at a time. */
 const PAGE = 32;
+/** A browser history page (`history-json`): at most this many rows and
+ * this many bytes of bodies, and at least one row. */
+export const JSON_ROWS = 256, JSON_BYTES = 64 * 1024;
+/** The JSON numbers a browser reads exactly: at most 2^53 - 1. */
+const SAFE = 9007199254740991n;
+const safe = (v: bigint) => {
+    if (v > SAFE)
+        throw Error("invalid browser integer");
+    return v.toString();
+};
+/** One browser page's messages, rendered by SQLite: from `?1`, at most
+ * `?2 - 1` rows (`?2` rows are read to tell `more`), and past the first
+ * row at most `?3` bytes of bodies. Answers the messages as JSON (without
+ * the brackets), the rows kept, the rows read and the largest `at`.
+ * `json_quote` escapes as `JSON.stringify` does (the vectors check it):
+ * `"`, `\` and controls only, short forms for \b \t \n \f \r. Shared with
+ * the Rust room (crates/wasmkeep-sdk/src/broadcast/core.rs). */
+export const JSON_PAGE = `WITH page AS (SELECT n,e,at,id,body,row_number() OVER w AS k,sum(length(CAST(body AS BLOB))) OVER w AS total FROM (SELECT n,e,at,id,body FROM ${H} WHERE n >= ?1 ORDER BY n LIMIT ?2) WINDOW w AS (ORDER BY n ROWS UNBOUNDED PRECEDING)), kept AS (SELECT * FROM page WHERE k < ?2 AND (k = 1 OR total <= ?3)) SELECT CAST(group_concat('{"position":{"e":'||e||',"n":'||n||'},"at":'||at||CASE WHEN id IS NULL THEN '' ELSE ',"id":'||json_quote(id) END||',"body":'||json_quote(body)||'}', ',' ORDER BY n) AS BLOB),(SELECT count(*) FROM kept),(SELECT count(*) FROM page),max(at) FROM kept`;
 /** A history row with its UTF-8 sizes, as SQLite counts them. */
 export interface Row extends Message {
     bodyBytes: number;
@@ -238,6 +256,57 @@ export class Core {
     /** `history`, and with `raw` each message's bytes for the wire answer
      * (then each message's `body` is left empty). */
     page(after?: Position, limit = 2000, last?: number, raw = false): { history: History; raw: Raw[] } {
+        const { history: h, from: start } = this.start(after, limit, last);
+        let from = start;
+        const out: Raw[] = [];
+        let bytes = 48 + (h.lost ? 16 : 0) + (h.reset ? 16 : 0);
+        while (from !== undefined && !h.more) {
+            const page = this.db.query(`SELECT n,e,at,id,${raw ? "CAST(body AS BLOB),CAST(id AS BLOB)" : "body,NULL"},length(CAST(body AS BLOB)),coalesce(length(CAST(id AS BLOB)),0) FROM ${H} WHERE n >= ?1 ORDER BY n LIMIT ?2`, [integer(from), integer(BigInt(PAGE))]).values;
+            for (const r of page) {
+                const encoded = 36 + Number(num(r[6])) + (r[3].tag === "null" ? 0 : 4 + Number(num(r[7])));
+                if (h.messages.length === limit || bytes + encoded > 262144) {
+                    h.more = true;
+                    break;
+                }
+                bytes += encoded;
+                h.messages.push({ position: { n: num(r[0]), e: num(r[1]) }, at: num(r[2]), id: r[3].tag === "null" ? undefined : str(r[3]), body: raw ? "" : str(r[4]) });
+                if (raw)
+                    out.push({ body: bytesOf(r[4]), id: r[3].tag === "null" ? undefined : bytesOf(r[5]) });
+                from = num(r[0]) + 1n;
+            }
+            if (page.length < PAGE)
+                break;
+        }
+        return { history: h, raw: out };
+    }
+    /** The page `history(after, limit)` answers, as the browser's JSON
+     * (`JSON.stringify(historyJSON(...))`, byte for byte), rendered by
+     * SQLite: no body or id crosses into the guest, so a front that
+     * forwards it pays nothing per message. At most `JSON_ROWS` rows and
+     * `JSON_BYTES` of bodies, at least one row, `more` when cut. */
+    pageJSON(after?: Position, limit = JSON_ROWS): Uint8Array {
+        const { history: h, from } = this.start(after, limit);
+        let rows: Uint8Array = new Uint8Array(), more = false;
+        if (from !== undefined) {
+            const r = this.db.query(JSON_PAGE, [integer(from), integer(BigInt(Math.min(limit, JSON_ROWS) + 1)), integer(BigInt(JSON_BYTES))]).values[0];
+            more = num(r[1]) < num(r[2]);
+            // Every other number on the page is at most the head's.
+            if (r[3].tag !== "null")
+                safe(num(r[3]));
+            if (r[0].tag !== "null")
+                rows = bytesOf(r[0]);
+        }
+        const p = (v: Position) => `{"e":${safe(v.e)},"n":${safe(v.n)}}`;
+        const start = new TextEncoder().encode(`{"head":${p(h.head)}${h.lost ? `,"lost":{"e":${safe(h.lost.e)},"base":${safe(h.lost.base)}}` : ""}${h.reset ? `,"reset":${p(h.reset)}` : ""},"more":${more},"messages":[`);
+        const out = new Uint8Array(start.length + rows.length + 2);
+        out.set(start);
+        out.set(rows, start.length);
+        out.set([0x5d, 0x7d], start.length + rows.length); // "]}"
+        return out;
+    }
+    /** What a history page starts with: its head, `lost` and `reset`, and
+     * the number its messages start from (none: the head only). */
+    private start(after?: Position, limit = 2000, last?: number): { history: History; from?: bigint } {
         if (!Number.isInteger(limit) || limit < 1 || limit > 2000 || (last !== undefined && (!Number.isInteger(last) || last < 0 || last > 2000)) || (after && last !== undefined))
             throw Error("invalid history request");
         const epoch = this.wake(), epochs = this.epochs(), first = this.edge(false);
@@ -265,26 +334,7 @@ export class Core {
             const r = this.db.query(`SELECT n FROM ${H} ORDER BY n DESC LIMIT 1 OFFSET ?1`, [integer(BigInt(last - 1))]).values[0];
             from = r ? num(r[0]) : first?.n;
         }
-        const out: Raw[] = [];
-        let bytes = 48 + (h.lost ? 16 : 0) + (h.reset ? 16 : 0);
-        while (from !== undefined && !h.more) {
-            const page = this.db.query(`SELECT n,e,at,id,${raw ? "CAST(body AS BLOB),CAST(id AS BLOB)" : "body,NULL"},length(CAST(body AS BLOB)),coalesce(length(CAST(id AS BLOB)),0) FROM ${H} WHERE n >= ?1 ORDER BY n LIMIT ?2`, [integer(from), integer(BigInt(PAGE))]).values;
-            for (const r of page) {
-                const encoded = 36 + Number(num(r[6])) + (r[3].tag === "null" ? 0 : 4 + Number(num(r[7])));
-                if (h.messages.length === limit || bytes + encoded > 262144) {
-                    h.more = true;
-                    break;
-                }
-                bytes += encoded;
-                h.messages.push({ position: { n: num(r[0]), e: num(r[1]) }, at: num(r[2]), id: r[3].tag === "null" ? undefined : str(r[3]), body: raw ? "" : str(r[4]) });
-                if (raw)
-                    out.push({ body: bytesOf(r[4]), id: r[3].tag === "null" ? undefined : bytesOf(r[5]) });
-                from = num(r[0]) + 1n;
-            }
-            if (page.length < PAGE)
-                break;
-        }
-        return { history: h, raw: out };
+        return { history: h, from };
     }
 }
 /** Whether the bodies are at most `max` bytes together. */

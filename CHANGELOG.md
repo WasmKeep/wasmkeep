@@ -9,6 +9,56 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **The room renders the browser's history page.** A front answering
+  `GET /history` decoded the room's binary page into objects and encoded
+  it again in the guest, so a full page cost the front most of its CPU
+  budget, or more: on a full window, a page of 256 messages of 200 B took
+  245 M fuel on QuickJS and one of 61 messages of 4 KiB 937 M (500 M is
+  what the 50 ms budget is calibrated for), and the request answered 500.
+  The room has a new operation, `history-json`: the same page, rendered
+  as the browser's JSON by one SQLite statement, byte for byte what
+  `JSON.stringify(broadcast.historyJSON(history))` made (shared vectors
+  and the unicode tests check every escape). Its pages hold at most 256
+  messages and 64 KiB of bodies, at least one message, `more` when cut.
+  A TypeScript front returns `room.historyJSON(after, limit)` unread
+  (Rust: `Client::history_json`); its fuel per page no longer grows with
+  the page: 1.1 M on QuickJS and 4.9 M on StarlingMonkey
+  ([raw measurements](bench/results/2026-11-20-2e614d8-front-history-fuel.csv)).
+  Against a room
+  of an earlier release the TypeScript client converts the binary page
+  as before. The binary `history` is unchanged. The example front
+  accepts `limit` (clamped to 1..256). See ADR 0040, section 3.
+- **The browser client keeps its socket on a 5xx history answer.**
+  `RoomClient` threw on any history answer but a 429 or 503, which closed
+  the socket; the client rejoined behind, asked for the same page, met
+  the same 500, and since `ready` reset its reconnect attempts after
+  10 s it did so at the fastest rate, forever. Now any 5xx is retried
+  like a 503, the socket kept, after `Retry-After` plus full jitter; a
+  5xx other than 503 also halves the page (`limit`, doubled back after
+  each answer). Only a 4xx is an error. The 30 s deadline covers each request, not the
+  waits between them. The attempt counter returns to 0 only once the
+  connection has stayed ready for 10 s after its history caught up. See
+  ADR 0040, section 6.
+- **Deploy the pusher with batched writes.** Its per-round write is its
+  alarm, and a strict pusher replicated every alarm move, and its alarm
+  index entry, before its next round: a busy pusher spent most of its
+  time there. Everything it must keep across a crash (its scale state,
+  operation row and migration step) is committed with `exec-durable`,
+  which waits for the upload in a batched class too, and child positions
+  are never stored. The ts-big-room example and the room benchmark smoke
+  now serve it batched; `room_cluster` crashes a batched pusher with its
+  alarm moves unacknowledged and a scale operation under way. See
+  ADR 0040, section 13.
+
+  **Upgrading:** deploy the pusher class batched:
+  `wasmkeep deploy --writes pusher=batched` (part of the version), or
+  `writes = "batched"` under `[classes.pusher]` in `wasmkeep.toml`, or
+  `serve --writes pusher=batched`. Deploy the front and the room
+  together for `history-json`. A new TypeScript front against an older
+  room still works, at the old cost; a Rust front's
+  `Client::history_json` has no such fallback (an older room answers
+  400), so a Rust front that uses it must be deployed with its room.
+
 - **`on-alarm` keeps the alarm it sets, even for the delivered time.**
   After a successful `on-alarm` the host cleared an alarm still at the
   time it had delivered, so a handler that re-armed for exactly that time

@@ -3,7 +3,8 @@ type Position = { e: bigint; n: bigint };
 export function api(room: {
   join(name: string, after?: Position): any;
   publish(messages: { body: string; id: string }[]): unknown;
-  history(after?: Position): unknown;
+  /** The page as JSON bytes, at most `limit` rows. */
+  history(after: Position | undefined, limit: number): Uint8Array;
   stats(): unknown;
 }) {
   const json = (value: unknown) => ({ status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(value, (_k, v) => typeof v === 'bigint' ? Number(v) : v) });
@@ -29,7 +30,11 @@ export function api(room: {
         const after = args.get('after');
         const parts = after?.split('.');
         if (parts && parts.length !== 2) return {status:400};
-        return json(room.history(position(parts?.[0] ?? null,parts?.[1] ?? null)));
+        // A client that met a 5xx asks for smaller pages; at most 256.
+        const limit = args.get('limit') ?? '256';
+        if (!/^\d{1,6}$/.test(limit)) return {status:400};
+        const page = room.history(position(parts?.[0] ?? null,parts?.[1] ?? null), Math.min(256, Math.max(1, Number(limit))));
+        return {status:200, headers:{'content-type':'application/json'}, body:page};
       }
       if (path === '/stats') return json(room.stats());
       const body = req.text(8192);

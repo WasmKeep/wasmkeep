@@ -14,6 +14,12 @@
   **pusher**, which pulls from the room ([section 13](#13-the-pusher-amended-2026-11-20)).
   Sections 3, 4, 7, 9 and 10 still describe what is done; section 13 says
   which class now does it.
+- Amended 2026-11-20, after load runs of 0.7.0: the
+  room renders the browser's history page itself (`history-json`,
+  [section 3](#3-the-room-numbers-epochs-and-the-history-window)), the
+  client keeps its socket on a 5xx history answer and resets its
+  reconnect attempts only once caught up ([section 6](#6-the-client-protocol)),
+  and the pusher is deployed with batched writes ([section 13](#13-the-pusher-amended-2026-11-20)).
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -197,7 +203,7 @@ is one durable write per wake of an idle room.
   older epoch knows it is void (section 6).
 
 `epochs` keeps the rows of the last 64 epochs.
-A retained row validates its exact `(epoch, number)` cursor even after that epoch leaves the 64-entry ledger, allowing reset recovery to paginate without changing the wire format. The browser bounds pending live work to 64 frames and 1 MiB of conservatively accounted string storage, cancels obsolete recovery on overflow, and reconnects from the last applied position; each history page including throttling has a 30-second deadline.
+A retained row validates its exact `(epoch, number)` cursor even after that epoch leaves the 64-entry ledger, allowing reset recovery to paginate without changing the wire format. The browser bounds pending live work to 64 frames and 1 MiB of conservatively accounted string storage, cancels obsolete recovery on overflow, and reconnects from the last applied position; each history request has a 30-second deadline (amended 2026-11-20: the waits between retries no longer count, see section 6).
 
 **How much can be lost.** With `confirm = false` (the default) a push
 goes out before its messages are in the bucket: a crash loses what
@@ -220,6 +226,36 @@ answers from the client's `(e, n)`:
 | above the `base` of a later epoch `e'` (lost) | `lost: {e: e', base}`, then the messages from `base + 1` |
 | older than the window, or older than the 64 epochs kept without an exact retained row | `reset: {e, n}` of the first message kept, then the messages from there |
 | absent (a new client) | the head only; `last = k` asks for the last `k` messages instead |
+
+**The browser's page (amended 2026-11-20).** The binary `history` above
+stays for the pusher and other callers. A front serving a browser calls
+`history-json(after, limit)` instead: the same decisions, answered as the
+browser's JSON (`{"head", "lost"?, "reset"?, "more", "messages"}`, `id`
+omitted when absent), byte for byte what `JSON.stringify` of the
+converted binary page makes, rendered by one SQLite statement
+(`json_quote` escapes as `JSON.stringify` does; shared vectors check it).
+The front returns the bytes unread. Its page holds at most 256 messages
+and 64 KiB of bodies, at least one message, `more` when cut. A room of an
+earlier release answers the operation 400: the TypeScript client then
+converts the binary page itself, but the Rust `Client::history_json` has
+no fallback, so a Rust front that uses it deploys with its room. Before, a
+front decoded each page into objects and encoded it again in the guest,
+so a reader far behind got full pages over the front's 50 ms budget (a
+500), which the client then answered by reconnecting, again and again. Fuel per front history request on a full
+window, the most over every page (deterministic, measured by
+`typescript_big_room_history_page_fuel` in
+`crates/wasmkeep-server/tests/big_room.rs`;
+[raw measurements](../../bench/results/2026-11-20-2e614d8-front-history-fuel.csv)):
+
+| Front | 256 messages of 200 B | 61 (now 15) messages of 4 KiB |
+|---|---|---|
+| QuickJS, before | 245 M | 937 M |
+| QuickJS, `history-json` | 1.1 M | 1.1 M |
+| StarlingMonkey, before | 58 M | 47 M |
+| StarlingMonkey, `history-json` | 4.9 M | 4.9 M |
+
+A JSON number above 2^53 - 1 is refused (`invalid browser integer`)
+rather than rounded, as the front's converter does.
 
 ### 4. The push
 
@@ -375,10 +411,18 @@ drains or the edge moved).
    edge's address. Delay before attempt *k* (from 0): a random time in
    `[0, min(30 s, 500 ms * 2^k))` (full jitter). After 4801 or 1012 the
    first delay is random in `[0, 2 s)`. `k` returns to 0 once a
-   connection has stayed `ready` for 10 s. A failed open (a browser sees
-   only 1006) is one more attempt.
-6. HTTP answers `429` and `503` are retried after `Retry-After` plus
-   the same jitter.
+   connection has stayed `ready` for 10 s after its history caught up
+   (amended 2026-11-20: not while still behind, so a client that cannot
+   catch up does not reconnect at the fastest rate forever). A failed
+   open (a browser sees only 1006) is one more attempt.
+6. HTTP answers `429` and any `5xx` are retried, the socket kept, after
+   `Retry-After` plus the same jitter; after a `5xx` other than `503`
+   (a room unavailable, not a page too big) the next request asks for
+   half the page (`limit`, which the front clamps to 1..256), and each
+   answer doubles it back. Only a `4xx` is an error (amended
+   2026-11-20: a `500`, the front's CPU budget cut by a full page, used
+   to close the socket, and the client rejoined behind as before). Each
+   request has a 30 s deadline; the waits between them do not count.
 
 Delivery is therefore **at least once, in order**: every message that
 stays in the history reaches every connected client, once or repeated;
@@ -710,6 +754,31 @@ by its own recorded steps. What it loses is memory: positions,
 suspects and lag retries. Its first round is header-only, and the
 answers rebuild the positions, as a 0.6.0 room's cold start did.
 
+**Write mode (amended 2026-11-20).** Deploy the pusher with batched
+writes ([ADR 0034](0034-batched-plain-writes.md)). Its per-round write is
+its alarm; everything that must survive a crash is committed durably;
+child positions are never stored. Strict, a busy pusher spent most of its
+time on the replication of its own alarm moves: each one, and its alarm
+index entry, a bucket round trip before its next round. Batched loses
+nothing that matters:
+
+- the scale state, the operation row and the migration step are each
+  committed with `exec-durable`, which waits for the acknowledged head
+  in a batched class too (the other migration writes land in those same
+  transactions);
+- positions are rebuilt from the edges' answers (above);
+- an edge drops numbers it already has, and the client's rule 1 drops
+  repeats, so a round repeated after a lost alarm move delivers nothing
+  twice to the application;
+- an alarm move lost with the node leaves the last acknowledged alarm,
+  which the sweep delivers on a live node: the idle alarm (at most 60 s
+  out), or a scale step's 2 s retry; and a room whose pusher stops
+  pulling counts it idle after 60 s, so its publishes poke it again.
+
+`room_cluster_batched_pusher_crash_keeps_its_operation_and_delivers`
+crashes a batched pusher with its alarm moves unacknowledged and a scale
+operation under way.
+
 **Stats.** The pusher answers the topology (the example's `stats` route);
 the room's head and window come from `history`.
 
@@ -724,9 +793,11 @@ the room's head and window come from `history`.
   4 MiB of queued frames (256 frames), and there is no node-wide cap on
   queued bytes, so a reconnect storm of slow clients can raise a node's
   peak far above its steady use.
-- A front on QuickJS turns a full 256 KiB history page from the room's
+- A front on QuickJS turned a full 256 KiB history page from the room's
   binary answer into JSON and bytes in the guest, without native UTF-8:
-  the tightest per-event cost left on a room's path.
+  the tightest per-event cost left on a room's path. Since 2026-11-20 the
+  room renders the page's JSON (`history-json`, section 3) and the front
+  forwards it.
 - `call-many` has no deadline of its own: a round waits for its slowest
   child up to the event's call deadline, and the room's other events wait
   behind it. Suspects bound that to one slow round per failing child.
@@ -858,7 +929,9 @@ R2's binary protocol retains its integer range. The JSON browser protocol
 accepts nonnegative safe integers (at most 2^53 - 1); rounds reject values
 outside that range rather than round them. A TypeScript front can return
 `JSON.stringify(broadcast.historyJSON(history))`, importing `broadcast`
-from `@wasmkeep/sdk/front`, after authorizing and calling R2 history.
+from `@wasmkeep/sdk/front`, after authorizing and calling R2 history
+(since 2026-11-20 it returns `room.historyJSON(after, limit)`, the same
+bytes rendered by the room, section 3).
 The helper converts bigint positions, timestamps and epoch boundaries and
 rejects unrepresentable numbers. JSON escaping can expand the R2 binary
 history response; a single text that cannot fit the 64 KiB live frame goes

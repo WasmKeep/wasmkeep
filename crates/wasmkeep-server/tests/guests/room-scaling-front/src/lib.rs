@@ -141,6 +141,38 @@ fn r6(path: &str, out: http::ResponseOutparam) {
             format!("/test-slow?ms={}", query(path, "ms").unwrap()),
         ),
         "/r6/children" => call(format!("pusher/{name}"), "/test-children".into()),
+        "/r6/op" => call(format!("pusher/{name}"), "/test-op".into()),
+        "/r6/refuse-range" => call(
+            format!("edge/{name}.e{}", query(path, "edge").unwrap()),
+            format!("/test-refuse-range?on={}", query(path, "on").unwrap()),
+        ),
+        // A publish whose poke is lost: the room numbers it, nobody pokes.
+        "/r6/publish-unpoked" => {
+            let body = b"unpoked";
+            let mut wire = vec![];
+            wire.extend_from_slice(&1u64.to_be_bytes());
+            wire.extend_from_slice(&0u64.to_be_bytes());
+            wire.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            wire.extend_from_slice(body);
+            wasmkeep_sdk::actors::call(
+                &format!("room/{name}"),
+                &wasmkeep_sdk::actors::Request {
+                    method: "POST".into(),
+                    path: "/wasmkeep-room/v1/publish".into(),
+                    headers: vec![],
+                    body: wire,
+                },
+            )
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|r| {
+                // count (1), then the position: e, n.
+                if r.status == 200 && r.body.len() >= 24 {
+                    Ok(u64::from_be_bytes(r.body[16..24].try_into().unwrap()).to_string())
+                } else {
+                    Err(format!("publish answered {}", r.status))
+                }
+            })
+        }
         "/r6/legacy-boot" => call(format!("room/{name}"), "/test-legacy-boot".into()),
         "/r6/legacy-rows" => call(format!("room/{name}"), "/test-legacy-rows".into()),
         "/r6/owner" => call(format!("directory/bg:{name}"), "/test-owner".into()),

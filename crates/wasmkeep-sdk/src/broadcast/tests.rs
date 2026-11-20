@@ -117,6 +117,7 @@ impl Store for Db {
                             Value::Text(String::from_utf8(v.to_vec()).unwrap())
                         }
                         rusqlite::types::ValueRef::Null => Value::Null,
+                        rusqlite::types::ValueRef::Blob(v) => Value::Blob(v.to_vec()),
                         _ => panic!("unexpected value"),
                     })
                     .collect())
@@ -136,6 +137,7 @@ fn param(v: &Value) -> rusqlite::types::Value {
     match v {
         Value::Integer(n) => (*n).into(),
         Value::Text(s) => s.clone().into(),
+        Value::Blob(b) => b.clone().into(),
         _ => rusqlite::types::Value::Null,
     }
 }
@@ -266,10 +268,187 @@ fn unicode_room_wire_vectors_for_typescript_front() {
             .unwrap(),
         vectors[3]
     );
+    // The browser's page, as the TypeScript front's JSON.stringify writes it.
+    assert_eq!(
+        super::super::protocol::serve(&mut room, "history-json", &vectors[4], 0, "app/front", "")
+            .unwrap(),
+        vectors[5]
+    );
     let messages = room.messages().unwrap();
     assert_eq!(messages[0].id.as_deref(), Some("x"));
     assert_eq!(messages[1].id.as_deref(), Some("\u{feff}x"));
     assert_eq!(messages[1].body, "\u{feff}body");
+}
+/// `JSON.stringify` of a string, the reference `history-json` must match:
+/// `"`, `\` and controls escaped, short forms for \b \t \n \f \r, the
+/// other controls as lowercase `\u00xx`, everything else as it is.
+fn stringify(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+/// The browser JSON of `h`, as the TypeScript front's
+/// `JSON.stringify(historyJSON(h))` writes it.
+fn browser(h: &History) -> String {
+    let p = |p: Position| format!(r#"{{"e":{},"n":{}}}"#, p.e, p.n);
+    let mut out = format!(r#"{{"head":{}"#, p(h.head));
+    if let Some(l) = h.lost {
+        out += &format!(r#","lost":{{"e":{},"base":{}}}"#, l.e, l.base);
+    }
+    if let Some(r) = h.reset {
+        out += &format!(r#","reset":{}"#, p(r));
+    }
+    out += &format!(r#","more":{},"messages":["#, h.more);
+    let messages: Vec<String> = h
+        .messages
+        .iter()
+        .map(|m| {
+            let id =
+                m.id.as_deref()
+                    .map_or(String::new(), |id| format!(r#","id":{}"#, stringify(id)));
+            format!(
+                r#"{{"position":{},"at":{}{id},"body":{}}}"#,
+                p(m.position),
+                m.at,
+                stringify(&m.body)
+            )
+        })
+        .collect();
+    out + &messages.join(",") + "]}"
+}
+#[test]
+fn history_json_is_the_browsers_json_byte_for_byte() {
+    let mut room = Core::new(Db::new(), false);
+    room.init().unwrap();
+    let mut bodies: Vec<String> = (0..0x100u32)
+        .step_by(16)
+        .map(|c| (c..c + 16).filter_map(char::from_u32).collect())
+        .collect();
+    for s in [
+        "\"\\/",
+        "\u{2028}\u{2029}",
+        "\u{feff}body",
+        "\u{1f600}\u{10ffff}",
+        &"\u{20ac}".repeat(100),
+        "",
+    ] {
+        bodies.push(s.into());
+    }
+    let input: Vec<Publish> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, b)| Publish {
+            body: b.clone(),
+            id: (i % 3 != 0 && !b.is_empty()).then(|| b.chars().take(16).collect()),
+        })
+        .collect();
+    room.publish(&input, 1_700_000_000_000).unwrap();
+    // Bodies and ids are bound as TEXT: `json_quote` refuses a BLOB, so a
+    // BLOB row would make every page that holds it fail.
+    let kinds = room
+        .db
+        .query(
+            "SELECT DISTINCT typeof(body), coalesce(typeof(id),'') FROM wasmkeep_room_history",
+            &[],
+        )
+        .unwrap();
+    assert!(
+        kinds.iter().all(
+            |r| r[0].as_str() == Some("text") && matches!(r[1].as_str(), Some("text" | "null"))
+        ),
+        "{kinds:?}"
+    );
+    for after in [
+        None,
+        Some(Position { e: 1, n: 0 }),
+        Some(Position { e: 1, n: 5 }),
+    ] {
+        let json = room.history_json(after, 256).unwrap();
+        let want = browser(&room.history(after, 256, None).unwrap());
+        assert_eq!(String::from_utf8(json).unwrap(), want);
+    }
+    // A crash voids numbers (lost), then the window moves past the cursor (reset).
+    room.db
+        .exec("DELETE FROM wasmkeep_room_history WHERE n > 20", &[], false)
+        .unwrap();
+    let mut room = Core::new(room.db, false);
+    room.publish(&[message("after the crash", None)], 1)
+        .unwrap();
+    let at = Some(Position { e: 1, n: 22 });
+    let lost = String::from_utf8(room.history_json(at, 256).unwrap()).unwrap();
+    assert!(lost.contains(r#""lost":{"e":2,"base":20}"#), "{lost}");
+    assert_eq!(lost, browser(&room.history(at, 256, None).unwrap()));
+    for _ in 0..2000 {
+        room.publish(&[message("x", None)], 2).unwrap();
+    }
+    let at = Some(Position { e: 1, n: 1 });
+    let reset = String::from_utf8(room.history_json(at, 256).unwrap()).unwrap();
+    assert!(reset.contains(r#""reset":"#));
+    assert_eq!(reset, browser(&room.history(at, 256, None).unwrap()));
+}
+#[test]
+fn history_json_pages_256_rows_64_kib_at_least_one_row() {
+    let mut room = Core::new(Db::new(), false);
+    room.init().unwrap();
+    for _ in 0..300 {
+        room.publish(&[message(&"y".repeat(193), None)], 0).unwrap();
+    }
+    let page = |room: &mut Core<Db>, after: u64, limit: usize| {
+        let json = room
+            .history_json(Some(Position { e: 1, n: after }), limit)
+            .unwrap();
+        let json = String::from_utf8(json).unwrap();
+        (
+            json.matches(r#"{"position""#).count(),
+            json.contains(r#""more":true"#),
+        )
+    };
+    assert_eq!(page(&mut room, 0, 256), (256, true));
+    assert_eq!(
+        page(&mut room, 0, 2000),
+        (256, true),
+        "at most 256 rows whatever the limit"
+    );
+    assert_eq!(page(&mut room, 0, 32), (32, true));
+    assert_eq!(page(&mut room, 256, 256), (44, false));
+    room.publish(
+        &(0..40)
+            .map(|_| message(&"z".repeat(4096), None))
+            .collect::<Vec<_>>(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        page(&mut room, 300, 256),
+        (16, true),
+        "16 bodies of 4 KiB in 64 KiB"
+    );
+    room.publish(&[message(&"w".repeat(65536), None)], 0)
+        .unwrap();
+    room.publish(&[message(&"v".repeat(65536), Some("big"))], 0)
+        .unwrap();
+    assert_eq!(page(&mut room, 340, 256), (1, true));
+    assert_eq!(page(&mut room, 341, 256), (1, false));
+    assert!(room.history_json(Some(Position { e: 1, n: 0 }), 0).is_err());
+    room.publish(&[message("late", None)], 1 << 53).unwrap();
+    assert!(
+        room.history_json(Some(Position { e: 1, n: 342 }), 256)
+            .unwrap_err()
+            .contains("invalid browser integer")
+    );
 }
 /// A full window and full history pages cost each event what it answers,
 /// not the window (TypeScript has the same test).

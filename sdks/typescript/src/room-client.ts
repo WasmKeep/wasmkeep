@@ -46,6 +46,8 @@ function validateHistory(h: any): asserts h is History {
         h.messages.some((m: any) => !m || !position(m.position) || !integer(m.at) || typeof m.body !== "string" || (m.id !== undefined && typeof m.id !== "string")))
         throw Error("invalid history");
 }
+/** The rows of a full history page, as the front serves it by default. */
+export const HISTORY_PAGE = 256;
 export function backoff(k: number, random = Math.random, closeCode?: number): number {
     return random() * (k === 0 && (closeCode === 4801 || closeCode === 1012) ? 2000 : Math.min(30000, 500 * 2 ** Math.min(k, 16)));
 }
@@ -313,12 +315,21 @@ export class RoomClient {
                 try {
                     const frame = JSON.parse(event.data) as Frame;
                     validateFrame(frame);
+                    const work = this.receiver.receive(frame);
                     if (frame.t === "ready") {
                         this.options.onState?.("ready");
                         this.cancel(this.stable);
-                        this.stable = this.later(() => { this.attempt = 0; }, 10000);
+                        // Rule 5: `k` returns to 0 once the connection has
+                        // stayed ready for 10 s after its history caught up,
+                        // never while it is still behind.
+                        void work.then(() => {
+                            if (!ended && generation === this.generation && !this.stopped) {
+                                this.cancel(this.stable);
+                                this.stable = this.later(() => { this.attempt = 0; }, 10000);
+                            }
+                        }, () => { });
                     }
-                    void this.receiver.receive(frame).catch(e => {
+                    void work.catch(e => {
                         if (ended || generation !== this.generation || this.stopped)
                             return;
                         this.options.onError?.(e);
@@ -340,30 +351,49 @@ export class RoomClient {
             disconnected(1006);
         }
     }
-    private async history(p?: Position, recovery?: AbortSignal): Promise<History> {
-        const deadline = new AbortController();
-        const timer = this.later(() => deadline.abort(Error("history deadline exceeded")), 30000);
-        const signal = AbortSignal.any([this.abort.signal, deadline.signal, ...(recovery ? [recovery] : [])]);
-        try {
-            return await this.fetchHistory(p, signal);
-        }
-        finally {
-            this.cancel(timer);
-        }
+    /** The `limit` the next history request asks for: halved after each
+     * 5xx but 503 (a page the front could not serve in its budget), doubled back
+     * after each answer, up to the front's own page. */
+    private limit = HISTORY_PAGE;
+    private history(p?: Position, recovery?: AbortSignal): Promise<History> {
+        const signal = AbortSignal.any([this.abort.signal, ...(recovery ? [recovery] : [])]);
+        return this.fetchHistory(p, signal);
     }
+    /** Rule 6: a 429 or any 5xx is retried, the socket kept, after
+     * `Retry-After` plus full jitter; only a 4xx is an error. Each request
+     * has a 30 s deadline; the waits between them do not count. */
     private async fetchHistory(p: Position | undefined, signal: AbortSignal): Promise<History> {
-        const url = new URL(this.options.history);
-        if (p)
-            url.searchParams.set("after", `${p.e}.${p.n}`);
         for (let k = 0;; k++) {
             signal.throwIfAborted();
-            const response = await (this.options.fetch ?? fetch)(url.toString(), { signal });
-            signal.throwIfAborted();
-            if (response.status !== 429 && response.status !== 503) {
-                if (!response.ok)
-                    throw Error(`history answered ${response.status}`);
-                return await response.json() as History;
+            const url = new URL(this.options.history);
+            if (p)
+                url.searchParams.set("after", `${p.e}.${p.n}`);
+            if (this.limit < HISTORY_PAGE)
+                url.searchParams.set("limit", String(this.limit));
+            const deadline = new AbortController();
+            const timer = this.later(() => deadline.abort(Error("history deadline exceeded")), 30000);
+            let response: Response, h: History | undefined;
+            try {
+                const attempt = AbortSignal.any([signal, deadline.signal]);
+                response = await (this.options.fetch ?? fetch)(url.toString(), { signal: attempt });
+                attempt.throwIfAborted();
+                if (response.ok)
+                    h = await response.json() as History;
+                attempt.throwIfAborted();
             }
+            finally {
+                this.cancel(timer);
+            }
+            if (h) {
+                this.limit = Math.min(HISTORY_PAGE, this.limit * 2);
+                return h;
+            }
+            if (response.status !== 429 && response.status < 500)
+                throw Error(`history answered ${response.status}`);
+            // A 503 is the room unavailable (a takeover), not a page too
+            // big for the front: it keeps the page.
+            if (response.status >= 500 && response.status !== 503)
+                this.limit = Math.max(1, Math.floor(this.limit / 2));
             const retry = response.headers.get("Retry-After") ?? "0";
             const seconds = Number(retry), delay = Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(retry) - this.clock.now());
             await new Promise<void>((resolve, reject) => {

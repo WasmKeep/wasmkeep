@@ -1,6 +1,7 @@
 import { Reader, Writer } from "./wire";
 import { call } from "./call";
 import type { Position, Publish, History, Message } from "./broadcast-core";
+import { historyJSON } from "./room-history";
 const PREFIX = "/wasmkeep-room/v1/", enc = new TextEncoder(), dec = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 function number(r: Reader): bigint {
     const n = r.u64();
@@ -43,6 +44,8 @@ export function pusherOf(room: string): string {
     return `pusher/${slash < 0 ? room : room.slice(slash + 1)}`;
 }
 const POKE = "/wasmkeep-pusher/v1/poke";
+/** What a room without `history-json` answers it (TypeScript, Rust). */
+const OLD = ["invalid room operation", "invalid room protocol"].map(s => enc.encode(s));
 /** Front helper; no calls from an edge or relay. */
 export class Client {
     readonly pusher: string;
@@ -94,6 +97,27 @@ export class Client {
             messages.push({ position: position(r), at: number(r), id: flag(r) ? text(r) : undefined, body: text(r) });
         end(r);
         return { head, lost, reset, more, messages };
+    }
+    /** The browser's history page, as JSON bytes to answer unread: the
+     * room renders `JSON.stringify(historyJSON(history(after, limit)))`
+     * itself, at most 256 rows and about 64 KiB of bodies (at least one
+     * row, `more` when cut), so this front's cost does not grow with the
+     * page. A room of an earlier release has no such operation: then the
+     * page is converted here, as before. */
+    historyJSON(after?: Position, limit = 256): Uint8Array {
+        const w = new Writer().u64(after ? 1 : 0);
+        if (after)
+            put(w, after);
+        w.u64(limit);
+        const result = call(this.address, "POST", PREFIX + "history-json", [], w.finish());
+        if ("error" in result)
+            throw Error(result.error);
+        const { status, body } = result.reply;
+        if (status === 200)
+            return body;
+        if (status === 400 && OLD.some(o => o.length === body.length && o.every((b, i) => b === body[i])))
+            return enc.encode(JSON.stringify(historyJSON(this.history(after, Math.min(limit, 256)))));
+        throw Error(`room answered ${status}`);
     }
 }
 export { historyJSON } from "./room-history";

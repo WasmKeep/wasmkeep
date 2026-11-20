@@ -448,6 +448,17 @@ them to the application's HTTP representation. History returns `lost`,
 page from its last message's position. The internal binary protocol matches
 Rust.
 
+For the browser, answer `room.historyJSON(after, limit)` as the response
+body (`content-type: application/json`): the room renders the page's JSON
+itself, in SQLite, byte for byte what
+`JSON.stringify(broadcast.historyJSON(room.history(after, limit)))` makes,
+so the front's cost does not grow with the page. Its pages hold at most
+256 messages and about 64 KiB of bodies (at least one message, `more` when
+cut). Clamp a `limit` query parameter to 1..256 and pass it on: the
+browser's `RoomClient` halves it after a 5xx. A room of an earlier release
+has no such operation; the front then converts the binary page itself.
+Numbers above 2^53 - 1 are refused rather than rounded.
+
 Use a batched class. One durable epoch boundary is recorded at the first
 operation after each cold start, including history, so reconnects learn
 losses before the next publish. Plain publishes retain 2,000 messages or

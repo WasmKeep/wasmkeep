@@ -80,6 +80,8 @@ impl Actor for Guest {
 thread_local! {
     /// The pusher tests' slow edge: how long each push waits before it is applied.
     static SLOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The batched pusher test's stuck operation: this edge refuses `range`.
+    static REFUSE_RANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 impl http::Guest for Guest {
     fn handle(req: http::IncomingRequest, out: http::ResponseOutparam) {
@@ -92,6 +94,32 @@ impl http::Guest for Guest {
         if let Some(ms) = path.strip_prefix("/test-slow?ms=") {
             SLOW.set(ms.parse().unwrap_or(0));
             http::respond(out, 200, "text/plain", b"ok");
+            return;
+        }
+        if let Some(on) = path.strip_prefix("/test-refuse-range?on=") {
+            REFUSE_RANGE.set(on == "1");
+            http::respond(out, 200, "text/plain", b"ok");
+            return;
+        }
+        if path == "/wasmkeep-edge/v1/range" && REFUSE_RANGE.get() {
+            http::respond(out, 503, "text/plain", b"range refused by the test");
+            return;
+        }
+        // The pusher's pending operation, by id ("" for none).
+        if path == "/test-op" {
+            let host = ScaleHost {
+                directory: String::new(),
+                room: String::new(),
+                capacity: 5,
+                head: Position { e: 0, n: 0 },
+            };
+            let op = host
+                .load()
+                .ok()
+                .and_then(|s| s.op)
+                .map(|o| o.id)
+                .unwrap_or_default();
+            http::respond(out, 200, "text/plain", op.as_bytes());
             return;
         }
         if path == "/wasmkeep-edge/v1/push" && SLOW.get() > 0 {

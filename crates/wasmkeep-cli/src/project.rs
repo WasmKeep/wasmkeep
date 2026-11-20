@@ -1050,8 +1050,8 @@ env = ".env.dev"
 
     #[test]
     fn writes_is_a_class_key() {
-        // ADR 0034: `strict` (the default) or `batched`; classes only. The
-        // deploy refuses `batched` for now; the file reads it.
+        // ADR 0034: `strict` (the default) or `batched`; classes only. A
+        // deploy names each class's mode in the version (section 15).
         use wasmkeep_server::apps::Writes;
         let base =
             "[app]\ntenant = \"acme\"\nname = \"shop\"\n[classes.carts]\ncomponent = \"c.wasm\"\n";

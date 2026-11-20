@@ -25,6 +25,8 @@ def main():
             for actor in ('room', 'pusher', 'edge', 'relay', 'directory'):
                 command += ['--actor', f'{actor}=examples/ts-big-room/{actor}.wasm',
                             '--access', f'{actor}=internal']
+            # Deployed as the example says (ADR 0040, section 13).
+            command += ['--writes', 'pusher=batched']
             node = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=log)
             deadline = time.monotonic() + 27
             try:
