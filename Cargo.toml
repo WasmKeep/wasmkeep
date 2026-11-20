@@ -21,7 +21,7 @@ wasmkeep-cluster = { path = "crates/wasmkeep-cluster" }
 wasmkeep-sdk = { path = "crates/wasmkeep-sdk" }
 # Exact versions are pinned here; wasmtime stays on one version per milestone
 # (see ROADMAP.md) and is never bumped in a feature change.
-wasmtime = { version = "=50.0.2", default-features = false, features = [
+wasmtime = { version = "=50.0.3", default-features = false, features = [
   "std",
   "runtime",
   "cranelift",
@@ -32,8 +32,8 @@ wasmtime = { version = "=50.0.2", default-features = false, features = [
   "backtrace",
   "call-hook",
 ] }
-wasmtime-wasi = { version = "=50.0.2", default-features = false, features = ["p2"] }
-wasmtime-wasi-http = { version = "=50.0.2", default-features = false, features = ["p2", "default-send-request"] }
+wasmtime-wasi = { version = "=50.0.3", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "=50.0.3", default-features = false, features = ["p2", "default-send-request"] }
 hyper = { version = "=1.12.0", features = ["server", "client", "http1"] }
 hyper-util = { version = "=0.1.21", features = ["tokio", "http1", "client-legacy"] }
 tower-service = "=0.3.3"
