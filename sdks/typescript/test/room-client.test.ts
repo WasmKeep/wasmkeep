@@ -392,3 +392,71 @@ test("the reconnect attempt counter returns to 0 only once history caught up", a
     assert.equal(sockets.length, 5, "attempt 0 waits 250 ms");
     c.close();
 });
+test("an edge's announced position fetches history only above the client's own", async () => {
+    const queries: unknown[] = [], seen: number[] = [];
+    const r = new Receiver({ onMessage: p => { seen.push(p.n); }, history: async (p) => {
+            queries.push(p);
+            return { head: { e: 1, n: 375 }, messages: [{ position: { e: 1, n: 374 }, at: 0, body: "374" }, { position: { e: 1, n: 375 }, at: 0, body: "375" }], more: false };
+        } }, { e: 1, n: 373 });
+    // Equal: the client missed nothing, no request.
+    await r.receive({ t: "ready", e: 1, b: 0, n: 373 });
+    assert.deepEqual(queries, []);
+    // Above: one history fetch from the client's own position.
+    await r.receive({ t: "ready", e: 1, b: 0, n: 375 });
+    assert.deepEqual(queries, [{ e: 1, n: 373 }]);
+    assert.deepEqual(seen, [374, 375]);
+    // Below (the push repeats what the client has): no request.
+    await r.receive({ t: "ready", e: 1, b: 0, n: 374 });
+    assert.deepEqual(queries, [{ e: 1, n: 373 }]);
+    assert.deepEqual(r.last, { e: 1, n: 375 });
+});
+test("an announced position in the next epoch applies its base without a fetch", async () => {
+    const lost: number[][] = [];
+    const r = new Receiver({ onLost: (a, b) => { lost.push([a, b]); }, history: async () => { throw Error("unexpected fetch"); } }, { e: 1, n: 373 });
+    await r.receive({ t: "ready", e: 2, b: 373, n: 373 });
+    assert.deepEqual(r.last, { e: 2, n: 373 });
+    const s = new Receiver({ onLost: (a, b) => { lost.push([a, b]); }, history: async () => { throw Error("unexpected fetch"); } }, { e: 1, n: 375 });
+    await s.receive({ t: "ready", e: 2, b: 373, n: 373 });
+    assert.deepEqual(lost, [[374, 375]]);
+    assert.deepEqual(s.last, { e: 2, n: 373 });
+});
+test("a pong with no head is a keepalive only", async () => {
+    const r = new Receiver({ history: async () => { throw Error("unexpected fetch"); } }, { e: 1, n: 3 });
+    await r.receive({ t: "pong", e: 0, n: null } as never);
+    assert.deepEqual(r.last, { e: 1, n: 3 });
+    for (const frame of [{ t: "behind", e: 1, n: null }, { t: "ready", e: 1, b: -1, n: 3 }]) {
+        let error: unknown;
+        try {
+            await r.receive(frame as never);
+        }
+        catch (e) {
+            error = e;
+        }
+        assert(error instanceof Error && /invalid/.test(error.message));
+    }
+});
+test("a woken edge's announcement on an open connection is not a new ready", async () => {
+    const clock = new FakeClock(), ws = new FakeSocket(), states: string[] = [], urls: string[] = [];
+    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", clock, random: () => .5, socket: () => ws, onState: s => { states.push(s); },
+        fetch: (async (url: string) => { urls.push(url); return new Response(JSON.stringify({ head: { e: 1, n: 2 }, messages: [], more: false })); }) as typeof fetch });
+    c.connect();
+    ws.onopen?.();
+    ws.frame({ t: "ready", e: 1, n: 2 });
+    await settle();
+    ws.frame({ t: "ready", e: 1, b: 0, n: 2 });
+    ws.frame({ t: "pong", e: 0, n: null });
+    await settle();
+    assert.deepEqual(states, ["connecting", "ready"]);
+    assert.deepEqual(urls, []);
+    assert(!ws.closed);
+    c.close();
+});
+test("a woken edge's first push across epochs reaches the client with no fetch", async () => {
+    const seen: string[] = [];
+    const r = new Receiver({ onMessage: p => { seen.push(`${p.e}.${p.n}`); }, history: async () => { throw Error("unexpected fetch"); } }, { e: 1, n: 370 });
+    // The frames of wake-vectors.txt's epoch-straddling push, no announcement.
+    await r.receive({ t: "m", e: 1, b: 0, n: 371, m: [{ a: 0, d: "371" }, { a: 0, d: "372" }, { a: 0, d: "373" }] });
+    await r.receive({ t: "m", e: 2, b: 373, n: 374, m: [{ a: 0, d: "374" }] });
+    assert.deepEqual(seen, ["1.371", "1.372", "1.373", "2.374"]);
+    assert.deepEqual(r.last, { e: 2, n: 374 });
+});

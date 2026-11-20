@@ -401,3 +401,144 @@ async fn fanout_500_starlingmonkey_default_budget() {
 async fn fanout_500_rust_default_budget() {
     fanout_budget("rust").await;
 }
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+async fn json_frame(ws: &mut Ws, what: &str) -> serde_json::Value {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("no frame: {what}"))
+            .unwrap()
+            .unwrap();
+        if let Message::Text(s) = m {
+            return serde_json::from_str(&s).unwrap();
+        }
+    }
+}
+fn body_of(response: &str) -> String {
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    if !headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return body.into();
+    }
+    let (mut rest, mut decoded) = (body, String::new());
+    loop {
+        let (size, tail) = rest.split_once("\r\n").unwrap();
+        let size = usize::from_str_radix(size, 16).unwrap();
+        if size == 0 {
+            return decoded;
+        }
+        decoded.push_str(&tail[..size]);
+        rest = &tail[size + 2..];
+    }
+}
+async fn hibernated(svc: &ActorService) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while svc.resident() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("actors did not hibernate");
+}
+// ADR 0040, section 5: an edge woken from hibernation holds its sockets but
+// no cursors. A ping right after the wake gets a pong; in a quiet room, one
+// publish after the edge hibernated reaches the open socket with no second
+// publish, live or through the position the edge announces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_edge_quiet_wake_delivers_one_publish_and_answers_ping() {
+    let wasm = guests::build_guest("../wasmkeep-sdk/tests/room-edge-guest", "room_edge_guest");
+    let runtime = Runtime::new(&RuntimeConfig {
+        max_instances: 8,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let component = guests::compile(&runtime, &wasm);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ActorConfig::new(dir.path());
+    config.mailbox.idle_timeout = Duration::from_millis(300);
+    let svc = ActorService::new(
+        runtime,
+        config,
+        vec![
+            ("t".into(), component.clone(), wasm.clone()),
+            ("pusher".into(), component.clone(), wasm.clone()),
+            ("edge".into(), component, wasm),
+        ],
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(wasmkeep_server::serve(listener, svc.clone(), async {
+        let _ = stopped.await;
+    }));
+    let warm = request(addr, "/actor/t/driver/r3-start").await;
+    assert!(warm.starts_with("HTTP/1.1 200"), "{warm}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/actor/edge/e/?c=one&p=0000000000000000"
+    ))
+    .await
+    .unwrap();
+    let ready = json_frame(&mut ws, "ready").await;
+    assert_eq!(ready["t"], "ready");
+    // The client's position: the stream starts after the head it joined at.
+    let mut last = (ready["e"].as_u64().unwrap(), ready["n"].as_u64().unwrap());
+    hibernated(&svc).await;
+    // A ping wakes a headless edge: it answers with no head.
+    ws.send(Message::Text(r#"{"t":"ping"}"#.into()))
+        .await
+        .unwrap();
+    let pong = json_frame(&mut ws, "pong after a wake").await;
+    assert_eq!(pong["t"], "pong");
+    hibernated(&svc).await;
+    // One publish into the quiet room; no second one follows.
+    let published = request(addr, "/actor/t/driver/r3-publish").await;
+    assert!(published.starts_with("HTTP/1.1 200"), "{published}");
+    let at = body_of(&published);
+    let (e, n) = at.trim().split_once('.').unwrap();
+    let target: (u64, u64) = (e.parse().unwrap(), n.parse().unwrap());
+    let mut fetched = false;
+    while last < target {
+        let f = json_frame(&mut ws, "the published message").await;
+        let e = f["e"].as_u64().unwrap();
+        match f["t"].as_str().unwrap() {
+            "m" => {
+                let first = f["n"].as_u64().unwrap();
+                assert!(
+                    e == last.0 && first <= last.1 + 1 || f["b"].as_u64() <= Some(last.1),
+                    "{f} after {last:?}"
+                );
+                last = (e, first + f["m"].as_array().unwrap().len() as u64 - 1);
+            }
+            "ready" => {
+                // Rules 2 and 3: the next epoch's base, then fetch only if
+                // the announced position is past the client's own.
+                let (b, n) = (f["b"].as_u64().unwrap(), f["n"].as_u64().unwrap());
+                if e == last.0 + 1 && b >= last.1 {
+                    last.0 = e;
+                }
+                if e != last.0 || n > last.1 {
+                    let h = request(
+                        addr,
+                        &format!("/actor/t/driver/r3-history?after={}.{}", last.0, last.1),
+                    )
+                    .await;
+                    assert!(h.starts_with("HTTP/1.1 200"), "{h}");
+                    let h: serde_json::Value = serde_json::from_str(&body_of(&h)).unwrap();
+                    for m in h["numbers"].as_array().unwrap() {
+                        last = (h["e"].as_u64().unwrap(), m.as_u64().unwrap());
+                    }
+                    fetched = true;
+                }
+            }
+            other => panic!("unexpected {other}: {f}"),
+        }
+    }
+    assert_eq!(last, target, "fetched over HTTP: {fetched}");
+    ws.close(None).await.unwrap();
+    let _ = stop.send(());
+    let _ = server.await;
+}

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { Edge, type Push } from "../src/room-edge";
 const push = (n: number): Push => ({ e: 1, b: 0, first: n, head: n, messages: [{ a: 0, d: "hello" }] });
 test("edge cursor, repeats, bounded buffer, behind then slow close", () => {
@@ -92,4 +93,68 @@ test("a push budgets distinct cursor frames and prioritizes caught-up sockets", 
     sent.length = 0;
     assert.equal(edge.push({e:1,b:0,first:34,head:33,messages:[]}).lagging, 0);
     assert.equal(sent.length, 5);
+});
+// A frame in the notation of wake-vectors.txt, shared with Rust.
+const notation = (id: bigint, frame: string) => {
+    const f = JSON.parse(frame);
+    if (f.t === "ready")
+        return f.b !== undefined ? `${id} ready ${f.e} ${f.b} ${f.n}` : `${id} ready ${f.e} ${f.n}`;
+    if (f.t === "behind")
+        return `${id} behind ${f.e} ${f.n}`;
+    if (f.t === "pong")
+        return f.n === null || f.n === undefined ? `${id} pong null` : `${id} pong ${f.e} ${f.n}`;
+    if (f.t === "m")
+        return `${id} m ${f.e} ${f.b} ${f.n} ${f.m.length}`;
+    throw Error(frame);
+};
+test("shared wake vectors: a woken edge's first push reaches its sockets", () => {
+    const text = readFileSync("../../crates/wasmkeep-sdk/src/broadcast/wake-vectors.txt", "utf8");
+    let count = 0;
+    for (const block of text.split("\n\n")) {
+        const scenario = block.split("\n").filter(l => l && !l.startsWith("#"));
+        if (!scenario.length)
+            continue;
+        count++;
+        const sent: string[] = [];
+        let sockets: bigint[] = [];
+        const edge = new Edge({ send(id, s) { sent.push(notation(id, s)); return "ok"; }, close() { } });
+        let expected: string[] = [], event = "";
+        const check = () => {
+            assert.deepEqual(sent.splice(0), expected, `after ${event} in:\n${scenario.join("\n")}`);
+            expected = [];
+        };
+        for (const line of scenario) {
+            const w = line.split(" ");
+            if (/^[0-9]+$/.test(w[0])) {
+                expected.push(line);
+                continue;
+            }
+            if (event)
+                check();
+            event = line;
+            const n = (i: number) => Number(w[i]);
+            if (w[0] === "sockets")
+                sockets = w[1].split(",").map(BigInt);
+            else if (w[0] === "open") {
+                sockets.push(BigInt(w[1]));
+                assert(edge.open(BigInt(w[1]), w.length === 4 ? { e: n(2), n: n(3) } : undefined));
+            }
+            else if (w[0] === "ping")
+                edge.ping(BigInt(w[1]));
+            else if (w[0] === "push")
+                edge.receive({ e: n(1), b: n(2), first: n(3), head: n(4), messages: Array.from({ length: n(5) }, (_, i) => w.length === 9 && i < n(8) ? { a: 0, d: "x", e: n(6), b: n(7) } : { a: 0, d: "x" }) }, [...sockets]);
+            else
+                throw Error(`unknown event ${line}`);
+        }
+        check();
+    }
+    assert.equal(count, 8);
+});
+test("a wake announcement that meets backpressure closes the socket as slow", () => {
+    const closed: [bigint, number][] = [];
+    const edge = new Edge({ send() { return "backpressure"; }, close(id, code) { closed.push([id, code]); } });
+    const ack = edge.receive({ ...push(5), first: 6, messages: [] }, [1n]);
+    assert.deepEqual(closed, [[1n, 4802]]);
+    assert.equal(ack.sockets, 0);
+    assert.equal(ack.slow, 1);
 });

@@ -357,10 +357,29 @@ thus costs the edge a cursor, never a copy of the stream.
 
 **After a hibernation** the buffer, the cursors and the points are gone
 while the sockets remain. The edge then knows no head until the next
-push or call from the room; it treats every socket's cursor as that
-head (it was idle for 30 s, and a client that missed a tail learns it
-from `pong`), and at a range change closes every socket whose point it
-no longer knows.
+push or call from the room, and at a range change closes every socket
+whose point it no longer knows.
+
+(Amended 2026-11-20.) On the first push after such a wake, the edge
+places every socket that has no cursor at `first - 1`, so the messages
+the push carries go out; their frames carry each message's own epoch,
+base and number, and rules 2 and 3 apply, one frame per socket. A
+header-only first push has nothing to send: the edge then sends each of
+those sockets `{"t":"ready","e":E,"b":B,"n":first - 1}` (the push's
+epoch and base), so the client learns where the stream starts. A client
+whose own position is lower fetches the gap over HTTP; one that missed
+nothing makes no request. If that `ready` meets `backpressure`, the
+socket closes with 4802, as for `behind`. (The announcement is not sent
+with messages: at 500 sockets a second frame each doubles the host sends
+of a cold event, a trap there repeats the wake, and the push's epoch can
+be newer than its first messages'.) A `ping` is always answered:
+before the first push, with `{"t":"pong","e":0,"n":null}`. Before this,
+the edge placed those sockets at the push's `head` before applying it:
+the messages of that push never reached them, nothing told them so, and
+a ping got no answer until a push came. A client that had received 373
+when a header-only push said 375 stayed at 373 until the next publish.
+A socket that joined the woken edge before that push already had its
+`ready` with `n: null` and gets no second one.
 
 **Open.** The front's hand-off path is the root with the query
 `?c=<client id>&p=<point, 16 hex digits>&e=<epoch>&n=<number>`, the
@@ -384,9 +403,10 @@ Text frames, JSON. Server to client:
 | Frame | Meaning |
 |---|---|
 | `{"t":"ready","e":4,"n":120}` | Connected; the stream resumes after `n`. `null`: check over HTTP. |
+| `{"t":"ready","e":4,"b":100,"n":120}` | On an open socket, from an edge woken from hibernation by a header-only push (section 5): the stream resumes after `n`; `b` is the epoch's base. |
 | `{"t":"m","e":4,"b":100,"n":121,"m":[{"a":1763400000000,"i":"k1","d":"hello"}]}` | Messages `n`, `n+1`, ... of epoch `e`, whose base is `b`. |
 | `{"t":"behind","e":4,"n":180}` | Fetch what you miss up to here over HTTP; live frames follow. |
-| `{"t":"pong","e":4,"n":180}` | Answer to `ping`, with the head. |
+| `{"t":"pong","e":4,"n":180}` | Answer to `ping`, with the head. `"e":0,"n":null`: the edge knows no head yet. |
 
 Client to server: `{"t":"ping"}` only. Close codes: 4801 `moved` (the
 range moved or the edge drains), 4802 `slow`, 1012 (the edge's node
@@ -404,7 +424,17 @@ drains or the edge moved).
 3. A frame whose first new number is past `last.n + 1`, a `behind`, a
    `ready` whose `n` is `null` or differs from `last.n` (a new client
    takes it as its start), a `pong` whose head differs from `last`:
-   there is a gap.
+   there is a gap. A `ready` with `b` (amended 2026-11-20) first applies
+   `b` as rule 2 does when its epoch is `last.e + 1`; it is a gap only
+   if its epoch then differs from `last.e` or its `n` is above `last.n`.
+   It does not change the connection's state. An older client ignores
+   `b` and takes the `ready` as a gap whenever its `e` or `n` differs from
+   `last`: since the room bumps its epoch when it wakes, that is one
+   request per older client after each header-only wake. A `pong` with
+   `n: null` is a keepalive only. An older client rejects it as invalid
+   (`onError`) and reconnects; in a quiet room, whose edge hibernates
+   between its pings, it thus cycles about every 45 s, where before the
+   edge's silence made it reconnect about every 55 s.
    Hold live frames, `GET <front>/history?after=<e>.<n>` until `more` is
    false, apply `lost` and `reset` as answered (`onReset`: the app
    reloads what it shows by its own means), then apply the held frames

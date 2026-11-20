@@ -232,7 +232,10 @@ Use `RoomClient` or implement all of the ADR's client rules:
 
 - Retain `(e, n)`, discard repeats and handle void ranges through `onLost`.
 - Hold live frames while fetching history pages after a gap, `behind`, or
-  inconsistent `ready`/`pong`. Handle `reset` by reloading application state
+  inconsistent `ready`/`pong`; an edge woken from hibernation by a header-only push sends open
+  sockets a `ready` with `b`, a gap only when its position is past yours,
+  and a `pong` with `n: null` is a keepalive. Handle `reset` by reloading
+  application state
   when history or the last 64 epochs no longer cover the position.
 - Reconnect through the front, with the last position and exponential full
   jitter (up to 30 seconds); handle 4801, 4802, 1012 and failed opens.

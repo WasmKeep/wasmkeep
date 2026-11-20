@@ -268,16 +268,8 @@ impl http::Guest for EdgeActor {
             }
             let push = Push::decode(body)?;
             Ok(EDGE.with_borrow_mut(|e| {
-                if e.head.is_none() {
-                    e.head = Some(Position {
-                        e: push.e,
-                        n: push.head,
-                    });
-                    e.floor = push.head;
-                }
-                e.adopt(&crate::websockets::connections());
-                let ack = e.push(&push, &mut HostSockets);
-                ack.encode()
+                e.receive(&push, &crate::websockets::connections(), &mut HostSockets)
+                    .encode()
             }))
         })();
         match result {
