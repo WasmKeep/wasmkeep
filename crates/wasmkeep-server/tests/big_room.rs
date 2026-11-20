@@ -518,7 +518,7 @@ async fn typescript_big_room_distinct_positions_at_default_budget() {
     distinct_positions("").await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "0.6.0 known limit: on a starved CPU the StarlingMonkey room runs out of guest memory (CHANGELOG); run with --run-ignored on two free cores"]
+#[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
 async fn typescript_big_room_distinct_positions_at_default_budget_starlingmonkey() {
     distinct_positions("-starlingmonkey").await;
 }

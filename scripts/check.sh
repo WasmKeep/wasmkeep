@@ -165,9 +165,10 @@ if $full || $rust; then
     # assert fuel ceilings too, but keep their real 50 ms CPU budget.
     # Only variants still sensitive to CPU speed remain ignored:
     # run them here, on this machine. The StarlingMonkey distinct-positions
-    # variant stays out, a 0.6.0 known limit (CHANGELOG).
+    # variant, a 0.6.0 known limit fixed by the room/pusher split, now
+    # runs here with the others.
     cargo nextest run -p wasmkeep-server --test big_room --test room_edge --locked --run-ignored only \
-      -E 'test(/default_budget/) - test(=typescript_big_room_distinct_positions_at_default_budget_starlingmonkey)'
+      -E 'test(/default_budget/)'
   else
     # The cluster suite over TLS repeats the cluster suite on another
     # transport: --full only.
