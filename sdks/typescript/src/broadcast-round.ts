@@ -51,6 +51,13 @@ interface Slice {
     messages: Push["messages"];
     sizes?: number[];
     recover: boolean;
+    /** Relayed: the rows and JSON bytes of this slice already counted,
+     * since a relay's children share one encoding of them. */
+    charged?: number;
+    chargedBytes?: number;
+    /** The cuts made of it, shared by the children given the same rows. */
+    cuts?: Map<number, Push["messages"]>;
+    fixed?: number;
 }
 const number = (v: bigint) => {
     const n = Number(v);
@@ -66,6 +73,9 @@ interface Child {
     sockets?: number;
     stallDelay?: number;
     stalled?: number;
+    /** The delay its last answer asked for (lagging sockets, or behind):
+     * a child left out keeps it. */
+    retry?: number;
 }
 export class Round {
     private children: Child[];
@@ -120,10 +130,18 @@ export class Round {
         this.resume = undefined;
         // Pulls by position: children at one position share one pull and one encoding.
         const slices = new Map<string, Slice | undefined>();
+        const keyOf = (position: Position | undefined) => position ? `${position.e}.${position.n}` : "";
+        // Relayed, a slice's rows are encoded once for all its children.
+        const relayed = this.relays.length > 0;
+        // The children at each position: a pull is sized to serve them all.
+        const sharers = new Map<string, number>();
+        for (const c of due)
+            if (c.initialized)
+                sharers.set(keyOf(c.position), (sharers.get(keyOf(c.position)) ?? 0) + 1);
         // The round's work in counts (ROUND_WORK): pulls, requests and rows.
         let read = 0, pulls = 0, work = 0, retry = 20, delivered: Position | undefined, current: Pull | undefined;
         const slice = (position: Position | undefined): Slice | undefined => {
-            const key = position ? `${position.e}.${position.n}` : "";
+            const key = keyOf(position);
             if (slices.has(key))
                 return slices.get(key);
             // A child at a head the round already pulled needs no read.
@@ -135,9 +153,11 @@ export class Round {
             if (pulls >= MAX_PULLS || work + PULL_WORK + PUSH_WORK + (position ? 2 : 0) > ROUND_WORK)
                 return;
             pulls++;
-            // What the pull reads is pushed at least once: half the work
-            // left after both requests buys rows.
-            const rows = Math.floor((ROUND_WORK - work - PULL_WORK - PUSH_WORK) / 2);
+            // What the pull reads is pushed to the children at its position:
+            // the work left after their requests buys rows, each counted
+            // once read and once pushed (once per child unless relayed).
+            const n = sharers.get(key) ?? 1;
+            const rows = Math.max(1, Math.floor((ROUND_WORK - work - PULL_WORK - PUSH_WORK * n) / (relayed ? 2 : 1 + n)));
             work += PULL_WORK;
             let pull: Pull;
             try {
@@ -173,7 +193,7 @@ export class Round {
         };
         // One round builds at most ROUND_BYTES of messages (one slice at
         // least): the rest keep their positions and go on 20 ms later.
-        let budget = ROUND_BYTES, deferred = false;
+        let budget = ROUND_BYTES, deferred = false, held = Infinity;
         const defer = (c: Child) => {
             deferred = true;
             this.resume ??= c.address;
@@ -185,11 +205,15 @@ export class Round {
         for (const c of due) {
             let body: string, op: string, header: Pull | undefined;
             if (work + PUSH_WORK > ROUND_WORK) {
-                // A child at the head this round read needs nothing: it
-                // goes first next round but sets no alarm, so a group at
+                // A child at the head this round read needs no messages: it
+                // goes first next round, and sets no alarm unless its last
+                // answer asked for one (its sockets lagging), so a group at
                 // its head goes idle. It keeps its last socket count.
-                if (c.initialized && c.position && current && c.position.e === current.e && c.position.n === current.head)
+                if (c.initialized && c.position && current && c.position.e === current.e && c.position.n === current.head) {
                     this.resume ??= c.address;
+                    if (c.retry !== undefined)
+                        held = Math.min(held, now + c.retry);
+                }
                 else
                     defer(c);
                 continue;
@@ -210,32 +234,45 @@ export class Round {
                 }
                 const h = header = s.header;
                 const p: Push = { e: number(h.e), b: number(h.b), first: number(h.head < 9007199254740991n ? h.head + 1n : h.head), head: number(h.head), messages: [] };
-                // Every row encoded counts, once per child it is pushed to.
+                // Every row encoded counts, once per child it is pushed to,
+                // or once per slice when relayed. Its bytes too.
+                const charged = relayed ? s.charged ?? 0 : 0, chargedBytes = relayed ? s.chargedBytes ?? 0 : 0;
                 const rows = Math.max(0, ROUND_WORK - work - PUSH_WORK);
+                let fresh = 0;
                 if (s.recover)
                     p.recover = true;
                 else if (s.messages.length) {
-                    if (!rows) {
+                    if (!rows && !charged) {
                         defer(c);
                         continue;
                     }
                     // The old cut: at most 512 messages and 512 KiB of JSON
                     // per request, and the round's rows left.
-                    const fixed = JSON.stringify({ ...p, first: s.first, messages: [] }).length;
-                    let k = 0, total = fixed;
-                    while (k < s.messages.length && k < 512 && k < rows && total + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
-                        total += s.sizes![k] + (k++ ? 1 : 0);
-                    if (k && total - fixed > budget && budget < ROUND_BYTES) {
+                    // The header's JSON is the same for every child of a slice.
+                    const fixed = s.fixed ??= JSON.stringify({ ...p, first: s.first, messages: [] }).length;
+                    let k = 0, bytes = 0;
+                    while (k < s.messages.length && k < 512 && k < charged + rows && fixed + bytes + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
+                        bytes += s.sizes![k] + (k++ ? 1 : 0);
+                    const more = Math.max(0, bytes - chargedBytes);
+                    if (k > charged && more > budget && budget < ROUND_BYTES) {
                         defer(c);
                         continue;
                     }
-                    budget -= total - fixed;
+                    budget -= more;
+                    fresh = Math.max(0, k - charged);
+                    if (relayed && k > charged) {
+                        s.charged = k;
+                        s.chargedBytes = bytes;
+                    }
                     p.first = s.first!;
-                    p.messages = s.messages.slice(0, k);
+                    s.cuts ??= new Map();
+                    p.messages = s.cuts.get(k) ?? s.messages.slice(0, k);
+                    s.cuts.set(k, p.messages);
                 }
-                work += PUSH_WORK + p.messages.length;
+                work += PUSH_WORK + fresh;
                 pushes.push(p);
-                body = JSON.stringify(p);
+                // Relayed, the relay's pack is the only encoding.
+                body = relayed ? "" : JSON.stringify(p);
             }
             sent.push(c);
             heads.push(header!);
@@ -277,9 +314,11 @@ export class Round {
         }
         if (deferred)
             next = now + retry;
+        next = Math.min(next, held);
         sent.forEach((c, i) => {
-            // A child sent a request this round says its count again.
+            // A child sent a request this round says its count and retry again.
             c.sockets = undefined;
+            c.retry = undefined;
             if (skipped.has(i))
                 return; // Relay failure belongs to the relay, not its edges.
             try {
@@ -304,8 +343,10 @@ export class Round {
                     c.position = position;
                     if (Number.isSafeInteger(a.sockets) && a.sockets >= 0)
                         c.sockets = a.sockets;
-                    if (position.e !== epoch || position.n < head || a.lagging)
-                        next = Math.min(next, now + (stalledOnly ? c.stallDelay : 20));
+                    if (position.e !== epoch || position.n < head || a.lagging) {
+                        c.retry = stalledOnly ? c.stallDelay : 20;
+                        next = Math.min(next, now + c.retry);
+                    }
                 }
                 c.suspect.success();
             }

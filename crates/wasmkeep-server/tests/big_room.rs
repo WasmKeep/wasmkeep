@@ -502,6 +502,13 @@ async fn typescript_big_room_full_window_at_default_budget_starlingmonkey() {
 /// own position (so every round meets 256 distinct slices), at the default
 /// budget. A trapped room event shows as a new epoch.
 async fn distinct_positions(suffix: &str) {
+    positions(suffix, "s", 256).await;
+}
+
+/// [`distinct_positions`] with `count` edges named for the stub edge's
+/// `tag`: `s` children each at its own position, `l` children all 300
+/// behind the head (one slice, fanned out to every child each round).
+async fn positions(suffix: &str, tag: &str, count: u64) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("wasmkeep=info")
         .with_test_writer()
@@ -526,7 +533,7 @@ async fn distinct_positions(suffix: &str) {
     }
     let _ = stop.send(());
     server.await.unwrap().unwrap();
-    seed_edges(data.path(), 256, "s");
+    seed_edges(data.path(), count, tag);
     let (addr, stop, server) = node_with(suffix, data.path(), Some(stub), None)
         .await
         .unwrap();
@@ -534,7 +541,7 @@ async fn distinct_positions(suffix: &str) {
     // About a hundred rounds over 256 lagging children.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let stats = http(addr, "GET", "/stats?name=alice", "").await;
-    assert!(stats.contains("\"edges\":256"), "{stats}");
+    assert!(stats.contains(&format!("\"edges\":{count}")), "{stats}");
     assert_eq!(publish(addr, "after", "x").await.unwrap(), (2, 2002));
     let _ = stop.send(());
     server.await.unwrap().unwrap();
@@ -557,6 +564,17 @@ async fn typescript_big_room_distinct_positions_at_default_budget() {
 #[ignore = "speed-sensitive: its first pusher alarm after a restart takes about 430 M of the 500 M fuel the 50 ms budget is calibrated for; scripts/check.sh --full runs it"]
 async fn typescript_big_room_distinct_positions_at_default_budget_starlingmonkey() {
     distinct_positions("-starlingmonkey").await;
+}
+/// One slice fanned out to 127 relayed edges (about 10,000 clients) each
+/// round: its rows are counted once, the requests once per edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typescript_big_room_one_position_127_edges_at_default_budget() {
+    positions("", "l", 127).await;
+}
+/// The same with 256 edges, more requests than one round's work holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typescript_big_room_one_position_256_edges_at_default_budget() {
+    positions("", "l", 256).await;
 }
 
 /// The front's fuel so far: the sum and count of `wasmkeep_front_fuel`.
