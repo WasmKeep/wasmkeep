@@ -539,14 +539,22 @@ async fn distinct_positions(suffix: &str) {
     let _ = stop.send(());
     server.await.unwrap().unwrap();
     fuel::assert_ceiling(500_000_000);
+    // A round's work is bounded in counts, not by the state (ADR 0040,
+    // section 13): about half the budget on QuickJS, whatever the children
+    // lag. On StarlingMonkey the rounds stay near 160 M too, but the first
+    // alarm after the restart takes about 430 M (453 M before the bound),
+    // most of it not the round's counted work.
+    if suffix.is_empty() {
+        fuel::assert_class_ceiling("pusher", "alarm", 250_000_000);
+    }
 }
+/// Bounded in fuel at half the budget, so it runs in plain runs and CI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "load-sensitive: pusher alarm exceeded the CPU budget in the four-thread affected suite; scripts/check.sh --full runs it"]
 async fn typescript_big_room_distinct_positions_at_default_budget() {
     distinct_positions("").await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "load-sensitive: one-core contention run exceeded the nextest timeout; scripts/check.sh --full runs it"]
+#[ignore = "speed-sensitive: its first pusher alarm after a restart takes about 430 M of the 500 M fuel the 50 ms budget is calibrated for; scripts/check.sh --full runs it"]
 async fn typescript_big_room_distinct_positions_at_default_budget_starlingmonkey() {
     distinct_positions("-starlingmonkey").await;
 }

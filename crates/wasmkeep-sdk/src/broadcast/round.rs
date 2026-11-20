@@ -108,9 +108,6 @@ impl Round {
     /// with the lowest head a pushed child was given, for the pusher's idle
     /// pull (ADR 0040, section 13).
     pub fn run(&mut self, source: &mut impl Source, now: u64) -> Result<RoundResult, String> {
-        for child in &mut self.children {
-            child.sockets = None;
-        }
         let mut indices = vec![];
         let mut heads: Vec<Option<(u64, u64)>> = vec![];
         let mut requests = vec![];
@@ -122,6 +119,8 @@ impl Round {
         let mut read = 0usize;
         let mut pulls = 0usize;
         let mut budget = ROUND_BYTES;
+        // The round's work in counts (ROUND_WORK): pulls, requests and rows.
+        let mut work = 0usize;
         let mut deferred = false;
         let mut retry = 20;
         let mut delivered: Option<Position> = None;
@@ -146,9 +145,24 @@ impl Round {
                             .is_some_and(|s| s.due > now)
                 })
             {
+                self.children[index].sockets = None;
+                continue;
+            }
+            if work + PUSH_WORK > ROUND_WORK {
+                // A child at the head this round read needs nothing: it
+                // goes first next round but sets no alarm, so a group at
+                // its head goes idle. It keeps its last socket count.
+                let at_head = child.initialized
+                    && child
+                        .position
+                        .zip(current)
+                        .is_some_and(|(p, (e, _, head))| p.e == e && p.n == head);
+                deferred |= !at_head;
+                self.resume.get_or_insert_with(|| child.address.clone());
                 continue;
             }
             let (path, body, header) = if !child.initialized {
+                work += PUSH_WORK;
                 let mut body = "{\"room\":".to_owned();
                 crate::json::write_str(&mut body, &{
                     let a = crate::actors::self_address();
@@ -177,6 +191,8 @@ impl Round {
                         }))
                     } else if (key.is_some() && (read >= ROUND_BYTES || budget == 0))
                         || pulls >= MAX_PULLS
+                        || work + PULL_WORK + PUSH_WORK + usize::from(key.is_some()) * 2
+                            > ROUND_WORK
                     {
                         // Reads stop with the budget too: a deferred child costs nothing.
                         deferred = true;
@@ -184,7 +200,15 @@ impl Round {
                         continue;
                     } else {
                         pulls += 1;
-                        let budget = if key.is_some() { ROUND_BYTES - read } else { 0 };
+                        // What the pull reads is pushed at least once: half
+                        // the work left after both requests buys rows.
+                        let rows = (ROUND_WORK - work - PULL_WORK - PUSH_WORK) / 2;
+                        work += PULL_WORK;
+                        let budget = if key.is_some() {
+                            (ROUND_BYTES - read).min(rows * super::core::ROW_COST)
+                        } else {
+                            0
+                        };
                         match source.pull(child.position, budget, false, now) {
                             Ok(pull) => {
                                 if child.position.is_none_or(|p| p.e == pull.e) {
@@ -198,6 +222,7 @@ impl Round {
                                 }
                                 let slice = Slice::read(pull);
                                 read += slice.read;
+                                work += slice.items.len();
                                 Some(slice)
                             }
                             Err(e) => {
@@ -225,13 +250,22 @@ impl Round {
                     head: h.head,
                     messages: vec![],
                 };
+                // Every row encoded counts, once per child it is pushed to.
+                let rows = ROUND_WORK.saturating_sub(work + PUSH_WORK);
                 if let Some(&first) = slice.first.as_ref().filter(|_| !h.recover) {
-                    // The cut: at most 512 messages and 512 KiB of JSON per request.
+                    if rows == 0 {
+                        deferred = true;
+                        self.resume.get_or_insert_with(|| child.address.clone());
+                        continue;
+                    }
+                    // The cut: at most 512 messages and 512 KiB of JSON per
+                    // request, and the round's rows left.
                     push.first = first;
                     let fixed = push.encode().len();
                     let (mut k, mut total) = (0, fixed);
                     while k < slice.items.len()
                         && k < 512
+                        && k < rows
                         && total + slice.sizes[k] + usize::from(k > 0) <= 512 * 1024
                     {
                         total += slice.sizes[k] + usize::from(k > 0);
@@ -245,6 +279,7 @@ impl Round {
                     budget = budget.saturating_sub(total - fixed);
                     push.messages = slice.items[..k].to_vec();
                 }
+                work += PUSH_WORK + push.messages.len();
                 let body = push.encode();
                 Push::decode(&body)?; // Reject numbers JSON cannot represent exactly.
                 ("push", body, Some((h.e, h.head)))
@@ -321,6 +356,8 @@ impl Round {
             results
         };
         for (slot, (index, result)) in indices.into_iter().zip(results).enumerate() {
+            // A child sent a request this round says its count again.
+            self.children[index].sockets = None;
             if skip.contains(&slot) {
                 continue;
             }
@@ -419,6 +456,17 @@ pub const MAX_PULLS: usize = 16;
 
 /// Message bytes one round builds for its children (ADR 0040, section 4).
 const ROUND_BYTES: usize = 1024 * 1024;
+/// The work one round does at most, in counts a guest can keep (ADR 0040,
+/// section 13): each pull costs `PULL_WORK`, each request to a child
+/// `PUSH_WORK`, each row read 1 and each row encoded into a child's push
+/// 1 (once per child). The children the rest would need are deferred to
+/// the next round, which starts at the first of them. Chosen so a round
+/// stays near half the 50 ms budget on QuickJS whatever the children lag.
+pub const ROUND_WORK: usize = 640;
+/// A pull's work: one call to the room and its header.
+const PULL_WORK: usize = 8;
+/// A request's work: one child's push or init, its call and its answer.
+const PUSH_WORK: usize = 3;
 /// The messages after one position, each with its JSON size.
 struct Slice {
     header: Pull,

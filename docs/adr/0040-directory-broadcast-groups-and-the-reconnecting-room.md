@@ -20,6 +20,8 @@
   client keeps its socket on a 5xx history answer and resets its
   reconnect attempts only once caught up ([section 6](#6-the-client-protocol)),
   and the pusher is deployed with batched writes ([section 13](#13-the-pusher-amended-2026-11-20)).
+- Amended 2026-11-20: a pusher round's work is bounded in counts, not
+  only in bytes ("A round's work", [section 13](#13-the-pusher-amended-2026-11-20)).
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -296,7 +298,9 @@ window with one statement SQLite runs; history reads the page it answers
 in 32-row pages; a round reads the messages after each distinct child
 position once and builds at most 1 MiB for all its children together, at
 least one slice. Each row read is charged its JSON plus 1 KiB, an empty
-one too, so a round reads about 1,000 rows at most whatever the bodies;
+one too, so a round reads about 1,000 rows at most whatever the bodies
+(since the amendment of 2026-11-20 to section 13, about 310: a round's
+work is counted too);
 the other lagging children keep their positions and are pushed by the
 alarm 20 ms later, the next round starting at the first child deferred,
 so under sustained publishing every child takes its turn. A child left
@@ -597,7 +601,7 @@ would silence the wake):
 | Field | Meaning |
 |---|---|
 | `after` | optional `(e, n)`: a child's acknowledged position. Absent: the header alone, for a child whose position is unknown. |
-| `budget` | what is left of the round's 1 MiB, at most 1 MiB: it buys rows at 1 KiB each (at least one); `0` asks for the header alone. |
+| `budget` | what is left of the round's 1 MiB, at most 1 MiB, and since 2026-11-20 no more than the rows the round's work bound leaves (below): it buys rows at 1 KiB each (at least one); `0` asks for the header alone. |
 | `idle` | the pusher is about to stop clocking itself (below). |
 
 The answer is the push header a child at `after` needs, then the messages:
@@ -636,6 +640,39 @@ budget does, 20 ms later. A round pulls at most 16 distinct positions;
 children at further positions are deferred to the next round, so many
 laggards never make one round a long chain of synchronous calls to the
 room.
+
+**A round's work (amended 2026-11-20).** The 1 MiB bounds bytes, not
+work: with small bodies a round over children lagging at distinct
+positions read about 1,000 rows and pushed as many, about 455 M fuel on
+QuickJS and StarlingMonkey, close to the 500 M the 50 ms budget is
+calibrated for. A guest cannot read its fuel, so a round also counts its
+work, the same way in both SDKs: 8 for each pull, 3 for each request to
+a child (a push or an init), 1 for each row read and 1 for each row
+encoded into a child's push, counted once per child it goes to. A round
+does at most `ROUND_WORK` = 640, besides the 1 MiB and the 16 pulls:
+
+- A pull asks for at most half the work left after its own 8 and one
+  push's 3, in rows (`budget` above), so its child can be pushed all it
+  read: one pull reads at most 314 rows.
+- A push is cut at the rows left, as at 512 messages; a child whose push
+  would carry none of the messages it needs is deferred.
+- The children the bound leaves out keep their positions and are pushed
+  20 ms later, the next round starting at the first of them, as the byte
+  budget defers: delivery stays eventual and in order. A child already at
+  the head this round read needs nothing: it goes first next round but
+  sets no alarm, so a group at its head still goes idle. A child left out
+  keeps the socket count it last answered.
+- The first child the round reaches is always pushed, at least one row.
+
+The weights come from measurements on QuickJS, where a row read and
+pushed cost about 0.4 M fuel and a push request about 0.7 M: the
+distinct-positions test's rounds take about 170 M, at most 219 M (its
+first round after a restart, a push to 210 children), against 455 M
+before. A one-message publish to a group of 256 edges reaches about 157
+of them a round, the others 20 ms later. On StarlingMonkey the rounds
+take about 160 M, but the first alarm after a restart still takes about
+430 M (453 M before), most of it not the counted work; its test stays
+`--full` only.
 
 **Waking the pusher.**
 

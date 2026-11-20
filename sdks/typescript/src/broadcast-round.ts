@@ -34,6 +34,17 @@ export interface RoundResult {
  * the next round, so laggards at many positions never make one round a
  * long chain of synchronous calls to the room. */
 export const MAX_PULLS = 16;
+/** The work one round does at most, in counts a guest can keep (ADR 0040,
+ * section 13): each pull costs `PULL_WORK`, each request to a child
+ * `PUSH_WORK`, each row read 1 and each row encoded into a child's push
+ * 1 (once per child). The children the rest would need are deferred to
+ * the next round, which starts at the first of them. Chosen so a round
+ * stays near half the 50 ms budget on QuickJS whatever the children lag. */
+export const ROUND_WORK = 640;
+/** A pull's work: one call to the room and its header. */
+const PULL_WORK = 8;
+/** A request's work: one child's push or init, its call and its answer. */
+const PUSH_WORK = 3;
 interface Slice {
     header: Pull;
     first?: number;
@@ -95,11 +106,12 @@ export class Round {
      * used), for the pusher's idle pull. */
     run(input: Source | Core, now: number): RoundResult {
         const source = asSource(input);
-        for (const c of this.children)
-            c.sockets = undefined;
         const ready = this.children.filter(c => {
             const r = this.relayOf.get(c.address);
-            return c.suspect.due <= now && !(r && (this.suspects.get(r.name)?.due ?? 0) > now);
+            const due = c.suspect.due <= now && !(r && (this.suspects.get(r.name)?.due ?? 0) > now);
+            if (!due)
+                c.sockets = undefined;
+            return due;
         });
         // A continuation starts at the child the last round deferred first,
         // so under sustained publishing every child takes its turn.
@@ -108,7 +120,8 @@ export class Round {
         this.resume = undefined;
         // Pulls by position: children at one position share one pull and one encoding.
         const slices = new Map<string, Slice | undefined>();
-        let read = 0, pulls = 0, retry = 20, delivered: Position | undefined, current: Pull | undefined;
+        // The round's work in counts (ROUND_WORK): pulls, requests and rows.
+        let read = 0, pulls = 0, work = 0, retry = 20, delivered: Position | undefined, current: Pull | undefined;
         const slice = (position: Position | undefined): Slice | undefined => {
             const key = position ? `${position.e}.${position.n}` : "";
             if (slices.has(key))
@@ -119,12 +132,16 @@ export class Round {
             // Reads stop with the budget too: a deferred child costs nothing.
             if (position && (read >= ROUND_BYTES || budget <= 0))
                 return;
-            if (pulls >= MAX_PULLS)
+            if (pulls >= MAX_PULLS || work + PULL_WORK + PUSH_WORK + (position ? 2 : 0) > ROUND_WORK)
                 return;
             pulls++;
+            // What the pull reads is pushed at least once: half the work
+            // left after both requests buys rows.
+            const rows = Math.floor((ROUND_WORK - work - PULL_WORK - PUSH_WORK) / 2);
+            work += PULL_WORK;
             let pull: Pull;
             try {
-                pull = source.pull(position, position ? ROUND_BYTES - read : 0, false, now);
+                pull = source.pull(position, position ? Math.min(ROUND_BYTES - read, rows * ROW_COST) : 0, false, now);
             }
             catch (e) {
                 // Not durable yet (confirm): the upload's retry is 50 ms.
@@ -150,6 +167,7 @@ export class Round {
                 // Every row costs, an empty one too: its lift, its item and its JSON.
                 read += ROW_COST + bytes;
             }
+            work += s.messages.length;
             slices.set(key, s);
             return s;
         };
@@ -166,7 +184,18 @@ export class Round {
         ][] = [];
         for (const c of due) {
             let body: string, op: string, header: Pull | undefined;
+            if (work + PUSH_WORK > ROUND_WORK) {
+                // A child at the head this round read needs nothing: it
+                // goes first next round but sets no alarm, so a group at
+                // its head goes idle. It keeps its last socket count.
+                if (c.initialized && c.position && current && c.position.e === current.e && c.position.n === current.head)
+                    this.resume ??= c.address;
+                else
+                    defer(c);
+                continue;
+            }
             if (!c.initialized) {
+                work += PUSH_WORK;
                 const a = actors.selfAddress();
                 op = "init";
                 body = JSON.stringify({ room: `${a.tenant}/${a.class}/${a.name}`, lo: "0000000000000000", state: "active" });
@@ -181,13 +210,20 @@ export class Round {
                 }
                 const h = header = s.header;
                 const p: Push = { e: number(h.e), b: number(h.b), first: number(h.head < 9007199254740991n ? h.head + 1n : h.head), head: number(h.head), messages: [] };
+                // Every row encoded counts, once per child it is pushed to.
+                const rows = Math.max(0, ROUND_WORK - work - PUSH_WORK);
                 if (s.recover)
                     p.recover = true;
                 else if (s.messages.length) {
-                    // The old cut: at most 512 messages and 512 KiB of JSON per request.
+                    if (!rows) {
+                        defer(c);
+                        continue;
+                    }
+                    // The old cut: at most 512 messages and 512 KiB of JSON
+                    // per request, and the round's rows left.
                     const fixed = JSON.stringify({ ...p, first: s.first, messages: [] }).length;
                     let k = 0, total = fixed;
-                    while (k < s.messages.length && k < 512 && total + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
+                    while (k < s.messages.length && k < 512 && k < rows && total + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
                         total += s.sizes![k] + (k++ ? 1 : 0);
                     if (k && total - fixed > budget && budget < ROUND_BYTES) {
                         defer(c);
@@ -197,6 +233,7 @@ export class Round {
                     p.first = s.first!;
                     p.messages = s.messages.slice(0, k);
                 }
+                work += PUSH_WORK + p.messages.length;
                 pushes.push(p);
                 body = JSON.stringify(p);
             }
@@ -241,6 +278,8 @@ export class Round {
         if (deferred)
             next = now + retry;
         sent.forEach((c, i) => {
+            // A child sent a request this round says its count again.
+            c.sockets = undefined;
             if (skipped.has(i))
                 return; // Relay failure belongs to the relay, not its edges.
             try {
