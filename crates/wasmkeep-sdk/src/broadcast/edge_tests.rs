@@ -373,8 +373,11 @@ fn shared_wake_vectors() {
                         first: num(3),
                         head: num(4),
                         messages: (0..num(5))
-                            .map(|_| Item {
-                                epoch: None,
+                            .map(|i| Item {
+                                epoch: (words.len() == 9 && i < num(8)).then(|| super::Epoch {
+                                    e: num(6),
+                                    base: num(7),
+                                }),
                                 at: 0,
                                 id: None,
                                 body: "x".into(),
@@ -389,7 +392,7 @@ fn shared_wake_vectors() {
         }
         check(&mut wire, &mut expected, &event);
     }
-    assert_eq!(count, 6);
+    assert_eq!(count, 8);
 }
 #[test]
 fn wake_announcement_backpressure_closes_slow() {
@@ -398,7 +401,12 @@ fn wake_announcement_backpressure_closes_slow() {
         blocked: true,
         ..Wire::default()
     };
-    let ack = edge.receive(&push(5), &[1], &mut wire);
+    let header = Push {
+        first: 6,
+        messages: vec![],
+        ..push(5)
+    };
+    let ack = edge.receive(&header, &[1], &mut wire);
     assert_eq!(wire.closed, vec![(1, 4802)]);
     assert_eq!(ack.sockets, 0);
     assert_eq!(ack.slow, 1);

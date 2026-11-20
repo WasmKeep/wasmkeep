@@ -298,13 +298,25 @@ impl Edge {
     ///
     /// The first push after a wake from hibernation (no head, sockets with
     /// no cursor) places those sockets at `first - 1`, so the messages it
-    /// carries go out, and first tells each of them that position with a
-    /// `ready` carrying `b`: a client whose own position is lower fetches
+    /// carries go out, their frames saying where they stand. A header-only
+    /// one has nothing to send, so it tells each socket that position with
+    /// a `ready` carrying `b`: a client whose own position is lower fetches
     /// the rest over HTTP, one that missed nothing makes no request
     /// (ADR 0040, section 5).
     pub fn receive(&mut self, p: &Push, ids: &[u64], io: &mut impl SocketIo) -> Ack {
         if self.head.is_some() {
             self.adopt(ids);
+        } else if !p.messages.is_empty() {
+            // Its frames carry each message's own position (and epoch):
+            // rules 2 and 3 apply, one frame per socket.
+            let n = p.first.saturating_sub(1);
+            for id in ids {
+                self.cursors.entry(*id).or_insert(Cursor {
+                    n,
+                    lagging: false,
+                    stalled: false,
+                });
+            }
         } else {
             let n = p.first.saturating_sub(1);
             let ready = format!(

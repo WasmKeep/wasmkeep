@@ -83,12 +83,20 @@ export class Edge {
      *
      * The first push after a wake from hibernation (no head, sockets with no
      * cursor) places those sockets at `first - 1`, so the messages it carries
-     * go out, and first tells each of them that position with a `ready`
+     * go out, their frames saying where they stand. A header-only one has
+     * nothing to send, so it tells each socket that position with a `ready`
      * carrying `b`: a client whose own position is lower fetches the rest
      * over HTTP, one that missed nothing makes no request (ADR 0040, section 5). */
     receive(p: Push, ids: bigint[]) {
         if (this.head)
             this.adopt(ids);
+        // Its frames carry each message's own position (and epoch): rules 2
+        // and 3 apply, one frame per socket.
+        else if (p.messages.length) {
+            for (const id of ids)
+                if (!this.cursors.has(id))
+                    this.cursors.set(id, { n: Math.max(0, p.first - 1), lagging: false });
+        }
         else {
             const n = Math.max(0, p.first - 1);
             const ready = JSON.stringify({ t: "ready", e: p.e, b: p.b, n });

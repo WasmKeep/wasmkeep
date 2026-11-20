@@ -361,13 +361,18 @@ push or call from the room, and at a range change closes every socket
 whose point it no longer knows.
 
 (Amended 2026-11-20.) On the first push after such a wake, the edge
-places every socket that has no cursor at `first - 1` and first sends
-it `{"t":"ready","e":E,"b":B,"n":first - 1}` (the push's epoch and
-base): the messages the push carries then go out, and the client learns
-where the stream starts. A client whose own position is lower fetches
-the gap over HTTP; one that missed nothing makes no request, and rule 1
-drops what the push repeats. If that `ready` meets `backpressure`, the
-socket closes with 4802, as for `behind`. A `ping` is always answered:
+places every socket that has no cursor at `first - 1`, so the messages
+the push carries go out; their frames carry each message's own epoch,
+base and number, and rules 2 and 3 apply, one frame per socket. A
+header-only first push has nothing to send: the edge then sends each of
+those sockets `{"t":"ready","e":E,"b":B,"n":first - 1}` (the push's
+epoch and base), so the client learns where the stream starts. A client
+whose own position is lower fetches the gap over HTTP; one that missed
+nothing makes no request. If that `ready` meets `backpressure`, the
+socket closes with 4802, as for `behind`. (The announcement is not sent
+with messages: at 500 sockets a second frame each doubles the host sends
+of a cold event, a trap there repeats the wake, and the push's epoch can
+be newer than its first messages'.) A `ping` is always answered:
 before the first push, with `{"t":"pong","e":0,"n":null}`. Before this,
 the edge placed those sockets at the push's `head` before applying it:
 the messages of that push never reached them, nothing told them so, and
@@ -398,7 +403,7 @@ Text frames, JSON. Server to client:
 | Frame | Meaning |
 |---|---|
 | `{"t":"ready","e":4,"n":120}` | Connected; the stream resumes after `n`. `null`: check over HTTP. |
-| `{"t":"ready","e":4,"b":100,"n":120}` | On an open socket, from an edge woken from hibernation (section 5): the stream resumes after `n`; `b` is the epoch's base. |
+| `{"t":"ready","e":4,"b":100,"n":120}` | On an open socket, from an edge woken from hibernation by a header-only push (section 5): the stream resumes after `n`; `b` is the epoch's base. |
 | `{"t":"m","e":4,"b":100,"n":121,"m":[{"a":1763400000000,"i":"k1","d":"hello"}]}` | Messages `n`, `n+1`, ... of epoch `e`, whose base is `b`. |
 | `{"t":"behind","e":4,"n":180}` | Fetch what you miss up to here over HTTP; live frames follow. |
 | `{"t":"pong","e":4,"n":180}` | Answer to `ping`, with the head. `"e":0,"n":null`: the edge knows no head yet. |
@@ -425,9 +430,11 @@ drains or the edge moved).
    It does not change the connection's state. An older client ignores
    `b` and takes the `ready` as a gap whenever its `e` or `n` differs from
    `last`: since the room bumps its epoch when it wakes, that is one
-   request per older client after each wake of the room. A `pong` with
-   `n: null` is a keepalive only; an older client rejects it as invalid
-   and reconnects.
+   request per older client after each header-only wake. A `pong` with
+   `n: null` is a keepalive only. An older client rejects it as invalid
+   (`onError`) and reconnects; in a quiet room, whose edge hibernates
+   between its pings, it thus cycles about every 45 s, where before the
+   edge's silence made it reconnect about every 55 s.
    Hold live frames, `GET <front>/history?after=<e>.<n>` until `more` is
    false, apply `lost` and `reset` as answered (`onReset`: the app
    reloads what it shows by its own means), then apply the held frames

@@ -15,16 +15,20 @@ The text under a version's heading is its GitHub release text
   the messages of that push never reached them and nothing told them so:
   in a quiet room a client stayed stale until the next publish, and a
   ping got no `pong` until a push came. Both SDKs' edges now place them at
-  `first - 1` and first send each a `ready` with the push's base,
+  `first - 1`, so the push's messages go out in frames that carry their
+  own position, one frame per socket. A header-only first push, which has
+  nothing to send, instead sends each a `ready` with the push's base,
   `{"t":"ready","e":E,"b":B,"n":first - 1}`; a `ping` before any push gets
   `{"t":"pong","e":0,"n":null}`. `RoomClient` fetches history after such a
   `ready` only when its position is past the client's own, applying `b`
   as for a frame of the next epoch, and takes a `pong` with no head as a
   keepalive; neither changes its state from `ready`. An older client
   fetches whenever the announced `e` or `n` differs from its own, which
-  after a wake of the room (it bumps the epoch) is one request each, and
-  rejects a headless `pong` and reconnects. Shared Rust/TypeScript vectors (`wake-vectors.txt`) cover
-  the wake.
+  after a header-only wake (the room bumps the epoch when it wakes) is one
+  request each. It also rejects a headless `pong` (`onError`) and
+  reconnects: in a quiet room, whose edge hibernates between pings, about
+  every 45 s, where it reconnected about every 55 s before (no `pong`).
+  Shared Rust/TypeScript vectors (`wake-vectors.txt`) cover the wake.
 
 - The QuickJS distinct-positions room budget test runs in `check.sh --full`
   again rather than in CI: its fuel is bounded, but its real 50 ms CPU budget

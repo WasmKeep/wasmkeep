@@ -142,18 +142,18 @@ test("shared wake vectors: a woken edge's first push reaches its sockets", () =>
             else if (w[0] === "ping")
                 edge.ping(BigInt(w[1]));
             else if (w[0] === "push")
-                edge.receive({ e: n(1), b: n(2), first: n(3), head: n(4), messages: Array.from({ length: n(5) }, () => ({ a: 0, d: "x" })) }, [...sockets]);
+                edge.receive({ e: n(1), b: n(2), first: n(3), head: n(4), messages: Array.from({ length: n(5) }, (_, i) => w.length === 9 && i < n(8) ? { a: 0, d: "x", e: n(6), b: n(7) } : { a: 0, d: "x" }) }, [...sockets]);
             else
                 throw Error(`unknown event ${line}`);
         }
         check();
     }
-    assert.equal(count, 6);
+    assert.equal(count, 8);
 });
 test("a wake announcement that meets backpressure closes the socket as slow", () => {
     const closed: [bigint, number][] = [];
     const edge = new Edge({ send() { return "backpressure"; }, close(id, code) { closed.push([id, code]); } });
-    const ack = edge.receive(push(5), [1n]);
+    const ack = edge.receive({ ...push(5), first: 6, messages: [] }, [1n]);
     assert.deepEqual(closed, [[1n, 4802]]);
     assert.equal(ack.sockets, 0);
     assert.equal(ack.slow, 1);

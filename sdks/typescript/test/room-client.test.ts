@@ -451,3 +451,12 @@ test("a woken edge's announcement on an open connection is not a new ready", asy
     assert(!ws.closed);
     c.close();
 });
+test("a woken edge's first push across epochs reaches the client with no fetch", async () => {
+    const seen: string[] = [];
+    const r = new Receiver({ onMessage: p => { seen.push(`${p.e}.${p.n}`); }, history: async () => { throw Error("unexpected fetch"); } }, { e: 1, n: 370 });
+    // The frames of wake-vectors.txt's epoch-straddling push, no announcement.
+    await r.receive({ t: "m", e: 1, b: 0, n: 371, m: [{ a: 0, d: "371" }, { a: 0, d: "372" }, { a: 0, d: "373" }] });
+    await r.receive({ t: "m", e: 2, b: 373, n: 374, m: [{ a: 0, d: "374" }] });
+    assert.deepEqual(seen, ["1.371", "1.372", "1.373", "2.374"]);
+    assert.deepEqual(r.last, { e: 2, n: 374 });
+});

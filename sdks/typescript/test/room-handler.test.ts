@@ -53,9 +53,17 @@ test("an edge woken with sockets announces their start, delivers its first push 
     try {
         e.websocket!.message!(7n, '{"t":"ping"}');
         assert.deepEqual(sockets.sent.splice(0).map(([id, s]) => [id, JSON.parse(s)]), [[7n, { t: "pong", e: 0, n: null }]]);
-        assert.equal(call("/wasmkeep-edge/v1/push", JSON.stringify({ e: 1, b: 0, first: 374, head: 375, messages: [{ a: 0, d: "374" }, { a: 0, d: "375" }] })), 200);
-        const frames = sockets.sent.splice(0).map(([id, s]) => [id, JSON.parse(s)]);
-        assert.deepEqual(frames, [[7n, { t: "ready", e: 1, b: 0, n: 373 }], [7n, { t: "m", e: 1, b: 0, n: 374, m: [{ a: 0, d: "374" }, { a: 0, d: "375" }] }]]);
+        // Header-only: the socket learns where the stream starts.
+        assert.equal(call("/wasmkeep-edge/v1/push", JSON.stringify({ e: 1, b: 0, first: 376, head: 375, messages: [] })), 200);
+        assert.deepEqual(sockets.sent.splice(0).map(([id, s]) => [id, JSON.parse(s)]), [[7n, { t: "ready", e: 1, b: 0, n: 375 }]]);
+        assert.equal(call("/wasmkeep-edge/v1/push", JSON.stringify({ e: 1, b: 0, first: 376, head: 376, messages: [{ a: 0, d: "376" }] })), 200);
+        assert.deepEqual(sockets.sent.splice(0).map(([id, s]) => [id, JSON.parse(s)]), [[7n, { t: "m", e: 1, b: 0, n: 376, m: [{ a: 0, d: "376" }] }]]);
+        // A second woken instance whose first push carries messages: they
+        // go out, with no announcement.
+        const woken = defineEdge();
+        const again = (body: string) => { const r = woken.fetch!({ method: "POST", path: "/wasmkeep-edge/v1/push", headers: { "x-wasmkeep-caller": "tenant/room/r" }, text: () => body, bytes: () => new TextEncoder().encode(body), json: <T>() => JSON.parse(body) as T }); assert(typeof r === "object" && !(r instanceof Uint8Array)); return r.status; };
+        assert.equal(again(JSON.stringify({ e: 1, b: 0, first: 374, head: 375, messages: [{ a: 0, d: "374" }, { a: 0, d: "375" }] })), 200);
+        assert.deepEqual(sockets.sent.splice(0).map(([id, s]) => [id, JSON.parse(s)]), [[7n, { t: "m", e: 1, b: 0, n: 374, m: [{ a: 0, d: "374" }, { a: 0, d: "375" }] }]]);
     }
     finally {
         sockets.open.splice(0);
