@@ -138,6 +138,8 @@ test("history-json is the browser's JSON byte for byte: escapes, ids, lost and r
     // Bodies and ids are bound as TEXT: `json_quote` refuses a BLOB.
     const kinds = db.query("SELECT DISTINCT typeof(body), typeof(id) FROM wasmkeep_room_history", []).values.map(r => r.map(v => v.tag === "text" ? v.val : "?").join(","));
     assert.deepEqual(kinds.sort(), ["text,null", "text,text"]);
+    // Read back whole, U+0000 and all, as the host reads it.
+    assert.deepEqual(r.history({ e: 1n, n: 0n }).messages.map(m => m.body), bodies);
     const dec = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
     for (const after of [undefined, { e: 1n, n: 0n }, { e: 1n, n: 5n }])
         assert.equal(dec.decode(r.pageJSON(after)), browserPage(r, after));
