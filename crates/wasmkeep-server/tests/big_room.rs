@@ -489,12 +489,10 @@ async fn heavy(suffix: &str) {
     fuel::assert_ceiling(500_000_000);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
 async fn typescript_big_room_full_window_at_default_budget() {
     heavy("").await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
 async fn typescript_big_room_full_window_at_default_budget_starlingmonkey() {
     heavy("-starlingmonkey").await;
 }
@@ -543,12 +541,12 @@ async fn distinct_positions(suffix: &str) {
     fuel::assert_ceiling(500_000_000);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
+#[ignore = "load-sensitive: pusher alarm exceeded the CPU budget in the four-thread affected suite; scripts/check.sh --full runs it"]
 async fn typescript_big_room_distinct_positions_at_default_budget() {
     distinct_positions("").await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
+#[ignore = "load-sensitive: one-core contention run exceeded the nextest timeout; scripts/check.sh --full runs it"]
 async fn typescript_big_room_distinct_positions_at_default_budget_starlingmonkey() {
     distinct_positions("-starlingmonkey").await;
 }

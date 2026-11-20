@@ -161,14 +161,12 @@ if $full || $rust; then
   step tests
   if $full; then
     cargo nextest run --workspace --locked
-    # The TypeScript room and edge tests at the default CPU budget
-    # assert fuel ceilings too, but keep their real 50 ms CPU budget.
-    # Only variants still sensitive to CPU speed remain ignored:
-    # run them here, on this machine. The StarlingMonkey distinct-positions
-    # variant, a 0.6.0 known limit fixed by the room/pusher split, now
-    # runs here with the others.
+    # Both distinct-positions variants remain ignored: a CPU-budget trap
+    # in the affected suite (QuickJS), and a one-core contention timeout
+    # (StarlingMonkey). The two TypeScript fanout tests also remain ignored
+    # because their in-test node build is load-sensitive.
     cargo nextest run -p wasmkeep-server --test big_room --test room_edge --locked --run-ignored only \
-      -E 'test(/default_budget/)'
+      -E '(binary(big_room) & test(/^typescript_big_room_distinct_positions_at_default_budget(_starlingmonkey)?$/)) | (binary(room_edge) & test(/^fanout_500_(quickjs|starlingmonkey)_default_budget$/))'
   else
     # The cluster suite over TLS repeats the cluster suite on another
     # transport: --full only.
