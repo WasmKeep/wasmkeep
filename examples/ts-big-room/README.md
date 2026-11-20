@@ -37,11 +37,6 @@ private content.
 by CI and `scripts/languages.sh` through their `examples/ts-*/` loop. The browser
 bundle and HTML are embedded in the front; `src/assets.ts` is generated.
 
-Deploy the QuickJS build (the default) for a real room. On StarlingMonkey,
-the room actor can run out of guest memory when its node is short of CPU
-(measured with one core); see the 0.6.0 known limits in the
-[changelog](../../CHANGELOG.md).
-
 The front accepts `GET /join`, `POST /publish`, `GET /history` and `GET /stats`,
 with `?name=<chosen name>`. Publish takes `{ "text": "hello", "id": "retry-id" }`;
 history accepts `after=<epoch>.<number>`. Stats reports the head (from the room)
