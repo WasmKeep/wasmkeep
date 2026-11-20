@@ -366,12 +366,12 @@ async fn fanout_budget(engine: &str) {
     });
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
+#[ignore = "load-sensitive: the in-test node build is sensitive to CPU contention; scripts/check.sh --full runs it"]
 async fn fanout_500_quickjs_default_budget() {
     fanout_budget("quickjs").await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
+#[ignore = "load-sensitive: the in-test node build is sensitive to CPU contention; scripts/check.sh --full runs it"]
 async fn fanout_500_starlingmonkey_default_budget() {
     fanout_budget("starlingmonkey").await;
 }

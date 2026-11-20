@@ -29,5 +29,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"
 name = "instantiate"
 harness = false
 
+[[bench]]
+name = "host_calls"
+harness = false
+
 [lints]
 workspace = true

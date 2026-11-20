@@ -91,11 +91,14 @@ The text under a version's heading is its GitHub release text
   ADR 0009, amendment of 2026-11-20, and the `alarms` and `on-alarm` docs
   in the WIT.
 - **StarlingMonkey big-room OOM on one core fixed by the room/pusher
-  split.** The distinct-positions and full-window tests both passed five
-  consecutive runs pinned to one core at the default 50 ms event budget
-  and 128 MiB memory limit. Like the other default-budget room tests, it
-  is speed-sensitive, so `scripts/check.sh --full` runs it rather than
-  every CI run.
+  split.** Both full-window variants now run in ordinary CI, retaining
+  their fuel ceilings and the serialized `big-room` group, after five
+  passes each on one core beside a CPU burner at the default 50 ms event
+  budget and 128 MiB memory limit. Both distinct-positions variants remain
+  `--full`-only: QuickJS passed the contention runs but hit a CPU-budget
+  trap in the four-thread affected suite; StarlingMonkey timed out in its
+  first contention run. The two TypeScript `room_edge` fanout tests also
+  remain `--full`-only because their in-test Node build is load-sensitive.
 - **Periodic snapshots of batched classes leave the mailbox.** A batched
   hold took its periodic snapshot inside the mailbox gap after an event:
   a flush to the barrier, the copy, then the upload, with every event
