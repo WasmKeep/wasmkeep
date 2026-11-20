@@ -370,5 +370,43 @@ pub fn next_sweep_wait_ms(found: SweepFound, now_ms: u64, period_ms: u64, overdu
     }
 }
 
+/// What a node's timer does with the committed alarm an event ended with
+/// (ADR 0009, amendment of 2026-11-19), given the hint of the delivery it
+/// has handed to the actor's mailbox and not heard back from
+/// (`in_flight`): whether that delivery covers it. It does when it is for
+/// the same time: the mailbox runs events in order, so the delivery runs
+/// after the event and reads the alarm it committed. Re-registering would
+/// queue a second delivery of the same round, which finds the alarm moved
+/// by the first and pays a stale-hint clear. Any other time (a move, a
+/// registration waiting or backing off, none) registers anew.
+pub fn delivery_covers(in_flight: Option<u64>, at: u64) -> bool {
+    in_flight == Some(at)
+}
+
+/// When a delivery that ran comes back to the timer with its registration
+/// unchanged since it was handed over: whether to deliver it again rather
+/// than forget it. Again when the delivery covered a commit
+/// ([`delivery_covers`]): its run registered nothing itself, so it may have
+/// ended before that commit (its result and the commit race to the timer),
+/// or without running `on-alarm` (another owner, a failure), and nothing
+/// else would arm the committed alarm. (A delivery the mailbox dropped
+/// before it answered is delivered again in any case, with the admission
+/// backoff: the server's `fire_alarm`.)
+pub fn deliver_again(covered: bool) -> bool {
+    covered
+}
+
+/// Whether an alarm delivery for `hint` that no longer matches the
+/// committed alarm may skip clearing the stale hint: when the hold already
+/// ran `on-alarm` for that time (`delivered`, this hold's latest), the
+/// entry it named for it is retired by its exact key once the move is
+/// replicated (R2), so the LIST would find nothing of this hold's. A
+/// delivery from the index (`swept`) always clears: the entries it lists
+/// at that time are named by no state (an earlier owner's, or one whose
+/// exact-key DELETE failed), and only such a delivery removes them.
+pub fn stale_clear_skippable(hint: u64, swept: bool, delivered: Option<u64>) -> bool {
+    !swept && delivered == Some(hint)
+}
+
 #[cfg(test)]
 mod tests;

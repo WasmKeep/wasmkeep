@@ -170,6 +170,8 @@ its first request.
 | `wasmkeep_mailbox_wait_seconds{tenant,app,class}` | histogram | Time from the accepted enqueue attempt to the start of a guest-event mailbox job; excludes capacity-admission retries. |
 | `wasmkeep_mailbox_host_work_seconds{tenant,app,class,work}` | histogram | Exclusive host work inside the mailbox, including jobs with no guest event; fixed `work` categories below. |
 | `wasmkeep_alarm_stale_hints_total{tenant,app,class}` | counter | Stale alarm hint clear attempts (including failures or deferred clears), not the number of index objects deleted. |
+| `wasmkeep_alarm_deliveries_total{tenant,app,class,outcome}` | counter | Alarm deliveries an actor's mailbox ran, by how they ended: `ran` (`on-alarm` ran for the committed alarm), `stale` (the delivery's time no longer matched the committed alarm: cleared or moved since), `duplicate` (a stale time this actor's hold had already run, met again from the node's timer after a move: not cleared, its entry was retired when the alarm moved), `deferred` (not run now: another node owns the actor, a draining node handed it off, the bucket was unavailable, a required value is missing, the actor was not ready or its class is no longer served). `stale` over `ran` is how many extra deliveries each alarm round costs; see [alarm deliveries](#alarm-deliveries). |
+| `wasmkeep_alarm_dropped_deliveries_total` | counter | Alarm deliveries the mailbox dropped before they answered (the actor failed to start, or the event stopped), rescheduled with the admission backoff (at most six in a row; then left to the next event or the sweep). |
 | `wasmkeep_event_duration_seconds{tenant,app,class,kind}` | histogram | Guest event execution, including awaited host calls: `fetch` (HTTP and actor calls), `alarm`, `websocket` (open/message/close), or `other` (initialization). Excludes post-event replication. |
 | `wasmkeep_event_start_rule_wait_seconds{tenant,app,class}` | histogram | A batched event's boundary holding back the next event: capture, upload-budget wait and the event-start rule's upload wait. Recorded once per completed boundary, including failed ones; absent for strict holds. |
 | `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit) or `lease` (this node lost the actor mid-event). |
@@ -281,7 +283,8 @@ maintenance jobs that never enter a guest. Its bounded `work` values are:
 - `stale_alarm_hint`: clearing a nonempty stale alarm hint, including its
   barrier wait, fencing, bucket LIST and DELETEs. Compare its rate with
   `wasmkeep_alarm_stale_hints_total` to distinguish frequent stale deliveries
-  from slow clears. A moved alarm can leave an old index hint to clear later.
+  from slow clears, and `wasmkeep_alarm_deliveries_total` for where the
+  stale deliveries come from. A moved alarm can leave an old index hint to clear later.
 - `complete_uploads`: the resident-only upload completion job's pump/capture.
 - `snapshot_in_gap`: a periodic batched snapshot and its barrier wait.
 - `flush_to_barrier`: a barrier flush outside another named host operation.
@@ -340,6 +343,31 @@ histogram_quantile(0.99,
   )
 )
 ```
+
+### Alarm deliveries
+
+The node's timer hands each due alarm to the actor's mailbox as one
+delivery, which reads the committed alarm and runs `on-alarm` if it is
+still due. `wasmkeep_alarm_deliveries_total` counts how those deliveries
+ended. In steady state each alarm round is one `ran` delivery; a `stale`
+one is a delivery whose time no longer matched the committed alarm, and in
+a cluster each one costs a stale-hint clear inside the mailbox (a flush, a
+fence, a LIST of the index and DELETEs, the `stale_alarm_hint` work above).
+Stale deliveries per round:
+
+```promql
+sum by (tenant, app, class) (rate(wasmkeep_alarm_deliveries_total{outcome="stale"}[5m]))
+/
+sum by (tenant, app, class) (rate(wasmkeep_alarm_deliveries_total{outcome="ran"}[5m]))
+```
+
+A ratio near zero is expected: stale deliveries come from index entries
+left by an earlier owner or a failed DELETE, and from alarms moved or
+cleared while their delivery was due. A ratio of one or more on a busy
+actor (before 0.7.0, a room whose mailbox was always busy) means the same
+round is being delivered several times. `duplicate` deliveries cost a
+mailbox turn but no clear; `wasmkeep_alarm_dropped_deliveries_total`
+counts deliveries redelivered after the mailbox dropped them.
 
 ### Bucket requests
 

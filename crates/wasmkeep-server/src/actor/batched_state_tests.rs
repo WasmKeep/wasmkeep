@@ -76,6 +76,7 @@ fn state(
         },
         alarms: crate::alarm::spawn(|_, _| {}),
         alarm_failures: 0,
+        delivered_alarm: None,
         service: Arc::default(),
         sockets: Arc::default(),
         chain: Arc::from(Vec::new()),

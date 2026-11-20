@@ -2,6 +2,7 @@
 //! alarm, keeping the index in line with the committed alarm (R1 to R3),
 //! clearing stale entries behind a fence, and the sweep.
 
+use super::timing::Delivered;
 use super::*;
 
 /// After a failed alarm hand-off, how soon this node tries again (ms).
@@ -13,9 +14,9 @@ impl ActorState {
     /// retry with exponential backoff, so delivery is at least once.
     ///
     /// `hint` is the time the alarm was registered for on this node (from an
-    /// event, the startup scan, a retry or the bucket's index); the
+    /// event, the startup scan, a retry or the bucket's index: `swept`); the
     /// committed alarm in the database decides what runs.
-    pub(super) async fn alarm(&mut self, hint: u64) {
+    pub(super) async fn alarm(&mut self, hint: u64, swept: bool) {
         self.chain = Arc::from(Vec::new());
         // The event runs on the class it takes now (ADR 0013).
         if let Err(e) = self.refresh_class() {
@@ -23,6 +24,7 @@ impl ActorState {
             // bucket's index), for a deploy that brings the class back.
             tracing::info!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "alarm: class no longer served");
             self.alarms.clear(self.address.clone());
+            self.timing.delivered(Delivered::Deferred);
             return;
         }
         match self.ensure_owner().await {
@@ -31,6 +33,7 @@ impl ActorState {
             // owner's committed state and the bucket's index).
             Err(OwnershipError::NotOwner { owner, .. }) => {
                 tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %owner, "alarm: not the owner");
+                self.timing.delivered(Delivered::Deferred);
                 return;
             }
             // This node is draining (ADR 0014): the chosen peer arms the
@@ -38,6 +41,7 @@ impl ActorState {
             // it, this node's timer tries again soon: then another peer, or
             // with none left, this node claims.
             Err(OwnershipError::Elsewhere { peer }) => {
+                self.timing.delivered(Delivered::Deferred);
                 let Some(cluster) = self.cluster.clone() else {
                     return;
                 };
@@ -66,6 +70,7 @@ impl ActorState {
                 | OwnershipError::Broken(e),
             ) => {
                 tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "alarm: bucket unavailable");
+                self.timing.delivered(Delivered::Deferred);
                 let wait = self
                     .cluster
                     .as_ref()
@@ -80,6 +85,7 @@ impl ActorState {
         // not run now, kept for when
         // it is set (tried again at the longest backoff).
         if self.class.missing_required(self.address.class()).is_some() {
+            self.timing.delivered(Delivered::Deferred);
             let wait = u64::try_from(self.limits.retry_max.as_millis()).unwrap_or(u64::MAX);
             self.alarms
                 .set_if_earlier(self.address.clone(), now_ms().saturating_add(wait));
@@ -95,10 +101,12 @@ impl ActorState {
                 Some(Barrier::Flushed) => {}
                 Some(Barrier::GaveUp(_)) => {
                     self.abandon("replication stopped before an alarm");
+                    self.timing.delivered(Delivered::Deferred);
                     self.retry_alarm().await;
                     return;
                 }
                 None => {
+                    self.timing.delivered(Delivered::Deferred);
                     self.retry_alarm().await;
                     return;
                 }
@@ -109,6 +117,7 @@ impl ActorState {
         // it would only create it again. Its entries at the hint go instead.
         if let Some(indexed) = self.without_state().await {
             tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), hint, "alarm: the actor has no state; removing its entries");
+            self.timing.delivered(Delivered::Stale);
             self.alarms.clear(self.address.clone());
             if !self.clear_stale_hint(Some(hint), Some(indexed)).await {
                 // Not removable yet (the bucket has nothing for the actor:
@@ -134,15 +143,18 @@ impl ActorState {
         }
         if let Err(e) = self.ensure_ready().await {
             tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "alarm: actor not ready");
+            self.timing.delivered(Delivered::Deferred);
             self.retry_alarm().await;
             return;
         }
         let Some(live) = self.live.as_mut() else {
+            self.timing.delivered(Delivered::Deferred);
             return;
         };
         let at = match with_db(&mut live.store, |db| db.alarm()).await {
             Ok(Ok(at)) => at,
             _ => {
+                self.timing.delivered(Delivered::Deferred);
                 // `ensure_ready` may have run `on-init`: finish the event so
                 // its writes are replicated like any event's.
                 self.finish(false, false).await;
@@ -153,17 +165,39 @@ impl ActorState {
         // An index entry that no longer matches the committed alarm (it was
         // cleared or moved since) is stale: removed below, once the
         // committed alarm is indexed.
-        let stale_hint = (at != Some(hint)).then_some(hint);
+        let mut stale_hint = (at != Some(hint)).then_some(hint);
+        // A local delivery of a time this hold already ran `on-alarm` for
+        // (ADR 0009, amendment of 2026-11-19): the entry it named then is
+        // retired by its exact key once the move is replicated, so nothing
+        // of this hold's is left at that time. A delivery from the index
+        // still clears what it lists there.
+        let generation = self.hold_generation();
+        let delivered = self
+            .delivered_alarm
+            .and_then(|(held, at)| (held == generation).then_some(at));
+        let duplicate =
+            stale_hint.is_some_and(|h| alarm_index::stale_clear_skippable(h, swept, delivered));
+        if duplicate {
+            tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), hint, "alarm: a time this hold already delivered; not clearing it");
+            stale_hint = None;
+        }
+        let stale = if duplicate {
+            Delivered::Duplicate
+        } else {
+            Delivered::Stale
+        };
         match at {
             // Nothing to run, but `ensure_ready` may have run `on-init`,
             // whose writes must be replicated like any event's.
             None => {
+                self.timing.delivered(stale);
                 self.alarms.clear(self.address.clone());
                 let named = self.index_and_replicate(None).await;
                 self.clear_stale_hint(stale_hint, named).await;
                 return;
             }
             Some(at) if at > now_ms() => {
+                self.timing.delivered(stale);
                 self.alarms.set(self.address.clone(), at);
                 let named = self.index_and_replicate(Some(at)).await;
                 self.clear_stale_hint(stale_hint, named).await;
@@ -175,6 +209,7 @@ impl ActorState {
 
         self.install_call_context().await;
         let Some(live) = self.live.as_mut() else {
+            self.timing.delivered(Delivered::Deferred);
             return;
         };
         // Read before the handler runs: a handler that sets an alarm resets
@@ -187,6 +222,8 @@ impl ActorState {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
 
+        self.timing.delivered(Delivered::Ran);
+        self.delivered_alarm = Some((generation, at));
         live.start_event("alarm");
         let run = limit(
             self.limits.wall,
@@ -260,6 +297,12 @@ impl ActorState {
                 self.clear_stale_hint(stale_hint, named).await;
             }
         }
+    }
+
+    /// The lease generation of this actor's hold, `None` without one (a
+    /// single node).
+    fn hold_generation(&self) -> Option<u64> {
+        self.held.as_ref().and_then(|h| h.lease().generation())
     }
 
     /// Whether this node may write the actor's alarm index entries: it
@@ -632,10 +675,30 @@ impl ActorState {
                 return true;
             }
         };
-        for stale in alarm_index::entries_to_clear(hint, &listed, indexed.as_ref(), generation) {
+        // Selected here, serialized with the hold's next event; the tagged
+        // keys' DELETEs finish off the actor's path (ADR 0034, section 9): a
+        // late one cannot remove a newer entry, tagged keys are never reused
+        // (R1). The legacy key at `hint` is no fresh key (a node of an older
+        // version writes it again for that millisecond): deleted here, as
+        // before, so a late DELETE cannot remove the one it wrote since.
+        let (legacy, stale): (Vec<_>, Vec<_>) =
+            alarm_index::entries_to_clear(hint, &listed, indexed.as_ref(), generation)
+                .into_iter()
+                .partition(|e| e.tag.is_none());
+        for stale in legacy {
             if let Err(e) = cluster.delete_alarm_entry(&self.address, &stale).await {
                 tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "removing a stale alarm entry failed");
             }
+        }
+        if !stale.is_empty() {
+            let (address, app) = (self.address.clone(), self.app_name.clone());
+            tokio::spawn(async move {
+                for stale in stale {
+                    if let Err(e) = cluster.delete_alarm_entry(&address, &stale).await {
+                        tracing::debug!(app = %crate::logging::named(&app), actor = %crate::logging::actor(&address), error = %e, "removing a stale alarm entry failed");
+                    }
+                }
+            });
         }
         true
     }

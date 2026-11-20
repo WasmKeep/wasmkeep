@@ -465,3 +465,51 @@ async fn timing_alarm_event_has_its_own_kind() {
         "missing fetch duration: {page}"
     );
 }
+
+/// Events that end while the actor's alarm delivery waits in its mailbox
+/// leave that one delivery queued: the committed alarm they sync is the
+/// one it will run. Before 0.7.0 each of them queued another delivery for
+/// the same time, and every one after the first found the alarm moved and
+/// cleared it as a stale hint (in a cluster: a flush, a fence, a LIST and
+/// DELETEs inside the mailbox).
+#[tokio::test(flavor = "multi_thread")]
+async fn events_that_end_while_a_delivery_is_queued_do_not_queue_more() {
+    const EVENTS: usize = 6;
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    // The mailbox is busy from 0 to 800 ms; the alarm comes due at 400 ms,
+    // behind the events that arrived at 100 ms.
+    ok(addr, "POST", "/alarm?in=400").await;
+    let busy = tokio::spawn(async move { call(addr, "POST", "/sleep?ms=800").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let events: Vec<_> = (0..EVENTS)
+        .map(|_| tokio::spawn(async move { call(addr, "GET", "/attempts").await }))
+        .collect();
+    assert_eq!(busy.await.unwrap().0, 200);
+    for event in events {
+        assert_eq!(event.await.unwrap().0, 200);
+    }
+    wait_fired(addr, 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(number(addr, "/fired").await, 1);
+    assert_eq!(number(addr, "/attempts").await, 1);
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    let stale: Vec<_> = page
+        .lines()
+        .filter(|l| l.starts_with("wasmkeep_alarm_stale_hints_total{") && !l.ends_with(" 0"))
+        .collect();
+    assert!(stale.is_empty(), "no stale hint was delivered: {stale:?}");
+    let delivered = |outcome: &str| {
+        let prefix = format!(
+            "wasmkeep_alarm_deliveries_total{{tenant=\"default\",app=\"default\",class=\"t\",outcome=\"{outcome}\"}} "
+        );
+        page.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .map_or(0, |n| n.parse::<u64>().unwrap())
+    };
+    assert_eq!(
+        [delivered("ran"), delivered("stale"), delivered("duplicate")],
+        [1, 0, 0],
+        "{page}"
+    );
+}

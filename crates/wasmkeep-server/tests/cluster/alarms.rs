@@ -353,6 +353,65 @@ async fn a_stale_index_entry_is_removed_when_it_comes_due() {
     assert_eq!(r.body.trim(), "0", "and no handler ran for it");
 }
 
+/// The legacy key at a stale hint is deleted inside the alarm event, not
+/// after it (only tagged keys' DELETEs finish off the mailbox): a node of
+/// an older version listing that millisecond again must not find it
+/// removed late, after it named it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_legacy_entry_is_deleted_before_the_alarm_event_ends() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(
+        Arc::clone(&inner),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let store: Arc<dyn ObjectStore> = Arc::clone(&flaky) as Arc<dyn ObjectStore>;
+    let data = tempfile::tempdir().unwrap();
+    let a = node_with(
+        "a",
+        data.path(),
+        &store,
+        Duration::from_secs(30),
+        "t",
+        test_actor_wasm(),
+    )
+    .await;
+    settle().await;
+    send(a.addr, "POST", "/actor/t/x/fired", "").await;
+    flaky.delay_alarm_deletes_ms.store(1_500, Ordering::SeqCst);
+    let due = epoch_ms() - 10_000;
+    let legacy =
+        object_store::path::Path::from(test_key(Family::Alarms, &format!("{due:015}/t/78")));
+    {
+        use object_store::ObjectStoreExt as _;
+        inner
+            .put(&legacy, object_store::PutPayload::new())
+            .await
+            .unwrap();
+    }
+    // The sweep delivers it: the delivery is counted stale before it clears.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let page = wasmkeep_server::metrics::render(Default::default());
+        if page.lines().any(|l| {
+            l.starts_with("wasmkeep_alarm_deliveries_total{")
+                && l.contains("outcome=\"stale\"")
+                && !l.ends_with(" 0")
+        }) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never delivered");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Queued behind the alarm event: answered once it ended.
+    let r = send(a.addr, "GET", "/actor/t/x/attempts", "").await;
+    assert_eq!(r.status, 200);
+    use object_store::ObjectStoreExt as _;
+    assert!(
+        inner.head(&legacy).await.is_err(),
+        "the legacy entry outlived the alarm event"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_and_owned_entries_at_one_time_fire_once_and_are_removed() {
     // A legacy entry (as nodes without tags wrote it) next to the tagged

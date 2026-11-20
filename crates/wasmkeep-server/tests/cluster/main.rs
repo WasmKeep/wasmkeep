@@ -917,6 +917,9 @@ struct Flaky {
     /// `release` turns true: a DELETE that lands late, after a retry or a
     /// slow network. `held` and `applied` count them.
     hold_alarm_deletes: Arc<AtomicBool>,
+    /// Every alarm-index delete waits this many ms before it is sent: the
+    /// caller's request is still open meanwhile (unlike `hold_alarm_deletes`).
+    delay_alarm_deletes_ms: Arc<std::sync::atomic::AtomicU64>,
     held: Arc<std::sync::atomic::AtomicU32>,
     applied: Arc<std::sync::atomic::AtomicU32>,
     release: tokio::sync::watch::Sender<bool>,
@@ -981,6 +984,7 @@ struct Flaky {
 impl Flaky {
     fn new(inner: Arc<dyn ObjectStore>, down: Arc<AtomicBool>) -> Self {
         Self {
+            delay_alarm_deletes_ms: Arc::default(),
             no_handoff_word: Arc::default(),
             frozen_node_load: std::sync::Mutex::default(),
             lease_gets: Arc::default(),
@@ -1355,6 +1359,7 @@ impl ObjectStore for Flaky {
     {
         use futures_util::StreamExt as _;
         let refuse = Arc::clone(&self.fail_request_deletes);
+        let delay = Arc::clone(&self.delay_alarm_deletes_ms);
         let unannounced = Arc::clone(&self.restore_requests_ended_without_outcome);
         let (inner, hold, held, applied, release) = (
             Arc::clone(&self.inner),
@@ -1366,6 +1371,7 @@ impl ObjectStore for Flaky {
         locations
             .then(move |location| {
                 let refuse = Arc::clone(&refuse);
+                let delay = delay.load(Ordering::SeqCst);
                 let unannounced = Arc::clone(&unannounced);
                 let (inner, hold, held, applied, mut release) = (
                     Arc::clone(&inner),
@@ -1376,6 +1382,9 @@ impl ObjectStore for Flaky {
                 );
                 async move {
                     let path = location?;
+                    if delay > 0 && path.as_ref().starts_with(&test_key(Family::Alarms, "")) {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
                     if refuse.load(Ordering::SeqCst)
                         && (path.as_ref().contains("/deletes/")
                             || path.as_ref().contains("/restores/"))
