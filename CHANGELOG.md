@@ -9,6 +9,10 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Wasmtime 50.0.3**, which fixes RUSTSEC-2026-0587: a WASI filesystem
+  sandbox escape on Windows through a drive-prefixed path. WasmKeep ships
+  no Windows build; the patch release of the pinned version is taken anyway.
+
 - **The room renders the browser's history page.** A front answering
   `GET /history` decoded the room's binary page into objects and encoded
   it again in the guest, so a full page cost the front most of its CPU
