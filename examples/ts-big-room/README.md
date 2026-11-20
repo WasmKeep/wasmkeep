@@ -21,8 +21,18 @@ cargo run -j 4 -p wasmkeep-cli -- serve examples/ts-big-room/front.wasm \
   --actor relay=examples/ts-big-room/relay.wasm \
   --actor directory=examples/ts-big-room/directory.wasm \
   --access room=internal --access pusher=internal --access edge=internal \
-  --access relay=internal --access directory=internal
+  --access relay=internal --access directory=internal \
+  --writes pusher=batched
 ```
+
+Deploy the pusher with batched writes, here and on a cluster
+(`wasmkeep deploy --writes pusher=batched`, or `writes = "batched"` under
+`[classes.pusher]` in `wasmkeep.toml`;
+[ADR 0040, section 13](../../docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#13-the-pusher-amended-2026-11-20)).
+Its only per-round write is its alarm, and strict replicates each alarm
+move before the next round; everything it must keep across a crash (its
+children, relays and scaling operation) is committed durably either way,
+and child positions are never stored.
 
 Open <http://localhost:8080> in two tabs and choose different names. Send a
 message, drop a connection and send another while it reconnects. The message
