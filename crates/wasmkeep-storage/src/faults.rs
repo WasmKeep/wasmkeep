@@ -24,7 +24,7 @@ pub fn held(point: &str) -> bool {
 
 /// Makes the next operation at `point` fail, once. Points:
 /// `set_meta:<key>` (writing a host metadata value), `meta:<key>` (reading
-/// one), `delete` (removing an actor's database files), `open_busy`
+/// one), `delete_meta:<key>` (removing one), `delete` (removing an actor's database files), `open_busy`
 /// (opening an actor's database answers "busy"; arm it several times for
 /// several attempts).
 pub fn fail_next(point: &str) {

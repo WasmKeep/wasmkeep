@@ -212,23 +212,37 @@ impl ActorState {
             self.timing.delivered(Delivered::Deferred);
             return;
         };
-        // Read before the handler runs: a handler that sets an alarm resets
-        // the count, and that must not cancel the backoff of its own failure.
-        // A touch marker left behind (a crash after the handler, or one an
-        // upload in the middle of an event carried to the bucket) is
-        // removed first: this run starts untouched.
-        let failures = with_db(&mut live.store, |db| {
+        // A touch marker left behind (a crash after the handler, a removal
+        // that failed, or one an upload in the middle of an event carried
+        // to the bucket) is removed first: this run starts untouched. If it
+        // cannot be, the handler does not run (an untouched run would keep
+        // the delivered time and run again at once); the alarm is retried.
+        let unmarked = with_db(&mut live.store, |db| {
             if db.meta(ALARM_TOUCHED_KEY)?.is_some() {
                 db.delete_meta(ALARM_TOUCHED_KEY)?;
             }
-            db.meta(ALARM_FAILURES_KEY)
+            Ok::<_, wasmkeep_storage::SqlError>(())
         })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
+        .await;
+        if !matches!(unmarked, Ok(Ok(()))) {
+            self.timing.delivered(Delivered::Deferred);
+            self.finish(false, false).await;
+            self.retry_alarm().await;
+            return;
+        }
+        let Some(live) = self.live.as_mut() else {
+            self.timing.delivered(Delivered::Deferred);
+            return;
+        };
+        // Read before the handler runs: a handler that sets an alarm resets
+        // the count, and that must not cancel the backoff of its own failure.
+        let failures = with_db(&mut live.store, |db| db.meta(ALARM_FAILURES_KEY))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
 
         self.timing.delivered(Delivered::Ran);
         self.delivered_alarm = Some((generation, at));

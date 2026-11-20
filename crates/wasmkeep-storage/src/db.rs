@@ -1300,6 +1300,13 @@ impl ActorDb {
 
     /// Removes a host metadata value, if there is one.
     pub fn delete_meta(&mut self, key: &str) -> Result<(), SqlError> {
+        #[cfg(feature = "fault-injection")]
+        if crate::faults::take(&format!("delete_meta:{key}")) {
+            return Err(SqlError::new(
+                crate::SqlErrorKind::Internal,
+                "disk I/O error (injected)",
+            ));
+        }
         self.internal(|conn| {
             conn.execute("DELETE FROM main._wasmkeep_meta WHERE key = ?1", [key])
                 .map(drop)

@@ -467,7 +467,9 @@ never read `get-alarm` inside `on-alarm`.
   `end_event`, in both the success and the failure arms, and removes one
   left behind (a crash right after the handler, or an `exec-durable`
   upload during it that a new owner restores) before the next handler
-  runs. It is set only by the handler's own calls: not by `on-init`
+  runs; if that removal fails, the handler does not run and the alarm is
+  retried with backoff (a leftover mark would make an untouched run keep
+  the delivered time and run again at once). It is set only by the handler's own calls: not by `on-init`
   running in the same event, nor by later events on the instance.
 - **The failure arm is unchanged.** Whatever a failed run left due before
   the retry time, the delivered time set again included, moves to the
@@ -505,7 +507,11 @@ never read `get-alarm` inside `on-alarm`.
   outcome (one run, then it stalled); the next four failed only on what
   `get-alarm` answered before the handler touched the alarm (the
   delivered time, none expected). Their alarm outcomes were already
-  right, and they guard them. The restore test passed before; it fails (the actor runs
+  right, and they guard them. A mark that cannot be removed before the
+  handler keeps the handler from running
+  (`a_touch_mark_that_cannot_be_removed_keeps_the_handler_from_running`,
+  the mark's removals failed by fault injection; before, a third run
+  followed at once). The restore test passed before; it fails (the actor runs
   again) when an untouched `get-alarm` answers the delivered time, and
   the open-transaction case fails when the mark is read before
   `end_event` (both checked by mutation).

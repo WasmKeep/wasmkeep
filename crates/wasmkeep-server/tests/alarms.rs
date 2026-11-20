@@ -625,3 +625,23 @@ async fn a_handler_that_saves_and_restores_the_alarm_runs_once() {
     assert_eq!(number(addr, "/attempts").await, 1);
     assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_touch_mark_that_cannot_be_removed_keeps_the_handler_from_running() {
+    // The first run sets the delivered time again, and removing its mark
+    // after the run fails: the mark is left, and the alarm is retried. The
+    // retry cannot remove the leftover mark either, so it must not run the
+    // handler: with the mark still there, a run that leaves the alarm
+    // alone would look as if it had kept the delivered time, and run once
+    // more at once. Retried again, the mark goes and the handler's run is
+    // its last.
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _stop) = start(service(data.path(), Duration::from_secs(30))).await;
+    wasmkeep_storage::faults::fail_next("delete_meta:alarm_touched");
+    wasmkeep_storage::faults::fail_next("delete_meta:alarm_touched");
+    alarm_doing(addr, "again", 1).await;
+    wait_fired(addr, 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(number(addr, "/attempts").await, 2);
+    assert_eq!(call(addr, "GET", "/alarm").await.1, "none");
+}
