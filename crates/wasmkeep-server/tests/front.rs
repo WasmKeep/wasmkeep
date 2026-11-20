@@ -542,6 +542,30 @@ async fn the_front_has_its_own_cpu_budget() {
     .await;
 }
 
+/// Each request's guest CPU time and fuel are measured, a trapped one's
+/// too: a request that trapped on its budget is charged about the budget,
+/// and the next one, in a fresh instance, only its own small work.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fronts_guest_work_is_measured_per_request() {
+    let node = start(Setup {
+        front_cpu: Some(Duration::from_millis(50)),
+        actor_cpu: Duration::from_secs(60),
+        ..Setup::default()
+    })
+    .await;
+    assert_eq!(get(node.addr, "/spin", "").await.status, 500);
+    let r = get(node.addr, "/", "").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "front ok"));
+    on_page(&[
+        "wasmkeep_front_cpu_seconds_count{tenant=\"default\",app=\"default\"} 2\n",
+        // The answered request well inside the budget, the trapped one past it.
+        "wasmkeep_front_cpu_seconds_bucket{tenant=\"default\",app=\"default\",le=\"0.025\"} 1\n",
+        "wasmkeep_front_cpu_seconds_bucket{tenant=\"default\",app=\"default\",le=\"0.1\"} 2\n",
+        "wasmkeep_front_fuel_count{tenant=\"default\",app=\"default\"} 2\n",
+    ])
+    .await;
+}
+
 /// Waits (up to 5 s) until the metrics page has every line of `lines`.
 async fn on_page(lines: &[&str]) {
     let deadline = Instant::now() + Duration::from_secs(5);
