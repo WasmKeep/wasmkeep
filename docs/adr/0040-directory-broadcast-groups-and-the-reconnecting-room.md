@@ -412,9 +412,10 @@ drains or the edge moved).
    catch up does not reconnect at the fastest rate forever). A failed
    open (a browser sees only 1006) is one more attempt.
 6. HTTP answers `429` and any `5xx` are retried, the socket kept, after
-   `Retry-After` plus the same jitter; after a `5xx` the next request
-   asks for half the page (`limit`, which the front clamps to 1..256),
-   and each answer doubles it back. Only a `4xx` is an error (amended
+   `Retry-After` plus the same jitter; after a `5xx` other than `503`
+   (a room unavailable, not a page too big) the next request asks for
+   half the page (`limit`, which the front clamps to 1..256), and each
+   answer doubles it back. Only a `4xx` is an error (amended
    2026-11-20: a `500`, the front's CPU budget cut by a full page, used
    to close the socket, and the client rejoined behind as before). Each
    request has a 30 s deadline; the waits between them do not count.

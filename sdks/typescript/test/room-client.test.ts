@@ -316,9 +316,9 @@ test("a 5xx history answer keeps the socket, halves the page and catches up", as
         fetch: (async (url: unknown) => {
             const u = new URL(String(url));
             queries.push(u);
-            // The front's CPU budget cuts a full page, then a 502 and a 504 on the way.
-            if (queries.length <= 3)
-                return new Response("internal error\n", { status: [500, 502, 504][queries.length - 1] });
+            // The front's CPU budget cuts a full page, a 502, a 503 (a takeover: same page), a 504.
+            if (queries.length <= 4)
+                return new Response("internal error\n", { status: [500, 502, 503, 504][queries.length - 1] });
             const after = Number(u.searchParams.get("after")!.split(".")[1]), limit = Number(u.searchParams.get("limit") ?? 256);
             return page(after + 1, Math.min(limit, 600 - after), 600);
         }) as typeof fetch });
@@ -337,7 +337,7 @@ test("a 5xx history answer keeps the socket, halves the page and catches up", as
     assert.deepEqual(errors.map(String), []);
     assert.equal(ws.closed, false, "a 5xx never closes the socket");
     assert.deepEqual(seen, Array.from({ length: 604 }, (_, i) => i + 1));
-    assert.deepEqual(queries.slice(0, 4).map(u => u.searchParams.get("limit")), [null, "128", "64", "32"]);
+    assert.deepEqual(queries.slice(0, 5).map(u => u.searchParams.get("limit")), [null, "128", "64", "64", "32"]);
     assert(queries.every(u => u.searchParams.get("name") === "a"));
     c.close();
 });

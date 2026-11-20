@@ -352,7 +352,7 @@ export class RoomClient {
         }
     }
     /** The `limit` the next history request asks for: halved after each
-     * 5xx (a page the front could not serve in its budget), doubled back
+     * 5xx but 503 (a page the front could not serve in its budget), doubled back
      * after each answer, up to the front's own page. */
     private limit = HISTORY_PAGE;
     private history(p?: Position, recovery?: AbortSignal): Promise<History> {
@@ -390,7 +390,9 @@ export class RoomClient {
             }
             if (response.status !== 429 && response.status < 500)
                 throw Error(`history answered ${response.status}`);
-            if (response.status >= 500)
+            // A 503 is the room unavailable (a takeover), not a page too
+            // big for the front: it keeps the page.
+            if (response.status >= 500 && response.status !== 503)
                 this.limit = Math.max(1, Math.floor(this.limit / 2));
             const retry = response.headers.get("Retry-After") ?? "0";
             const seconds = Number(retry), delay = Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(retry) - this.clock.now());

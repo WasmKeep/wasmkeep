@@ -31,9 +31,9 @@ The text under a version's heading is its GitHub release text
   the socket; the client rejoined behind, asked for the same page, met
   the same 500, and since `ready` reset its reconnect attempts after
   10 s it did so at the fastest rate, forever. Now any 5xx is retried
-  like a 503, the socket kept, after `Retry-After` plus full jitter, with
-  half the page each time (`limit`, doubled back after each answer);
-  only a 4xx is an error. The 30 s deadline covers each request, not the
+  like a 503, the socket kept, after `Retry-After` plus full jitter; a
+  5xx other than 503 also halves the page (`limit`, doubled back after
+  each answer). Only a 4xx is an error. The 30 s deadline covers each request, not the
   waits between them. The attempt counter returns to 0 only once the
   connection has stayed ready for 10 s after its history caught up. See
   ADR 0040, section 6.
